@@ -74,6 +74,8 @@ interface PlanOpts {
   templates?: DeviceTemplateProfile[];
   authProfiles?: AuthProfile[];
   authProfile?: AuthProfile;
+  adoptionChoice?: "adopt" | "decline";
+  providerInstanceKey?: string;
 }
 
 function plan(opts: PlanOpts): InventorySyncPlan {
@@ -83,9 +85,40 @@ function plan(opts: PlanOpts): InventorySyncPlan {
     currentServers: opts.servers ?? [],
     now: 5000,
     authProfile: opts.authProfile,
+    adoptionChoice: opts.adoptionChoice,
+    providerInstanceKey: opts.providerInstanceKey,
     templatesById: new Map((opts.templates ?? []).map((t) => [t.id, t] as const)),
     authProfilesById: new Map((opts.authProfiles ?? []).map((p) => [p.id, p] as const))
   });
+}
+
+/** DEVICE_INSTANCE — the NetBox deployment the Fix 1 adoption fixtures record and sync against. */
+const DEVICE_INSTANCE = "https://netbox.example.com";
+
+/**
+ * A "Keep Servers" kept record: no origin, a `formerlySynced` marker naming this
+ * device/provider/instance, at the device's address, agent auth, no key. Adoptable
+ * by a source of the same provider+instance when `adoptionChoice: "adopt"`.
+ */
+function keptServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+  return {
+    id: "kept-1",
+    name: "old-name",
+    host: "10.0.0.1",
+    port: 22,
+    username: "admin",
+    authType: "agent",
+    isHidden: false,
+    formerlySynced: {
+      sourceId: "removed-source",
+      sourceName: "NetBox (removed)",
+      providerId: "netbox",
+      instanceKey: DEVICE_INSTANCE,
+      externalId: "device:1",
+      detachedAt: 900
+    },
+    ...overrides
+  };
 }
 
 /** The `after` record for a given owned server id, or `undefined` if it was left unchanged. */
@@ -581,6 +614,186 @@ describe("§5.3 proxy reference validation — dangling / self-referential jumpH
     const after = afterFor(p, server.id) ?? server;
     expect(after.proxy).toEqual(P_A); // existing proxy kept, NOT clobbered to the dangling proxy or to undefined
     expect(after.origin?.templated?.proxy).toEqual(P_A); // stamp carried forward
+  });
+});
+
+// -------- FIX 3 (PR #61 Codex) — update-path self-proxy uses the OWNED record's id --------
+
+describe("FIX 3 — self-proxy detection on the update path uses ownedServer.id, not the deterministic id", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+
+  it("Fixture 33 — an owned server whose id was PRESERVED (id ≠ deterministic id) with a catch-all override proxy pointing at its OWN id is SKIPPED as a self-reference; sibling field still applies (kills passing the computed `id`, which writes the self-proxy)", () => {
+    // Preserved-id owned server (adoptee kept its id, or an ID-preserving import):
+    // ownedServer.id "preserved-id" ≠ deterministicServerId("source-1","device:1").
+    const owned = ownedServer({ id: "preserved-id", proxy: undefined }, { templated: undefined });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()], // maps to the owned server (update path)
+      servers: [owned],
+      templates: [template({ proxy: { mode: "override", value: sshProxy("preserved-id") }, multiplexing: { mode: "fill", value: true } })]
+    });
+    const after = afterFor(p, "preserved-id")!;
+    expect(after.proxy).toBeUndefined(); // self-proxy NOT written
+    expect(after.multiplexing).toBe(true); // sibling field still applied
+    expect(p.warnings.filter((w) => w.includes("through itself")).length).toBe(1);
+  });
+});
+
+// -------- FIX 1 (PR #61 Codex) — adoption applies the template matrix + auth winner --------
+
+describe("FIX 1 — adoption branch consumes the template cascade (proxy / booleans / auth), stamped", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const bastion: ServerConfig = { id: "bastion-1", name: "bastion", host: "10.9.9.9", port: 22, username: "admin", authType: "agent", isHidden: false };
+
+  it("Fixture 34 — adopting a kept server under a catch-all OVERRIDE template applies its proxy, boolean and explicit auth link, each STAMPED (kills the shipped 'adoption defers templates' — leaves them unapplied)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [keptServer(), bastion],
+      templates: [
+        template({
+          proxy: { mode: "override", value: sshProxy("bastion-1") },
+          multiplexing: { mode: "override", value: true },
+          authProfileId: { mode: "override", value: "p-explicit" }
+        })
+      ],
+      authProfiles: [authProfile("p-explicit")],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    // Non-auth values applied AND stamped.
+    expect(after.proxy).toEqual(sshProxy("bastion-1"));
+    expect(after.origin?.templated?.proxy).toEqual(sshProxy("bastion-1"));
+    expect(after.multiplexing).toBe(true);
+    expect(after.origin?.templated?.multiplexing).toBe(true);
+    // Auth link applied AND stamped (the cascade winner, restored into the origin
+    // rebuild rather than lost).
+    expect(after.authProfileId).toBe("p-explicit");
+    expect(after.origin?.syncedAuthProfileId).toBe("p-explicit");
+  });
+
+  it("Fixture 35 — adopting under a catch-all FILL template does NOT overwrite the adoptee's existing proxy (fill write-once), but DOES fill an unset boolean (kills applying fill over a configured field on the adoption path)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [keptServer({ proxy: P_A }), bastion],
+      templates: [
+        template({
+          proxy: { mode: "fill", value: sshProxy("bastion-1") },
+          multiplexing: { mode: "fill", value: true }
+        })
+      ],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    expect(after.proxy).toEqual(P_A); // existing proxy kept (fill write-once)
+    expect(after.origin?.templated?.proxy).toBeUndefined(); // nothing stamped for a field left alone
+    expect(after.multiplexing).toBe(true); // unset boolean filled
+    expect(after.origin?.templated?.multiplexing).toBe(true);
+  });
+
+  it("Fixture 36 — a FILL auth link is NOT applied to an adoptee with a hand-configured login (username ≠ baseline) — the six AUTH 2 clauses hold on the adoption path (kills bypassing eligibility for a fill link)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [keptServer({ username: "custom" })], // hand-configured login ≠ source default "admin"
+      templates: [template({ authProfileId: { mode: "fill", value: "p1" } })],
+      authProfiles: [authProfile("p1")],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    expect(after.authProfileId).toBeUndefined(); // fill refused — the login is hand-configured
+    expect(after.origin?.syncedAuthProfileId).toBeUndefined();
+  });
+});
+
+// -------- FIX 2 (PR #61 Codex) — post-plan jump-host survivor validation --------
+
+describe("FIX 2 — jump-host references validated against the POST-PLAN survivor set", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const JUMP_ID = deterministicServerId("source-1", "device:jump");
+
+  it("Fixture 37 — a template ssh proxy whose jump host is an owned server the SAME plan PRUNES (delete policy) is NOT written to the templated servers; one survivor warning (kills validating against the pre-prune set, which writes the proxy)", () => {
+    // The jump host: owned by this source, its device absent from the tree, so it
+    // is pruned under delete policy.
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()], // device:1 → fresh add, gets the template proxy → JUMP_ID
+      servers: [jumpHost],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(JUMP_ID) } })]
+    });
+    // The jump host is pruned...
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === JUMP_ID)).toBe(true);
+    // ...so the freshly-added server's proxy pointing at it is dropped (field absent).
+    const added = p.adds.find((s) => s.origin?.externalId === "device:1")!;
+    expect(added.proxy).toBeUndefined();
+    expect("proxy" in added).toBe(false); // absent, never a written undefined
+    expect(added.origin?.templated?.proxy).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 38 — a template ssh proxy whose jump host is a device SKIPPED this run (invalid port) is NOT written + one survivor warning (kills counting a skipped device's id as live)", () => {
+    const SKIP_ID = deterministicServerId("source-1", "device:skip");
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [
+        makeDevice(), // device:1 → add, gets proxy → SKIP_ID
+        makeDevice({ externalId: "device:skip", name: "skipme", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 0 }] }) // invalid port → skipped
+      ],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(SKIP_ID) } })]
+    });
+    const added = p.adds.find((s) => s.origin?.externalId === "device:1")!;
+    expect(added.proxy).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 39 — a template ssh proxy whose jump host is a device ADDED this run IS written (the freshly-synced jump host survives; kills an over-broad drop)", () => {
+    const JUMP2_ID = deterministicServerId("source-1", "device:2");
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [
+        makeDevice(), // device:1 → add, gets proxy → device:2's id (survives)
+        makeDevice({ externalId: "device:2", name: "jump-2", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })
+      ],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(JUMP2_ID) } })]
+    });
+    const added = p.adds.find((s) => s.origin?.externalId === "device:1")!;
+    expect(added.proxy).toEqual(sshProxy(JUMP2_ID)); // written — the jump host is a fresh add, a survivor
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
+  });
+
+  it("Fixture 40 — a HAND-SET proxy (no template stamp) pointing at a pruned server is left UNTOUCHED by the pass, while a template-owned proxy at the same jump host IS dropped (kills touching a proxy the template didn't write this run)", () => {
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    // An owned server carrying a HAND-SET ssh proxy → JUMP_ID (no origin.templated stamp).
+    // A template boolean write makes it appear in `updates` so its proxy is observable.
+    const handServer = ownedServer(
+      { id: "hand-1", proxy: sshProxy(JUMP_ID), multiplexing: undefined },
+      { externalId: "device:hand" }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [
+        makeDevice(), // device:1 → fresh add, template-owned proxy → JUMP_ID (dropped)
+        makeDevice({ externalId: "device:hand", name: "hand-dev", endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })
+      ],
+      servers: [jumpHost, handServer],
+      templates: [
+        template({ proxy: { mode: "override", value: sshProxy(JUMP_ID) }, multiplexing: { mode: "fill", value: true } })
+      ]
+    });
+    // The hand-set proxy is left exactly as configured (no stamp = not a template write).
+    const handAfter = afterFor(p, "hand-1")!;
+    expect(handAfter.proxy).toEqual(sshProxy(JUMP_ID));
+    expect(handAfter.multiplexing).toBe(true); // the boolean write did land
+    // The template-owned proxy on the fresh add is dropped.
+    const added = p.adds.find((s) => s.origin?.externalId === "device:1")!;
+    expect(added.proxy).toBeUndefined();
   });
 });
 

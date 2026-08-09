@@ -711,19 +711,32 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   for (const w of cascade.warnings) {
     warnings.push(w);
   }
-  // §5.3 proxy jump-host resolution set: every server that exists AFTER this
-  // sync — the current servers plus the deterministic ids of the devices this
-  // fetch adds (so a jump host being freshly synced this run resolves, and a
-  // self-reference on a brand-new device is judged a self-reference, not a
-  // dangle). A `jumpHostId` outside this set is dangling; the equality against
-  // the target device's own id is the self-reference, checked per-device below.
+  // §5.3 proxy jump-host resolution set — the OPTIMISTIC first pass (FIX 2, PR
+  // #61 Codex review). This set names every id that COULD exist after the sync:
+  // the current servers plus the deterministic ids of every device this fetch
+  // carries. It admits a reference that WON'T actually survive — an owned jump
+  // host this plan prunes under `delete`, or a device row skipped below for an
+  // invalid endpoint / port / id collision — so it is NOT the authoritative
+  // dangling check. Its job is narrower and still needed: a `jumpHostId` outside
+  // even this optimistic set can NEVER resolve (it names nothing this sync knows
+  // about), so composition drops such a proxy to "desired none" HERE, which is
+  // what gives §4.3 row-5 carry — an existing sync-owned proxy is kept instead of
+  // being clobbered by a never-resolvable one (fixture 32). The AUTHORITATIVE
+  // check against the definitive post-plan SURVIVOR set (current minus prunes,
+  // plus adds, plus adopted ids) runs after the device loop, because prune and
+  // per-device skip decisions are only known once the loop has run; it drops the
+  // references this optimistic set over-admitted. The two are mutually exclusive
+  // by construction — a ref this set rejects never reaches the survivor pass
+  // (its desired is already none), and a ref this set admits is the only kind the
+  // survivor pass re-examines — so no proxy is warned about twice.
   const liveServerIds = new Set(currentServers.map((s) => s.id));
   for (const device of tree.devices) {
     liveServerIds.add(deterministicServerId(source.id, device.externalId));
   }
   // Compose the non-auth desired fields (§4.2 layer 2) once; applied by the
-  // §4.3 matrix on both the add and update paths. A dangling jump-host proxy is
-  // dropped to "desired none" here (device-independent) with one plan warning.
+  // §4.3 matrix on both the add and update paths. A never-resolvable jump-host
+  // proxy is dropped to "desired none" here (device-independent) with one plan
+  // warning; a merely non-surviving one is caught by the post-plan pass instead.
   const composed = composeDesiredFields(cascade.winners, {
     hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
     proxyTemplateName: cascade.proxyTemplateName,
@@ -1068,8 +1081,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // load-bearing §5.2 regression lives here — it must go INTO the origin
       // literal, like every other stamp, since the auth branches below rebuild
       // the origin). `templateMatrix.values` are the field writes for `after`.
+      //
+      // FIX 3 (PR #61 Codex review) — the §5.3 self-reference check inside the
+      // matrix compares `proxy.jumpHostId` against `targetServerId`, which must be
+      // the id the RECORD carries — `ownedServer.id` — NOT the computed
+      // deterministic `id`. The two DIVERGE for an owned server that entered with
+      // a preserved id (an adoptee kept its id, or an ID-preserving imported
+      // record): passing `id` would let a template proxy whose `jumpHostId ===
+      // ownedServer.id` route the server through itself and go uncaught. The add
+      // path (~2018) is correct with `id` because a fresh record's id IS the
+      // computed `id`; the adoption path uses `adoptee.id`, same reasoning.
       const templateMatrix = applyTemplateMatrix(ownedServer, desiredNonAuth, {
-        targetServerId: id,
+        targetServerId: ownedServer.id,
         targetServerName: device.name,
         proxyTemplateName: cascade.proxyTemplateName
       });
@@ -1718,6 +1741,30 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesIpmiHost =
           mgmtHost !== undefined &&
           syncOwnsIpmiHost(adoptee.ipmiHost, adoptee.formerlySynced?.syncedIpmiHost, mgmtHost);
+        // FIX 1 (PR #61 Codex review) — APPLY THE TEMPLATE MATRIX ON ADOPTION,
+        // mirroring the update path (~1071). An adopted server is OWNED from this
+        // point (the same principle the `endpoint.username` and OOB writes below
+        // invoke, and the design's "implicit source rule IS the lowest template
+        // rule" — source-auth already retro-applies at adoption, so the rest of
+        // the cascade must too). Deferring the non-auth writes would leave the
+        // adopted server usable with stale proxy/booleans for one whole sync until
+        // the next run's update path applies the identical write.
+        //
+        // `targetServerId: adoptee.id` — the adoptee keeps its own id through
+        // adoption, so the §5.3 self-reference check judges the proxy against the
+        // record's real id (this is Fix 3's rule on the adoption path). The stamp
+        // (`matrix.templated`) goes INTO `adoptionOrigin` below, because the auth
+        // branch rebuilds the origin as `{ ...adoptionOrigin, syncedAuthProfileId }`
+        // and would silently discard anything stamped onto `after.origin` after the
+        // literal — exactly the discipline the OOB/AUTH stamps already follow here.
+        const templateMatrix = applyTemplateMatrix(adoptee, desiredNonAuth, {
+          targetServerId: adoptee.id,
+          targetServerName: device.name,
+          proxyTemplateName: cascade.proxyTemplateName
+        });
+        for (const w of templateMatrix.warnings) {
+          warnings.push(w);
+        }
         const adoptionOrigin: ServerOrigin = {
           sourceId: source.id,
           externalId: device.externalId,
@@ -1805,7 +1852,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // brought with it is left alone (row 5) with no stamp invented for it,
           // and a device offering no OOB endpoint at all touches neither (row 6,
           // the `mgmtHost !== undefined` guard) — the receipt simply carries.
-          syncedIpmiHost: takesIpmiHost ? mgmtHost : adoptee.formerlySynced?.syncedIpmiHost
+          syncedIpmiHost: takesIpmiHost ? mgmtHost : adoptee.formerlySynced?.syncedIpmiHost,
+          // FIX 1 — the per-field template stamps for the non-auth fields the
+          // matrix above wrote onto this adoptee, folded into the origin literal
+          // so the auth-branch rebuild (`{ ...adoptionOrigin, syncedAuthProfileId }`)
+          // preserves them, exactly as the update path folds `templateMatrix.templated`
+          // into `afterOrigin`. Undefined when the source has no proxy/boolean
+          // template winner (the shipped no-template case), which `toEqual` reads
+          // as absent.
+          templated: templateMatrix.templated
         };
         const after: ServerConfig = {
           ...adoptee,
@@ -1815,6 +1870,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           host: endpoint.host,
           port,
           group,
+          // FIX 1 — the non-auth template field VALUES (proxy / multiplexing /
+          // legacyAlgorithms / logSession) the matrix resolved for this adoptee.
+          // AFTER `...adoptee` so a template write overrides the spread; a field
+          // the matrix left alone (rows 2/4/5/6/7) is absent here and the spread's
+          // value stands.
+          ...templateMatrix.values,
           origin: adoptionOrigin,
           // MUTUALLY EXCLUSIVE WITH `origin` — and EXPLICIT, because the spread
           // above would otherwise carry the marker onto a now-owned server. A
@@ -1876,9 +1937,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // already restored the receipt, so the ordinary update path reads the
         // opt-out from the origin on the next sync without needing the marker
         // that adoption spends.
-        if (qualifiesForSourceProfileRetroApply(adoptee, resolvedProfileId, source.defaultUsername)) {
-          after.authProfileId = resolvedProfileId;
-          after.origin = { ...adoptionOrigin, syncedAuthProfileId: resolvedProfileId };
+        //
+        // FIX 1 (PR #61 Codex review) — the AUTH WINNER is now the CASCADE
+        // winner's resolved id (`winnerResolvedId`), not the source-level
+        // `resolvedProfileId`, so an explicit template auth rule beats the implicit
+        // source rule at adoption exactly as it does on the add/update paths (they
+        // both write `winnerResolvedId` / consume `effectiveAuthWinner`). Only the
+        // INPUT changed — the eligibility is still the six-clause FILL predicate,
+        // unweakened: an adoptee is a kept server with NO origin, so the update
+        // path's OVERRIDE MOVE (which keys on `origin.syncedAuthProfileId ===
+        // authProfileId`) is structurally unreachable for it here too, and its
+        // deferral to the first owned sync is the same one-sync delay the AUTH 2b
+        // rollback note below relies on. `winnerResolvedId` equals
+        // `resolvedProfileId` when no explicit rule sets auth, so a template-less
+        // adoption links exactly what it did before. Keyless winners are already
+        // dropped from `winnerResolvedId`, so a keyless profile stamps no link.
+        if (qualifiesForSourceProfileRetroApply(adoptee, winnerResolvedId, source.defaultUsername)) {
+          after.authProfileId = winnerResolvedId;
+          after.origin = { ...adoptionOrigin, syncedAuthProfileId: winnerResolvedId };
         }
         // No `changed` comparison, unlike the owned-update path above: gaining
         // `origin` guarantees before !== after, so an adoption is ALWAYS an
@@ -2351,6 +2427,84 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
   if (source.targetFolder) {
     folderSet.add(source.targetFolder);
+  }
+
+  // FIX 2 (PR #61 Codex review) — POST-PLAN jump-host survivor validation. The
+  // §5.3 dangling check that ran during composition used the OPTIMISTIC
+  // `liveServerIds`, which admits a jump host this plan prunes under `delete`
+  // policy or a device the loop skipped — so the plan could write a template
+  // proxy pointing at a server that will NOT exist after apply. The definitive
+  // survivor set is only knowable HERE, once prune and per-device skip decisions
+  // are all made.
+  //
+  // SURVIVORS — the ids that exist after apply, read off the plan structures
+  // `planToApplication` itself consumes: `prunes` with `policy: "delete"` are the
+  // only servers actually removed (orphan/keep survive in place, and are re-added
+  // to `upsertServers`), so a current server survives unless it is a delete-prune;
+  // every `adds[].id` is a fresh survivor; and an ADOPTED server is a kept server
+  // already in `currentServers` that this run turned into an update, never a
+  // prune, so its id is already covered by "current minus deletes" — listed in
+  // the comment for completeness, needing no separate collection.
+  const deletedServerIds = new Set(prunes.filter((p) => p.policy === "delete").map((p) => p.server.id));
+  const survivorIds = new Set<string>();
+  for (const s of currentServers) {
+    if (!deletedServerIds.has(s.id)) {
+      survivorIds.add(s.id);
+    }
+  }
+  for (const a of adds) {
+    survivorIds.add(a.id);
+  }
+  // Only THIS run's template proxy is re-validated. `desiredNonAuth.proxy` is the
+  // single (device-independent, T1) proxy winner this run's cascade produced; if
+  // there is none, no field the template wrote this run can dangle, so a proxy an
+  // earlier run's template left behind (§6.3 retained, row-5 carry) is left
+  // entirely alone. When it IS an ssh reference whose jump host is not a survivor,
+  // walk `adds` and the `updates` afters and drop it from every record the
+  // template actually OWNS this run — guarded on the record's `origin.templated.proxy`
+  // stamp matching the written proxy, so a hand-set or previously-stamped proxy
+  // the template did not touch is never disturbed. Dropping means the field goes
+  // ABSENT (never a written `undefined`), and the stamp goes with it so the record
+  // and its ownership receipt stay consistent. The self-reference case is handled
+  // inline per-device (the jump host is the record itself, hence a survivor).
+  const desiredProxy = desiredNonAuth.proxy;
+  if (desiredProxy !== undefined && desiredProxy.value.type === "ssh" && !survivorIds.has(desiredProxy.value.jumpHostId)) {
+    const danglingJumpHostId = desiredProxy.value.jumpHostId;
+    let droppedAny = false;
+    const dropTemplateProxy = (record: ServerConfig): void => {
+      const p = record.proxy;
+      const stampedProxy = record.origin?.templated?.proxy;
+      if (
+        p === undefined ||
+        p.type !== "ssh" ||
+        p.jumpHostId !== danglingJumpHostId ||
+        stampedProxy === undefined ||
+        !proxyConfigsEqual(p, stampedProxy)
+      ) {
+        return; // not a proxy THIS run's template owns on this record — leave alone
+      }
+      delete record.proxy;
+      const origin = record.origin;
+      if (origin?.templated !== undefined) {
+        const templated = { ...origin.templated };
+        delete templated.proxy;
+        const stillStamped =
+          templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
+        record.origin = { ...origin, templated: stillStamped ? templated : undefined };
+      }
+      droppedAny = true;
+    };
+    for (const a of adds) {
+      dropTemplateProxy(a);
+    }
+    for (const u of updates) {
+      dropTemplateProxy(u.after);
+    }
+    if (droppedAny) {
+      warnings.push(
+        `Device template "${cascade.proxyTemplateName ?? "?"}" on "${source.name}" sets a jump-host proxy whose jump host will not survive this sync (it is being pruned, or its device was skipped) — the proxy field was not applied.`
+      );
+    }
   }
 
   const hiddenPruneCount = prunes.filter((p) => p.server.isHidden).length;
