@@ -113,6 +113,29 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
   WebviewFormPanel.open(formId, definition, {
     onSubmit: async (values) => {
       const template = parseDeviceTemplateFormValues(values, seed?.id);
+      // MECHANISM 2 (P2 #4, PR #62 Codex round 1) — resolve a submitted
+      // `authProfileId` against LIVE core immediately before persisting. The
+      // profile-deletion sweep (`removeAuthProfile`) only clears the link off
+      // templates that ALREADY reference the profile — it cannot reach the link
+      // this Save is about to write for the FIRST time (or newly point at a
+      // different profile). So a profile deleted while this editor sat open
+      // would otherwise be persisted as a dangling `fields.authProfileId` that
+      // §5.3 reference-validation later drops with a warning at apply time —
+      // silent to the author. No `await` separates this resolve from the
+      // `addOrUpdateDeviceTemplate` below, so on the extension host's single
+      // thread nothing can interleave between them. `authProfileId` is the only
+      // templatable field that carries a cross-record reference resolved here;
+      // `proxy.jumpHostId` is validated at apply time (§5.3) against the target
+      // fleet, not against a single form. Throwing routes through
+      // WebviewFormPanel's submit try/catch, which keeps the editor open with
+      // the message — exactly like `readTemplateField`'s "no value" reject.
+      const linkedAuthProfileId = template.fields.authProfileId?.value;
+      if (linkedAuthProfileId !== undefined && ctx.core.getAuthProfile(linkedAuthProfileId) === undefined) {
+        throw new Error(
+          "The selected auth profile no longer exists — it was deleted while this editor was open. " +
+            'Choose another auth profile, or set the Auth Profile field\'s mode to "Not set".'
+        );
+      }
       await ctx.core.addOrUpdateDeviceTemplate(template);
       // U1 (§6.1 UX-S8) — the VERBATIM save toast (single "saved." wording, not a
       // created/updated split), telling the user the edit takes effect on each
@@ -401,6 +424,16 @@ export function registerDeviceTemplateCommands(ctx: CommandContext): vscode.Disp
         void vscode.window.showInformationMessage("No servers in this folder.");
         return;
       }
+      // MECHANISM 1 (P1 #1, PR #62 Codex round 1) — the revision of the template
+      // the modal below is rendered from, captured before the unbounded modal
+      // wait. `revision` is minted fresh on every `addOrUpdateDeviceTemplate`, so
+      // it is the ONLY signal that distinguishes a value-only in-place edit
+      // (override proxy host A→B, a boolean flip) from no edit at all: such an
+      // edit keeps the field set, the modes and the per-field counts identical,
+      // so `buildConsentModalDetail` renders byte-for-byte the same text and the
+      // detail comparator below waves it through — while the recomputed plan
+      // would write values the user never saw disclosed.
+      const pickedRevision = template.revision;
       const previewPlan = planFor(ctx, template, servers);
       // P7 — a headline naming the template + folder in `message`, the per-field
       // plan lines + `plan.warnings` (U2) in `detail`. `shownDetail` is captured
@@ -438,6 +471,19 @@ export function registerDeviceTemplateCommands(ctx: CommandContext): vscode.Disp
               refusal =
                 `The template was deleted while the confirmation was open — nothing was applied. ` +
                 "Run Apply Device Template again to review what it would apply now.";
+              return;
+            }
+            // MECHANISM 1 (P1 #1) — the value-only-edit guard the detail
+            // comparator below cannot be: `revision` changes on every save, so a
+            // template edited in place while this modal sat open (its fields,
+            // modes and counts unchanged, hence its `buildConsentModalDetail`
+            // identical) is caught HERE and nowhere else. Placed before the
+            // server-set and detail guards, which catch orthogonal drift (folder
+            // membership; target-value changes that DO alter the rendered plan).
+            if (live.revision !== pickedRevision) {
+              refusal =
+                `The device template "${template.name}" was edited while the confirmation was open — nothing was applied. ` +
+                "Run Apply Device Template again to review the current plan.";
               return;
             }
             const current = serversInFolder(ctx, folderPath);

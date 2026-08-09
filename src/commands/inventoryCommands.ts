@@ -961,6 +961,44 @@ function inventoryAuthProfileRejection(
 }
 
 /**
+ * MECHANISM 2 (P2 #3, PR #62 Codex round 1) — the template-side twin of
+ * `inventoryAuthProfileRejection`: re-resolve a SUBMITTED catch-all rule's
+ * `templateId` against LIVE core inside the persistence critical section, and
+ * refuse a selection that vanished while the source form sat open.
+ *
+ * WHY THE DELETION SWEEP DOES NOT COVER THIS. `removeDeviceTemplate` clears
+ * referencing rules from sources that ALREADY persist them (and re-revisions
+ * those sources, which trips the ITEM 4 `sourceConfigUnchanged` guard on an
+ * open Edit form). But a rule this Save is about to write for the FIRST time —
+ * an Add, or an Edit that newly points the catch-all rule at a template — is
+ * not yet in any persisted source, so the sweep cannot reach it. Absent this
+ * check the dangling `templateId` is persisted and then silently skipped by the
+ * sync engine (PR-T1 resolves rules against live templates and drops a missing
+ * one), leaving a source that references nothing with no visible reason.
+ *
+ * `undefined` rules (the read-only fallback was shown, or nothing was
+ * submitted) name nothing NEW to validate — the source keeps its existing
+ * rules untouched (UX-M3), which were valid when written and are swept on
+ * deletion — so this returns `undefined`. Returns a MISSING-style message that
+ * does NOT quote a name, mirroring `MISSING_AUTH_PROFILE_MESSAGE`: the template
+ * is gone, so there is no name left to quote.
+ */
+const MISSING_DEVICE_TEMPLATE_MESSAGE =
+  "The selected device template no longer exists — it was deleted while the form was open. Reopen the source and choose a device template, or set it to (None).";
+
+function submittedTemplateRuleRejection(core: NexusCore, templateRules: readonly TemplateRule[] | undefined): string | undefined {
+  if (templateRules === undefined) {
+    return undefined;
+  }
+  for (const rule of templateRules) {
+    if (core.getDeviceTemplate(rule.templateId) === undefined) {
+      return MISSING_DEVICE_TEMPLATE_MESSAGE;
+    }
+  }
+  return undefined;
+}
+
+/**
  * REVIEW FINDING (P2) — the fallback username a source records. Called by both
  * persist helpers with the profile they just re-resolved (above), i.e. at the
  * exact moment the record is written.
@@ -1182,6 +1220,23 @@ async function persistNewInventorySource(
       throw new Error(authProfileRejection);
     }
 
+    // MECHANISM 2 (P2 #3) — reject a catch-all rule naming a template deleted
+    // while this Add form was open, in the SAME critical section (no `await`
+    // before the persist below). Best-effort rollback of this run's vault
+    // writes, exactly as the auth-profile rejection above: the source is not
+    // created on this path either, so nothing would ever enumerate these keys.
+    const templateRuleRejection = submittedTemplateRuleRejection(core, templateRules);
+    if (templateRuleRejection !== undefined) {
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      throw new Error(templateRuleRejection);
+    }
+
     // ITEM A — stamp the provider's fingerprint at creation time: the user
     // is knowingly configuring against WHICHEVER registrant currently holds
     // `provider.id` right now, so that registrant's observable shape is the
@@ -1357,6 +1412,20 @@ async function persistUpdatedInventorySource(
     if (authProfileRejection !== undefined) {
       await rollbackThisRunsVaultWrites();
       throw new Error(authProfileRejection);
+    }
+
+    // MECHANISM 2 (P2 #3) — reject a submitted catch-all rule whose template was
+    // deleted while this Edit form was open, in the SAME critical section (no
+    // `await` before the persist below). `templateRules` is `undefined` when the
+    // fallback was shown / rules were left untouched, in which case nothing NEW
+    // is referenced and this is a no-op; a source that already referenced the
+    // now-deleted template instead tripped the ITEM 4 guard above (the deletion
+    // sweep re-revisioned it), so this fires only for a rule newly pointed at a
+    // vanished template.
+    const templateRuleRejection = submittedTemplateRuleRejection(core, templateRules);
+    if (templateRuleRejection !== undefined) {
+      await rollbackThisRunsVaultWrites();
+      throw new Error(templateRuleRejection);
     }
 
     // ITEM A — restamp on every save: the user has the form open against
@@ -2226,6 +2295,50 @@ function resolveTemplatesById(core: NexusCore): Map<string, DeviceTemplateProfil
 
 function resolveAuthProfilesById(core: NexusCore): Map<string, AuthProfile> {
   return new Map(core.getSnapshot().authProfiles.map((p) => [p.id, p] as const));
+}
+
+/**
+ * MECHANISM 1 (P1 #2, PR #62 Codex round 1) — a snapshot of the `revision` of
+ * exactly the device templates a source's rules reference, keyed by templateId.
+ * A vanished template maps to `undefined`, which is itself a change worth
+ * catching. Captured at plan-preview time and re-read under the apply lock (see
+ * the two call sites in `syncNow`).
+ *
+ * WHY REVISION AND NOT THE RENDERED PLAN. The confirm modal's drift comparator
+ * (`planDetailDrift`) works off `describePlanDetail`, which renders COUNTS and
+ * identity/auth-switch sets — never the field VALUES a template supplies. A
+ * template edited between preview and confirm to new values that keep the plan's
+ * shape (an override proxy host A→B, a boolean flip) alters the fleet settings
+ * the confirmed plan would write while leaving every rendered line byte-for-byte
+ * identical, so the drift guard waves it through and the apply commits values
+ * the user never previewed. `addOrUpdateDeviceTemplate` mints a fresh `revision`
+ * on every write, so comparing it is the one signal that catches exactly that
+ * value-only edit. Fixed on THIS (sync) side rather than by serializing the
+ * independent template-save command — a source with no template rules snapshots
+ * nothing and behaves exactly as before.
+ */
+function referencedTemplateRevisions(core: NexusCore, source: InventorySourceConfig): Map<string, string | undefined> {
+  const revisions = new Map<string, string | undefined>();
+  for (const rule of source.templateRules ?? []) {
+    revisions.set(rule.templateId, core.getDeviceTemplate(rule.templateId)?.revision);
+  }
+  return revisions;
+}
+
+/** True if any referenced template's revision changed (or the template vanished)
+ *  between the preview snapshot and the in-lock re-read. Both maps are built from
+ *  the same rule set — `sourceConfigUnchanged` has already proven the rules did
+ *  not change — so a per-key comparison is exhaustive. */
+function referencedTemplatesChanged(shown: Map<string, string | undefined>, current: Map<string, string | undefined>): boolean {
+  if (shown.size !== current.size) {
+    return true;
+  }
+  for (const [templateId, revision] of shown) {
+    if (!current.has(templateId) || current.get(templateId) !== revision) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function registerInventoryCommands(
@@ -3815,6 +3928,18 @@ export function registerInventoryCommands(
         // it — so consent is for those pairings, and the drift check below is
         // what keeps either half from being swapped out under it.
         const shownAdoptionPairs = adoptionPairKeys(plan);
+        // MECHANISM 1 (P1 #2) — captured beside the other consent artifacts, at
+        // the same preview this attempt will apply: the revisions of the device
+        // templates this source's rules fold values in from. `shownDetail` above
+        // renders the plan's SHAPE (counts, switch/adoption identities) and
+        // cannot see a template's field values, so a value-only template edit
+        // landing while this modal sits open is invisible to `planDetailDrift`;
+        // re-read under the lock and compared, this revision snapshot is what
+        // aborts such an edit before the confirmed plan writes unseen values.
+        // Re-captured every loop iteration (a legitimate drift-retry re-shows the
+        // modal with the new template values and re-bases this snapshot to match),
+        // so it never false-aborts a change the user has just re-consented to.
+        const shownTemplateRevisions = referencedTemplateRevisions(core, source);
         // The button is keyed on the BUFFER, not on plan.warnings: a retro-apply
         // sync usually carries no engine warnings at all, and without this the
         // one place that names the servers about to switch would be unreachable
@@ -3860,6 +3985,25 @@ export function registerInventoryCommands(
           if (!sourceConfigUnchanged(source, freshSource)) {
             void vscode.window.showErrorMessage(
               `Inventory source "${source.name}" configuration changed while syncing — run Sync Now again.`
+            );
+            return { kind: "abort" };
+          }
+
+          // MECHANISM 1 (P1 #2) — the template-side twin of the source-config
+          // guard just above. `sourceConfigUnchanged` proves the source RECORD
+          // (and thus its `templateRules`) is unchanged; this proves the foreign
+          // DEVICE TEMPLATES those rules fold values in from are unchanged too.
+          // A template edited to new values (proxy host A→B, a boolean flip)
+          // between the preview and this apply keeps the plan's rendered detail
+          // identical, so `planDetailDrift` below cannot see it — but the in-lock
+          // `computeSyncPlan` recompute resolves the LATEST template values and
+          // would write them. Because `sourceConfigUnchanged` has fixed the rule
+          // set, both snapshots reference the same templates. Abort (same idiom
+          // as the source-drift guard) so nothing the user never previewed is
+          // applied; a plain re-run reflects the new values in a fresh preview.
+          if (referencedTemplatesChanged(shownTemplateRevisions, referencedTemplateRevisions(core, freshSource))) {
+            void vscode.window.showErrorMessage(
+              `A device template applied by "${source.name}" changed while the sync preview was open — nothing was applied, run Sync Now again.`
             );
             return { kind: "abort" };
           }

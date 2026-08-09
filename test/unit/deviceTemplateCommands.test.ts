@@ -379,6 +379,58 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
     expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Applied device template"));
   });
 
+  it("1a — ABORTS on a VALUE-ONLY template edit under the open modal (PR #62 Codex round 1, P1 #1)", async () => {
+    // Codex round 1 P1 #1: the existing detail comparator (buildConsentModalDetail)
+    // encodes counts/modes, never field VALUES — so a template edited IN PLACE to a
+    // new value that keeps its fields/modes identical renders the SAME detail and
+    // slips the guard. The revision check is the only thing that catches it.
+    const core = makeCore();
+    const server: ServerConfig = {
+      id: "srv-1",
+      name: "sw",
+      host: "h",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      group: "DC",
+      proxy: P, // { host: 10.0.0.9 } — the pre-existing, undisclosed baseline
+      origin: { sourceId: "src", externalId: "d", templated: { proxy: P } }
+    };
+    await core.addOrUpdateServer(server);
+    // Template proxy OVERRIDE value A (host .2) — what the modal is rendered from.
+    await core.addOrUpdateDeviceTemplate({
+      id: "t1",
+      name: "Reproxy",
+      fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.0.0.2", port: 1080 } } }
+    });
+    register(core);
+    const picked = core.getSnapshot().deviceTemplates[0];
+    mockShowQuickPick.mockResolvedValue({ label: "Reproxy", template: picked });
+    // While the modal is open, edit the template IN PLACE to a value-only change:
+    // proxy override B (host .99). Same field, same mode → buildConsentModalDetail
+    // is byte-identical, so the server-set and detail guards both pass; only the
+    // fresh revision differs.
+    mockShowWarningMessage.mockImplementation(async () => {
+      await core.addOrUpdateDeviceTemplate({
+        id: "t1",
+        name: "Reproxy",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.0.0.99", port: 1080 } } }
+      });
+      return "Apply";
+    });
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    // NOTHING written — the server keeps its baseline proxy P. Against b247d32 the
+    // identical detail passes the guard and B (host .99) is applied as a permanent
+    // hand edit the user never saw.
+    expect(core.getServer("srv-1")!.proxy).toEqual(P);
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
+      expect.stringContaining('The device template "Reproxy" was edited while the confirmation was open — nothing was applied.')
+    );
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Applied device template"));
+  });
+
   it("P6 — the zero-template apply state is a MODAL offering New Device Template", async () => {
     const core = makeCore();
     register(core);
@@ -399,5 +451,37 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
     await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("EMPTY", "EMPTY"));
     expect(mockShowInformationMessage).toHaveBeenCalledWith("No servers in this folder.");
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("2b — template save rejects a vanished auth-profile reference (PR #62 Codex round 1, P2 #4)", () => {
+  it("REJECTS (form kept open) when fields.authProfileId names a profile deleted while the editor was open — nothing persisted", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "prof-1", name: "Prod", username: "svc", authType: "agent" });
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    // The profile is deleted while the editor sits open.
+    await core.removeAuthProfile("prof-1");
+    // onSubmit rejects (WebviewFormPanel surfaces the message and keeps the form
+    // open, exactly like readTemplateField's "no value" reject) and NOTHING is
+    // persisted. Against b247d32 the save writes a template whose
+    // fields.authProfileId dangles — later dropped with a warning at apply time,
+    // silent to the author here.
+    await expect(
+      formPanelOpens[0].options.onSubmit({ name: "Linked", mode_authProfileId: "fill", authProfileId: "prof-1" })
+    ).rejects.toThrow(/auth profile no longer exists/i);
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(0);
+  });
+
+  it("sibling — a LIVE auth-profile id persists normally (guard not over-firing)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "prof-1", name: "Prod", username: "svc", authType: "agent" });
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await formPanelOpens[0].options.onSubmit({ name: "Linked", mode_authProfileId: "fill", authProfileId: "prof-1" });
+    const templates = core.getSnapshot().deviceTemplates;
+    expect(templates).toHaveLength(1);
+    expect(templates[0].fields.authProfileId).toEqual({ mode: "fill", value: "prof-1" });
   });
 });
