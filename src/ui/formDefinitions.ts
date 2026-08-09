@@ -2,6 +2,7 @@ import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, Seria
 import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 import { isCatchAllFilter, templateAppliedFields, type TemplatableField } from "../services/inventory/templateApply";
 import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
@@ -1109,6 +1110,28 @@ function inventoryConfigFieldDescriptor(
       hint: field.description
     };
   }
+  if (field.type === "select") {
+    // PRIMARY-IP FAMILY PREFERENCE (issue #48 PR-E) — a provider-declared enum
+    // rendered as a form select. The stored value seeds the current selection;
+    // when the source predates the field (no stored value), the FIRST option is
+    // the default the form opens on, so a provider ordering `auto` first gets
+    // "auto" for every legacy source — byte-identical to that provider treating
+    // an absent value as its default.
+    const options = field.options ?? [];
+    const existing = existingConfig[field.id];
+    const existingValue = existing !== undefined ? String(existing) : undefined;
+    const value = existingValue !== undefined && options.some((o) => o.value === existingValue)
+      ? existingValue
+      : options[0]?.value ?? "";
+    return {
+      type: "select",
+      key,
+      label: field.label,
+      options,
+      value,
+      hint: field.description
+    };
+  }
   if (field.type === "number") {
     const existing = existingConfig[field.id];
     return {
@@ -1143,6 +1166,54 @@ function inventoryConfigFieldDescriptor(
 /** The source form's "Create new device template…" sentinel (the established
  *  `__create__` convention, §7.1). */
 export const DEVICE_TEMPLATE_CREATE_SENTINEL = "__create__deviceTemplate";
+
+/**
+ * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the provider config-field id the
+ * saved-filter picker fills. NetBox's Device Filter is `filter`; the picker only
+ * renders for a provider that declares a config field with this id, and fills
+ * that field's prefixed form key (`inventoryConfigFieldPrefixedKey("filter")`).
+ */
+export const SAVED_FILTER_TARGET_FIELD_ID = "filter";
+/** The picker's own form key. NOT a persisted source field — `parseSourceFormValues`
+ *  and `formValuesToProviderConfig` never read it, so it is a pure picker whose
+ *  only effect is filling the Device Filter field via autofill. */
+export const SAVED_FILTER_SELECT_KEY = "savedFilter";
+/** "Save current filter as…" — the `__create__` sentinel (formHtml routes any
+ *  option whose value starts with `__create__` to the inline-create handler). */
+export const SAVED_FILTER_SAVE_CURRENT_SENTINEL = "__create__savedFilter";
+
+/**
+ * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the "Saved Filter" picker rendered
+ * directly above the Device Filter field. Reuses PR-F1's filterable select and
+ * the generic autofill seam: picking a saved filter fills the Device Filter field
+ * (`onAutofill` returns `{ [cfg_filter]: definition.filter }`), and the trailing
+ * "Save current filter as…" sentinel routes to `onCreateInline`, which saves the
+ * current Device Filter text as a named definition. Rendered even with zero saved
+ * filters — the empty state is constructive (the "Save current filter as…" row is
+ * always offered), never a dead-end.
+ */
+function savedFilterSelectField(savedFilters: SavedFilterDefinition[] | undefined): FormFieldDescriptor {
+  const list = savedFilters ?? [];
+  return {
+    type: "select",
+    key: SAVED_FILTER_SELECT_KEY,
+    label: "Saved Filter",
+    // Grows with the library — filterable, with (None) pinned top and the save
+    // affordance pinned bottom, same as the auth-profile / device-template selects.
+    filterable: true,
+    autofill: true,
+    options: [
+      { label: "(None)", value: "" },
+      ...list.map((f) => ({ label: f.name, value: f.id, description: f.filter || "(empty filter)" })),
+      { label: "Save current filter as…", value: SAVED_FILTER_SAVE_CURRENT_SENTINEL }
+    ],
+    // Always opens on (None): a source stores its own copy of a filter string, not
+    // a link to a definition, so there is no id to pre-select. This is a
+    // pick-to-fill control, not a stored value.
+    value: "",
+    hint: "Pick a saved filter to fill the Device Filter below, or save the current one for reuse on other sources."
+  };
+}
 
 // §7.2 rung-1 hint, VERBATIM (no cascade vocabulary).
 const DEVICE_TEMPLATE_SOURCE_HINT =
@@ -1277,7 +1348,8 @@ export function inventorySourceFormDefinition(
   seed?: InventorySourceConfig,
   defaultUsernameSeed?: string,
   authProfiles?: AuthProfile[],
-  deviceTemplates?: DeviceTemplateProfile[]
+  deviceTemplates?: DeviceTemplateProfile[],
+  savedFilters?: SavedFilterDefinition[]
 ): FormDefinition {
   const isEdit = Boolean(seed);
   const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
@@ -1404,7 +1476,16 @@ export function inventorySourceFormDefinition(
         value: seed?.prunePolicy ?? "orphan",
         hint: "What should happen when a device disappears from the source."
       },
-      ...provider.configFields.map((field) => inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds))
+      // Provider config fields, with the SAVED FILTER DEFINITIONS (PR-E) picker
+      // interleaved directly above the Device Filter field so the two read as one
+      // control. The picker renders only for a provider that declares a `filter`
+      // config field (NetBox does); other providers get their config fields
+      // unchanged, byte-for-byte.
+      ...provider.configFields.flatMap((field) =>
+        field.id === SAVED_FILTER_TARGET_FIELD_ID
+          ? [savedFilterSelectField(savedFilters), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
+          : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
+      )
     ]
   };
 }

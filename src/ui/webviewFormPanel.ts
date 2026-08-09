@@ -17,7 +17,7 @@ export class WebviewFormPanel {
     private readonly onCancel: () => void,
     private readonly onBrowse?: (key: string) => Promise<string | undefined>,
     private readonly onScan?: (key: string) => Promise<string | undefined>,
-    private readonly onCreateInline?: (key: string) => void,
+    private readonly onCreateInline?: (key: string, values?: FormValues) => void,
     private readonly onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>,
     private readonly onTest?: (values: FormValues) => void | Promise<void>
   ) {
@@ -66,7 +66,7 @@ export class WebviewFormPanel {
         }
       }
       if (message.type === "createInline" && this.onCreateInline) {
-        this.onCreateInline(message.key);
+        this.onCreateInline(message.key, message.values);
       }
       if (message.type === "autofill" && this.onAutofill) {
         const result = await this.onAutofill(message.key, message.value);
@@ -134,7 +134,7 @@ export class WebviewFormPanel {
       onCancel?: () => void;
       onBrowse?: (key: string) => Promise<string | undefined>;
       onScan?: (key: string) => Promise<string | undefined>;
-      onCreateInline?: (key: string) => void;
+      onCreateInline?: (key: string, values?: FormValues) => void;
       onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>;
       onTest?: (values: FormValues) => void | Promise<void>;
     }

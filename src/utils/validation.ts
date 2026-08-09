@@ -10,6 +10,7 @@ import type {
 } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 import { normalizeFolderPath } from "./folderPaths";
 
 function isNonEmptyString(value: unknown): value is string {
@@ -460,6 +461,22 @@ export function validateDeviceTemplate(item: unknown): item is DeviceTemplatePro
     validField(fields.legacyAlgorithms, (v) => typeof v === "boolean") &&
     validField(fields.logSession, (v) => typeof v === "boolean")
   );
+}
+
+/**
+ * SAVED FILTER DEFINITIONS (issue #48 PR-E) — shape guard for a persisted
+ * `SavedFilterDefinition`. Same trust boundary and tolerant disposition as the
+ * other config-store guards: `id`/`name` non-empty strings, `filter` a string
+ * (empty allowed — a saved definition MAY be a catch-all, and the source's own
+ * Device Filter field admits ""). A whole definition is skipped by the storage
+ * getter if this fails — never a partial one.
+ */
+export function validateSavedFilter(item: unknown): item is SavedFilterDefinition {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  return isNonEmptyString(obj.id) && isNonEmptyString(obj.name) && typeof obj.filter === "string";
 }
 
 export function validateTunnelProfile(item: unknown): item is TunnelProfile {

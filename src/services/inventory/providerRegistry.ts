@@ -5,7 +5,7 @@ export interface ProviderRegistration {
   dispose(): void;
 }
 
-const VALID_FIELD_TYPES: ReadonlySet<InventoryConfigFieldType> = new Set(["string", "password", "number", "boolean"]);
+const VALID_FIELD_TYPES: ReadonlySet<InventoryConfigFieldType> = new Set(["string", "password", "number", "boolean", "select"]);
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]*$/i;
 
 /**

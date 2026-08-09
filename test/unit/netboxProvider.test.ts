@@ -119,7 +119,7 @@ describe("createNetboxProvider", () => {
   it("has the expected id and a stable config field order (drives sequential add-source prompts)", () => {
     const provider = createNetboxProvider(vi.fn() as unknown as typeof fetch);
     expect(provider.id).toBe(NETBOX_PROVIDER_ID);
-    expect(provider.configFields.map((f) => f.id)).toEqual(["baseUrl", "apiToken", "filter", "folderTemplate", "includeVms"]);
+    expect(provider.configFields.map((f) => f.id)).toEqual(["baseUrl", "apiToken", "filter", "folderTemplate", "includeVms", "primaryIpFamily"]);
     expect(provider.configFields.find((f) => f.id === "apiToken")?.type).toBe("password");
   });
 
@@ -554,6 +554,86 @@ describe("createNetboxProvider", () => {
 
       expect(tree.devices).toHaveLength(1);
       expect(tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "10.0.1.7", port: 22 }]);
+    });
+
+    /**
+     * PRIMARY-IP FAMILY PREFERENCE (issue #48 PR-E, backlog #3) — the SSH endpoint
+     * address is chosen per the source's `primaryIpFamily` config from the SAME
+     * device row (primary_ip / primary_ip4 / primary_ip6, no new API call). `auto`
+     * is byte-identical to the previous single `primary_ip` read; `prefer-ipv4` /
+     * `prefer-ipv6` read their family field with a fall-back to `primary_ip`.
+     * `oob_ip` is a single field and MUST be unaffected by the preference.
+     */
+    describe("primary-IP family preference (PR-E)", () => {
+      const bothFamilies = {
+        id: 1,
+        name: "dual-stack",
+        primary_ip: { address: "2001:db8::5/64" }, // NetBox's primary_ip yields IPv6 when both exist
+        primary_ip4: { address: "10.0.0.5/24" },
+        primary_ip6: { address: "2001:db8::5/64" },
+        oob_ip: { address: "10.9.9.9/24" }
+      };
+      const fetchOne = (row: unknown) =>
+        vi.fn(async () => makeResponse(200, { count: 1, results: [row] }));
+
+      it("auto (default) takes primary_ip unchanged — byte-identical to pre-PR-E (kills a family read that reroutes the default)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+        expect(tree.devices[0].endpoints).toContainEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
+      });
+
+      it("prefer-ipv4 takes primary_ip4 (kills auto/prefer-ipv6 picking the wrong family)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv4" },
+          { apiToken: "tok" }
+        );
+        expect(tree.devices[0].endpoints).toContainEqual({ kind: "ssh", host: "10.0.0.5", port: 22 });
+        // Must NOT have taken the IPv6 primary_ip.
+        expect(tree.devices[0].endpoints).not.toContainEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
+      });
+
+      it("prefer-ipv6 takes primary_ip6 (kills a fixed primary_ip read)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv6" },
+          { apiToken: "tok" }
+        );
+        expect(tree.devices[0].endpoints).toContainEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
+      });
+
+      it("prefer-ipv4 falls back to primary_ip when the device has only primary_ip (kills a no-fallback impl that drops the endpoint)", async () => {
+        const onlyPrimary = { id: 2, name: "legacy", primary_ip: { address: "10.0.0.7/24" } };
+        const provider = createNetboxProvider(fetchOne(onlyPrimary) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv4" },
+          { apiToken: "tok" }
+        );
+        // The endpoint survives via the primary_ip fallback rather than dropping.
+        expect(tree.devices[0].endpoints).toContainEqual({ kind: "ssh", host: "10.0.0.7", port: 22 });
+        expect(tree.warnings).toEqual([]);
+      });
+
+      it("oob_ip is UNAFFECTED by the family preference across auto/prefer-ipv4/prefer-ipv6 (kills a family-pref that wrongly reroutes oob)", async () => {
+        for (const family of ["auto", "prefer-ipv4", "prefer-ipv6"]) {
+          const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+          const tree = await provider.fetchInventory(
+            { baseUrl: "https://netbox.local", primaryIpFamily: family },
+            { apiToken: "tok" }
+          );
+          // The redfish (oob) endpoint is always the single oob_ip, never a v4/v6 variant.
+          expect(tree.devices[0].endpoints).toContainEqual({ kind: "redfish", host: "10.9.9.9" });
+        }
+      });
+
+      it("an unknown/absent primaryIpFamily degrades to auto (kills a strict parse that drops the endpoint on a legacy source)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "garbage" },
+          { apiToken: "tok" }
+        );
+        expect(tree.devices[0].endpoints).toContainEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
+      });
     });
 
     it("FINDING 1 — throws a protocol error (not a silent drop) when a page contains a null row (kills silently dropping the row while pagination still believes the count was fully collected)", async () => {

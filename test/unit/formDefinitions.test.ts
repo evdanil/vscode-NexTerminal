@@ -6,8 +6,11 @@ import {
   serverFormDefinition,
   tunnelFormDefinition,
   unifiedProfileFormDefinition,
-  unifiedProfileFormId
+  unifiedProfileFormId,
+  SAVED_FILTER_SELECT_KEY,
+  SAVED_FILTER_SAVE_CURRENT_SENTINEL
 } from "../../src/ui/formDefinitions";
+import type { SavedFilterDefinition } from "../../src/models/savedFilter";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
 import type { InventoryProvider, InventorySourceConfig } from "../../src/models/inventory";
 import type { AuthProfile } from "../../src/models/config";
@@ -639,6 +642,114 @@ describe("inventorySourceFormDefinition", () => {
         ).toEqual(expected);
       }
     });
+  });
+});
+
+/**
+ * SAVED FILTER DEFINITIONS (issue #48 PR-E, backlog #1) — the "Saved Filter"
+ * picker rendered directly above the Device Filter field, and the minimal
+ * `select` config-field support the family preference (#3) rides on.
+ */
+describe("inventorySourceFormDefinition — saved-filter picker (PR-E)", () => {
+  const netboxLike: InventoryProvider = {
+    id: "nb",
+    label: "NetBox-like",
+    configFields: [
+      { id: "baseUrl", label: "Base URL", type: "string", required: true },
+      { id: "filter", label: "Device Filter", type: "string" },
+      {
+        id: "primaryIpFamily",
+        label: "Primary IP Family",
+        type: "select",
+        options: [
+          { label: "Automatic", value: "auto" },
+          { label: "Prefer IPv4", value: "prefer-ipv4" },
+          { label: "Prefer IPv6", value: "prefer-ipv6" }
+        ]
+      }
+    ],
+    testConnection: async () => undefined,
+    fetchInventory: async () => ({ nodes: [] }) as never
+  };
+  const noFilterProvider: InventoryProvider = {
+    id: "x",
+    label: "No filter",
+    configFields: [{ id: "baseUrl", label: "Base URL", type: "string", required: true }],
+    testConnection: async () => undefined,
+    fetchInventory: async () => ({ nodes: [] }) as never
+  };
+  const savedFilters: SavedFilterDefinition[] = [
+    { id: "sf1", name: "Syd core", filter: "role=core&site=syd" },
+    { id: "sf2", name: "Edge", filter: "role=edge" }
+  ];
+
+  it("renders the Saved Filter picker directly ABOVE the Device Filter field (kills placing it away from the field it fills)", () => {
+    const definition = inventorySourceFormDefinition(netboxLike, undefined, undefined, [], [], savedFilters);
+    const keys = definition.fields.map((f) => ("key" in f ? f.key : undefined));
+    const pickerIndex = keys.indexOf(SAVED_FILTER_SELECT_KEY);
+    const filterIndex = keys.indexOf("cfg_filter");
+    expect(pickerIndex).toBeGreaterThan(-1);
+    expect(filterIndex).toBeGreaterThan(-1);
+    // Immediately above — the two read as one control.
+    expect(pickerIndex).toBe(filterIndex - 1);
+  });
+
+  it("the picker offers each saved filter plus the save-current sentinel, and is an autofill filterable select", () => {
+    const definition = inventorySourceFormDefinition(netboxLike, undefined, undefined, [], [], savedFilters);
+    const picker = keyedField(definition, SAVED_FILTER_SELECT_KEY);
+    expect(picker.type).toBe("select");
+    const select = picker as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(select.autofill).toBe(true);
+    expect(select.filterable).toBe(true);
+    const values = select.options.map((o) => o.value);
+    expect(values).toContain("");
+    expect(values).toContain("sf1");
+    expect(values).toContain("sf2");
+    expect(values).toContain(SAVED_FILTER_SAVE_CURRENT_SENTINEL);
+  });
+
+  it("renders constructively with ZERO saved filters — still offers the save-current sentinel (kills a dead-end empty state)", () => {
+    const definition = inventorySourceFormDefinition(netboxLike, undefined, undefined, [], [], []);
+    const picker = keyedField(definition, SAVED_FILTER_SELECT_KEY) as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(picker.options.map((o) => o.value)).toContain(SAVED_FILTER_SAVE_CURRENT_SENTINEL);
+  });
+
+  it("does NOT render the picker for a provider with no Device Filter field (kills showing a fill-nothing picker)", () => {
+    const definition = inventorySourceFormDefinition(noFilterProvider, undefined, undefined, [], [], savedFilters);
+    expect(maybeKeyedField(definition, SAVED_FILTER_SELECT_KEY)).toBeUndefined();
+  });
+
+  it("the picker never persists — parse ignores its key; the source stores only its own cfg_filter copy", () => {
+    // The picker is a pure fill control (its key is not a stored source field), so
+    // even a stray value on it changes nothing about what a save would persist.
+    const definition = inventorySourceFormDefinition(netboxLike, undefined, undefined, [], [], savedFilters);
+    const picker = keyedField(definition, SAVED_FILTER_SELECT_KEY) as Extract<FormFieldDescriptor, { type: "select" }>;
+    // Opens on (None) — a source links to no definition, only copies its value.
+    expect(picker.value).toBe("");
+  });
+
+  it("a select config field renders as a form select defaulting to its first option for a source with no stored value", () => {
+    const definition = inventorySourceFormDefinition(netboxLike, undefined, undefined, [], [], []);
+    const family = keyedField(definition, "cfg_primaryIpFamily") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(family.type).toBe("select");
+    expect(family.value).toBe("auto");
+    expect(family.options.map((o) => o.value)).toEqual(["auto", "prefer-ipv4", "prefer-ipv6"]);
+  });
+
+  it("a select config field carries a stored value through on reopen (kills a select that resets to default on edit)", () => {
+    const seed: InventorySourceConfig = {
+      id: "s1",
+      providerId: "nb",
+      name: "S",
+      targetFolder: "",
+      prunePolicy: "orphan",
+      defaultUsername: "u",
+      config: { primaryIpFamily: "prefer-ipv4" },
+      secretFieldIds: []
+    };
+    const definition = inventorySourceFormDefinition(netboxLike, seed, undefined, [], [], []);
+    const family = keyedField(definition, "cfg_primaryIpFamily") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(family.value).toBe("prefer-ipv4");
   });
 });
 

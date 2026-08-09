@@ -56,7 +56,7 @@ export interface InventoryTree {
   truncated?: boolean;
 }
 
-export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean";
+export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
 
 export interface InventoryConfigField {
   id: string;
@@ -65,6 +65,17 @@ export interface InventoryConfigField {
   required?: boolean;
   placeholder?: string;
   description?: string;
+  /**
+   * PRIMARY-IP FAMILY PREFERENCE (issue #48 PR-E, backlog #3) — the closed set of
+   * choices for a `type: "select"` field, in the order the dropdown lists them.
+   * The stored value is the chosen `value`; the provider is responsible for
+   * defaulting an absent/unknown value (a select added to a provider whose older
+   * sources predate the field has no stored value on those sources). Ignored for
+   * every other field type. The value strings are the same non-secret vocabulary
+   * as a string field, so `formValuesToProviderConfig` stores a select exactly as
+   * it stores a string.
+   */
+  options?: { label: string; value: string }[];
 }
 
 export type InventorySourceValues = Record<string, string | number | boolean>; // secrets NEVER here

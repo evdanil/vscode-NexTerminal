@@ -767,7 +767,24 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           setCustomSelectOpen(wrapper, false);
           var trigger = wrapper.querySelector('.custom-select-trigger');
           if (trigger) trigger.focus();
-          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name });
+          // Snapshot current field values so an inline-create handler can act on
+          // what the user has typed (issue #48 PR-E: "Save current filter as…"
+          // needs the current Device Filter text). Same collection the submit
+          // handler uses.
+          var createValues = {};
+          for (var cvi = 0; cvi < form.elements.length; cvi++) {
+            var cvEl = form.elements[cvi];
+            if (cvEl.disabled) continue;
+            if (!cvEl.name) continue;
+            if (cvEl.type === "checkbox") {
+              createValues[cvEl.name] = cvEl.checked;
+            } else if (cvEl.type === "number") {
+              createValues[cvEl.name] = cvEl.value === "" ? undefined : Number(cvEl.value);
+            } else {
+              createValues[cvEl.name] = cvEl.value;
+            }
+          }
+          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: createValues });
           return;
         }
         selectCustomOption(wrapper, value);

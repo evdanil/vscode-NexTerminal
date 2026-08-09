@@ -72,7 +72,15 @@ export type FormMessage =
   | { type: "cancel" }
   | { type: "browse"; key: string }
   | { type: "scan"; key: string }
-  | { type: "createInline"; key: string }
+  /**
+   * `values` (issue #48 PR-E) — a snapshot of the form's current field values at
+   * the moment the "Create new…" sentinel was chosen, so an inline-create handler
+   * can act on what the user has typed so far (the saved-filter "Save current
+   * filter as…" affordance needs the current Device Filter text). Optional and
+   * additive: handlers that only need the `key` (auth profile, device template)
+   * ignore it.
+   */
+  | { type: "createInline"; key: string; values?: FormValues }
   | { type: "autofill"; key: string; value: string }
   | { type: "test"; values: FormValues };
 

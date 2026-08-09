@@ -319,6 +319,11 @@ describe("isValidExport", () => {
     expect(isValidExport(makeExportData({ inventorySources: [makeInventorySource()] }))).toBe(true);
     expect(isValidExport(makeExportData({ inventorySources: "not-an-array" }))).toBe(false);
   });
+
+  it("accepts a valid savedFilters array and rejects a non-array savedFilters (PR-E)", () => {
+    expect(isValidExport(makeExportData({ savedFilters: [{ id: "f1", name: "n", filter: "x=1" }] }))).toBe(true);
+    expect(isValidExport(makeExportData({ savedFilters: "not-an-array" }))).toBe(false);
+  });
 });
 
 describe("SETTINGS_KEYS", () => {
@@ -1954,6 +1959,33 @@ describe("backup import", () => {
     const afterSecondMerge = getMacros();
     expect(afterSecondMerge.map((m) => m.name)).toEqual(["Enable", "Poll", "Reload"]);
     expect(afterSecondMerge[2].id).toBe("file-c");
+  });
+
+  it("SAVED FILTER DEFINITIONS (PR-E) — round-trips through backup import preserving ids and values (kills a bucket that is exported but never imported)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      savedFilters: [
+        { id: "sf1", name: "Syd core", filter: "role=core&site=syd" },
+        { id: "sf2", name: "Edge", filter: "role=edge" }
+      ],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "merge");
+
+    expect(core.getSnapshot().savedFilters).toEqual([
+      { id: "sf1", name: "Syd core", filter: "role=core&site=syd" },
+      { id: "sf2", name: "Edge", filter: "role=edge" }
+    ]);
   });
 
   it("merge still skips by ID, so a macro edited locally is not re-added from the backup as a second copy", async () => {

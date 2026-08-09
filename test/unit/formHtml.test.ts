@@ -1314,15 +1314,18 @@ describe("renderFormHtml — filterable client wiring is present in the emitted 
     // `wrapper.classList.remove('open')` with no trigger focus — stranding
     // focus on the hidden filter input and leaving aria-expanded="true" stale
     // when the inline-create editor was cancelled.
+    // The load-bearing invariant: the __create__ branch closes the dropdown
+    // through setCustomSelectOpen(false) + restores trigger focus before posting.
     expect(html).toContain(
       "if (value && value.indexOf('__create__') === 0) {\n" +
         "          setCustomSelectOpen(wrapper, false);\n" +
         "          var trigger = wrapper.querySelector('.custom-select-trigger');\n" +
-        "          if (trigger) trigger.focus();\n" +
-        "          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name });\n" +
-        "          return;\n" +
-        "        }",
+        "          if (trigger) trigger.focus();\n",
     );
+    // SAVED FILTER DEFINITIONS (issue #48 PR-E) — the create message now carries a
+    // snapshot of the current form values, so "Save current filter as…" can act on
+    // the typed Device Filter text.
+    expect(html).toContain("vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: createValues });");
     // And the discarded bare-remove idiom must be gone entirely (it existed
     // nowhere else in the emitted script).
     expect(html).not.toContain("wrapper.classList.remove('open')");

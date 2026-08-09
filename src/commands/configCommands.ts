@@ -8,6 +8,7 @@ import { cloneTemplatedStamps } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { stripImportedCapabilityFields } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
@@ -41,6 +42,7 @@ import {
   validateLocalShellProfile,
   validateInventorySource,
   validateDeviceTemplate,
+  validateSavedFilter,
   isValidServerOrigin,
   isValidDetachedServerOrigin
 } from "../utils/validation";
@@ -103,6 +105,14 @@ interface NexusConfigExport {
    * workspace. No secrets, so no vault section.
    */
   deviceTemplates?: DeviceTemplateProfile[];
+  /**
+   * SAVED FILTER DEFINITIONS (issue #48 PR-E) — backup-only, EXCLUDED from a
+   * share export like `inventorySources`/`deviceTemplates`: a saved filter is
+   * workspace-specific inventory-import wiring with no meaning in a stranger's
+   * workspace. No secrets, so no vault section — the query string is the same
+   * non-secret data as a source's own Device Filter field.
+   */
+  savedFilters?: SavedFilterDefinition[];
   groups?: string[];
   macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
   /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
@@ -500,6 +510,9 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
     return false;
   }
   if (obj.deviceTemplates !== undefined && !Array.isArray(obj.deviceTemplates)) {
+    return false;
+  }
+  if (obj.savedFilters !== undefined && !Array.isArray(obj.savedFilters)) {
     return false;
   }
   if (
@@ -1292,6 +1305,8 @@ export async function captureBackupStateForExport(
   inventorySourceSecrets: Record<string, Record<string, string>>;
   // DEVICE TEMPLATES (PR-T1) — captured in the same lock; no secrets, so no vault section.
   deviceTemplates: DeviceTemplateProfile[];
+  // SAVED FILTER DEFINITIONS (PR-E) — captured in the same lock; no secrets.
+  savedFilters: SavedFilterDefinition[];
   // FINDING 1 (P2, secrets review) — count of sources for which at least one declared
   // secretFieldId came back empty from vault.get (a locked/unavailable keychain, most
   // commonly). Previously these secrets were just omitted from the bucket with no signal
@@ -1312,6 +1327,7 @@ export async function captureBackupStateForExport(
     const authProfiles = snapshot.authProfiles;
     const inventorySources = snapshot.inventorySources;
     const deviceTemplates = snapshot.deviceTemplates;
+    const savedFilters = snapshot.savedFilters;
 
     const passwords: Record<string, string> = {};
     const passphrases: Record<string, string> = {};
@@ -1356,6 +1372,7 @@ export async function captureBackupStateForExport(
       inventorySources,
       inventorySourceSecrets,
       deviceTemplates,
+      savedFilters,
       sourcesWithMissingSecrets
     };
   });
@@ -1442,6 +1459,7 @@ export function registerConfigCommands(
           authProfiles: captured.authProfiles,
           inventorySources: captured.inventorySources,
           deviceTemplates: captured.deviceTemplates,
+          savedFilters: captured.savedFilters,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
           macroFolders: getMacroFolders(),
@@ -1980,6 +1998,13 @@ export function registerConfigCommands(
       for (const template of snapshot.deviceTemplates) {
         await core.removeDeviceTemplate(template.id);
       }
+      // SAVED FILTER DEFINITIONS (PR-E) — no secrets, no references, so a plain
+      // record drop; deletion here does NOT sweep any source's stored filter
+      // (removeSavedFilter's contract), which is fine in replace mode since every
+      // source is being removed above anyway.
+      for (const filter of snapshot.savedFilters) {
+        await core.removeSavedFilter(filter.id);
+      }
     }
 
     // F14 — merge mode: existing inventory source ids join the existing-id set so
@@ -1995,7 +2020,10 @@ export function registerConfigCommands(
           ...snapshot.inventorySources.map((s) => s.id),
           // DEVICE TEMPLATES (PR-T1) — join the existing-id set so merge mode
           // never silently overwrites a local template with a same-id one.
-          ...snapshot.deviceTemplates.map((t) => t.id)
+          ...snapshot.deviceTemplates.map((t) => t.id),
+          // SAVED FILTER DEFINITIONS (PR-E) — same, so a same-id saved filter is
+          // not silently overwritten in merge mode.
+          ...snapshot.savedFilters.map((f) => f.id)
         ])
       : new Set<string>();
 
@@ -2024,7 +2052,11 @@ export function registerConfigCommands(
     const deviceTemplateTally = await importPreservingIds(data.deviceTemplates, existingIds, validateDeviceTemplate, (e) =>
       core.addOrUpdateDeviceTemplate(e)
     );
-    for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally, deviceTemplateTally]) {
+    // SAVED FILTER DEFINITIONS (PR-E) — imported id-preserving like every other bucket.
+    const savedFilterTally = await importPreservingIds(data.savedFilters, existingIds, validateSavedFilter, (e) =>
+      core.addOrUpdateSavedFilter(e)
+    );
+    for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally, deviceTemplateTally, savedFilterTally]) {
       imported += tally.imported;
       skipped += tally.skipped;
     }
