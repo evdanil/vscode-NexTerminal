@@ -1627,13 +1627,11 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
  * user interaction that was not.
  *
  * A GENUINELY EMPTY SYNC STILL SHOWS NO MODAL: no candidates means no question,
- * so `adoptionCandidateNames` is empty and this reads exactly as the count
+ * so `adoptionCandidates` is empty and this reads exactly as the count
  * check did.
  */
 function planHasNothingToDo(plan: InventorySyncPlan): boolean {
-  return (
-    plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0 && plan.adoptionCandidateNames.length === 0
-  );
+  return plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0 && plan.adoptionCandidates.length === 0;
 }
 
 /**
@@ -1686,7 +1684,48 @@ function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
  * difference anywhere, so the derivation has to be assertable on its own.
  */
 export function adoptionPairKeys(plan: InventorySyncPlan): Set<string> {
-  return new Set(adoptionUpdates(plan).map((u) => `${u.before.id}\u0000${u.after.origin?.externalId ?? ""}`));
+  return new Set(adoptionUpdates(plan).map((u) => adoptionPairKey(u.before.id, u.after.origin?.externalId ?? "")));
+}
+
+/**
+ * The one place the (record, device) pairing is spelled as a string, shared by
+ * both derivations around it (REVIEW FINDING, P1). `adoptionPairKeys` reads the
+ * pairing off an adoption the plan ALREADY MADE; `adoptionCandidateKeys` below
+ * reads the same pairing off a candidate the plan has only OFFERED. The two are
+ * compared against captures taken at different moments of one run, so they must
+ * name a pairing identically — otherwise one guard could pass a key the other
+ * would have failed.
+ */
+function adoptionPairKey(serverId: string, externalId: string): string {
+  return `${serverId}\u0000${externalId}`;
+}
+
+/**
+ * REVIEW FINDING (P1, re-ask when adoption candidates change) — the (adoptee,
+ * device) pairs the plan would OFFER to adopt, in the same key space as
+ * `adoptionPairKeys` above.
+ *
+ * WHY A SECOND DERIVATION EXISTS AT ALL. `adoptionPairKeys` can only see pairs
+ * that became `updates`, which happens on an `"adopt"` run and no other — and
+ * the plan the adoption QUESTION is asked from is by construction computed
+ * BEFORE there is an answer, so its adoption-pair set is empty however many
+ * candidates it carries. These pairs are what the question's consent is about,
+ * and the only shape of that consent available at the moment it is collected.
+ *
+ * The two agree wherever both are defined: on an `"adopt"` run every candidate
+ * becomes an update (syncEngine.ts pushes one unconditionally inside the adopt
+ * branch), so `adoptionCandidateKeys(plan)` and `adoptionPairKeys(plan)` are the
+ * same set. That is not a coincidence to lean on — it is what stops the two
+ * guards built on them from ever disagreeing about what a pairing IS. They still
+ * differ in the only way that matters: WHICH MOMENT each compares against (see
+ * `answeredAdoptionPairs` in syncNow).
+ *
+ * Exported for the same reason `adoptionPairKeys` is: the swaps it exists to
+ * catch are invisible in every rendered artifact, so the derivation has to be
+ * assertable on its own.
+ */
+export function adoptionCandidateKeys(plan: InventorySyncPlan): Set<string> {
+  return new Set(plan.adoptionCandidates.map((c) => adoptionPairKey(c.serverId, c.externalId)));
 }
 
 /** Set equality — the shape every captured-set drift comparison below uses (ids, and adoption pair keys). */
@@ -2989,22 +3028,90 @@ export function registerInventoryCommands(
       // source can ever reclaim its own servers — so "empty" now means "nothing
       // to do and nothing to ask", at both of the fast path's gates.
       let adoptionChoice: InventoryAdoptionChoice | undefined;
-      if (plan.adoptionCandidateNames.length > 0) {
-        const n = plan.adoptionCandidateNames.length;
+      // ADOPT 1 / REVIEW FINDING (P1, re-ask when adoption candidates change) —
+      // the candidate set the question below was PUT ABOUT, captured from the
+      // very plan that raised it. `undefined` while (and only while) no question
+      // has been asked; see `adoptionAnswerIsStale` for what that state means.
+      let answeredAdoptionPairs: ReadonlySet<string> | undefined;
+      /**
+       * REVIEW FINDING (P1, re-ask when adoption candidates change) — "is this
+       * plan still about the candidates the user answered for?", asked of EVERY
+       * plan computed under `adoptionChoice` before that plan is rendered or
+       * applied.
+       *
+       * WHY THE ANSWER NEEDS A GUARD OF ITS OWN, over and above `planDetailDrift`.
+       * The drift comparator's baseline ROLLS FORWARD: it compares the plan about
+       * to be applied against the plan the LAST preview rendered, and on a
+       * mismatch it re-renders and re-bases. That is right for the preview, whose
+       * consent is collected fresh on every pass. The question is not re-put on
+       * any pass, so its consent has one fixed baseline — this set — and the
+       * window it has to cover starts the moment the question is shown, which is
+       * BEFORE the first preview exists. A swap landing in that window (another
+       * source removed with Keep Servers, a config import or backup restore
+       * replacing a kept record) is invisible to every artifact downstream of it:
+       * the preview counts the same number of adoptions, `describePlanDetail`
+       * renders byte-identical text, and the pair list behind Show Warnings —
+       * where the identities do appear — is one click the user need never take.
+       *
+       * SET EQUALITY, not "no new candidates". A candidate that DISAPPEARS is
+       * also a changed question: the count the user weighed ("adopt 4 servers")
+       * is part of what they answered, and a shrunken set means at least one
+       * device they were told would be reclaimed is about to be duplicated or
+       * skipped instead.
+       *
+       * `undefined` means the question was never put, which is not the same as
+       * "no candidates were disclosed" — it is a run with no adoption consent in
+       * it at all. `adoptionChoice` is then `undefined` too, so nothing can be
+       * adopted whatever candidates a later recompute turns up (they render as
+       * duplicate adds — today's accepted behaviour, see the note under the
+       * question block). Refusing there would abort syncs over a set that cannot
+       * be acted on.
+       */
+      const adoptionAnswerIsStale = (candidatePlan: InventorySyncPlan): boolean =>
+        answeredAdoptionPairs !== undefined && !capturedSetsEqual(answeredAdoptionPairs, adoptionCandidateKeys(candidatePlan));
+      /**
+       * ABORT, NOT RE-ASK — the precedent every other "the world moved under a
+       * confirmation" check in this command follows (source removed, config
+       * changed, credentials changed; and `serverAuthProfileRejection` /
+       * `inventoryAuthProfileRejection` outside it). The preview's drift guard
+       * re-shows instead, but it can: it sits in a loop that already exists and
+       * is capped, and the modal it re-shows is the one it just rendered.
+       *
+       * The question has neither. It is deliberately asked ONCE per run and never
+       * while `configMutationLock` is held (see its own doc) — and two of the
+       * three places this guard fires are inside that lock, after teardown has
+       * begun. Re-asking from there would mean unwinding the lock, threading a
+       * second answer back through a plan that has already been previewed, and
+       * capping a second loop that can spin for the same reason the first one
+       * can. Refusing costs the user one re-run of a sync that has changed
+       * nothing, and the next run puts the question about the set that actually
+       * exists.
+       */
+      const reportStaleAdoptionAnswer = (): void => {
+        // States the FACT rather than the moment: this fires from three
+        // different windows (while the question was open, while the preview was,
+        // and during the in-lock awaits), and copy naming any one of them would
+        // be wrong in the other two.
+        void vscode.window.showErrorMessage(
+          `The servers "${source.name}" offered to adopt are no longer the ones you were asked about — sync aborted, run Sync Now again.`
+        );
+      };
+      if (plan.adoptionCandidates.length > 0) {
+        const n = plan.adoptionCandidates.length;
         // Up to three names, `pushSkipSummary`'s precedent (syncEngine.ts) —
         // both the cap and the "e.g." that goes with it. Device names, which is
-        // what the plan carries: at this point the user has not been shown any
-        // pairing yet, and the device list is the half they can recognise from
-        // the inventory they just re-added. The kept servers' own tree names are
-        // named one click away, behind the preview's Show Warnings.
+        // the half of each candidate pair the user can recognise from the
+        // inventory they just re-added: at this point they have not been shown
+        // any pairing yet, and the kept servers' own tree names are named one
+        // click away, behind the preview's Show Warnings.
         //
         // The names sit beside the noun they belong to — "1 device (…)", not
         // "…a server you kept (…)" (NIT): they are DEVICE names, and attached to
         // the nearest noun they read as the tree names of the servers, which is
         // the one pairing the user cannot yet see.
-        const examples = plan.adoptionCandidateNames
+        const examples = plan.adoptionCandidates
           .slice(0, 3)
-          .map((name) => `"${name}"`)
+          .map((candidate) => `"${candidate.deviceName}"`)
           .join(", ");
         // m1/m2 — full sentences, per-count verbs, no bare counts. The first
         // line states the FACT that makes these servers eligible, in the same
@@ -3043,6 +3150,19 @@ export function registerInventoryCommands(
                 "Add Separately leaves those servers untouched and adds each device as a separate new server.",
                 "Nothing changes until you choose Apply on the sync preview."
               ].join("\n");
+        // REVIEW FINDING (P1) — WHAT THE QUESTION IS ABOUT, captured BEFORE the
+        // await that puts it, off the same `plan` object the copy above was
+        // rendered from. Taking it here rather than after the answer comes back
+        // is the whole discipline in one line: it cannot pick up a candidate set
+        // that arrived while the modal was open, which is exactly the set the
+        // answer must never be spent on.
+        //
+        // The full pair set, not the (up to three) names the copy shows: the
+        // question asks the user to hand over a POPULATION it describes by count
+        // and samples, so consent covers all n of them, and a comparison against
+        // the rendered text alone would wave through any swap among the
+        // candidates past the third.
+        answeredAdoptionPairs = adoptionCandidateKeys(plan);
         // Information, not warning: this fork mutates nothing on its own — the
         // preview below still gates the apply. "Adopt Existing" first, since in
         // the scenario this feature exists for (remove with Keep Servers, re-add
@@ -3081,6 +3201,22 @@ export function registerInventoryCommands(
             providerInstanceKey: planInstanceKey,
             adoptionChoice
           });
+          // GUARD SITE 1 of 3 (REVIEW FINDING, P1) — this recompute is the first
+          // consumer of the answer, and the one the finding is about: it reads a
+          // server snapshot taken AFTER the question was answered, so the set it
+          // finds eligible can differ from the set the question named while
+          // reporting the same count. Everything downstream then agrees with
+          // itself and with nothing the user saw — the preview counts n
+          // adoptions, the drift comparator re-bases on those pairs, and Apply
+          // transfers a record, its saved credentials and its future prune
+          // lifecycle to this source without it ever having been mentioned.
+          //
+          // Nothing has been mutated at this point (the fetch is the only work
+          // discarded), exactly as on the dismissal path below.
+          if (adoptionAnswerIsStale(plan)) {
+            reportStaleAdoptionAnswer();
+            return;
+          }
           // NO FAST-PATH RE-ENTRY after this recompute, deliberately. On Adopt
           // the plan carries the adoption, so there is nothing to re-enter for.
           // On Add Separately it CAN come back empty — the restored-backup shape
@@ -3116,7 +3252,15 @@ export function registerInventoryCommands(
       // question was never asked (initial count 0) render as duplicate adds.
       // That is today's behavior, accepted: the run is already under way and
       // re-asking mid-loop would collect an answer to a question the user never
-      // saw the plan for.
+      // saw the plan for. `adoptionAnswerIsStale` deliberately passes them —
+      // there is no answer for them to be stale against, and with
+      // `adoptionChoice` undefined nothing can be adopted whatever turns up.
+      //
+      // Where an answer DOES exist it is checked against the candidate set of
+      // every plan computed under it, at all three of the sites below, and a
+      // change ends the run. That is the other half of "asked once per run": the
+      // question is not re-put, so the set it was put about is fixed for the rest
+      // of the run and a plan about a different set is not this run's to apply.
 
       // FINDING 1 — the post-teardown final recompute (below) can turn up a
       // different plan than the one just reconfirmed (e.g. a concurrent
@@ -3241,6 +3385,21 @@ export function registerInventoryCommands(
             // user through the modal until the mismatch cap aborts the sync.
             adoptionChoice
           });
+          // GUARD SITE 2 of 3 (REVIEW FINDING, P1) — BEFORE the drift check, not
+          // after it, and that order is the point. The drift comparator's verdict
+          // on a changed candidate set is "re-show the preview", which re-bases
+          // its own baseline on the new pairs; the next pass then agrees with
+          // itself and applies a set the question was never put about. Asking the
+          // fixed question here first means a swap that lands while the PREVIEW
+          // is open ends the run instead of laundering itself through one extra
+          // confirmation.
+          //
+          // Nothing has been mutated yet on this path either — the teardown loop
+          // below is the first thing that touches anything.
+          if (adoptionAnswerIsStale(recomputed)) {
+            reportStaleAdoptionAnswer();
+            return { kind: "abort" };
+          }
           const recomputedDrift = planDetailDrift(
             { detail: shownDetail, deleteIds: shownDeleteIds, authSwitchIds: shownAuthSwitchIds, adoptionPairs: shownAdoptionPairs },
             recomputed,
@@ -3349,6 +3508,22 @@ export function registerInventoryCommands(
             // (caught by the drift check just below, but only as a retry).
             adoptionChoice
           });
+          // GUARD SITE 3 of 3 (REVIEW FINDING, P1) — the LAST consumer of the
+          // answer, and the plan that is actually applied. The awaits above it
+          // (the teardown loop, the vault re-read) are a window a candidate swap
+          // can land in like any other.
+          //
+          // On an "adopt" run `finalDrift` below would also notice — candidates
+          // and adoption pairs are the same set there (`adoptionCandidateKeys`)
+          // — but only as a retry, which is the laundering site 2 exists to
+          // close, one loop iteration later. On a DECLINE run nothing else
+          // compares candidates at all: no adoption pairs exist to compare, and a
+          // candidate that stops being one is worth the same rendered counts. The
+          // answer given governs this plan, so this plan is checked against it.
+          if (adoptionAnswerIsStale(finalPlan)) {
+            reportStaleAdoptionAnswer();
+            return { kind: "abort" };
+          }
           const finalApplication = planToApplication(finalPlan, freshSource);
 
           // FINDING 1 — compare the post-teardown final recompute's rendered

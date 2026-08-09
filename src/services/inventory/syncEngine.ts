@@ -49,7 +49,7 @@ export interface ComputeSyncPlanInput {
    * record's whole lifecycle — its name, address, folder, and the source's
    * prune policy, `delete` included — to the source, which is a decision only
    * the user can make. The caller asks once per sync run and feeds the answer to
-   * every recompute; that is also why `adoptionCandidateNames` is computed
+   * every recompute; that is also why `adoptionCandidates` is computed
    * regardless of this answer, since the plan the caller asks FROM is one
    * computed before there is an answer at all.
    */
@@ -135,17 +135,45 @@ export interface InventorySyncPlan {
    */
   manualDuplicateCount: number;
   /**
-   * ADOPT 1 — device names, in tree order, of every adoption CANDIDATE: a
-   * device that matches exactly one eligible kept server.
+   * ADOPT 1 — every adoption CANDIDATE, in tree order: a device that matches
+   * exactly one eligible kept server.
    *
    * Computed REGARDLESS of `adoptionChoice`, because the caller decides whether
    * to put the question to the user from a plan computed BEFORE there is an
    * answer — that is the only plan it has when the question arises. `.length` is
-   * the candidate count; the names exist so the question can name examples
+   * the candidate count; `deviceName` is what the question names examples from
    * (callers cap the render at 3, per `pushSkipSummary`'s precedent). On an
-   * `"adopt"` run these are exactly the devices that became adoptions.
+   * `"adopt"` run these are exactly the pairs that became adoptions.
    */
-  adoptionCandidateNames: string[];
+  adoptionCandidates: InventoryAdoptionCandidate[];
+}
+
+/**
+ * ADOPT 1 / REVIEW FINDING (P1, re-ask when adoption candidates change) — ONE
+ * adoption candidate, named on BOTH halves of the pairing an adoption would
+ * create: the device, and the kept server it would reclaim.
+ *
+ * PAIR-SHAPED for the reason `adoptionPairKeys` (commands/inventoryCommands.ts)
+ * is: the caller captures this set when it puts the adoption question, and an
+ * answer collected for one set must never be applied to another. A count is not
+ * an identity, and neither half alone is either — the same device can come to
+ * claim a different record (a restore or config import replacing the kept
+ * server), and the same record can come to be claimed by a different device (a
+ * restore rewriting its marker). Both swaps keep the count, and the second keeps
+ * the device names the question rendered.
+ *
+ * It carries the candidate as the plan KNOWS it, not as anything renders it —
+ * the caller derives both the question's example names and its captured
+ * comparison key from this one field, so the thing that was disclosed and the
+ * thing that is compared can never come from two different derivations.
+ */
+export interface InventoryAdoptionCandidate {
+  /** The device's name as the fetched tree reports it — the half the question shows. */
+  deviceName: string;
+  /** The device's stable identity in the source — what an adoption stamps as `ServerOrigin.externalId`. */
+  externalId: string;
+  /** `ServerConfig.id` of the kept server this device would reclaim — the record the adoption hands over. */
+  serverId: string;
 }
 
 function joinTargetAndRel(targetFolder: string, rel: string | undefined): string | undefined {
@@ -599,8 +627,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       index.set(kept.externalId, [server]);
     }
   }
-  /** ADOPT 1 — see `InventorySyncPlan.adoptionCandidateNames`. Filled in BOTH modes. */
-  const adoptionCandidateNames: string[] = [];
+  /** ADOPT 1 — see `InventorySyncPlan.adoptionCandidates`. Filled in BOTH modes. */
+  const adoptionCandidates: InventoryAdoptionCandidate[] = [];
   /**
    * REVIEW FINDING (P1, cross-instance adoption) — the two refusal buckets, both
    * aggregated into ONE warning each after the loop rather than one line per
@@ -1180,7 +1208,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // here: `device.externalId` is the index key, and the duplicate-externalId
       // guard earlier in this loop already skips any second device carrying the
       // same id, so one kept server can never be reached twice in one plan.
-      adoptionCandidateNames.push(device.name);
+      //
+      // BOTH HALVES, recorded where both are in hand (REVIEW FINDING, P1): the
+      // adoptee this device resolved to is known right here and nowhere else,
+      // and a caller that had only the name could not tell one candidate set
+      // from another with the same names in it.
+      adoptionCandidates.push({ deviceName: device.name, externalId: device.externalId, serverId: adoptee.id });
       if (adoptKeptServers) {
         // The adopted record: re-stamping plus ordinary source ownership, NEVER
         // a credential copy. `...adoptee` first is the whole field-ownership
@@ -1693,7 +1726,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     warnings,
     hiddenPruneCount,
     manualDuplicateCount,
-    adoptionCandidateNames
+    adoptionCandidates
   };
 }
 

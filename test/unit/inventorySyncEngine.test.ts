@@ -1970,7 +1970,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.manualDuplicateCount).toBe(1);
     expect(plan.warnings).toContain('Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.');
     // And no question is ever raised about it.
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
   });
 
   it("(E-1) flag on: the kept server is UPDATED in place — same id, credentials byte-for-byte, name/host/port/folder from the device, marker cleared (kills the duplicate add, the minted id, and the rebuilt-from-the-add-path record)", () => {
@@ -2027,7 +2027,48 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.manualDuplicateCount).toBe(0);
     expect(plan.unchangedCount).toBe(0);
     expect(plan.warnings.some((w) => w.includes("duplicate"))).toBe(false);
-    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(plan.adoptionCandidates.map((c) => c.deviceName)).toEqual(["core-sw-1"]);
+  });
+
+  it("(E-1c) REVIEW FINDING (P1) — a candidate names BOTH halves of the pairing it offers, each device against ITS OWN adoptee (kills a candidate list of device names alone, which cannot tell one candidate set from another that shares its names, and kills pairing by position in the server list)", () => {
+    // Two devices, two adoptees, and the servers deliberately in the OPPOSITE
+    // order to the tree: a pairing derived from position rather than from the
+    // marker it actually resolved would come out crossed, and every count in
+    // the plan would still be right.
+    const source = makeSource();
+    const secondDevice = makeDevice({ externalId: "device:2", name: "dist-rtr-1", endpoints: [{ kind: "ssh", host: "lab-rtr-01" }] });
+    const secondKept = makeKeptServer({ id: "kept-2", name: "spare-rtr", host: "LAB-RTR-01", formerlySynced: keptMarker({ externalId: "device:2" }) });
+
+    // Computed with NO answer, which is the state the caller asks its question
+    // from — the pairing has to be knowable before anything is adopted, because
+    // that is the moment the consent is collected.
+    const plan = planFor({
+      source,
+      tree: makeTree([keptDevice(), secondDevice]),
+      currentServers: [secondKept, makeKeptServer()],
+      now: 5000
+    });
+
+    expect(plan.adoptionCandidates).toEqual([
+      { deviceName: "core-sw-1", externalId: "device:1", serverId: "kept-1" },
+      { deviceName: "dist-rtr-1", externalId: "device:2", serverId: "kept-2" }
+    ]);
+
+    // And an "adopt" run turns each candidate into the update its own pair
+    // describes — the property the caller's two guards rely on to compare the
+    // same pairing at two different moments without disagreeing.
+    const adopted = planFor({
+      source,
+      tree: makeTree([keptDevice(), secondDevice]),
+      currentServers: [secondKept, makeKeptServer()],
+      now: 5000,
+      adoptionChoice: "adopt"
+    });
+    expect(adopted.adoptionCandidates).toEqual(plan.adoptionCandidates);
+    expect(adopted.updates.map((u) => [u.before.id, u.after.origin?.externalId])).toEqual([
+      ["kept-1", "device:1"],
+      ["kept-2", "device:2"]
+    ]);
   });
 
   it("(E-1b) a kept server ALREADY identical to the device in every source-owned field is still an update — gaining `origin` is the change (kills mirroring the owned path's AUTH 3 `changed` comparison, which would compute the adoption and discard it as 'unchanged')", () => {
@@ -2064,7 +2105,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // whichever way the plan was computed — otherwise the question could never
     // be raised on an unanswered plan, which is the only kind the caller has
     // when it needs to decide.
-    expect(plan.adoptionCandidateNames).toHaveLength(1);
+    expect(plan.adoptionCandidates).toHaveLength(1);
   });
 
   it("(E-2b) NO ANSWER — the question was never asked: both refusals still explain themselves (kills gating this copy on the adopt answer, which is the pre-fix silence: neither shape is a CANDIDATE, so the caller never raises the question for it and the adopt answer can never be given — a re-addressed or double-marked device produced a duplicate with nothing anywhere saying why)", () => {
@@ -2091,7 +2132,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       currentServers: [makeKeptServer({ id: "kept-a", name: "copy-a" }), makeKeptServer({ id: "kept-b", name: "copy-b" })],
       now: 1000
     });
-    expect(ambiguous.adoptionCandidateNames).toHaveLength(0);
+    expect(ambiguous.adoptionCandidates).toHaveLength(0);
     expect(ambiguous.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
       'Device "core-sw-1" matches 2 servers kept from a removed inventory source at lab-sw-01:22 — Nexus cannot tell which to adopt, so it will be added as a duplicate. Cancel, remove the extra copies, then sync again to adopt.',
       // Today's duplicate warning, unchanged, naming the server the
@@ -2130,7 +2171,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     // The question named exactly one device, and it is the only one the answer
     // speaks for: it is duplicated with no adoption commentary of its own.
-    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(plan.adoptionCandidates.map((c) => c.deviceName)).toEqual(["core-sw-1"]);
     expect(plan.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
       'Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.'
     ]);
@@ -2190,7 +2231,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const refused = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [moved], now: 1000, adoptionChoice: "adopt" });
     expect(refused.updates).toHaveLength(0);
     expect(refused.adds).toHaveLength(1);
-    expect(refused.adoptionCandidateNames).toHaveLength(0);
+    expect(refused.adoptionCandidates).toHaveLength(0);
     expect(refused.warnings).toContain(
       'Device "core-sw-1" was previously synced onto server "old-name", but that server is now at 10.9.9.9:22 and the device is at lab-sw-01:22 — it will be added as a new server instead.'
     );
@@ -2206,7 +2247,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const refused = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [otherPort], now: 1000, adoptionChoice: "adopt" });
     expect(refused.updates).toHaveLength(0);
     expect(refused.adds).toHaveLength(1);
-    expect(refused.adoptionCandidateNames).toHaveLength(0);
+    expect(refused.adoptionCandidates).toHaveLength(0);
 
     const twoMoved = [makeKeptServer({ id: "kept-a", name: "copy-a", host: "10.9.9.9" }), makeKeptServer({ id: "kept-b", name: "copy-b", host: "10.9.9.8" })];
     const plural = planFor({ source, tree: makeTree([keptDevice()]), currentServers: twoMoved, now: 1000, adoptionChoice: "adopt" });
@@ -2223,7 +2264,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
     // Not even the mismatch note — this marker is not this source's business at all.
     expect(plan.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
   });
@@ -2255,11 +2296,11 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
     expect(plan.adds[0].id).toBe(ADD_PATH_ID);
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
     // And it is never even OFFERED — an adoption the user could approve is as
     // much a transfer as one that happens by itself, because the question does
     // not say which instance the record came from.
-    expect(plan.adoptionCandidateNames).toEqual([]);
+    expect(plan.adoptionCandidates.map((c) => c.deviceName)).toEqual([]);
 
     // The refusal explains itself, naming BOTH deployments — the one diagnostic
     // that separates "these really are two systems" from "I typed the URL
@@ -2292,7 +2333,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(adopted.adds).toHaveLength(0);
     expect(adopted.updates).toHaveLength(1);
     expect(adopted.updates[0].after.id).toBe("kept-1");
-    expect(adopted.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(adopted.adoptionCandidates.map((c) => c.deviceName)).toEqual(["core-sw-1"]);
 
     // The contrast that makes the assertion above mean something: change ONE
     // character of the instance and the identical fixture stops adopting.
@@ -2325,7 +2366,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     });
     expect(againstKnownInstance.updates).toHaveLength(0);
     expect(againstKnownInstance.adds).toHaveLength(1);
-    expect(againstKnownInstance.adoptionCandidateNames).toHaveLength(0);
+    expect(againstKnownInstance.adoptionCandidates).toHaveLength(0);
 
     // THE KILLER CASE. Both sides absent: a naive equality check matches here
     // and adopts, which is the pre-fix defect reached through a missing field
@@ -2341,7 +2382,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     });
     expect(bothAbsent.updates).toHaveLength(0);
     expect(bothAbsent.adds).toHaveLength(1);
-    expect(bothAbsent.adoptionCandidateNames).toHaveLength(0);
+    expect(bothAbsent.adoptionCandidates).toHaveLength(0);
   });
 
   it("(E-15d) a provider that reports no instance identity gets NO adoption, and the plan says so in the provider's terms rather than the user's (kills falling back to the provider-kind check when instanceKey is unavailable — the decision this feature makes for third-party providers)", () => {
@@ -2363,7 +2404,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
     // Different copy from the mismatch case, because it has a different repair:
     // this one is the provider author's to fix, not the user's, and claiming
     // "a different instance" would assert something Nexus cannot know.
@@ -2473,7 +2514,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       adoptionChoice: "decline"
     });
 
-    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(plan.adoptionCandidates.map((c) => c.deviceName)).toEqual(["core-sw-1"]);
     expect(plan.warnings).toContain(
       `1 device matches a server kept from a removed inventory source of this provider, but that server was synced from "${INSTANCE_B}" rather than this source's "${INSTANCE_A}" — it will be added as a new server instead (e.g. "dist-rtr-1").`
     );
@@ -2490,7 +2531,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
     // It IS still an address collision, so today's duplicate warning fires.
     expect(plan.manualDuplicateCount).toBe(1);
   });
@@ -2505,7 +2546,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
   });
 
   it("(E-6) two kept servers naming the same device at its address: NEITHER is adopted, the device is added as a duplicate, and the warning names the count (kills adopt-the-first-in-array-order, and counting an ambiguous device as a candidate)", () => {
@@ -2530,7 +2571,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     );
     // An all-ambiguous plan must not make the caller ask a question adoption
     // could not act on.
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
   });
 
   it("(E-9) two devices cannot share one kept server: the duplicate-externalId guard skips the second before it ever reaches the match (kills adopting one server twice)", () => {
@@ -2545,7 +2586,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.updates[0].before.id).toBe("kept-1");
     expect(plan.updates[0].after.origin?.externalId).toBe("device:1");
     expect(plan.adds).toHaveLength(0);
-    expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+    expect(plan.adoptionCandidates.map((c) => c.deviceName)).toEqual(["core-sw-1"]);
     expect(plan.warnings.some((w) => w.includes("Duplicate device ID"))).toBe(true);
   });
 
@@ -2662,7 +2703,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.warnings.some((w) => w.includes("already used"))).toBe(true);
     // The candidate bookkeeping sits behind the guard too — a skipped device is
     // not a candidate.
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
   });
 
   it("(E-12) a keyless key profile (AUTH 1b) is not linked onto a kept server either — adoption reads the RESOLVED id, not the matched profile (kills linking an unusable profile through the new branch)", () => {
@@ -2707,7 +2748,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     expect(plan.prunes).toHaveLength(0);
     expect(plan.updates).toHaveLength(0);
-    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    expect(plan.adoptionCandidates).toHaveLength(0);
   });
 
   /**
@@ -3047,7 +3088,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       // The plan the caller decides to ASK from is computed with no answer at all.
       const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000 });
 
-      expect(plan.adoptionCandidateNames).toEqual(["core-sw-1"]);
+      expect(plan.adoptionCandidates.map((c) => c.deviceName)).toEqual(["core-sw-1"]);
       // And nothing has happened yet — no adoption, and above all no add under an
       // id that is already in use.
       expect(plan.updates).toHaveLength(0);
@@ -3064,7 +3105,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
       expect(plan.adds).toHaveLength(0);
       expect(plan.updates).toHaveLength(0);
-      expect(plan.adoptionCandidateNames).toHaveLength(0);
+      expect(plan.adoptionCandidates).toHaveLength(0);
       expect(plan.warnings).toContain(
         'Device "core-sw-1" (device:1) maps to an id already used by unrelated server "someone-elses" — skipped.'
       );
@@ -3088,7 +3129,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
       expect(plan.updates).toHaveLength(0);
       expect(plan.adds).toHaveLength(0);
-      expect(plan.adoptionCandidateNames).toHaveLength(0);
+      expect(plan.adoptionCandidates).toHaveLength(0);
       expect(plan.warnings).toContain(
         'Device "core-sw-1" (device:1) maps to an id already used by unrelated server "someone-elses" — skipped.'
       );
@@ -3109,7 +3150,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
       expect(plan.updates).toHaveLength(0);
       expect(plan.adds).toHaveLength(0);
-      expect(plan.adoptionCandidateNames).toHaveLength(0);
+      expect(plan.adoptionCandidates).toHaveLength(0);
       // The COLLISION is what refuses it, not the ambiguity warning: the guard
       // runs first and its wording is the one the user sees.
       expect(plan.warnings).toContain(
@@ -3157,7 +3198,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
       expect(plan.updates).toHaveLength(0);
       expect(plan.adds).toHaveLength(0);
-      expect(plan.adoptionCandidateNames).toHaveLength(0);
+      expect(plan.adoptionCandidates).toHaveLength(0);
       expect(plan.warnings).toContain(
         'Device "core-sw-1" (device:1) maps to an id already used by unrelated server "old-name" — skipped.'
       );
@@ -3237,7 +3278,7 @@ describe("planToApplication (F19 — no targetFolder parameter)", () => {
       warnings: [],
       hiddenPruneCount: 0,
       manualDuplicateCount: 0,
-      adoptionCandidateNames: []
+      adoptionCandidates: []
     };
 
     const expectedSource = makeSource({ id: "source-1" });
@@ -3269,7 +3310,7 @@ describe("prunedServerIdsForSecretCleanup", () => {
       warnings: [],
       hiddenPruneCount: 0,
       manualDuplicateCount: 0,
-      adoptionCandidateNames: []
+      adoptionCandidates: []
     };
     expect(prunedServerIdsForSecretCleanup(plan)).toEqual(["d1"]);
   });
