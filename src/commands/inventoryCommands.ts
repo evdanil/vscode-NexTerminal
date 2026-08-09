@@ -31,12 +31,14 @@ import {
 import type { SecretVault } from "../services/ssh/contracts";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { configMutationLock } from "../services/configMutationLock";
-import { inventoryConfigFieldPrefixedKey, inventorySourceFormDefinition } from "../ui/formDefinitions";
+import { inventoryConfigFieldPrefixedKey, inventorySourceFormDefinition, resolveSubmittedTemplateRules } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import type { TemplateRule } from "../models/inventory";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { mostCommonUsername } from "./configCommands";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
+import { createInlineDeviceTemplateCreation } from "./inlineDeviceTemplateCreation";
 
 /**
  * F1 — server runtime teardown, injected from extension.ts (mirrors the
@@ -736,6 +738,7 @@ async function parseSourceFormValues(
   return { name, targetFolder, authProfileId, defaultUsername, prunePolicy, config, secrets };
 }
 
+
 /**
  * REVIEW FINDING (P2) — shared by both persist helpers below, which re-resolve
  * the form's selected auth profile against LIVE core state immediately before
@@ -1079,6 +1082,9 @@ export interface NewInventorySourceInput {
   provider: InventoryProvider;
   config: InventorySourceValues;
   secrets: InventorySourceSecrets;
+  /** DEVICE TEMPLATES (PR-T1b) — the catch-all rule (or `[]`) the Device
+   *  Template select resolved to, or `undefined` to store no rules. */
+  templateRules?: TemplateRule[];
 }
 
 /**
@@ -1099,7 +1105,7 @@ async function persistNewInventorySource(
   vault: SecretVault,
   input: NewInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, secrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, secrets, templateRules } = input;
   const id = randomUUID();
   const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
 
@@ -1199,7 +1205,10 @@ async function persistNewInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider)
+      providerFingerprint: computeProviderFingerprint(provider),
+      // DEVICE TEMPLATES (PR-T1b) — a representable select resolved to `[]` or one
+      // catch-all rule; `undefined` (fallback shown / never touched) stores none.
+      ...(templateRules !== undefined ? { templateRules } : {})
     };
 
     // FINDING 1 — if persisting the new source record fails, the vault keys
@@ -1237,6 +1246,10 @@ export interface UpdatedInventorySourceInput {
   config: InventorySourceValues;
   /** Only fields the user actually re-typed this run — a blank/kept field is omitted. */
   reenteredSecrets: InventorySourceSecrets;
+  /** DEVICE TEMPLATES (PR-T1b) — the catch-all rule (or `[]`) the Device
+   *  Template select resolved to, or `undefined` to KEEP the source's existing
+   *  `templateRules` (fallback shown / non-representable). */
+  templateRules?: TemplateRule[];
 }
 
 /**
@@ -1257,7 +1270,7 @@ async function persistUpdatedInventorySource(
   source: InventorySourceConfig,
   input: UpdatedInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, reenteredSecrets, templateRules } = input;
   const existingSecretFieldIds = new Set(source.secretFieldIds);
 
   return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
@@ -1371,7 +1384,13 @@ async function persistUpdatedInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds: newSecretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider)
+      providerFingerprint: computeProviderFingerprint(provider),
+      // DEVICE TEMPLATES (PR-T1b) — a representable select supplies the new rule
+      // list; `undefined` (fallback shown / non-representable) keeps the source's
+      // existing rules, which `...source` above already carried forward. Assigned
+      // explicitly so a representable `[]` (cleared) overwrites, exactly as
+      // `authProfileId` is written unconditionally above.
+      templateRules: templateRules ?? source.templateRules
     };
 
     // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
@@ -2304,13 +2323,17 @@ export function registerInventoryCommands(
       provider,
       undefined,
       mostCommonUsername(snapshot.servers),
-      snapshot.authProfiles
+      snapshot.authProfiles,
+      snapshot.deviceTemplates
     );
     // Same controller/handler triple the server edit form uses
     // (serverCommands.ts) — the only difference is onAutofill's payload: this
     // form mirrors the profile's username into `defaultUsername`, not into
     // `username`/`authType`/`keyPath` (fields it doesn't have).
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    // DEVICE TEMPLATES (PR-T1b) — the source form's "Create new device template…"
+    // affordance, routed to whichever `onCreateInline` key fired.
+    const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
     // REVIEW FINDING (P2) — the profile whose username this form is currently
     // showing, checked against live state at Save by
     // `inventoryAuthProfileRejection`. Seeded as `undefined` and NOT from any
@@ -2332,7 +2355,10 @@ export function registerInventoryCommands(
           prunePolicy: parsed.prunePolicy,
           provider,
           config: parsed.config,
-          secrets: parsed.secrets
+          secrets: parsed.secrets,
+          // No existing rules on an Add — a representable submit either stores
+          // one catch-all rule or none.
+          templateRules: resolveSubmittedTemplateRules(values, undefined)
         });
 
         // F1 — onSubmit resolves as soon as persistence succeeds. The follow-up
@@ -2351,7 +2377,10 @@ export function registerInventoryCommands(
         })();
       },
       onTest: (values) => handleFormTest(values, provider, provider.label),
-      onCreateInline: inlineAuthProfile.handleCreateInline,
+      onCreateInline: (key) => {
+        inlineAuthProfile.handleCreateInline(key);
+        inlineDeviceTemplate.handleCreateInline(key);
+      },
       onAutofill: async (_key, value) => {
         // ONE lookup feeds both: what the form is about to show, and what Save
         // checks that against.
@@ -2361,6 +2390,7 @@ export function registerInventoryCommands(
       }
     });
     inlineAuthProfile.attachPanel(panel);
+    inlineDeviceTemplate.attachPanel(panel);
   }
 
   // `sourceIdArg` mirrors syncNow's: the manage hub (and any future caller
@@ -2491,7 +2521,8 @@ export function registerInventoryCommands(
     // seeded `source.authProfileId` survives sanitization, so a stale list
     // would render a real link as `(None)` and quietly drop it on Save.
     const authProfiles = core.getSnapshot().authProfiles;
-    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles);
+    const deviceTemplates = core.getSnapshot().deviceTemplates;
+    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles, deviceTemplates);
     // REVIEW FINDING (P2) — as addSource's, but seeded: this form opens already
     // showing the LINKED profile's username in Default SSH Username, locked
     // (`inventorySourceFormDefinition`'s render rule), so on Edit "rendered"
@@ -2509,6 +2540,7 @@ export function registerInventoryCommands(
     // record, so nothing this controller does can race the edit it is nested
     // in. The marker machinery below is untouched by this wiring.
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
     try {
       // F6 — WebviewFormPanel.open can throw synchronously (or reject — see
@@ -2543,7 +2575,11 @@ export function registerInventoryCommands(
               prunePolicy: parsed.prunePolicy,
               provider,
               config: parsed.config,
-              reenteredSecrets: parsed.secrets
+              reenteredSecrets: parsed.secrets,
+              // Representable submit → new rule list; fallback shown → undefined
+              // keeps `source.templateRules` untouched (a filtered/multi-rule set
+              // the select never rendered), byte-for-byte (UX-M3).
+              templateRules: resolveSubmittedTemplateRules(values, source.templateRules)
             });
 
             const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
@@ -2602,7 +2638,10 @@ export function registerInventoryCommands(
           return submitPromise;
         },
         onTest: (values) => handleFormTest(values, provider, source.name, source),
-        onCreateInline: inlineAuthProfile.handleCreateInline,
+        onCreateInline: (key) => {
+          inlineAuthProfile.handleCreateInline(key);
+          inlineDeviceTemplate.handleCreateInline(key);
+        },
         onAutofill: async (_key, value) => {
           // ONE lookup feeds both — see addSource's copy.
           const profile = core.getAuthProfile(value);
@@ -2616,6 +2655,7 @@ export function registerInventoryCommands(
     }
     panel.onDidDispose(releaseInFlight);
     inlineAuthProfile.attachPanel(panel);
+    inlineDeviceTemplate.attachPanel(panel);
   }
 
   /** `sourceIdArg` as in editSource/syncNow — see editSource's note. */

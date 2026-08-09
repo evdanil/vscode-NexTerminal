@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import { authProfileOwnedCredentials, resolveSerialProfileMode, type ActiveLocalShellSession, type ActiveSerialSession, type ActiveSession, type AuthProfile, type LocalShellProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
+import { templateAppliedFields, TEMPLATE_FIELD_SHORT_LABELS } from "../services/inventory/templateApply";
 import { toParityCode } from "../utils/helpers";
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
@@ -77,7 +78,15 @@ export class ServerTreeItem extends vscode.TreeItem {
     // on the IPMI line; shown only when the line itself is (a server with a host).
     const ipmiAuthSuffix = ipmiAuthProfileName ? ` [auth: ${ipmiAuthProfileName}]` : "";
     const ipmiSuffix = typeof server.ipmiHost === "string" && server.ipmiHost.trim() ? `\nIPMI/BMC: ${server.ipmiHost.trim()}${ipmiAuthSuffix}` : "";
-    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${syncedSuffix}`;
+    // §7.3 (UX-S12) — one summary line naming the fields still carrying a
+    // template value (cur === stamp), via the shared short-label map. Derived
+    // purely from record + origin; a hand-edited field drops out, which is the
+    // "your edits override" signal. Empty ⇒ no line at all.
+    const applied = templateAppliedFields(server);
+    const templateSuffix = applied.length > 0
+      ? `\nTemplate-applied: ${applied.map((f) => TEMPLATE_FIELD_SHORT_LABELS[f]).join(", ")} (your edits override)`
+      : "";
+    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";

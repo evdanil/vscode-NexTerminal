@@ -64,6 +64,7 @@ import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
+import { registerDeviceTemplateCommands } from "./commands/deviceTemplateCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
 import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
@@ -1225,6 +1226,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
+  const deviceTemplateDisposables = registerDeviceTemplateCommands(ctx);
   // F1 — same objects nexus.server.remove tears down with (ctx carries core/tunnelManager/sshPool).
   const inventoryTeardown: InventoryRuntimeTeardown = {
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
@@ -1316,6 +1318,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,
+    ...deviceTemplateDisposables,
     ...inventoryDisposables,
     ...configDisposables,
     ...macroDisposables,
