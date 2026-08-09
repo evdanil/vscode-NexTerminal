@@ -1848,7 +1848,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const source = makeSource();
     // Identical to the canonical fixture in every respect EXCEPT the marker.
     const handMade = makeKeptServer({ formerlySynced: undefined });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [handMade], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [handMade], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -1869,7 +1869,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       tree: makeTree([keptDevice({ folderPath: "Syd/R1" })]),
       currentServers: [kept],
       now: 5000,
-      adoptKeptServers: true
+      adoptionChoice: "adopt"
     });
 
     // The count+id pair IS the test. A duplicate-add implementation leaves the
@@ -1915,7 +1915,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // to avoid is neither added nor resolved.
     const source = makeSource();
     const kept = makeKeptServer({ name: "core-sw-1", host: "lab-sw-01", port: 22, group: "NetBox" });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.unchangedCount).toBe(0);
     expect(plan.adds).toHaveLength(0);
@@ -1924,7 +1924,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.updates[0].after.origin?.sourceId).toBe("source-1");
   });
 
-  it("(E-2) flag omitted: today's behavior bit-for-bit — a duplicate add with the verbatim warning — yet the candidate list is still populated (kills a default-true flag, and a candidate list computed only when the flag is on)", () => {
+  it("(E-2) no answer supplied: today's PLAN bit-for-bit — a duplicate add with the verbatim warning — yet the candidate list is still populated (kills a default-adopt answer, and a candidate list computed only for an adopting run)", () => {
     const source = makeSource();
     const kept = makeKeptServer();
     const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000 });
@@ -1934,38 +1934,79 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.updates).toHaveLength(0);
     expect(plan.manualDuplicateCount).toBe(1);
     expect(plan.warnings).toContain('Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.');
-    // No mismatch/ambiguity copy leaks into a flag-off run.
+    // A CANDIDATE is never explained away: the two refusal warnings are about
+    // matches adoption could not take, and this one it can.
     expect(plan.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
+    expect(plan.warnings.some((w) => w.includes("cannot tell which to adopt"))).toBe(false);
     // The caller decides whether to ASK from this list, so it must be computed
     // whichever way the plan was computed — otherwise the question could never
-    // be raised on a flag-off plan, which is the only kind the caller has when
-    // it needs to decide.
+    // be raised on an unanswered plan, which is the only kind the caller has
+    // when it needs to decide.
     expect(plan.adoptionCandidateNames).toHaveLength(1);
   });
 
-  it("(E-2b) flag off: NEITHER new warning is emitted, for a re-addressed kept server or an ambiguous one — a run that never asked the question says nothing about adoption (kills the new copy leaking into a no-question run, where it would also drift the preview text against the recompute)", () => {
+  it("(E-2b) NO ANSWER — the question was never asked: both refusals still explain themselves (kills gating this copy on the adopt answer, which is the pre-fix silence: neither shape is a CANDIDATE, so the caller never raises the question for it and the adopt answer can never be given — a re-addressed or double-marked device produced a duplicate with nothing anywhere saying why)", () => {
     const source = makeSource();
 
-    // Same fixture as E-3's refusal, flag off: the mismatch note explains a
-    // refusal that was never on the table.
+    // Same fixture as E-3's refusal, with no answer supplied: the device moved
+    // while detached, which is the case this whole feature was written for.
     const moved = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [makeKeptServer({ host: "10.9.9.9" })], now: 1000 });
-    expect(moved.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
-    // Bit-for-bit: the endpoint no longer collides, so there is nothing to say at all.
-    expect(moved.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([]);
+    expect(moved.warnings).toContain(
+      'Device "core-sw-1" was previously synced onto server "old-name", but that server is now at 10.9.9.9:22 and the device is at lab-sw-01:22 — it will be added as a new server instead.'
+    );
+    // And it is the ONLY thing said about that device — the address no longer
+    // collides, so today's duplicate warning still correctly stays away.
+    expect(moved.warnings.filter((w) => w.includes("core-sw-1"))).toHaveLength(1);
+    expect(moved.adds).toHaveLength(1);
 
-    // Same fixture as E-6, flag off: the ambiguity note likewise describes a
-    // decision this run never made.
+    // Same fixture as E-6. Two markers naming one device at one address is
+    // reachable through this feature's OWN happy path (Keep Servers → re-add →
+    // Add Separately → apply → remove with Keep Servers again), and it is never
+    // a candidate either, so this run cannot have been asked anything.
     const ambiguous = computeSyncPlan({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [makeKeptServer({ id: "kept-a", name: "copy-a" }), makeKeptServer({ id: "kept-b", name: "copy-b" })],
       now: 1000
     });
+    expect(ambiguous.adoptionCandidateNames).toHaveLength(0);
+    expect(ambiguous.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
+      'Device "core-sw-1" matches 2 servers kept from a removed inventory source at lab-sw-01:22 — Nexus cannot tell which to adopt, so it will be added as a duplicate. Cancel, remove the extra copies, then sync again to adopt.',
+      // Today's duplicate warning, unchanged, naming the server the
+      // single-valued address index names.
+      'Device "core-sw-1" matches existing server "copy-b" (lab-sw-01:22) — will be added as a duplicate.'
+    ]);
+    expect(ambiguous.manualDuplicateCount).toBe(1);
+  });
+
+  it("(E-2c) DECLINED — the user was asked and chose Add Separately: the same two fixtures say NOTHING about adoption (kills emitting the refusals unconditionally, which would explain a refusal to the one user who has just decided on it, on this sync and every sync after it)", () => {
+    const source = makeSource();
+
+    const moved = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [makeKeptServer({ host: "10.9.9.9" })],
+      now: 1000,
+      adoptionChoice: "decline"
+    });
+    expect(moved.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
+    expect(moved.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([]);
+
+    const ambiguous = computeSyncPlan({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [makeKeptServer({ id: "kept-a", name: "copy-a" }), makeKeptServer({ id: "kept-b", name: "copy-b" })],
+      now: 1000,
+      adoptionChoice: "decline"
+    });
     expect(ambiguous.warnings.some((w) => w.includes("cannot tell which to adopt"))).toBe(false);
-    // Only today's duplicate warning, naming the server the single-valued index names.
+    // Only today's duplicate warning survives — declining changes what is SAID,
+    // never what is planned.
     expect(ambiguous.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
       'Device "core-sw-1" matches existing server "copy-b" (lab-sw-01:22) — will be added as a duplicate.'
     ]);
+    expect(ambiguous.adds).toHaveLength(1);
+    expect(ambiguous.updates).toHaveLength(0);
     expect(ambiguous.manualDuplicateCount).toBe(1);
   });
 
@@ -1975,7 +2016,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // Device host upper, kept server host lower — the mirror of E-1's fixture.
     const lowerServer = makeKeptServer({ host: "lab-sw-01" });
     const upperDevice = makeDevice({ endpoints: [{ kind: "ssh", host: "LAB-SW-01" }] });
-    const matched = computeSyncPlan({ source, tree: makeTree([upperDevice]), currentServers: [lowerServer], now: 1000, adoptKeptServers: true });
+    const matched = computeSyncPlan({ source, tree: makeTree([upperDevice]), currentServers: [lowerServer], now: 1000, adoptionChoice: "adopt" });
     expect(matched.adds).toHaveLength(0);
     expect(matched.updates).toHaveLength(1);
     expect(matched.updates[0].before.id).toBe("kept-1");
@@ -1984,7 +2025,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // enough: this is the clause that stops one provider instance's "device:1"
     // from claiming another instance's kept server.
     const moved = makeKeptServer({ host: "10.9.9.9" });
-    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [moved], now: 1000, adoptKeptServers: true });
+    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [moved], now: 1000, adoptionChoice: "adopt" });
     expect(refused.updates).toHaveLength(0);
     expect(refused.adds).toHaveLength(1);
     expect(refused.adoptionCandidateNames).toHaveLength(0);
@@ -2000,13 +2041,13 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     // The device's omitted port defaults to 22 and must not match a kept server on 2222.
     const otherPort = makeKeptServer({ port: 2222 });
-    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [otherPort], now: 1000, adoptKeptServers: true });
+    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [otherPort], now: 1000, adoptionChoice: "adopt" });
     expect(refused.updates).toHaveLength(0);
     expect(refused.adds).toHaveLength(1);
     expect(refused.adoptionCandidateNames).toHaveLength(0);
 
     const twoMoved = [makeKeptServer({ id: "kept-a", name: "copy-a", host: "10.9.9.9" }), makeKeptServer({ id: "kept-b", name: "copy-b", host: "10.9.9.8" })];
-    const plural = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: twoMoved, now: 1000, adoptKeptServers: true });
+    const plural = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: twoMoved, now: 1000, adoptionChoice: "adopt" });
     expect(plural.updates).toHaveLength(0);
     expect(plural.warnings).toContain(
       'Device "core-sw-1" was previously synced onto 2 servers in your list, none of which is still at lab-sw-01:22 — it will be added as a new server instead.'
@@ -2016,7 +2057,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-8) a marker from a DIFFERENT provider is never claimed (kills matching on externalId alone across provider kinds)", () => {
     const source = makeSource({ providerId: "netbox" });
     const kept = makeKeptServer({ formerlySynced: keptMarker({ providerId: "some-other-provider" }) });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -2028,7 +2069,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-8b) a marker naming a DIFFERENT device is never claimed (kills falling back to address matching when the externalId does not match)", () => {
     const source = makeSource();
     const kept = makeKeptServer({ formerlySynced: keptMarker({ externalId: "device:999" }) });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -2043,7 +2084,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       id: "foreign-1",
       origin: { sourceId: "other-source", externalId: "device:1", syncedAt: 1 }
     });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [foreignWithMarker], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [foreignWithMarker], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -2054,13 +2095,22 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const source = makeSource();
     const first = makeKeptServer({ id: "kept-a", name: "copy-a" });
     const second = makeKeptServer({ id: "kept-b", name: "copy-b" });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [first, second], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [first, second], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
     expect(plan.adds[0].id).toBe(ADD_PATH_ID);
     expect(plan.manualDuplicateCount).toBe(1);
-    expect(plan.warnings.some((w) => w.includes("matches 2 servers kept from a previous sync") && w.includes("cannot tell which to adopt"))).toBe(true);
+    // EXACT, not a substring: the sentence has to name the population by the
+    // rule that actually selects it (a REMOVED inventory source of the same
+    // PROVIDER — "a previous sync of this source" was wrong twice over, since
+    // the marker index matches by provider and the source doing the adopting may
+    // be ninety seconds old), and its repair has to be reachable from where the
+    // reader stands — after Apply the device is owned and removing copies
+    // achieves nothing.
+    expect(plan.warnings).toContain(
+      'Device "core-sw-1" matches 2 servers kept from a removed inventory source at lab-sw-01:22 — Nexus cannot tell which to adopt, so it will be added as a duplicate. Cancel, remove the extra copies, then sync again to adopt.'
+    );
     // An all-ambiguous plan must not make the caller ask a question adoption
     // could not act on.
     expect(plan.adoptionCandidateNames).toHaveLength(0);
@@ -2072,7 +2122,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // Same externalId — the marker names exactly one device, so this is the ONLY
     // shape in which two devices could contend for one kept server.
     const tree = makeTree([keptDevice(), keptDevice({ name: "core-sw-2" })]);
-    const plan = computeSyncPlan({ source, tree, currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree, currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(1);
     expect(plan.updates[0].before.id).toBe("kept-1");
@@ -2095,7 +2145,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       currentServers: [kept],
       now: 5000,
       authProfile: profile,
-      adoptKeptServers: true
+      adoptionChoice: "adopt"
     });
     expect(first.updates).toHaveLength(1);
     const adopted = first.updates[0].after;
@@ -2128,7 +2178,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       currentServers: [kept],
       now: 5000,
       authProfile: profile,
-      adoptKeptServers: true
+      adoptionChoice: "adopt"
     });
 
     expect(plan.adds).toHaveLength(0);
@@ -2155,7 +2205,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       currentServers: [kept],
       now: 5000,
       authProfile: profile,
-      adoptKeptServers: true
+      adoptionChoice: "adopt"
     });
 
     expect(plan.updates).toHaveLength(1);
@@ -2168,7 +2218,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-10) a hidden kept server is eligible and stays hidden — isHidden is tree visibility, not identity (kills excluding hidden servers, and un-hiding on adoption)", () => {
     const source = makeSource();
     const kept = makeKeptServer({ isHidden: true });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.adds).toHaveLength(0);
     expect(plan.updates).toHaveLength(1);
@@ -2187,7 +2237,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       tree: makeTree([keptDevice()]),
       currentServers: [collider, kept],
       now: 5000,
-      adoptKeptServers: true
+      adoptionChoice: "adopt"
     });
 
     expect(plan.updates).toHaveLength(0);
@@ -2209,7 +2259,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       currentServers: [kept],
       now: 5000,
       authProfile: keyProfile,
-      adoptKeptServers: true
+      adoptionChoice: "adopt"
     });
 
     expect(plan.updates).toHaveLength(1);
@@ -2223,7 +2273,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-13) planToApplication carries an adoption as an ordinary upsert under the SURVIVING id, and removes nothing (kills any 'adoptions need their own application channel' regression)", () => {
     const source = makeSource();
     const kept = makeKeptServer();
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
     const application = planToApplication(plan, source);
 
     expect(application.upsertServers.map((s) => s.id)).toEqual(["kept-1"]);
@@ -2236,7 +2286,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-14) a kept server whose device is absent from the fetch is NOT pruned — it is nobody's to prune until it is adopted (kills treating markers as ownership)", () => {
     const source = makeSource({ prunePolicy: "delete" });
     const kept = makeKeptServer();
-    const plan = computeSyncPlan({ source, tree: makeTree([]), currentServers: [kept], now: 5000, adoptKeptServers: true });
+    const plan = computeSyncPlan({ source, tree: makeTree([]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.prunes).toHaveLength(0);
     expect(plan.updates).toHaveLength(0);

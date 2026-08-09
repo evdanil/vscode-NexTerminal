@@ -1708,8 +1708,23 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         // nexus.group.rename touching server.group) updates both sides at
         // once and the check would pass despite the change.
         if (!serverConfigsEqual(currentRecord, confirmedSnapshot)) {
+          // Says what happened AND what it cost — "nothing was removed" is the
+          // load-bearing half after a destructive click — then names the next
+          // step's object rather than a bare "try again". Worded identically to
+          // its three siblings in the same refusal family (nexus.tunnel.remove,
+          // nexus.serial.remove, nexus.localShell.remove) and to the auth
+          // profile refusals in commands/authProfileCommands.ts and
+          // ui/authProfileEditorPanel.ts, so the whole family reads as one
+          // system: "<subject> changed while the confirmation was open —
+          // nothing was <verb>. <Next step> again to review …".
+          //
+          // GENERIC by necessity here, more than anywhere else in the family:
+          // this compares the WHOLE record structurally, so "changed" covers a
+          // rename, a port edit, a proxy change, a folder move — naming any one
+          // of them would be a guess.
           void vscode.window.showWarningMessage(
-            `Server "${confirmedSnapshot.name}" changed since the removal was confirmed — try again.`
+            `Server "${confirmedSnapshot.name}" changed while the confirmation was open — nothing was removed. ` +
+              "Remove it again to review the current details."
           );
           return;
         }

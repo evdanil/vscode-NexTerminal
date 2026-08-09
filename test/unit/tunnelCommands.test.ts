@@ -290,7 +290,43 @@ describe("nexus.tunnel.remove — the disclosure is re-checked under the lock (R
     // The pre-fix implementation stops and deletes here regardless.
     expect((await repo.getTunnels()).map((t) => t.id)).toEqual(["t1"]);
     expect(stop).not.toHaveBeenCalled();
-    expect(refusals()).toEqual(['Tunnel "Tunnel 1" changed since the removal was confirmed — try again.']);
+    // Names WHAT changed, not merely that something did: the profile itself is
+    // untouched here, so the generic "Tunnel … changed" this used to emit sent
+    // the user hunting for a rename that never happened.
+    expect(refusals()).toEqual([
+      'Tunnel "Tunnel 1" started running in another window while the confirmation was open — ' +
+        "nothing was removed. Remove it again to review the current details."
+    ]);
+  });
+
+  it("names the OTHER direction of the same flip — the tunnel stopped running elsewhere while the confirmation was open — rather than reusing the started-running sentence (kills hardcoding one direction, and kills falling back to the generic changed refusal)", async () => {
+    const { core, repo, stop } = await fixture([makeTunnel()]);
+    core.registerTunnel(makeActiveTunnel("t1"));
+    // This window believes another one is running it, so the modal carries the
+    // "won't stop the running tunnel" warning.
+    core.setRemoteTunnels([makeRegistryEntry("t1")]);
+
+    const modal = deferred<string>();
+    mockShowWarningMessage.mockReturnValueOnce(modal.promise);
+    const run = removeTunnel("t1");
+    await settle();
+
+    expect(modalCalls()[0][0]).toBe(
+      'Tunnel "Tunnel 1" is running in another window. Removing the profile won\'t stop the running tunnel. Remove anyway?'
+    );
+
+    // The other window closes its tunnel; TunnelRegistrySync's poll clears it.
+    core.setRemoteTunnels([]);
+
+    modal.resolve("Remove");
+    await run;
+
+    expect((await repo.getTunnels()).map((t) => t.id)).toEqual(["t1"]);
+    expect(stop).not.toHaveBeenCalled();
+    expect(refusals()).toEqual([
+      'Tunnel "Tunnel 1" stopped running in another window while the confirmation was open — ' +
+        "nothing was removed. Remove it again to review the current details."
+    ]);
   });
 
   it("refuses when the tunnel was renamed while the confirmation was open, rather than deleting a profile under a name the user never agreed to (kills a presence-only re-check)", async () => {
@@ -311,8 +347,15 @@ describe("nexus.tunnel.remove — the disclosure is re-checked under the lock (R
 
     expect((await repo.getTunnels()).map((t) => t.name)).toEqual(["Prod DB Forward"]);
     expect(stop).not.toHaveBeenCalled();
-    // Quoted by the name the MODAL used, not the new one.
-    expect(refusals()).toEqual(['Tunnel "Tunnel 1" changed since the removal was confirmed — try again.']);
+    // Quoted by the name the MODAL used, not the new one. The GENERIC sentence:
+    // the running-elsewhere clause did not move, so the refusal must not claim
+    // it did — and it stays generic rather than saying "was renamed" because the
+    // check re-renders the whole disclosure and would catch a future third input
+    // this wording could not name.
+    expect(refusals()).toEqual([
+      'Tunnel "Tunnel 1" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
+    ]);
   });
 
   it("reports that the tunnel was already removed, and does not mistake that for a changed disclosure, when it was deleted while the confirmation was open (kills re-rendering the disclosure off a record that is no longer there)", async () => {
@@ -370,6 +413,9 @@ describe("nexus.tunnel.remove — the disclosure is re-checked under the lock (R
 
     expect((await repo.getTunnels()).map((t) => t.name)).toEqual(["Prod DB Forward"]);
     expect(stop).not.toHaveBeenCalled();
-    expect(refusals()).toEqual(['Tunnel "Tunnel 1" changed since the removal was confirmed — try again.']);
+    expect(refusals()).toEqual([
+      'Tunnel "Tunnel 1" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
+    ]);
   });
 });

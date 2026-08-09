@@ -382,12 +382,16 @@ describe("Apply Auth Profile — the disclosure is re-checked and the write re-d
     return Promise.resolve(cmd!(new ServerTreeItem(server)));
   }
 
-  it("names the servers it is about to link with the right number, singular and plural (the disclosure the checks below are compared against)", async () => {
+  it("names the servers it is about to link with the right number AND agrees with itself in the next sentence, singular and plural (the disclosure the checks below are compared against)", async () => {
     const one = await folderFixture([makeServer({ id: "s1", group: "Prod" })]);
     mockShowWarningMessage.mockResolvedValue(undefined); // Cancel — nothing is written.
     await applyToFolder("Prod");
+    // "1 server" … "its credentials". The count phrase was already inflected;
+    // the sentence after it said "their" for one server, which is what this
+    // exact-string assertion pins. A `toContain('1 server')` here would pass
+    // against that bug.
     expect(modalCalls()[0][0]).toBe(
-      'Link "Prod Auth" to 1 server in "Prod"?\nThis links their credentials to the auth profile.'
+      'Link "Prod Auth" to 1 server in "Prod"?\nThis links its credentials to the auth profile.'
     );
     expect(one.core.getServer("s1")?.authProfileId).toBeUndefined();
 

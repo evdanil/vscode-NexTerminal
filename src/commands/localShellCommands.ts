@@ -742,7 +742,22 @@ export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposab
         if (localShellRemovalDisclosure(current.name) !== shownDisclosure) {
           // Quoted by the name the MODAL used, not the current one: that is the
           // profile the user acted on, and a rename is what this catches.
-          refusal = `Local shell profile "${confirmedName}" changed since the removal was confirmed — try again.`;
+          //
+          // Says what happened AND what it cost — "nothing was removed" is the
+          // load-bearing half after a destructive click — then names the next
+          // step's object rather than a bare "try again", matching the refusals
+          // in nexus.authProfile.applyToFolder (commands/authProfileCommands.ts)
+          // and the auth profile editor's delete handler
+          // (ui/authProfileEditorPanel.ts) phrase for phrase.
+          //
+          // Deliberately GENERIC ("changed") rather than "was renamed": the
+          // check re-renders localShellRemovalDisclosure instead of comparing
+          // named fields precisely so a second input added to it is caught for
+          // free, and a refusal naming a rename would start lying the moment
+          // that happens.
+          refusal =
+            `Local shell profile "${confirmedName}" changed while the confirmation was open — ` +
+            "nothing was removed. Remove it again to review the current details.";
           return;
         }
         for (const [sessionId, entry] of ctx.localShellTerminals.entries()) {

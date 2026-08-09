@@ -615,8 +615,12 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
     // Distinct from the already-removed message — the record is present,
     // just no longer the one the user confirmed.
+    // Exact string, not a substring: this refusal is copy the reviewer graded
+    // against its siblings, and a `stringContaining` would pass against the
+    // pre-fix wording that omitted the outcome and the next step's object.
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      expect.stringContaining("changed since the removal was confirmed")
+      'Server "Server 1" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
     );
     expect(vscode.window.showInformationMessage).not.toHaveBeenCalledWith(
       expect.stringContaining("already removed")
@@ -654,8 +658,12 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
+    // Substring on the NEGATIVE side on purpose: an exact string here would go
+    // green again the moment the refusal is reworded, which is the one thing
+    // this assertion must not do. "nothing was removed" is the phrase that makes
+    // it a refusal at all.
     expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
-      expect.stringContaining("changed since the removal was confirmed")
+      expect.stringContaining("nothing was removed")
     );
   });
 
@@ -696,8 +704,12 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).not.toHaveBeenCalled();
     expect(secretDelete).not.toHaveBeenCalled();
     expect(removeServer).not.toHaveBeenCalled();
+    // Exact string, not a substring: this refusal is copy the reviewer graded
+    // against its siblings, and a `stringContaining` would pass against the
+    // pre-fix wording that omitted the outcome and the next step's object.
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      expect.stringContaining("changed since the removal was confirmed")
+      'Server "Server 1" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
     );
   });
 

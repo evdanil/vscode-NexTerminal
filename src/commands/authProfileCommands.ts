@@ -50,9 +50,15 @@ function serversInFolder(ctx: CommandContext, folderPath: string): ServerConfig[
  * too.
  */
 function applyToFolderDisclosure(profileName: string, count: number, folderPath: string): string {
+  // The second sentence agrees with the first: "1 server" takes "its", N take
+  // "their". serverCountPhrase already inflects the count; this sentence used to
+  // say "their" regardless, so a one-server folder read "…to 1 server… This links
+  // their credentials…". Inflected rather than hedged into "its/their", which is
+  // the same "(s)" construction the repo keeps out of user-facing copy.
+  const credentials = count === 1 ? "its credentials" : "their credentials";
   return (
     `Link "${profileName}" to ${serverCountPhrase(count)} in "${folderPath}"?\n` +
-    "This links their credentials to the auth profile."
+    `This links ${credentials} to the auth profile.`
   );
 }
 

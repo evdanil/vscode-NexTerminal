@@ -498,10 +498,12 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       // input that IS rewritten in place.
       const profileId = profile.id;
       const confirmedName = profile.name;
-      const shownDisclosure = tunnelRemovalDisclosure(
-        confirmedName,
-        isTunnelRunningElsewhere(ctx.core, profileId)
-      );
+      // Kept alongside the rendered text, not just folded into it: it is the one
+      // input whose movement the refusal below can NAME, and naming it is the
+      // difference between "go look for a rename that never happened" and "another
+      // window claimed this tunnel".
+      const confirmedRunningElsewhere = isTunnelRunningElsewhere(ctx.core, profileId);
+      const shownDisclosure = tunnelRemovalDisclosure(confirmedName, confirmedRunningElsewhere);
       const confirm = await vscode.window.showWarningMessage(
         shownDisclosure,
         { modal: true },
@@ -552,13 +554,40 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
           alreadyRemoved = `Tunnel "${confirmedName}" was already removed.`;
           return;
         }
-        if (
-          tunnelRemovalDisclosure(current.name, isTunnelRunningElsewhere(ctx.core, profileId)) !==
-          shownDisclosure
-        ) {
+        const runningElsewhereNow = isTunnelRunningElsewhere(ctx.core, profileId);
+        if (tunnelRemovalDisclosure(current.name, runningElsewhereNow) !== shownDisclosure) {
           // Quoted by the name the MODAL used, not the current one: that is the
           // tunnel the user acted on, and a rename is one of the things this catches.
-          refusal = `Tunnel "${confirmedName}" changed since the removal was confirmed — try again.`;
+          //
+          // The running-in-another-window clause gets its OWN sentence, because
+          // the generic one misdirects for it: the profile did not change at all
+          // — its runtime status somewhere else did — so a user told the tunnel
+          // "changed" goes hunting through the profile for an edit that never
+          // happened. This is the same one-refusal-per-cause standard
+          // nexus.authProfile.applyToFolder holds itself to
+          // (commands/authProfileCommands.ts), where a deleted profile, a moved
+          // server set and a renamed profile each get their own sentence rather
+          // than one shared "something changed".
+          //
+          // Named ahead of a simultaneous rename on purpose: a rename only
+          // changes the label, while this clause changes whether removing the
+          // profile leaves a tunnel running — the fact the decision turns on,
+          // and the one the user has no other way to have learned. The trailing
+          // sentence sends them back through the modal, where a rename that
+          // landed in the same window is disclosed anyway.
+          //
+          // The fall-through stays GENERIC ("changed") rather than naming a
+          // rename: tunnelRemovalDisclosure is re-rendered, not field-compared,
+          // precisely so a third input added to it is caught for free — and a
+          // refusal that said "was renamed" would start lying the moment that
+          // happens.
+          refusal =
+            runningElsewhereNow !== confirmedRunningElsewhere
+              ? `Tunnel "${confirmedName}" ${runningElsewhereNow ? "started" : "stopped"} running in ` +
+                "another window while the confirmation was open — nothing was removed. " +
+                "Remove it again to review the current details."
+              : `Tunnel "${confirmedName}" changed while the confirmation was open — nothing was removed. ` +
+                "Remove it again to review the current details.";
           return;
         }
         await stopTunnelByProfile(ctx.core, ctx.tunnelManager, profileId);

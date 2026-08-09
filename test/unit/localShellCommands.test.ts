@@ -787,7 +787,8 @@ describe("nexus.localShell.remove — the disclosure is re-checked under the loc
     expect(dispose).not.toHaveBeenCalled();
     // Quoted by the name the MODAL used, not the new one.
     expect(refusals()).toEqual([
-      'Local shell profile "Dev" changed since the removal was confirmed — try again.'
+      'Local shell profile "Dev" changed while the confirmation was open — ' +
+        "nothing was removed. Remove it again to review the current details."
     ]);
   });
 
@@ -845,7 +846,8 @@ describe("nexus.localShell.remove — the disclosure is re-checked under the loc
     expect((await repo.getLocalShellProfiles()).map((p) => p.name)).toEqual(["Build Box"]);
     expect(dispose).not.toHaveBeenCalled();
     expect(refusals()).toEqual([
-      'Local shell profile "Dev" changed since the removal was confirmed — try again.'
+      'Local shell profile "Dev" changed while the confirmation was open — ' +
+        "nothing was removed. Remove it again to review the current details."
     ]);
   });
 });

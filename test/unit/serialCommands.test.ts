@@ -607,7 +607,8 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
     expect(dispose).not.toHaveBeenCalled();
     // Quoted by the name the MODAL used, not the new one.
     expect(refusals()).toEqual([
-      'Serial profile "USB Console" changed since the removal was confirmed — try again.'
+      'Serial profile "USB Console" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
     ]);
   });
 
@@ -668,7 +669,8 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
     expect((await repo.getSerialProfiles()).map((p) => p.name)).toEqual(["Rack 4 Console"]);
     expect(dispose).not.toHaveBeenCalled();
     expect(refusals()).toEqual([
-      'Serial profile "USB Console" changed since the removal was confirmed — try again.'
+      'Serial profile "USB Console" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
     ]);
   });
 });

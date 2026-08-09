@@ -30,26 +30,51 @@ export interface ComputeSyncPlanInput {
    */
   authProfile?: AuthProfile;
   /**
-   * ADOPT 1 — when true, a planned add whose device matches EXACTLY ONE server
-   * KEPT from a previous sync of this provider becomes an UPDATE of that server
-   * (adoption) instead of a second server beside it. See the eligibility rule in
-   * the device loop; `ServerConfig.formerlySynced` (models/config.ts) is the
-   * marker it reads.
+   * ADOPT 1 — the user's answer to the adoption question, and THREE states
+   * rather than two. See `InventoryAdoptionChoice` for what each one means and
+   * for why "was asked and said no" must not be spelled the same way as "was
+   * never asked" (REVIEW FINDING — the moved-address and ambiguity warnings
+   * were keyed on the old boolean, so the two cases the CHANGELOG promises an
+   * explanation for were exactly the two that got silence).
    *
-   * Default false is today's behavior BIT-FOR-BIT: every host:port collision
-   * renders the existing duplicate warning and increments
-   * `manualDuplicateCount`, and the plan is identical field for field.
+   * Undefined — nobody asked — is today's behavior field for field on the PLAN:
+   * every host:port collision renders the existing duplicate warning and
+   * increments `manualDuplicateCount`, and no record changes ownership. It is
+   * NOT bit-for-bit on `warnings`, deliberately: a marker that matched and could
+   * not be acted on is reported in that state (see the warnings at the end of
+   * the adoption block).
    *
    * The engine NEVER decides this for itself. Adoption hands an existing
    * record's whole lifecycle — its name, address, folder, and the source's
    * prune policy, `delete` included — to the source, which is a decision only
    * the user can make. The caller asks once per sync run and feeds the answer to
    * every recompute; that is also why `adoptionCandidateNames` is computed
-   * regardless of this flag, since the plan the caller asks FROM is one computed
-   * with it off.
+   * regardless of this answer, since the plan the caller asks FROM is one
+   * computed before there is an answer at all.
    */
-  adoptKeptServers?: boolean;
+  adoptionChoice?: InventoryAdoptionChoice;
 }
+
+/**
+ * ADOPT 1 — what the user answered when asked whether this source may reclaim
+ * the servers a previous source of the same provider synced and they kept.
+ *
+ *  - `"adopt"` — reclaim them: a planned add whose device matches EXACTLY ONE
+ *    eligible kept server becomes an UPDATE of that server instead of a second
+ *    server beside it. See the eligibility rule in the device loop;
+ *    `ServerConfig.formerlySynced` (models/config.ts) is the marker it reads.
+ *  - `"decline"` — the user was asked and chose to add the devices separately.
+ *  - `undefined` — the question was never put. Not a synonym for `"decline"`:
+ *    the caller only asks when the plan reports at least one CANDIDATE (a
+ *    device matching exactly one eligible kept server), so a run whose only
+ *    marker matches are ambiguous or re-addressed never raises the question at
+ *    all, and those are precisely the matches whose refusal has to explain
+ *    itself. `"decline"` therefore suppresses that explanation and `undefined`
+ *    does not — the user who has just answered the question does not need to be
+ *    told what they answered it about, and the user who was never asked has no
+ *    other way to find out why they got a duplicate.
+ */
+export type InventoryAdoptionChoice = "adopt" | "decline";
 
 export interface InventorySyncPlan {
   sourceId: string;
@@ -68,8 +93,8 @@ export interface InventorySyncPlan {
   /**
    * FIX 3: how many planned adds collided by host:port with a manual server.
    *
-   * ADOPT 1 — with `adoptKeptServers` on this NARROWS to the collisions adoption
-   * did not take. An adopted server sits at the device's own endpoint by
+   * ADOPT 1 — on an `adoptionChoice: "adopt"` run this NARROWS to the collisions
+   * adoption did not take. An adopted server sits at the device's own endpoint by
    * construction (that is the corroboration rule), so without this narrowing
    * every adoption would ALSO be reported as a duplicate about to be added —
    * describing an add that is not happening.
@@ -79,12 +104,12 @@ export interface InventorySyncPlan {
    * ADOPT 1 — device names, in tree order, of every adoption CANDIDATE: a
    * device that matches exactly one eligible kept server.
    *
-   * Computed REGARDLESS of `adoptKeptServers`, because the caller decides
-   * whether to put the question to the user from a plan computed with the flag
-   * OFF — that is the only plan it has when the question arises. `.length` is
+   * Computed REGARDLESS of `adoptionChoice`, because the caller decides whether
+   * to put the question to the user from a plan computed BEFORE there is an
+   * answer — that is the only plan it has when the question arises. `.length` is
    * the candidate count; the names exist so the question can name examples
-   * (callers cap the render at 3, per `pushSkipSummary`'s precedent). With the
-   * flag ON these are exactly the devices that became adoptions.
+   * (callers cap the render at 3, per `pushSkipSummary`'s precedent). On an
+   * `"adopt"` run these are exactly the devices that became adoptions.
    */
   adoptionCandidateNames: string[];
 }
@@ -267,7 +292,12 @@ function pushSkipSummary(warnings: string[], reason: string, examples: string[])
  * timestamp (and tests get determinism).
  */
 export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan {
-  const { source, tree, currentServers, now, adoptKeptServers = false } = input;
+  const { source, tree, currentServers, now } = input;
+  // ADOPT 1 — the tri-state answer, split into the two questions the loop below
+  // actually asks of it. `adoptionDeclined` is NOT `!adoptKeptServers`: the
+  // third state (never asked) is false for both.
+  const adoptKeptServers = input.adoptionChoice === "adopt";
+  const adoptionDeclined = input.adoptionChoice === "decline";
   const warnings: string[] = [...(tree.warnings ?? [])];
 
   // AUTH 1 — the source names a profile by id; the caller supplies the profile
@@ -897,11 +927,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // box moved and both the source and the user's record moved with it,
     // adoption should still fire. A recorded address would refuse exactly that
     // case.
+    //
+    // THE TWO REFUSAL WARNINGS at the end of this block (ambiguous, and moved
+    // address) fire in EVERY state except `"decline"` — REVIEW FINDING, and the
+    // reason `adoptionChoice` is a tri-state at all. They used to require the
+    // adopt flag, which cannot be set unless the question was asked, which the
+    // caller only asks when the plan reports a CANDIDATE — and neither refusal
+    // is a candidate. So the exact two shapes this copy was written for (the
+    // re-IP'd lab, the accidental second marker) were the two that produced a
+    // silent duplicate set. The two-marker state is reachable through this
+    // feature's own happy path: Keep Servers → re-add → Add Separately → apply →
+    // remove that source with Keep Servers again leaves two markers naming one
+    // device at one address.
     const keptMatches = keptByExternalId.get(device.externalId) ?? [];
     const eligibleForAdoption = keptMatches.filter((s) => s.host.toLowerCase() === endpoint.host.toLowerCase() && s.port === port);
     if (eligibleForAdoption.length === 1) {
       const adoptee = eligibleForAdoption[0];
-      // Recorded in BOTH modes — the flag changes what the plan DOES with a
+      // Recorded whatever the answer — it changes what the plan DOES with a
       // candidate, never whether it is one. Nothing claims/locks the adoptee
       // here: `device.externalId` is the index key, and the duplicate-externalId
       // guard earlier in this loop already skips any second device carrying the
@@ -953,6 +995,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // by the next source of the same provider.
           formerlySynced: undefined
         };
+        // The ONE field outside the source's four that adoption may overwrite,
+        // and the only place the "it keeps its saved credentials" copy could
+        // ever fall short (REVIEW FINDING). Kept as-is deliberately, for the
+        // same reason retro-apply is allowed on an adoptee two lines below: an
+        // adopted server is OWNED from this point, and the ordinary update path
+        // writes `endpoint.username` onto every owned server whose endpoint
+        // supplies one (see the `changed` comparison above), so refusing here
+        // would only defer the identical overwrite to the next sync while
+        // leaving one run where the source does not own a field it owns
+        // everywhere else.
+        //
+        // No shipped provider emits endpoint usernames, so this is unreachable
+        // today; a third-party provider through the public API can reach it. The
+        // disclosure is therefore made where it can be TRUE OF THE ACTUAL PLAN
+        // rather than promised in advance: describePlanDetail derives an extra
+        // preview line from the adoption pairs whose username actually changes,
+        // so the correction reaches the user before Apply, on the plan it
+        // applies to (commands/inventoryCommands.ts).
         if (endpoint.username !== undefined) {
           after.username = endpoint.username;
         }
@@ -983,16 +1043,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // describing an add that is not happening.
         continue;
       }
-    } else if (adoptKeptServers && eligibleForAdoption.length >= 2) {
+    } else if (!adoptionDeclined && eligibleForAdoption.length >= 2) {
       // AMBIGUITY — adopt NEITHER. Records at one endpoint can differ in every
       // credential the endpoint does not show, so picking "the first in array
       // order" would be a guess about which one the user considers canonical.
       // A duplicate add plus an explanation is the safe floor, and the warning
       // says which repair makes adoption possible.
+      //
+      // REVIEW FINDING — the repair only works from a CANCELLED sync. Applied
+      // first, the device is owned from that moment: the adoption block is
+      // unreachable on every later run, so removing the extra copies achieves
+      // nothing and the just-created duplicate has to be deleted as well. The
+      // sentence therefore leads with Cancel rather than describing a repair
+      // that dead-ends for anyone who reads it in the order it is written.
       warnings.push(
-        `Device "${device.name}" matches ${eligibleForAdoption.length} servers kept from a previous sync of this source at ${endpoint.host}:${port} — Nexus cannot tell which to adopt, so it will be added as a duplicate. Remove the extra copies and sync again to adopt.`
+        `Device "${device.name}" matches ${eligibleForAdoption.length} servers kept from a removed inventory source at ${endpoint.host}:${port} — Nexus cannot tell which to adopt, so it will be added as a duplicate. Cancel, remove the extra copies, then sync again to adopt.`
       );
-    } else if (adoptKeptServers && keptMatches.length > 0) {
+    } else if (!adoptionDeclined && keptMatches.length > 0) {
       // Identity matched, address did not. Without this the user sees a silent
       // duplicate and concludes adoption is broken; with it, the refusal states
       // its own reason and the repair is obvious (the addresses are both named).
