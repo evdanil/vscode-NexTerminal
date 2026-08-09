@@ -12,6 +12,7 @@ import type {
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay } from "./proxiedSshConnection";
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
+import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
@@ -208,11 +209,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
     // keychain-store failure must not abort an already-established connection.
     if (storeOnSuccess) {
-      try {
-        await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
-      } catch {
-        /* best-effort — a keychain-store failure must not abort an established connection */
-      }
+      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, storeOnSuccess);
     }
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
@@ -253,15 +250,49 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
     // keychain-store failure must not abort an already-established connection.
     if (storeOnSuccess) {
-      try {
-        await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
-      } catch {
-        /* best-effort — a keychain-store failure must not abort an established connection */
-      }
+      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, storeOnSuccess);
     }
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
+  }
+
+  /**
+   * Store-side twin of `clearStaleProxyPasswordSecretsBeforeApply`
+   * (proxySecretHygiene.ts). The invariant BOTH enforce: never leave a
+   * `proxy-password-{id}` that doesn't match the server's CURRENT authenticated
+   * endpoint — the clear side enforces it on delete, this enforces it on the
+   * deferred store.
+   *
+   * SECURITY (issue #48 PR-T1b / PR #62 Codex round 8) — the deferred store key is
+   * server-id-only, so a concurrent connect that read the OLD server config and
+   * prompted for the OLD proxy's password can reach this post-connect store AFTER a
+   * template apply has already cleared `proxy-password-{id}` and published a NEW
+   * proxy endpoint. Storing unconditionally would repopulate the key with the OLD
+   * endpoint's credential, which the factory would then send to the server's NEW
+   * proxy — the exact leak the pre-apply hygiene prevents, recreated on the store
+   * side. Guard: re-read the live server and store ONLY IF it still names the SAME
+   * authenticated endpoint this connection actually used. A live proxy that is
+   * undefined, a different endpoint, a different type, or ssh/none means the
+   * endpoint changed under us → skip the store (the stale credential must not be
+   * repopulated). Best-effort throughout: a lookup miss or a keychain-store failure
+   * must never abort an already-established connection. `connectionProxy` is
+   * password-bearing socks5/http (we only reach the prompt/store path for a
+   * username-bearing proxy), so `isSameAuthenticatedEndpoint` compares like-for-like.
+   */
+  private async persistProxyPasswordIfEndpointUnchanged(
+    target: ServerConfig,
+    connectionProxy: Socks5Proxy | HttpConnectProxy,
+    storeOnSuccess: { key: string; value: string }
+  ): Promise<void> {
+    try {
+      const live = this.serverLookup(target.id);
+      if (live && isSameAuthenticatedEndpoint(live.proxy, connectionProxy)) {
+        await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
+      }
+    } catch {
+      /* best-effort — a keychain-store failure must not abort an established connection */
+    }
   }
 
   /**
