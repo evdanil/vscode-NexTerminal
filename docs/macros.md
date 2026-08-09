@@ -287,7 +287,7 @@ checked:
 | `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:` — the address only, no `https://` and no path. `[` and `]` only as a whole bracketed IPv6 literal, with an optional port: `[fe80::1]`, `[::ffff:10.0.0.1]`, `[fe80::1]:623` |
 | `${profile.port}` | digits |
 | `${profile.username}` | letters, digits, `.`, `_`, `-`, `@` |
-| `${profile.name}` | anything except `$`, a backtick, `%`, `!`, `~`, `*`, `?`, `[`, `]`, quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `/`, `.`, `^` and accents are fine |
+| `${profile.name}` | anything except `$`, a backtick, `#`, `%`, `!`, `~`, `*`, `?`, `[`, `]`, quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `/`, `.`, `:`, `^` and accents are fine |
 
 No value may contain a `$` or a backtick, in any token. A profile carrying shell
 syntax — which can reach your config through an inventory sync or an imported
@@ -319,13 +319,26 @@ That is why a profile **name** may not contain:
   pathname expansion resolves to a filename with no method call involved.)
 - **`~`** — tilde expansion, for the same reason in one character: at the start
   of a word a default shell replaces it with a home directory path.
+- **`#`** — a comment. This one does not execute or expand anything; it
+  *truncates*. Interactive bash and PowerShell both end the line at a `#` that
+  starts a word, so a macro of `tool ${profile.name} --required-check` run
+  against a server named `device #` sends `tool device # --required-check` and
+  the shell runs `tool device` — the flag is silently dropped. A value that
+  arrives from an inventory sync or an imported backup therefore gets to choose
+  which part of *your* command line disappears (a `--dry-run`, a `--confirm`, a
+  redirect that was meant to capture the output), with nothing to see afterwards
+  but the missing behaviour. Deleting part of the author's command counts the
+  same as adding to it.
 
 Rename the profile — `Core Switch DC1` rather than `Core Switch (DC1)`,
-`Rack A - Spare` rather than `Rack A [Spare]` — or escape the token
-(`$${profile.name}`) if you only want the literal text. Spaces, `/`, `.` and
-accents stay legal: with glob syntax gone they are plain text, so `Rack 4 / Ünit
-2` is fine. A caret (`^`) is legal too: it is cmd's escape character, and
-escaping can only ever *remove* a metacharacter's meaning.
+`Rack A - Spare` rather than `Rack A [Spare]`, `Device 4` rather than
+`Device #4` — or escape the token (`$${profile.name}`) if you only want the
+literal text. Spaces, `/`, `.` and accents stay legal: with glob syntax gone they
+are plain text, so `Rack 4 / Ünit 2` is fine. A caret (`^`) is legal too: it is
+cmd's escape character, and escaping can only ever *remove* a metacharacter's
+meaning. So is a colon (`:`): it is inert in an argument for both bash and
+PowerShell, and cmd's colon-spelled comment (`::`) is a *label*, which only
+counts as one at the start of a command, not in the middle of a line.
 
 `${profile.host}` and `${profile.ipmiHost}` still accept square brackets, but
 only as a **whole bracketed IPv6 literal** — `[fe80::1]` or `[fe80::1]:623`, and

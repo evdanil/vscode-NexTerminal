@@ -64,8 +64,8 @@ const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
   port: "Use the port number only — digits, nothing else.",
   username: 'Use letters, digits, ".", "_", "-" and "@" only.',
   name:
-    'Remove $, `, %, "!", "~", "*", "?", quotes, ";", "|", "&", "<", ">", "\\", parentheses, square brackets and ' +
-    'braces from the name — spaces, "/", ".", "^" and accents are fine.'
+    'Remove $, `, %, "#", "!", "~", "*", "?", quotes, ";", "|", "&", "<", ">", "\\", parentheses, square brackets ' +
+    'and braces from the name — spaces, "/", ".", ":", "^" and accents are fine.'
 };
 
 /** The server-form label for a token, so pickers and errors name the same field. */
@@ -350,8 +350,58 @@ const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
  *   new (and control characters, newlines included, are refused in the value
  *   itself). In bash and PowerShell `^` is an ordinary character. Nothing it can
  *   do meets the bar, and "Rack 4 ^ Spare" stays a legal label.
+ *
+ * REVIEW FINDING (P2) — `#` IS REFUSED, AND THE BAR GAINS A SECOND CLAUSE. Every
+ * character above earned its place by causing EXECUTION or EXPANSION in a
+ * default-configuration shell. `#` does neither: it starts a COMMENT — in every
+ * interactive bash (`interactive_comments` is on by default) and in PowerShell,
+ * where a `#` at the start of a token comments out the rest of the line. So a
+ * macro of `tool ${profile.name} --required-check` with a name of `device #`
+ * sends `tool device # --required-check`, and the shell runs `tool device`. The
+ * flag the macro's author wrote is gone, with no error anywhere.
+ *
+ * TRUNCATION JOINS THE BAR because its integrity impact is comparable to
+ * expansion's: externally supplied data (a name arrives from inventory sync and
+ * from backup import, same as every other token) silently DELETES part of the
+ * author's command. What gets deleted is chosen by whoever supplied the value —
+ * `--dry-run`, `--required-check`, a `--confirm`, a redirect that was meant to
+ * capture the output. The macro then does something other than what it says,
+ * and the only signal is its absence. That is not code execution, but "the
+ * command that ran is not the command that was written" is the same failure this
+ * whole list exists to prevent.
+ *
+ * THE SAME TRUNCATION LENS, APPLIED TO EVERYTHING STILL ALLOWED — the question
+ * being "can this ONE character, from inside a substituted value, make a default
+ * shell discard the rest of the author's line?":
+ *
+ *   `:` IS NOT REFUSED. In bash and PowerShell it is inert in argument position
+ *   (bash's `:` is the null command, and PowerShell uses `:` only in `label:`
+ *   and in scope/drive qualifiers like `$env:X`, which need a `$`, refused).
+ *   cmd.exe HAS a comment form spelled with colons, but `::` is a LABEL, and a
+ *   label is only recognised as the FIRST token of a command — mid-line, after
+ *   a command name, `::x` is an ordinary argument. So it is not reachable from
+ *   one character in the middle of a line, and reaching it at line start would
+ *   need the value to be BOTH the whole first word and two colons, in which case
+ *   the value already occupies command position (a case this list has always
+ *   left to the macro author — see `/` and `.` below). `:` also has to stay:
+ *   it is in `ADDRESS_CHARSET` for IPv6, and site labels use it.
+ *
+ *   `^` STAYS, on the reasoning above plus this one: cmd's line continuation
+ *   JOINS the following line, it never discards this one.
+ *
+ *   `/`, `.`, `,`, `+`, `=`, `@`, SPACES AND ACCENTS STAY. None of the three
+ *   shells gives any of them a comment meaning. cmd's other comment form is the
+ *   WORD `REM`, which is not a character and cannot be reached from a charset
+ *   rule at all. PowerShell's block comment is `<#`, whose `<` is already
+ *   refused. At command position `.` sources a file and `/` starts a path — but
+ *   that is a value standing where a COMMAND goes, which is the macro template's
+ *   choice and out of scope here, exactly as it is for `host`.
+ *
+ * So `#` is the only addition the truncation lens produces; nothing else that is
+ * currently legal can comment out a line, and a name of `Rack 4 / Ünit 2` is
+ * still fine.
  */
-const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}%!*?\[\]~]/;
+const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}%!*?\[\]~#]/;
 /**
  * Refused in EVERY token, no exceptions. `$` and a backtick are what turn a
  * substituted value into syntax rather than data — for the shell, and for this

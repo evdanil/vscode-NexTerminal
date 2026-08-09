@@ -300,20 +300,66 @@ describe("resolveProfileTokens — injection defense", () => {
     expect(resolved("# ${profile.name}", server({ name: "Rack 4 ^ Spare" }))).toBe("# Rack 4 ^ Spare");
   });
 
-  it("refuses `%` and `!` one at a time, in `name` only — the address charsets already excluded them", () => {
-    for (const bad of ["a%b", "100%", "a!b", "Do not touch!"]) {
+  it("refuses `#` in a display name — a comment character DELETES the rest of the author's command", () => {
+    // NOT execution and NOT expansion, which is why it took a second look: `#`
+    // starts a comment in every interactive bash and in PowerShell, so what it
+    // does is TRUNCATE. The macro's own `--required-check` is what disappears,
+    // and nothing reports it. A name arrives from inventory sync and backup
+    // import, so the value picking which flag to drop is externally supplied.
+    const name = "device #";
+    const macro = "tool ${profile.name} --required-check\n";
+    const outcome = resolveProfileTokens(macro, server({ name }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("name");
+    expect(outcome.error.message).toContain("#");
+
+    // THE SHAPE OF THE BUG, spelled out: this is the exact line the pre-fix
+    // implementation substituted — a safety flag sitting AFTER a comment
+    // character, i.e. text the shell throws away. Asserting the refusal alone
+    // would pass against a `name` rule that happened to reject "device #" for
+    // some unrelated reason, so pin the string that must never be produced.
+    const preFix = macro.replace("${profile.name}", name);
+    expect(preFix).toBe("tool device # --required-check\n");
+    // …and everything from the `#` onwards is what a default shell discards.
+    expect(preFix.slice(preFix.indexOf("#"))).toBe("# --required-check\n");
+    expect(JSON.stringify(outcome)).not.toContain("tool device # --required-check");
+
+    // The same character alone, wherever it sits in the value.
+    for (const bad of ["#", "#4", "Device #4", "a#b", "DC1 #spare"]) {
+      expect(resolveProfileTokens(macro, server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+  });
+
+  it("keeps hyphenated, dotted, slashed and colon-bearing labels legal — `#` did not narrow the rest", () => {
+    // The truncation lens was applied to every character still allowed and
+    // produced exactly one addition. `:` in particular STAYS: it is inert in an
+    // argument for bash and PowerShell, and cmd's `::` comment is a LABEL, only
+    // recognised as the first token of a command, so it is not reachable from a
+    // single character mid-line.
+    for (const good of ["Rack A - Spare", "dc1.rack4.unit2", "Rack 4 / Ünit 2", "DC1: Core Switch", "Rack 4 ^ Spare"]) {
+      expect(resolved("tool ${profile.name} --required-check\n", server({ name: good }))).toBe(
+        `tool ${good} --required-check\n`
+      );
+    }
+  });
+
+  it("refuses `%`, `!` and `#` one at a time, in `name` only — the address charsets already excluded them", () => {
+    for (const bad of ["a%b", "100%", "a!b", "Do not touch!", "a#b", "#1"]) {
       expect(resolveProfileTokens("x ${profile.name}", server({ name: bad })).ok, `name ${bad}`).toBe(false);
     }
     // `host`/`ipmiHost`/`username` are positive charsets and never admitted
-    // either character — asserted so the two rules cannot silently diverge.
-    for (const bad of ["10.0.0.1%2", "10.0.0.1!"]) {
+    // any of the three — asserted so the two rules cannot silently diverge.
+    for (const bad of ["10.0.0.1%2", "10.0.0.1!", "10.0.0.1#"]) {
       expect(resolveProfileTokens("-H ${profile.host}", server({ host: bad })).ok, `host ${bad}`).toBe(false);
       expect(resolveProfileTokens("-H ${profile.ipmiHost}", server({ ipmiHost: bad })).ok, `ipmiHost ${bad}`).toBe(false);
     }
-    for (const bad of ["ad%min", "admin!"]) {
+    for (const bad of ["ad%min", "admin!", "admin#1"]) {
       expect(resolveProfileTokens("-U ${profile.username}", server({ username: bad })).ok, `username ${bad}`).toBe(false);
     }
     expect(resolveProfileTokens("-p ${profile.port}", server({ port: "22%" as unknown as number })).ok).toBe(false);
+    expect(resolveProfileTokens("-p ${profile.port}", server({ port: "22#" as unknown as number })).ok).toBe(false);
   });
 
   it("refuses parens and braces one at a time, and only in `name` — the address charsets are untouched", () => {
