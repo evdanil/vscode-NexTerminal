@@ -1046,6 +1046,103 @@ describe("FIX B — an UNCHANGED template-owned server whose stamped jump host i
   });
 });
 
+// -------- Codex round 4 (P2) — the survivor-cleanup decrement must be gated on actually-counted-unchanged --------
+
+describe("Codex round 4 — unchangedCount decrements ONLY for servers that were counted unchanged, never for a skipped-device server", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const JUMP_ID = deterministicServerId("source-1", "device:jump");
+  const S_ID = deterministicServerId("source-1", "device:1");
+  const U_ID = deterministicServerId("source-1", "device:u");
+  const T1_ID = deterministicServerId("source-1", "device:t1");
+  const T2_ID = deterministicServerId("source-1", "device:t2");
+
+  it("Fixture 48 — a skipped-device template server promoted by the survivor sweep does NOT decrement unchangedCount (only the genuinely-counted S does); the buggy unconditional decrement drives the count NEGATIVE (kills decrementing for a server that never reached `unchangedCount++`)", () => {
+    // No template rules this run — every proxy stamp is a PRE-EXISTING receipt an
+    // earlier run's template left, which is exactly what the survivor cleanup
+    // sweeps on. So the sweep fires purely off `origin.templated.proxy`, and no
+    // this-run override forces a proxy onto the plain baseline server U.
+    const source = makeSource({ prunePolicy: "delete" });
+
+    // J — owned, its device ABSENT from the tree → delete-pruned this run, hence
+    // a non-survivor every stamped proxy below points at.
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+
+    // S — mapped + otherwise unchanged, still carrying its template-stamped
+    // proxy → J. It reaches `unchangedCount++` (mapped no-change branch) and is
+    // THEN promoted by the sweep, so its decrement is legitimate: net zero.
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(JUMP_ID) } });
+
+    // U — a genuinely-unchanged PLAIN server (no proxy, no template stamp). It is
+    // counted unchanged and stays unchanged: the true tally is 1.
+    const u = ownedServer({ id: U_ID, name: "u-sw", host: "10.0.0.5" }, { externalId: "device:u" });
+
+    // T1 / T2 — owned servers whose devices are SKIPPED this fetch (invalid port),
+    // so the device loop hits `continue` before the mapped-update branch and they
+    // are NEVER counted at `unchangedCount++`. Both still carry a template-stamped
+    // proxy → J, so the survivor sweep promotes them. Decrementing for them (the
+    // round-2 bug) subtracts from a bucket they never entered.
+    const t1 = ownedServer(
+      { id: T1_ID, name: "t1-sw", host: "10.0.0.6", proxy: sshProxy(JUMP_ID) },
+      { externalId: "device:t1", templated: { proxy: sshProxy(JUMP_ID) } }
+    );
+    const t2 = ownedServer(
+      { id: T2_ID, name: "t2-sw", host: "10.0.0.7", proxy: sshProxy(JUMP_ID) },
+      { externalId: "device:t2", templated: { proxy: sshProxy(JUMP_ID) } }
+    );
+
+    const p = plan({
+      source,
+      devices: [
+        makeDevice(), // device:1 → S, mapped + unchanged
+        makeDevice({ externalId: "device:u", name: "u-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5" }] }), // U, unchanged
+        makeDevice({ externalId: "device:t1", name: "t1-sw", endpoints: [{ kind: "ssh", host: "10.0.0.6", port: 0 }] }), // skipped
+        makeDevice({ externalId: "device:t2", name: "t2-sw", endpoints: [{ kind: "ssh", host: "10.0.0.7", port: 0 }] }) // skipped
+        // device:jump absent → J delete-pruned
+      ],
+      servers: [jumpHost, s, u, t1, t2]
+    });
+
+    // J is delete-pruned; S, T1, T2 are all promoted to proxy-dropping updates.
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === JUMP_ID)).toBe(true);
+    expect(afterFor(p, S_ID)).toBeDefined();
+    expect(afterFor(p, T1_ID)).toBeDefined();
+    expect(afterFor(p, T2_ID)).toBeDefined();
+    // U is left untouched — its device mapped unchanged and it carries no proxy.
+    expect(afterFor(p, U_ID)).toBeUndefined();
+
+    // The true tally is exactly 1 (U). S left the unchanged bucket it had entered
+    // (net zero); T1/T2 were never in it. The round-2 bug decremented for all
+    // three promotions → 1 − 1(S already netted) − 1(T1) − 1(T2) = −1, a count
+    // that is not merely understated but IMPOSSIBLE.
+    expect(p.unchangedCount).toBe(1);
+    expect(p.unchangedCount).toBeGreaterThanOrEqual(0);
+  });
+
+  it("Fixture 49 — GUARD: the decrement still fires for a legitimately-counted promoted server (one plain unchanged server + one unchanged template server whose jump host is pruned → count decrements by exactly 1, landing on the plain server's tally)", () => {
+    const source = makeSource({ prunePolicy: "delete" });
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    // S — counted unchanged, then promoted by the sweep: it MUST decrement.
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(JUMP_ID) } });
+    // U — genuinely unchanged, the surviving tally of 1.
+    const u = ownedServer({ id: U_ID, name: "u-sw", host: "10.0.0.5" }, { externalId: "device:u" });
+    const p = plan({
+      source,
+      devices: [
+        makeDevice(),
+        makeDevice({ externalId: "device:u", name: "u-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5" }] })
+      ],
+      servers: [jumpHost, s, u]
+    });
+    expect(afterFor(p, S_ID)).toBeDefined(); // S promoted
+    expect(afterFor(p, U_ID)).toBeUndefined(); // U untouched
+    // Both S and U were counted (tally would be 2), then S's promotion decrements
+    // exactly once → 1. A fix that over-gated and stopped decrementing for S would
+    // leave this at 2; the round-2 bug leaves it at 1 too, so this fixture guards
+    // the fix did not lose the legitimate decrement.
+    expect(p.unchangedCount).toBe(1);
+  });
+});
+
 // -------- clearTemplatedStamps (§5.1, unit-tested, wired to nothing) --------
 
 describe("clearTemplatedStamps — §5.1 (manual path helper; not wired in T1)", () => {

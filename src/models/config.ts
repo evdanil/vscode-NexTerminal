@@ -696,6 +696,16 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // restore the forgetful one, and the adopted server's BMC address would be
     // back to looking hand-typed, which no later sync can repair.
     a.syncedIpmiHost === b.syncedIpmiHost &&
+    // DEVICE TEMPLATES (issue #48 PR-T1) — the template receipt joins for the
+    // identical reason `syncedAuthProfileId` and `syncedIpmiHost` above it did:
+    // a rollback that called two markers equal while one remembers the non-auth
+    // fields the removed source's template last wrote and the other does not
+    // would restore the forgetful one, and the adopted server's proxy/booleans
+    // would be back to looking hand-owned (matrix row 7), which no later
+    // override template can reclaim. Structural, PRESENT-when-false — the same
+    // helper `serverOriginStampsEqual` uses for `ServerOrigin.templated`, the
+    // shapes being identical.
+    templatedStampsEqual(a.templated, b.templated) &&
     a.detachedAt === b.detachedAt
   );
 }

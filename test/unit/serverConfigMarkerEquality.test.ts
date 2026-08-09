@@ -105,12 +105,32 @@ describe("serverConfigsEqual — formerlySynced (ADOPT 1)", () => {
     expect(serverConfigsEqual(withOob, server({ formerlySynced: { ...MARKER } }))).toBe(false);
   });
 
+  it("two markers differing only in the `templated` receipt are not equal (kills leaving `templated` out of the detached comparator — round 2 added the member but not the comparison, so a rollback would replace a marker remembering the removed source's template-written proxy/booleans with one that does not, and call the two identical while doing it)", () => {
+    // Both sides HAVE a `templated` record — the difference is in its CONTENTS,
+    // not present-vs-absent (that would be the vacuous-fixture trap: a broken
+    // comparator ignoring `templated` and a correct one both go on to compare
+    // the rest, and if one side merely lacked the member some other clause might
+    // catch it). Here every field including the presence of `templated` is
+    // identical; only `templated.proxy` differs.
+    const a = server({ formerlySynced: { ...MARKER, templated: { proxy: { type: "socks5", host: "10.9.9.1", port: 1080 } } } });
+    const b = server({ formerlySynced: { ...MARKER, templated: { proxy: { type: "socks5", host: "10.9.9.2", port: 1080 } } } });
+    expect(serverConfigsEqual(a, b)).toBe(false);
+    expect(serverConfigsEqual(b, a)).toBe(false);
+    // Boolean-stamp variant — PRESENT-when-false through the detached comparator
+    // too: a stamp of `false` is a DIFFERENT ownership fact from no stamp, and a
+    // comparator that conflated them would let a rollback undo a template clear.
+    const falseStamp = server({ formerlySynced: { ...MARKER, templated: { multiplexing: false } } });
+    const absentStamp = server({ formerlySynced: { ...MARKER, templated: {} } });
+    expect(serverConfigsEqual(falseStamp, absentStamp)).toBe(false);
+    expect(serverConfigsEqual(absentStamp, falseStamp)).toBe(false);
+  });
+
   it("identical markers (distinct objects) still compare equal, and so do two records with no marker at all (kills a comparator that compares by reference, which would report every unchanged kept server as changed)", () => {
     expect(serverConfigsEqual(server({ formerlySynced: MARKER }), server({ formerlySynced: { ...MARKER } }))).toBe(true);
     expect(serverConfigsEqual(server(), server())).toBe(true);
     // Including the optional members, so the clause added for them cannot be a
     // permanent "not equal".
-    const full = { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1", syncedIpmiHost: "10.9.9.9" };
+    const full = { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1", syncedIpmiHost: "10.9.9.9", templated: { proxy: { type: "socks5", host: "10.9.9.1", port: 1080 }, multiplexing: false } };
     expect(serverConfigsEqual(server({ formerlySynced: full }), server({ formerlySynced: { ...full } }))).toBe(true);
   });
 });

@@ -729,6 +729,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const prunes: InventorySyncPlan["prunes"] = [];
   let unchangedCount = 0;
   /**
+   * Codex round 4 (P2) — the ids of owned servers that actually reached the
+   * `unchangedCount++` site (the mapped-update no-change branch, the sole
+   * incrementer — adoption is always an update, never counted). The
+   * survivor-cleanup promotion loop below reaches ANY owned server not already
+   * planned — including one whose device was SKIPPED before that branch (no
+   * usable endpoint / invalid port) and so was never counted — and must
+   * decrement `unchangedCount` ONLY for servers this set records as counted;
+   * an unconditional decrement understates the count or drives it negative.
+   */
+  const unchangedServerIds = new Set<string>();
+  /**
    * AUTH 2b — per-profile counts of the links this plan UNDOES / deliberately
    * LEAVES in place (the server brings its own key file). Keyed by profile id so
    * the source-level warning and the referrer-specific template/retained-link
@@ -1446,6 +1457,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         }
       } else {
         unchangedCount++;
+        unchangedServerIds.add(ownedServer.id);
       }
       continue;
     }
@@ -2584,7 +2596,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     };
     updates.push({ before: ownedServer, after });
     plannedServerIds.add(ownedServer.id);
-    unchangedCount--; // this device was counted unchanged in the loop; it is now an update
+    // Codex round 4 (P2) — gate the decrement on actually-counted-unchanged.
+    // The promotion above is unconditional (any owned survivor-cleanup server
+    // leaves its dangling template proxy behind), but a server whose device was
+    // SKIPPED this fetch reaches here without ever having hit `unchangedCount++`,
+    // so decrementing for it would understate the count or drive it negative.
+    // Only servers this set records left the unchanged bucket.
+    if (unchangedServerIds.has(ownedServer.id)) {
+      unchangedCount--; // this device was counted unchanged in the loop; it is now an update
+    }
     warnings.push(
       `Server "${ownedServer.name}" on "${source.name}" carries a device-template jump-host proxy whose jump host will not survive this sync (it is being pruned) — the proxy field was removed.`
     );
