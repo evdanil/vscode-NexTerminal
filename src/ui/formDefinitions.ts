@@ -185,7 +185,44 @@ function authProfileSelectField(
   };
 }
 
-function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDescriptor[] {
+/**
+ * The BMC's OWN credentials — a second link into the same `AuthProfile` store,
+ * deliberately NOT the SSH one (`authProfileSelectField`). Two differences carry
+ * the whole distinction:
+ *
+ *   - `autofill` is OFF. The SSH select mirrors the chosen profile's username /
+ *     auth type / key path into the form's own controls and locks them; this one
+ *     must never touch them, because the BMC account and the SSH account are two
+ *     different logins on two different interfaces of the same appliance.
+ *   - Only `username` and the stored password are ever read from the profile it
+ *     names, so `authType`/`keyPath` are ignored on this link and the hint says
+ *     so — a `key` or `agent` profile is accepted and simply supplies a username.
+ */
+function ipmiAuthProfileSelectField(
+  authProfiles?: AuthProfile[],
+  selectedId?: string,
+  vw?: VisibleWhen
+): FormFieldDescriptor {
+  return {
+    type: "select",
+    key: "ipmiAuthProfileId",
+    label: "IPMI Auth Profile",
+    options: [
+      { label: "(None)", value: "" },
+      ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id }))
+    ],
+    value: selectedId ?? "",
+    hint:
+      "The BMC's own login — separate from the SSH credentials above. Its username fills ${profile.ipmiUsername}, " +
+      "and its saved password is handed to ipmitool through the environment (never the command line) by macros you tick " +
+      '"Provide IPMI credentials" on, and by Connect BMC Serial Console. Only the username and password are used; ' +
+      "the profile's authentication type and key file are ignored here.",
+    advanced: true,
+    visibleWhen: vw
+  };
+}
+
+function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?: AuthProfile[]): FormFieldDescriptor[] {
   return [
     { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the SSH server.", visibleWhen: vw },
     { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: seed?.port ?? 22, visibleWhen: vw },
@@ -209,6 +246,23 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen): FormFieldDes
     // profile (services/profileTokens.ts). Advanced, because a server that has
     // no BMC should not be asked about one.
     { type: "text", key: "ipmiHost", label: "IPMI / BMC Host", placeholder: "10.0.0.1 or bmc.example.com", value: seed?.ipmiHost, hint: "Optional out-of-band management address — the address only, no https:// or path (e.g. 10.0.0.1, not https://10.0.0.1/). Used by macros through ${profile.ipmiHost}; never used to connect over SSH.", advanced: true, visibleWhen: vw },
+    ipmiAuthProfileSelectField(authProfiles, seed?.ipmiAuthProfileId, vw),
+    // Two literals, never a free-text scheme: `ipmiHost` is an address (no `/`,
+    // no scheme concept — see profileTokens.ts's ADDRESS_CHARSET), so the scheme
+    // has to live in its own typed field or not at all.
+    {
+      type: "select",
+      key: "bmcWebProtocol",
+      label: "BMC Web Protocol",
+      options: [
+        { label: "HTTPS (default)", value: "https" },
+        { label: "HTTP (insecure)", value: "http" }
+      ],
+      value: seed?.bmcWebProtocol === "http" ? "http" : "https",
+      hint: "Scheme used by Open BMC Web Console. Some older BMCs only serve their web interface over plain HTTP. HTTP sends your BMC login in clear text over the management network — use it only where the BMC offers nothing else.",
+      advanced: true,
+      visibleWhen: vw
+    },
     { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server.", advanced: true, visibleWhen: vw },
     { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.legacyAlgorithms ?? false, hint: "Use only for older devices that reject modern SSH algorithms.", advanced: true, visibleWhen: vw }
   ];
@@ -521,7 +575,7 @@ export function serverFormDefinition(
   const linkedProfile = seed?.authProfileId
     ? (authProfiles ?? []).find((profile) => profile.id === seed.authProfileId)
     : undefined;
-  const ssh = applyLinkedAuthProfileValues(sshFields(seed), linkedProfile);
+  const ssh = applyLinkedAuthProfileValues(sshFields(seed, undefined, authProfiles), linkedProfile);
 
   return {
     title: isEdit ? "Edit SSH Server Profile" : "Add SSH Server Profile",
@@ -747,7 +801,7 @@ export function unifiedProfileFormDefinition(
       unifiedProfileTypeField(seed),
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server, Console, or Project Shell" },
       authProfileSelectField(authProfiles, sshVw),
-      ...sshFields(undefined, sshVw),
+      ...sshFields(undefined, sshVw, authProfiles),
       ...proxyFields(undefined, servers, sshVw),
       openFileExplorerOnFirstConnectField(undefined, sshVw),
       ...serialFields(undefined, serialVw),

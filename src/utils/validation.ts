@@ -239,6 +239,20 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.ipmiHost !== undefined && typeof obj.ipmiHost !== "string") {
     return false;
   }
+  // Same shape check as `authProfileId` above — it is the same kind of value (a
+  // profile id), read at the same kind of site, and an empty string is not a
+  // link to anything.
+  if (obj.ipmiAuthProfileId !== undefined && (typeof obj.ipmiAuthProfileId !== "string" || obj.ipmiAuthProfileId === "")) {
+    return false;
+  }
+  // TOLERANT, deliberately: anything outside the two literals is READ as absent
+  // by `resolveBmcWebProtocol()` (⇒ https), so rejecting the row here would cost
+  // a server its whole record — group, proxy, sync ownership — over a
+  // bookkeeping field the use site already neutralizes. Only a shape no writer
+  // of ours produces is rejected, matching `ipmiHost`/`keyPath` above.
+  if (obj.bmcWebProtocol !== undefined && typeof obj.bmcWebProtocol !== "string") {
+    return false;
+  }
   // F13/FIX 5 — a malformed `origin` does not invalidate the whole server
   // row: the row is still accepted here. Stripping the malformed field is
   // NOT this function's job — a type guard must not mutate the value it is

@@ -1003,6 +1003,26 @@ describe("formValuesToProxy", () => {
   });
 });
 
+describe("formValuesToServer — BMC fields (issue #48 PR-B)", () => {
+  const base = { name: "Test", host: "example.com", port: 22, username: "root", authType: "password" };
+
+  it("stores a chosen IPMI auth profile and treats a blank select as no link", () => {
+    expect(formValuesToServer({ ...base, ipmiAuthProfileId: "ap-bmc" })!.ipmiAuthProfileId).toBe("ap-bmc");
+    // Never an empty-string id: `""` would satisfy a truthiness check somewhere
+    // downstream and then resolve to no profile.
+    expect(formValuesToServer({ ...base, ipmiAuthProfileId: "" })!.ipmiAuthProfileId).toBeUndefined();
+    expect(formValuesToServer(base)!.ipmiAuthProfileId).toBeUndefined();
+  });
+
+  it("persists bmcWebProtocol ONLY for http — absent already means https", () => {
+    expect(formValuesToServer({ ...base, bmcWebProtocol: "http" })!.bmcWebProtocol).toBe("http");
+    // Writing "https" explicitly would put a member on every server record that
+    // no build before this one understands, for no change in behaviour.
+    expect(formValuesToServer({ ...base, bmcWebProtocol: "https" })!.bmcWebProtocol).toBeUndefined();
+    expect(formValuesToServer(base)!.bmcWebProtocol).toBeUndefined();
+  });
+});
+
 describe("formValuesToServer with proxy", () => {
   it("includes proxy config in server when present", () => {
     const server = formValuesToServer({

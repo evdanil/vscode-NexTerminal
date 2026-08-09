@@ -21,11 +21,37 @@
  */
 import { serializeForInlineScript } from "../ui/shared/inlineScriptData";
 import { MACRO_PLACEHOLDER_SOURCE } from "./macroVariables";
-import type { ServerConfig } from "../models/config";
 
-export const PROFILE_TOKEN_WHITELIST = ["host", "port", "username", "name", "ipmiHost"] as const;
+export const PROFILE_TOKEN_WHITELIST = ["host", "port", "username", "name", "ipmiHost", "ipmiUsername"] as const;
 
 export type ProfileTokenName = (typeof PROFILE_TOKEN_WHITELIST)[number];
+
+/**
+ * WHAT A TOKEN RESOLVES AGAINST — deliberately NOT `ServerConfig` itself.
+ *
+ * Two of the six tokens are not raw fields of the record: `username` is the one
+ * a CONNECTION would use (the linked auth profile's, where it supplies one —
+ * see `effectiveServerUsername`), and `ipmiUsername` lives on a different
+ * record entirely (the profile named by `ServerConfig.ipmiAuthProfileId`). The
+ * caller that has a `NexusCore` assembles both (`profileTokenServer` in
+ * commands/serverMacroCommands.ts); this module stays pure and `vscode`-free
+ * and only ever reads the facts it is handed.
+ *
+ * Every member is optional even where `ServerConfig`'s is required, so a
+ * `ServerConfig` is assignable as-is — the shape only ever gets fields ADDED —
+ * and an absent one lands in `rawTokenValue`'s "not set" arm, which is the
+ * typed `missing` refusal rather than the string `"undefined"` on a command
+ * line.
+ */
+export interface ProfileTokenFacts {
+  host?: string;
+  port?: number;
+  username?: string;
+  name?: string;
+  ipmiHost?: string;
+  /** The linked IPMI auth profile's username; see `ServerConfig.ipmiAuthProfileId`. */
+  ipmiUsername?: string;
+}
 
 /** Display names used in error text — what the user sees on the server form. */
 const PROFILE_TOKEN_FIELD_LABELS: Record<ProfileTokenName, string> = {
@@ -33,7 +59,8 @@ const PROFILE_TOKEN_FIELD_LABELS: Record<ProfileTokenName, string> = {
   port: "Port",
   username: "Username",
   name: "Name",
-  ipmiHost: "IPMI / BMC Host"
+  ipmiHost: "IPMI / BMC Host",
+  ipmiUsername: "IPMI Username"
 };
 
 /**
@@ -47,7 +74,12 @@ const PROFILE_TOKEN_FIELD_LOCATION: Record<ProfileTokenName, string> = {
   port: "in the server form",
   username: "in the server form",
   name: "in the server form",
-  ipmiHost: "under Advanced options in the server form"
+  ipmiHost: "under Advanced options in the server form",
+  // Names the FIELD to set, not the value: `ipmiUsername` is not a field of the
+  // server at all — it is the linked profile's username — so "add it in the
+  // server form" would send the user looking for a text box that does not exist.
+  ipmiUsername:
+    "by choosing an IPMI Auth Profile (one whose Username is filled in) under Advanced options in the server form"
 };
 
 /**
@@ -59,14 +91,19 @@ const ADDRESS_GUIDANCE =
   'Use the address only — letters, digits, ".", "-", "_" and ":" — without a scheme like https:// or a path. ' +
   'Square brackets are accepted only as a whole bracketed IPv6 literal, e.g. [fe80::1] or [fe80::1]:623.';
 
+const USERNAME_GUIDANCE =
+  'Use letters, digits, ".", "_" and "-", with at most one "@" between name and realm ' +
+  "(e.g. admin, or user@REALM.EXAMPLE.COM). " +
+  'A leading or trailing "@" is refused.';
+
 const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
   host: ADDRESS_GUIDANCE,
   ipmiHost: ADDRESS_GUIDANCE,
   port: "Use the port number only — digits, nothing else.",
-  username:
-    'Use letters, digits, ".", "_" and "-", with at most one "@" between name and realm ' +
-    "(e.g. admin, or user@REALM.EXAMPLE.COM). " +
-    'A leading or trailing "@" is refused.',
+  username: USERNAME_GUIDANCE,
+  // Same rule, one record further away: the value comes from the linked IPMI
+  // auth profile, so the repair is in that profile's own editor.
+  ipmiUsername: `${USERNAME_GUIDANCE} Edit the linked IPMI auth profile to fix it.`,
   name:
     'Use letters, digits, spaces and ".", "-", "_", "/", ":", "," and "+" only — accents are fine. ' +
     "Every other punctuation mark is refused, because some shell reads it as syntax. " +
@@ -497,6 +534,10 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
     case "port":
       return DIGITS_ONLY.test(value);
     case "username":
+    case "ipmiUsername":
+      // The same charset for the same reason: `-U ${profile.ipmiUsername}` is a
+      // local command line, and this value arrives from an auth profile that a
+      // backup import can write anything into.
       return USERNAME_CHARSET.test(value);
     case "name":
       return NAME_CHARSET.test(value);
@@ -724,7 +765,7 @@ function displayValue(value: string): string {
 }
 
 /** The raw string a whitelisted token stands for, or `""` when the field carries nothing usable. */
-function rawTokenValue(token: ProfileTokenName, server: Pick<ServerConfig, ProfileTokenName>): string {
+function rawTokenValue(token: ProfileTokenName, server: ProfileTokenFacts): string {
   if (token === "port") {
     // Typed `number`, but a foreign record can carry anything; a non-number is
     // "not set" rather than `"undefined"` on a command line.
@@ -910,7 +951,7 @@ export function unescapeProfileTokens(text: string): string {
  */
 export function resolveProfileTokens(
   text: string,
-  server: Pick<ServerConfig, ProfileTokenName>,
+  server: ProfileTokenFacts,
   context: ProfileTokenContext = {}
 ): ProfileTokenOutcome {
   const form: ProfileTokenForm = context.form ?? "command";

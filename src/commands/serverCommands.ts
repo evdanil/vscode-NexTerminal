@@ -642,7 +642,16 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     openFileExplorerOnFirstConnect: values.openFileExplorerOnFirstConnect === true ? true : undefined,
     proxy: formValuesToProxy(values),
     authProfileId: typeof values.authProfileId === "string" && values.authProfileId
-      ? values.authProfileId : undefined
+      ? values.authProfileId : undefined,
+    // The BMC's own credentials, on the same terms as `authProfileId` above: a
+    // blank select is no link at all, never an empty-string id.
+    ipmiAuthProfileId: typeof values.ipmiAuthProfileId === "string" && values.ipmiAuthProfileId
+      ? values.ipmiAuthProfileId : undefined,
+    // Only `"http"` is stored — `"https"` is the default the absent field
+    // already means, and writing it explicitly would put a member on every
+    // server record no build before this one understands (the same rule
+    // `runIn` follows in the macro editor).
+    bmcWebProtocol: values.bmcWebProtocol === "http" ? "http" : undefined
   };
 }
 

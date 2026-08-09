@@ -566,6 +566,33 @@ describe("package contributions", () => {
     });
   });
 
+  describe("direct BMC commands (issue #48 §3.6)", () => {
+    const ids = ["nexus.server.connectBmcSol", "nexus.server.openBmcWebConsole"];
+
+    it("contributes both as palette-invocable Nexus commands", () => {
+      for (const id of ids) {
+        const command = packageJson.contributes.commands.find((item) => item.command === id);
+        expect(command, id).toBeDefined();
+        expect(command!.category).toBe("Nexus");
+        expect(command!.title).toBeTruthy();
+      }
+    });
+
+    it("places them on server items UNCONDITIONALLY, matching the existing anchored contextValue regex", () => {
+      // B5 — the server item's `contextValue` is matched by ~15 anchored `when`
+      // regexes, so expressing "this server has a BMC" would mean a new variant
+      // and a rewrite of all of them. The standing rule is "pickers flag, menus
+      // don't hide": an unconfigured server gets an actionable refusal instead.
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      for (const id of ids) {
+        const entry = menuItems.find((item) => item.command === id);
+        expect(entry, id).toBeDefined();
+        expect(entry!.when).toBe("view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/");
+        expect(entry!.group).toMatch(/^0_connect@/);
+      }
+    });
+  });
+
   it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
     const command = packageJson.contributes.commands.find((item) => item.command === "nexus.config.import.inventory");
     expect(command).toBeDefined();

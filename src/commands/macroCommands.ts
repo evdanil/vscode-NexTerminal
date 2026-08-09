@@ -112,26 +112,76 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
     // editor and happening to notice the new Variables section.
     id: "prompted-command",
     label: "IPMI SOL console",
-    description: "Fill the BMC address in from the server profile, prompt for username and password, then run ipmitool (leading space keeps it out of shell history).",
+    description: "Open a serial-over-LAN console with ipmitool, using the server profile's BMC address and IPMI auth profile (leading space keeps it out of shell history).",
     macro: {
       name: "IPMI SOL console",
       // Leading space intentional: docs/macros.md's "Avoiding remote shell
       // history" section documents `HISTCONTROL=ignorespace` — a shipped
       // example should follow its own documented practice.
       //
-      // `${profile.ipmiHost}` (issue #48) rather than a prompted `$host`: the
-      // address is a fact about the server profile this macro is run against,
-      // so Run Macro on Server fills it in. The PASSWORD stays a masked
-      // prompt-at-run variable and must never become a literal `-P secret` in
-      // a template — an argv password is visible in `ps`, in the terminal
-      // scrollback, and in this extension's own TerminalCaptureBuffer, which
-      // `nexus.terminal.copyAll` will happily hand to the clipboard.
-      text: " ipmitool -I lanplus -H ${profile.ipmiHost} -U $username -P $password sol activate\n",
+      // `${profile.ipmiHost}` / `${profile.ipmiUsername}` (issue #48) rather
+      // than prompted variables: both are facts about the server profile this
+      // macro is run against, so Run Macro on Server fills them in.
+      //
+      // `-E`, NEVER `-P` (issue #48 Phase 3). The password is read by ipmitool
+      // from IPMITOOL_PASSWORD/IPMI_PASSWORD, which the flag below puts into
+      // the terminal's environment. An argv password is visible in `ps`, in the
+      // terminal scrollback, and in this extension's own TerminalCaptureBuffer,
+      // which `nexus.terminal.copyAll` will happily hand to the clipboard.
+      text: " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E sol activate\n",
       runIn: "localTerminal",
-      variables: [
-        { name: "username", label: "Username" },
-        { name: "password", label: "Password", secret: true }
-      ]
+      // THE ONE PLACE THE EXTENSION ITSELF VOUCHES that the command is ipmitool.
+      // Inserting the template is the user's consent act, and the flag is then
+      // visible and revocable in the editor like any other macro property. A
+      // template insert is a LOCAL action, not an import, so the capability
+      // strip list (configCommands.ts) never touches it — which is the whole
+      // point of shipping the flag set.
+      provideIpmiCredentials: true
+    }
+  },
+  // Chassis power control — the other thing operators actually run against a
+  // BMC, in the same shape as the SOL template above (localTerminal, `-E`,
+  // flag set) so all four read and behave identically.
+  {
+    id: "ipmi-power-status",
+    label: "IPMI Power Status",
+    description: "Ask the BMC whether the machine is powered on, using the server profile's BMC address and IPMI auth profile.",
+    macro: {
+      name: "IPMI Power Status",
+      text: " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E chassis power status\n",
+      runIn: "localTerminal",
+      provideIpmiCredentials: true
+    }
+  },
+  {
+    id: "ipmi-power-on",
+    label: "IPMI Power On",
+    description: "Power the machine on through its BMC, using the server profile's BMC address and IPMI auth profile.",
+    macro: {
+      name: "IPMI Power On",
+      text: " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E chassis power on\n",
+      runIn: "localTerminal",
+      provideIpmiCredentials: true
+    }
+  },
+  {
+    // DESTRUCTIVE, and that is carried in the NAME and the DESCRIPTION — which
+    // is where a user reads it, in the template picker and then in the macro
+    // list — rather than in a per-macro confirmation flag. `chassis power off`
+    // is an abrupt power cut, not a graceful shutdown. No new confirm mechanism
+    // is invented for one template: the text is visible in the picker and in the
+    // editor before anything runs, and it lands in a terminal the user still has
+    // to look at. ("cycle"/"reset" are deliberately not shipped — trivial to
+    // write from this shape, and the shipped set should stay the operations
+    // everyone needs rather than a catalogue.)
+    id: "ipmi-power-off",
+    label: "IPMI Power Off (hard, no OS shutdown)",
+    description: "Cut power at the BMC immediately — the OS is NOT shut down cleanly. Uses the server profile's BMC address and IPMI auth profile.",
+    macro: {
+      name: "IPMI Power Off (hard, no OS shutdown)",
+      text: " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E chassis power off\n",
+      runIn: "localTerminal",
+      provideIpmiCredentials: true
     }
   },
   {

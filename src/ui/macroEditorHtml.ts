@@ -5,7 +5,7 @@ import { serializeForInlineScript } from "./shared/inlineScriptData";
 import { renderWebviewDocument } from "./shared/webviewDocument";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
-import { MACRO_RUN_TARGETS, MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE, resolveMacroRunTarget } from "../models/terminalMacro";
+import { MACRO_RUN_TARGETS, MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE, macroProvidesIpmiCredentials, resolveMacroRunTarget } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
@@ -151,6 +151,12 @@ export function renderMacroEditorHtml(
           : "Browser - the text is a URL, opened externally"
   }));
   const selectedRunInLabel = runInOptions.find((option) => option.value === runIn)?.label ?? runInOptions[0].label;
+  // Issue #48 §3.3 — the credential opt-in, read through the model's own gate so
+  // the checkbox can never render "on" for a macro a run would treat as off (a
+  // non-boolean from legacy-settings absorption, or a flag left on a macro whose
+  // "Run in" was later moved off Local terminal).
+  const provideIpmi = macro ? macroProvidesIpmiCredentials(macro) : false;
+  const provideIpmiVisible = runIn === "localTerminal";
   const runInOptionsHtml = runInOptions.map((option) =>
     `<div class="custom-select-option${option.value === runIn ? " selected" : ""}" data-value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</div>`
   ).join("\n        ");
@@ -291,7 +297,7 @@ export function renderMacroEditorHtml(
   <div class="form-group">
     <label for="macro-text">Text</label>
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">${TEXTAREA_LEADING_NEWLINE}${escapeHtml(textValue)}</textarea>
-    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
+    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.ipmiUsername}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
   </div>
@@ -327,6 +333,17 @@ export function renderMacroEditorHtml(
     </div>
     <div class="field-error" id="error-runIn"></div>
     <div class="hint">Local terminal and Browser macros are run from a server profile (Connectivity Hub → right-click a server → Run Macro on Server…). Neither can auto-trigger.</div>
+  </div>
+
+  <!-- Issue #48 §3.3 — the IPMI credential opt-in. Shown only while Run in =
+       Local terminal, where it is the only thing it can mean; the save handler
+       drops the flag for every other target regardless of what is checked. -->
+  <div class="form-group form-group-checkbox" id="provide-ipmi-group"${provideIpmiVisible ? "" : ' style="display:none;"'}>
+    <label>
+      <input type="checkbox" id="macro-provide-ipmi"${provideIpmi ? " checked" : ""} />
+      Provide IPMI credentials to this macro's terminal
+    </label>
+    <div class="hint">Puts the server's IPMI password (from the IPMI Auth Profile linked in its server form) into the local terminal's environment as IPMITOOL_PASSWORD/IPMI_PASSWORD, so <code>ipmitool -E</code> can read it without the password ever appearing in the command line, the scrollback, or Copy All. Every command this macro runs in that terminal can read it. Leave this off unless the macro is an ipmitool command. If no password is stored, you are asked for one at run time and it is used for that run only.</div>
   </div>
 
   <div class="form-group">
@@ -473,6 +490,18 @@ ${folderOptionsHtml}
         input.disabled = !isProfile;
         if (!isProfile) {
           document.getElementById("error-trigger-profile").textContent = "";
+        }
+      }
+
+      // Issue #48 §3.3 — the opt-in is meaningless on a session or browser macro,
+      // so it is hidden there AND unchecked: leaving a checked-but-hidden box
+      // would submit a consent the user cannot see. (The host drops the flag for
+      // a non-local target anyway; this is the visible half of the same rule.)
+      function updateProvideIpmiState() {
+        var isLocal = document.getElementById("macro-run-in").value === "localTerminal";
+        document.getElementById("provide-ipmi-group").style.display = isLocal ? "" : "none";
+        if (!isLocal) {
+          document.getElementById("macro-provide-ipmi").checked = false;
         }
       }
 
@@ -868,7 +897,9 @@ ${folderOptionsHtml}
       document.getElementById("macro-run-in").addEventListener("change", function() {
         markDirty();
         updateRunInConflictWarning();
+        updateProvideIpmiState();
       });
+      document.getElementById("macro-provide-ipmi").addEventListener("change", markDirty);
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
         updateTriggerProfileState();
@@ -935,6 +966,7 @@ ${folderOptionsHtml}
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
         var runInVal = document.getElementById("macro-run-in").value;
+        var provideIpmiVal = document.getElementById("macro-provide-ipmi").checked;
         var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
@@ -1036,6 +1068,7 @@ ${folderOptionsHtml}
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
           runIn: runInVal,
+          provideIpmiCredentials: provideIpmiVal,
           variables: variablesForSave,
           group: folderVal || null
         });
@@ -1079,6 +1112,7 @@ ${folderOptionsHtml}
         }
       });
       updateTriggerProfileState();
+      updateProvideIpmiState();
       computeDiagnostics();
       updateTriggerConflictWarning();
       updateRunInConflictWarning();

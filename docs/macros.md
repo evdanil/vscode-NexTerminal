@@ -41,10 +41,13 @@ Built-in templates include:
   appears.
 - **Scoped auto-trigger example**: shows a prompt-triggered command that starts
   paused until you resume it.
-- **IPMI SOL console**: prompts for a username and password, fills the BMC
-  address in from the server profile, and runs a templated `ipmitool` command in
-  a local terminal — a complete worked example of **Variables** (below) and of
-  **Profile tokens**.
+- **IPMI SOL console**: opens a serial-over-LAN console with `ipmitool`,
+  reading the BMC address, the BMC username and the BMC password from the server
+  profile — a complete worked example of **Profile tokens** and of
+  **Providing IPMI credentials** (both below). Nothing is prompted for.
+- **IPMI Power Status / IPMI Power On / IPMI Power Off (hard, no OS shutdown)**:
+  chassis power control, in the same shape as the SOL template. Power Off is an
+  abrupt power cut, not a graceful shutdown — that is why it says so in its name.
 - **Launch IPMI web console**: opens a server's BMC web interface in the
   browser, using the profile's IPMI / BMC Host.
 
@@ -157,21 +160,23 @@ then press Esc at the username prompt — the host value you already entered is
 still remembered for the next time you run the macro, even though nothing was
 sent this time.
 
-### Worked example: IPMI SOL console
+### Worked example: a macro that prompts for one value
 
-The **IPMI SOL console** template starts from this macro:
+Variables are for values that genuinely change per run. The shipped IPMI
+templates no longer use any — everything they need is on the server profile
+(see **Profile tokens** and **Providing IPMI credentials**, below) — so here is
+the shape when something really is per-run:
 
 ```
-Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U $username -P $password sol activate
+Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E chassis bootdev $device
 Run in:    Local terminal
-Variables: username (Username), password (Password, masked)
+Variables: device (Boot device)
 ```
 
-The BMC address is not prompted for — it is read from the server profile you
-run the macro against (see **Profile tokens**, below). Running it prompts for
-the username, then the password (masked, never remembered), then sends the
+The address and the username are read from the server profile you run the macro
+against; only `$device` is asked for. Running it prompts once, then sends the
 filled-in command line to a local terminal — even if you switch to a different
-terminal tab while the prompts are still open.
+terminal tab while the prompt is still open.
 
 ### Which terminal receives the macro
 
@@ -256,6 +261,7 @@ do not retype what Nexus already knows. Write them as `${profile.<field>}`:
 | `${profile.port}` | its SSH port |
 | `${profile.username}` | the username it connects as — the linked **auth profile**'s where one supplies it, the server's own otherwise |
 | `${profile.ipmiHost}` | its **IPMI / BMC Host** (Advanced section of the server form — filled in automatically on servers synced from a NetBox device that carries an out-of-band IP) |
+| `${profile.ipmiUsername}` | the username of its **IPMI Auth Profile** (Advanced section of the server form). The BMC's own account, separate from the SSH one; only the profile's username and saved password are used, never its authentication type or key file |
 
 Nothing else is exposed — key paths, ids and inventory bookkeeping are
 deliberately not addressable.
@@ -286,7 +292,7 @@ checked:
 |---|---|
 | `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:` — the address only, no `https://` and no path. `[` and `]` only as a whole bracketed IPv6 literal, with an optional port: `[fe80::1]`, `[::ffff:10.0.0.1]`, `[fe80::1]:623` |
 | `${profile.port}` | digits |
-| `${profile.username}` | letters, digits, `.`, `_`, `-`, and at most one `@` *between* the name and the realm — `admin`, `first.last`, `user@REALM.EXAMPLE.COM`. A leading, trailing or repeated `@` is refused |
+| `${profile.username}`, `${profile.ipmiUsername}` | letters, digits, `.`, `_`, `-`, and at most one `@` *between* the name and the realm — `admin`, `first.last`, `user@REALM.EXAMPLE.COM`. A leading, trailing or repeated `@` is refused |
 | `${profile.name}` | letters, digits (any language — accents included), spaces, and `.`, `-`, `_`, `/`, `:`, `,`, `+`. Everything else is refused |
 
 No value may contain a `$` or a backtick, in any token. A profile carrying shell
@@ -386,6 +392,83 @@ has: a rule fired by terminal output has no server to resolve the tokens
 against. The macro editor refuses the combination, and a macro that reaches the
 store some other way (a hand-edited settings file, an import) simply never
 compiles a trigger rule.
+
+## Providing IPMI credentials
+
+`ipmitool` can read the BMC password from the environment instead of the command
+line — that is what its `-E` flag does, and it is why the shipped IPMI templates
+use `-E` and never `-P`. A password on a command line is visible in `ps` on the
+machine that runs it, in the terminal's scrollback, and in Nexus's own
+*Copy All to Clipboard* transcript; a password in the environment is readable
+only by the same OS user, and dies with the terminal.
+
+Two things have to be in place.
+
+**1. Link an IPMI Auth Profile to the server.** In the server form, under
+Advanced, beside **IPMI / BMC Host**. It is the same auth profile store you use
+for SSH — an IPMI credential is a username and a password, which is exactly what
+an auth profile holds — so one shared BMC account can be linked from every
+server in the fleet. Only its **username** and its saved **password** are used
+here; its authentication type and key file are ignored on this link, so a
+`key` or `agent` profile is accepted and simply supplies a username. The
+username is also what `${profile.ipmiUsername}` resolves to.
+
+**2. Tick "Provide IPMI credentials" on the macro.** It appears in the macro
+editor under **Run in**, and only when Run in is *Local terminal* — the only
+place it can mean anything. Ticking it puts the linked profile's password into
+that macro's terminal as `IPMITOOL_PASSWORD` and `IPMI_PASSWORD` (both, because
+which one ipmitool honours has changed between versions). Every command the
+macro runs in that terminal can read it, which is why it is off unless you turn
+it on, and why the hint says to leave it off for anything that is not an
+ipmitool command.
+
+If no password is stored for the linked profile — or no profile is linked at all
+— Nexus asks for one when the macro runs: masked, used for that run only, never
+saved. Cancelling the prompt cancels the run; a terminal without the variable is
+not what you asked for.
+
+A macro that uses `${profile.ipmiHost}` or `${profile.ipmiUsername}` **without**
+the checkbox still runs. `ipmitool -E` then prompts or fails on its own, and the
+send confirmation tells you which switch is missing. Token usage is a hint, never
+an authorization: a macro's text is something anyone can write, so it can never
+be what decides that a stored password is handed over.
+
+### Capability settings are never imported
+
+**Provide IPMI credentials** is stripped from every macro that arrives from
+outside this installation — a shared bundle *and* a restored backup, without
+exception. A shared macro could otherwise arrive already armed, and its first
+run would hand the BMC password to whatever its text does with the environment,
+with you never having seen the checkbox. Provenance is not something the import
+can check (a backup file is an ordinary file; nothing in it says whose it is),
+so the rule is the same on both paths and worth remembering in one sentence:
+after a restore, re-tick the box on the IPMI macros you trust.
+
+Inserting a template is not an import — it is you, on this machine, asking for a
+specific command — so the shipped IPMI templates keep the flag they ship with.
+
+## One-click BMC actions
+
+Two commands on a server's right-click menu do the common jobs without going
+through the macro picker:
+
+- **Connect BMC Serial Console** opens a local terminal already running
+  ` ipmitool -I lanplus -H <IPMI / BMC Host> -U <IPMI username> -E sol activate`,
+  with the credential environment supplied exactly as a ticked macro would get
+  it. Choosing the command *is* the consent — there is no stored record here to
+  arrive pre-armed from somewhere else, which is what the macro checkbox exists
+  to guard against.
+- **Open BMC Web Console** opens the BMC's web interface in your default
+  browser. HTTPS unless the server's **BMC Web Protocol** (Advanced, beside the
+  other IPMI fields) is set to HTTP — some older iDRAC/iLO cards serve nothing
+  else, and HTTP sends your BMC login in clear text over the management network,
+  so it is a per-server opt-in. There is no auto-login: it opens the address, and
+  the BMC asks for whatever it asks for.
+
+Both are listed on every server, configured or not — the menu never hides them —
+and a server missing a piece gets an error naming the field and where to set it,
+with an **Edit Server** button that opens the form with Advanced already
+expanded.
 
 ## Where a macro runs
 

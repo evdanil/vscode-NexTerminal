@@ -146,6 +146,10 @@ const unsupportedCommands = [
   "nexus.script.revealInExplorer",
   "nexus.server.runWithScript",
   "nexus.server.runMacro",
+  // Both need a local shell (ipmitool) or a desktop browser handoff, neither of
+  // which the web host provides — the ordinary desktop-only fallback.
+  "nexus.server.connectBmcSol",
+  "nexus.server.openBmcWebConsole",
   "nexus.serial.runWithScript",
   "nexus.server.testConnection",
   "nexus.serial.testConnection",

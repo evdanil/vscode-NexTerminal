@@ -80,6 +80,30 @@ export interface TerminalMacro {
    * macro that got past it anyway.
    */
   runIn?: MacroRunTarget;
+  /**
+   * OPT-IN (issue #48 Phase 3): give this macro's local terminal the linked IPMI
+   * auth profile's password in `IPMITOOL_PASSWORD` / `IPMI_PASSWORD`, so
+   * `ipmitool -E` can read it without the password ever reaching the command
+   * line. Only meaningful for `runIn: "localTerminal"`.
+   *
+   * ABSENT MEANS FALSE — no injection — so every existing macro, every macro
+   * from an older build, and every imported one is non-privileged by default.
+   * UNTRUSTED at every read site like `runIn` and `group`: go through
+   * `macroProvidesIpmiCredentials()`, which tests `=== true`, so a non-boolean
+   * absorbed from legacy settings can never become consent.
+   *
+   * WHY A STORED FLAG RATHER THAN "the text looks like ipmitool". Token presence
+   * is not consent: a macro whose text merely mentions `${profile.ipmiHost}` —
+   * a `ping`, a `curl`, an imported macro written to look innocuous — would
+   * otherwise get the fleet-wide BMC password in an environment every command it
+   * runs can read. The macro text is user-editable data, not an authorization
+   * decision.
+   *
+   * NEVER SURVIVES AN IMPORT (`IMPORTED_CAPABILITY_FIELDS`,
+   * commands/configCommands.ts): a stored consent flag is only consent if the
+   * person it binds is the person who ticked it.
+   */
+  provideIpmiCredentials?: boolean;
 }
 
 /**
@@ -94,6 +118,25 @@ export function resolveMacroRunTarget(macro: Pick<TerminalMacro, "runIn">): Macr
   return typeof raw === "string" && (MACRO_RUN_TARGETS as readonly string[]).includes(raw)
     ? (raw as MacroRunTarget)
     : "session";
+}
+
+/**
+ * Does a run of this macro get the linked IPMI profile's password in its
+ * terminal environment? The ONE read site for `provideIpmiCredentials`, so the
+ * two halves of the gate that live on the record — the flag being exactly
+ * `true`, and the run actually being a local terminal — cannot be asked
+ * separately or asked differently by two callers.
+ *
+ * The third half is not on the record and stays at the call site: a password
+ * must actually be obtained (vault or masked prompt), so a cancelled prompt
+ * aborts the run rather than spawning an env-less terminal.
+ *
+ * `=== true`, never truthiness — see the field's doc.
+ */
+export function macroProvidesIpmiCredentials(
+  macro: Pick<TerminalMacro, "runIn" | "provideIpmiCredentials">
+): boolean {
+  return resolveMacroRunTarget(macro) === "localTerminal" && (macro.provideIpmiCredentials as unknown) === true;
 }
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */

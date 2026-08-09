@@ -599,6 +599,13 @@ export class MacroEditorPanel {
         // stored — absent MEANS "session", so writing it explicitly would put a
         // field on every macro that no build before this one understands.
         delete macro.runIn;
+        // Issue #48 §3.3 — same delete-then-conditionally-re-add shape, and it
+        // carries more than tidiness here: without the unconditional delete,
+        // un-ticking the box (or moving the macro off "Local terminal") would
+        // leave a stored `true` alive through the `{ ...existingMacro }` spread,
+        // so a macro the user had just de-privileged would keep receiving the
+        // BMC password. Absent means false; a `false` is never written.
+        delete macro.provideIpmiCredentials;
         // §4.1 — "" canonicalizes to `undefined`; only a non-empty normalized
         // path is ever persisted. The untouched case re-attaches the stored
         // string byte-for-byte instead (see the Folder-field comment above);
@@ -611,6 +618,13 @@ export class MacroEditorPanel {
           macro.group = normalizedGroup;
         }
         if (runIn !== "session") macro.runIn = runIn;
+        // `=== true` on the message, and gated on the RESOLVED run target rather
+        // than on what the webview showed: the flag means nothing anywhere but a
+        // local terminal, and storing it on a session macro would leave a
+        // capability armed on a record where no UI renders it.
+        if (runIn === "localTerminal" && (msg.provideIpmiCredentials as unknown) === true) {
+          macro.provideIpmiCredentials = true;
+        }
         if (secret) macro.secret = true;
         else delete macro.secret;
         const triggerCooldown = msg.triggerCooldown as number | undefined;
