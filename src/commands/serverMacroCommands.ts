@@ -6,8 +6,8 @@ import { getMacros } from "../macroSettings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { sanitizeMacroGroup } from "../services/macroFolders";
-import { hasProfileTokens, profileTokenLabel, profileTokensUsed, resolveProfileTokens } from "../services/profileTokens";
-import type { ProfileTokenError, ProfileTokenForm } from "../services/profileTokens";
+import { formatProfileTokenErrorForCommand, hasProfileTokens, profileTokenLabel, profileTokensUsed, resolveProfileTokens } from "../services/profileTokens";
+import type { ProfileTokenError, ProfileTokenErrorCommandSubject, ProfileTokenForm } from "../services/profileTokens";
 import { profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 import { macroWillPrompt } from "./macroCommands";
@@ -260,8 +260,36 @@ export function ipmiCredentialsOffNote(macro: TerminalMacro): string | undefined
   if (resolveMacroRunTarget(macro) !== "localTerminal" || macroProvidesIpmiCredentials(macro)) {
     return undefined;
   }
+  // C4 — kept short so the actionable tail survives the 4s status bar clip; the
+  // fuller explanation now lives in the persistent macro-editor hint (B1). No
+  // trailing period: the status line (macroVariablePrompt.ts) adds its own.
   return usesIpmiTokens(macro.text)
-    ? 'it uses IPMI tokens but is not set to receive IPMI credentials, so ipmitool will prompt or fail — tick "Provide IPMI credentials" in the macro editor'
+    ? 'IPMI credentials were not provided — tick "Provide IPMI credentials" in the macro editor'
+    : undefined;
+}
+
+/** An `ipmitool …` invocation in a macro's text — at line start or after whitespace. */
+const IPMITOOL_COMMAND_RE = /(^|\s)ipmitool\b/;
+
+/**
+ * The caveat for a SESSION-target macro whose text reaches for a BMC — it uses an
+ * IPMI token or invokes ipmitool — but was typed into the connected SSH session,
+ * so it ran on the REMOTE host, not this machine (issue #48 PR-B, "Ogun's case":
+ * a legacy session macro running ipmitool got no IPMI messaging at all).
+ *
+ * A HINT, not a gate. Text/token inspection is sanctioned as a hint only (§3.3),
+ * so this never blocks or reroutes the run — it appends one clause pointing at
+ * "Run in" in the editor. Kept short because it shares the same 4s status bar the
+ * other delivery notes clip in (C4).
+ *
+ * Lowercase, unpunctuated: appended as a clause, like the sibling notes.
+ */
+export function sessionIpmiHintNote(macro: TerminalMacro): string | undefined {
+  if (resolveMacroRunTarget(macro) !== "session") {
+    return undefined;
+  }
+  return usesIpmiTokens(macro.text) || IPMITOOL_COMMAND_RE.test(macro.text)
+    ? 'ran in the SSH session on the remote host — set "Run in" to Local terminal to run ipmitool from this machine'
     : undefined;
 }
 
@@ -412,15 +440,32 @@ async function resolveServerSessionTarget(
  * failure is. Exported because the direct BMC commands (`bmcCommands.ts`) refuse
  * through the SAME pathway rather than inventing their own error copy — the
  * fields they need are the fields a macro needs, and the repair is the same form.
+ *
+ * `subject` re-phrases the message for a menu-invoked command, where the default
+ * "…but this macro uses ${profile.X}" is wrong because there is no macro (C1). The
+ * macro path passes none and keeps the original copy verbatim.
  */
-export async function reportProfileTokenError(error: ProfileTokenError, server: ServerConfig): Promise<void> {
-  const action = await vscode.window.showErrorMessage(error.message, "Edit Server");
+export async function reportProfileTokenError(
+  error: ProfileTokenError,
+  server: ServerConfig,
+  subject?: ProfileTokenErrorCommandSubject
+): Promise<void> {
+  const message = subject ? formatProfileTokenErrorForCommand(error, subject) : error.message;
+  const action = await vscode.window.showErrorMessage(message, "Edit Server");
   if (action === "Edit Server") {
-    // `expandAdvanced` — "IPMI / BMC Host" is an advanced field, so without it
-    // the button lands on a form with the field the error named collapsed out
-    // of sight.
-    await vscode.commands.executeCommand("nexus.server.edit", { server, expandAdvanced: true });
+    await openServerAdvancedEdit(server);
   }
+}
+
+/**
+ * The "Edit Server" repair route with Advanced options expanded — "IPMI / BMC
+ * Host" is an advanced field, so without `expandAdvanced` the button lands on a
+ * form with the field the error named collapsed out of sight. Shared by the token
+ * refusal above and the BMC web-address error (bmcCommands.ts, C5), so every
+ * missing-piece BMC error offers the identical repair (docs/macros.md).
+ */
+export async function openServerAdvancedEdit(server: ServerConfig): Promise<void> {
+  await vscode.commands.executeCommand("nexus.server.edit", { server, expandAdvanced: true });
 }
 
 /**
@@ -511,7 +556,8 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // delivery report, because everything below can still abort.
   const deliveryNote = combineDeliveryNotes(
     unknownTokenNote(resolution.unknownTokens),
-    ipmiCredentialsOffNote(macro)
+    ipmiCredentialsOffNote(macro),
+    sessionIpmiHintNote(macro)
   );
 
   // THE CREDENTIAL GATE (issue #48 §3.3). Three conditions, all required, and

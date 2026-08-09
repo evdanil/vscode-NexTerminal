@@ -182,7 +182,9 @@ describe("renderMacroEditorHtml", () => {
   it("says exactly what the flag grants, and where it goes", () => {
     const html = render([], null);
     expect(html).toContain("IPMITOOL_PASSWORD/IPMI_PASSWORD");
-    expect(html).toContain("Every command this macro runs in that terminal can read it.");
+    // C3 — the hint now states the grant's real lifetime (the env belongs to the
+    // terminal, which outlives the macro).
+    expect(html).toContain("Every command run in that terminal — by this macro or typed later — can read it.");
     expect(html).toContain("Leave this off unless the macro is an ipmitool command.");
   });
 

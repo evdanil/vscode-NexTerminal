@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { TerminalMacro } from "../models/terminalMacro";
+import { stripImportedCapabilityFields } from "../models/terminalMacro";
 import {
   assignIdsForAbsorbedMacros,
   assignMacroIds,
@@ -800,9 +801,26 @@ export class VscodeMacroStore implements MacroStore {
     // per-record loop below passes non-objects through verbatim. It stays on disk until
     // a save the user actually asks for rewrites the list.
     const keyed = assignIdsForAbsorbedMacros(existingOnDisk, absorbed.filter(isUsableMacro));
-    const assigned = [...keyed.existing, ...keyed.absorbed].map((m) =>
-      m && typeof m === "object" ? dropNonPathGroup(withRedactedVariables(m)) : m
-    );
+    // The ABSORBED half additionally has its capability flags stripped
+    // (`stripImportedCapabilityFields`, shared with `sanitizeImportedMacro` so
+    // "stripped on EVERY import path" holds — legacy `nexus.terminal.macros`
+    // absorption is one of those paths). Absorbed values arrive via Settings Sync
+    // replay or a checked-in `.vscode/settings.json` in an opened repo, both
+    // attacker-controllable, so a `provideIpmiCredentials: true` reaching this
+    // path is unearned consent and must not persist.
+    //
+    // The EXISTING half is deliberately NOT stripped — same reason it is not
+    // `isUsableMacro`-filtered: those records are already in MACROS_KEY and this
+    // routine runs at every activation, so rewriting them here is the class of
+    // activation-time write this branch removed. An already-persisted armed flag
+    // is only reachable if a PRIOR absorb wrote it, which this strip now prevents
+    // going forward.
+    const assigned = [
+      ...keyed.existing.map((m) => (m && typeof m === "object" ? dropNonPathGroup(withRedactedVariables(m)) : m)),
+      ...keyed.absorbed.map((m) =>
+        m && typeof m === "object" ? dropNonPathGroup(withRedactedVariables(stripImportedCapabilityFields(m))) : m
+      )
+    ];
 
     const vaultStores: Array<{ id: string; value: string }> = [];
     const onDisk: TerminalMacro[] = [];

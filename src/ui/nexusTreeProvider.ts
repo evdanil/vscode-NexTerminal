@@ -56,7 +56,11 @@ export class ServerTreeItem extends vscode.TreeItem {
     // snapshot.inventorySources against server.origin.sourceId), or undefined
     // when the source no longer exists (removed, but this server's origin
     // wasn't stripped) — the tooltip falls back to a generic line in that case.
-    syncedSourceName?: string
+    syncedSourceName?: string,
+    // D3 — the linked IPMI Auth Profile's name, so the tooltip's IPMI line
+    // predicts whether Connect BMC Serial Console will find a username/password
+    // or prompt. Resolved by the caller against `server.ipmiAuthProfileId`.
+    ipmiAuthProfileName?: string
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -69,7 +73,10 @@ export class ServerTreeItem extends vscode.TreeItem {
     const syncedSuffix = server.origin ? (syncedSourceName ? `\nSynced from "${syncedSourceName}"` : "\nSynced from inventory") : "";
     // Issue #48 — the out-of-band address is not part of the SSH connection, so
     // it gets its own line rather than joining the `user@host:port` summary.
-    const ipmiSuffix = typeof server.ipmiHost === "string" && server.ipmiHost.trim() ? `\nIPMI/BMC: ${server.ipmiHost.trim()}` : "";
+    // D3 — mirror the SSH `authSuffix` idiom so a linked IPMI profile is visible
+    // on the IPMI line; shown only when the line itself is (a server with a host).
+    const ipmiAuthSuffix = ipmiAuthProfileName ? ` [auth: ${ipmiAuthProfileName}]` : "";
+    const ipmiSuffix = typeof server.ipmiHost === "string" && server.ipmiHost.trim() ? `\nIPMI/BMC: ${server.ipmiHost.trim()}${ipmiAuthSuffix}` : "";
     this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${syncedSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
@@ -596,6 +603,7 @@ export class NexusTreeProvider
     // `authProfile.username` directly showed an imported profile's
     // whitespace-only username as the server's, rendering "@host:22" in the
     // label and tooltip while the connection uses the server's own username.
+    const ipmiAuthProfile = server.ipmiAuthProfileId ? this.authProfileById.get(server.ipmiAuthProfileId) : undefined;
     return new ServerTreeItem(
       server,
       connected,
@@ -603,7 +611,8 @@ export class NexusTreeProvider
       showDesc,
       authProfile?.name,
       authProfileOwnedCredentials(authProfile).username,
-      syncedSourceName
+      syncedSourceName,
+      ipmiAuthProfile?.name
     );
   }
 

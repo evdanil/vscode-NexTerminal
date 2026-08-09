@@ -209,7 +209,12 @@ function ipmiAuthProfileSelectField(
     label: "IPMI Auth Profile",
     options: [
       { label: "(None)", value: "" },
-      ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id }))
+      ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
+      // C2 — same inline-create escape hatch as the SSH select above, so an empty
+      // list is not a dead end. NO `autofill` on this field (see the header), so
+      // the created profile is appended and selected without mirroring anything
+      // into the SSH controls — the BMC login and the SSH login are separate.
+      { label: "Create new auth profile…", value: "__create__authProfile" }
     ],
     value: selectedId ?? "",
     hint:

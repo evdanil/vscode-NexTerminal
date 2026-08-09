@@ -660,11 +660,13 @@ describe("formDefinitions — IPMI auth profile and BMC web protocol", () => {
     expect(field.advanced).toBe(true);
     expect(field.value).toBe("ap-bmc");
     if (field.type === "select") {
-      expect(field.options.map((o) => o.value)).toEqual(["", "ap-ssh", "ap-bmc"]);
-      // No inline "Create new auth profile…" here: that option is wired to the
-      // SSH select's own creation flow (`__create__authProfile`), which mirrors
-      // the created profile into the form's SSH credential fields.
-      expect(field.options.some((o) => o.value.startsWith("__create__"))).toBe(false);
+      // C2 — the inline "Create new auth profile…" escape hatch is offered here
+      // too, so an empty list is not a dead end. It shares the SSH select's
+      // sentinel (`__create__authProfile`); the follow-up MIRRORING into the SSH
+      // credential fields is gated on autofill, which this field does not set
+      // (see the autofill test below), so a created profile is appended and
+      // selected without touching the SSH controls.
+      expect(field.options.map((o) => o.value)).toEqual(["", "ap-ssh", "ap-bmc", "__create__authProfile"]);
     }
   });
 

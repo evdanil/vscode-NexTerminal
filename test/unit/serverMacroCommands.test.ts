@@ -74,7 +74,8 @@ import { setActiveMacroStore } from "../../src/macroSettings";
 import {
   buildServerMacroPicks,
   resolveMacroBrowserUrl,
-  runMacroOnServer
+  runMacroOnServer,
+  sessionIpmiHintNote
 } from "../../src/commands/serverMacroCommands";
 
 const store = new InMemoryMacroStore();
@@ -1065,7 +1066,8 @@ describe("nexus.server.runMacro — IPMI credential injection (issue #48 §3.3)"
     // …and says what to do about it, in the channel that survives to the end of
     // the run.
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join(" ");
-    expect(status).toContain("not set to receive IPMI credentials");
+    // C4 — shortened so the actionable tail survives the 4s status-bar clip.
+    expect(status).toContain("IPMI credentials were not provided");
     expect(status).toContain("Provide IPMI credentials");
   });
 
@@ -1201,5 +1203,51 @@ describe("an imported macro cannot arrive pre-armed (issue #48 §3.5)", () => {
     expect(showInputBox).not.toHaveBeenCalled();
     // The password is nowhere in this run at all.
     expect(createdTerminals[0].sent.join("")).not.toContain("s3cr3t-bmc");
+  });
+});
+
+/**
+ * B1 (issue #48 PR-B) — Ogun's exact case: a SESSION-target macro whose text runs
+ * ipmitool got zero IPMI messaging. The scan is a HINT, not a gate: it only appends
+ * a delivery-note clause pointing at "Run in". If the scan were removed, the
+ * "note present" cases below revert to `undefined` and fail.
+ */
+describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
+  it("returns the hint for a session macro that invokes ipmitool", () => {
+    const note = sessionIpmiHintNote({ id: "a", name: "SOL", text: "ipmitool -H 10.0.0.9 sol activate\n", runIn: "session" });
+    expect(note).toBeDefined();
+    expect(note).toContain("SSH session");
+    expect(note).toContain("Local terminal");
+  });
+
+  it("returns the hint for a session macro that uses an IPMI token (even without the literal word ipmitool)", () => {
+    const note = sessionIpmiHintNote({ id: "a", name: "BMC", text: "ping -c1 ${profile.ipmiHost}\n", runIn: "session" });
+    expect(note).toBeDefined();
+  });
+
+  it("treats an ABSENT runIn as session and still hints", () => {
+    // Absent means session — the compatibility default — so a legacy macro (the
+    // whole point of B1) is covered.
+    const note = sessionIpmiHintNote({ id: "a", name: "SOL", text: "ipmitool chassis power status\n" });
+    expect(note).toBeDefined();
+  });
+
+  it("returns nothing for a session macro whose text has nothing to do with IPMI", () => {
+    expect(sessionIpmiHintNote({ id: "a", name: "Reload", text: "reload\n", runIn: "session" })).toBeUndefined();
+  });
+
+  it("does not fire on a word that merely contains 'ipmitool' as a substring", () => {
+    // Word-boundary anchored — `myipmitoolwrapper` is not an ipmitool invocation.
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text: "myipmitoolwrapper --run\n", runIn: "session" })).toBeUndefined();
+  });
+
+  it("returns nothing for a localTerminal ipmitool macro — that path is ipmiCredentialsOffNote's, not this one", () => {
+    expect(
+      sessionIpmiHintNote({ id: "a", name: "SOL", text: "ipmitool -H 10.0.0.9 sol activate\n", runIn: "localTerminal" })
+    ).toBeUndefined();
+  });
+
+  it("returns nothing for a browser macro", () => {
+    expect(sessionIpmiHintNote({ id: "a", name: "Web", text: "https://10.0.0.9/\n", runIn: "browser" })).toBeUndefined();
   });
 });

@@ -417,10 +417,11 @@ username is also what `${profile.ipmiUsername}` resolves to.
 editor under **Run in**, and only when Run in is *Local terminal* — the only
 place it can mean anything. Ticking it puts the linked profile's password into
 that macro's terminal as `IPMITOOL_PASSWORD` and `IPMI_PASSWORD` (both, because
-which one ipmitool honours has changed between versions). Every command the
-macro runs in that terminal can read it, which is why it is off unless you turn
-it on, and why the hint says to leave it off for anything that is not an
-ipmitool command.
+which one ipmitool honours has changed between versions). The environment belongs
+to the terminal, which outlives the macro run: every command run in that terminal
+— this macro's, or anything you type there afterwards — can read it, which is why
+it is off unless you turn it on, and why the hint says to leave it off for
+anything that is not an ipmitool command.
 
 If no password is stored for the linked profile — or no profile is linked at all
 — Nexus asks for one when the macro runs: masked, used for that run only, never
@@ -432,6 +433,19 @@ the checkbox still runs. `ipmitool -E` then prompts or fails on its own, and the
 send confirmation tells you which switch is missing. Token usage is a hint, never
 an authorization: a macro's text is something anyone can write, so it can never
 be what decides that a stored password is handed over.
+
+### Upgrading an older IPMI macro
+
+**Run in** did not always exist, so a macro created before it defaults to *Session
+terminal* — which types the command into the connected SSH session, running it on
+the remote host rather than from this machine. An `ipmitool` command written that
+way runs wherever the session is, not against the BMC the way the templates
+intend. To upgrade one: open the macro, set **Run in** → *Local terminal*, replace
+`-P $password` (or a typed-in password) with `-E`, and tick **Provide IPMI
+credentials**. The macro editor shows a hint the moment it sees an ipmitool
+command still set to *Session terminal*, and the send confirmation says the same.
+The alternative is to delete the macro and re-insert the shipped template, which
+already has all of this set.
 
 ### Capability settings are never imported
 
@@ -464,6 +478,11 @@ through the macro picker:
   else, and HTTP sends your BMC login in clear text over the management network,
   so it is a per-server opt-in. There is no auto-login: it opens the address, and
   the BMC asks for whatever it asks for.
+
+The **BMC Web Protocol** setting affects only the **Open BMC Web Console**
+command — the browser web-console *macro template* writes its own `https://`
+scheme into its text, so changing the protocol does not change what an
+already-inserted template opens; edit the macro's URL, or use the command.
 
 Both are listed on every server, configured or not — the menu never hides them —
 and a server missing a piece gets an error naming the field and where to set it,

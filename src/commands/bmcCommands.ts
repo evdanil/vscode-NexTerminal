@@ -3,7 +3,7 @@ import type { ServerConfig } from "../models/config";
 import { resolveBmcWebProtocol } from "../models/config";
 import { resolveProfileTokens } from "../services/profileTokens";
 import { profileTokenServer, resolveIpmiTerminalEnv } from "./ipmiCredentials";
-import { reportProfileTokenError, resolveMacroBrowserUrl } from "./serverMacroCommands";
+import { openServerAdvancedEdit, reportProfileTokenError, resolveMacroBrowserUrl } from "./serverMacroCommands";
 import { pickServer, toServerFromArg } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -84,11 +84,15 @@ export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise
 
   const resolution = resolveProfileTokens(BMC_SOL_COMMAND, profileTokenServer(ctx, server), { form: "command" });
   if (!resolution.ok) {
-    await reportProfileTokenError(resolution.error, server);
+    // Subject-phrased: a menu click has no macro, so the refusal names the command
+    // that needed the field, not "this macro" (C1).
+    await reportProfileTokenError(resolution.error, server, { subject: "Connect BMC Serial Console", outcome: "run" });
     return;
   }
 
-  const credential = await resolveIpmiTerminalEnv(ctx, server, { purpose: "BMC" });
+  // D2 — the same vault password the macro path titles "IPMI password for …";
+  // the field family is "IPMI", so both prompts use it rather than drifting to "BMC".
+  const credential = await resolveIpmiTerminalEnv(ctx, server, { purpose: "IPMI" });
   if (credential.kind === "cancelled") {
     vscode.window.setStatusBarMessage(`BMC console for "${server.name}" cancelled — nothing was run.`, 4000);
     return;
@@ -122,7 +126,7 @@ export async function openBmcWebConsole(ctx: CommandContext, arg?: unknown): Pro
     form: "url"
   });
   if (!resolution.ok) {
-    await reportProfileTokenError(resolution.error, server);
+    await reportProfileTokenError(resolution.error, server, { subject: "Open BMC Web Console", outcome: "opened" });
     return;
   }
 
@@ -132,9 +136,15 @@ export async function openBmcWebConsole(ctx: CommandContext, arg?: unknown): Pro
   // that what came out is a URL an external open may be handed.
   const url = resolveMacroBrowserUrl(resolution.text);
   if (!url) {
-    void vscode.window.showErrorMessage(
-      `The IPMI / BMC Host of "${server.name}" does not form a usable web address. Check it under Advanced options in the server form. Nothing was opened.`
+    // C5 — every missing-piece BMC error carries the same Edit Server (Advanced
+    // expanded) repair the token refusals do; the message already names the field.
+    const action = await vscode.window.showErrorMessage(
+      `The IPMI / BMC Host of "${server.name}" does not form a usable web address. Check it under Advanced options in the server form. Nothing was opened.`,
+      "Edit Server"
     );
+    if (action === "Edit Server") {
+      await openServerAdvancedEdit(server);
+    }
     return;
   }
 

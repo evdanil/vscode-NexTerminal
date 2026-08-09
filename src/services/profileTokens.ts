@@ -139,6 +139,47 @@ export interface ProfileTokenError {
   serverName: string;
   /** Ready-to-show sentence; never contains the macro text. */
   message: string;
+  /**
+   * The raw offending value on an `"invalid"` error, so a caller re-rendering the
+   * message for a different subject (see `formatProfileTokenErrorForCommand`) can
+   * reproduce the `("…")` fragment without re-resolving. Absent on `"missing"`.
+   */
+  value?: string;
+}
+
+/**
+ * The subject a menu-invoked COMMAND supplies so a token refusal can say what
+ * needed the field — there is no macro to point at. `subject` is the command's
+ * own name ("Connect BMC Serial Console"); `outcome` is the verb tail, so
+ * "Nothing was run." / "Nothing was opened." matches what the command does.
+ */
+export interface ProfileTokenErrorCommandSubject {
+  subject: string;
+  outcome: string;
+}
+
+/**
+ * Re-render a token refusal for a menu-invoked command (bmcCommands.ts) instead
+ * of a macro run. The default `error.message` reads "…but this macro uses
+ * ${profile.X}", which is wrong at a command click where no macro exists (C1,
+ * issue #48 PR-B). This is a SEPARATE rendering off the same structured error —
+ * the macro-path copy in `missingError`/`invalidError` is untouched.
+ */
+export function formatProfileTokenErrorForCommand(
+  error: ProfileTokenError,
+  { subject, outcome }: ProfileTokenErrorCommandSubject
+): string {
+  const label = PROFILE_TOKEN_FIELD_LABELS[error.token];
+  if (error.kind === "missing") {
+    return (
+      `"${error.serverName}" has no ${label} set — ${subject} needs it. ` +
+      `Add it ${PROFILE_TOKEN_FIELD_LOCATION[error.token]}. Nothing was ${outcome}.`
+    );
+  }
+  return (
+    `The ${label} of "${error.serverName}" ("${displayValue(error.value ?? "")}") has characters that ` +
+    `can't be placed in a command or URL. ${PROFILE_TOKEN_CHARSET_GUIDANCE[error.token]} Nothing was ${outcome}.`
+  );
 }
 
 export interface ProfileTokenResolution {
@@ -791,6 +832,7 @@ function invalidError(token: ProfileTokenName, serverName: string, value: string
     kind: "invalid",
     token,
     serverName,
+    value,
     message:
       `The ${PROFILE_TOKEN_FIELD_LABELS[token]} of "${serverName}" ("${displayValue(value)}") has characters that ` +
       `can't be placed in a command or URL. ${PROFILE_TOKEN_CHARSET_GUIDANCE[token]} Nothing was sent.`

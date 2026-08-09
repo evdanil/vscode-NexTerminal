@@ -867,4 +867,108 @@ describe("MacroStore legacy migration", () => {
       expect(store.getAll()[0].id).toBe("existing-id");
     });
   });
+
+  describe("A1 — capability flags never survive legacy-settings absorption (issue #48 PR-B)", () => {
+    // The strip lives in `sanitizeImportedMacro` (backup/share import) AND now the
+    // absorb path (`persistLegacyMigration`), sharing ONE field list
+    // (`stripImportedCapabilityFields`). `nexus.terminal.macros` values are
+    // attacker-controllable — a checked-in `.vscode/settings.json` reaches
+    // `workspaceValue`/`workspaceFolderValue`, a Settings Sync replay reaches
+    // `globalValue` — so an armed `provideIpmiCredentials: true` reaching the store
+    // would inject the fleet-wide BMC password with no checkbox ever ticked.
+
+    it("strips provideIpmiCredentials from an absorbed GLOBAL-value macro — field ABSENT, not false", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [
+          { name: "BMC power", text: "ipmitool -E chassis power status\n", runIn: "localTerminal", provideIpmiCredentials: true }
+        ] as TerminalMacro[]
+      });
+      const { ctx, state } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+      await store.initialize();
+
+      const persisted = state.get("nexus.macros") as TerminalMacro[];
+      const m = persisted.find((r) => r.name === "BMC power")!;
+      expect("provideIpmiCredentials" in m).toBe(false);
+      expect(store.getAll().find((r) => r.name === "BMC power")!.provideIpmiCredentials).toBeUndefined();
+      // The rest of the record is intact — the strip is surgical, not a rewrite.
+      expect(m.runIn).toBe("localTerminal");
+    });
+
+    it("strips `route` from an absorbed WORKSPACE-value macro — field ABSENT", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        workspace: [
+          { name: "Gateway run", text: "reload\n", route: "ipmi-gateway" } as unknown as TerminalMacro
+        ]
+      });
+      const { ctx, state } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+      await store.initialize();
+
+      const persisted = state.get("nexus.macros") as TerminalMacro[];
+      const m = persisted.find((r) => r.name === "Gateway run")!;
+      expect("route" in m).toBe(false);
+    });
+
+    it("strips provideIpmiCredentials: FALSE too — the strip deletes, never normalizes (guards against a `=== true`-only fix)", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      vscode.__setConfig("nexus.terminal", {
+        global: [
+          { name: "Explicit off", text: "echo hi\n", runIn: "localTerminal", provideIpmiCredentials: false }
+        ] as TerminalMacro[]
+      });
+      const { ctx, state } = makeCtx();
+      const store = new VscodeMacroStore(ctx);
+      await store.initialize();
+
+      const persisted = state.get("nexus.macros") as TerminalMacro[];
+      const m = persisted.find((r) => r.name === "Explicit off")!;
+      // A stored `false` re-exports a decision the user never made, so it must be
+      // absent, not `false`.
+      expect("provideIpmiCredentials" in m).toBe(false);
+    });
+
+    it("does NOT strip an already-persisted existing record — the existing half stays byte-for-byte, no activation-time rewrite", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      const { ctx, state } = makeCtx();
+      // An armed flag already in globalState (reachable only via a prior absorb, which
+      // this fix now prevents going forward). Widening the strip to `keyed.existing`
+      // would turn this into an activation-time write of user data — the class of write
+      // the existing-half branch deliberately removed.
+      state.set("nexus.macros", [
+        { id: "kept", name: "Existing armed", text: "ipmitool -E chassis power status\n", runIn: "localTerminal", provideIpmiCredentials: true }
+      ] as TerminalMacro[]);
+      // An unrelated legacy macro so persistLegacyMigration actually runs.
+      vscode.__setConfig("nexus.terminal", { global: [{ name: "new", text: "echo new" }] as TerminalMacro[] });
+
+      const store = new VscodeMacroStore(ctx);
+      await store.initialize();
+
+      const persisted = state.get("nexus.macros") as TerminalMacro[];
+      const existing = persisted.find((m) => m.id === "kept")!;
+      expect(existing.provideIpmiCredentials).toBe(true); // untouched
+      expect(persisted.map((m) => m.name).sort()).toEqual(["Existing armed", "new"]);
+    });
+
+    it("passes a non-object legacy record through verbatim while still stripping a sibling armed macro", async () => {
+      const vscode = await import("vscode") as unknown as { __setConfig: (s: string, v: Record<string, unknown>) => void };
+      const { ctx, state } = makeCtx();
+      state.set("nexus.macros", [null]);
+      vscode.__setConfig("nexus.terminal", {
+        global: [
+          { name: "Armed", text: "ipmitool -E chassis power status\n", runIn: "localTerminal", provideIpmiCredentials: true }
+        ] as TerminalMacro[]
+      });
+
+      const store = new VscodeMacroStore(ctx);
+      await store.initialize();
+
+      const persisted = state.get("nexus.macros") as unknown[];
+      expect(persisted[0]).toBeNull(); // non-object survives the map verbatim
+      const armed = (persisted as TerminalMacro[]).find((m) => m && m.name === "Armed")!;
+      expect("provideIpmiCredentials" in armed).toBe(false);
+    });
+  });
 });

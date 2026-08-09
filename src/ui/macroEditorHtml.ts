@@ -333,6 +333,11 @@ export function renderMacroEditorHtml(
     </div>
     <div class="field-error" id="error-runIn"></div>
     <div class="hint">Local terminal and Browser macros are run from a server profile (Connectivity Hub → right-click a server → Run Macro on Server…). Neither can auto-trigger.</div>
+    <!-- B1 (issue #48 PR-B) — a legacy ipmitool macro defaults to Session terminal
+         (absent runIn), which types the command into the connected SSH session, so
+         it runs on the REMOTE host. Non-blocking hint (does NOT disable Save); shown
+         only while Run in = Session terminal AND the text looks like ipmitool. -->
+    <div class="hint" id="session-ipmitool-hint" style="display:none;">This looks like an ipmitool command. "Session terminal" types it into the connected SSH session, so it runs on the remote host. Choose "Local terminal" to run it from this machine, then tick "Provide IPMI credentials" to supply the BMC password.</div>
   </div>
 
   <!-- Issue #48 §3.3 — the IPMI credential opt-in. Shown only while Run in =
@@ -343,7 +348,7 @@ export function renderMacroEditorHtml(
       <input type="checkbox" id="macro-provide-ipmi"${provideIpmi ? " checked" : ""} />
       Provide IPMI credentials to this macro's terminal
     </label>
-    <div class="hint">Puts the server's IPMI password (from the IPMI Auth Profile linked in its server form) into the local terminal's environment as IPMITOOL_PASSWORD/IPMI_PASSWORD, so <code>ipmitool -E</code> can read it without the password ever appearing in the command line, the scrollback, or Copy All. Every command this macro runs in that terminal can read it. Leave this off unless the macro is an ipmitool command. If no password is stored, you are asked for one at run time and it is used for that run only.</div>
+    <div class="hint">Puts the server's IPMI password (from the IPMI Auth Profile linked in its server form) into the local terminal's environment as IPMITOOL_PASSWORD/IPMI_PASSWORD, so <code>ipmitool -E</code> can read it without the password ever appearing in the command line, the scrollback, or Copy All. Every command run in that terminal — by this macro or typed later — can read it. Leave this off unless the macro is an ipmitool command. If no password is stored, you are asked for one at run time and it is used for that run only.</div>
   </div>
 
   <div class="form-group">
@@ -543,6 +548,20 @@ ${folderOptionsHtml}
         var show = !!triggerVal && usesProfile;
         el.textContent = show ? PROFILE_TRIGGER_CONFLICT_MESSAGE : "";
         el.classList.toggle("visible", show);
+      }
+
+      // B1 — the same session/ipmitool HINT the host emits as a delivery note
+      // (sessionIpmiHintNote, serverMacroCommands.ts), surfaced live in the editor.
+      // Text/token inspection is sanctioned as a hint only (§3.3): this shows a
+      // note, never blocks Save.
+      function updateSessionIpmitoolHint() {
+        var runInVal = document.getElementById("macro-run-in").value;
+        var text = document.getElementById("macro-text").value;
+        var used = scanProfileTokens(text).used;
+        var usesIpmiToken = used.indexOf("ipmiHost") !== -1 || used.indexOf("ipmiUsername") !== -1;
+        var looksIpmitool = /(^|\\s)ipmitool\\b/.test(text) || usesIpmiToken;
+        var show = runInVal === "session" && looksIpmitool;
+        document.getElementById("session-ipmitool-hint").style.display = show ? "" : "none";
       }
 
       // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
@@ -883,6 +902,7 @@ ${folderOptionsHtml}
         markDirty();
         scheduleDiagnostics();
         updateProfileTriggerConflictWarning();
+        updateSessionIpmitoolHint();
       });
       document.getElementById("macro-secret").addEventListener("change", markDirty);
       document.getElementById("macro-trigger").addEventListener("input", function() {
@@ -898,6 +918,7 @@ ${folderOptionsHtml}
         markDirty();
         updateRunInConflictWarning();
         updateProvideIpmiState();
+        updateSessionIpmitoolHint();
       });
       document.getElementById("macro-provide-ipmi").addEventListener("change", markDirty);
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
@@ -1117,6 +1138,7 @@ ${folderOptionsHtml}
       updateTriggerConflictWarning();
       updateRunInConflictWarning();
       updateProfileTriggerConflictWarning();
+      updateSessionIpmitoolHint();
     })();`
   });
 }

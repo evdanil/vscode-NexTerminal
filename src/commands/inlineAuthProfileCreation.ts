@@ -37,7 +37,12 @@ export function createInlineAuthProfileCreation(
       });
     },
     handleCreateInline(key) {
-      if (key !== "authProfileId" || !panel) {
+      // Both the SSH auth select (`authProfileId`) and the IPMI one
+      // (`ipmiAuthProfileId`, C2) offer "Create new auth profile…"; the new
+      // profile is appended to WHICHEVER field triggered the create. The IPMI
+      // field carries no autofill, so it never mirrors the profile into the SSH
+      // controls — that follow-up is gated on `authProfileId` in formHtml.ts.
+      if ((key !== "authProfileId" && key !== "ipmiAuthProfileId") || !panel) {
         return;
       }
 
@@ -50,7 +55,7 @@ export function createInlineAuthProfileCreation(
         if (!added) {
           return;
         }
-        panel?.addSelectOption("authProfileId", added.id, authProfileOptionLabel(added));
+        panel?.addSelectOption(key, added.id, authProfileOptionLabel(added));
         clearWatcher();
       });
     }
