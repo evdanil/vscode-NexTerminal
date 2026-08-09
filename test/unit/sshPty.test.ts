@@ -847,4 +847,58 @@ describe("SshPty", () => {
     pty.markShuttingDown("shutdown reason");
     expect(writes.length).toBe(firstRoundLen);
   });
+
+  /**
+   * REVIEW FINDING (P2) — the only signal a failed INITIAL connect emits
+   * outside this class. Everything else about the failure is unchanged and
+   * deliberately so: the error is still swallowed, the terminal is still left
+   * open with the "press any key" notice, no session opens and nothing closes —
+   * which is exactly why a caller waiting on a session (the connect-first macro
+   * flow) needs to be told.
+   */
+  it("reports a failed initial connect through onConnectFailed, and still keeps the terminal open", async () => {
+    const sshFactory = { connect: vi.fn(async () => { throw new Error("All configured authentication methods failed"); }) };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    let closed = false;
+    pty.onDidClose(() => { closed = true; });
+
+    pty.open();
+    await flushAsync();
+
+    expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
+    expect(callbacks.onConnectFailed.mock.calls[0][1]).toBe("All configured authentication methods failed");
+    // Unchanged contract: no session, no close, and the SSH layer still names
+    // the cause itself — so a caller must not repeat it.
+    expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
+    expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
+    expect(closed).toBe(false);
+    expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire onConnectFailed for a failed RECONNECT — that path rethrows to reconnect()", async () => {
+    const stream = new PassThrough();
+    const { connection, emitClose } = createConnection(stream);
+    let attempt = 0;
+    const sshFactory = {
+      connect: vi.fn(async () => {
+        attempt += 1;
+        if (attempt === 1) return connection;
+        throw new Error("host went away");
+      })
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+
+    pty.open();
+    await flushAsync();
+    emitClose();
+    pty.handleInput("r");
+    await flushAsync();
+
+    expect(sshFactory.connect).toHaveBeenCalledTimes(2);
+    expect(callbacks.onConnectFailed).not.toHaveBeenCalled();
+  });
 });

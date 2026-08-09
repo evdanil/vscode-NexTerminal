@@ -212,10 +212,34 @@ function sessionTerminalsFor(ctx: CommandContext, serverId: string): vscode.Term
 }
 
 /**
+ * How the wait below ended. The two failures are kept apart because they are
+ * different events with different things to say: a connect that was REFUSED is
+ * known-over the moment it is refused, while the timeout is the last-resort
+ * "nothing has happened for 90 seconds and I cannot tell why".
+ */
+type ConnectWatchOutcome =
+  | { kind: "session"; sessionId: string }
+  | { kind: "connect-failed" }
+  | { kind: "timeout" };
+
+/**
  * Connects `server` and waits for the session that connect produced — the same
  * new-session-by-difference watch `connectAndRunScript` uses, because
  * `connectServer` resolves when the terminal exists, not when the SSH session
  * is registered.
+ *
+ * REVIEW FINDING (P2) — A FAILED CONNECT IS NOT A TIMEOUT. `SshPty.start()`
+ * catches its own initial-connect errors (services/ssh/sshPty.ts): the terminal
+ * stays open holding a "Connection failed / press any key to close" notice, the
+ * pty is never disposed and `closeEmitter` never fires, and no session is ever
+ * registered. So neither `onDidCloseTerminal` nor `exitStatus` nor the session
+ * watch below says anything, and the flow used to sit out the FULL 90 seconds
+ * on a refused password before telling the user it had "connected" — with a
+ * macro they asked to run still pending on it. `onConnectFailed` (threaded
+ * through `ConnectServerOptions`) is that missing signal, and it is the earliest
+ * one there is: it fires from the same catch block that decides the connect is
+ * over. The timer stays as the fallback for everything it cannot cover — a
+ * connect that hangs forever, or a session that registers late.
  */
 async function connectAndAwaitSessionTerminal(
   ctx: CommandContext,
@@ -225,8 +249,9 @@ async function connectAndAwaitSessionTerminal(
     ctx.core.getSnapshot().activeSessions.filter((s) => s.serverId === server.id).map((s) => s.id)
   );
 
-  let settle: (sessionId: string | undefined) => void = () => {};
-  const opened = new Promise<string | undefined>((resolve) => {
+  let settle: (outcome: ConnectWatchOutcome) => void = () => {};
+  // First settle wins; the later ones are no-ops on an already-resolved promise.
+  const settled = new Promise<ConnectWatchOutcome>((resolve) => {
     settle = resolve;
   });
   const unsubscribe = ctx.core.onDidChange(() => {
@@ -234,15 +259,27 @@ async function connectAndAwaitSessionTerminal(
       .getSnapshot()
       .activeSessions.find((s) => s.serverId === server.id && !preExisting.has(s.id));
     if (session) {
-      settle(session.id);
+      settle({ kind: "session", sessionId: session.id });
     }
   });
-  const timer = setTimeout(() => settle(undefined), CONNECT_SESSION_TIMEOUT_MS);
+  const timer = setTimeout(() => settle({ kind: "timeout" }), CONNECT_SESSION_TIMEOUT_MS);
 
   try {
-    await connectServer(ctx, server.id, { allowAutoFileExplorer: false });
-    const sessionId = await opened;
-    if (!sessionId) {
+    await connectServer(ctx, server.id, {
+      allowAutoFileExplorer: false,
+      onConnectFailed: () => settle({ kind: "connect-failed" })
+    });
+    const outcome = await settled;
+    if (outcome.kind === "connect-failed") {
+      // DELIBERATELY DOES NOT REPEAT THE CAUSE. `SshPty.start()` has already
+      // shown "Nexus SSH connection failed for <name>: <reason>", so the only
+      // thing left unsaid is the consequence for THIS command — the macro the
+      // user asked to run went nowhere. Warning, not error, for the same
+      // reason: the error is already on screen.
+      void vscode.window.showWarningMessage(`Could not connect to "${server.name}" — nothing was sent.`);
+      return undefined;
+    }
+    if (outcome.kind === "timeout") {
       void vscode.window.showWarningMessage(
         `Connected to ${server.name} but no session appeared in time — nothing was sent.`
       );
@@ -252,7 +289,7 @@ async function connectAndAwaitSessionTerminal(
     // both inside one synchronous callback — so this read, which happens in a
     // later microtask, sees it. The server-wide fallback covers a session whose
     // terminal was never recorded at all.
-    return ctx.sessionTerminals.get(sessionId) ?? sessionTerminalsFor(ctx, server.id)[0];
+    return ctx.sessionTerminals.get(outcome.sessionId) ?? sessionTerminalsFor(ctx, server.id)[0];
   } finally {
     clearTimeout(timer);
     unsubscribe();

@@ -588,3 +588,137 @@ describe("nexus.server.runMacro — ${profile.username} and linked auth profiles
     expect(listed[0].issue?.token).toBe("username");
   });
 });
+
+/**
+ * REVIEW FINDING (P2) — the connect-first flow's three endings.
+ *
+ * `SshPty.start()` CATCHES its own initial-connect errors: on a refused
+ * password or an unreachable host the terminal stays open holding a "Connection
+ * failed / press any key to close" notice, the pty is not disposed, no session
+ * is registered and nothing closes. The flow therefore had no failure signal at
+ * all and sat out the whole 90-second watchdog before claiming it had
+ * "connected". `ConnectServerOptions.onConnectFailed` is that signal.
+ */
+describe("nexus.server.runMacro — connect-first flow", () => {
+  const SESSION_MACRO: TerminalMacro = { id: "s", name: "Version", text: "show version\n", runIn: "session" };
+
+  /** A core with no sessions yet and a live change event, plus a way to add one. */
+  function connectableCore(): {
+    core: unknown;
+    register: (session: { id: string; serverId: string }) => void;
+  } {
+    const listeners = new Set<() => void>();
+    const activeSessions: Array<{ id: string; serverId: string }> = [];
+    return {
+      core: {
+        getSnapshot: () => ({ activeSessions: [...activeSessions], servers: [] }),
+        getAuthProfile: () => undefined,
+        onDidChange: (listener: () => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        }
+      },
+      register: (session) => {
+        activeSessions.push(session);
+        for (const listener of [...listeners]) {
+          listener();
+        }
+      }
+    };
+  }
+
+  function warnings(): string[] {
+    return showWarningMessage.mock.calls.map((call) => String(call[0]));
+  }
+
+  it("settles the instant the connect fails, instead of waiting out the 90s watchdog", async () => {
+    await setMacros([SESSION_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showWarningMessage.mockResolvedValue("Connect and Run");
+    connectServer.mockImplementation(
+      async (_ctx: unknown, _id: unknown, options?: { onConnectFailed?: (message: string) => void }) => {
+        // What production does: connectServer resolves (the terminal exists),
+        // and the pty's own connect then fails inside it.
+        options?.onConnectFailed?.("All configured authentication methods failed");
+      }
+    );
+
+    const { core } = connectableCore();
+    const ctx = context({ core } as unknown as Partial<CommandContext>);
+
+    vi.useFakeTimers();
+    try {
+      let done = false;
+      const run = runMacroOnServer(ctx, { server: server() }).then(() => {
+        done = true;
+      });
+
+      // One second of virtual time — 1/90th of the watchdog. The pre-fix flow
+      // could not settle until the timer itself fired.
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(done).toBe(true);
+      expect(warnings()[1]).toBe('Could not connect to "Core Switch" — nothing was sent.');
+      // Never the timeout copy: nothing timed out, and nothing "connected".
+      expect(warnings().some((message) => message.includes("no session appeared in time"))).toBe(false);
+      await run;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still falls back to the timeout when the connect neither fails nor produces a session", async () => {
+    await setMacros([SESSION_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showWarningMessage.mockResolvedValue("Connect and Run");
+    // Resolves and then nothing at all happens — a connect that hangs past the
+    // watchdog, which is the only case the timer is still there for.
+    connectServer.mockImplementation(async () => {});
+
+    const { core } = connectableCore();
+    const ctx = context({ core } as unknown as Partial<CommandContext>);
+
+    vi.useFakeTimers();
+    try {
+      let done = false;
+      const run = runMacroOnServer(ctx, { server: server() }).then(() => {
+        done = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(done).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(done).toBe(true);
+      expect(warnings()[1]).toBe("Connected to Core Switch but no session appeared in time — nothing was sent.");
+      await run;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends the macro to the terminal of the session the connect produced", async () => {
+    await setMacros([SESSION_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showWarningMessage.mockResolvedValue("Connect and Run");
+
+    const sent: string[] = [];
+    const sessionTerminal = { name: "Nexus SSH: Core Switch", sendText: (text: string) => sent.push(text) };
+    openTerminals = [sessionTerminal];
+
+    const { core, register } = connectableCore();
+    const sessionTerminals = new Map<string, unknown>();
+    connectServer.mockImplementation(async () => {
+      sessionTerminals.set("sess-new", sessionTerminal);
+      register({ id: "sess-new", serverId: "srv-1" });
+    });
+    const ctx = context({ core, sessionTerminals } as unknown as Partial<CommandContext>);
+
+    await runMacroOnServer(ctx, { server: server() });
+
+    expect(sent).toEqual(["show version\n"]);
+    // Only the "not connected — connect now?" prompt; no failure copy of either kind.
+    expect(warnings()).toHaveLength(1);
+    expect(warnings()[0]).toContain("not connected");
+  });
+});

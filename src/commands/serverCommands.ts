@@ -846,6 +846,19 @@ function hasActiveTunnelsForServer(ctx: CommandContext, serverId: string): boole
 
 export interface ConnectServerOptions {
   allowAutoFileExplorer?: boolean;
+  /**
+   * REVIEW FINDING (P2) — the session this call created never came up: its
+   * initial SSH connect failed (`SshPtyCallbacks.onConnectFailed`,
+   * services/ssh/sshPty.ts). `connectServer` itself RESOLVES in that case —
+   * it resolves once the terminal exists, and the connect runs inside the pty
+   * afterwards — so a caller that waits for the session to register needs this
+   * to know the wait is over. It fires after `connectServer`'s own promise has
+   * settled, hence a callback rather than a return value or a rejection.
+   *
+   * The SSH layer has already reported the CAUSE to the user by the time this
+   * fires; a handler should say only what it adds (what did not happen next).
+   */
+  onConnectFailed?: (message: string) => void;
 }
 
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
@@ -970,6 +983,9 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
             // alive for reconnect) and do NOT stop auto-stop tunnels — they
             // will be cleaned up when the terminal is fully closed via
             // onSessionClosed.
+          },
+          onConnectFailed: (_sessionId, message) => {
+            options.onConnectFailed?.(message);
           },
           onDataReceived: (sessionId) => {
             if (terminalRef && ctx.focusedTerminal !== terminalRef) {
