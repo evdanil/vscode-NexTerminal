@@ -9,7 +9,8 @@ import {
   validateAuthProfile,
   validateLocalShellProfile,
   validateInventorySource,
-  isValidServerOrigin
+  isValidServerOrigin,
+  isValidDetachedServerOrigin
 } from "../utils/validation";
 
 const SERVERS_KEY = "nexus.servers";
@@ -46,13 +47,51 @@ export class VscodeConfigRepository implements ConfigRepository {
       // but the corrupt marker still must not reach NexusCore: copy the
       // server without it here, at the storage boundary, instead of mutating
       // the value the type guard was asked to check.
-      if (item.origin !== undefined && !isValidServerOrigin(item.origin)) {
-        console.warn("[Nexus] Server config has a malformed origin; stripping it:", JSON.stringify(item.origin));
-        const { origin: _origin, ...rest } = item;
-        result.push(rest as ServerConfig);
-        continue;
+      //
+      // ADOPT 1 — `formerlySynced` gets the same treatment at the same
+      // boundary, for the same reason: validateServerConfig deliberately
+      // accepts a row whose marker is malformed, and the sync engine's
+      // adoption rule reads `providerId`/`externalId` off it to decide whether
+      // a source may claim an existing record. The two checks are sequential
+      // rather than exclusive so a row carrying both malformed loses both —
+      // a strip costs a field its trust, never the user their server.
+      //
+      // ADOPT 1 (mutual exclusion) — with the one coupling `addServerSanitizingOrigin`
+      // carries at the import boundary, in the same single direction and for the
+      // same reason: a marker is dropped when the origin beside it was stripped,
+      // however well-formed the marker itself is. The two fields are mutually
+      // exclusive by construction, and the engine's first eligibility clause
+      // (`origin === undefined`) is the only thing making a row that holds both
+      // inert. Stripping the origin removes exactly that protection, so a corrupt
+      // row would come out of this read ADOPTABLE — claimable whole by a source
+      // that never kept it — having arrived unadoptable. A sanitizer may cost an
+      // untrusted field its trust; it must never let corruption GAIN authority.
+      // Repair is not on offer: the origin is malformed precisely because its own
+      // `externalId` cannot be trusted, so there is nothing to build a truthful
+      // marker from. See that function's doc comment for why the coupling is
+      // deliberately NOT widened to a well-formed origin.
+      let sanitized: ServerConfig = item;
+      let originWasStripped = false;
+      if (sanitized.origin !== undefined && !isValidServerOrigin(sanitized.origin)) {
+        console.warn("[Nexus] Server config has a malformed origin; stripping it:", JSON.stringify(sanitized.origin));
+        const { origin: _origin, ...rest } = sanitized;
+        sanitized = rest as ServerConfig;
+        originWasStripped = true;
       }
-      result.push(item);
+      if (sanitized.formerlySynced !== undefined) {
+        const markerIsMalformed = !isValidDetachedServerOrigin(sanitized.formerlySynced);
+        if (markerIsMalformed || originWasStripped) {
+          console.warn(
+            markerIsMalformed
+              ? "[Nexus] Server config has a malformed formerlySynced marker; stripping it:"
+              : "[Nexus] Server config carried a formerlySynced marker beside a malformed origin; stripping the marker too:",
+            JSON.stringify(sanitized.formerlySynced)
+          );
+          const { formerlySynced: _formerlySynced, ...rest } = sanitized;
+          sanitized = rest as ServerConfig;
+        }
+      }
+      result.push(sanitized);
     }
     return result;
   }

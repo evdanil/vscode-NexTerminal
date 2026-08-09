@@ -72,6 +72,11 @@ vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
 
 import * as vscode from "vscode";
 import { formValuesToSerial, registerSerialCommands } from "../../src/commands/serialCommands";
+import type { CommandContext } from "../../src/commands/types";
+import { NexusCore } from "../../src/core/nexusCore";
+import type { SerialProfile } from "../../src/models/config";
+import { configMutationLock } from "../../src/services/configMutationLock";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
 describe("formValuesToSerial", () => {
   beforeEach(() => {
@@ -450,5 +455,222 @@ describe("serial terminal tab visual differentiation", () => {
         color: expect.objectContaining({ id: "terminal.ansiCyan" })
       })
     );
+  });
+});
+
+/** Two macrotask turns — enough for every mocked prompt to settle and the command to park. */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Parks INSIDE the lock until released — the "already in the critical section,
+ * still awaiting its I/O" phase these races need to be pinned against rather
+ * than raced for (copied from test/unit/authProfileCommands.test.ts).
+ */
+function gatedLockedWrite(
+  lock: { runExclusive: <T>(fn: () => Promise<T>) => Promise<T> },
+  write: () => Promise<void>
+): { done: Promise<void>; release: () => void } {
+  const gate = deferred<void>();
+  const done = lock.runExclusive(async () => {
+    await gate.promise;
+    await write();
+  });
+  return { done, release: () => gate.resolve() };
+}
+
+/** The confirmation modal call, told apart from a bare refusal by its `{ modal: true }` options. */
+function modalCalls(): unknown[][] {
+  return mockShowWarningMessage.mock.calls.filter((call) => {
+    const options = call[1];
+    return typeof options === "object" && options !== null && (options as { modal?: boolean }).modal === true;
+  });
+}
+
+/** Every non-modal warning — the refusals this fix introduces. */
+function refusals(): string[] {
+  return mockShowWarningMessage.mock.calls.filter((call) => call.length === 1).map((call) => String(call[0]));
+}
+
+function makeSerialProfile(overrides: Partial<SerialProfile> = {}): SerialProfile {
+  return {
+    id: "sp1",
+    name: "USB Console",
+    path: "COM3",
+    baudRate: 115200,
+    dataBits: 8,
+    stopBits: 1,
+    parity: "none",
+    rtscts: false,
+    mode: "standard",
+    ...overrides
+  };
+}
+
+/**
+ * REMOVE-MUTATION-RACE FAMILY — nexus.serial.remove named a profile sampled
+ * before its confirmation modal and then disposed its terminals and deleted it
+ * by id from that pre-modal copy: no lock, no presence re-check, no revalidation
+ * of what had been disclosed.
+ *
+ * Every concurrent operation below is GATED — it parks in a deferred modal or
+ * inside the lock and is released by the test — so it is guaranteed to land in
+ * the window under test rather than usually winning a race. Each assertion is on
+ * PERSISTED state (the repository behind NexusCore), not on a modal having been
+ * shown.
+ */
+describe("nexus.serial.remove — the disclosure is re-checked under the lock (REMOVE-MUTATION-RACE FAMILY)", () => {
+  async function fixture(profiles: SerialProfile[]): Promise<{
+    core: NexusCore;
+    repo: InMemoryConfigRepository;
+    dispose: ReturnType<typeof vi.fn>;
+    serialTerminals: Map<string, { terminal: { dispose: () => void }; profileId: string }>;
+  }> {
+    const repo = new InMemoryConfigRepository([], [], profiles);
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const dispose = vi.fn();
+    const serialTerminals = new Map<string, { terminal: { dispose: () => void }; profileId: string }>();
+    serialTerminals.set("session-1", { terminal: { dispose }, profileId: "sp1" });
+    const ctx = {
+      core,
+      serialTerminals,
+      serialSidecar: {},
+      loggerFactory: { create: vi.fn() },
+      macroAutoTrigger: { createObserver: vi.fn() },
+      sessionLogDir: "",
+      highlighter: {},
+      activityIndicators: new Map()
+    } as unknown as CommandContext;
+    registerSerialCommands(ctx);
+    return { core, repo, dispose, serialTerminals };
+  }
+
+  function removeSerial(id: string): Promise<unknown> {
+    const cmd = registeredCommands.get("nexus.serial.remove");
+    expect(cmd).toBeDefined();
+    return Promise.resolve(cmd!(id));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("removes the profile — disposing its session terminal and persisting the deletion — when nothing changed while the confirmation was open", async () => {
+    const { repo, dispose, serialTerminals } = await fixture([
+      makeSerialProfile(),
+      makeSerialProfile({ id: "sp2", name: "Lab Console" })
+    ]);
+    mockShowWarningMessage.mockResolvedValue("Remove");
+
+    await removeSerial("sp1");
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(serialTerminals.size).toBe(0);
+    expect((await repo.getSerialProfiles()).map((p) => p.id)).toEqual(["sp2"]);
+    expect(refusals()).toEqual([]);
+  });
+
+  it("refuses when the profile was renamed while the confirmation was open, rather than deleting a profile under a name the user never agreed to (kills a presence-only re-check)", async () => {
+    const { core, repo, dispose } = await fixture([makeSerialProfile()]);
+
+    const modal = deferred<string>();
+    mockShowWarningMessage.mockReturnValueOnce(modal.promise);
+    const run = removeSerial("sp1");
+    await settle();
+    expect(modalCalls()[0][0]).toBe('Remove serial profile "USB Console" and disconnect all sessions?');
+
+    // Still present under the same id — a presence-only guard sees "yes, still
+    // there" and deletes the renamed record, terminals and all.
+    await core.addOrUpdateSerialProfile({ ...core.getSerialProfile("sp1")!, name: "Rack 4 Console" });
+
+    modal.resolve("Remove");
+    await run;
+
+    expect((await repo.getSerialProfiles()).map((p) => p.name)).toEqual(["Rack 4 Console"]);
+    expect(dispose).not.toHaveBeenCalled();
+    // Quoted by the name the MODAL used, not the new one.
+    expect(refusals()).toEqual([
+      'Serial profile "USB Console" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
+    ]);
+  });
+
+  it("reports that the profile was already removed, and does not mistake that for a changed disclosure, when it was deleted while the confirmation was open (kills re-rendering the disclosure off a record that is no longer there)", async () => {
+    const { core, repo, dispose } = await fixture([
+      makeSerialProfile(),
+      makeSerialProfile({ id: "sp2", name: "Lab Console" })
+    ]);
+
+    const modal = deferred<string>();
+    mockShowWarningMessage.mockReturnValueOnce(modal.promise);
+    const run = removeSerial("sp1");
+    await settle();
+
+    // A replace-mode import's wipe (configCommands' importMergeReplaceLocked
+    // deletes every existing profile by id) lands while the modal sits open.
+    await core.removeSerialProfile("sp1");
+
+    modal.resolve("Remove");
+    // The presence re-check has to come FIRST inside the lock: a disclosure
+    // re-render that assumes the record is still there dereferences
+    // `undefined.name` and rejects this promise with a TypeError.
+    await expect(run).resolves.toBeUndefined();
+
+    expect(dispose).not.toHaveBeenCalled();
+    expect((await repo.getSerialProfiles()).map((p) => p.id)).toEqual(["sp2"]);
+    expect(vi.mocked(vscode.window.showInformationMessage)).toHaveBeenCalledWith(
+      'Serial profile "USB Console" was already removed.'
+    );
+    expect(refusals()).toEqual([]);
+  });
+
+  it("queues its whole mutation behind an in-flight locked section and refuses when that section renamed the profile (kills the lock-free dispose+delete, which commits before any concurrent holder can)", async () => {
+    const { core, repo, dispose } = await fixture([makeSerialProfile()]);
+    mockShowWarningMessage.mockResolvedValue("Remove");
+
+    // A replace-mode import / complete reset stand-in: already inside the lock,
+    // still awaiting its own I/O.
+    const gated = gatedLockedWrite(configMutationLock, async () => {
+      await core.addOrUpdateSerialProfile({ ...core.getSerialProfile("sp1")!, name: "Rack 4 Console" });
+    });
+    await settle();
+
+    const run = removeSerial("sp1");
+    await settle();
+
+    // THE KILL. The modal has already answered, so a lock-free implementation has
+    // finished disposing and deleting by now — before the holder it should be
+    // queued behind has even started its body.
+    expect(modalCalls()).toHaveLength(1);
+    expect((await repo.getSerialProfiles()).map((p) => p.id)).toEqual(["sp1"]);
+    expect(dispose).not.toHaveBeenCalled();
+
+    gated.release();
+    await gated.done;
+    await run;
+
+    expect((await repo.getSerialProfiles()).map((p) => p.name)).toEqual(["Rack 4 Console"]);
+    expect(dispose).not.toHaveBeenCalled();
+    expect(refusals()).toEqual([
+      'Serial profile "USB Console" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
+    ]);
   });
 });

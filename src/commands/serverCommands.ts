@@ -1297,6 +1297,25 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // manage a server it no longer owns). `liveRecord` reflects
           // whatever ownership state actually holds at write time: present →
           // keep it, stripped/absent → leave it absent.
+          //
+          // ADOPT 1 — `formerlySynced` is restored the same way, from the same
+          // place, because it is the same bug in the same shape: the form has
+          // no field for the marker either, so the reconstruction drops it and
+          // saving ANY edit to a kept server destroys the one thing that makes
+          // it adoptable — permanently, since a re-added source has no other
+          // way to recognize it and nothing in the UI reports the loss. That
+          // is not a corner case: renaming a kept server is the exact flow this
+          // feature exists to serve, and it was the flow that broke it.
+          //
+          // Sourced from `liveRecord` for the mirror-image reason `origin` is,
+          // in both directions. If a sync ADOPTED this server while the form
+          // sat open, the live record has traded its marker for an `origin` —
+          // and reattaching the stale marker from `existing` would leave a
+          // record carrying BOTH, which the engine's first eligibility clause
+          // makes inert but which still misrepresents the record's history. If
+          // Remove Source → Keep Servers landed while the form sat open, the
+          // live record gained a marker `existing` never had, and only the live
+          // read preserves it.
           // FINDING 2 (P2, edit-race review) — the record persist and the
           // proxy-secret sync must commit as ONE generation with respect to
           // captureBackupStateForExport (configCommands.ts), which reads a
@@ -1381,8 +1400,16 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // sources from `liveRecord`, captured immediately above, NOT
             // from the form-open `existing` snapshot: present → keep it,
             // stripped/absent (e.g. a Remove Source → Keep Servers that
-            // landed while the form was open) → leave it absent.
-            const updated = liveRecord?.origin !== undefined ? { ...linked, origin: liveRecord.origin } : linked;
+            // landed while the form was open) → leave it absent. ADOPT 1 —
+            // `formerlySynced` is carried across on identical terms; the
+            // conditional spread is what keeps "absent stays absent" true for
+            // both, rather than writing an explicit `undefined` key onto a
+            // record that never had one.
+            const updated: ServerConfig = {
+              ...linked,
+              ...(liveRecord?.origin !== undefined ? { origin: liveRecord.origin } : {}),
+              ...(liveRecord?.formerlySynced !== undefined ? { formerlySynced: liveRecord.formerlySynced } : {})
+            };
             // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
             // enforces single ownership of openFileExplorerOnFirstConnect:
             // if `updated` enables the flag, it clears it from whichever
@@ -1708,8 +1735,23 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         // nexus.group.rename touching server.group) updates both sides at
         // once and the check would pass despite the change.
         if (!serverConfigsEqual(currentRecord, confirmedSnapshot)) {
+          // Says what happened AND what it cost — "nothing was removed" is the
+          // load-bearing half after a destructive click — then names the next
+          // step's object rather than a bare "try again". Worded identically to
+          // its three siblings in the same refusal family (nexus.tunnel.remove,
+          // nexus.serial.remove, nexus.localShell.remove) and to the auth
+          // profile refusals in commands/authProfileCommands.ts and
+          // ui/authProfileEditorPanel.ts, so the whole family reads as one
+          // system: "<subject> changed while the confirmation was open —
+          // nothing was <verb>. <Next step> again to review …".
+          //
+          // GENERIC by necessity here, more than anywhere else in the family:
+          // this compares the WHOLE record structurally, so "changed" covers a
+          // rename, a port edit, a proxy change, a folder move — naming any one
+          // of them would be a guess.
           void vscode.window.showWarningMessage(
-            `Server "${confirmedSnapshot.name}" changed since the removal was confirmed — try again.`
+            `Server "${confirmedSnapshot.name}" changed while the confirmation was open — nothing was removed. ` +
+              "Remove it again to review the current details."
           );
           return;
         }
@@ -1750,7 +1792,24 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // F6 — a duplicate of a synced server is a manual server: keeping `origin`
       // would make the copy compete with the original for the SAME deterministic
       // id on the next sync (both share externalId, but only one id can win it).
-      const copy = { ...server, id: randomUUID(), name: `${server.name} (copy)`, openFileExplorerOnFirstConnect: undefined, origin: undefined };
+      //
+      // ADOPT 1 — `formerlySynced` is dropped by exactly that reasoning, one
+      // step further along: the marker is the adoption key, so a copy carrying
+      // it hands a re-added source TWO candidates for one device (same
+      // providerId, same externalId, and — a spread copy keeps host/port — the
+      // same endpoint corroboration). That is the ambiguity the sync engine
+      // resolves by adopting NEITHER and warning, so duplicating a kept server
+      // would cost the ORIGINAL its adoption too, silently, until the user
+      // deletes the copy. And it is the governing rule besides: a server the
+      // user made by hand is never adoptable, and a duplicate is made by hand.
+      const copy = {
+        ...server,
+        id: randomUUID(),
+        name: `${server.name} (copy)`,
+        openFileExplorerOnFirstConnect: undefined,
+        origin: undefined,
+        formerlySynced: undefined
+      };
       await ctx.core.addOrUpdateServer(copy);
     }),
 

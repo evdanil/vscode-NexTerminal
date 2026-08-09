@@ -335,6 +335,17 @@ export class NexusCore {
         if (server.origin?.syncedAuthProfileId === profileId) {
           cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
         }
+        // REVIEW FINDING (P1, adoption auth provenance) — the DETACHED form of
+        // the same stamp, on a server kept from a removed source
+        // (`DetachedServerOrigin.syncedAuthProfileId`). Adoption restores it into
+        // a real origin, so a stamp left standing here would name a deleted
+        // profile from the moment that server is reclaimed — the permanent
+        // opt-out this clear exists to prevent, merely deferred until the marker
+        // is cashed in. Scoped identically: only where the link being cleared is
+        // the one the stamp names, so a user's own divergence survives.
+        if (server.formerlySynced?.syncedAuthProfileId === profileId) {
+          cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
+        }
         this.servers.set(id, cleared);
         serversChanged = true;
       }

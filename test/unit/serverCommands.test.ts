@@ -615,8 +615,12 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
     // Distinct from the already-removed message — the record is present,
     // just no longer the one the user confirmed.
+    // Exact string, not a substring: this refusal is copy the reviewer graded
+    // against its siblings, and a `stringContaining` would pass against the
+    // pre-fix wording that omitted the outcome and the next step's object.
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      expect.stringContaining("changed since the removal was confirmed")
+      'Server "Server 1" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
     );
     expect(vscode.window.showInformationMessage).not.toHaveBeenCalledWith(
       expect.stringContaining("already removed")
@@ -654,8 +658,12 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
+    // Substring on the NEGATIVE side on purpose: an exact string here would go
+    // green again the moment the refusal is reworded, which is the one thing
+    // this assertion must not do. "nothing was removed" is the phrase that makes
+    // it a refusal at all.
     expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
-      expect.stringContaining("changed since the removal was confirmed")
+      expect.stringContaining("nothing was removed")
     );
   });
 
@@ -696,8 +704,12 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).not.toHaveBeenCalled();
     expect(secretDelete).not.toHaveBeenCalled();
     expect(removeServer).not.toHaveBeenCalled();
+    // Exact string, not a substring: this refusal is copy the reviewer graded
+    // against its siblings, and a `stringContaining` would pass against the
+    // pre-fix wording that omitted the outcome and the next step's object.
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      expect.stringContaining("changed since the removal was confirmed")
+      'Server "Server 1" changed while the confirmation was open — nothing was removed. ' +
+        "Remove it again to review the current details."
     );
   });
 
@@ -735,6 +747,44 @@ describe("server disconnect with tunnel autoStop", () => {
 
     const copy = addOrUpdateServer.mock.calls[0][0];
     expect(copy.origin).toBeUndefined();
+  });
+
+  it("(ADOPT 1) duplicating a KEPT server strips formerlySynced from the copy while the original keeps its own (kills the spread-copy that inherits the marker and gives one device two adoption candidates)", async () => {
+    const marker = {
+      sourceId: "netbox-1",
+      sourceName: "NetBox Prod",
+      providerId: "netbox",
+      externalId: "device:42",
+      detachedAt: 1000
+    };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      // No `origin` — this is exactly a Remove Source → Keep Servers record:
+      // unowned, but carrying the marker that makes it adoptable.
+      servers: [makeServer({ formerlySynced: marker })]
+    });
+
+    registerServerCommands(ctx);
+    const duplicateCmd = registeredCommands.get("nexus.server.duplicate");
+    expect(duplicateCmd).toBeDefined();
+
+    await duplicateCmd!("srv-1");
+
+    const copy = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
+    // The kill check. `{ ...server, ..., origin: undefined }` — the pre-fix
+    // expression — carries `formerlySynced` straight through, and because a
+    // spread copy also keeps host and port, the copy satisfies the endpoint
+    // corroboration too. A re-added NetBox source then finds TWO eligible
+    // records for device:42 and, per the ambiguity rule in syncEngine.ts,
+    // adopts NEITHER — so the duplicate silently costs the ORIGINAL the
+    // adoption it was kept for.
+    expect(copy.formerlySynced).toBeUndefined();
+    expect(copy.id).not.toBe("srv-1");
+    // ...and the fix must take the marker off the COPY only. Blanket-clearing
+    // the marker (e.g. writing it back onto `server` too) would make the
+    // original unadoptable, which is the opposite failure.
+    expect(ctx.core.getServer("srv-1")?.formerlySynced).toEqual(marker);
   });
 
   it("group disconnect applies only to direct-folder servers and skips hidden ones", async () => {
@@ -2523,6 +2573,156 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
     // marker onto a record it no longer owns. The fix sources from the LIVE
     // record captured inside the mutation lock, which has no origin.
     expect(saved.origin).toBeUndefined();
+  });
+});
+
+/**
+ * ADOPT 1 — `formerlySynced` preservation across a server edit, the marker's
+ * copy of the `origin` rule directly above and broken in exactly the same way:
+ * `formValuesToServer` rebuilds the record from form values, and the form has
+ * no field for the marker, so without a deliberate restore every save wipes it.
+ *
+ * Each test asserts on the record that was actually STORED
+ * (`ctx.core.getServer("srv-1")`, read after the save returns), not on the
+ * value handed to the form or held in webview state — a marker that survives
+ * in the form's snapshot while the persisted record loses it is precisely the
+ * bug, so an assertion that never reaches the store would pass against it.
+ */
+describe("nexus.server.edit — formerlySynced preservation (ADOPT 1)", () => {
+  const MARKER = {
+    sourceId: "netbox-1",
+    sourceName: "NetBox Prod",
+    providerId: "netbox",
+    externalId: "device:42",
+    detachedAt: 1000
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  async function openEditForm(ctx: CommandContext): Promise<(v: Record<string, unknown>) => Promise<void>> {
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    expect(editCmd).toBeDefined();
+    await editCmd!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1)!;
+    return (call[2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> }).onSubmit;
+  }
+
+  const RENAME = {
+    name: "Renamed Server",
+    host: "example.com",
+    port: 22,
+    username: "dev",
+    authType: "password"
+  };
+
+  it("a rename of a KEPT server leaves the marker on the PERSISTED record (kills the reconstruction that silently destroys it — the exact flow this feature exists to serve)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ formerlySynced: MARKER })]
+    });
+
+    const onSubmit = await openEditForm(ctx);
+    await onSubmit(RENAME);
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    // Read back what was STORED, not what was submitted.
+    const stored = ctx.core.getServer("srv-1");
+    expect(stored?.name).toBe("Renamed Server");
+    // The kill check. `formValuesToServer`'s rebuilt object has no
+    // `formerlySynced` key at all, so without the restore this is `undefined`
+    // — and the server has permanently stopped being adoptable, with nothing
+    // anywhere reporting the loss. Renaming a server you kept is the single
+    // most likely thing to do to it before re-adding the source.
+    expect(stored?.formerlySynced).toEqual(MARKER);
+    // Host and port are the endpoint corroboration adoption also needs; a
+    // rename must not disturb them either.
+    expect(stored?.host).toBe("example.com");
+    expect(stored?.port).toBe(22);
+  });
+
+  it("leaves formerlySynced undefined when editing a hand-made server that never carried a marker (kills a 'restore' that invents one)", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()] // no origin, no marker — a manual server
+    });
+
+    const onSubmit = await openEditForm(ctx);
+    await onSubmit(RENAME);
+
+    const stored = ctx.core.getServer("srv-1");
+    expect(stored?.formerlySynced).toBeUndefined();
+    // Not merely absent-valued — absent. The governing rule is that a marker
+    // is the whole eligibility test, so the key must not appear at all on a
+    // record the user made by hand.
+    expect(stored !== undefined && "formerlySynced" in stored).toBe(false);
+  });
+
+  it("picks up a marker the LIVE record gained while the form sat open (Remove Source → Keep Servers mid-edit) — kills sourcing it from the form-open snapshot, which has none", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      // Form opens on a server that is still OWNED: origin set, no marker.
+      servers: [makeServer({ origin: { sourceId: "netbox-1", externalId: "device:42", syncedAt: 1000 } })]
+    });
+
+    const onSubmit = await openEditForm(ctx);
+
+    // Remove Source → Keep Servers lands on the live record while the form is
+    // open: ownership goes, the marker arrives.
+    await ctx.core.addOrUpdateServer({ ...makeServer({ formerlySynced: MARKER }), origin: undefined });
+    addOrUpdateServer.mockClear();
+
+    await onSubmit(RENAME);
+
+    const stored = ctx.core.getServer("srv-1");
+    // Sourcing the marker from `existing` (the form-open snapshot, which has
+    // none) leaves this undefined and throws away a marker the user earned
+    // seconds ago. Only the LIVE read inside the mutation lock has it.
+    expect(stored?.formerlySynced).toEqual(MARKER);
+    // ...and the dead source's ownership must not come back with the edit.
+    expect(stored?.origin).toBeUndefined();
+    expect(stored?.name).toBe("Renamed Server");
+  });
+
+  it("does NOT resurrect a marker the LIVE record shed when a sync adopted the server mid-edit (kills reattaching existing.formerlySynced, which would leave the record carrying BOTH an origin and a stale marker)", async () => {
+    const adoptedOrigin = { sourceId: "netbox-2", externalId: "device:42", syncedAt: 5000 };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      // Form opens on a KEPT server: marker present, no origin.
+      servers: [makeServer({ formerlySynced: MARKER })]
+    });
+
+    const onSubmit = await openEditForm(ctx);
+
+    // A re-added source syncs and ADOPTS this record while the form is open:
+    // it trades the marker for real ownership (see syncEngine's adoption
+    // branch, which writes `formerlySynced: undefined` alongside the origin).
+    await ctx.core.addOrUpdateServer({
+      ...makeServer({ origin: adoptedOrigin }),
+      formerlySynced: undefined
+    });
+    addOrUpdateServer.mockClear();
+
+    await onSubmit(RENAME);
+
+    const stored = ctx.core.getServer("srv-1");
+    // The kill check: reattaching from `existing` puts the consumed marker
+    // back, producing a record with an `origin` AND a marker — inert by the
+    // engine's `origin === undefined` clause, but a false claim about the
+    // record's history that the UI will happily show.
+    expect(stored?.formerlySynced).toBeUndefined();
+    // The adoption's ownership survives the edit (the P1 origin rule).
+    expect(stored?.origin).toEqual(adoptedOrigin);
   });
 });
 

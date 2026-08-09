@@ -55,6 +55,129 @@ export interface InventoryProvider {
   configFields: InventoryConfigField[];
   testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void>;
   fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree>;
+  /**
+   * ADOPT 1 / REVIEW FINDING (P1, cross-instance adoption) — OPTIONAL. A stable
+   * key identifying WHICH DEPLOYMENT of this provider `config` points at: not
+   * "NetBox", but "the NetBox at https://netbox.example.com". Two sources of the
+   * same provider pointing at different deployments must return different keys;
+   * the same deployment configured twice (or re-added after removal, which mints
+   * a brand-new source id) must return the same one.
+   *
+   * WHY THE PROVIDER AND NOT THE ENGINE. `InventoryDevice.externalId` is unique
+   * only WITHIN one deployment — two NetBox instances both call their first
+   * device "device:1" — so adoption (`ServerConfig.formerlySynced`, see
+   * models/config.ts) cannot be scoped by provider KIND alone: a lab instance
+   * and a production instance answering to the same `providerId` would each be
+   * able to claim the other's kept servers, at which point the claiming source's
+   * prune policy can delete a record — and its stored credentials — that it has
+   * never seen. Which part of a config identifies the deployment is
+   * provider-specific (a base URL here, a tenant/region/endpoint triple
+   * elsewhere), so only the provider can answer it; the engine and the core
+   * cannot reach into `InventorySourceValues` generically.
+   *
+   * NEVER PUT A SECRET IN IT. The returned key is PERSISTED verbatim on every
+   * server the source keeps when it is removed, and travels in exported backups.
+   * `secrets` is deliberately not a parameter — the method cannot see the vault
+   * — but a non-secret field can still carry one (a base URL typed as
+   * `https://user:token@host`), so derive the key from the connection IDENTITY
+   * only and strip anything credential-shaped. `createNetboxProvider`'s
+   * implementation is the reference: scheme + host + port + path, with userinfo,
+   * query and fragment dropped.
+   *
+   * NOT IMPLEMENTING IT DISABLES ADOPTION for this provider's sources —
+   * deliberately. See the eligibility rule in services/inventory/syncEngine.ts
+   * for why falling back to the provider id was rejected. Everything else about
+   * the provider works unchanged; the sync simply adds a kept server's device as
+   * a new server rather than reclaiming it, which is the pre-adoption behaviour.
+   *
+   * Must be pure and synchronous, must not throw, and must not depend on
+   * anything outside `config`. A throw, a non-string, an empty/oversized
+   * (> `MAX_INVENTORY_INSTANCE_KEY_LENGTH`) or control-character-bearing return
+   * value is treated as "no instance identity" — see
+   * `resolveProviderInstanceKey` below, which is the ONLY sanctioned way to call
+   * this method.
+   */
+  instanceKey?(config: InventorySourceValues): string | undefined;
+}
+
+/**
+ * Upper bound on a provider-supplied instance key, enforced by
+ * `resolveProviderInstanceKey`. The key is persisted on every kept server and
+ * rendered into plan warnings, so an unbounded string from a third-party
+ * provider would bloat globalState (and every backup) once per kept server and
+ * could push an unreadable wall of text into the sync preview. 512 characters is
+ * far beyond any real endpoint identity — the reference NetBox key is a base URL
+ * — while staying obviously finite.
+ */
+export const MAX_INVENTORY_INSTANCE_KEY_LENGTH = 512;
+
+// Control characters (C0 + DEL) — see resolveProviderInstanceKey.
+const INSTANCE_KEY_CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+/**
+ * ADOPT 1 / REVIEW FINDING (P1, cross-instance adoption) — the ONE place
+ * `InventoryProvider.instanceKey` is invoked, so every caller (the sync path,
+ * the "Keep Servers" stamp, the import rollback's stamp) reaches the same
+ * verdict from the same code. Two halves of an identity rule that can disagree
+ * is how a marker gets written under one notion of "same instance" and read
+ * under another.
+ *
+ * Everything a third-party provider could get wrong degrades to `undefined`,
+ * which means "this provider offers no instance identity" and disables adoption
+ * for it — never an exception escaping into a sync, and never a partially
+ * trusted key:
+ *  - no method at all (the common case: a provider written before this existed);
+ *  - a method that throws (it runs on the remove-source path, where an
+ *    exception would abort a removal that has already asked the user to confirm);
+ *  - a non-string, or a string that is empty/blank after trimming — an empty key
+ *    would compare equal to another empty key and re-create exactly the
+ *    cross-instance collision this whole mechanism removes;
+ *  - a key longer than `MAX_INVENTORY_INSTANCE_KEY_LENGTH` (see above);
+ *  - a key containing control characters. It is persisted, exported to backups
+ *    and rendered into a user-facing warning; a newline or an escape sequence
+ *    there is at best unreadable and at worst a way to forge extra lines in the
+ *    sync preview.
+ *
+ * Trimming (rather than rejecting) surrounding whitespace matches how every
+ * other config-derived value in this file is normalized, and cannot create a
+ * false match: two keys equal after trimming named the same endpoint before it.
+ *
+ * REVIEW FINDING (P2, defensive copy) — the provider is handed its OWN COPY of
+ * `config`, on exactly the terms `cloneForProvider` gives `fetchInventory` and
+ * `testConnection` (commands/inventoryCommands.ts). Every caller here passes a
+ * LIVE object: `source.config` as stored on the record in NexusCore, or the
+ * config of a source record read straight out of core a line earlier. A
+ * third-party `instanceKey` that normalizes its argument in place — lowercasing a
+ * host, stripping a trailing slash — would therefore mutate stored state with no
+ * revision bump behind it, so `sourceConfigUnchanged` still reports the record as
+ * the same incarnation and the apply persists the mutated config while the tree
+ * it applies was fetched from the original. `structuredClone` is cheap here for
+ * the same reason it is there (every value is a string/number/boolean), and it is
+ * inside the try so a non-cloneable value smuggled into globalState degrades to
+ * "no instance identity" — the safe answer — instead of throwing into a sync or a
+ * source removal.
+ */
+export function resolveProviderInstanceKey(
+  provider: Pick<InventoryProvider, "instanceKey">,
+  config: InventorySourceValues
+): string | undefined {
+  if (typeof provider.instanceKey !== "function") {
+    return undefined;
+  }
+  let raw: unknown;
+  try {
+    raw = provider.instanceKey(structuredClone(config));
+  } catch {
+    return undefined;
+  }
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_INVENTORY_INSTANCE_KEY_LENGTH || INSTANCE_KEY_CONTROL_CHARS.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
 }
 
 export type InventoryErrorKind = "auth" | "network" | "protocol";

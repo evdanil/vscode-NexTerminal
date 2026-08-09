@@ -53,6 +53,18 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (typeof obj.fetchInventory !== "function") {
     throw new Error("Inventory provider must implement fetchInventory().");
   }
+  // REVIEW FINDING (P1, cross-instance adoption) — `instanceKey` is OPTIONAL, so
+  // absence is not an error: a provider without it simply gets no adoption (see
+  // the method's contract in models/inventory.ts). A non-function value under
+  // that name IS an error, and loudly rather than silently: everything else a
+  // provider can get wrong about this method degrades quietly inside
+  // `resolveProviderInstanceKey`, which would make a typo'd `instanceKey: "..."`
+  // (a string, not a function) look exactly like a provider that never declared
+  // one — and the symptom, adoption never firing, is invisible until a user has
+  // already removed a source with Keep Servers.
+  if (obj.instanceKey !== undefined && typeof obj.instanceKey !== "function") {
+    throw new Error("Inventory provider instanceKey must be a function when present.");
+  }
 }
 
 /**

@@ -11,6 +11,7 @@ const mockFormValuesToSerial = vi.fn();
 const mockFormValuesToLocalShell = vi.fn();
 const mockCollectGroups = vi.fn(() => []);
 const mockSyncProxyPasswordSecret = vi.fn();
+const mockAuthProfileCredentialMirror = vi.fn(() => ({ username: "root", authType: "password" }));
 const mockBrowseForKey = vi.fn();
 const mockScanForPort = vi.fn();
 const mockInlineAuthProfile = {
@@ -45,6 +46,7 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 }));
 
 vi.mock("../../src/commands/serverCommands", () => ({
+  authProfileCredentialMirror: (...args: unknown[]) => mockAuthProfileCredentialMirror(...(args as [])),
   browseForKey: (...args: unknown[]) => mockBrowseForKey(...args),
   collectGroups: (...args: unknown[]) => mockCollectGroups(...args),
   formValuesToServer: (...args: unknown[]) => mockFormValuesToServer(...args),
@@ -209,6 +211,155 @@ describe("openUnifiedForm test action", () => {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/**
+ * REVIEW FINDING — the Add form mirrors a chosen auth profile's credentials into
+ * its fields and can then sit open indefinitely, but its save never re-resolved
+ * the link. Deleting the profile while the form was open wrote a DANGLING
+ * `authProfileId` onto the newly created server: `removeAuthProfile`'s own
+ * reference clearing has already run by then, nothing revisits the record, and
+ * nothing in the UI reports it.
+ *
+ * Deliberately NARROWER than the server EDIT form's `serverAuthProfileRejection`
+ * — see the comment on the guard itself. The ownership-signature half of that
+ * guard exists only because `preserveLinkedServerCredentials` decides which
+ * submitted fields are user input by reading the live profile, and that helper
+ * does not run on the add path at all (there is no `existing` record to put
+ * anything back from). The last test here pins that scope decision so a full
+ * rejection cannot be added by accident.
+ *
+ * This describe block runs BEFORE the one that spies on
+ * `configMutationLock.runExclusive` and never restores it, so the gated test
+ * below exercises the real mutex.
+ */
+describe("openUnifiedForm SSH submit — the auth profile link is re-resolved under the lock (REVIEW FINDING)", () => {
+  const MISSING_AUTH_PROFILE_MESSAGE =
+    "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({
+      get: vi.fn((_key: string, fallback: unknown) => fallback)
+    });
+    mockShowQuickPick.mockReset();
+    mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
+    mockSyncProxyPasswordSecret.mockImplementation(async () => {});
+  });
+
+  function ctxWithProfiles(profiles: Map<string, { id: string; name: string }>) {
+    const addOrUpdateServer = vi.fn(async () => {});
+    return {
+      addOrUpdateServer,
+      ctx: {
+        core: {
+          getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [...profiles.values()] })),
+          getAuthProfile: vi.fn((id: string) => profiles.get(id)),
+          addOrUpdateServer,
+          removeServer: vi.fn(),
+          addOrUpdateSerialProfile: vi.fn(),
+          addOrUpdateLocalShellProfile: vi.fn()
+        },
+        secretVault: { get: vi.fn(), store: vi.fn(), delete: vi.fn() }
+      } as any
+    };
+  }
+
+  it("refuses to create a server carrying an auth profile id that no longer resolves, and creates nothing (kills the missing-profile guard being absent — a dangling link on a brand-new record)", async () => {
+    const profiles = new Map<string, { id: string; name: string }>();
+    const { ctx, addOrUpdateServer } = ctxWithProfiles(profiles);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", authProfileId: "ap-gone" });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    await expect(
+      onSubmit({
+        profileType: "ssh",
+        name: "New Server",
+        host: "example.com",
+        username: "me",
+        authProfileId: "ap-gone"
+      })
+    ).rejects.toThrow(MISSING_AUTH_PROFILE_MESSAGE);
+
+    // The kill: without the guard the record is created, carrying "ap-gone".
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(mockSyncProxyPasswordSecret).not.toHaveBeenCalled();
+  });
+
+  it("re-resolves INSIDE the lock, so a deletion committed by an in-flight locked section still refuses the save (kills checking the link before acquiring the lock, which resolves against state the section is about to change)", async () => {
+    const profiles = new Map<string, { id: string; name: string }>([["ap1", { id: "ap1", name: "Prod Auth" }]]);
+    const { ctx, addOrUpdateServer } = ctxWithProfiles(profiles);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", authProfileId: "ap1" });
+
+    // A holder that parks inside the lock and only then deletes the profile —
+    // guaranteed to land after this submit has queued and before its body runs.
+    let releaseHolder!: () => void;
+    const holderGate = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = configMutationLock.runExclusive(async () => {
+      await holderGate;
+      profiles.delete("ap1");
+    });
+    await delay(10);
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+    const submit = onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      authProfileId: "ap1"
+    });
+    await delay(10);
+    // Queued behind the holder — nothing written, and a pre-lock check would
+    // already have resolved "ap1" successfully by this point.
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+
+    releaseHolder();
+    await holder;
+    await expect(submit).rejects.toThrow(MISSING_AUTH_PROFILE_MESSAGE);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("still saves when the profile the form mirrored has since CHANGED SHAPE, because nothing on this path decides anything from the live profile (kills refusing on any link at all, and kills importing the edit form's ownership-signature rejection onto a create path with no stored record to mis-decide about)", async () => {
+    // Mirrored as a `password` profile that supplies a username; edited under
+    // the open form into a keyless `key` profile — a change on every axis
+    // `authProfileOwnershipSignature` covers, i.e. exactly what the server EDIT
+    // form refuses a save for.
+    const profiles = new Map<string, { id: string; name: string }>([
+      ["ap1", { id: "ap1", name: "Prod Auth", username: "root", authType: "password" } as { id: string; name: string }]
+    ]);
+    const { ctx, addOrUpdateServer } = ctxWithProfiles(profiles);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", authProfileId: "ap1" });
+
+    openUnifiedForm(ctx);
+    const handlers = mockWebviewOpen.mock.calls.at(-1)![2] as {
+      onSubmit: (values: FormValues) => Promise<void>;
+      onAutofill: (key: string, value: string) => Promise<unknown>;
+    };
+
+    // The moment the form is handed this profile's credentials — the only point
+    // at which a signature-comparing port could stamp what it rendered.
+    await handlers.onAutofill("authProfileId", "ap1");
+
+    profiles.set("ap1", { id: "ap1", name: "Prod Auth", username: "", authType: "key" } as { id: string; name: string });
+
+    await handlers.onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      authProfileId: "ap1"
+    });
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "srv-new", authProfileId: "ap1" })
+    );
+  });
+});
 
 describe("openUnifiedForm SSH submit — record+secret mutation locking (FINDING 2, P2 sibling)", () => {
   beforeEach(() => {

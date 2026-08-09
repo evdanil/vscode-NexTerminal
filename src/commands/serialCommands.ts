@@ -14,6 +14,7 @@ import {
 } from "../services/serial/smartSerialPty";
 import type { SerialPortInfo } from "../services/serial/protocol";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
+import { configMutationLock } from "../services/configMutationLock";
 import { serialFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import {
@@ -48,6 +49,23 @@ async function pickSerialProfile(
     { title: "Select Serial Profile" }
   );
   return pick?.profile;
+}
+
+/**
+ * The Remove Serial Profile confirmation text, built in ONE place so what the
+ * modal discloses and what the removal is later re-checked against cannot drift
+ * apart — the same "re-render the disclosure and compare" shape used by
+ * nexus.tunnel.remove (commands/tunnelCommands.ts), the auth profile editor's
+ * delete handler (ui/authProfileEditorPanel.ts) and nexus.authProfile.applyToFolder
+ * (commands/authProfileCommands.ts).
+ *
+ * Its only input today is the profile's NAME — the sessions clause is a constant,
+ * since the modal promises to disconnect "all" of them rather than counting any.
+ * Re-rendering rather than comparing that one field is still what makes a future
+ * input (a session count, the port) checked automatically instead of forgotten.
+ */
+function serialRemovalDisclosure(profileName: string): string {
+  return `Remove serial profile "${profileName}" and disconnect all sessions?`;
 }
 
 function toSerialProfileFromArg(
@@ -649,21 +667,100 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       if (!profile) {
         return;
       }
+      // Sampled BEFORE the first await, and captured as TEXT — see the matching
+      // comment in nexus.tunnel.remove (commands/tunnelCommands.ts) for why the
+      // rendered string, not the record, is the detached comparand. It matters
+      // more here than there: serial records are among the ones NexusCore's
+      // folder rename and folder cascade rewrite IN PLACE.
+      const profileId = profile.id;
+      const confirmedName = profile.name;
+      const shownDisclosure = serialRemovalDisclosure(confirmedName);
       const confirm = await vscode.window.showWarningMessage(
-        `Remove serial profile "${profile.name}" and disconnect all sessions?`,
+        shownDisclosure,
         { modal: true },
         "Remove"
       );
       if (confirm !== "Remove") {
         return;
       }
-      for (const [sessionId, entry] of ctx.serialTerminals.entries()) {
-        if (entry.profileId === profile.id) {
-          entry.terminal.dispose();
-          ctx.serialTerminals.delete(sessionId);
+      // REMOVE-MUTATION-RACE FAMILY (same finding as nexus.server.remove in
+      // commands/serverCommands.ts and nexus.tunnel.remove in
+      // commands/tunnelCommands.ts) — the confirmation names a profile sampled
+      // before a modal whose wait is unbounded, and the disposal below then ran
+      // lock-free against that stale sample: the profile could have been renamed
+      // (so the name the user consented to is not the name being deleted) or
+      // already removed and RECREATED under the same id by a replace-mode import
+      // or a complete reset, both of which run their whole mutation phase inside
+      // this SAME lock. Every core write persists a snapshot captured
+      // synchronously at call time and then awaits, so an unserialized removal
+      // and one of those imports can each "succeed" while the last writer to
+      // commit silently decides what is left on disk.
+      //
+      // Hold the lock across the whole mutation, re-check presence as the first
+      // thing inside it, re-render the disclosure from live state, and refuse if
+      // it no longer reads the same. ABORT, NOT RECONFIRM — re-asking would mean
+      // releasing the lock to show a modal and re-acquiring it, and re-running
+      // this command is one click that rebuilds every fact from scratch.
+      //
+      // NO CALLER HOLDS THIS LOCK ALREADY, so acquiring it here cannot deadlock
+      // the non-re-entrant AsyncMutex. Two entry points exist: VS Code's command
+      // dispatcher (package.json `commands` + the Command Center view/item
+      // menus), and nexus.profile.actions' quick pick, which merely
+      // `executeCommand`s this id after its own pick resolves and holds no lock
+      // (commands/profileCommands.ts — its only runExclusive is inside the
+      // unified add form's SSH submit path, a different flow entirely).
+      // webExtension.ts registers an unavailable stub for this id in the web
+      // host. Nothing reached from inside the section acquires the lock either:
+      // Terminal.dispose() delivers onDidCloseTerminal to lock-free listeners,
+      // and NexusCore is lock-free by the same rule that keeps this lock out of
+      // NexusCore.removeAuthProfile (see that method's doc comment).
+      //
+      // Acquired AFTER the last prompt, as the lock's contract requires, and
+      // nothing inside shows UI: both notices below are deferred out of the section.
+      let alreadyRemoved: string | undefined;
+      let refusal: string | undefined;
+      await configMutationLock.runExclusive(async () => {
+        const current = ctx.core.getSerialProfile(profileId);
+        if (!current) {
+          alreadyRemoved = `Serial profile "${confirmedName}" was already removed.`;
+          return;
         }
+        if (serialRemovalDisclosure(current.name) !== shownDisclosure) {
+          // Quoted by the name the MODAL used, not the current one: that is the
+          // profile the user acted on, and a rename is what this catches.
+          //
+          // Says what happened AND what it cost — "nothing was removed" is the
+          // load-bearing half after a destructive click — then names the next
+          // step's object rather than a bare "try again", matching the refusals
+          // in nexus.authProfile.applyToFolder (commands/authProfileCommands.ts)
+          // and the auth profile editor's delete handler
+          // (ui/authProfileEditorPanel.ts) phrase for phrase.
+          //
+          // Deliberately GENERIC ("changed") rather than "was renamed": the
+          // check re-renders serialRemovalDisclosure instead of comparing named
+          // fields precisely so a second input added to it is caught for free,
+          // and a refusal naming a rename would start lying the moment that
+          // happens.
+          refusal =
+            `Serial profile "${confirmedName}" changed while the confirmation was open — nothing was removed. ` +
+            "Remove it again to review the current details.";
+          return;
+        }
+        for (const [sessionId, entry] of ctx.serialTerminals.entries()) {
+          if (entry.profileId === profileId) {
+            entry.terminal.dispose();
+            ctx.serialTerminals.delete(sessionId);
+          }
+        }
+        await ctx.core.removeSerialProfile(profileId);
+      });
+      if (alreadyRemoved !== undefined) {
+        void vscode.window.showInformationMessage(alreadyRemoved);
+        return;
       }
-      await ctx.core.removeSerialProfile(profile.id);
+      if (refusal !== undefined) {
+        void vscode.window.showWarningMessage(refusal);
+      }
     }),
 
     vscode.commands.registerCommand("nexus.serial.connect", async (arg?: unknown) => {

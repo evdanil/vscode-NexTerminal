@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InventoryProviderRegistry, validateProviderShape } from "../../src/services/inventory/providerRegistry";
+import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, resolveProviderInstanceKey } from "../../src/models/inventory";
 import type { InventoryProvider } from "../../src/models/inventory";
 
 function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
@@ -108,5 +109,138 @@ describe("validateProviderShape", () => {
 
   it("rejects a missing label", () => {
     expect(() => validateProviderShape(makeProvider({ label: "" }))).toThrow(/label/i);
+  });
+
+  it("accepts a provider with NO instanceKey — it is optional, and its absence only costs adoption (kills making it required, which would break every provider written before it existed)", () => {
+    const provider = makeProvider();
+    expect(provider.instanceKey).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function instanceKey loudly (kills a silent degrade for a typo'd `instanceKey: \"...\"`, which is indistinguishable at runtime from a provider that never declared one — and the symptom, adoption quietly never firing, only shows up after a user has already removed a source with Keep Servers)", () => {
+    expect(() => validateProviderShape(makeProvider({ instanceKey: "https://netbox.example.com" as never }))).toThrow(/instanceKey/);
+    expect(() => validateProviderShape(makeProvider({ instanceKey: 42 as never }))).toThrow(/instanceKey/);
+  });
+});
+
+/**
+ * Lives beside the shape validation because both answer one question about the
+ * provider contract — what a third-party registrant may hand Nexus, and what
+ * Nexus does with it. REVIEW FINDING (P1, cross-instance adoption): every answer
+ * this function accepts is PERSISTED on kept servers and later decides whether a
+ * source may take one over, so "degrades to undefined" is the only safe verdict
+ * for anything it cannot fully vouch for — undefined means no adoption, never a
+ * looser match.
+ */
+describe("resolveProviderInstanceKey", () => {
+  it("returns the provider's key, trimmed, and passes ONLY the non-secret config (kills reading the key from anywhere the vault can reach)", () => {
+    const seen: unknown[] = [];
+    const key = resolveProviderInstanceKey(
+      {
+        instanceKey: (config) => {
+          seen.push(config);
+          return "  https://netbox.example.com  ";
+        }
+      },
+      { baseUrl: "https://netbox.example.com" }
+    );
+    expect(key).toBe("https://netbox.example.com");
+    expect(seen).toEqual([{ baseUrl: "https://netbox.example.com" }]);
+    // The signature is the enforcement: there is no second parameter a provider
+    // could read secrets from.
+    expect(seen[0]).not.toHaveProperty("apiToken");
+  });
+
+  it("degrades to undefined for a provider that declares no instanceKey at all (kills throwing on the common case — most providers will never implement it)", () => {
+    expect(resolveProviderInstanceKey({}, { baseUrl: "https://netbox.example.com" })).toBeUndefined();
+  });
+
+  it("degrades to undefined when the provider THROWS rather than letting the exception escape (kills an unguarded call: this runs on the remove-source path, where a throw would abort a removal the user has already confirmed)", () => {
+    expect(
+      resolveProviderInstanceKey(
+        {
+          instanceKey: () => {
+            throw new Error("provider blew up");
+          }
+        },
+        {}
+      )
+    ).toBeUndefined();
+  });
+
+  it("degrades to undefined for every unusable answer — non-string, empty, blank, over-long, or control-character-bearing (kills persisting a key that would compare equal to another provider's empty one, or that would forge lines in a plan warning)", () => {
+    const cases: Array<unknown> = [
+      42,
+      null,
+      undefined,
+      {},
+      "",
+      "   ",
+      "x".repeat(MAX_INVENTORY_INSTANCE_KEY_LENGTH + 1),
+      "https://netbox\nInjected: a second line",
+      "https://netbox\u001b[2K"
+    ];
+    for (const answer of cases) {
+      expect(resolveProviderInstanceKey({ instanceKey: () => answer as string | undefined }, {})).toBeUndefined();
+    }
+    // The boundary itself is accepted — the cap is a cap, not an off-by-one.
+    const atLimit = "x".repeat(MAX_INVENTORY_INSTANCE_KEY_LENGTH);
+    expect(resolveProviderInstanceKey({ instanceKey: () => atLimit }, {})).toBe(atLimit);
+  });
+
+  it("two blank answers do not become one shared key (kills accepting the empty string, which would pool every sloppy provider's kept servers into one instance)", () => {
+    expect(resolveProviderInstanceKey({ instanceKey: () => "" }, { baseUrl: "a" })).toBeUndefined();
+    expect(resolveProviderInstanceKey({ instanceKey: () => "" }, { baseUrl: "b" })).toBeUndefined();
+  });
+
+  /**
+   * REVIEW FINDING (P2, defensive copy) — the same boundary rule `cloneForProvider`
+   * enforces for `fetchInventory` / `testConnection` (commands/inventoryCommands.ts),
+   * applied to the third place a provider is handed a config.
+   *
+   * WHY IT MATTERS HERE SPECIFICALLY: every caller passes a LIVE object — the
+   * `config` sitting on an InventorySourceConfig inside NexusCore. Because
+   * InventorySourceValues is all primitives, an in-place normalization by a
+   * third-party provider mutates the STORED record with no revision bump behind
+   * it, so `sourceConfigUnchanged` still calls the record the same incarnation and
+   * the apply persists the mutation while the tree it applies was fetched from
+   * the pre-mutation config.
+   *
+   * BOTH ASSERTIONS ARE LOAD-BEARING. The identity check alone would pass against
+   * a shallow `{...config}` that a nested value could still escape; the
+   * unchanged-original check alone would pass against a provider that happens not
+   * to mutate on this run. Together they pin "the provider cannot reach the
+   * caller's object", which is the property.
+   */
+  it("hands the provider a COPY of the config, so an instanceKey that normalizes its argument in place cannot mutate stored source state (kills passing source.config straight through, where the mutation lands in globalState with no revision bump to notice it)", () => {
+    const live = { baseUrl: "HTTPS://NetBox.Example.COM/", port: 443 };
+    const seen: unknown[] = [];
+    const key = resolveProviderInstanceKey(
+      {
+        instanceKey: (config) => {
+          seen.push(config);
+          // The shape of third-party normalization this guards against: helpful,
+          // plausible, and destructive to the caller's record.
+          config.baseUrl = String(config.baseUrl).toLowerCase().replace(/\/$/, "");
+          return String(config.baseUrl);
+        }
+      },
+      live
+    );
+
+    expect(key).toBe("https://netbox.example.com");
+    // Not the caller's object.
+    expect(seen[0]).not.toBe(live);
+    // And the caller's object is untouched by what the provider did to its copy.
+    expect(live).toEqual({ baseUrl: "HTTPS://NetBox.Example.COM/", port: 443 });
+  });
+
+  it("degrades to undefined when the config cannot be cloned at all, rather than throwing into a sync or a source removal (kills cloning outside the guarded call)", () => {
+    // Only a hand-edited globalState row can put a function here — the type says
+    // string | number | boolean — but the cost of being wrong is a TypeError
+    // thrown after an inventory fetch, or mid-removal, so the clone lives inside
+    // the same try the provider call does.
+    const uncloneable = { baseUrl: (() => "nope") as unknown as string };
+    expect(resolveProviderInstanceKey({ instanceKey: () => "https://netbox.example.com" }, uncloneable)).toBeUndefined();
   });
 });

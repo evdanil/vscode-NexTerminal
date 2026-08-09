@@ -1,5 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { describePlanDetail, registerInventoryCommands, type InventoryRuntimeTeardown } from "../../src/commands/inventoryCommands";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  adoptionCandidateKeys,
+  adoptionPairKeys,
+  describePlanDetail,
+  planDetailDrift,
+  planWarningsBuffer,
+  registerInventoryCommands,
+  type InventoryRuntimeTeardown
+} from "../../src/commands/inventoryCommands";
 import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import {
@@ -7,6 +15,7 @@ import {
   inventorySecretKey,
   type InventoryProvider,
   type InventorySourceConfig,
+  type InventorySourceValues,
   type InventoryTree
 } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
@@ -142,6 +151,16 @@ function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProv
     ],
     testConnection: vi.fn(async () => {}),
     fetchInventory: vi.fn(async (): Promise<InventoryTree> => ({ contractVersion: 1, devices: [] })),
+    // REVIEW FINDING (P1, cross-instance adoption) — the fake provider names its
+    // DEPLOYMENT the way the real NetBox one does: from its own non-secret
+    // config, here the `host` field declared above. Sources built by
+    // `makeSource` carry no host, so they all resolve to one shared instance
+    // ("fake://default"), which is what makes every existing single-source test
+    // read as "one deployment, removed and re-added". A test that needs two
+    // deployments gives its sources different `config.host` values, and one that
+    // needs a provider with no instance identity overrides this with
+    // `instanceKey: undefined`.
+    instanceKey: (config: InventorySourceValues) => `fake://${String(config.host ?? "default")}`,
     ...overrides
   };
 }
@@ -192,6 +211,30 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     username: "netops",
     authType: "agent",
     isHidden: false,
+    ...overrides
+  };
+}
+
+// A synthetic plan for the pure rendering/drift helpers (describePlanDetail,
+// planWarningsBuffer, planDetailDrift). Those three are functions of a plan
+// alone, and several of the shapes they must render — an identity swap between
+// two otherwise-identical plans, a nameless auth switch — are unreachable or
+// prohibitively awkward to stage through a provider fetch. Centralised in ONE
+// place so a future field on InventorySyncPlan is a one-line fix here rather
+// than a hunt through every literal in this file.
+function makeSyncPlan(overrides: Partial<InventorySyncPlan> = {}): InventorySyncPlan {
+  return {
+    sourceId: "src-1",
+    syncedAt: 1,
+    adds: [],
+    updates: [],
+    prunes: [],
+    unchangedCount: 0,
+    folders: [],
+    warnings: [],
+    hiddenPruneCount: 0,
+    manualDuplicateCount: 0,
+    adoptionCandidates: [],
     ...overrides
   };
 }
@@ -3217,7 +3260,12 @@ describe("inventoryCommands", () => {
         name: "old-sw",
         host: "10.0.0.1",
         port: 22,
-        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        // REVIEW FINDING (P1, adoption instance identity) — the origin already
+        // carries the instance this source's provider reports, because this test
+        // needs the pre-removal plan to be genuinely EMPTY (see below) and a
+        // missing instance stamp is a change the sync would write, i.e. an update
+        // that takes syncNow off the fast path this test is about.
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://default" }
       });
       const repo = new InMemoryConfigRepository([owned]);
       const core = new NexusCore(repo);
@@ -3670,7 +3718,20 @@ describe("inventoryCommands", () => {
       // carrying everything the add path stamped, the source's default username
       // included. A server whose username differs reads as hand-edited and is
       // deliberately left alone — see the hand-edited-username test below.
-      return makeServer({ username: "admin", origin: { sourceId: "src-1", externalId, syncedAt: 1 }, ...rest });
+      // REVIEW FINDING (P1, adoption instance identity) — `syncedInstanceKey`
+      // matches what `makeProvider`'s `instanceKey` reports for `makeHarness`'s
+      // source config (`host: "netbox.local"`), i.e. these servers are already
+      // stamped with the deployment they were synced from. Omitting it would make
+      // EVERY server in this block an update on every sync (the stamp would be
+      // computed for the first time), which is a real behaviour — the backfill
+      // for servers synced by an older build — but not the one these auth-profile
+      // tests are about: it inflates the "N servers will be updated" counts they
+      // assert on and takes the fast-path tests off the fast path.
+      return makeServer({
+        username: "admin",
+        origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedInstanceKey: "fake://netbox.local" },
+        ...rest
+      });
     }
 
     function modalCalls(): Array<[string, { detail: string }]> {
@@ -4755,18 +4816,7 @@ describe("inventoryCommands", () => {
           const before = ownedServer({ id: `owned-${i}`, externalId: `device:${i}`, name: `sw${i}` });
           return { before, after: { ...before, authProfileId: "p1" } };
         });
-        return {
-          sourceId: "src-1",
-          syncedAt: 1,
-          adds: [],
-          updates,
-          prunes: [],
-          unchangedCount: 0,
-          folders: [],
-          warnings: [],
-          hiddenPruneCount: 0,
-          manualDuplicateCount: 0
-        };
+        return makeSyncPlan({ updates });
       }
 
       // Unreachable through syncNow — every call site pairs a plan with the
@@ -4977,6 +5027,1679 @@ describe("inventoryCommands", () => {
       // Pre-feature fallback, field for field.
       expect(servers[0].authType).toBe("agent");
       expect(servers[0].username).toBe("admin");
+    });
+  });
+
+  // Adopt-on-add, command-layer half: the plan-preview line, the Show Warnings
+  // pair list, and the adoption id-set the drift comparator captures.
+  //
+  // Driven with synthetic plans rather than through syncNow, deliberately: an
+  // adoption is an ORDINARY `updates` entry — one whose `before` carries no
+  // origin — and that is the entire contract these three renderers are written
+  // against. Building it by hand is what lets the drift test below stage the one
+  // case that matters (two plans that differ ONLY in which server they adopt),
+  // which no fixture can produce through a fetch because both plans render the
+  // same text by construction.
+  describe("adopt-on-add rendering and drift", () => {
+    // The canonical adoptee: a survivor of Remove Source → Keep Servers, i.e. a
+    // record a removed inventory source synced and the user chose to keep, its
+    // `origin` stripped by that removal. Deliberately skewed away from anything
+    // this sync's add path could have produced — a name the user changed and the
+    // device is about to overwrite, a hand-picked username, password auth — so a
+    // renderer that reads a field off `after` where it owes the user `before`
+    // shows up as one of these.
+    //
+    // It carries no marker field of its own here on purpose: nothing in the
+    // command layer reads one. Eligibility is decided entirely inside
+    // computeSyncPlan, and everything these three renderers need is already in
+    // the update pair the engine emits.
+    function keptServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+      return makeServer({
+        id: "kept-1",
+        name: "old-lab-switch",
+        host: "10.0.0.11",
+        port: 22,
+        username: "handpicked",
+        authType: "password",
+        ...overrides
+      });
+    }
+
+    /**
+     * One adoption entry, in the shape computeSyncPlan produces: the adoptee's
+     * own record (id and credentials intact) wearing the device's name and this
+     * source's origin. `before.origin === undefined` is what makes it an
+     * adoption rather than an ordinary update.
+     */
+    function adoption(
+      before: ServerConfig,
+      device: { name: string; externalId?: string }
+    ): { before: ServerConfig; after: ServerConfig } {
+      return {
+        before,
+        after: {
+          ...before,
+          name: device.name,
+          origin: { sourceId: "src-1", externalId: device.externalId ?? "device:1", syncedAt: 1 }
+        }
+      };
+    }
+
+    /** An ORDINARY owned update — the population every adoption rendering must exclude. */
+    function ownedUpdate(id: string, overrides: Partial<ServerConfig> = {}): { before: ServerConfig; after: ServerConfig } {
+      const before = makeServer({
+        id,
+        name: `${id}-old`,
+        host: "10.0.0.99",
+        origin: { sourceId: "src-1", externalId: `device:${id}`, syncedAt: 1 }
+      });
+      return { before, after: { ...before, name: `${id}-new`, ...overrides } };
+    }
+
+    it("the preview annotates the adopted SUBSET of the updated servers, directly under the updates line and above the auth-switch line (kills rendering plan.updates.length — which would claim the source is taking over servers it already owns — and kills the annotation floating away from the line it qualifies)", () => {
+      const plan = makeSyncPlan({
+        updates: [
+          adoption(keptServer(), { name: "core-sw-01" }),
+          adoption(keptServer({ id: "kept-2", name: "spare-rtr", host: "10.0.0.12" }), {
+            name: "core-sw-02",
+            externalId: "device:2"
+          }),
+          // Owned, and simultaneously an auth switch: the third line of the
+          // trio, so the ordering assertion below has all three to order.
+          ownedUpdate("owned-1", { authProfileId: "p1" })
+        ]
+      });
+
+      const detail = describePlanDetail(plan, [], "Lab credentials");
+      const lines = detail.split("\n");
+      const updatesLine = "3 servers will be updated.";
+      // FUTURE tense, like every sibling line and like this plan's own pair-list
+      // heading behind Show Warnings — the line used to read "are being
+      // adopted", describing the plan as already in flight.
+      const adoptionLine =
+        "2 of the updated servers will be adopted by this source — they were kept from a removed inventory source, and they keep their saved credentials.";
+      const switchLine = '1 server will switch to auth profile "Lab credentials".';
+
+      expect(lines).toContain(updatesLine);
+      // TWO of the three updates, not three: the count is the origin-less subset.
+      expect(lines).toContain(adoptionLine);
+      expect(lines).toContain(switchLine);
+      // Directly under the line it qualifies — a subset annotation that has
+      // drifted away from its parent line reads as an independent claim about
+      // some other population.
+      expect(lines.indexOf(adoptionLine)).toBe(lines.indexOf(updatesLine) + 1);
+      // Above the auth-switch line, which can name the very same servers: the
+      // ownership change first, then what it does to their credentials.
+      expect(lines.indexOf(switchLine)).toBeGreaterThan(lines.indexOf(adoptionLine));
+    });
+
+    it("the adoption line is singular for one adopted server, drops the subset qualifier when there is no wider set, and is absent from a plan that adopts nothing (kills plural-only copy, kills '1 of the updated servers' over a lone update — which sends the reader looking for the others — and kills rendering it over ordinary owned updates or over the Add-Separately duplicates path)", () => {
+      // The ONLY update in the plan: there is no subset to be part of, so the
+      // line points at the line above it instead of counting into it.
+      const lone = makeSyncPlan({ updates: [adoption(keptServer(), { name: "core-sw-01" })] });
+      const loneLines = describePlanDetail(lone, [], undefined).split("\n");
+      expect(loneLines).toContain("1 server will be updated.");
+      expect(loneLines).toContain(
+        "The updated server will be adopted by this source — it was kept from a removed inventory source, and it keeps its saved credentials."
+      );
+
+      // One adoption among several updates: the qualifier is back, because now
+      // it is telling the user that the other update is not an adoption.
+      const oneOfTwo = makeSyncPlan({ updates: [adoption(keptServer(), { name: "core-sw-01" }), ownedUpdate("owned-1")] });
+      const oneOfTwoLines = describePlanDetail(oneOfTwo, [], undefined).split("\n");
+      expect(oneOfTwoLines).toContain("2 servers will be updated.");
+      expect(oneOfTwoLines).toContain(
+        "1 of the updated servers will be adopted by this source — it was kept from a removed inventory source, and it keeps its saved credentials."
+      );
+
+      const ownedOnly = makeSyncPlan({ updates: [ownedUpdate("owned-1"), ownedUpdate("owned-2")] });
+      const ownedDetail = describePlanDetail(ownedOnly, [], undefined);
+      expect(ownedDetail).toContain("2 servers will be updated.");
+      expect(ownedDetail).not.toContain("will be adopted by this source");
+
+      // A plan that adopts nothing but does collide by address: the pre-existing
+      // manual-duplicate line, unchanged by this feature and now describing a
+      // wholly separate population (a hand-made server at the same address is
+      // never adoptable). Its line renders; the adoption line must not.
+      const declined = makeSyncPlan({
+        adds: [makeServer({ id: "new-1", name: "core-sw-01", host: "10.0.0.11" })],
+        manualDuplicateCount: 1
+      });
+      const declinedDetail = describePlanDetail(declined, [], undefined);
+      expect(declinedDetail).toContain("1 device matches existing manual servers and will be added as duplicates.");
+      expect(declinedDetail).not.toContain("will be adopted by this source");
+    });
+
+    it("an adoption whose username the inventory overwrites says so, and only then (kills the copy's silent overpromise: 'it keeps its saved credentials' while the engine writes the endpoint's username over a hand-picked one — unreachable with today's providers, reachable through the public provider API)", () => {
+      // Two adoptions, one of which the endpoint supplies a username for. The
+      // engine writes it (syncEngine.ts, and the comment there says why that is
+      // right); the disclosure is what keeps the promise above it honest.
+      const overwritten = adoption(keptServer(), { name: "core-sw-01" });
+      const plan = makeSyncPlan({
+        updates: [
+          { before: overwritten.before, after: { ...overwritten.after, username: "netbox-svc" } },
+          adoption(keptServer({ id: "kept-2", name: "spare-rtr", host: "10.0.0.12" }), { name: "core-sw-02", externalId: "device:2" })
+        ]
+      });
+
+      const lines = describePlanDetail(plan, [], undefined).split("\n");
+      const adoptionLine =
+        "2 of the updated servers will be adopted by this source — they were kept from a removed inventory source, and they keep their saved credentials.";
+      const usernameLine = "1 adopted server will also take the username the inventory reports, replacing the one stored on it.";
+      expect(lines).toContain(adoptionLine);
+      // ONE of the two, and directly under the promise it qualifies.
+      expect(lines).toContain(usernameLine);
+      expect(lines.indexOf(usernameLine)).toBe(lines.indexOf(adoptionLine) + 1);
+
+      // The ordinary case — no endpoint username anywhere — says nothing extra.
+      const untouched = makeSyncPlan({ updates: [adoption(keptServer(), { name: "core-sw-01" })] });
+      expect(describePlanDetail(untouched, [], undefined)).not.toContain("take the username");
+      // Nor does a plain owned update whose username the source rewrote: that
+      // is not an adoption, and the promise this line qualifies was never made
+      // about it.
+      const ownedRename = makeSyncPlan({ updates: [ownedUpdate("owned-1", { username: "netbox-svc" })] });
+      expect(describePlanDetail(ownedRename, [], undefined)).not.toContain("take the username");
+    });
+
+    it("Show Warnings names every adopted pair — the tree's name AND the device it is being reclaimed by, with the address that record will carry — and marks a hidden adoptee (kills a count-only disclosure, kills reading both names off `after` so a hand-rename goes invisible, kills a missing or stray (hidden) marker)", () => {
+      const plan = makeSyncPlan({
+        warnings: ["Device \"core-sw-03\" has no usable SSH endpoint."],
+        updates: [
+          // Renamed by hand: "old-lab-switch" is the only name the user can find
+          // in their tree, and the only one an `after`-only list would drop.
+          adoption(keptServer(), { name: "core-sw-01" }),
+          adoption(keptServer({ id: "kept-2", name: "spare-rtr", host: "10.0.0.12", port: 2222, isHidden: true }), {
+            name: "dist-rtr-01",
+            externalId: "device:2"
+          }),
+          ownedUpdate("owned-1")
+        ]
+      });
+
+      const buffer = planWarningsBuffer(plan, undefined);
+
+      expect(buffer).toContain(
+        "2 servers kept from a removed inventory source will be adopted by this source (each keeps its saved credentials):"
+      );
+      expect(buffer).toContain('  "old-lab-switch" — device "core-sw-01" (10.0.0.11:22)');
+      expect(buffer).toContain('  "spare-rtr" — device "dist-rtr-01" (10.0.0.12:2222) (hidden)');
+      // The visible one carries no marker, and the owned update is not a pair.
+      expect(buffer).not.toContain('  "old-lab-switch" — device "core-sw-01" (10.0.0.11:22) (hidden)');
+      expect(buffer.some((line) => line.includes("owned-1"))).toBe(false);
+      // The engine's own warnings still lead the buffer.
+      expect(buffer[0]).toBe("Device \"core-sw-03\" has no usable SSH endpoint.");
+    });
+
+    it("the pair list carries the singular heading and sits ABOVE the auth-switch list that names the same server (kills plural-only copy, and kills disclosing a credential change before the ownership change that causes it)", () => {
+      // The same-plan retro-apply shape: adopted AND linked to the source's
+      // profile, so this one server appears in both lists.
+      const before = keptServer({ authType: "agent", username: "admin" });
+      const adopted = adoption(before, { name: "core-sw-01" });
+      const plan = makeSyncPlan({ updates: [{ before, after: { ...adopted.after, authProfileId: "p1" } }] });
+
+      const buffer = planWarningsBuffer(plan, "Lab credentials");
+      const headingIndex = buffer.indexOf(
+        "1 server kept from a removed inventory source will be adopted by this source (it keeps its saved credentials):"
+      );
+      const switchIndex = buffer.indexOf('1 server will switch to auth profile "Lab credentials":');
+
+      expect(headingIndex).toBeGreaterThanOrEqual(0);
+      expect(switchIndex).toBeGreaterThan(headingIndex);
+      expect(buffer).toContain('  "old-lab-switch" — device "core-sw-01" (10.0.0.11:22)');
+      // The switch list's own line for the same server, still by its tree name.
+      expect(buffer.indexOf('  "old-lab-switch"')).toBeGreaterThan(switchIndex);
+    });
+
+    it("a mid-modal swap of WHICH server is adopted drifts, though both plans render byte-identical detail and identical delete/auth-switch sets (kills a comparator without adoptionIds: the swapped-in server would be taken over — origin, prune policy, rename and all — under consent collected for a different record)", () => {
+      const planFor = (id: string, name: string) =>
+        makeSyncPlan({ updates: [adoption(keptServer({ id, name }), { name: "core-sw-01" })] });
+      const planA = planFor("kept-A", "kept-a");
+      const planB = planFor("kept-B", "kept-b");
+
+      const detailA = describePlanDetail(planA, [], undefined);
+      const detailB = describePlanDetail(planB, [], undefined);
+      // THE non-vacuity assertion: the consent text the user actually reads
+      // cannot tell these two plans apart, so the text comparison inside
+      // planDetailDrift can never be what catches this.
+      expect(detailB).toBe(detailA);
+
+      // Neither plan deletes anything or moves any auth profile, so the two
+      // pre-existing id-set comparisons are equal-to-equal as well.
+      const shown = {
+        detail: detailA,
+        deleteIds: new Set<string>(),
+        authSwitchIds: new Set<string>(),
+        adoptionPairs: adoptionPairKeys(planA)
+      };
+
+      expect(planDetailDrift(shown, planB, [], undefined).drift).toBe(true);
+      // Control — the SAME captured tuple with only the adoption pairs swapped
+      // to planB's. If this also reported drift, the assertion above would prove
+      // nothing about the adoption set.
+      expect(planDetailDrift({ ...shown, adoptionPairs: adoptionPairKeys(planB) }, planB, [], undefined).drift).toBe(false);
+    });
+
+    it("a mid-modal swap of WHICH DEVICE adopts one server drifts, though both plans adopt THE SAME record, render byte-identical detail, and carry identical delete/auth-switch sets AND identical adoptee ids (kills a captured set of adoptee ids alone: consent names a PAIR — 'server X — device A' — and this swap re-points X at device B, renaming and re-addressing it onto a machine the user was never shown, while A quietly becomes an add)", () => {
+      // One record, two claimants. A restore-from-backup landing while the
+      // preview is open can rewrite kept-1's marker AND its address onto
+      // device:2's endpoint, at which point device:2 adopts it and device:1
+      // falls back to an add — the counts, and therefore every line of the
+      // rendered detail, are unchanged.
+      const planFor = (externalId: string, host: string) => {
+        const before = keptServer({ host });
+        return makeSyncPlan({
+          updates: [{ before, after: { ...before, name: "core-sw-01", origin: { sourceId: "src-1", externalId, syncedAt: 1 } } }]
+        });
+      };
+      const planA = planFor("device:1", "10.0.0.11");
+      const planB = planFor("device:2", "10.0.0.12");
+
+      const detailA = describePlanDetail(planA, [], undefined);
+      expect(describePlanDetail(planB, [], undefined)).toBe(detailA);
+      // THE non-vacuity assertion: the adoptee is the same record in both plans,
+      // so a captured set of `before.id` — what this used to be — is equal to
+      // equal and reports nothing. Only the device differs.
+      expect(new Set(planA.updates.map((u) => u.before.id))).toEqual(new Set(planB.updates.map((u) => u.before.id)));
+      expect(planA.updates[0].after.origin?.externalId).not.toBe(planB.updates[0].after.origin?.externalId);
+
+      const shown = {
+        detail: detailA,
+        deleteIds: new Set<string>(),
+        authSwitchIds: new Set<string>(),
+        adoptionPairs: adoptionPairKeys(planA)
+      };
+      expect(planDetailDrift(shown, planB, [], undefined).drift).toBe(true);
+      // Control, as above: with planB's own pairs captured there is no drift, so
+      // the assertion above is about the pairing and nothing else.
+      expect(planDetailDrift({ ...shown, adoptionPairs: adoptionPairKeys(planB) }, planB, [], undefined).drift).toBe(false);
+    });
+
+    it("the captured adoption keys are exactly the origin-less updates, each paired with the device claiming it (kills capturing every update, which would re-confirm on ordinary owned churn, and kills a key that carries only one half of the pair)", () => {
+      const plan = makeSyncPlan({
+        updates: [adoption(keptServer(), { name: "core-sw-01" }), ownedUpdate("owned-1"), ownedUpdate("owned-2")]
+      });
+      const [key] = [...adoptionPairKeys(plan)];
+      expect(adoptionPairKeys(plan).size).toBe(1);
+      // Both halves present, joined by a character the first half — a server id —
+      // can never contain, so the boundary holds whatever a provider puts in an
+      // externalId.
+      expect(key.split("\u0000")).toEqual(["kept-1", "device:1"]);
+      expect(adoptionPairKeys(makeSyncPlan({ updates: [ownedUpdate("owned-1")] })).size).toBe(0);
+    });
+
+    it("the captured CANDIDATE keys name a pairing exactly as the adopted-pair keys do — same key, same halves — so the question's captured consent and the preview's drift comparison can never disagree about what a pairing IS (kills a candidate capture keyed on the device name or on the adoptee alone, and kills reusing adoptionPairKeys for the question: an unanswered plan adopts nothing)", () => {
+      const candidate = { deviceName: "core-sw-01", externalId: "device:1", serverId: "kept-1", separateAddBlocked: false };
+
+      // An "adopt" run's plan carries BOTH shapes of the same fact: the
+      // candidate the question was put about, and the update it became. Where
+      // both are defined they must be the same set — that is what lets the two
+      // guards compare different MOMENTS without ever disagreeing about the
+      // thing they compare. The ordinary owned update is in here to prove the
+      // candidate derivation is not just "every update" either.
+      const adopting = makeSyncPlan({
+        updates: [adoption(keptServer(), { name: "core-sw-01" }), ownedUpdate("owned-1")],
+        adoptionCandidates: [candidate]
+      });
+      expect(adoptionCandidateKeys(adopting)).toEqual(adoptionPairKeys(adopting));
+
+      const [key] = [...adoptionCandidateKeys(adopting)];
+      // The DEVICE NAME is not part of the key, deliberately: it is what the
+      // question renders, and two different candidate sets can carry identical
+      // names (a replaced kept record still claimed by the same device). A key
+      // built out of what was rendered would wave that swap through.
+      expect(key).not.toContain("core-sw-01");
+
+      // THE REASON THIS DERIVATION EXISTS. The plan the question is asked from
+      // is computed before there is an answer, so it adopts nothing: the pair
+      // set is empty exactly where the question needs a capture. Reusing
+      // adoptionPairKeys there would capture the empty set and compare it
+      // against every later plan's empty set — a guard that passes always.
+      const unanswered = makeSyncPlan({ adoptionCandidates: [candidate] });
+      expect(adoptionPairKeys(unanswered).size).toBe(0);
+      expect(adoptionCandidateKeys(unanswered).size).toBe(1);
+      expect(adoptionCandidateKeys(makeSyncPlan({ updates: [ownedUpdate("owned-1")] })).size).toBe(0);
+    });
+  });
+
+  // Adopt-on-add, end to end: the question syncNow asks, the answer it threads
+  // into every recompute of the run, and the "Keep Servers" marker without which
+  // there would be nothing to adopt.
+  //
+  // THE TRAP THESE TESTS ARE BUILT AROUND: an adopted server and a
+  // duplicate-added one look almost the same field by field, so every outcome
+  // here is asserted on the server COUNT and the surviving ID. A fixture that
+  // only checked "a server exists with the device's name" passes against the
+  // very bug this feature exists to fix — the duplicate-add leaves the original
+  // record sitting right next to the new one. The kept server is therefore
+  // deliberately skewed away from anything the add path could mint: a
+  // hand-chosen id, a name the user changed, password auth, a hand-picked
+  // username.
+  describe("adopt-on-add — the question, the answer, and the Keep Servers marker", () => {
+    const DEVICE_1 = {
+      externalId: "device:1",
+      name: "core-sw-01",
+      endpoints: [{ kind: "ssh" as const, host: "10.0.0.11", port: 22 }]
+    };
+    const DEVICE_2 = {
+      externalId: "device:2",
+      name: "dist-rtr-01",
+      endpoints: [{ kind: "ssh" as const, host: "10.0.0.12", port: 22 }]
+    };
+    /** What the ADD path mints for DEVICE_1 under "src-1" — the id an adoption must NOT produce. */
+    const ADD_PATH_ID = deterministicServerId("src-1", "device:1");
+
+    // Count-correct: the title used to be plural over a single candidate.
+    const QUESTION = 'Adopt 1 server kept from a removed inventory source into "My Source"?';
+    const PREVIEW = 'Apply inventory sync from "My Source"?';
+    const ADOPTION_LINE_SINGULAR =
+      "The updated server will be adopted by this source — it was kept from a removed inventory source, and it keeps its saved credentials.";
+
+    /**
+     * REVIEW FINDING (P1, cross-instance adoption) — what `makeProvider`'s
+     * `instanceKey` returns for a source built by `makeSource` (whose `config`
+     * carries no `host`). Every marker below records it, so this block reads as
+     * "one deployment throughout" unless a test says otherwise.
+     */
+    const DEFAULT_INSTANCE = "fake://default";
+
+    /** The receipt "Keep Servers" leaves behind: this device, this provider, this INSTANCE of it, a source that is gone. */
+    function keptMarker(overrides: Partial<NonNullable<ServerConfig["formerlySynced"]>> = {}): NonNullable<ServerConfig["formerlySynced"]> {
+      return {
+        sourceId: "old-src",
+        sourceName: "My Source (removed)",
+        providerId: "fake",
+        instanceKey: DEFAULT_INSTANCE,
+        externalId: "device:1",
+        detachedAt: 900,
+        ...overrides
+      };
+    }
+
+    /** The canonical adoptee — kept from a previous sync of DEVICE_1, renamed by hand since. */
+    function keptServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+      return makeServer({
+        id: "kept-1",
+        name: "old-lab-switch",
+        host: "10.0.0.11",
+        port: 22,
+        username: "handpicked",
+        authType: "password",
+        formerlySynced: keptMarker(),
+        ...overrides
+      });
+    }
+
+    async function harness(
+      options: {
+        servers?: ServerConfig[];
+        devices?: InventoryTree["devices"];
+        sources?: Array<Partial<InventorySourceConfig>>;
+        /** REVIEW FINDING (P1) — for the one test that needs a provider naming no instance at all. */
+        provider?: Partial<InventoryProvider>;
+        /** REVIEW FINDING (P2, detached auth opt-outs) — sources that carry a profile need it to actually resolve. */
+        profiles?: AuthProfile[];
+        /**
+         * REVIEW FINDING (P1, re-ask when adoption candidates change) — a hook
+         * called before each vault `get` resolves. The in-lock credential
+         * re-check (syncNow's FINDING D block) is the last await before the
+         * final recompute, and the only vault read that happens after the
+         * preview has been answered — so a hook that waits for that answer lands
+         * its edit inside that window on every run rather than usually racing it.
+         */
+        onSecretRead?: () => void | Promise<void>;
+      } = {}
+    ): Promise<{ core: NexusCore }> {
+      const core = new NexusCore(new InMemoryConfigRepository(options.servers ?? [keptServer()]));
+      await core.initialize();
+      for (const profile of options.profiles ?? []) {
+        await core.addOrUpdateAuthProfile(profile);
+      }
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: options.devices ?? [DEVICE_1] })),
+          ...options.provider
+        })
+      );
+      const sources = options.sources ?? [{}];
+      const vault = makeVault(Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id ?? "src-1", "apiToken"), "tok"])));
+      if (options.onSecretRead) {
+        const hook = options.onSecretRead;
+        const inner = vault.get;
+        vault.get = vi.fn(async (key: string) => {
+          await hook();
+          return inner(key);
+        });
+      }
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      for (const overrides of sources) {
+        await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"], ...overrides }));
+      }
+      return { core };
+    }
+
+    // Several tests below deliberately queue an answer the GUARDED run never
+    // reaches — that is what lets them prove the unguarded run would have gone
+    // on to apply. The root `vi.clearAllMocks()` does not drain a
+    // `mockResolvedValueOnce` queue (it clears calls, not the implementation
+    // queue), so an unconsumed answer would be handed to the next test's first
+    // modal and quietly answer a question it was never written for.
+    afterEach(() => {
+      mockShowInformationMessage.mockReset();
+    });
+
+    /** Every MODAL showInformationMessage call, in order — the question and the preview(s), never the closing toasts. */
+    function modals(): Array<[string, { detail: string }, ...string[]]> {
+      return mockShowInformationMessage.mock.calls.filter(
+        (call) => typeof call[1] === "object" && call[1] !== null && (call[1] as { modal?: boolean }).modal === true
+      ) as Array<[string, { detail: string }, ...string[]]>;
+    }
+
+    it("Adopt Existing reclaims the kept record IN PLACE — one server afterwards, still `kept-1`, now owned by this source, credentials intact (kills the duplicate add this feature exists to remove, and kills an adoption that mints the add path's id)", async () => {
+      const { core } = await harness();
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      // Exactly two: the question, then the preview. A third would mean a
+      // recompute the answer never reached — the plan would have drifted
+      // (adds↔updates) and the loop re-shown the modal.
+      expect(shown).toHaveLength(2);
+
+      expect(shown[0][0]).toBe(QUESTION);
+      // EXACT, line by line, because every clause here is doing consent work:
+      // the device name sits beside "1 device" (attached to "a server you kept"
+      // it read as the SERVER's name — the one pairing the user cannot see yet);
+      // the population is named the one way the whole feature names it; the
+      // prune consequence is disclosed HERE, at the moment of the decision,
+      // rather than arriving months later as an anonymous deletion count; and
+      // Add Separately no longer promises adjacency the target folder breaks.
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '1 device ("core-sw-01") was previously synced onto a server you kept from a removed inventory source.',
+        'Adopt Existing re-links that server to "My Source" instead of adding a copy — it keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to it too, so a source set to Delete removes it, and its saved credentials, if the device later disappears from the source.',
+        "Add Separately leaves that server untouched and adds the device as a separate new server.",
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      expect(shown[0].slice(2)).toEqual(["Adopt Existing", "Add Separately"]);
+
+      // The preview describes an UPDATE, and says which population it is about.
+      expect(shown[1][0]).toBe(PREVIEW);
+      expect(shown[1][1].detail).toContain("1 server will be updated.");
+      expect(shown[1][1].detail).toContain(ADOPTION_LINE_SINGULAR);
+      expect(shown[1][1].detail).not.toContain("will be added");
+
+      // THE PASS/FAIL LINE for the whole feature: one server, and it is the one
+      // that was already there. A duplicate-add implementation leaves `kept-1`
+      // untouched beside a second record — every field check below would then
+      // pass against the WRONG server without these two assertions.
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].id).toBe("kept-1");
+      expect(servers[0].id).not.toBe(ADD_PATH_ID);
+
+      expect(servers[0].origin?.sourceId).toBe("src-1");
+      expect(servers[0].origin?.externalId).toBe("device:1");
+      // The source takes over the name; the credentials are not touched, and the
+      // marker is spent (a now-owned server must stop advertising itself).
+      expect(servers[0].name).toBe("core-sw-01");
+      expect(servers[0].authType).toBe("password");
+      expect(servers[0].username).toBe("handpicked");
+      expect(servers[0].formerlySynced).toBeUndefined();
+      expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("Add Separately adds the device beside the kept server and leaves it exactly as it was, marker included (kills an implementation that ignores the answer, and kills rendering the adoption line over a plan that adopts nothing)", async () => {
+      const { core } = await harness();
+
+      mockShowInformationMessage.mockResolvedValueOnce("Add Separately").mockResolvedValueOnce("Apply");
+      // The address collision still warns, so the post-apply warnings toast fires.
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[1][1].detail).toContain("1 server will be added.");
+      expect(shown[1][1].detail).toContain("1 device matches existing manual servers and will be added as duplicates.");
+      expect(shown[1][1].detail).not.toContain("being adopted by this source");
+
+      // Two servers, by id: the kept one and a brand-new one under the add
+      // path's deterministic id. Declining is today's behavior, preserved.
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(["kept-1", ADD_PATH_ID].sort());
+      const kept = core.getServer("kept-1")!;
+      expect(kept.origin).toBeUndefined();
+      expect(kept.name).toBe("old-lab-switch");
+      // The offer must still stand next run — declining once is not a decision
+      // about every future sync.
+      expect(kept.formerlySynced?.externalId).toBe("device:1");
+    });
+
+    it("a device whose kept server has MOVED raises no question — and the sync says so instead of duplicating in silence (kills gating that explanation on the adopt answer: this shape is never a candidate, so the question is never asked, so the answer can never be given — the pre-fix run produced a duplicate with no warning, no Show Warnings button, and nothing anywhere to explain it)", async () => {
+      // The re-IP'd lab: the marker still names device:1, but the record was
+      // re-addressed while the source was gone, so identity matches and
+      // corroboration does not.
+      const { core } = await harness({ servers: [keptServer({ host: "10.9.9.9" })] });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      // No question: there is nothing adoption could take, so the preview is the
+      // first thing the user sees.
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe(PREVIEW);
+      // The button itself is the finding: the plan carries a warning at all.
+      // Before the fix this run produced NO engine warning — the address no
+      // longer collides, so not even the duplicate notice fired — and the modal
+      // offered "Apply" alone.
+      expect(shown[0].slice(2)).toEqual(["Apply", "Show Warnings"]);
+      expect(shown[0][1].detail).toContain("1 warning — choose Show Warnings to review.");
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      expect(openArgs[0].content.split("\n")).toContain(
+        'Device "core-sw-01" was previously synced onto server "old-lab-switch", but that server is now at 10.9.9.9:22 and the device is at 10.0.0.11:22 — it will be added as a new server instead.'
+      );
+      // Reviewing is not consenting: nothing applied, the record untouched.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("kept-1")?.name).toBe("old-lab-switch");
+    });
+
+    it("declining the question does NOT silence the refusal for a device the question never mentioned — the answer covers the servers it named, and only those (kills suppressing the refusals per-plan on Add Separately: the question counts CLEAN CANDIDATES, and neither shape that produces a refusal is one, so declining could only ever quiet devices the user was told nothing about)", async () => {
+      // THE MIXED RUN, which is the only way `decline` and a refusal can meet:
+      // device:1 is a clean candidate — that is what raises the question at all
+      // — while device:2's kept server has moved, so it is the shape the
+      // previous test explains and the question could not have covered it. The
+      // user is shown "1 device (core-sw-01)" and answers about THAT.
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2],
+        servers: [
+          keptServer(),
+          keptServer({ id: "kept-2", name: "spare-rtr", host: "10.9.9.9", formerlySynced: keptMarker({ externalId: "device:2" }) })
+        ]
+      });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Add Separately").mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe(QUESTION);
+      // The question named ONE device — proof that dist-rtr-01 was never part of
+      // what the user answered.
+      expect(shown[0][1].detail).toContain('1 device ("core-sw-01")');
+      // TWO warnings now: the duplicate notice for the device the user decided
+      // about, and the explanation for the one they did not. The pre-fix run
+      // rendered "1 warning" here and added dist-rtr-01 as an unexplained
+      // duplicate.
+      expect(shown[1][1].detail).toContain("2 warnings — choose Show Warnings to review.");
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      const lines = openArgs[0].content.split("\n");
+      expect(lines).toContain('Device "core-sw-01" matches existing server "old-lab-switch" (10.0.0.11:22) — will be added as a duplicate.');
+      expect(lines).toContain(
+        'Device "dist-rtr-01" was previously synced onto server "spare-rtr", but that server is now at 10.9.9.9:22 and the device is at 10.0.0.12:22 — it will be added as a new server instead.'
+      );
+      // The device the user DID answer about gets no adoption commentary — that
+      // half of the old behaviour is right and stays.
+      expect(lines.some((line) => line.includes("core-sw-01") && line.includes("previously synced onto"))).toBe(false);
+      expect(applySpy).not.toHaveBeenCalled();
+    });
+
+    it("a declined run applies in ONE preview and leaves every kept record untouched, both the device the question named and the one it did not (kills treating a dismissal-shaped answer as Adopt, and kills a preview that drifts against the recompute under it — the modal would re-show until the mismatch cap aborted a sync nothing was wrong with)", async () => {
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2],
+        servers: [
+          keptServer(),
+          keptServer({ id: "kept-2", name: "spare-rtr", host: "10.9.9.9", formerlySynced: keptMarker({ externalId: "device:2" }) })
+        ]
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Add Separately").mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // TWO modals: the question and ONE preview. A third means the plan the
+      // preview rendered and the plan the in-lock recompute produced disagreed —
+      // the drift comparator sends the user back through the same preview until
+      // the mismatch cap aborts the run.
+      expect(modals()).toHaveLength(2);
+      // Both kept records untouched, both devices added beside them.
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(
+        ["kept-1", "kept-2", ADD_PATH_ID, deterministicServerId("src-1", "device:2")].sort()
+      );
+      expect(core.getServer("kept-1")?.origin).toBeUndefined();
+      expect(core.getServer("kept-2")?.origin).toBeUndefined();
+    });
+
+    it("Esc on the question ABORTS the sync — no preview, nothing applied (kills defaulting a dismissal to either answer, which re-introduces the silent path the question exists to remove)", async () => {
+      const { core } = await harness();
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Exactly ONE modal: the question. Defaulting to "Add Separately" would
+      // show the preview next (2 calls, then an add); defaulting to "Adopt
+      // Existing" likewise, with the record taken over.
+      expect(modals()).toHaveLength(1);
+      expect(modals()[0][0]).toBe(QUESTION);
+      expect(applySpy).not.toHaveBeenCalled();
+
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].id).toBe("kept-1");
+      expect(servers[0].origin).toBeUndefined();
+      expect(servers[0].name).toBe("old-lab-switch");
+    });
+
+    it("a server the user built by hand at the device's exact address raises NO question — the preview is the first thing shown (kills the rejected address-match design at the one place the user would meet it: hand-made servers must never be offered to a source)", async () => {
+      const { core } = await harness({ servers: [keptServer({ formerlySynced: undefined })] });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe(PREVIEW);
+      // And the outcome is today's: a duplicate add, the user's record untouched.
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(["kept-1", ADD_PATH_ID].sort());
+      expect(core.getServer("kept-1")?.name).toBe("old-lab-switch");
+    });
+
+    it("a marker left by a DIFFERENT provider's source raises no question either (kills a provider-blind marker lookup — externalId is provider-scoped, so two products' \"device:1\" are different machines)", async () => {
+      const { core } = await harness({
+        servers: [keptServer({ formerlySynced: keptMarker({ providerId: "some-other-provider" }) })]
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe(PREVIEW);
+      expect(core.getSnapshot().servers).toHaveLength(2);
+    });
+
+    it("the answer reaches the recomputes inside the retry loop: a plan that drifts mid-preview is RE-SHOWN still adopting, and applies as an adoption (kills a recompute computed without the flag — the preview would flip back to an add, and the run would loop to the mismatch cap instead of applying)", async () => {
+      const { core } = await harness({ devices: [DEVICE_1, DEVICE_2] });
+
+      mockShowInformationMessage
+        .mockResolvedValueOnce("Adopt Existing")
+        // Lands WHILE the first preview is open, and drifts the plan by a route
+        // that has nothing to do with adoption: a hand-added server appears at
+        // DEVICE_2's address, so the manual-duplicate line joins the detail.
+        // That forces the loop around a second time — which is the only way to
+        // observe what the in-lock recompute actually computed.
+        .mockImplementationOnce(async () => {
+          await core.addOrUpdateServer(makeServer({ id: "manual-2", name: "hand-made", host: "10.0.0.12", port: 22 }));
+          return "Apply";
+        })
+        .mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(3);
+      expect(shown[0][0]).toBe(QUESTION);
+      // The re-shown preview carries the new duplicate line (proving the loop
+      // really went round) AND still adopts (proving the answer survived into
+      // the recompute that produced it).
+      expect(shown[2][1].detail).toContain("1 device matches existing manual servers and will be added as duplicates.");
+      expect(shown[2][1].detail).toContain(ADOPTION_LINE_SINGULAR);
+      expect(shown[2][1].detail).toContain("1 server will be updated.");
+
+      // Three servers: the reclaimed record (its own id), the new one for
+      // DEVICE_2, and the hand-added server that caused the drift. A flag-less
+      // recompute applies FOUR — `kept-1` untouched beside two adds.
+      const servers = core.getSnapshot().servers;
+      expect([...servers].map((s) => s.id).sort()).toEqual(["kept-1", "manual-2", deterministicServerId("src-1", "device:2")].sort());
+      expect(core.getServer("kept-1")?.origin?.sourceId).toBe("src-1");
+      expect(core.getServer("kept-1")?.name).toBe("core-sw-01");
+    });
+
+    it("Show Warnings names every adopted pair by BOTH names, and is offered even though the adopting plan carries no engine warning at all (kills a count-only disclosure of an ownership change, and kills keying the button on plan.warnings)", async () => {
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2],
+        servers: [
+          keptServer(),
+          keptServer({
+            id: "kept-2",
+            name: "spare-rtr",
+            host: "10.0.0.12",
+            isHidden: true,
+            formerlySynced: keptMarker({ externalId: "device:2" })
+          })
+        ]
+      });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      // The plural question, count-correct in the title and carrying the same
+      // prune disclosure the singular one does — the two are written out
+      // separately, so both have to be pinned.
+      expect(shown[0][0]).toBe('Adopt 2 servers kept from a removed inventory source into "My Source"?');
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '2 devices (e.g. "core-sw-01", "dist-rtr-01") were previously synced onto servers you kept from a removed inventory source.',
+        'Adopt Existing re-links those servers to "My Source" instead of adding copies — each keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to them too, so a source set to Delete removes any one of them, and its saved credentials, if its device later disappears from the source.',
+        "Add Separately leaves those servers untouched and adds each device as a separate new server.",
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      // Both devices adopt, so the plan has NO engine warnings — a button keyed
+      // on plan.warnings.length would be "Apply" alone and the pair list would
+      // be unreachable in exactly the case it exists for.
+      expect(shown[1].slice(2)).toEqual(["Apply", "Show Warnings"]);
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      const lines = openArgs[0].content.split("\n");
+      expect(lines).toContain("2 servers kept from a removed inventory source will be adopted by this source (each keeps its saved credentials):");
+      // The tree name FIRST: "old-lab-switch" is the only name the user can
+      // find today, and the only one an `after`-only list would drop.
+      expect(lines).toContain('  "old-lab-switch" — device "core-sw-01" (10.0.0.11:22)');
+      expect(lines).toContain('  "spare-rtr" — device "dist-rtr-01" (10.0.0.12:22) (hidden)');
+      expect(lines).not.toContain('  "old-lab-switch" — device "core-sw-01" (10.0.0.11:22) (hidden)');
+
+      // Show Warnings ends the command — reviewing is not consenting.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("kept-1")?.origin).toBeUndefined();
+    });
+
+    it("Remove Source → Keep Servers stamps each kept server with the device IT was mapped to (kills the strip-only removal that makes re-adding the source duplicate the whole fleet, and kills a stamp that copies one device's id onto every record)", async () => {
+      const { core } = await harness({
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "sw1",
+            host: "10.0.0.11",
+            origin: { sourceId: "src-1", externalId: "device:7", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+          }),
+          makeServer({
+            id: "owned-2",
+            name: "sw2",
+            host: "10.0.0.12",
+            origin: { sourceId: "src-1", externalId: "device:8", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      const first = core.getServer("owned-1")!;
+      // The strip is unchanged — that half stays non-negotiable.
+      expect(first.origin).toBeUndefined();
+      expect(first.formerlySynced).toEqual({
+        sourceId: "src-1",
+        sourceName: "My Source",
+        providerId: "fake",
+        // REVIEW FINDING (P1, cross-instance adoption), fed by REVIEW FINDING
+        // (P1, the instance guard fed from the wrong place) — copied off each
+        // server's own `origin.syncedInstanceKey`, which is the only record of
+        // the deployment its `externalId` came from once `source.config` is
+        // deleted with the source a line later. `toEqual` (not a subset check) is
+        // what makes an omission visible here.
+        instanceKey: DEFAULT_INSTANCE,
+        externalId: "device:7",
+        detachedAt: expect.any(Number)
+      });
+      // Per-server, from that server's OWN origin.
+      expect(core.getServer("owned-2")?.formerlySynced?.externalId).toBe("device:8");
+      expect(core.getServer("owned-2")?.origin).toBeUndefined();
+    });
+
+    it("ROUND TRIP — Keep Servers, hand-rename, re-add the source under a new id: the same record is offered and reclaimed, never duplicated (kills a marker written in a shape the sync engine cannot match, which every isolated half of this feature would still pass)", async () => {
+      const { core } = await harness({
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            username: "labuser",
+            authType: "password",
+            // Synced from netbox-a, which is what the removal copies into the
+            // marker and what makes src-2 (pointed at the same deployment)
+            // eligible to reclaim it.
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://netbox-a" }
+          })
+        ],
+        // Both incarnations exist from the start; the removal below takes the
+        // first one out, exactly as re-adding after a removal would.
+        //
+        // REVIEW FINDING (P1, cross-instance adoption) — both are pointed at the
+        // SAME deployment, spelled out rather than left to the fixture default,
+        // because that is now the thing making this round trip work: the source
+        // id changes (src-1 -> src-2) and the instance key does not, which is
+        // exactly the asymmetry the feature depends on.
+        sources: [
+          { config: { host: "netbox-a" } },
+          { id: "src-2", name: "My Source B", config: { host: "netbox-a" } }
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+      // Renamed by hand while unmanaged — so "the device's name is back" is an
+      // observable consequence of the adoption rather than a coincidence.
+      await core.addOrUpdateServer({ ...core.getServer("owned-1")!, name: "renamed-by-hand" });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      // The marker written by the removal above is what raises this question at
+      // all: written wrong (or not at all), call 0 is the preview and this fails.
+      expect(shown[0][0]).toBe('Adopt 1 server kept from a removed inventory source into "My Source B"?');
+      expect(shown[0][1].detail).toContain('1 device ("core-sw-01")');
+
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].id).toBe("owned-1");
+      expect(servers[0].id).not.toBe(deterministicServerId("src-2", "device:1"));
+      expect(servers[0].origin?.sourceId).toBe("src-2");
+      expect(servers[0].name).toBe("core-sw-01");
+      expect(servers[0].formerlySynced).toBeUndefined();
+    });
+
+    it("CROSS-INSTANCE ROUND TRIP — a second deployment of the SAME provider is never offered the first one's kept server, and never takes it (kills the providerId-only identity check end to end: the marker, the question and the apply all agree)", async () => {
+      // The whole reported scenario, driven through the real commands: a lab
+      // instance beside a production one. Both are "fake" providers, both report
+      // "device:1", and the kept record sits at exactly the address the second
+      // instance's device reports — the coincidence a homelab reproduces on the
+      // first try, since NetBox numbers devices from 1 and 10.0.0.11 is nobody's
+      // idea of a unique address.
+      const { core } = await harness({
+        sources: [
+          { config: { host: "netbox-prod" } },
+          { id: "src-2", name: "Lab NetBox", config: { host: "netbox-lab" } }
+        ],
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            username: "labuser",
+            authType: "password",
+            // Synced from production, recorded on the record itself.
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://netbox-prod" }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+      // The marker records WHICH deployment kept it — this is what the sync
+      // below has to disagree with.
+      expect(core.getServer("owned-1")?.formerlySynced?.instanceKey).toBe("fake://netbox-prod");
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      const shown = modals();
+      // ONE modal, and it is the preview: the question is never raised, because
+      // a question the user answers "Adopt" to is a transfer as surely as a
+      // silent one — the modal cannot say which deployment the record came from.
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe('Apply inventory sync from "Lab NetBox"?');
+      expect(shown[0][1].detail).not.toContain("adopted by this source");
+
+      // Two servers: the untouched record kept from production, and the lab
+      // instance's own new one. The pre-fix build applied ONE — `owned-1`
+      // re-homed onto src-2, at which point the lab source's Removed-Device
+      // Policy governed a production server and its saved credentials.
+      const servers = core.getSnapshot().servers;
+      expect([...servers].map((s) => s.id).sort()).toEqual(["owned-1", deterministicServerId("src-2", "device:1")].sort());
+      const keptFromProd = core.getServer("owned-1")!;
+      expect(keptFromProd.origin).toBeUndefined();
+      expect(keptFromProd.username).toBe("labuser");
+      expect(keptFromProd.formerlySynced?.instanceKey).toBe("fake://netbox-prod");
+      expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("REPOINTED-BEFORE-REMOVAL — a source edited to point at a SECOND deployment and then removed with Keep Servers stamps the deployment its servers were actually SYNCED from, and a source at the second deployment does not adopt them (kills deriving the marker from the source's current config, which hands the servers of instance A to a source of instance B — the instance guard fed from the wrong place)", async () => {
+      // THE WINDOW THIS LIVES IN: Edit Source can be repointed at any time, and
+      // until a sync against the new deployment succeeds the owned servers'
+      // externalIds are still the OLD deployment's. Removing in that window used
+      // to stamp every marker with the new deployment's key, so the instance
+      // guard — real, and correct as written — was simply fed the wrong value.
+      const { core } = await harness({
+        sources: [
+          { config: { host: "netbox-a" } },
+          { id: "src-2", name: "Lab NetBox", config: { host: "netbox-b" } }
+        ],
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            username: "prod-account",
+            authType: "password",
+            // What a real sync against netbox-a stamped: device:1 is netbox-a's
+            // device:1, and this is the only record of that fact.
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://netbox-a" }
+          })
+        ]
+      });
+
+      // The repoint. No sync follows it — that is the entire point.
+      const repointed = core.getInventorySource("src-1")!;
+      await core.addOrUpdateInventorySource({ ...repointed, config: { host: "netbox-b" } });
+      expect(core.getInventorySource("src-1")?.config).toEqual({ host: "netbox-b" });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      // THE KILLER ASSERTION. A build that re-derives from `source.config` writes
+      // "fake://netbox-b" here, and every consequence below follows from it.
+      expect(core.getServer("owned-1")?.formerlySynced?.instanceKey).toBe("fake://netbox-a");
+      expect(core.getServer("owned-1")?.formerlySynced?.instanceKey).not.toBe("fake://netbox-b");
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      // ONE modal, and it is the preview: the netbox-b source is never even
+      // OFFERED the netbox-a record, because an adoption the user approves is as
+      // much a transfer as a silent one.
+      const shown = modals();
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe('Apply inventory sync from "Lab NetBox"?');
+      expect(shown[0][1].detail).not.toContain("adopted by this source");
+
+      // Two servers: the untouched netbox-a record and netbox-b's own new one.
+      // The pre-fix build applied ONE — owned-1 re-homed onto src-2, after which
+      // the lab source's Removed-Device Policy governed a production server and
+      // its saved credentials.
+      const servers = core.getSnapshot().servers;
+      expect([...servers].map((s) => s.id).sort()).toEqual(["owned-1", deterministicServerId("src-2", "device:1")].sort());
+      const keptFromA = core.getServer("owned-1")!;
+      expect(keptFromA.origin).toBeUndefined();
+      expect(keptFromA.username).toBe("prod-account");
+      expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("Keep Servers carries the source's OWN auth-profile link record into the marker (kills a detach that drops `syncedAuthProfileId`, after which an adopted server's sync-applied profile can never be taken back off)", async () => {
+      const { core } = await harness({
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "sw1",
+            host: "10.0.0.11",
+            authProfileId: "p1",
+            origin: {
+              sourceId: "src-1",
+              externalId: "device:1",
+              syncedAt: 1,
+              syncedInstanceKey: DEFAULT_INSTANCE,
+              // The sync's own record that IT applied p1.
+              syncedAuthProfileId: "p1"
+            }
+          }),
+          // The near-miss beside it: identical link, but the USER made it, so
+          // there is no receipt to carry and none must be invented.
+          makeServer({
+            id: "owned-2",
+            name: "sw2",
+            host: "10.0.0.12",
+            authProfileId: "p1",
+            origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      // The link itself stays on both records — a detach removes ownership, not
+      // credentials.
+      expect(core.getServer("owned-1")?.authProfileId).toBe("p1");
+      expect(core.getServer("owned-2")?.authProfileId).toBe("p1");
+      // Only the sync's own link leaves a receipt.
+      expect(core.getServer("owned-1")?.formerlySynced?.syncedAuthProfileId).toBe("p1");
+      expect(core.getServer("owned-2")?.formerlySynced).not.toHaveProperty("syncedAuthProfileId");
+    });
+
+    it("a provider that reports no instance at all writes a receipt-only marker and adopts nothing (kills stamping an instance key the provider never supplied, and kills falling back to the provider id when it has none)", async () => {
+      const { core } = await harness({
+        provider: { instanceKey: undefined },
+        sources: [{}, { id: "src-2", name: "My Source B" }],
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+      // The receipt still exists — the UI can still say where this server came
+      // from — but it names no instance, so it is not an adoption key.
+      const marker = core.getServer("owned-1")?.formerlySynced;
+      expect(marker?.sourceName).toBe("My Source");
+      expect(marker?.externalId).toBe("device:1");
+      expect(marker).not.toHaveProperty("instanceKey");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      // No question, and a duplicate add rather than a reclaim — the deliberate
+      // cost of a provider that cannot say which deployment it is talking to.
+      expect(modals()).toHaveLength(1);
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(
+        ["owned-1", deterministicServerId("src-2", "device:1")].sort()
+      );
+      expect(core.getServer("owned-1")?.origin).toBeUndefined();
+    });
+
+    it("RESTORED ID-PRESERVING BACKUP — the question is asked and the adoption applies, on a plan whose add/update/prune counts are all ZERO (kills the no-op fast path swallowing the one run whose only work IS the question: the kept server already holds the id this device's add would need, so the engine plans nothing, the fast path applied an empty plan and returned, and the restored source could never reclaim its own servers — with the collision guard's adoptee exemption sitting there unreachable)", async () => {
+      // THE RESTORE, exactly: the kept record still carries the id the sync that
+      // created it minted (`deterministicServerId("src-1", "device:1")`), and the
+      // restored source record kept its own id, so the two meet head-on.
+      const { core } = await harness({ servers: [keptServer({ id: ADD_PATH_ID })] });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      // No warning-toast mock: an adopting plan carries no engine warning at
+      // all, so nothing here may reach `showWarningMessage`.
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // THE FINDING. Pre-fix there were NO modals at all: the counts were empty,
+      // so the sync reported "nothing to change" and returned before the question
+      // could be put.
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe(QUESTION);
+      expect(shown[1][0]).toBe(PREVIEW);
+      expect(shown[1][1].detail).toContain("1 server will be updated.");
+      expect(shown[1][1].detail).toContain(ADOPTION_LINE_SINGULAR);
+
+      // AND IT ACTUALLY RECLAIMS — a test that stopped at "a candidate is
+      // reported" would have passed against the pre-fix build while the user
+      // still had no way to reach it. One server, the one that was already
+      // there, now owned by this source and with its marker spent.
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].id).toBe(ADD_PATH_ID);
+      expect(servers[0].origin?.sourceId).toBe("src-1");
+      expect(servers[0].origin?.externalId).toBe("device:1");
+      expect(servers[0].name).toBe("core-sw-01");
+      expect(servers[0].username).toBe("handpicked");
+      expect(servers[0].formerlySynced).toBeUndefined();
+      expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    // REVIEW FINDING (P2, "avoid promising a separate add when the ID is
+    // occupied") — the three shapes of the decline line. The fast-path fix above
+    // is what made this copy reachable: a restored ID-preserving backup now DOES
+    // reach the question, and the sentence it read there ("adds the device as a
+    // separate new server") described something the engine cannot do — its
+    // collision fall-through skips the device, so the user chose an add, got
+    // nothing, and had one line behind Show Warnings to work out why.
+    //
+    // Each test below asserts the WHOLE detail, line by line, plus the buttons.
+    // Asserting a substring of the changed line would let the other three lines
+    // rot silently, and asserting "a modal was shown" would pass against the very
+    // copy this finding is about.
+    it("ALL BLOCKED — the question promises no add at all and names the button for what it does, and choosing it really does leave the kept server untouched and add nothing (kills the blanket 'adds the device as a separate new server': that is exactly what does NOT happen when the adoptee already holds the id, and it is the state a restored ID-preserving backup lands in)", async () => {
+      const { core } = await harness({ servers: [keptServer({ id: ADD_PATH_ID })] });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Don't Adopt").mockResolvedValueOnce("Apply");
+      // The blocked device's own warning survives the apply, so the post-apply
+      // warnings toast fires.
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe(QUESTION);
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '1 device ("core-sw-01") was previously synced onto a server you kept from a removed inventory source.',
+        'Adopt Existing re-links that server to "My Source" instead of adding a copy — it keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to it too, so a source set to Delete removes it, and its saved credentials, if the device later disappears from the source.',
+        // THE FINDING, in one line. It states the outcome (adds nothing), the
+        // reason, and it does so in the engine's own words — the sentence found
+        // later behind Show Warnings describes the same situation, not a second
+        // one.
+        "Don't Adopt leaves that server untouched and adds nothing: it still uses the id a new server for this device would need, so the device is skipped rather than added separately.",
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      // And the BUTTON, which is an action label: "Add Separately" over a body
+      // reading "adds nothing" is the same false promise one line higher up.
+      expect(shown[0].slice(2)).toEqual(["Adopt Existing", "Don't Adopt"]);
+
+      // THE OUTCOME THE COPY NOW DESCRIBES, applied for real rather than
+      // abandoned at Show Warnings: one server, the one that was already there,
+      // still un-owned and still advertising itself for adoption next run. A
+      // second record here would mean the old copy had been true and the fix
+      // aimed at the wrong half.
+      expect(applySpy).toHaveBeenCalledTimes(1);
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].id).toBe(ADD_PATH_ID);
+      expect(servers[0].name).toBe("old-lab-switch");
+      expect(servers[0].username).toBe("handpicked");
+      expect(servers[0].origin).toBeUndefined();
+      expect(servers[0].formerlySynced?.externalId).toBe("device:1");
+    });
+
+    it("ALL BLOCKED, plural — the same promise withdrawn for a whole set (kills reusing the singular sentence, whose 'it still uses the id' names no server when there are two of them)", async () => {
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2],
+        servers: [
+          keptServer({ id: ADD_PATH_ID }),
+          keptServer({
+            id: deterministicServerId("src-1", "device:2"),
+            name: "spare-rtr",
+            host: "10.0.0.12",
+            formerlySynced: keptMarker({ externalId: "device:2" })
+          })
+        ]
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown[0][0]).toBe('Adopt 2 servers kept from a removed inventory source into "My Source"?');
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '2 devices (e.g. "core-sw-01", "dist-rtr-01") were previously synced onto servers you kept from a removed inventory source.',
+        'Adopt Existing re-links those servers to "My Source" instead of adding copies — each keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to them too, so a source set to Delete removes any one of them, and its saved credentials, if its device later disappears from the source.',
+        "Don't Adopt leaves those servers untouched and adds nothing: each still uses the id a new server for its device would need, so every one of these devices is skipped rather than added separately.",
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      expect(shown[0].slice(2)).toEqual(["Adopt Existing", "Don't Adopt"]);
+    });
+
+    it("MIXED — the question names the ONE device that cannot be added beside its server while still promising the add for the other, and the run then does exactly that (kills a fix that treats any blocked candidate as all of them: 'adds nothing' would be false about dist-rtr-01, which really is added — and kills leaving the blanket promise in place, which is false about core-sw-01, which really is not)", async () => {
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2],
+        servers: [
+          // Blocked: this record already holds the id an add for device:1 would
+          // mint — the restored-backup shape.
+          keptServer({ id: ADD_PATH_ID }),
+          // Clean: a hand-chosen id, so nothing stands in the way of the add.
+          keptServer({ id: "kept-2", name: "spare-rtr", host: "10.0.0.12", formerlySynced: keptMarker({ externalId: "device:2" }) })
+        ]
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Add Separately").mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe('Adopt 2 servers kept from a removed inventory source into "My Source"?');
+      expect(shown[0][1].detail.split("\n")).toEqual([
+        '2 devices (e.g. "core-sw-01", "dist-rtr-01") were previously synced onto servers you kept from a removed inventory source.',
+        'Adopt Existing re-links those servers to "My Source" instead of adding copies — each keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source\'s Removed-Device Policy applies to them too, so a source set to Delete removes any one of them, and its saved credentials, if its device later disappears from the source.',
+        // NAMED, not averaged: one device of the two is the exception, and the
+        // user is told which. A count alone ("1 of them") would leave them
+        // choosing without knowing which server they are about to lose the add
+        // for. One name is the whole list, so it is not an "e.g.".
+        'Add Separately leaves those servers untouched and adds each device as a separate new server — except 1 device ("core-sw-01"), whose kept server still uses the id a new server for it would need, so that device is skipped rather than added separately.',
+        "Nothing changes until you choose Apply on the sync preview."
+      ]);
+      // The label stands here — it is true of dist-rtr-01, and the detail names
+      // the exception. A third label would be a third thing to learn for no gain.
+      expect(shown[0].slice(2)).toEqual(["Adopt Existing", "Add Separately"]);
+
+      // AND THE RUN DOES EXACTLY WHAT THE SENTENCE SAID. Three servers: both kept
+      // records untouched, and ONE new one — device:2's. device:1 produced
+      // nothing, which is the whole reason the sentence had to be written.
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(
+        [ADD_PATH_ID, "kept-2", deterministicServerId("src-1", "device:2")].sort()
+      );
+      expect(core.getServer(ADD_PATH_ID)?.origin).toBeUndefined();
+      expect(core.getServer(ADD_PATH_ID)?.name).toBe("old-lab-switch");
+      expect(core.getServer("kept-2")?.origin).toBeUndefined();
+      expect(core.getServer(deterministicServerId("src-1", "device:2"))?.name).toBe("dist-rtr-01");
+    });
+
+    it("MIXED, plural exception — two blocked among three are named as examples under the same cap and 'e.g.' the count line uses (kills a singular exception clause bolted on for the one-blocked case: 'whose kept server still uses the id' names one server for two devices)", async () => {
+      const DEVICE_3 = {
+        externalId: "device:3",
+        name: "edge-fw-01",
+        endpoints: [{ kind: "ssh" as const, host: "10.0.0.13", port: 22 }]
+      };
+      const { core } = await harness({
+        devices: [DEVICE_1, DEVICE_2, DEVICE_3],
+        servers: [
+          keptServer({ id: ADD_PATH_ID }),
+          keptServer({
+            id: deterministicServerId("src-1", "device:2"),
+            name: "spare-rtr",
+            host: "10.0.0.12",
+            formerlySynced: keptMarker({ externalId: "device:2" })
+          }),
+          keptServer({ id: "kept-3", name: "old-fw", host: "10.0.0.13", formerlySynced: keptMarker({ externalId: "device:3" }) })
+        ]
+      });
+      expect(core.getSnapshot().servers).toHaveLength(3);
+
+      mockShowInformationMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const detail = modals()[0][1].detail.split("\n");
+      expect(detail[0]).toBe('3 devices (e.g. "core-sw-01", "dist-rtr-01", "edge-fw-01") were previously synced onto servers you kept from a removed inventory source.');
+      expect(detail[2]).toBe(
+        'Add Separately leaves those servers untouched and adds each device as a separate new server — except 2 devices (e.g. "core-sw-01", "dist-rtr-01"), whose kept servers still use the ids new servers for them would need, so those devices are skipped rather than added separately.'
+      );
+      expect(modals()[0].slice(2)).toEqual(["Adopt Existing", "Add Separately"]);
+    });
+
+    it("RESTORED BACKUP, declined — the run reaches the preview and Show Warnings carries the engine's explanation, so the answer given before the run and the account given after it agree (kills a fix that only unblocks the Adopt branch: the decline cannot add this device either, and the sentence saying why has to survive to the warnings)", async () => {
+      const { core } = await harness({ servers: [keptServer({ id: ADD_PATH_ID })] });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      // "Don't Adopt", not "Add Separately": every candidate in this run is
+      // blocked, so that is the label the question actually renders (see the
+      // detail-text test above). A run answering the OTHER string would be
+      // dismissing the modal, and the assertions below would then be about Esc.
+      mockShowInformationMessage.mockResolvedValueOnce("Don't Adopt").mockResolvedValueOnce("Show Warnings");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe(QUESTION);
+      // The preview is honest about a plan that does nothing, and offers the one
+      // button that leads to the reason.
+      expect(shown[1][0]).toBe(PREVIEW);
+      expect(shown[1][1].detail).toContain("1 warning — choose Show Warnings to review.");
+      expect(shown[1].slice(2)).toEqual(["Apply", "Show Warnings"]);
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      expect(openArgs[0].content.split("\n")).toContain(
+        'Device "core-sw-01" (device:1) was previously synced onto server "old-lab-switch", which still uses the id a new server for this device would need — so it is skipped rather than added separately. Sync again and choose Adopt Existing to reclaim that server.'
+      );
+
+      // Nothing applied (Show Warnings ends the command), and above all no second
+      // record under an id that is already in use.
+      expect(applySpy).not.toHaveBeenCalled();
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].origin).toBeUndefined();
+      expect(servers[0].formerlySynced?.externalId).toBe("device:1");
+    });
+
+    it("THE SECOND GATE — a candidate that appears only in the fast path's in-lock recompute is asked about too, not applied away (kills fixing the outer count check alone: the recompute exists because a queued mutation can land between the two, and the write that lands can be the config import that CREATES the adoptee)", async () => {
+      // Pre-lock the plan is genuinely empty AND has no candidate: device:1 maps
+      // to an owned server that is already exactly what the sync would write.
+      const owned = makeServer({
+        id: "owned-1",
+        name: "core-sw-01",
+        host: "10.0.0.11",
+        port: 22,
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+      });
+      const { core } = await harness({ servers: [owned] });
+
+      let releaseImport!: () => void;
+      const importGate = new Promise<void>((resolve) => {
+        releaseImport = resolve;
+      });
+      // A locked mutation queued AHEAD of syncNow's fast-path lock acquisition —
+      // an ID-preserving restore replacing the owned record with the kept one it
+      // was before the source was removed. After it lands the fresh recompute
+      // finds a candidate whose add is blocked by its own adoptee's id, i.e. a
+      // count-empty plan carrying a question.
+      const importPromise = configMutationLock.runExclusive(async () => {
+        await importGate;
+        await core.removeServer("owned-1");
+        await core.addOrUpdateServer(keptServer({ id: ADD_PATH_ID }));
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Apply");
+      const syncPromise = registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+      // Let syncNow reach (and queue behind) its fast-path lock acquisition.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      releaseImport();
+      await importPromise;
+      await syncPromise;
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe(QUESTION);
+      // Never the fast path's toast: the recompute found something to ask about.
+      expect(mockShowInformationMessage.mock.calls.some(([msg]) => typeof msg === "string" && msg.includes("nothing to change"))).toBe(false);
+
+      const servers = core.getSnapshot().servers;
+      expect(servers).toHaveLength(1);
+      expect(servers[0].id).toBe(ADD_PATH_ID);
+      expect(servers[0].origin?.sourceId).toBe("src-1");
+      expect(servers[0].name).toBe("core-sw-01");
+    });
+
+    it("REVIEW FINDING (P2) — an auth-profile link the user cleared BEFORE the source was removed is still cleared after the adoption, while the kept server beside it that was never linked adopts the profile as usual (kills a retro-apply predicate blind to the marker: the receipt is preserved across the detach and then ignored, so the same opt-out is honoured forever if made after the adoption and silently reversed if made before it)", async () => {
+      const LAB_PROFILE: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+      const { core } = await harness({
+        profiles: [LAB_PROFILE],
+        devices: [DEVICE_1, DEVICE_2],
+        // Both incarnations of the source, both carrying the profile: the second
+        // is the one re-added after the removal below.
+        sources: [
+          { authProfileId: "p1", defaultUsername: "labuser" },
+          { id: "src-2", name: "My Source B", authProfileId: "p1", defaultUsername: "labuser" }
+        ],
+        servers: [
+          // THE OPT-OUT, made while the source still owned the server: the sync
+          // had applied p1 (the origin stamp says so) and the user set Auth
+          // Profile back to (None). Every other retro-apply clause still passes —
+          // agent auth, no key of its own, and the username the sync stamped —
+          // so the receipt is the only thing that can refuse the re-link.
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            username: "labuser",
+            authType: "agent",
+            authProfileId: undefined,
+            origin: {
+              sourceId: "src-1",
+              externalId: "device:1",
+              syncedAt: 1,
+              syncedInstanceKey: DEFAULT_INSTANCE,
+              syncedUsername: "labuser",
+              syncedAuthProfileId: "p1"
+            }
+          }),
+          // THE CONTROL, identical but for the one field: no sync ever put a
+          // profile on this record, so nothing here is an opt-out and the
+          // adoption must link the source's profile exactly as it always has.
+          makeServer({
+            id: "owned-2",
+            name: "dist-rtr-01",
+            host: "10.0.0.12",
+            port: 22,
+            username: "labuser",
+            authType: "agent",
+            authProfileId: undefined,
+            origin: {
+              sourceId: "src-1",
+              externalId: "device:2",
+              syncedAt: 1,
+              syncedInstanceKey: DEFAULT_INSTANCE,
+              syncedUsername: "labuser"
+            }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+      // The persisted receipt this whole finding is about — preserved by the
+      // detach, and until now read by nothing on the adoption path.
+      expect(core.getServer("owned-1")?.formerlySynced?.syncedAuthProfileId).toBe("p1");
+      expect(core.getServer("owned-1")?.authProfileId).toBeUndefined();
+      expect(core.getServer("owned-2")?.formerlySynced).not.toHaveProperty("syncedAuthProfileId");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      const shown = modals();
+      expect(shown).toHaveLength(2);
+      expect(shown[0][0]).toBe('Adopt 2 servers kept from a removed inventory source into "My Source B"?');
+      // ONE switch disclosed, not two: the preview counts what the plan actually
+      // writes, so the opted-out server is not in it.
+      expect(shown[1][1].detail).toContain('1 server will switch to auth profile "Lab credentials".');
+
+      // THE ASSERTION THE FINDING TURNS ON, read off the persisted record.
+      const optedOut = core.getServer("owned-1")!;
+      expect(optedOut.origin?.sourceId).toBe("src-2");
+      expect(optedOut.authProfileId).toBeUndefined();
+      // The receipt moves into the new origin, so the next ordinary sync reads
+      // the same opt-out without the marker the adoption has spent.
+      expect(optedOut.origin?.syncedAuthProfileId).toBe("p1");
+      expect(optedOut.formerlySynced).toBeUndefined();
+
+      const control = core.getServer("owned-2")!;
+      expect(control.origin?.sourceId).toBe("src-2");
+      expect(control.authProfileId).toBe("p1");
+      expect(control.origin?.syncedAuthProfileId).toBe("p1");
+    });
+
+    // REVIEW FINDING (P1) — RE-ASK WHEN THE CANDIDATES CHANGE.
+    //
+    // The question is a consent moment of its own: the user agrees to hand a
+    // NAMED SET of servers to this source, and every plan computed from that
+    // answer must still be about that set. `planDetailDrift` cannot supply this.
+    // Its baseline rolls forward with the preview and only starts existing once
+    // the preview does — which is one recompute AFTER the answer is first spent.
+    //
+    // Every test below is a SAME-COUNT swap, because a count check would catch
+    // anything else: one candidate before, one candidate after, and the run must
+    // not adopt the one that arrived. Each stages the change through a modal
+    // implementation or a vault-read hook, so it lands inside the window every
+    // time rather than usually racing it, and each asserts the PERSISTED result.
+    const STALE_ANSWER_REFUSAL =
+      'The servers "My Source" offered to adopt are no longer the ones you were asked about — sync aborted, run Sync Now again.';
+
+    /** The record that replaces the adoptee mid-question: another survivor of the same removal, at the same address, claiming the same device. */
+    function restoredAdoptee(): ServerConfig {
+      return keptServer({ id: "kept-9", name: "restored-lab-switch", username: "restored" });
+    }
+
+    /** The first line of the question's `detail` — the only part of it that names anything the two candidate sets could differ on. */
+    const QUESTION_FIRST_LINE = '1 device ("core-sw-01") was previously synced onto a server you kept from a removed inventory source.';
+
+    it("a same-count swap of WHICH kept record is eligible, landing while the question is open, aborts instead of spending the answer on the record that replaced it (kills capturing the question's device names, its rendered text, or its count: both sets are one device named \"core-sw-01\", so nothing the question showed can tell them apart)", async () => {
+      const { core } = await harness();
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        // The replacement lands WHILE the question is open — a replace-mode
+        // config import, or a restore from backup, swapping the kept record for
+        // another survivor of the same removal at the same address, still
+        // claiming device:1. One candidate before, one candidate after.
+        .mockImplementationOnce(async () => {
+          await core.removeServer("kept-1");
+          await core.addOrUpdateServer(restoredAdoptee());
+          return "Adopt Existing";
+        })
+        // Queued so the UNGUARDED path can actually reach the apply: without an
+        // answer waiting here the preview would collect `undefined` and return,
+        // leaving the state untouched for a reason that proves nothing.
+        .mockResolvedValueOnce("Apply");
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      // The question, and nothing after it: the preview the "Apply" above was
+      // queued for is never reached.
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe(QUESTION);
+      expect(shown[0][1].detail.split("\n")[0]).toBe(QUESTION_FIRST_LINE);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(STALE_ANSWER_REFUSAL);
+
+      // THE PASS/FAIL LINE: kept-9 is exactly as the swap left it. Unguarded,
+      // this run renames it "core-sw-01", stamps src-1's origin on it — and with
+      // it this source's Removed-Device Policy, `delete` included — spends its
+      // Keep Servers marker, and keeps its saved credentials pointed at a record
+      // now owned by a source the user never offered it to.
+      expect(applySpy).not.toHaveBeenCalled();
+      const restored = core.getServer("kept-9")!;
+      expect(restored.name).toBe("restored-lab-switch");
+      expect(restored.origin).toBeUndefined();
+      expect(restored.formerlySynced?.externalId).toBe("device:1");
+      // Nor did the run fall back to Add Separately: it ended.
+      expect(core.getSnapshot().servers.map((s) => s.id)).toEqual(["kept-9"]);
+    });
+
+    it("the swapped-in record raises the same question, word for word, and is adopted when the question is actually asked about IT (fixture non-vacuity for the swap above: the two candidate sets are indistinguishable in everything the user is shown, and the swapped-in set is otherwise a perfectly ordinary adoption)", async () => {
+      const { core } = await harness({ servers: [restoredAdoptee()] });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const shown = modals();
+      // Same title (which carries the count) and same first line (which carries
+      // the device names) as the run above — the rest of the copy is static and
+      // names only the source. A guard comparing what the question RENDERED
+      // therefore sees two identical questions.
+      expect(shown[0][0]).toBe(QUESTION);
+      expect(shown[0][1].detail.split("\n")[0]).toBe(QUESTION_FIRST_LINE);
+      expect(shown[1][1].detail).toContain("1 server will be updated.");
+      expect(shown[1][1].detail).toContain(ADOPTION_LINE_SINGULAR);
+      // And the harm the guard prevents, shown happening when it is consented
+      // to: this is precisely what the aborted run above would have done.
+      const restored = core.getServer("kept-9")!;
+      expect(restored.name).toBe("core-sw-01");
+      expect(restored.origin?.sourceId).toBe("src-1");
+      expect(restored.formerlySynced).toBeUndefined();
+    });
+
+    it("a same-count swap of WHICH DEVICE claims the kept record, landing while the question is open, aborts instead of re-pointing that record at a machine the user was never shown (kills capturing adoptee server ids alone: the record is `kept-1` before and after)", async () => {
+      const { core } = await harness({ devices: [DEVICE_1, DEVICE_2] });
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        .mockImplementationOnce(async () => {
+          // The marker and the address move together onto device:2 — a restore
+          // of an older backup. kept-1 is still the one and only adoptee; the
+          // device coming to claim it is not the one the question named.
+          await core.addOrUpdateServer({
+            ...core.getServer("kept-1")!,
+            host: "10.0.0.12",
+            formerlySynced: keptMarker({ externalId: "device:2" })
+          });
+          return "Adopt Existing";
+        })
+        .mockResolvedValueOnce("Apply");
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(modals()).toHaveLength(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(STALE_ANSWER_REFUSAL);
+
+      // Unguarded, kept-1 is adopted BY DEVICE:2 — renamed "dist-rtr-01",
+      // re-addressed and re-foldered onto a machine that was never mentioned,
+      // while core-sw-01 (the device the question DID name) becomes an add.
+      expect(applySpy).not.toHaveBeenCalled();
+      const kept = core.getServer("kept-1")!;
+      expect(kept.name).toBe("old-lab-switch");
+      expect(kept.origin).toBeUndefined();
+      expect(kept.formerlySynced?.externalId).toBe("device:2");
+      expect(core.getSnapshot().servers).toHaveLength(1);
+    });
+
+    it("the same swap landing while the PREVIEW is open aborts inside the lock instead of re-showing and applying the new set on the next pass (kills guarding only the recompute that follows the answer: planDetailDrift re-bases on the swapped-in pairs, so the second preview and the plan under it agree with each other — and with nothing the user was asked)", async () => {
+      const { core } = await harness();
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        .mockResolvedValueOnce("Adopt Existing")
+        // Answered about kept-1, then the record is replaced while the preview
+        // that was rendered for kept-1 is on screen.
+        .mockImplementationOnce(async () => {
+          await core.removeServer("kept-1");
+          await core.addOrUpdateServer(restoredAdoptee());
+          return "Apply";
+        })
+        // The re-confirmation the drift comparator puts up when it notices the
+        // pair change. Answering it "Apply" is exactly what makes an
+        // answer-guarded-once implementation apply the set nobody was asked
+        // about — the drift check has re-based on it by then.
+        .mockResolvedValueOnce("Apply");
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(STALE_ANSWER_REFUSAL);
+      expect(applySpy).not.toHaveBeenCalled();
+      const restored = core.getServer("kept-9")!;
+      expect(restored.name).toBe("restored-lab-switch");
+      expect(restored.origin).toBeUndefined();
+      expect(core.getSnapshot().servers.map((s) => s.id)).toEqual(["kept-9"]);
+    });
+
+    it("a swap landing in the last window of all — after the credential re-check, on the plan that is actually applied — ends the run there rather than re-confirming into the same refusal one modal later (kills leaving the final recompute unguarded: it is the plan applyInventorySyncPlan receives)", async () => {
+      let live: NexusCore | undefined;
+      let previewAnswered = false;
+      let swapped = false;
+      const { core } = await harness({
+        // The vault reads before the fetch all happen while the preview is still
+        // unanswered; the FIRST read after it is answered is the in-lock
+        // credential re-check — the last await before the plan that is applied.
+        // Gating on that puts the swap inside that window on every run.
+        onSecretRead: async () => {
+          if (!previewAnswered || swapped || live === undefined) return;
+          swapped = true;
+          await live.removeServer("kept-1");
+          await live.addOrUpdateServer(restoredAdoptee());
+        }
+      });
+      live = core;
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      mockShowInformationMessage
+        .mockResolvedValueOnce("Adopt Existing")
+        .mockImplementationOnce(async () => {
+          previewAnswered = true;
+          return "Apply";
+        })
+        // Queued for the re-confirmation an unguarded final recompute would
+        // produce: the drift comparator sees the pair change and re-shows.
+        .mockResolvedValueOnce("Apply");
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The question and ONE preview. Without the guard on the final recompute
+      // the run instead re-confirms and only refuses on the pass after that —
+      // three modals for a decision that was already invalid, having torn down
+      // runtime state for the plan it was about to apply.
+      expect(modals()).toHaveLength(2);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(STALE_ANSWER_REFUSAL);
+      expect(applySpy).not.toHaveBeenCalled();
+      const restored = core.getServer("kept-9")!;
+      expect(restored.name).toBe("restored-lab-switch");
+      expect(restored.origin).toBeUndefined();
+    });
+
+    it("a candidate that appears when the question was NEVER asked does not abort the sync — there is no answer to be stale, and nothing can be adopted without one (kills capturing an empty set on a run with no question: it would refuse ordinary syncs that meet a kept server mid-flight)", async () => {
+      const { core } = await harness({ servers: [] });
+
+      mockShowInformationMessage
+        // No candidates at plan time, so no question — the preview is the first
+        // modal. The kept server arrives while it is open, which makes device:1
+        // a candidate for every recompute from here on.
+        .mockImplementationOnce(async () => {
+          await core.addOrUpdateServer(keptServer());
+          return "Apply";
+        })
+        // The duplicate line the newly-arrived record adds to the plan is drift,
+        // so the preview re-shows; this confirms the plan that is applied.
+        .mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
+      // Today's accepted behaviour, unchanged: with no answer in the run nothing
+      // is adopted, so the device is added beside the record that turned up and
+      // the kept server is left exactly as it arrived.
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(["kept-1", ADD_PATH_ID].sort());
+      const kept = core.getServer("kept-1")!;
+      expect(kept.origin).toBeUndefined();
+      expect(kept.name).toBe("old-lab-switch");
+      expect(kept.formerlySynced?.externalId).toBe("device:1");
     });
   });
 

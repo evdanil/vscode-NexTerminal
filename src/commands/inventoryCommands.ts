@@ -8,6 +8,7 @@ import {
   InventoryProviderError,
   inventorySecretKey,
   inventorySourceValuesEqual,
+  resolveProviderInstanceKey,
   sourceConfigUnchanged,
   type InventoryConfigField,
   type InventoryPrunePolicy,
@@ -23,6 +24,7 @@ import {
   planToApplication,
   prunedServerIdsForSecretCleanup,
   validateInventoryTree,
+  type InventoryAdoptionChoice,
   type InventorySyncPlan
 } from "../services/inventory/syncEngine";
 import type { SecretVault } from "../services/ssh/contracts";
@@ -137,6 +139,12 @@ function sourceBusyMessage(name: string, holder: SourceBusyReason, asking: Sourc
  * and a shallow copy for secrets (also a flat Record<string,string>). A tiny
  * shared helper so future provider call sites inherit this for free instead
  * of each having to remember it individually.
+ *
+ * THE THIRD BOUNDARY is `provider.instanceKey`, and it cannot use this helper —
+ * it is invoked from `resolveProviderInstanceKey` in models/inventory.ts, which
+ * must not import from the command layer. It clones inline on the same terms
+ * (REVIEW FINDING, P2); the rule is "no provider ever receives a live config",
+ * not "every caller uses this function".
  */
 function cloneForProvider(
   config: InventorySourceValues,
@@ -1254,6 +1262,29 @@ function authProfileClears(plan: InventorySyncPlan): Array<{ before: ServerConfi
 }
 
 /**
+ * The updates that ADOPT a kept server — computeSyncPlan's adopt-on-add rule,
+ * where a device's planned add instead becomes an update OF AN EXISTING RECORD:
+ * one this source's predecessor synced from the same device and the user kept
+ * when that source was removed. Reclaiming, not discovery — a server the user
+ * built by hand is never eligible, whatever address it happens to sit at.
+ *
+ * Derived from the plan's own before/after pairs rather than carried as a
+ * separate plan field, the same derive-don't-duplicate rationale as
+ * `authProfileSwitches` above: a rendering computed from `updates` can never
+ * disagree with what `updates` will actually write.
+ *
+ * The filter is EXACT, not a heuristic. Every OTHER update the engine produces
+ * starts from a server this source already owns — the mapped-device path builds
+ * them from its `ownedByExternalId` index (which requires
+ * `origin.sourceId === source.id`) and both auth-profile passes likewise iterate
+ * owned servers — so an update whose `before` carries no origin at all can only
+ * be an adoption.
+ */
+function adoptionUpdates(plan: InventorySyncPlan): Array<{ before: ServerConfig; after: ServerConfig }> {
+  return plan.updates.filter((u) => u.before.origin === undefined);
+}
+
+/**
  * m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync
  * plan for the confirm modal's `detail`.
  *
@@ -1284,6 +1315,73 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
   if (plan.updates.length > 0) {
     const n = plan.updates.length;
     lines.push(`${n} server${n === 1 ? "" : "s"} will be updated.`);
+  }
+  // The adoption consent line. Like the auth-switch line below it annotates a
+  // SUBSET of the "will be updated." line it sits directly under — an adopted
+  // server IS one of those updates and is counted there too — which is why it is
+  // placed immediately after it, the same subset-annotation placement
+  // manualDuplicateCount uses after the adds line.
+  //
+  // Above the auth-switch line rather than below it, because the two can name
+  // the very same servers: an adopted record in the add-path shape qualifies for
+  // retro-apply in the SAME plan, so it renders on both lines. Adoption is the
+  // identity change ("this existing server becomes this device"); the switch
+  // annotates what that does to its credentials. Reversing them would describe
+  // the credential consequence of an ownership change the user hasn't been told
+  // about yet.
+  //
+  // "keeps its saved credentials" is the load-bearing half of the sentence: the
+  // whole reason to adopt rather than duplicate is that the record — and so its
+  // id, and so every SecretStorage key hanging off that id — survives.
+  //
+  // The clause naming WHERE these servers came from is the other half, and it is
+  // not decoration: adoption is offered only for records a removed inventory
+  // source synced and the user kept on Remove Source, never for a server built
+  // by hand that merely sits at the same address. Saying "existing servers"
+  // would describe a wider population than the plan can actually touch, and
+  // wording it as an address match would describe a rule this no longer is.
+  // "kept from a removed inventory source" is THE name for that population —
+  // REVIEW FINDING: the branch had four (an earlier / a previous / a removed
+  // inventory source, and "a previous sync of this source"), and the last of
+  // them also misstated the rule, which matches by PROVIDER and not by source.
+  //
+  // FUTURE TENSE, like every sibling line here ("will be added.", "will be
+  // updated.", "will be deleted…") and like the pair list this same plan renders
+  // behind Show Warnings (REVIEW FINDING — it read "is being adopted", which
+  // described the plan as already in flight while its own heading one click away
+  // said "will be adopted").
+  const adoptionCount = adoptionUpdates(plan).length;
+  if (adoptionCount > 0) {
+    const n = adoptionCount;
+    // The subset qualifier is dropped when there IS no wider set to be a subset
+    // of: with a single update, "1 of the updated servers" invites the reader to
+    // look for the others (NIT). The definite article does the same job of
+    // pointing at the line directly above.
+    const subject = plan.updates.length === 1 ? "The updated server" : n === 1 ? "1 of the updated servers" : `${n} of the updated servers`;
+    lines.push(
+      n === 1
+        ? `${subject} will be adopted by this source — it was kept from a removed inventory source, and it keeps its saved credentials.`
+        : `${subject} will be adopted by this source — they were kept from a removed inventory source, and they keep their saved credentials.`
+    );
+    // REVIEW FINDING (latent) — the ONE thing an adoption can overwrite outside
+    // the source's four fields, disclosed only when the plan actually does it.
+    // The engine writes `endpoint.username` onto an adoptee when the inventory
+    // supplies one (syncEngine.ts, and the comment there explains why that is
+    // right), which no shipped provider does — but a third-party provider
+    // through the public API would otherwise silently replace a hand-picked
+    // username under copy that promises the server "keeps its saved
+    // credentials". Derived from the pairs themselves rather than promised in
+    // advance, so it can never disagree with what `updates` will write, and it
+    // costs a plan that does not do this exactly nothing.
+    const usernameOverwrites = adoptionUpdates(plan).filter((u) => u.before.username !== u.after.username).length;
+    if (usernameOverwrites > 0) {
+      const u = usernameOverwrites;
+      lines.push(
+        u === 1
+          ? "1 adopted server will also take the username the inventory reports, replacing the one stored on it."
+          : `${u} adopted servers will also take the usernames the inventory reports, replacing the ones stored on them.`
+      );
+    }
   }
   // The retro-apply consent line (UX §4). Derived from the plan's own
   // before/after pairs rather than a dedicated plan field, so it can never
@@ -1414,9 +1512,51 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
  * also surfaced after a successful apply ("N warnings during sync") and in the
  * nothing-to-change toast, and a switch the user just consented to is not an
  * issue to report back to them.
+ *
+ * Exported for direct unit testing, for the same reason describePlanDetail is:
+ * this is rendered consent text, and the cheapest way to pin its exact wording,
+ * its per-list ordering, and the before/after side each name is read from is to
+ * call it on synthetic plans rather than to reconstruct every plan shape through
+ * a provider fetch.
  */
-function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): string[] {
+export function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): string[] {
   const buffer = [...plan.warnings];
+  // The adoption pair list, in the established heading-plus-indented-names
+  // shape and for the same reason the switch list exists: adoption changes WHICH
+  // records this source owns (and hands their lifecycle, prune policy included,
+  // to it), so "is MY server in this set" has to be answerable one click before
+  // Apply — countable is not enough.
+  //
+  // BOTH names are shown per pair because the source renames what it adopts:
+  // listing only the device name would hide the tree entry the user is actually
+  // looking for whenever they had renamed it by hand, which is precisely the
+  // population most likely to be checking. `before` is the record as it stands
+  // in the tree right now (its name and its hidden state); `after` is the device
+  // reclaiming it, with the address that record will carry afterwards — enough
+  // to check the pairing at a glance. The address is a CONSEQUENCE here, never
+  // the qualification: eligibility is device identity plus the kept marker, so
+  // the line must not read as "these two share an address, therefore they are
+  // the same machine".
+  //
+  // Listed BEFORE the two auth-profile lists below, which may name some of the
+  // same servers, for the same ordering reason as the modal's lines.
+  const adoptions = adoptionUpdates(plan);
+  if (adoptions.length > 0) {
+    const n = adoptions.length;
+    buffer.push(
+      n === 1
+        ? "1 server kept from a removed inventory source will be adopted by this source (it keeps its saved credentials):"
+        : `${n} servers kept from a removed inventory source will be adopted by this source (each keeps its saved credentials):`
+    );
+    for (const u of adoptions) {
+      // Hidden servers are eligible for adoption (isHidden is tree visibility,
+      // not identity), so the list has to say when a named pair will not be
+      // visible in the tree after Apply — otherwise the audit reads as naming a
+      // server the user then cannot find.
+      const hiddenSuffix = u.before.isHidden ? " (hidden)" : "";
+      buffer.push(`  "${u.before.name}" — device "${u.after.name}" (${u.after.host}:${u.after.port})${hiddenSuffix}`);
+    }
+  }
   const switches = authProfileAdoptions(plan);
   if (switches.length > 0) {
     const n = switches.length;
@@ -1454,6 +1594,47 @@ function deletePruneIds(plan: InventorySyncPlan): Set<string> {
 }
 
 /**
+ * ADOPT 1 / REVIEW FINDING (P1, the adoption question behind the no-op fast
+ * path) — "is there NOTHING for this sync to do AND nothing to ask the user
+ * about?", the one condition syncNow's empty-plan fast path is allowed to
+ * short-circuit on.
+ *
+ * THE COUNTS ALONE ARE NOT THAT CONDITION. An adoption candidate is normally
+ * also a planned ADD (the device would be added beside the record it came from),
+ * so a plan with candidates is non-empty by the counts and the question is
+ * reached. There is exactly one shape where it is not: restore an ID-preserving
+ * backup taken while a source was live, remove that source with Keep Servers and
+ * add it back, and the kept server still holds
+ * `deterministicServerId(source.id, externalId)` — the id THIS device's add
+ * would need. The engine records the candidate, refuses to mint a second record
+ * under an occupied id, and produces an entirely empty plan (syncEngine.ts, the
+ * collision skip after the adoption block). The counts then say "nothing to do"
+ * about the one run whose whole purpose is to ask a question, so the fast path
+ * applied a no-op and returned, and a restored source could never reclaim its
+ * servers — closing by the back door the exact path the collision guard's
+ * adoptee exemption was written to open.
+ *
+ * WHY THIS PREDICATE AND NOT AN EARLIER QUESTION. Moving the question above the
+ * fast path would ask it from the PRE-LOCK plan, before the in-lock recompute
+ * that exists precisely because that plan can be stale, and would then have to
+ * thread the answer into that recompute and re-derive the candidate list there —
+ * two places deciding when to ask, for a question whose entire contract is that
+ * it is asked once per run. It would also risk raising a modal for a sync that
+ * the fresh snapshot proves has nothing left to ask about (another window
+ * adopted or deleted the kept server first), which is the one thing this fast
+ * path exists to prevent. Naming what "empty" means, and asking BOTH gates the
+ * same question, fixes the predicate that was wrong instead of relocating the
+ * user interaction that was not.
+ *
+ * A GENUINELY EMPTY SYNC STILL SHOWS NO MODAL: no candidates means no question,
+ * so `adoptionCandidates` is empty and this reads exactly as the count
+ * check did.
+ */
+function planHasNothingToDo(plan: InventorySyncPlan): boolean {
+  return plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0 && plan.adoptionCandidates.length === 0;
+}
+
+/**
  * REVIEW FINDING (P2) — the set of server ids the plan would move onto a
  * different auth profile, the identity behind `authProfileSwitches`' count.
  * Read off `before.id` for the same reason `planWarningsBuffer` names
@@ -1469,8 +1650,86 @@ function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
   return new Set(authProfileSwitches(plan).map((u) => u.before.id));
 }
 
-/** Set equality over server ids — the shape both id-set drift comparisons below use. */
-function serverIdSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+/**
+ * The (adoptee, device) PAIRS the plan would adopt — the identity behind the
+ * adoption count `describePlanDetail` renders and the pairs
+ * `planWarningsBuffer` lists.
+ *
+ * PAIR-SHAPED, not a set of server ids (REVIEW FINDING). A set of `before.id`
+ * protects WHICH RECORD is handed over but not WHICH DEVICE claims it, and both
+ * halves are consent: the pair list names "server X — device A", so a mid-modal
+ * change that leaves X adopted by device B instead (a backup restore rewriting
+ * X's marker and address onto another device, while A falls back to an add)
+ * produces identical counts, identical rendered text, and an identical
+ * `before.id` set. Nothing drifts, and X is renamed, re-addressed and re-foldered
+ * onto a machine the user was never shown.
+ *
+ * The device half is `after.origin.externalId` — its IDENTITY, not its address.
+ * `tree` is fetched once and reused by every recompute of a run, so a device's
+ * endpoint is a function of its externalId here and adding host:port would
+ * capture nothing further; the reverse does not hold, since two devices in one
+ * tree may report the same address while being different machines.
+ *
+ * `before.id` for the record half, for the same reason the two sets above use
+ * it: it is the record as it exists in the tree right now, which is what the
+ * user is being asked to consent to. (For an adoption `after.id === before.id`
+ * by construction — the whole point is that the record survives — so this is a
+ * statement of intent as much as a choice of operand.) NUL-joined, and
+ * unambiguous whatever a provider puts in an externalId, because the FIRST half
+ * can never contain one — server ids are uuids or the deterministic hash — so
+ * nothing can shift the boundary between the two.
+ *
+ * Exported for direct unit testing alongside `planDetailDrift`, which is the
+ * only production caller: the swaps these keys exist to catch render no visible
+ * difference anywhere, so the derivation has to be assertable on its own.
+ */
+export function adoptionPairKeys(plan: InventorySyncPlan): Set<string> {
+  return new Set(adoptionUpdates(plan).map((u) => adoptionPairKey(u.before.id, u.after.origin?.externalId ?? "")));
+}
+
+/**
+ * The one place the (record, device) pairing is spelled as a string, shared by
+ * both derivations around it (REVIEW FINDING, P1). `adoptionPairKeys` reads the
+ * pairing off an adoption the plan ALREADY MADE; `adoptionCandidateKeys` below
+ * reads the same pairing off a candidate the plan has only OFFERED. The two are
+ * compared against captures taken at different moments of one run, so they must
+ * name a pairing identically — otherwise one guard could pass a key the other
+ * would have failed.
+ */
+function adoptionPairKey(serverId: string, externalId: string): string {
+  return `${serverId}\u0000${externalId}`;
+}
+
+/**
+ * REVIEW FINDING (P1, re-ask when adoption candidates change) — the (adoptee,
+ * device) pairs the plan would OFFER to adopt, in the same key space as
+ * `adoptionPairKeys` above.
+ *
+ * WHY A SECOND DERIVATION EXISTS AT ALL. `adoptionPairKeys` can only see pairs
+ * that became `updates`, which happens on an `"adopt"` run and no other — and
+ * the plan the adoption QUESTION is asked from is by construction computed
+ * BEFORE there is an answer, so its adoption-pair set is empty however many
+ * candidates it carries. These pairs are what the question's consent is about,
+ * and the only shape of that consent available at the moment it is collected.
+ *
+ * The two agree wherever both are defined: on an `"adopt"` run every candidate
+ * becomes an update (syncEngine.ts pushes one unconditionally inside the adopt
+ * branch), so `adoptionCandidateKeys(plan)` and `adoptionPairKeys(plan)` are the
+ * same set. That is not a coincidence to lean on — it is what stops the two
+ * guards built on them from ever disagreeing about what a pairing IS. They still
+ * differ in the only way that matters: WHICH MOMENT each compares against (see
+ * `answeredAdoptionPairs` in syncNow).
+ *
+ * Exported for the same reason `adoptionPairKeys` is: the swaps it exists to
+ * catch are invisible in every rendered artifact, so the derivation has to be
+ * assertable on its own.
+ */
+export function adoptionCandidateKeys(plan: InventorySyncPlan): Set<string> {
+  return new Set(plan.adoptionCandidates.map((c) => adoptionPairKey(c.serverId, c.externalId)));
+}
+
+/** Set equality — the shape every captured-set drift comparison below uses (ids, and adoption pair keys). */
+function capturedSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) {
     return false;
   }
@@ -1525,14 +1784,43 @@ function serverIdSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): bool
 // deleteIds (a captured set compared for equality) rather than a parallel
 // mechanism, so there is one discipline here, not two.
 //
+// The ADOPTION pair set is the third instance of exactly that discipline, and
+// the one with the least visible symptom. describePlanDetail renders only a
+// COUNT of adoptions ("3 of the updated servers will be adopted by this
+// source…"), so a mid-modal change to WHICH kept record a device reclaims — a
+// config import replacing the record, a hand-delete followed by a restore from
+// backup, a second copy of the same kept server landing in the list — produces
+// byte-identical text with an identical delete set and an identical
+// auth-switch set. Nothing drifts, and the fresh plan then takes over a server
+// that was never disclosed: it gains this source's origin (and with it the
+// source's prune policy, `delete` included), gets renamed and moved to the
+// device's folder, while the server the user actually approved handing over
+// stays behind as a duplicate. Adoption is disclosed BY NAME —
+// `planWarningsBuffer` lists every pair behind Show Warnings — so the consent
+// the modal collected is consent for THOSE servers, and an identity swap
+// invalidates it exactly as a delete-set swap invalidates the teardown. Same
+// shape as the two sets above (a captured set compared for equality) rather than
+// a parallel mechanism, so there is one discipline here, not three.
+//
+// REVIEW FINDING — it is a set of PAIRS rather than of adoptee ids because the
+// swap has two directions and a bare id set only closes one. The other is the
+// device: same record, different claimant, same counts, same text, same ids (see
+// `adoptionPairKeys`).
+//
 // `nextAuthProfileName` follows the same rule as `nextServers`: it is the
 // resolution taken FRESH alongside `nextPlan`, not the one the shown modal
 // rendered with. That is what makes a mid-modal profile rename (same plan,
 // different name → different text) and a mid-modal profile delete (no
 // resolution → no switch line, plus a dangling-profile warning) both surface
 // as ordinary drift, with no dedicated comparison of their own.
-function planDetailDrift(
-  previous: { detail: string; deleteIds: ReadonlySet<string>; authSwitchIds: ReadonlySet<string> },
+//
+// Exported for direct unit testing: an identity swap is by definition the case
+// where every rendered artifact is identical, so the only way to prove the
+// comparator still catches it — rather than the surrounding text having caught
+// something incidental — is to call it on two hand-built plans that differ in
+// nothing else.
+export function planDetailDrift(
+  previous: { detail: string; deleteIds: ReadonlySet<string>; authSwitchIds: ReadonlySet<string>; adoptionPairs: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
   nextServers: ServerConfig[],
   nextAuthProfileName: string | undefined
@@ -1541,10 +1829,13 @@ function planDetailDrift(
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
-  if (!serverIdSetsEqual(previous.deleteIds, deletePruneIds(nextPlan))) {
+  if (!capturedSetsEqual(previous.deleteIds, deletePruneIds(nextPlan))) {
     return { drift: true, detail: nextDetail };
   }
-  if (!serverIdSetsEqual(previous.authSwitchIds, authProfileSwitchIds(nextPlan))) {
+  if (!capturedSetsEqual(previous.authSwitchIds, authProfileSwitchIds(nextPlan))) {
+    return { drift: true, detail: nextDetail };
+  }
+  if (!capturedSetsEqual(previous.adoptionPairs, adoptionPairKeys(nextPlan))) {
     return { drift: true, detail: nextDetail };
   }
   return { drift: false, detail: nextDetail };
@@ -2308,7 +2599,95 @@ export function registerInventoryCommands(
             await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
           }
         } else if (choice === "Keep Servers") {
-          const strippedServers = owned.map(({ origin, ...rest }) => rest as ServerConfig);
+          // ADOPT 1 — strip AND STAMP. The strip is unchanged and stays
+          // non-negotiable (a dangling origin must never let any sync act on a
+          // record its source no longer manages); the stamp is what makes the
+          // strip survivable. Without it, "Keep Servers" is a one-way door: a
+          // re-added source mints a new id, so ownership resolution and
+          // deterministicServerId both miss, and every device arrives a second
+          // time beside the record it used to be — the reported bug.
+          //
+          // The marker is a RECEIPT, not an origin: it names the device this
+          // server was mapped to and the provider that mapped it, so a future
+          // source of the SAME provider can OFFER to reclaim the record. It
+          // confers nothing on its own — no sync reads it unless the user
+          // answers the adoption question with "Adopt Existing".
+          //
+          // One timestamp for the whole batch, not one per server: these
+          // records were detached by a single user action, and a per-server
+          // Date.now() would imply an ordering that does not exist.
+          const detachedAt = Date.now();
+          // REVIEW FINDING (P1, cross-instance adoption) — WHICH DEPLOYMENT of
+          // the provider these servers came from, recorded now because after
+          // this removal nothing else remembers: `source.config` is about to be
+          // deleted with the record, and the marker is all that is left.
+          //
+          // `providerId` alone cannot scope the marker's `externalId` — two
+          // instances of one provider both emit "device:1" — so a marker without
+          // this is refused by the adoption rule rather than adopted on the
+          // strength of the provider kind. See DetachedServerOrigin
+          // (models/config.ts) and `sameProviderInstance` (syncEngine.ts).
+          //
+          // REVIEW FINDING (P1, the instance guard fed from the wrong place) —
+          // COPIED FROM EACH SERVER'S OWN `origin.syncedInstanceKey`, never
+          // re-derived here from `source.config` through the registered provider.
+          // The config is mutable and the origins are not: a source synced
+          // against deployment A and then EDITED to point at B — with no
+          // successful sync since, which is the entire window this bug lives in
+          // — still owns servers whose `externalId`s belong to A. Deriving the
+          // key from the current config stamped every one of those markers "B",
+          // so a later B source with the same id and address passed the instance
+          // guard and could adopt, then prune, A's servers and their saved
+          // credentials. The origin stamp is the only value that describes the
+          // deployment those ids actually came from, and no edit can move it.
+          //
+          // A server whose origin carries no stamp (synced before the field
+          // existed) yields a marker with no instance key: the receipt is still
+          // written — the UI can still say which source kept this server — but
+          // the record is not adoptable. Same safe direction as before, reached
+          // for one more reason: an un-adoptable kept server costs a duplicate
+          // the next sync explains, while a marker claiming an instance nobody
+          // verified is how a record changes owner. Re-deriving as a FALLBACK for
+          // those was rejected outright — a fallback is available in exactly the
+          // repointed-config case that produces the wrong answer.
+          const strippedServers = owned.map(({ origin, ...rest }) =>
+            // `owned` is filtered on `origin?.sourceId === source.id`, so every
+            // entry HAS an origin — but that is a filter, not a type narrowing,
+            // and the marker's externalId has to come from somewhere. An
+            // origin-less entry (unreachable today) keeps today's exact
+            // behavior: stripped of nothing, stamped with nothing.
+            origin === undefined
+              ? (rest as ServerConfig)
+              : ({
+                  ...rest,
+                  formerlySynced: {
+                    sourceId: source.id,
+                    sourceName: source.name,
+                    providerId: source.providerId,
+                    // Omitted entirely rather than written as `undefined` when
+                    // the sync recorded no instance: `formerlySynced` is
+                    // persisted verbatim, and an explicit `instanceKey:
+                    // undefined` survives into globalState as a key with no
+                    // value on some JSON paths. Absent and absent-valued mean
+                    // the same thing to every reader here, so write the one that
+                    // cannot be misread.
+                    ...(origin.syncedInstanceKey !== undefined ? { instanceKey: origin.syncedInstanceKey } : {}),
+                    externalId: origin.externalId,
+                    // REVIEW FINDING (P1, adoption auth provenance) — the one
+                    // part of the origin that has to SURVIVE the strip. It says
+                    // whether the `authProfileId` this server keeps was the
+                    // SYNC'S doing or the USER'S, which is what AUTH 2b (the
+                    // unlink that rescues a server stranded by a key profile with
+                    // no key file) and retro-apply's per-server opt-out are both
+                    // decided on. Dropped here, an adopted server carried a
+                    // sync-applied link that nothing could prove was the sync's,
+                    // so nothing could ever take it back off. Omitted rather than
+                    // written as `undefined` for the reason `instanceKey` is.
+                    ...(origin.syncedAuthProfileId !== undefined ? { syncedAuthProfileId: origin.syncedAuthProfileId } : {}),
+                    detachedAt
+                  }
+                } as ServerConfig)
+          );
           // FINDING 2 — the pre-strip snapshot for each server, so core can
           // refuse to overwrite one that was replaced in the window above.
           const expectedBeforeByServerId = new Map(owned.map((s) => [s.id, s] as const));
@@ -2471,10 +2850,33 @@ export function registerInventoryCommands(
       // with `plan` at every point below where `plan` itself is reassigned
       // (the fast-path fall-through and the retry loop).
       let planAuthProfile = resolveSourceAuthProfile(core, source);
-      let plan = computeSyncPlan({ source, tree, currentServers: core.getSnapshot().servers, now: Date.now(), authProfile: planAuthProfile });
+      // ADOPT 1 / REVIEW FINDING (P1, cross-instance adoption) — which DEPLOYMENT
+      // of `provider` this sync is talking to, derived from the same source
+      // config the fetch above used. Only a kept server whose marker names this
+      // same deployment may be adopted (see `ComputeSyncPlanInput
+      // .providerInstanceKey`); `undefined` — a provider that names no instance —
+      // means no adoption at all, never a fall back to the provider id.
+      //
+      // Re-derived, like `planAuthProfile`, at every point below where `plan` is
+      // recomputed against a re-read source record, so it always describes the
+      // config that plan was computed from rather than the one this run started
+      // with.
+      let planInstanceKey = resolveProviderInstanceKey(provider, source.config);
+      let plan = computeSyncPlan({
+        source,
+        tree,
+        currentServers: core.getSnapshot().servers,
+        now: Date.now(),
+        authProfile: planAuthProfile,
+        providerInstanceKey: planInstanceKey
+      });
 
-      // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
-      if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
+      // Nothing to do AND nothing to ask: apply an empty application to bump
+      // lastSyncAt without a confirm modal. `planHasNothingToDo` is the whole of
+      // that condition and is shared with the in-lock recompute below — see its
+      // doc for why an adoption candidate makes a count-empty plan non-empty
+      // here, and why both gates have to ask the same question.
+      if (planHasNothingToDo(plan)) {
         // FINDING 2 (P2, fast-path-stale-recompute review) — `plan` above was
         // computed BEFORE this lock acquisition; a queued mutation elsewhere
         // (e.g. a locked nexus.server.remove deleting a server this source
@@ -2497,7 +2899,16 @@ export function registerInventoryCommands(
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
           | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number; source: InventorySourceConfig }
-          | { kind: "not-empty"; plan: InventorySyncPlan; authProfile: AuthProfile | undefined }
+          | {
+              kind: "not-empty";
+              plan: InventorySyncPlan;
+              authProfile: AuthProfile | undefined;
+              // REVIEW FINDING (P1) — carried out with the plan for the same
+              // reason `authProfile` is: the caller keeps computing plans after
+              // this, and each of them must be computed against the same
+              // instance identity this recompute used.
+              instanceKey: string | undefined;
+            }
           | { kind: "abort" };
         const fastPathResult: FastPathResult = await configMutationLock.runExclusive(async (): Promise<FastPathResult> => {
           const freshSource = core.getInventorySource(source.id);
@@ -2512,15 +2923,28 @@ export function registerInventoryCommands(
             return { kind: "abort" };
           }
           const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          // Derived from `freshSource.config`, not the outer `source`'s — the
+          // pairing rule `planAuthProfile` follows, for the same reason: this
+          // plan is about the record as it stands now.
+          const freshInstanceKey = resolveProviderInstanceKey(provider, freshSource.config);
           const recomputed = computeSyncPlan({
             source: freshSource,
             tree,
             currentServers: core.getSnapshot().servers,
             now: Date.now(),
-            authProfile: freshAuthProfile
+            authProfile: freshAuthProfile,
+            providerInstanceKey: freshInstanceKey
           });
-          if (recomputed.adds.length > 0 || recomputed.updates.length > 0 || recomputed.prunes.length > 0) {
-            return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile };
+          // THE SAME PREDICATE AS THE OUTER GATE, deliberately — a second gate
+          // asking a narrower question is the first one's blindness moved rather
+          // than fixed (REVIEW FINDING, P1). This one is reachable with a
+          // candidate the outer plan did not have: the queued mutation this
+          // recompute exists to catch can be the very write that CREATES the
+          // adoptee (an ID-preserving config import landing while the fetch was
+          // in flight), which leaves the fresh plan count-empty and carrying a
+          // question nobody would ever be asked.
+          if (!planHasNothingToDo(recomputed)) {
+            return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile, instanceKey: freshInstanceKey };
           }
           try {
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
@@ -2570,7 +2994,348 @@ export function registerInventoryCommands(
         // normal confirmation flow below with the freshly recomputed plan.
         plan = fastPathResult.plan;
         planAuthProfile = fastPathResult.authProfile;
+        planInstanceKey = fastPathResult.instanceKey;
       }
+
+      // ADOPT 1 — THE QUESTION. Asked at most once per run, here: after the
+      // fetch and the plan it produced, before the confirmation loop below.
+      //
+      // WHY THE ENGINE CANNOT DECIDE THIS. Adoption hands an existing record's
+      // whole lifecycle to the source — its name, its address, its folder, and
+      // the source's prune policy with `delete` in it. The plan can prove a
+      // device WAS synced onto a record and that the record is still at that
+      // address; it cannot know whether the user wants that record back under
+      // management or deliberately kept it separate. So the engine reports
+      // candidates and refuses to act, and the answer to this question is what
+      // turns them into updates.
+      //
+      // WHY HERE, and not on the preview modal's button row: the preview's
+      // detail must describe the ONE plan the user is consenting to, and the
+      // drift machinery compares one rendered detail against one recompute. Two
+      // apply variants would be one text describing two futures.
+      //
+      // NEVER WHILE HOLDING configMutationLock — the same rule the preview
+      // modal obeys (see the lock's own doc). The fast-path block above has
+      // released it by the time control reaches here, in both of its
+      // fall-through paths.
+      //
+      // REACHED FROM EVERY PATH ABOVE, which is what `planHasNothingToDo` is
+      // for. The fast path used to swallow this question whenever the counts came
+      // back empty, and a candidate is NOT always a planned add: the restored
+      // ID-preserving backup produces a candidate the engine cannot add (its id
+      // is held by the adoptee) and therefore an empty-by-the-counts plan. That
+      // run is the one that most needs asking — it is the only way a restored
+      // source can ever reclaim its own servers — so "empty" now means "nothing
+      // to do and nothing to ask", at both of the fast path's gates.
+      let adoptionChoice: InventoryAdoptionChoice | undefined;
+      // ADOPT 1 / REVIEW FINDING (P1, re-ask when adoption candidates change) —
+      // the candidate set the question below was PUT ABOUT, captured from the
+      // very plan that raised it. `undefined` while (and only while) no question
+      // has been asked; see `adoptionAnswerIsStale` for what that state means.
+      let answeredAdoptionPairs: ReadonlySet<string> | undefined;
+      /**
+       * REVIEW FINDING (P1, re-ask when adoption candidates change) — "is this
+       * plan still about the candidates the user answered for?", asked of EVERY
+       * plan computed under `adoptionChoice` before that plan is rendered or
+       * applied.
+       *
+       * WHY THE ANSWER NEEDS A GUARD OF ITS OWN, over and above `planDetailDrift`.
+       * The drift comparator's baseline ROLLS FORWARD: it compares the plan about
+       * to be applied against the plan the LAST preview rendered, and on a
+       * mismatch it re-renders and re-bases. That is right for the preview, whose
+       * consent is collected fresh on every pass. The question is not re-put on
+       * any pass, so its consent has one fixed baseline — this set — and the
+       * window it has to cover starts the moment the question is shown, which is
+       * BEFORE the first preview exists. A swap landing in that window (another
+       * source removed with Keep Servers, a config import or backup restore
+       * replacing a kept record) is invisible to every artifact downstream of it:
+       * the preview counts the same number of adoptions, `describePlanDetail`
+       * renders byte-identical text, and the pair list behind Show Warnings —
+       * where the identities do appear — is one click the user need never take.
+       *
+       * SET EQUALITY, not "no new candidates". A candidate that DISAPPEARS is
+       * also a changed question: the count the user weighed ("adopt 4 servers")
+       * is part of what they answered, and a shrunken set means at least one
+       * device they were told would be reclaimed is about to be duplicated or
+       * skipped instead.
+       *
+       * `undefined` means the question was never put, which is not the same as
+       * "no candidates were disclosed" — it is a run with no adoption consent in
+       * it at all. `adoptionChoice` is then `undefined` too, so nothing can be
+       * adopted whatever candidates a later recompute turns up (they render as
+       * duplicate adds — today's accepted behaviour, see the note under the
+       * question block). Refusing there would abort syncs over a set that cannot
+       * be acted on.
+       */
+      const adoptionAnswerIsStale = (candidatePlan: InventorySyncPlan): boolean =>
+        answeredAdoptionPairs !== undefined && !capturedSetsEqual(answeredAdoptionPairs, adoptionCandidateKeys(candidatePlan));
+      /**
+       * ABORT, NOT RE-ASK — the precedent every other "the world moved under a
+       * confirmation" check in this command follows (source removed, config
+       * changed, credentials changed; and `serverAuthProfileRejection` /
+       * `inventoryAuthProfileRejection` outside it). The preview's drift guard
+       * re-shows instead, but it can: it sits in a loop that already exists and
+       * is capped, and the modal it re-shows is the one it just rendered.
+       *
+       * The question has neither. It is deliberately asked ONCE per run and never
+       * while `configMutationLock` is held (see its own doc) — and two of the
+       * three places this guard fires are inside that lock, after teardown has
+       * begun. Re-asking from there would mean unwinding the lock, threading a
+       * second answer back through a plan that has already been previewed, and
+       * capping a second loop that can spin for the same reason the first one
+       * can. Refusing costs the user one re-run of a sync that has changed
+       * nothing, and the next run puts the question about the set that actually
+       * exists.
+       */
+      const reportStaleAdoptionAnswer = (): void => {
+        // States the FACT rather than the moment: this fires from three
+        // different windows (while the question was open, while the preview was,
+        // and during the in-lock awaits), and copy naming any one of them would
+        // be wrong in the other two.
+        void vscode.window.showErrorMessage(
+          `The servers "${source.name}" offered to adopt are no longer the ones you were asked about — sync aborted, run Sync Now again.`
+        );
+      };
+      if (plan.adoptionCandidates.length > 0) {
+        const n = plan.adoptionCandidates.length;
+        // Up to three names, `pushSkipSummary`'s precedent (syncEngine.ts) —
+        // both the cap and the "e.g." that goes with it. Device names, which is
+        // the half of each candidate pair the user can recognise from the
+        // inventory they just re-added: at this point they have not been shown
+        // any pairing yet, and the kept servers' own tree names are named one
+        // click away, behind the preview's Show Warnings.
+        //
+        // The names sit beside the noun they belong to — "1 device (…)", not
+        // "…a server you kept (…)" (NIT): they are DEVICE names, and attached to
+        // the nearest noun they read as the tree names of the servers, which is
+        // the one pairing the user cannot yet see.
+        const examples = plan.adoptionCandidates
+          .slice(0, 3)
+          .map((candidate) => `"${candidate.deviceName}"`)
+          .join(", ");
+        // REVIEW FINDING (P2) — THE DECLINE LINE, which is the only line here
+        // that can be false. `separateAddBlocked` is the engine's own record of
+        // the collision exemption that let the candidate exist at all (see
+        // `InventoryAdoptionCandidate`): the adoptee already holds the id an add
+        // for this device would need, so choosing Add Separately reaches the
+        // engine's collision fall-through, which skips the device and adds
+        // nothing. Read off the candidate rather than recomputed from
+        // `deterministicServerId` here — a second derivation of the same fact is
+        // a second thing that can drift from the plan the answer is spent on.
+        //
+        // WHY THIS IS NOW REACHABLE AT ALL: the fast path used to return before
+        // the question whenever a plan's add/update/prune counts were empty, and
+        // a restored ID-preserving backup produces exactly such a plan. Fixing
+        // that made this the ordinary shape of the restored-backup run, not a
+        // corner of it — the copy promising a separate add went live with it.
+        //
+        // THE MIXED CASE IS NAMED, NOT AVERAGED. With one blocked device among
+        // three, neither "adds each device" nor "adds nothing" is true, and a
+        // sentence hedged into vagueness would leave the user unable to tell
+        // which of the three they are about to lose. Same cap and the same "e.g."
+        // discipline as the count line above (`pushSkipSummary`'s precedent), and
+        // the same singular/plural rule: one name is the whole list, so it is not
+        // an example.
+        //
+        // The reason given is the engine's own words for it ("still uses the id a
+        // new server ... would need" — one name for one concept), so the sentence
+        // the user reads before choosing and the warning they find afterwards
+        // behind Show Warnings describe one situation rather than two.
+        const blocked = plan.adoptionCandidates.filter((candidate) => candidate.separateAddBlocked);
+        const blockedExamples = blocked
+          .slice(0, 3)
+          .map((candidate) => `"${candidate.deviceName}"`)
+          .join(", ");
+        /**
+         * AND THE BUTTON ITSELF, in the one case where its name is the false
+         * promise. "Add Separately" is an ACTION label — it says what pressing it
+         * does — so when nothing can be added separately it is wrong in exactly
+         * the way the detail line was, and a dialog whose button says "Add
+         * Separately" above a body reading "adds nothing" makes the user
+         * reconcile a contradiction the code could simply not have written.
+         *
+         * ONLY when EVERY candidate is blocked. In the mixed case the label is
+         * true of at least one device and the detail names the exceptions, so a
+         * third label there would buy nothing and cost the same.
+         *
+         * THE COST, stated plainly: a label that varies between runs is a real
+         * cost — people learn a button by its name as well as its position. It is
+         * paid here because the two runs are not the same question (their bodies
+         * already differ), the button keeps its POSITION as the second, non-
+         * adopting choice, and the name changes precisely when the old one would
+         * have described something that does not happen. A fixed label bought
+         * consistency by being false in a state the user can reach by restoring a
+         * backup, which is the defect this finding is about.
+         *
+         * "Don't Adopt" rather than "Keep Servers": that phrase is already spent
+         * on the removal dialog's opposite-of-delete fork, and reusing it for the
+         * opposite-of-adopt fork would make one label mean two things.
+         */
+        const declineLabel = blocked.length === n ? "Don't Adopt" : "Add Separately";
+        const separateLine =
+          blocked.length === 0
+            ? n === 1
+              ? "Add Separately leaves that server untouched and adds the device as a separate new server."
+              : "Add Separately leaves those servers untouched and adds each device as a separate new server."
+            : blocked.length === n
+              ? n === 1
+                ? "Don't Adopt leaves that server untouched and adds nothing: it still uses the id a new server for this device would need, so the device is skipped rather than added separately."
+                : "Don't Adopt leaves those servers untouched and adds nothing: each still uses the id a new server for its device would need, so every one of these devices is skipped rather than added separately."
+              : blocked.length === 1
+                ? `Add Separately leaves those servers untouched and adds each device as a separate new server — except 1 device (${blockedExamples}), whose kept server still uses the id a new server for it would need, so that device is skipped rather than added separately.`
+                : `Add Separately leaves those servers untouched and adds each device as a separate new server — except ${blocked.length} devices (e.g. ${blockedExamples}), whose kept servers still use the ids new servers for them would need, so those devices are skipped rather than added separately.`;
+        // m1/m2 — full sentences, per-count verbs, no bare counts. The first
+        // line states the FACT that makes these servers eligible, in the same
+        // words the preview and the pair list use ("kept from a removed
+        // inventory source" — one name for one concept, REVIEW FINDING):
+        // eligibility is a recorded history, not an address match, and copy that
+        // said "servers already in your list" would describe a population this
+        // can never touch.
+        //
+        // Each button's line says what that button does to the EXISTING
+        // servers, because that is the whole of the decision — both answers
+        // leave the same devices synced afterwards.
+        //
+        // THE PRUNE DISCLOSURE (REVIEW FINDING) is part of the Adopt line rather
+        // than a footnote, because it is the one consequence of this decision
+        // that arrives long after it and looks like something else when it does:
+        // the code's own comments say five times that adoption hands the whole
+        // lifecycle over "prune policy, `delete` included", while every sentence
+        // the user ever saw stopped at name/address/folder — which reads as the
+        // complete list. A source set to Delete can then remove an adopted
+        // server, and its saved credentials, months later, reported only as an
+        // anonymous count in some future plan. Named as the form names it
+        // ("Removed-Device Policy", formDefinitions.ts) so it can be found and
+        // changed.
+        const detail =
+          n === 1
+            ? [
+                `1 device (${examples}) was previously synced onto a server you kept from a removed inventory source.`,
+                `Adopt Existing re-links that server to "${source.name}" instead of adding a copy — it keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source's Removed-Device Policy applies to it too, so a source set to Delete removes it, and its saved credentials, if the device later disappears from the source.`,
+                separateLine,
+                "Nothing changes until you choose Apply on the sync preview."
+              ].join("\n")
+            : [
+                `${n} devices (e.g. ${examples}) were previously synced onto servers you kept from a removed inventory source.`,
+                `Adopt Existing re-links those servers to "${source.name}" instead of adding copies — each keeps its saved credentials and settings, and this source takes over its name, address and folder from now on. This source's Removed-Device Policy applies to them too, so a source set to Delete removes any one of them, and its saved credentials, if its device later disappears from the source.`,
+                separateLine,
+                "Nothing changes until you choose Apply on the sync preview."
+              ].join("\n");
+        // REVIEW FINDING (P1) — WHAT THE QUESTION IS ABOUT, captured BEFORE the
+        // await that puts it, off the same `plan` object the copy above was
+        // rendered from. Taking it here rather than after the answer comes back
+        // is the whole discipline in one line: it cannot pick up a candidate set
+        // that arrived while the modal was open, which is exactly the set the
+        // answer must never be spent on.
+        //
+        // The full pair set, not the (up to three) names the copy shows: the
+        // question asks the user to hand over a POPULATION it describes by count
+        // and samples, so consent covers all n of them, and a comparison against
+        // the rendered text alone would wave through any swap among the
+        // candidates past the third.
+        answeredAdoptionPairs = adoptionCandidateKeys(plan);
+        // Information, not warning: this fork mutates nothing on its own — the
+        // preview below still gates the apply. "Adopt Existing" first, since in
+        // the scenario this feature exists for (remove with Keep Servers, re-add
+        // the same source) it is almost always the intent.
+        const answer = await vscode.window.showInformationMessage(
+          n === 1
+            ? `Adopt 1 server kept from a removed inventory source into "${source.name}"?`
+            : `Adopt ${n} servers kept from a removed inventory source into "${source.name}"?`,
+          { modal: true, detail },
+          "Adopt Existing",
+          declineLabel
+        );
+        // Compared against the label that was actually RENDERED, never against
+        // the string literal: the decline button is named for what it does in
+        // this run, so a hard-coded "Add Separately" here would silently drop the
+        // answer on every all-blocked run and fall through to "dismissed".
+        if (answer === "Adopt Existing" || answer === declineLabel) {
+          adoptionChoice = answer === "Adopt Existing" ? "adopt" : "decline";
+          // PAIRING RULE (see resolveSourceAuthProfile) — re-resolved in
+          // lockstep with `plan`, immediately before the call it feeds, against
+          // the same `source` snapshot the initial computation used.
+          planAuthProfile = resolveSourceAuthProfile(core, source);
+          planInstanceKey = resolveProviderInstanceKey(provider, source.config);
+          // RECOMPUTED ON BOTH ANSWERS, not just on Adopt. The rule this run
+          // follows from here is that the answer is threaded by name into EVERY
+          // computeSyncPlan call, and the preview is the first of them: a plan
+          // the modal renders that was computed under different inputs from the
+          // in-lock recompute under it is drift by construction — the modal
+          // re-shows on every pass until the mismatch cap aborts a sync nothing
+          // was actually wrong with. `"decline"` happens to produce the same plan
+          // as no answer today (see `InventoryAdoptionChoice`); making the
+          // preview depend on that staying true is how the next behaviour keyed
+          // on the answer would arrive already broken.
+          plan = computeSyncPlan({
+            source,
+            tree,
+            currentServers: core.getSnapshot().servers,
+            now: Date.now(),
+            authProfile: planAuthProfile,
+            providerInstanceKey: planInstanceKey,
+            adoptionChoice
+          });
+          // GUARD SITE 1 of 3 (REVIEW FINDING, P1) — this recompute is the first
+          // consumer of the answer, and the one the finding is about: it reads a
+          // server snapshot taken AFTER the question was answered, so the set it
+          // finds eligible can differ from the set the question named while
+          // reporting the same count. Everything downstream then agrees with
+          // itself and with nothing the user saw — the preview counts n
+          // adoptions, the drift comparator re-bases on those pairs, and Apply
+          // transfers a record, its saved credentials and its future prune
+          // lifecycle to this source without it ever having been mentioned.
+          //
+          // Nothing has been mutated at this point (the fetch is the only work
+          // discarded), exactly as on the dismissal path below.
+          if (adoptionAnswerIsStale(plan)) {
+            reportStaleAdoptionAnswer();
+            return;
+          }
+          // NO FAST-PATH RE-ENTRY after this recompute, deliberately. On Adopt
+          // the plan carries the adoption, so there is nothing to re-enter for.
+          // On Add Separately it CAN come back empty — the restored-backup shape
+          // above is exactly that: the device cannot be added under an id its own
+          // adoptee still holds, so the answer produces a skip and a warning
+          // rather than a record. That run falls through into the preview below
+          // with an empty plan, which is where it belongs: the modal states the
+          // (nil) effect and Show Warnings carries the engine's sentence saying
+          // the device was skipped rather than added separately, and how to
+          // reclaim it. A silent return would drop the one explanation the user
+          // has, and re-entering the fast path would collect a second consent for
+          // a run they have already answered. An empty plan reaching this modal
+          // is not a new shape — the drift/retry loop below can produce one
+          // whenever a concurrent change empties a confirmed plan.
+        } else {
+          // Esc/dismiss ABORTS the sync. The answer governs the apply, and none
+          // was given: defaulting an unanswered question to either side is the
+          // silent path this whole feature exists to remove. Nothing has been
+          // mutated at this point — the fetch is the only work discarded.
+          return;
+        }
+      }
+      // From here `adoptionChoice` is fixed for the whole run and is threaded BY
+      // NAME into every remaining computeSyncPlan call. A recompute that misses
+      // it computes a different plan than the preview rendered: the drift
+      // comparator does catch that (adds↔updates changes the detail text), but
+      // only by re-showing the modal until the mismatch cap aborts the sync.
+      // The two fast-path recomputes above deliberately pass no answer — they
+      // run BEFORE the question, and the candidate list of an unanswered plan is
+      // exactly what decides whether the question is asked at all.
+      //
+      // Candidates that first appear in a LATER recompute of a run where the
+      // question was never asked (initial count 0) render as duplicate adds.
+      // That is today's behavior, accepted: the run is already under way and
+      // re-asking mid-loop would collect an answer to a question the user never
+      // saw the plan for. `adoptionAnswerIsStale` deliberately passes them —
+      // there is no answer for them to be stale against, and with
+      // `adoptionChoice` undefined nothing can be adopted whatever turns up.
+      //
+      // Where an answer DOES exist it is checked against the candidate set of
+      // every plan computed under it, at all three of the sites below, and a
+      // change ends the run. That is the other half of "asked once per run": the
+      // question is not re-put, so the set it was put about is fixed for the rest
+      // of the run and a plan about a different set is not this run's to apply.
 
       // FINDING 1 — the post-teardown final recompute (below) can turn up a
       // different plan than the one just reconfirmed (e.g. a concurrent
@@ -2614,6 +3379,11 @@ export function registerInventoryCommands(
         // Captured alongside the delete set, from the SAME plan this modal
         // renders — these are the servers `shownWarnings` is about to name.
         const shownAuthSwitchIds = authProfileSwitchIds(plan);
+        // Same capture, same reason, for the pairs this plan would adopt:
+        // `shownWarnings` names each pair — the record AND the device claiming
+        // it — so consent is for those pairings, and the drift check below is
+        // what keeps either half from being swapped out under it.
+        const shownAdoptionPairs = adoptionPairKeys(plan);
         // The button is keyed on the BUFFER, not on plan.warnings: a retro-apply
         // sync usually carries no engine warnings at all, and without this the
         // one place that names the servers about to switch would be unreachable
@@ -2669,15 +3439,44 @@ export function registerInventoryCommands(
           // point of the pairing rule: a profile renamed or deleted while the
           // modal was open changes this render and drifts.
           const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          // REVIEW FINDING (P1) — derived fresh beside the profile, from
+          // `freshSource.config`. `sourceConfigUnchanged` above has already
+          // refused a changed config, so this cannot differ from
+          // `planInstanceKey` today; deriving it here anyway keeps the plan's
+          // inputs coming from ONE record rather than two, which is what stops a
+          // later loosening of that check from quietly pairing this tree with
+          // another deployment's identity.
+          const freshInstanceKey = resolveProviderInstanceKey(provider, freshSource.config);
           const recomputed = computeSyncPlan({
             source: freshSource,
             tree,
             currentServers: freshServersForRecompute,
             now: Date.now(),
-            authProfile: freshAuthProfile
+            authProfile: freshAuthProfile,
+            providerInstanceKey: freshInstanceKey,
+            // ADOPT 1 — the answer given once above governs EVERY recompute of
+            // this run. Omitted here, this plan would render adds where the
+            // preview rendered adoptions and drift on every pass, looping the
+            // user through the modal until the mismatch cap aborts the sync.
+            adoptionChoice
           });
+          // GUARD SITE 2 of 3 (REVIEW FINDING, P1) — BEFORE the drift check, not
+          // after it, and that order is the point. The drift comparator's verdict
+          // on a changed candidate set is "re-show the preview", which re-bases
+          // its own baseline on the new pairs; the next pass then agrees with
+          // itself and applies a set the question was never put about. Asking the
+          // fixed question here first means a swap that lands while the PREVIEW
+          // is open ends the run instead of laundering itself through one extra
+          // confirmation.
+          //
+          // Nothing has been mutated yet on this path either — the teardown loop
+          // below is the first thing that touches anything.
+          if (adoptionAnswerIsStale(recomputed)) {
+            reportStaleAdoptionAnswer();
+            return { kind: "abort" };
+          }
           const recomputedDrift = planDetailDrift(
-            { detail: shownDetail, deleteIds: shownDeleteIds, authSwitchIds: shownAuthSwitchIds },
+            { detail: shownDetail, deleteIds: shownDeleteIds, authSwitchIds: shownAuthSwitchIds, adoptionPairs: shownAdoptionPairs },
             recomputed,
             freshServersForRecompute,
             freshAuthProfile?.name
@@ -2772,8 +3571,34 @@ export function registerInventoryCommands(
             tree,
             currentServers: finalServersForRecompute,
             now: Date.now(),
-            authProfile: finalAuthProfile
+            authProfile: finalAuthProfile,
+            // Same record, same derivation as the recompute above — this is the
+            // plan that is actually APPLIED, so the identity that decided its
+            // adoptions must be the one derived from the source it applies
+            // against.
+            providerInstanceKey: freshInstanceKey,
+            // ADOPT 1 — same answer, same run. This is the plan that is actually
+            // APPLIED, so an answer missed here would not merely loop: it would
+            // apply duplicate adds against consent collected for adoptions
+            // (caught by the drift check just below, but only as a retry).
+            adoptionChoice
           });
+          // GUARD SITE 3 of 3 (REVIEW FINDING, P1) — the LAST consumer of the
+          // answer, and the plan that is actually applied. The awaits above it
+          // (the teardown loop, the vault re-read) are a window a candidate swap
+          // can land in like any other.
+          //
+          // On an "adopt" run `finalDrift` below would also notice — candidates
+          // and adoption pairs are the same set there (`adoptionCandidateKeys`)
+          // — but only as a retry, which is the laundering site 2 exists to
+          // close, one loop iteration later. On a DECLINE run nothing else
+          // compares candidates at all: no adoption pairs exist to compare, and a
+          // candidate that stops being one is worth the same rendered counts. The
+          // answer given governs this plan, so this plan is checked against it.
+          if (adoptionAnswerIsStale(finalPlan)) {
+            reportStaleAdoptionAnswer();
+            return { kind: "abort" };
+          }
           const finalApplication = planToApplication(finalPlan, freshSource);
 
           // FINDING 1 — compare the post-teardown final recompute's rendered
@@ -2785,7 +3610,12 @@ export function registerInventoryCommands(
           // (applyInventorySyncPlan hasn't been called), so re-declining on
           // the next confirmation leaves state untouched.
           const finalDrift = planDetailDrift(
-            { detail: recomputedDrift.detail, deleteIds: deletePruneIds(recomputed), authSwitchIds: authProfileSwitchIds(recomputed) },
+            {
+              detail: recomputedDrift.detail,
+              deleteIds: deletePruneIds(recomputed),
+              authSwitchIds: authProfileSwitchIds(recomputed),
+              adoptionPairs: adoptionPairKeys(recomputed)
+            },
             finalPlan,
             finalServersForRecompute,
             finalAuthProfile?.name

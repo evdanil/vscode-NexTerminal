@@ -37,7 +37,8 @@ import {
   validateSerialProfile,
   validateLocalShellProfile,
   validateInventorySource,
-  isValidServerOrigin
+  isValidServerOrigin,
+  isValidDetachedServerOrigin
 } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
@@ -545,15 +546,68 @@ async function importPreservingIds<T extends { id: string }>(
  * a numeric externalId from a hand-edited or version-skewed backup) would
  * otherwise reach core.addOrUpdateServer as-is and can mis-key the sync
  * engine's owned-index until the next reload.
+ *
+ * ADOPT 1 — `formerlySynced` is sanitized here on the same terms, because it
+ * arrives the same way and is read by the same engine: a backup keeps the
+ * marker verbatim (full fidelity), so a hand-edited or version-skewed one lands
+ * here malformed and would otherwise reach the adoption rule, which decides on
+ * `providerId`/`externalId` whether a source may claim an existing record whole.
+ * The two strips are independent — a row carrying both malformed loses both and
+ * is still kept — because the cost of a strip is only that the field stops being
+ * trusted, never that the user loses the server.
+ *
+ * ADOPT 1 (mutual exclusion) — with ONE coupling between them, in one direction:
+ * a marker is dropped when the origin beside it was stripped, however well-formed
+ * the marker itself is.
+ *
+ * `origin` and `formerlySynced` are mutually exclusive by construction — every
+ * writer sets one and clears the other — and the engine's first eligibility
+ * clause (`origin === undefined`) is what makes a record that somehow holds both
+ * inert rather than dangerous. Stripping the origin is exactly what removes that
+ * clause's protection: a row arriving with a corrupt origin and an intact marker
+ * came in unadoptable and would leave ADOPTABLE, claimable whole — name, address,
+ * folder, prune policy included — by a source that never kept it. A sanitizer may
+ * cost an untrusted field its trust; it must never let a corrupt payload GAIN
+ * authority it did not arrive with.
+ *
+ * Dropping the marker is the only resolution the evidence supports. The record
+ * asserts two contradictory things about who manages it, and the half that would
+ * survive is the half that confers something. Repairing instead is not available:
+ * the origin is malformed precisely because its own `externalId` cannot be
+ * trusted, so there is nothing to re-derive a truthful marker from. The cost is
+ * the marker's standing cost — the server stops being adoptable, so a later sync
+ * adds a duplicate and says so — and never the server itself.
+ *
+ * Scoped to the malformed case ON PURPOSE, not widened into "a record may never
+ * hold both". A well-formed origin keeps its marker here because nothing has
+ * removed the clause that makes it inert, and because a record legitimately holds
+ * both for a moment (the server-edit path reattaches a live origin over a snapshot
+ * that still carries the marker). Normalizing there would destroy history at a
+ * boundary that was only asked to reject what it cannot trust.
  */
 async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: ServerConfig) => Promise<void>): Promise<void> {
-  if (server.origin !== undefined && !isValidServerOrigin(server.origin)) {
-    console.warn("[Nexus] Imported server has a malformed origin; stripping it:", JSON.stringify(server.origin));
-    const { origin: _origin, ...rest } = server;
-    await add(rest as ServerConfig);
-    return;
+  let sanitized: ServerConfig = server;
+  let originWasStripped = false;
+  if (sanitized.origin !== undefined && !isValidServerOrigin(sanitized.origin)) {
+    console.warn("[Nexus] Imported server has a malformed origin; stripping it:", JSON.stringify(sanitized.origin));
+    const { origin: _origin, ...rest } = sanitized;
+    sanitized = rest as ServerConfig;
+    originWasStripped = true;
   }
-  await add(server);
+  if (sanitized.formerlySynced !== undefined) {
+    const markerIsMalformed = !isValidDetachedServerOrigin(sanitized.formerlySynced);
+    if (markerIsMalformed || originWasStripped) {
+      console.warn(
+        markerIsMalformed
+          ? "[Nexus] Imported server has a malformed formerlySynced marker; stripping it:"
+          : "[Nexus] Imported server carried a formerlySynced marker beside a malformed origin; stripping the marker too:",
+        JSON.stringify(sanitized.formerlySynced)
+      );
+      const { formerlySynced: _formerlySynced, ...rest } = sanitized;
+      sanitized = rest as ServerConfig;
+    }
+  }
+  await add(sanitized);
 }
 
 /**
@@ -722,7 +776,25 @@ export function sanitizeForSharing(
     // §B6 — a share export travels to another person/machine; a synced-server marker
     // (sourceId/externalId) names an inventory source that only exists locally and
     // would be meaningless (and misleading) on the receiving end.
-    return { ...s, id: newId, username: "user", keyPath: "", proxy: remapProxy(s.proxy, idMap), authProfileId: newAuthProfileId, origin: undefined };
+    //
+    // ADOPT 1 — `formerlySynced` goes with it, for exactly that reason and one
+    // more. It is the same kind of local-only reference (sourceId/sourceName name
+    // a source that was removed on the EXPORTING machine and never existed on the
+    // receiving one), but unlike a dangling `origin` it is not inert: it is the
+    // adoption key. Left on a shared record, the recipient's own source — same
+    // provider, same device — would silently claim a server it never synced, and
+    // take its whole lifecycle including the prune policy. Backups keep the marker
+    // (full fidelity, same machine); a share never does.
+    return {
+      ...s,
+      id: newId,
+      username: "user",
+      keyPath: "",
+      proxy: remapProxy(s.proxy, idMap),
+      authProfileId: newAuthProfileId,
+      origin: undefined,
+      formerlySynced: undefined
+    };
   });
 
   const newTunnels = tunnels.map((t) => {
@@ -1248,7 +1320,25 @@ export async function captureBackupStateForExport(
   });
 }
 
-export function registerConfigCommands(core: NexusCore, vault: SecretVault, context?: import("vscode").ExtensionContext): vscode.Disposable[] {
+/**
+ * REVIEW FINDING (P1, cross-instance adoption) took a `registry` parameter here
+ * for ONE purpose — the import-rollback path stamped a `formerlySynced` marker
+ * and asked the registered provider which DEPLOYMENT the rolled-back servers
+ * came from. REVIEW FINDING (P1, the instance guard fed from the wrong place)
+ * removed the need: the marker now COPIES `ServerOrigin.syncedInstanceKey` off
+ * each server being detached, which is the deployment the sync that created it
+ * actually read from, rather than re-deriving one from a source config that may
+ * have been repointed since (or, on this path, restored from a backup that
+ * describes a different deployment entirely). Nothing in this module consults a
+ * provider any more, so the parameter is gone rather than left unused — a
+ * threaded-through dependency with no reader is an invitation to give it a
+ * second, unexamined job.
+ */
+export function registerConfigCommands(
+  core: NexusCore,
+  vault: SecretVault,
+  context?: import("vscode").ExtensionContext
+): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
     if (!masterPassword) return;
@@ -1645,12 +1735,53 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
           remappedProxy = undefined; // Jump host not in export
         }
       }
+      /**
+       * ADOPT 1 — the one field a share import DROPS rather than remaps, and
+       * deliberately NOT symmetric with `origin` one line below it.
+       *
+       * A stale `origin` is inert on the recipient: no source here holds that
+       * id, nothing on this machine dereferences it, and no sync can act
+       * through it. `formerlySynced` is the opposite — it is the adoption key,
+       * and `planInventorySync` matches it on `providerId` + `externalId` + the
+       * server's CURRENT address, never on `sourceId`. So a marker riding in on
+       * a share file is a live claim here: the recipient's own same-provider
+       * source would silently take a shared record over whole — name, address,
+       * folder, and the prune policy that can later delete it — for a source
+       * the recipient never removed and a device they never synced.
+       *
+       * The provenance it asserts is also false on this machine. The marker
+       * means "a source HERE synced this server, and you kept it when you
+       * removed that source". The recipient did neither; what they did was
+       * accept a file from someone else, which makes the record theirs by hand
+       * — and the governing rule is that a server the user made by hand is
+       * never adopted. A share file is untrusted third-party content by
+       * construction (this path already replaces `username`/`keyPath` for that
+       * reason), so the marker is exactly the kind of assertion a trust
+       * boundary exists to refuse.
+       *
+       * `sanitizeForSharing` already strips it on the way out, so a file this
+       * extension produced carries none and this costs it nothing. What is left
+       * is the untrusted route — a hand-edited share file, or one written by a
+       * build predating that export strip — which is the whole reason the check
+       * belongs on the import side too.
+       *
+       * This is not the "an import must never silently delete a record the user
+       * still holds" case the auth-profile sweep above is careful about: the
+       * marker is bookkeeping, not a credential, and dropping it drops nothing
+       * else — the server itself lands intact, with its links remapped.
+       *
+       * The BACKUP path keeps a well-formed marker on purpose (see
+       * `addServerSanitizingOrigin`): a backup restores the same machine's own
+       * history, where the marker is true, and stripping it there would make
+       * every restored kept server permanently unadoptable.
+       */
       const remappedServer: ServerConfig = {
         ...server,
         id: idMap.get(server.id)!,
         proxy: remappedProxy,
         authProfileId: linkToImportedProfile(server.authProfileId),
-        origin: remapOriginStamp(server.origin)
+        origin: remapOriginStamp(server.origin),
+        formerlySynced: undefined
       };
       tally(await addIfValid(remappedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
@@ -1854,6 +1985,15 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
         // already diverged from is their decision and is left alone.
         if (server.origin?.syncedAuthProfileId === server.authProfileId) {
           cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
+        }
+        // REVIEW FINDING (P1, adoption auth provenance) — and the detached form
+        // of that stamp, for the reason NexusCore.removeAuthProfile gives: a
+        // kept server's marker carries the removed source's own link record, and
+        // adoption restores it into a live origin. Left naming a profile this
+        // import has just established does not exist, it would lock the record
+        // out of retro-apply the moment it is reclaimed.
+        if (server.formerlySynced?.syncedAuthProfileId === server.authProfileId) {
+          cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
         }
         await core.addOrUpdateServer(cleared);
       }
@@ -2133,12 +2273,95 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
             // re-added source gets a fresh id, so nothing could ever claim them again. Scope
             // the sweep to servers THIS RUN imported (serverTally.importedIds) — a pre-existing
             // server is never touched, even if it happens to share the rolled-back source id.
+            //
+            // ADOPT 1 — and what goes in the origin's place is a "Keep Servers" MARKER,
+            // because that is precisely what this disposition already is. Source removed,
+            // its servers retained, their origin stripped: field for field the same event as
+            // Remove Source → Keep Servers (inventoryCommands.ts), which stamps. Stripping
+            // alone made this the ONE detach path that leaves no receipt, so the servers it
+            // converts were permanently unadoptable — and the very warning this rollback
+            // prints tells the user to "re-import or add it manually", the action a marker is
+            // what makes work.
+            //
+            // The provenance is as real here as on that path and is read from the same place:
+            // `origin.externalId` says which device this record was mapped to, and it is
+            // trustworthy by the time this loop sees it (addServerSanitizingOrigin strips any
+            // origin that is not well-formed, so a surviving one passed `isValidServerOrigin`).
+            // Nor does the stamp grant anything new: had the secret restore succeeded, this
+            // source would OWN these servers outright. Adoptable-by-offer is strictly less
+            // than owned, so a rollback that ends in a marker hands out less authority than
+            // the run it is undoing would have.
+            //
+            // The marker is ASSIGNED, not merged, and that closes a second finding at the
+            // same site. A payload can carry a server holding BOTH an origin naming this
+            // source AND a stale marker naming a different one (nothing this extension writes
+            // produces that, but a hand-edited or version-skewed backup can). The engine's
+            // first eligibility clause — `origin === undefined` — is the only thing keeping
+            // such a marker inert, so stripping the origin and leaving the marker PROMOTED
+            // the record into an adoption candidate for a source that never kept it. Writing
+            // this source's own marker over it resolves the contradiction in the only
+            // direction the evidence supports.
+            //
+            // A server carrying `formerlySynced.sourceId === sourceId` and NO origin is
+            // deliberately left alone rather than swept. That state is reachable (ids survive
+            // import, so restoring an older backup in MERGE mode resurrects this source under
+            // its original id while the local servers a previous "Keep Servers" stamped keep
+            // their markers — and a backup taken from there carries both), but the marker it
+            // already holds is exactly the marker this sweep would write. There is nothing to
+            // correct, and rewriting `detachedAt` would restamp a detach that happened long
+            // before this import.
+            //
+            // One timestamp for the whole batch, for the reason the Keep Servers branch gives:
+            // these records are detached by a single event, and a per-server Date.now() would
+            // imply an ordering that does not exist.
+            const detachedAt = Date.now();
             for (const serverId of serverTally.importedIds) {
               const server = core.getServer(serverId);
-              if (!server || server.origin?.sourceId !== sourceId) continue;
-              const { origin: _origin, ...withoutOrigin } = server;
+              const rolledBackOrigin = server?.origin;
+              if (!server || rolledBackOrigin === undefined || rolledBackOrigin.sourceId !== sourceId) continue;
+              // Both fields come off first, so the marker below is an assignment rather than
+              // a merge with whatever the payload happened to carry.
+              const { origin: _origin, formerlySynced: _formerlySynced, ...detached } = server;
+              // `importedSource` is the record importPreservingIds persisted under this id, so
+              // it is present for every id in `importedSourceIds`. If it somehow is not, there
+              // is no `sourceName`/`providerId` to stamp a truthful marker from — and a marker
+              // that cannot be truthful must not be left behind either, so the server falls
+              // back to today's exact behavior: a plain manual server, carrying neither field.
+              const converted: ServerConfig = importedSource
+                ? {
+                    ...detached,
+                    formerlySynced: {
+                      sourceId,
+                      sourceName: importedSource.name,
+                      providerId: importedSource.providerId,
+                      // REVIEW FINDING (P1, cross-instance adoption), amended by
+                      // REVIEW FINDING (P1, the instance guard fed from the wrong
+                      // place) — the instance and the auth provenance are COPIED
+                      // FROM THE ORIGIN being stripped, on exactly the terms the
+                      // Keep Servers stamp in inventoryCommands.ts uses, and for
+                      // the same two reasons. The origin is what the sync that
+                      // created this server actually recorded; the imported
+                      // source record's `config` is only what the backup says it
+                      // is TODAY, and a backup can perfectly well carry a source
+                      // repointed at a second deployment after the servers beside
+                      // it were synced from a first. Re-deriving from that config
+                      // (through a provider registry this path may not even have)
+                      // would mint an adoption key nothing verified.
+                      //
+                      // Both omitted rather than written as `undefined`, for the
+                      // reason the Keep Servers stamp gives: this object is
+                      // persisted verbatim.
+                      ...(rolledBackOrigin.syncedInstanceKey !== undefined ? { instanceKey: rolledBackOrigin.syncedInstanceKey } : {}),
+                      externalId: rolledBackOrigin.externalId,
+                      ...(rolledBackOrigin.syncedAuthProfileId !== undefined
+                        ? { syncedAuthProfileId: rolledBackOrigin.syncedAuthProfileId }
+                        : {}),
+                      detachedAt
+                    }
+                  }
+                : (detached as ServerConfig);
               try {
-                await core.addOrUpdateServer(withoutOrigin as ServerConfig);
+                await core.addOrUpdateServer(converted);
                 convertedServerCount++;
               } catch {
                 // Best-effort, same residue class as the vault-delete rollback above: at worst

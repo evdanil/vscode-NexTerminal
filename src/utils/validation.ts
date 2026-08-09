@@ -1,4 +1,13 @@
-import type { AuthProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile, ProxyConfig, LocalShellProfile } from "../models/config";
+import type {
+  AuthProfile,
+  DetachedServerOrigin,
+  ServerConfig,
+  ServerOrigin,
+  TunnelProfile,
+  SerialProfile,
+  ProxyConfig,
+  LocalShellProfile
+} from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { normalizeFolderPath } from "./folderPaths";
 
@@ -52,14 +61,18 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     return false;
   }
   const obj = value as Record<string, unknown>;
-  // `syncedUsername` and `syncedAuthProfileId` are optional (absent on every
-  // server synced before each field existed) but shape-checked like the rest:
+  // `syncedInstanceKey`, `syncedUsername` and `syncedAuthProfileId` are optional
+  // (absent on every server synced before each field existed) but shape-checked
+  // like the rest:
   // this guard is the ONLY thing standing between a hand-edited backup /
   // version-skewed globalState and the retro-apply rule that reads them, and an
   // origin member the engine did not write makes the whole marker untrustworthy.
   // Empty is rejected as well as non-string: neither ServerConfig.username nor
-  // AuthProfile.id can ever be empty, so an empty stamp could not have come from
-  // a sync. The disposition for a malformed origin is unchanged and
+  // AuthProfile.id can ever be empty, and `resolveProviderInstanceKey` rejects an
+  // empty/blank instance key outright, so an empty stamp could not have come from
+  // a sync. An empty `syncedInstanceKey` matters most of the three — it is COPIED
+  // into a detached marker and then compared for equality, where two empties
+  // would read as one deployment. The disposition for a malformed origin is unchanged and
   // deliberately loud — both callers of this guard strip the WHOLE origin (see
   // VscodeConfigRepository.getServers and addServerSanitizingOrigin), which costs
   // that server its sync ownership and makes the next sync report an id collision
@@ -68,8 +81,74 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     isNonEmptyString(obj.sourceId) &&
     isNonEmptyString(obj.externalId) &&
     typeof obj.syncedAt === "number" &&
+    isOptionalNonEmptyString(obj.syncedInstanceKey) &&
     isOptionalNonEmptyString(obj.syncedUsername) &&
     isOptionalNonEmptyString(obj.syncedAuthProfileId)
+  );
+}
+
+/**
+ * ADOPT 1 — the shape guard for `ServerConfig.formerlySynced`, the receipt
+ * "Keep Servers" leaves behind (see DetachedServerOrigin in models/config.ts).
+ *
+ * Same trust boundary and the same deliberately strict disposition as
+ * `isValidServerOrigin` above: this guard is the only thing standing between a
+ * hand-edited backup or a version-skewed globalState row and the sync engine's
+ * adoption rule, which hands an existing record's whole lifecycle — name,
+ * address, folder, and the source's prune policy, `delete` included — to a
+ * source. EVERY member is required and every string non-empty, because the
+ * engine's only writer (`removeSource`'s Keep Servers branch) writes all five
+ * unconditionally: an absent one cannot have come from this extension, and a
+ * partially-trusted marker is one whose `externalId` decides an adoption while
+ * its `providerId` is missing to scope it.
+ *
+ * Callers strip the WHOLE marker rather than the offending member (the same
+ * F13/FIX 5 disposition `origin` gets, at the same two boundaries). The cost of
+ * a stripped marker is proportionate and self-repairing in the safe direction:
+ * the server simply stops being adoptable, so the next sync adds a duplicate and
+ * says so, instead of re-homing a record on the strength of a field nobody wrote.
+ *
+ * REVIEW FINDING (P1, cross-instance adoption) — `instanceKey` is one of TWO
+ * optional members, and the asymmetry is deliberate. Absent, it means "this
+ * marker names no provider instance", which the engine already refuses to adopt
+ * on (see DetachedServerOrigin in models/config.ts): requiring it here would
+ * discard the marker's `sourceName`/`detachedAt` receipts — the only record of
+ * where such a server came from — to enforce a rule the engine enforces anyway.
+ * PRESENT it must be well-formed, because a present key is compared for equality
+ * and decides an adoption: a non-string or an empty string cannot have come from
+ * `resolveProviderInstanceKey` (models/inventory.ts, which rejects both), and an
+ * empty one would compare equal to another empty one — the very collision the
+ * field exists to prevent. Length and control characters are not re-checked
+ * here: those bound what this extension WRITES, and a marker that merely carries
+ * an over-long key still names a real instance, which is a worse thing to
+ * discard than to keep.
+ *
+ * REVIEW FINDING (P1, adoption auth provenance) — `syncedAuthProfileId` is the
+ * second optional member, and optional for a plainer reason than `instanceKey`:
+ * the detach copies it from the origin, and a source that had linked no profile
+ * leaves nothing to copy, so absent is the ordinary case rather than a legacy
+ * one. PRESENT it must be a non-empty string, exactly as the origin stamp it
+ * mirrors is checked by `isValidServerOrigin`: an `AuthProfile.id` is never
+ * empty, and this value is restored into a real origin at adoption, where AUTH 2b
+ * and retro-apply's opt-out both compare it against a live profile id.
+ */
+export function isValidDetachedServerOrigin(value: unknown): value is DetachedServerOrigin {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  if (obj.instanceKey !== undefined && !isNonEmptyString(obj.instanceKey)) {
+    return false;
+  }
+  if (obj.syncedAuthProfileId !== undefined && !isNonEmptyString(obj.syncedAuthProfileId)) {
+    return false;
+  }
+  return (
+    isNonEmptyString(obj.sourceId) &&
+    isNonEmptyString(obj.sourceName) &&
+    isNonEmptyString(obj.providerId) &&
+    isNonEmptyString(obj.externalId) &&
+    typeof obj.detachedAt === "number"
   );
 }
 
@@ -148,6 +227,10 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   // a `boolean`-returning predicate). The actual strip-and-warn happens one
   // layer up, in VscodeConfigRepository.getServers(), which owns producing
   // the final, storage-clean ServerConfig list.
+  //
+  // ADOPT 1 — `formerlySynced` is governed by exactly the same rule, for
+  // exactly the same reason: see `isValidDetachedServerOrigin` above, which the
+  // same two boundaries call to strip it.
   return true;
 }
 

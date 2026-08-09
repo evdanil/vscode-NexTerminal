@@ -3959,4 +3959,61 @@ describe("serverConfigsEqual / mergeServerConfigFields — origin.syncedUsername
     expect(serverOriginStampsEqual(undefined, undefined)).toBe(true);
     expect(serverOriginStampsEqual(base, undefined)).toBe(false);
   });
+
+  /**
+   * REVIEW FINDING (P1, adoption instance identity) — the same rule for
+   * `syncedInstanceKey`, and it carries more weight than the other two stamps
+   * because of what a MISSING one costs. This is the only value a later
+   * "Keep Servers" can copy into the marker, so a comparator that skips it
+   * discards the very write that backfills a legacy server — and that server's
+   * marker is then never adoptable, permanently and silently.
+   */
+  it("serverOriginStampsEqual counts syncedInstanceKey, in both directions (kills leaving the instance stamp out of the sync engine's `changed` check, which would discard the backfill that makes a legacy synced server adoptable at all)", () => {
+    const legacy = { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" };
+    const stamped = { ...legacy, syncedInstanceKey: "https://netbox.example.com" };
+    // Gaining a stamp is a change — this is the backfill.
+    expect(serverOriginStampsEqual(legacy, stamped)).toBe(false);
+    expect(serverOriginStampsEqual(stamped, legacy)).toBe(false);
+    // Moving to another deployment is a change — this is a repointed source
+    // re-stamping the servers it still owns.
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedInstanceKey: "https://netbox-lab.example.com" })).toBe(false);
+    // And an unchanged stamp is not, or every owned server would be an update on
+    // every sync forever.
+    expect(serverOriginStampsEqual(stamped, { ...stamped })).toBe(true);
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedAt: 9999 })).toBe(true);
+  });
+
+  /**
+   * REVIEW FINDING (P1, adoption auth provenance) — the detached form of the
+   * link receipt, cleared here for exactly the reason the origin's own copy is:
+   * this clear is the SYSTEM'S doing, not a user opt-out, and adoption restores
+   * the marker's receipt into a live origin. A stamp left standing against a
+   * profile that no longer exists would lock the record out of retro-apply from
+   * the moment it is reclaimed — the permanent opt-out nobody chose, merely
+   * deferred until the marker is cashed in.
+   */
+  it("removeAuthProfile clears a KEPT server's marker receipt alongside its link, and leaves a receipt the user has already diverged from alone (kills clearing only origin.syncedAuthProfileId, which strands the adopted record, and kills clearing a stamp on a server whose link the user moved)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateAuthProfile({ id: "p1", name: "Lab", username: "labuser", authType: "password" });
+    const marker = { sourceId: "old-src", sourceName: "NetBox", providerId: "netbox", instanceKey: "https://netbox.example.com", externalId: "device:1", detachedAt: 900 };
+
+    // The sync's own link, on a server kept from a removed source.
+    await core.addOrUpdateServer(server({ id: "kept-1", authProfileId: "p1", formerlySynced: { ...marker, syncedAuthProfileId: "p1" } }));
+    // The user has since moved this one to another profile: the receipt still
+    // names p1, but the link does not, so p1's deletion is not about it.
+    await core.addOrUpdateAuthProfile({ id: "p2", name: "Other", username: "other", authType: "password" });
+    await core.addOrUpdateServer(server({ id: "kept-2", authProfileId: "p2", formerlySynced: { ...marker, externalId: "device:2", syncedAuthProfileId: "p1" } }));
+
+    await core.removeAuthProfile("p1");
+
+    expect(core.getServer("kept-1")?.authProfileId).toBeUndefined();
+    expect(core.getServer("kept-1")?.formerlySynced?.syncedAuthProfileId).toBeUndefined();
+    // The rest of the marker is untouched — the clear is one member, not a wipe.
+    expect(core.getServer("kept-1")?.formerlySynced?.instanceKey).toBe("https://netbox.example.com");
+    expect(core.getServer("kept-1")?.formerlySynced?.externalId).toBe("device:1");
+    // The diverged record keeps both its link and its receipt.
+    expect(core.getServer("kept-2")?.authProfileId).toBe("p2");
+    expect(core.getServer("kept-2")?.formerlySynced?.syncedAuthProfileId).toBe("p1");
+  });
 });

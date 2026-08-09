@@ -134,6 +134,7 @@ import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroS
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
 import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
+import { isValidDetachedServerOrigin } from "../../src/utils/validation";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
@@ -779,6 +780,153 @@ describe("config import command (legacy)", () => {
     expect(snapshot.servers).toHaveLength(1);
     expect(snapshot.servers[0].id).toBe("s1");
     expect(snapshot.servers[0].origin).toBeUndefined();
+  });
+
+  /**
+   * ADOPT 1 — the same import-boundary disposition for `formerlySynced`, the
+   * "Keep Servers" receipt the sync engine's adoption rule matches on. A backup
+   * keeps the marker verbatim, so a restored or hand-edited one arrives here
+   * malformed; it must cost the marker and nothing else.
+   *
+   * Both wrong implementations are visible in this fixture rather than
+   * equivalent to the right one: the payload really carries a marker (so
+   * "passthrough" leaves an object behind), and the server is asserted present
+   * by id (so "reject the row" — which validateServerConfig deliberately does
+   * NOT do for a malformed marker — shows up as a missing server, not as an
+   * absent field that would read exactly like a successful strip).
+   */
+  it("(ADOPT 1) strips a malformed formerlySynced (numeric externalId) from a backup-imported server and keeps the server (kills passthrough and kills rejecting the row)", async () => {
+    const exportData = makeExportData({
+      servers: [
+        {
+          ...makeServer(),
+          formerlySynced: { sourceId: "src1", sourceName: "NetBox", providerId: "netbox", externalId: 12345, detachedAt: 1000 }
+        }
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData, "merge");
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].id).toBe("s1");
+    expect(snapshot.servers[0].formerlySynced).toBeUndefined();
+  });
+
+  it("(ADOPT 1) a backup-imported server keeps a WELL-FORMED formerlySynced marker, instanceKey and all (kills stripping it unconditionally at the import boundary, which would make every restored kept server permanently unadoptable, and kills dropping the one member that decides which deployment may claim it)", async () => {
+    const marker = {
+      sourceId: "src1",
+      sourceName: "NetBox",
+      providerId: "netbox",
+      // REVIEW FINDING (P1, cross-instance adoption) — asserted by `toEqual`, so
+      // a boundary that quietly dropped this member would show up here rather
+      // than as a mysteriously un-adoptable server three flows later.
+      instanceKey: "https://netbox.example.com",
+      externalId: "device:1",
+      detachedAt: 1717000000000
+    };
+    const exportData = makeExportData({
+      servers: [{ ...makeServer(), formerlySynced: marker }],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData, "merge");
+
+    const snapshot = core.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.servers[0].formerlySynced).toEqual(marker);
+  });
+
+  it("(REVIEW FINDING, P1) a marker with NO instanceKey survives import as a receipt, while one carrying an EMPTY instanceKey is stripped whole (kills requiring the member — which would discard the only record of where a legacy kept server came from — and kills accepting a blank one, which compares equal to another blank one and re-creates the cross-instance collision)", async () => {
+    const legacyMarker = { sourceId: "src1", sourceName: "NetBox", providerId: "netbox", externalId: "device:1", detachedAt: 1717000000000 };
+    const exportData = makeExportData({
+      servers: [
+        { ...makeServer(), id: "s-legacy", formerlySynced: legacyMarker },
+        {
+          ...makeServer(),
+          id: "s-blank",
+          formerlySynced: { ...legacyMarker, instanceKey: "" }
+        },
+        {
+          ...makeServer(),
+          id: "s-nonstring",
+          formerlySynced: { ...legacyMarker, instanceKey: 42 }
+        }
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData, "merge");
+
+    const byId = new Map(core.getSnapshot().servers.map((s) => [s.id, s] as const));
+    // Kept, unchanged: the sync engine refuses to adopt it anyway (no instance
+    // key means no match), so there is nothing to protect against by throwing
+    // away its `sourceName`/`detachedAt` receipts.
+    expect(byId.get("s-legacy")?.formerlySynced).toEqual(legacyMarker);
+    // Stripped whole, the same disposition every other malformed member gets —
+    // and the servers themselves are still here.
+    expect(byId.get("s-blank")).toBeDefined();
+    expect(byId.get("s-blank")?.formerlySynced).toBeUndefined();
+    expect(byId.get("s-nonstring")).toBeDefined();
+    expect(byId.get("s-nonstring")?.formerlySynced).toBeUndefined();
+  });
+
+  /**
+   * ADOPT 1 (mutual exclusion) — the two strips above are independent, and that
+   * independence had a hole where they meet. A row carrying a MALFORMED origin
+   * beside a WELL-FORMED marker arrives unadoptable — the engine's first
+   * eligibility clause is `origin === undefined` — and stripping only the origin
+   * is precisely what removes that protection, so it left ADOPTABLE: claimable
+   * whole, prune policy included, by a source that never kept it. Corruption must
+   * never buy a payload authority it did not arrive with, so the marker goes with
+   * the origin it could not be told apart from.
+   *
+   * Three wrong implementations, all visible in this one fixture rather than
+   * equivalent to the right one:
+   *  - "strip the origin, keep the marker" (the state before this fix) leaves a
+   *    marker object on `Corrupt Origin`;
+   *  - "reject the row" — which validateServerConfig deliberately does not do for
+   *    either bookkeeping field — shows up as a missing server, not as an absent
+   *    field that reads the same as a successful strip;
+   *  - "a record may never hold both" (the over-wide normalization this
+   *    deliberately is NOT) strips the marker off `Live Origin` too, where nothing
+   *    has removed the clause that keeps it inert.
+   */
+  it("(ADOPT 1) a backup-imported server whose origin is malformed loses its WELL-FORMED marker along with the origin, keeping the server — while a server whose origin is well-formed keeps both (kills stripping the origin alone, which promotes a corrupt row to adoptable; kills rejecting the row; kills blanket both-field normalization)", async () => {
+    const marker = { sourceId: "src1", sourceName: "NetBox", providerId: "netbox", externalId: "device:1", detachedAt: 1717000000000 };
+    // The premise: the marker really is well-formed, so its loss below is the
+    // coupling's doing and not the malformed-marker strip's.
+    expect(isValidDetachedServerOrigin(marker)).toBe(true);
+    const liveOrigin = { sourceId: "src1", externalId: "device:2", syncedAt: 1000 };
+
+    const exportData = makeExportData({
+      servers: [
+        { ...makeServer({ id: "srv-corrupt", name: "Corrupt Origin", host: "10.9.9.9" }), origin: null, formerlySynced: marker },
+        { ...makeServer({ id: "srv-live", name: "Live Origin" }), origin: liveOrigin, formerlySynced: marker }
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData, "merge");
+
+    const snapshot = core.getSnapshot();
+    // Neither row was rejected — a bookkeeping field never costs the user a server.
+    expect(snapshot.servers.map((s) => s.id).sort()).toEqual(["srv-corrupt", "srv-live"]);
+
+    const corrupt = snapshot.servers.find((s) => s.id === "srv-corrupt")!;
+    // THE ASSERTION — the corrupt row comes out of the boundary carrying neither
+    // field, i.e. exactly as unadoptable as it went in.
+    expect(corrupt.origin).toBeUndefined();
+    expect(corrupt.formerlySynced).toBeUndefined();
+    // …and it is otherwise intact.
+    expect(corrupt.host).toBe("10.9.9.9");
+
+    // The coupling is scoped to the strip, not to the co-existence: this row's
+    // origin was trustworthy, so nothing was taken from it.
+    const live = snapshot.servers.find((s) => s.id === "srv-live")!;
+    expect(live.origin).toEqual(liveOrigin);
+    expect(live.formerlySynced).toEqual(marker);
   });
 
   it("imports shared local shell profiles after path sanitization", async () => {
@@ -3189,6 +3337,94 @@ describe("share import", () => {
     expect(stamped.origin?.syncedAuthProfileId).not.toBe("ap-ok");
   });
 
+  /**
+   * ADOPT 1 — the share path keeps `origin` (it only remaps the stamp inside it),
+   * and by that same spread it used to keep `formerlySynced`. The two must NOT be
+   * handled alike. A stale `origin` is inert on the recipient — no source here
+   * holds that id and nothing dereferences it — while the marker IS the adoption
+   * key, matched on `providerId`/`externalId` plus the server's current address
+   * and never on `sourceId`. Left on a shared record it is a live claim on THIS
+   * machine: the recipient's own same-provider source takes the record over
+   * whole, prune policy included, for a source the recipient never removed.
+   *
+   * `sanitizeForSharing` strips it on the way out, so the route this closes is the
+   * untrusted one — a hand-edited share file, or one written by a build predating
+   * that export strip — which is exactly what an import boundary is for.
+   *
+   * THE FIXTURE IS BUILT SO A PASS CANNOT MEAN SOMETHING ELSE:
+   *  - the marker is asserted WELL-FORMED through the very guard both import
+   *    boundaries strip on, so its absence below cannot be `addServerSanitizingOrigin`
+   *    quietly discarding a malformed one — which would make the whole test vacuous;
+   *  - the server is asserted present WITH its address and its remapped profile
+   *    link, so "stripped" is distinguished from "the row was rejected";
+   *  - a second server's `origin` is asserted to SURVIVE, so the strip cannot have
+   *    been bought by blanking inventory bookkeeping wholesale.
+   */
+  it("(ADOPT 1) share import strips a WELL-FORMED formerlySynced marker while keeping the server, its address, its remapped profile link, and another server's origin (kills the spread that carries a share file's adoption key onto the recipient's machine)", async () => {
+    const marker = {
+      sourceId: "src-on-the-other-machine",
+      sourceName: "Their NetBox",
+      providerId: "netbox",
+      externalId: "device:1",
+      detachedAt: 1717000000000
+    };
+    // The premise, proven rather than assumed: this marker passes the shape guard
+    // both boundaries strip on, so nothing but the share-path strip can account for
+    // its absence below.
+    expect(isValidDetachedServerOrigin(marker)).toBe(true);
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({
+          id: "share-s-kept",
+          name: "Kept Elsewhere",
+          host: "10.0.0.7",
+          port: 2222,
+          authProfileId: "ap-ok",
+          formerlySynced: marker
+        }),
+        makeServer({
+          id: "share-s-owned",
+          name: "Owned Elsewhere",
+          origin: { sourceId: "src-on-the-other-machine", externalId: "device:2", syncedAt: 1000 }
+        })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [makeAuthProfile({ id: "ap-ok", name: "Kept" })]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-kept-marker.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const kept = snapshot.servers.find((s) => s.name === "Kept Elsewhere")!;
+
+    // THE ASSERTION — the adoption key does not cross the boundary. Under the
+    // passthrough this is the marker object, and the recipient's own NetBox source
+    // would claim this record on its next sync.
+    expect(kept.formerlySynced).toBeUndefined();
+
+    // It was the marker that was refused, not the record: everything the recipient
+    // actually receives is still here, links remapped as usual. A "reject the row"
+    // implementation fails on every line below.
+    expect(snapshot.servers).toHaveLength(2);
+    expect(kept.host).toBe("10.0.0.7");
+    expect(kept.port).toBe(2222);
+    expect(kept.authProfileId).toBe(snapshot.authProfiles[0].id);
+    expect(kept.authProfileId).not.toBe("ap-ok");
+
+    // And the strip is specific to the marker — a dangling `origin` still crosses,
+    // as it always has (it is inert here, and the stamp remap depends on it), so
+    // this cannot pass by blanking both fields.
+    const owned = snapshot.servers.find((s) => s.name === "Owned Elsewhere")!;
+    expect(owned.origin?.externalId).toBe("device:2");
+  });
+
   it("v1 share import reads legacy macros from settings key", async () => {
     const v1ShareData = {
       version: 1,
@@ -4472,6 +4708,27 @@ describe("sanitizeForSharing", () => {
     expect(result.authProfiles).toHaveLength(0);
     expect(result.servers[0].authProfileId).toBeUndefined();
   });
+
+  it("(ADOPT 1) clears formerlySynced alongside origin (kills sharing the adoption key a recipient's own source would silently match)", () => {
+    const server = makeServer({
+      formerlySynced: {
+        sourceId: "src-removed-here",
+        sourceName: "NetBox",
+        providerId: "netbox",
+        externalId: "device:1",
+        detachedAt: 1717000000000
+      }
+    });
+    // Premise: the input carries a marker, so a passing assertion below cannot
+    // be the no-op reading of an input that never had one.
+    expect(server.formerlySynced).toBeDefined();
+
+    const result = sanitizeForSharing([server], [], [], [], {});
+
+    expect(result.servers[0].formerlySynced).toBeUndefined();
+    // The strip is a copy, not a mutation of the caller's live record.
+    expect(server.formerlySynced).toBeDefined();
+  });
 });
 
 describe("complete reset", () => {
@@ -4771,6 +5028,65 @@ describe("share export round-trip", () => {
     expect(exported.inventorySources).toBeUndefined();
     expect(exported.servers).toHaveLength(1);
     expect(exported.servers[0].origin).toBeUndefined();
+  });
+
+  /**
+   * ADOPT 1 — the same §B6 rule for `formerlySynced`. The marker names a source
+   * that was removed on the EXPORTING machine (sourceId/sourceName are receipts
+   * for a source id nothing else will ever hold again), and unlike a dangling
+   * `origin` it is not inert on the receiving end: it is the adoption key, so a
+   * recipient's own source of the same provider would silently claim the shared
+   * record and take its whole lifecycle, prune policy included.
+   *
+   * Non-vacuity, both halves:
+   *  - the fixture is asserted to CARRY a marker on the way in (line marked
+   *    "premise"), so the export assertion cannot pass merely because nothing
+   *    was ever there;
+   *  - the assertion is on the serialized payload — `"formerlySynced" in row`
+   *    against the parsed JSON — which is what actually travels. Under the wrong
+   *    implementation (no clearing) the key is present with the marker object.
+   */
+  it("(ADOPT 1) share export strips formerlySynced from every server (fixture server WITH a marker) — kills carrying the adoption key to another machine", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const marker = {
+      sourceId: "src-removed-here",
+      sourceName: "NetBox",
+      providerId: "netbox",
+      externalId: "device:1",
+      detachedAt: 1717000000000
+    };
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    // A "Keep Servers" survivor: no `origin` (the two are mutually exclusive),
+    // just the receipt naming the source that used to own it.
+    await sourceCore.addOrUpdateServer(makeServer({ id: "s1", name: "Kept Server", formerlySynced: marker }));
+
+    // Premise — the fixture really does carry a marker into the export.
+    expect(sourceCore.getSnapshot().servers[0].formerlySynced).toEqual(marker);
+
+    registerConfigCommands(sourceCore, vault);
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/share.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    await registeredCommands.get("nexus.config.export")!();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.servers).toHaveLength(1);
+    expect(exported.servers[0].name).toBe("Kept Server");
+    // Absent from what travels, not merely undefined on some in-memory object.
+    expect("formerlySynced" in exported.servers[0]).toBe(false);
+    // …and the local record was not mutated on the way out.
+    expect(sourceCore.getSnapshot().servers[0].formerlySynced).toEqual(marker);
   });
 });
 
@@ -5865,6 +6181,337 @@ describe("backup export round-trip", () => {
     // The warning reports the conversion.
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
       'Source "Source One" could not be restored — its credentials failed to store; re-import or add it manually; 2 of its servers were kept as manual servers.'
+    );
+  });
+
+  /**
+   * ADOPT 1 — the rollback above is field for field the same event as Remove
+   * Source → Keep Servers: the source is gone, its servers are retained, their
+   * origin is stripped. That path STAMPS a marker; this one was the only detach
+   * path that did not, so every server it converted was permanently unadoptable —
+   * and the warning it prints tells the user to "re-import or add it manually",
+   * which is the action a marker is what makes work.
+   *
+   * The stamp grants nothing new: had the secret restore succeeded, this source
+   * would OWN these servers. Adoptable-by-offer is strictly less than owned.
+   *
+   * The fixture separates the fix from two wrong implementations:
+   *  - "strip the origin and stop" (the state before this) leaves `formerlySynced`
+   *    undefined on the converted server;
+   *  - "stamp every server this run imported" puts a marker on the plain manual
+   *    server that was never this source's to detach.
+   * The stamp is also asserted through the adoption rule's own shape guard, so a
+   * half-filled marker — which would read as a pass on a `toBeDefined()` — cannot
+   * satisfy it.
+   */
+  it("(ADOPT 1) a successfully rolled-back source stamps a Keep-Servers marker onto each server whose origin it strips, naming the device that origin recorded, and invents none for an unrelated manual server (kills the strip-only conversion that left every rolled-back server permanently unadoptable)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const backingStore = new Map<string, string>();
+    const vault: SecretVault = {
+      get: vi.fn(async (key: string) => backingStore.get(key)),
+      store: vi.fn(async (key: string, value: string) => {
+        if (key === inventorySecretKey("src1", "apiToken")) {
+          throw new Error("secret storage unavailable");
+        }
+        backingStore.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        backingStore.delete(key);
+      })
+    };
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const secrets = { inventorySourceSecrets: { src1: { apiToken: "src1-token" } } };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({ id: "srv-owned", name: "Owned", origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1 } }),
+        makeServer({ id: "srv-manual", name: "Manual" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")).toBeUndefined();
+
+    const owned = core.getServer("srv-owned")!;
+    // The origin still goes, exactly as before.
+    expect(owned.origin).toBeUndefined();
+    // THE ASSERTION — and a receipt takes its place, naming the source that was
+    // rolled back, its provider, and the device the stripped origin recorded.
+    // `detachedAt` is this run's clock, so it is matched by type rather than value.
+    expect(owned.formerlySynced).toEqual({
+      sourceId: "src1",
+      sourceName: "Source One",
+      providerId: "netbox",
+      externalId: "dev-a",
+      detachedAt: expect.any(Number)
+    });
+    // …and it is a marker the adoption rule can actually act on, not a partial one.
+    expect(isValidDetachedServerOrigin(owned.formerlySynced)).toBe(true);
+
+    // The server this source never owned gains nothing — the stamp follows the
+    // stripped origin, it is not sprayed over everything the run imported.
+    const manual = core.getServer("srv-manual")!;
+    expect(manual.origin).toBeUndefined();
+    expect(manual.formerlySynced).toBeUndefined();
+  });
+
+  /**
+   * REVIEW FINDING (P1, cross-instance adoption) — the rollback marker's INSTANCE
+   * member, which the test above cannot see: its server carries no sync-time
+   * instance stamp, so the marker it asserts is deliberately the degraded one (a
+   * receipt naming no deployment, therefore not adoptable).
+   *
+   * REVIEW FINDING (P1, the instance guard fed from the wrong place) — and WHERE
+   * that member comes from, which is the whole point of this test now. It is
+   * copied off the rolled-back server's own `origin.syncedInstanceKey`, never
+   * re-derived from the imported source's `config` through a registered provider.
+   * The fixture is built so the two answers DIFFER: the origin says
+   * `https://netbox-a.example.com`, while the imported source's config says
+   * `https://netbox.example.com` (makeInventorySource's default, which is exactly
+   * what `createNetboxProvider`'s `instanceKey` would return from it). A backup
+   * can carry precisely that skew — a source repointed at a second deployment
+   * after the servers beside it were synced from a first — and the config-derived
+   * answer is the one that lets a later source of the second deployment adopt,
+   * and then prune, the first one's records.
+   *
+   * Both halves matter and each kills a different mistake. Stamping nothing when
+   * the origin HAS a stamp re-creates the un-adoptable rollback the marker was
+   * added to fix, one level down. Stamping something when it does NOT — a
+   * placeholder, the provider id, or the source config's own URL as a "fallback"
+   * — hands out an identity nobody verified, which is the whole class of defect
+   * this finding is about, and a fallback would be reached in exactly the
+   * repointed-config case that produces the wrong answer.
+   */
+  it("(REVIEW FINDING, P1) a rolled-back source's marker copies the instance the SERVER'S ORIGIN recorded, and records none when the origin recorded none — never the one the imported source's config names (kills a rollback that forgets the instance, and kills re-deriving it from a mutable config that may have been repointed since)", async () => {
+    async function rollbackMarkerWith(syncedInstanceKey?: string) {
+      vi.clearAllMocks();
+      registeredCommands.clear();
+      configStore.clear();
+      const { encrypt } = await import("../../src/utils/configCrypto");
+
+      const backingStore = new Map<string, string>();
+      const vault: SecretVault = {
+        get: vi.fn(async (key: string) => backingStore.get(key)),
+        store: vi.fn(async (key: string, value: string) => {
+          if (key === inventorySecretKey("src1", "apiToken")) {
+            throw new Error("secret storage unavailable");
+          }
+          backingStore.set(key, value);
+        }),
+        delete: vi.fn(async (key: string) => {
+          backingStore.delete(key);
+        })
+      };
+
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      registerConfigCommands(core, vault);
+
+      const secrets = { inventorySourceSecrets: { src1: { apiToken: "src1-token" } } };
+      const importData = {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [
+          makeServer({
+            id: "srv-owned",
+            name: "Owned",
+            origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1, syncedInstanceKey }
+          })
+        ],
+        tunnels: [],
+        serialProfiles: [],
+        authProfiles: [],
+        // config.baseUrl is "https://netbox.example.com" — the value a
+        // config-derived implementation would stamp, and deliberately NOT the
+        // value either assertion below expects.
+        inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
+        encryptedSecrets: encrypt(JSON.stringify(secrets), "masterpass1")
+      };
+
+      mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+      mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+      mockShowInputBox.mockResolvedValueOnce("masterpass1");
+      mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+      mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await registeredCommands.get("nexus.config.import")!();
+      return core.getServer("srv-owned")!.formerlySynced;
+    }
+
+    // THE KILLER ASSERTION: the deployment the SYNC recorded, which is not the
+    // one the imported source's config names. A build that re-derives from
+    // `importedSource.config` through the netbox provider stamps
+    // "https://netbox.example.com" here and fails.
+    const fromOrigin = await rollbackMarkerWith("https://netbox-a.example.com");
+    expect(fromOrigin?.instanceKey).toBe("https://netbox-a.example.com");
+    expect(fromOrigin?.instanceKey).not.toBe("https://netbox.example.com");
+    expect(isValidDetachedServerOrigin(fromOrigin)).toBe(true);
+
+    // No sync-time stamp — the marker is honest about knowing nothing: written
+    // as an ABSENT member rather than an empty or placeholder string, because
+    // the sync engine reads absent as "not adoptable" and would read a
+    // placeholder as an instance to match on. A config-derived FALLBACK for this
+    // case fails here too, and would be reached in exactly the repointed-config
+    // scenario that makes the config-derived answer wrong.
+    const withoutStamp = await rollbackMarkerWith(undefined);
+    expect(withoutStamp?.externalId).toBe("dev-a");
+    expect(withoutStamp).not.toHaveProperty("instanceKey");
+  });
+
+  /**
+   * ADOPT 1 — the same sweep, from the marker's side. Two shapes a backup can
+   * carry that the origin-strip had no answer for:
+   *
+   *  - BOTH fields, with the marker naming a DIFFERENT source. Nothing this
+   *    extension writes produces that, but a hand-edited or version-skewed backup
+   *    can, and the engine's first eligibility clause (`origin === undefined`) is
+   *    the only thing keeping such a marker inert. Stripping the origin and
+   *    leaving the marker is exactly what PROMOTES the record into an adoption
+   *    candidate for a source that never kept it — the rollback handing out
+   *    authority the payload never had. Assigning this source's own marker over it
+   *    resolves the contradiction in the only direction the evidence supports.
+   *
+   *  - A marker naming the rolled-back source, with NO origin. Reachable without
+   *    hand-editing: ids survive import, so restoring an older backup in MERGE
+   *    mode resurrects a source under its original id while the local servers a
+   *    previous "Keep Servers" stamped are skipped (their ids already exist) and
+   *    keep their markers — and a backup taken from that state carries both. It is
+   *    deliberately left ALONE: the marker it holds is already the marker this
+   *    sweep would write, so there is nothing to correct, and restamping would
+   *    move `detachedAt` onto a detach that happened long before this import.
+   *
+   * `detachedAt` on the untouched server is asserted by VALUE for that reason — it
+   * is what tells "left alone" apart from "swept and rewritten with the same
+   * content", which would otherwise read identically.
+   */
+  it("(ADOPT 1) a rolled-back source overwrites a stale foreign marker on a server whose origin it strips, and leaves untouched an imported server that already carries this source's marker with no origin (kills leaving a promoted adoption key behind, and kills sweeping every marker that names the source)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const backingStore = new Map<string, string>();
+    const vault: SecretVault = {
+      get: vi.fn(async (key: string) => backingStore.get(key)),
+      store: vi.fn(async (key: string, value: string) => {
+        if (key === inventorySecretKey("src1", "apiToken")) {
+          throw new Error("secret storage unavailable");
+        }
+        backingStore.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        backingStore.delete(key);
+      })
+    };
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // A marker left by an entirely different provider's source, riding on a server
+    // this backup also claims src1 owns. Inert on arrival, live the moment the
+    // origin comes off.
+    const staleForeignMarker = {
+      sourceId: "src-long-gone",
+      sourceName: "Their Zabbix",
+      providerId: "some-other-provider",
+      externalId: "dev-zzz",
+      detachedAt: 111
+    };
+    // A genuine kept server of src1 — no origin, marker already correct.
+    const ownMarker = {
+      sourceId: "src1",
+      sourceName: "Source One",
+      providerId: "netbox",
+      externalId: "dev-k",
+      detachedAt: 222
+    };
+
+    const secrets = { inventorySourceSecrets: { src1: { apiToken: "src1-token" } } };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({
+          id: "srv-both",
+          name: "Owned With Stale Marker",
+          origin: { sourceId: "src1", externalId: "dev-b", syncedAt: 1 },
+          formerlySynced: staleForeignMarker
+        }),
+        makeServer({ id: "srv-kept", name: "Already Kept", formerlySynced: ownMarker })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")).toBeUndefined();
+
+    const both = core.getServer("srv-both")!;
+    expect(both.origin).toBeUndefined();
+    // THE ASSERTION — the foreign claim is gone, replaced by the one this rollback
+    // can actually vouch for. Leaving the stale marker (the state before this fix)
+    // would leave `providerId: "some-other-provider"` here, adoptable by a source
+    // that never synced this machine.
+    expect(both.formerlySynced).toEqual({
+      sourceId: "src1",
+      sourceName: "Source One",
+      providerId: "netbox",
+      externalId: "dev-b",
+      detachedAt: expect.any(Number)
+    });
+
+    // The already-kept server is not swept: same marker, same detachedAt, no origin
+    // invented. A fix that stripped every marker naming the rolled-back source, or
+    // that restamped it, fails here.
+    const kept = core.getServer("srv-kept")!;
+    expect(kept.origin).toBeUndefined();
+    expect(kept.formerlySynced).toEqual(ownMarker);
+
+    // One conversion, not two — the untouched server is not counted as converted.
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      'Source "Source One" could not be restored — its credentials failed to store; re-import or add it manually; 1 of its servers were kept as manual servers.'
     );
   });
 

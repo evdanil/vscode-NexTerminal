@@ -25,6 +25,16 @@ interface ProfileActionPick extends vscode.QuickPickItem {
   command: string;
 }
 
+/**
+ * Byte-identical to the sentence the server edit form and the inventory source
+ * form each refuse with (commands/serverCommands.ts,
+ * commands/inventoryCommands.ts). Duplicated rather than shared for the same
+ * reason those two already duplicate it between themselves: each form module
+ * owns its own refusal copy, and there is no messages module to hang it on.
+ */
+const MISSING_AUTH_PROFILE_MESSAGE =
+  "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
+
 function isUnifiedProfileSeed(arg: unknown): arg is UnifiedProfileSeed {
   if (!arg || typeof arg !== "object") {
     return false;
@@ -85,6 +95,52 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         // serverCommands.ts for the full torn-pair scenario. No UI runs
         // inside this span.
         await configMutationLock.runExclusive(async () => {
+          // REVIEW FINDING — the Add form mirrors a chosen auth profile's
+          // credentials into its fields (`onAutofill` below), and can then sit
+          // open indefinitely while auth profile add/edit/delete run as
+          // ordinary commands. Re-resolve the submitted link against LIVE core
+          // state before anything is written, and while holding the lock every
+          // auth profile write also takes (ui/authProfileEditorPanel.ts), so
+          // the answer cannot move between this check and the write below.
+          // Without it, deleting the profile while the form was open wrote a
+          // DANGLING authProfileId onto a brand-new server —
+          // removeAuthProfile's own reference clearing has already run by
+          // then, nothing revisits the record afterwards, and nothing in the
+          // UI reports it. Throwing here reaches the user as "Save failed: …"
+          // and leaves the panel open with its contents intact, which is what
+          // the message tells them to act on. First statement in the section
+          // on purpose: nothing has been written yet, so there is nothing to
+          // roll back.
+          //
+          // WHY ONLY THE MISSING CASE, and not the server EDIT form's full
+          // `serverAuthProfileRejection` (commands/serverCommands.ts). That
+          // guard has two halves, and only one of them has a counterpart here.
+          // Its ownership-signature half exists solely because
+          // `preserveLinkedServerCredentials` reads the LIVE profile to decide
+          // which submitted credential fields are the user's own input and
+          // which come back from the STORED record — a decision made about a
+          // form nobody rendered if the profile's shape moved underneath it,
+          // which silently discards a field the user typed or writes the
+          // profile's own mirrored value over the record's. That helper does
+          // not run on this path at all: it returns `next` untouched without an
+          // `existing`, and there is no stored record to put anything back
+          // from. This path writes the submission verbatim, so a new server
+          // linked here ALWAYS stores the profile's mirrored credentials as its
+          // own — that is the intended value underneath the link, not a
+          // corruption, and a drifted shape only makes it one profile edit
+          // stale. That is the same state the record would be in had the user
+          // pressed Save a moment earlier, and it is what the link itself
+          // means: the live profile decides at connect time regardless. Same
+          // reasoning `inventoryAuthProfileRejection` uses to omit the server
+          // form's comparand — compare what this save actually READS from the
+          // profile, which here is the id and nothing else.
+          //
+          // The missing half has no such excuse: an id that resolves to nothing
+          // is not one edit stale, it is a reference to a record that does not
+          // exist, and it is the one outcome no save may leave behind.
+          if (server.authProfileId !== undefined && ctx.core.getAuthProfile(server.authProfileId) === undefined) {
+            throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
+          }
           // FINDINGS 2+3 (P2, create-rollback review, sibling) — same
           // single-owner displacement as the nexus.server.edit rollback
           // (serverCommands.ts): if `server` enables
