@@ -169,7 +169,13 @@ export class SettingsTreeProvider
       new SettingsLinkItem("Macros", "nexus.macro.editor", "record-keys", "Open the macro editor")
     );
     items.push(
-      new SettingsLinkItem("Auth Profiles", "nexus.authProfile.manage", "key", "Create and manage reusable credential templates")
+      // §7 UX-M6 — description changed to "reusable SSH credentials" so
+      // "template" means exactly one thing (the device template) in the product.
+      new SettingsLinkItem("Auth Profiles", "nexus.authProfile.manage", "key", "Create and manage reusable SSH credentials")
+    );
+    // Device templates settings-tree row, beside Auth Profiles (§7.1).
+    items.push(
+      new SettingsLinkItem("Device Templates", "nexus.deviceTemplate.manage", "layers", "Apply shared settings to servers synced from inventory")
     );
     // Inventory sources had no home in this tree at all — editing one meant
     // knowing the palette command "Nexus: Edit Inventory Source". The link

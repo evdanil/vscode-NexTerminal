@@ -42,6 +42,54 @@ import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "..
 export type TemplatableField = "proxy" | "authProfileId" | "multiplexing" | "legacyAlgorithms" | "logSession";
 
 /**
+ * §7.3 / §7.4 — the ONE short-label map for templatable field display names,
+ * reused by the manual-apply consent modal, the tree tooltip's "Template-applied:"
+ * line, and (from PR-T2) the rules picker's `Sets:` detail, so a field is spelled
+ * one way everywhere ("Proxy", never also "SSH proxy"). Pure, so tests and the
+ * vscode-land consumers share the same table.
+ */
+export const TEMPLATE_FIELD_SHORT_LABELS: Record<TemplatableField, string> = {
+  proxy: "Proxy",
+  authProfileId: "Auth Profile",
+  multiplexing: "Multiplexing",
+  legacyAlgorithms: "Legacy Algorithms",
+  logSession: "Session Logging"
+};
+
+/** The four non-auth stamp fields, in the order the tooltip lists them. */
+const NON_AUTH_TEMPLATABLE_FIELDS = ["proxy", "multiplexing", "legacyAlgorithms", "logSession"] as const;
+
+/**
+ * §7.3 (UX-S12) — the non-auth templatable fields a server is CURRENTLY carrying
+ * a template value for, i.e. where the record's value still equals the stamp the
+ * sync wrote (`cur === origin.templated.X`). Derived purely from record + origin,
+ * with NO rule re-evaluation (device attributes are not persisted, §3.4), so it
+ * is always truthful about OWNERSHIP even though it cannot name the rule. A field
+ * the user has since hand-edited (`cur !== stamp`, row 6) or cleared (row 2) drops
+ * out, which is exactly the "your edits override" signal the tooltip needs. Boolean
+ * stamps are compared by `=== ` (a PRESENT `false` stamp is a real stamp, m12);
+ * proxy by structural equality. `authProfileId` is deliberately NOT included — the
+ * SSH auth link already surfaces on its own `[auth: …]` tooltip suffix.
+ */
+export function templateAppliedFields(server: Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "origin">): TemplatableField[] {
+  const stamps = server.origin?.templated;
+  if (stamps === undefined) {
+    return [];
+  }
+  const applied: TemplatableField[] = [];
+  for (const field of NON_AUTH_TEMPLATABLE_FIELDS) {
+    if (field === "proxy") {
+      if (stamps.proxy !== undefined && proxyEqual(server.proxy, stamps.proxy)) {
+        applied.push("proxy");
+      }
+    } else if (stamps[field] !== undefined && server[field] === stamps[field]) {
+      applied.push(field);
+    }
+  }
+  return applied;
+}
+
+/**
  * A rule's `filter` is a catch-all (matches every device) when it is absent,
  * empty, or whitespace-only. The cheap PR-T1 predicate: the full parser +
  * matcher (`parseTemplateFilter` / `deviceMatchesFilter`) is PR-T2, so a T1
@@ -634,6 +682,240 @@ export function computeProfilesNeedingServerKey(params: {
  * a user action clears a stamp" invariant (§4.3) expressed in the module's API
  * surface: no sync path may call this.
  */
+// ---------------------------------------------------------------------------
+// §7.4 MANUAL FOLDER APPLY — the pure planner behind `nexus.deviceTemplate
+// .applyToFolder`. Kept here (not in the command) so the SAME six-clause
+// eligibility (`authFillEligible`) and per-target usability (`authLinkUsableForTarget`)
+// the sync engine uses also gate the manual path — "one predicate, two callers"
+// (§7.4 / risk 5) — and so the modal's dry-run counts and the actual writes are
+// computed from ONE decision, never two that can disagree.
+// ---------------------------------------------------------------------------
+
+/** What one server receives from a manual apply — only the fields actually written. */
+export interface ManualApplyServerWrite {
+  serverId: string;
+  proxy?: ProxyConfig;
+  multiplexing?: boolean;
+  legacyAlgorithms?: boolean;
+  logSession?: boolean;
+  authProfileId?: string;
+  /** The fields written above, in `TemplatableField` terms — fed verbatim to `clearTemplatedStamps`. */
+  writtenFields: TemplatableField[];
+}
+
+/** Dry-run counts for one value field's consent line. */
+export interface ValueFieldPlan {
+  mode: TemplateFieldMode;
+  willSet: number;
+  skipped: number;
+}
+
+/** Dry-run counts for the auth link's consent line, skips split by reason (§7.4 UX-S7). */
+export interface AuthFieldPlan {
+  mode: TemplateFieldMode;
+  linked: number;
+  /** Fill only — a link is already present (write-once leaves it). */
+  skippedAlreadyLinked: number;
+  /** Fill only — SSH login was configured by hand (clauses 3/4/5/6, incl. non-synced & fail-closed). */
+  skippedLoginConfigured: number;
+  /** Both modes — the profile needs a key file this target does not have (§4.4 per-target usability). */
+  skippedNeedsKey: number;
+  /** Override only — the honest count of hand-configured logins this override replaces. */
+  replacingHandConfigured: number;
+}
+
+export interface ManualApplyPlan {
+  serverWrites: ManualApplyServerWrite[];
+  proxy?: ValueFieldPlan;
+  multiplexing?: ValueFieldPlan;
+  legacyAlgorithms?: ValueFieldPlan;
+  logSession?: ValueFieldPlan;
+  auth?: AuthFieldPlan;
+  /** §5.3 reference-validation warnings — dangling auth profile / jump host / per-target self-proxy. */
+  warnings: string[];
+}
+
+export interface ManualApplyContext {
+  template: DeviceTemplateProfile;
+  servers: readonly ServerConfig[];
+  /** The `defaultUsername` of the source named by a server's `origin.sourceId`, or `undefined` if that source is gone (fail closed, §7.4 clause 6). */
+  sourceDefaultUsername: (sourceId: string) => string | undefined;
+  /** Resolve a profile id to the live `AuthProfile` (dangling → undefined). */
+  authProfile: (id: string) => AuthProfile | undefined;
+  /** Does a live server with this id exist? — §5.3 jump-host dangling check. */
+  hasServer: (id: string) => boolean;
+}
+
+/**
+ * §7.4 clause-6 baseline: for a SYNCED server, `origin.syncedUsername` else the
+ * source's current `defaultUsername`; `undefined` when the server is NON-SYNCED
+ * (every field was hand-typed — clause 6 cannot pass) or its source is gone
+ * (fail closed — refuse rather than guess which account it logs in as).
+ */
+function manualBaselineUsername(server: ServerConfig, sourceDefaultUsername: (sourceId: string) => string | undefined): string | undefined {
+  if (server.origin === undefined) {
+    return undefined;
+  }
+  return server.origin.syncedUsername ?? sourceDefaultUsername(server.origin.sourceId);
+}
+
+/**
+ * Computes the manual-apply plan for a folder of servers. Value fields
+ * (proxy/multiplexing/legacyAlgorithms/logSession): fill writes where unset,
+ * override writes over anything. Auth link: FILL runs the six `authFillEligible`
+ * clauses then the per-target usability gate (§4.4 composition — for a
+ * fill-eligible target usability degenerates to a profile-level keyless check);
+ * OVERRIDE is unconstrained except that same per-target usability gate, and is
+ * the only mode that can face — and link — an own-key target. Skips are split by
+ * reason for the modal; a keyless-key target is always its own line because the
+ * repair differs.
+ */
+export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPlan {
+  const { template, servers, sourceDefaultUsername, authProfile, hasServer } = ctx;
+  const warnings: string[] = [];
+  const serverWrites = new Map<string, ManualApplyServerWrite>();
+  const writeFor = (id: string): ManualApplyServerWrite => {
+    let w = serverWrites.get(id);
+    if (w === undefined) {
+      w = { serverId: id, writtenFields: [] };
+      serverWrites.set(id, w);
+    }
+    return w;
+  };
+
+  const plan: ManualApplyPlan = { serverWrites: [], warnings };
+
+  // ---- Proxy ----------------------------------------------------------------
+  const proxyField = template.fields.proxy;
+  if (proxyField !== undefined) {
+    let proxyValue: ProxyConfig | undefined = proxyField.value;
+    // §5.3 dangling jump host — device-independent, checked once; drops the field.
+    if (proxyValue.type === "ssh" && !hasServer(proxyValue.jumpHostId)) {
+      warnings.push(`Device template "${template.name}" sets a jump-host proxy whose jump host no longer exists — the proxy field was skipped.`);
+      proxyValue = undefined;
+    }
+    if (proxyValue !== undefined) {
+      const stats: ValueFieldPlan = { mode: proxyField.mode, willSet: 0, skipped: 0 };
+      for (const server of servers) {
+        // §5.3 per-device self-reference — a jump host that IS this server.
+        if (proxyValue.type === "ssh" && proxyValue.jumpHostId === server.id) {
+          warnings.push(`Device template "${template.name}" would route "${server.name}" through itself — the proxy field was skipped.`);
+          stats.skipped++;
+          continue;
+        }
+        const write = proxyField.mode === "override" || server.proxy === undefined;
+        if (write) {
+          const w = writeFor(server.id);
+          w.proxy = proxyValue;
+          w.writtenFields.push("proxy");
+          stats.willSet++;
+        } else {
+          stats.skipped++;
+        }
+      }
+      plan.proxy = stats;
+    }
+  }
+
+  // ---- Boolean value fields -------------------------------------------------
+  const applyBool = (field: "multiplexing" | "legacyAlgorithms" | "logSession"): ValueFieldPlan | undefined => {
+    const tf = template.fields[field];
+    if (tf === undefined) {
+      return undefined;
+    }
+    const stats: ValueFieldPlan = { mode: tf.mode, willSet: 0, skipped: 0 };
+    for (const server of servers) {
+      const write = tf.mode === "override" || server[field] === undefined;
+      if (write) {
+        const w = writeFor(server.id);
+        w[field] = tf.value;
+        w.writtenFields.push(field);
+        stats.willSet++;
+      } else {
+        stats.skipped++;
+      }
+    }
+    return stats;
+  };
+  plan.multiplexing = applyBool("multiplexing");
+  plan.legacyAlgorithms = applyBool("legacyAlgorithms");
+  plan.logSession = applyBool("logSession");
+
+  // ---- Auth link ------------------------------------------------------------
+  const authField = template.fields.authProfileId;
+  if (authField !== undefined) {
+    const profile = authProfile(authField.value);
+    if (profile === undefined) {
+      // §5.3 dangling auth profile — drop the field entirely.
+      warnings.push(`Device template "${template.name}" links an auth profile that no longer exists — the auth field was skipped.`);
+    } else {
+      const stats: AuthFieldPlan = {
+        mode: authField.mode,
+        linked: 0,
+        skippedAlreadyLinked: 0,
+        skippedLoginConfigured: 0,
+        skippedNeedsKey: 0,
+        replacingHandConfigured: 0
+      };
+      for (const server of servers) {
+        const baseline = manualBaselineUsername(server, sourceDefaultUsername);
+        const fillEligible = baseline !== undefined && authFillEligible(server, profile.id, baseline);
+        const usable = authLinkUsableForTarget(profile, server);
+        if (authField.mode === "fill") {
+          if (!fillEligible) {
+            // Eligibility skip, split into the two buckets the modal names.
+            if (server.authProfileId !== undefined) {
+              stats.skippedAlreadyLinked++;
+            } else {
+              stats.skippedLoginConfigured++;
+            }
+            continue;
+          }
+          // Fill-eligible ⇒ hasOwnKeyPath === false, so usability is the
+          // profile-level keyless check (§4.4 composition).
+          if (!usable) {
+            stats.skippedNeedsKey++;
+            continue;
+          }
+          const w = writeFor(server.id);
+          w.authProfileId = profile.id;
+          w.writtenFields.push("authProfileId");
+          stats.linked++;
+        } else {
+          // OVERRIDE — unconstrained except the per-target usability gate.
+          if (!usable) {
+            stats.skippedNeedsKey++;
+            continue;
+          }
+          const w = writeFor(server.id);
+          w.authProfileId = profile.id;
+          w.writtenFields.push("authProfileId");
+          stats.linked++;
+          // P1 (adversarial minor 2) — "replacing N hand-configured logins" must
+          // count ONLY targets whose current effective login is genuinely
+          // hand-configured AND actually changes. Excluded:
+          //   - a never-configured (fill-eligible) target — nothing to replace;
+          //   - a SYNC-OWNED link (`authProfileId === origin.syncedAuthProfileId`)
+          //     — the sync put it there, not the hand, so override is moving a
+          //     sync link, not replacing a hand one;
+          //   - a target ALREADY linked to this same profile — the write is a
+          //     no-op, so it "replaces" nothing.
+          const current = server.authProfileId;
+          const syncOwned = current !== undefined && current === server.origin?.syncedAuthProfileId;
+          const alreadySameProfile = current === profile.id;
+          if (!fillEligible && !syncOwned && !alreadySameProfile) {
+            stats.replacingHandConfigured++;
+          }
+        }
+      }
+      plan.auth = stats;
+    }
+  }
+
+  plan.serverWrites = [...serverWrites.values()].filter((w) => w.writtenFields.length > 0);
+  return plan;
+}
+
 export function clearTemplatedStamps(origin: ServerOrigin | undefined, writtenFields: readonly TemplatableField[]): ServerOrigin | undefined {
   if (origin === undefined) {
     return origin;

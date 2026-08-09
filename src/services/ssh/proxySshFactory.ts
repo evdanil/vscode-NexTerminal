@@ -1,7 +1,7 @@
 import * as net from "node:net";
 import type { Duplex } from "node:stream";
 import { SocksClient } from "socks";
-import type { ServerConfig, ProxyConfig } from "../../models/config";
+import type { ServerConfig, ProxyConfig, Socks5Proxy, HttpConnectProxy } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import type {
   ContextAwareSshFactory,
@@ -12,8 +12,45 @@ import type {
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay } from "./proxiedSshConnection";
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
+import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
+import { configMutationLock } from "../configMutationLock";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
+
+/**
+ * Per-connect proxy-password prompt (design doc §5.3; §11 OQ2). §5.3 said a
+ * template's authenticated socks5/http proxy "gets the existing per-connect
+ * password prompt behavior" — but that prompt was assumed-but-never-built:
+ * `connectViaSocks5` / `connectViaHttpConnect` only did `vault.get` and sent
+ * `proxyPassword ?? ""`, so after a template applied an authenticated proxy
+ * (templates carry no secret, and the round-2 hygiene sweeps any stale
+ * `proxy-password-{id}`) the connection sent an empty password and failed. This
+ * OPTIONAL dependency realizes that prompt: when present it is fired only for a
+ * username-bearing proxy whose vault lookup returned nothing, at the SAME await
+ * point the `vault.get` already happens (preserving the socket/banner IPC
+ * ordering). Absent ⇒ exactly the prior behavior (backward-compatible). On a
+ * saved success the password is stored under `proxyPasswordSecretKey(id)` so it
+ * is one-time; a later template endpoint change re-clears it via the existing
+ * hygiene → re-prompt next connect, exactly §5.3.
+ */
+export type ProxyPasswordPrompt = (
+  server: ServerConfig,
+  proxy: Socks5Proxy | HttpConnectProxy
+) => Promise<{ password: string; save: boolean } | undefined>;
+
+/**
+ * Resolution of the per-connect proxy password. `password` is fed to the
+ * handshake exactly as before. `storeOnSuccess`, when present, is a deferred
+ * best-effort persist descriptor: the caller stores it ONLY after
+ * `authFactory.connect` resolves (proxy handshake + ssh auth both succeeded),
+ * so a mistyped first-time password is never persisted (which would otherwise
+ * lock the proxy out of every later connect via the `stored !== undefined`
+ * early-return).
+ */
+interface ResolvedProxyPassword {
+  password: string | undefined;
+  storeOnSuccess?: { key: string; value: string };
+}
 
 function normalizeProxyTimeoutMs(timeoutMs: number): number {
   return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 5_000, 300_000) : 60_000;
@@ -27,7 +64,11 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     private readonly authFactory: SilentAuthSshFactory,
     private readonly serverLookup: (id: string) => ServerConfig | undefined,
     private readonly vault: SecretVault,
-    proxyTimeoutMs: number = 60_000
+    proxyTimeoutMs: number = 60_000,
+    // OPTIONAL — see `ProxyPasswordPrompt`. Absent ⇒ today's `?? ""` behavior
+    // unchanged (backward-compatible; existing constructions and tests keep
+    // working). Only the socks5/http (password-bearing) paths consult it.
+    private readonly promptProxyPassword?: ProxyPasswordPrompt
   ) {
     this.proxyTimeoutMs = normalizeProxyTimeoutMs(proxyTimeoutMs);
   }
@@ -118,12 +159,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
   private async connectViaSocks5(
     target: ServerConfig,
-    proxy: { host: string; port: number; username?: string },
+    proxy: Socks5Proxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const proxyPassword = proxy.username
-      ? await this.vault.get(proxyPasswordSecretKey(target.id))
-      : undefined;
+    const { password: proxyPassword, storeOnSuccess } = await this.resolveProxyPassword(target, proxy);
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -165,6 +204,14 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       sockFactory,
       ...(onAuthMessage && { onAuthMessage })
     });
+    // The connection succeeded (proxy handshake + ssh auth). Now persist a freshly
+    // prompted, save-flagged password — deferred to here so a mistyped first-time
+    // secret is never stored before the handshake, and kept OUT of the timing-
+    // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
+    // keychain-store failure must not abort an already-established connection.
+    if (storeOnSuccess) {
+      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, storeOnSuccess);
+    }
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -172,12 +219,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
   private async connectViaHttpConnect(
     target: ServerConfig,
-    proxy: { host: string; port: number; username?: string },
+    proxy: HttpConnectProxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const proxyPassword = proxy.username
-      ? await this.vault.get(proxyPasswordSecretKey(target.id))
-      : undefined;
+    const { password: proxyPassword, storeOnSuccess } = await this.resolveProxyPassword(target, proxy);
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -200,9 +245,126 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       sockFactory,
       ...(onAuthMessage && { onAuthMessage })
     });
+    // The connection succeeded (proxy handshake + ssh auth). Now persist a freshly
+    // prompted, save-flagged password — deferred to here so a mistyped first-time
+    // secret is never stored before the handshake, and kept OUT of the timing-
+    // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
+    // keychain-store failure must not abort an already-established connection.
+    if (storeOnSuccess) {
+      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, storeOnSuccess);
+    }
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
+  }
+
+  /**
+   * Store-side twin of `clearStaleProxyPasswordSecretsBeforeApply`
+   * (proxySecretHygiene.ts). The invariant BOTH enforce: never leave a
+   * `proxy-password-{id}` that doesn't match the server's CURRENT authenticated
+   * endpoint — the clear side enforces it on delete, this enforces it on the
+   * deferred store.
+   *
+   * SECURITY (issue #48 PR-T1b / PR #62 Codex round 8) — the deferred store key is
+   * server-id-only, so a concurrent connect that read the OLD server config and
+   * prompted for the OLD proxy's password can reach this post-connect store AFTER a
+   * template apply has already cleared `proxy-password-{id}` and published a NEW
+   * proxy endpoint. Storing unconditionally would repopulate the key with the OLD
+   * endpoint's credential, which the factory would then send to the server's NEW
+   * proxy — the exact leak the pre-apply hygiene prevents, recreated on the store
+   * side. Guard: re-read the live server and store ONLY IF it still names the SAME
+   * authenticated endpoint this connection actually used. A live proxy that is
+   * undefined, a different endpoint, a different type, or ssh/none means the
+   * endpoint changed under us → skip the store (the stale credential must not be
+   * repopulated). Best-effort throughout: a lookup miss or a keychain-store failure
+   * must never abort an already-established connection. `connectionProxy` is
+   * password-bearing socks5/http (we only reach the prompt/store path for a
+   * username-bearing proxy), so `isSameAuthenticatedEndpoint` compares like-for-like.
+   *
+   * SECURITY (issue #48 PR-T1b / PR #62 Codex round 9) — the round-8 re-read closed
+   * the ordering hole but not the ATOMICITY hole: the sync `serverLookup` re-read +
+   * `isSameAuthenticatedEndpoint` check and the async `await this.vault.store(...)`
+   * were two separate steps, not one critical section. A template apply's
+   * clear-then-publish (`clearStaleProxyPasswordSecretsBeforeApply` → publish new
+   * endpoint) could land in the await window BETWEEN a passing check and the store
+   * completing: the check saw the still-old endpoint and passed, then the apply
+   * cleared `proxy-password-{id}` and published the NEW proxy, then the pending
+   * store wrote the OLD endpoint's credential back under the server-only key — sent
+   * to the new proxy = the same leak, again. Fix: run the re-read + check + store as
+   * a single critical section under `configMutationLock` — the SAME lock the template
+   * apply (manual and sync) holds across its clear+publish. With them mutually
+   * exclusive, both orderings are safe: (a) store-then-apply — the store writes while
+   * the endpoint is still old, then the apply's pre-publish clear deletes it before
+   * publishing the new proxy; (b) apply-then-store — the apply clears+publishes first,
+   * then the store re-reads the NEW endpoint, `isSameAuthenticatedEndpoint` is false,
+   * and it skips. No interleaving leaves a mismatched secret.
+   *
+   * NO REENTRANCY: `configMutationLock` is NOT re-entrant, but the proxy connect/store
+   * path is otherwise lock-free — it runs AFTER `authFactory.connect` resolved and
+   * never itself holds the lock (mirrors the command-layer discipline: the connect
+   * path is a lock-free consumer that briefly takes the lock only for this store), so
+   * acquiring it here cannot deadlock. Accepted cost: a first-time proxy-authenticated
+   * connection's password store briefly waits for any in-flight config mutation
+   * (sync/apply) to release the lock before the connection object is returned — rare
+   * (only the first prompt for a server's proxy), short, and the correctness win is
+   * the point. The whole thing stays best-effort inside the try/catch.
+   */
+  private async persistProxyPasswordIfEndpointUnchanged(
+    target: ServerConfig,
+    connectionProxy: Socks5Proxy | HttpConnectProxy,
+    storeOnSuccess: { key: string; value: string }
+  ): Promise<void> {
+    try {
+      // Atomic w.r.t. the template apply's clear+publish (which holds the same lock):
+      // re-read + endpoint check + store are one critical section, so no apply can
+      // interleave between the check passing and the store completing.
+      await configMutationLock.runExclusive(async () => {
+        const live = this.serverLookup(target.id);
+        if (live && isSameAuthenticatedEndpoint(live.proxy, connectionProxy)) {
+          await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
+        }
+      });
+    } catch {
+      /* best-effort — a keychain-store failure must not abort an established connection */
+    }
+  }
+
+  /**
+   * Resolve the proxy password at the SAME await point the connect paths used to
+   * call `vault.get` (do NOT move — it preserves the documented socket/banner IPC
+   * ordering). Realizes the §5.3 per-connect prompt that was assumed-but-unbuilt:
+   * a username-bearing proxy whose vault lookup returns nothing consults the
+   * optional prompt (when wired). A saved success is NOT stored here — it is
+   * returned as a `storeOnSuccess` descriptor and persisted by the caller ONLY
+   * after `authFactory.connect` resolves (deferred, post-connect, best-effort),
+   * so a mistyped first-time password is never persisted before the handshake
+   * (which would lock the proxy out of every later connect). A cancelled prompt,
+   * an absent prompt dependency, or a proxy without a username all fall back to
+   * the prior behavior (`undefined` → `?? ""` downstream) with no behavior change.
+   */
+  private async resolveProxyPassword(
+    target: ServerConfig,
+    proxy: Socks5Proxy | HttpConnectProxy
+  ): Promise<ResolvedProxyPassword> {
+    if (!proxy.username) {
+      return { password: undefined };
+    }
+    const stored = await this.vault.get(proxyPasswordSecretKey(target.id));
+    if (stored !== undefined) {
+      return { password: stored };
+    }
+    if (this.promptProxyPassword) {
+      const result = await this.promptProxyPassword(target, proxy);
+      if (result) {
+        return {
+          password: result.password,
+          ...(result.save && {
+            storeOnSuccess: { key: proxyPasswordSecretKey(target.id), value: result.password }
+          })
+        };
+      }
+    }
+    return { password: undefined };
   }
 
   private addToVisited(visited: ReadonlySet<string>, server: ServerConfig): Set<string> {

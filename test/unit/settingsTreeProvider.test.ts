@@ -88,10 +88,10 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 12 root items", () => {
+    it("returns 13 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(12);
+      expect(roots).toHaveLength(13);
     });
 
     it("has 9 category items first with Security & Data after SSH", () => {
@@ -103,12 +103,36 @@ describe("SettingsTreeProvider", () => {
         .toEqual(["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
     });
 
-    it("has 3 root link items for Macros, Auth Profiles, and Inventory Sources", () => {
+    it("has 4 root link items for Macros, Auth Profiles, Device Templates, and Inventory Sources", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const links = roots.filter((r) => r instanceof SettingsLinkItem);
-      expect(links).toHaveLength(3);
-      expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles", "Inventory Sources"]);
+      expect(links).toHaveLength(4);
+      expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles", "Device Templates", "Inventory Sources"]);
+    });
+
+    // §7 UX-M6 — the Auth Profiles row description no longer says "template" so
+    // the word means exactly one thing (the device template) in the product.
+    it("describes Auth Profiles as reusable SSH credentials (not a template)", () => {
+      const provider = createProvider();
+      const links = provider.getChildren().filter((r) => r instanceof SettingsLinkItem) as SettingsLinkItem[];
+      const authProfiles = links[1];
+      expect(authProfiles.label).toBe("Auth Profiles");
+      expect(authProfiles.tooltip).toBe("Create and manage reusable SSH credentials");
+    });
+
+    // §7.1 — the Device Templates settings-tree row, beside Auth Profiles.
+    it("has a Device Templates link pointing at nexus.deviceTemplate.manage with the layers icon", () => {
+      const provider = createProvider();
+      const links = provider.getChildren().filter((r) => r instanceof SettingsLinkItem) as SettingsLinkItem[];
+      const deviceTemplates = links[2];
+      expect(deviceTemplates.label).toBe("Device Templates");
+      expect(deviceTemplates.command).toEqual({
+        command: "nexus.deviceTemplate.manage",
+        title: "Device Templates"
+      });
+      expect((deviceTemplates.iconPath as { id: string }).id).toBe("layers");
+      expect(deviceTemplates.tooltip).toBe("Apply shared settings to servers synced from inventory");
     });
 
     // The owner's complaint this answers: inventory sources had no home in the
@@ -120,7 +144,7 @@ describe("SettingsTreeProvider", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const links = roots.filter((r) => r instanceof SettingsLinkItem) as SettingsLinkItem[];
-      const inventory = links[2];
+      const inventory = links[3];
       expect(inventory.label).toBe("Inventory Sources");
       expect(inventory.command).toEqual({
         command: "nexus.inventory.manage",

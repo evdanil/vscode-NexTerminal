@@ -1,9 +1,12 @@
 import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config";
-import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues } from "../models/inventory";
+import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
+import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import { isCatchAllFilter, templateAppliedFields, type TemplatableField } from "../services/inventory/templateApply";
 import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
-import type { FormDefinition, FormFieldDescriptor, VisibleWhen, VisibleWhenCondition } from "./formTypes";
+import { randomUUID } from "node:crypto";
+import type { FormDefinition, FormFieldDescriptor, FormValues, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
 
 /** Default placement/wording of the shared Auth Profile select — the profile
@@ -18,11 +21,33 @@ interface AuthProfileSelectOptions {
   advanced?: boolean;
   /** Defaults to `AUTH_PROFILE_HINT`. */
   hint?: string;
+  /**
+   * Device templates (PR-T1b) — the form key this select submits under. Defaults
+   * to `"authProfileId"`. The device-template editor keeps that key (it IS the
+   * template's own auth field) but every OTHER caller relies on the default.
+   */
+  key?: string;
+  /**
+   * Device templates (PR-T1b) — defaults to `true` (mirror the chosen profile's
+   * username/authType/keyPath into the form's own controls and lock them). The
+   * template editor sets it `false`: there is NO server SSH form on that editor
+   * to mirror INTO, so autofill must be off and no lock/mirror machinery runs.
+   */
+  autofill?: boolean;
   /** What this render already overwrote with the selected profile's values —
    *  see `applyLinkedAuthProfileValues`. Absent on forms that cannot open with
    *  a profile already selected (the unified Add Profile form), where there is
    *  nothing for a render to have displaced. */
   displacedValues?: Record<string, string>;
+  /**
+   * P2 (adversarial minor 3) — drop the "Create new auth profile…" sentinel
+   * option. The template editor sets this: `openDeviceTemplateEditor` wires NO
+   * inline-create handler for its auth select, so offering the sentinel there
+   * makes the auth field silently vanish on submit (the sentinel is not a real
+   * profile id). Suppressing the option removes the dead capability rather than
+   * leaving a dangling one. Every OTHER caller keeps it (defaults to `false`).
+   */
+  suppressCreate?: boolean;
 }
 
 /**
@@ -167,12 +192,15 @@ function authProfileSelectField(
   const options = [
     { label: "(None)", value: "" },
     ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
-    { label: "Create new auth profile\u2026", value: "__create__authProfile" }
+    // P2 \u2014 suppressed in the device-template editor, whose auth select has no
+    // inline-create handler wired (choosing it would silently drop the field).
+    ...(opts?.suppressCreate ? [] : [{ label: "Create new auth profile\u2026", value: "__create__authProfile" }])
   ];
   const selectedProfile = selectedId ? (authProfiles ?? []).find((p) => p.id === selectedId) : undefined;
+  const autofill = opts?.autofill ?? true;
   return {
     type: "select",
-    key: "authProfileId",
+    key: opts?.key ?? "authProfileId",
     label: "Auth Profile",
     options,
     // Grows with the auth-profile list; type-to-filter with (None)/create
@@ -183,9 +211,12 @@ function authProfileSelectField(
     value: selectedId ?? "",
     hint: opts?.hint ?? AUTH_PROFILE_HINT,
     advanced: opts?.advanced ?? true,
-    autofill: true,
-    autofillFilledKeys: authProfileFilledKeys(selectedProfile),
-    autofillDisplacedValues: opts?.displacedValues,
+    // Device templates (PR-T1b) — autofill/lock/mirror is meaningless without a
+    // server SSH form to mirror INTO, so the template editor turns it OFF and,
+    // with it, the render-time filled-keys/displaced seeds it feeds.
+    autofill,
+    autofillFilledKeys: autofill ? authProfileFilledKeys(selectedProfile) : undefined,
+    autofillDisplacedValues: autofill ? opts?.displacedValues : undefined,
     visibleWhen: vw
   };
 }
@@ -498,10 +529,31 @@ export interface ServerListEntry {
   name: string;
 }
 
+// Device templates (PR-T1b, UX-M4/m13) — per-server proxy passwords are never
+// stored in a template (§5.3: templates carry no SECRETS); a template-set
+// socks5/http proxy prompts for its password per-connect. This hint replaces the
+// password control the template editor omits, so a user isn't left wondering
+// where to type one.
+const TEMPLATE_PROXY_PASSWORD_HINT =
+  "Proxy passwords aren't stored in templates — each server prompts for its own the first time it connects.";
+
 function proxyFields(
   seed?: Partial<ServerConfig>,
   servers?: ServerListEntry[],
-  vw?: VisibleWhen
+  vw?: VisibleWhen,
+  // Device templates (PR-T1b, UX-M4/m13) — defaults to `true` so every existing
+  // call site is byte-identical. The template editor passes `false`: the proxy
+  // controls ARE the field being templated, so burying them under the Advanced
+  // chevron would hide the editor's main content.
+  advanced = true,
+  // Device templates (PR-T1b, PR #62 Codex round 2, Fix C) — defaults to `true`
+  // so the server form and every other caller keep both password controls. The
+  // template editor passes `false`: `parseDeviceTemplateFormValues` calls only
+  // `formValuesToProxy`, which silently DISCARDS the proxy passwords (§5.3 —
+  // templates carry no secrets), so rendering the two password inputs would let a
+  // user type a value that Save throws away, then hit an unexpected auth prompt at
+  // connect. Omitting them, plus the per-server hint above, states the real model.
+  includePasswords = true
 ): FormFieldDescriptor[] {
   const proxy = seed?.proxy;
   const proxyType = proxy?.type ?? "none";
@@ -546,7 +598,7 @@ function proxyFields(
       ],
       value: proxyType,
       hint: "Route SSH through a jump host, SOCKS5 proxy, or HTTP CONNECT proxy.",
-      advanced: true,
+      advanced,
       visibleWhen: vw
     },
     // SSH Jump Host fields
@@ -560,20 +612,192 @@ function proxyFields(
       filterable: true,
       options: serverOptions,
       value: jumpHostId,
-      advanced: true,
+      advanced,
       visibleWhen: compoundVw(sshJumpVw)
     },
     // SOCKS5 fields
-    { type: "text", key: "proxySocks5Host", label: "SOCKS5 Proxy Host", required: true, placeholder: "proxy.example.com", value: socks5Host, advanced: true, visibleWhen: compoundVw(socks5Vw) },
-    { type: "number", key: "proxySocks5Port", label: "SOCKS5 Proxy Port", required: true, min: 1, max: 65535, value: socks5Port, advanced: true, visibleWhen: compoundVw(socks5Vw) },
-    { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, advanced: true, visibleWhen: compoundVw(socks5Vw) },
-    { type: "password", key: "proxySocks5Password", label: "SOCKS5 Password", placeholder: "Leave blank to keep existing", advanced: true, visibleWhen: compoundVw(socks5Vw) },
+    { type: "text", key: "proxySocks5Host", label: "SOCKS5 Proxy Host", required: true, placeholder: "proxy.example.com", value: socks5Host, advanced, visibleWhen: compoundVw(socks5Vw) },
+    { type: "number", key: "proxySocks5Port", label: "SOCKS5 Proxy Port", required: true, min: 1, max: 65535, value: socks5Port, advanced, visibleWhen: compoundVw(socks5Vw) },
+    { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, advanced, ...(includePasswords ? {} : { hint: TEMPLATE_PROXY_PASSWORD_HINT }), visibleWhen: compoundVw(socks5Vw) },
+    ...(includePasswords
+      ? [{ type: "password" as const, key: "proxySocks5Password", label: "SOCKS5 Password", placeholder: "Leave blank to keep existing", advanced, visibleWhen: compoundVw(socks5Vw) }]
+      : []),
     // HTTP CONNECT fields
-    { type: "text", key: "proxyHttpHost", label: "HTTP Proxy Host", required: true, placeholder: "proxy.example.com", value: httpHost, advanced: true, visibleWhen: compoundVw(httpVw) },
-    { type: "number", key: "proxyHttpPort", label: "HTTP Proxy Port", required: true, min: 1, max: 65535, value: httpPort, advanced: true, visibleWhen: compoundVw(httpVw) },
-    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, advanced: true, visibleWhen: compoundVw(httpVw) },
-    { type: "password", key: "proxyHttpPassword", label: "HTTP Proxy Password", placeholder: "Leave blank to keep existing", advanced: true, visibleWhen: compoundVw(httpVw) }
+    { type: "text", key: "proxyHttpHost", label: "HTTP Proxy Host", required: true, placeholder: "proxy.example.com", value: httpHost, advanced, visibleWhen: compoundVw(httpVw) },
+    { type: "number", key: "proxyHttpPort", label: "HTTP Proxy Port", required: true, min: 1, max: 65535, value: httpPort, advanced, visibleWhen: compoundVw(httpVw) },
+    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, advanced, ...(includePasswords ? {} : { hint: TEMPLATE_PROXY_PASSWORD_HINT }), visibleWhen: compoundVw(httpVw) },
+    ...(includePasswords
+      ? [{ type: "password" as const, key: "proxyHttpPassword", label: "HTTP Proxy Password", placeholder: "Leave blank to keep existing", advanced, visibleWhen: compoundVw(httpVw) }]
+      : [])
   ];
+}
+
+// ---------------------------------------------------------------------------
+// DEVICE TEMPLATES (issue #48 PR-T1b) — the tri-state template editor (§7.1),
+// built entirely on the existing form framework: a per-field mode select gating
+// the field's value control(s) via `visibleWhen`, with every quoted string here
+// adopted verbatim from §7.1. No new webview machinery.
+// ---------------------------------------------------------------------------
+
+/** The five v1 templatable fields, in editor order. */
+export type TemplatableFormField = "proxy" | "authProfileId" | "multiplexing" | "legacyAlgorithms" | "logSession";
+
+/** The form key of a field's companion mode select (`mode_proxy`, …). */
+export function deviceTemplateModeKey(field: TemplatableFormField): string {
+  return `mode_${field}`;
+}
+
+// §7.1 mode-select copy, VERBATIM.
+const TEMPLATE_MODE_OPTIONS = [
+  { label: "Not set", value: "none" },
+  { label: "Fill — only where nothing is set", value: "fill" },
+  { label: "Override — replace source and sync values", value: "override" }
+];
+const TEMPLATE_MODE_SHARED_HINT =
+  "Fill writes this value only where the field isn't configured yet. Override also replaces values the source or an earlier sync supplied. Neither mode ever changes a value you set yourself — your own edits always win.";
+const TEMPLATE_AUTH_MODE_HINT =
+  "Fill links this profile only on servers whose SSH login was never configured by hand. Override also moves servers a sync previously linked — but never a link you chose yourself.";
+const TEMPLATE_OVERRIDE_PREEMPTION =
+  "Values a server already had before any template applied count as hand-configured and are kept. To replace those deliberately, use Apply Device Template to Folder.";
+// §7.1 editor intro (UX-M1) — the three invariants, VERBATIM.
+const TEMPLATE_EDITOR_INTRO_HTML = [
+  '<div style="padding: 12px; border-left: 4px solid var(--vscode-focusBorder, #007acc); background: var(--vscode-textBlockQuote-background, rgba(127,127,127,0.1)); border-radius: 6px; line-height: 1.5;">',
+  "A device template applies these settings to servers synced from inventory. Three rules always hold: <strong>your own edits win</strong> — a template never changes a value you set by hand; <strong>clearing a template-applied value opts that server out</strong> — it won't be re-applied; <strong>changes apply on each source's next sync</strong>, not immediately.",
+  "</div>"
+].join("");
+
+/** The companion mode select for one templatable field. Always visible; its
+ *  value gates the field's controls below through `visibleWhen`. */
+function templateModeSelect(field: TemplatableFormField, seededMode: string): FormFieldDescriptor {
+  return {
+    type: "select",
+    key: deviceTemplateModeKey(field),
+    label: `${field === "authProfileId" ? "Auth Profile" : field === "proxy" ? "Proxy" : field === "multiplexing" ? "Connection multiplexing" : field === "legacyAlgorithms" ? "Legacy SSH algorithms" : "Session Logging"} — Template mode`,
+    options: TEMPLATE_MODE_OPTIONS,
+    value: seededMode,
+    hint: field === "authProfileId" ? TEMPLATE_AUTH_MODE_HINT : TEMPLATE_MODE_SHARED_HINT
+  };
+}
+
+/** The row-7 pre-emption line (UX-M2), shown only when this field's mode is
+ *  `override`. VERBATIM copy. */
+function templateOverridePreemption(field: TemplatableFormField): FormFieldDescriptor {
+  return {
+    type: "html",
+    content: `<div style="padding: 8px 12px; opacity: 0.85; line-height: 1.5;">${TEMPLATE_OVERRIDE_PREEMPTION}</div>`,
+    visibleWhen: { field: deviceTemplateModeKey(field), value: "override" }
+  };
+}
+
+/** `visibleWhen` for a field's value control(s): visible when its mode is fill or override. */
+function templateValueVisibleWhen(field: TemplatableFormField): VisibleWhen {
+  return { field: deviceTemplateModeKey(field), value: ["fill", "override"] };
+}
+
+export function deviceTemplateFormDefinition(
+  seed?: DeviceTemplateProfile,
+  servers?: ServerListEntry[],
+  authProfiles?: AuthProfile[]
+): FormDefinition {
+  const isEdit = Boolean(seed?.id);
+  const modeOf = (field: TemplatableFormField): string => seed?.fields[field]?.mode ?? "none";
+
+  const proxyVw = templateValueVisibleWhen("proxy");
+  const authVw = templateValueVisibleWhen("authProfileId");
+  const mpxVw = templateValueVisibleWhen("multiplexing");
+  const legacyVw = templateValueVisibleWhen("legacyAlgorithms");
+  const logVw = templateValueVisibleWhen("logSession");
+
+  return {
+    title: isEdit ? "Edit Device Template" : "New Device Template",
+    // The whole editor is main content — nothing lives behind the Advanced
+    // chevron (the proxy controls pass `advanced: false`, m13).
+    fields: [
+      { type: "html", content: TEMPLATE_EDITOR_INTRO_HTML },
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "Branch-office defaults", value: seed?.name },
+
+      // Proxy
+      templateModeSelect("proxy", modeOf("proxy")),
+      // Fix C (PR #62 Codex round 2) — `includePasswords: false`: §5.3 templates
+      // carry no proxy SECRETS, and `parseDeviceTemplateFormValues` discards them,
+      // so the password inputs are omitted (a per-server hint replaces them).
+      ...proxyFields({ proxy: seed?.fields.proxy?.value }, servers, proxyVw, false, false),
+      templateOverridePreemption("proxy"),
+
+      // Auth Profile — autofill OFF (no server SSH form to mirror into, m13).
+      templateModeSelect("authProfileId", modeOf("authProfileId")),
+      authProfileSelectField(authProfiles, authVw, seed?.fields.authProfileId?.value, {
+        advanced: false,
+        autofill: false,
+        // P2 — no inline-create handler is wired for this select, so drop the
+        // "Create new auth profile…" option rather than let it silently vanish
+        // the field on submit.
+        suppressCreate: true,
+        // P8 (UX polish 5) — rung-3 cascade vocabulary leak: nothing in T1b
+        // "matches" (catch-all only), so name what actually happens.
+        hint: "The saved SSH credentials this template links onto the servers it applies to."
+      }),
+      templateOverridePreemption("authProfileId"),
+
+      // Connection multiplexing
+      templateModeSelect("multiplexing", modeOf("multiplexing")),
+      { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.fields.multiplexing?.value ?? true, visibleWhen: mpxVw },
+      templateOverridePreemption("multiplexing"),
+
+      // Legacy SSH algorithms
+      templateModeSelect("legacyAlgorithms", modeOf("legacyAlgorithms")),
+      { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.fields.legacyAlgorithms?.value ?? false, visibleWhen: legacyVw },
+      templateOverridePreemption("legacyAlgorithms"),
+
+      // Session transcript logging
+      templateModeSelect("logSession", modeOf("logSession")),
+      { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.fields.logSession?.value ?? true, visibleWhen: logVw },
+      templateOverridePreemption("logSession")
+    ]
+  };
+}
+
+// §7.3 (UX-S5) — VERBATIM hint appended to a field that is currently
+// template-applied on the server being edited.
+const TEMPLATE_APPLIED_FIELD_HINT =
+  "This value was applied by a device template. Changing it here makes your value permanent — future syncs and template edits will leave it alone.";
+
+/** The Edit Server form key each templatable field's control carries. */
+const TEMPLATE_FIELD_FORM_KEY: Record<Exclude<TemplatableField, "authProfileId">, string> = {
+  proxy: "proxyType",
+  multiplexing: "multiplexing",
+  legacyAlgorithms: "legacyAlgorithms",
+  logSession: "logSession"
+};
+
+/**
+ * §7.3 (UX-S5) — appends the template-applied hint to the control(s) of each
+ * field the server is CURRENTLY carrying a template value for (`cur === stamp`,
+ * derived by `templateAppliedFields`). No lock, no badge — template values are
+ * editable by design. A hand-edited or unset field is not in the set, so it is
+ * untouched. The hint is appended to whatever hint the field already had.
+ */
+function withTemplateAppliedHints(seed: Partial<ServerConfig> | undefined, fields: FormFieldDescriptor[]): FormFieldDescriptor[] {
+  if (!seed) {
+    return fields;
+  }
+  const applied = new Set(templateAppliedFields(seed));
+  if (applied.size === 0) {
+    return fields;
+  }
+  const appliedKeys = new Set<string>();
+  for (const field of applied) {
+    if (field !== "authProfileId") {
+      appliedKeys.add(TEMPLATE_FIELD_FORM_KEY[field]);
+    }
+  }
+  return fields.map((field) => {
+    if ("key" in field && appliedKeys.has(field.key)) {
+      const existingHint = "hint" in field && field.hint ? `${field.hint} ` : "";
+      return { ...field, hint: `${existingHint}${TEMPLATE_APPLIED_FIELD_HINT}` };
+    }
+    return field;
+  });
 }
 
 export function serverFormDefinition(
@@ -596,14 +820,14 @@ export function serverFormDefinition(
 
   return {
     title: isEdit ? "Edit SSH Server Profile" : "Add SSH Server Profile",
-    fields: [
+    fields: withTemplateAppliedHints(seed, [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
       authProfileSelectField(authProfiles, undefined, seed?.authProfileId, { displacedValues: ssh.displaced }),
       ...ssh.fields,
       ...proxyFields(seed, servers),
       openFileExplorerOnFirstConnectField(seed),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
-    ]
+    ])
   };
 }
 
@@ -916,6 +1140,119 @@ function inventoryConfigFieldDescriptor(
   };
 }
 
+/** The source form's "Create new device template…" sentinel (the established
+ *  `__create__` convention, §7.1). */
+export const DEVICE_TEMPLATE_CREATE_SENTINEL = "__create__deviceTemplate";
+
+// §7.2 rung-1 hint, VERBATIM (no cascade vocabulary).
+const DEVICE_TEMPLATE_SOURCE_HINT =
+  "Servers synced from this source also receive this device template's settings. Your own per-server edits always win.";
+
+/**
+ * §7.2 selectRepresentable guard — the single "Device Template" select can
+ * round-trip a rule set losslessly iff it is zero rules, or exactly one CATCH-ALL
+ * rule. Deliberately SYNTACTIC (not parse-based, §7.2): empty/whitespace filters
+ * canonicalize to catch-all first (`isCatchAllFilter` trims), so `filter: ""` is
+ * representable, but any rule carrying a real filter — even a bare `name=*` glob
+ * that PARSES to zero conditions — takes the read-only fallback. A filtered rule
+ * means the select was never rendered, so writing/clearing the catch-all can
+ * never touch it.
+ */
+export function deviceTemplateSelectRepresentable(rules: readonly TemplateRule[] | undefined): boolean {
+  const list = rules ?? [];
+  return list.length === 0 || (list.length === 1 && isCatchAllFilter(list[0].filter));
+}
+
+/**
+ * §7.2 — the source form's "Device Template" control: a single select over the
+ * one catch-all rule when the rule set is representable, else a read-only
+ * `type: "html"` fallback that submits NO template key (so Save cannot mutate
+ * `templateRules`, UX-M3). Fallback copy pluralized on the rule count, VERBATIM.
+ *
+ * NOTE (PR-T1b, U4): the fallback names "Edit Template Rules…", which is a PR-T2
+ * command that does not exist yet. So the sentence appends the engine's companion
+ * repair idiom — "(requires a newer version of Nexus)" — staying true in a T1b
+ * build (where there is no such menu item) and still correct in T2 (where the
+ * command lands). The string is doc-adopted (§7.2, kept in sync with the design
+ * doc) — no command is registered or pointed at here.
+ */
+function deviceTemplateSourceField(
+  deviceTemplates: DeviceTemplateProfile[] | undefined,
+  rules: readonly TemplateRule[] | undefined
+): FormFieldDescriptor {
+  const list = rules ?? [];
+  if (!deviceTemplateSelectRepresentable(list)) {
+    const content =
+      list.length === 1
+        ? "A filtered template rule is configured for this source. Manage it with <strong>Edit Template Rules…</strong> (requires a newer version of Nexus)."
+        : `${list.length} template rules are configured for this source. Manage them with <strong>Edit Template Rules…</strong> (requires a newer version of Nexus).`;
+    return {
+      type: "html",
+      content: `<div style="padding: 12px; border-left: 4px solid var(--vscode-inputValidation-infoBorder, #3794ff); background: var(--vscode-inputValidation-infoBackground, rgba(55,148,255,0.1)); border-radius: 6px; line-height: 1.5;">${content}</div>`
+    };
+  }
+  const catchAll = list.find((r) => isCatchAllFilter(r.filter));
+  // Sanitize a dangling reference to `(None)` the same way the auth-profile
+  // select does: a catch-all rule whose template no longer resolves would
+  // otherwise display "(None)" while submitting a dead id. `removeDeviceTemplate`
+  // and the backup import both sweep such rules, so this only ever bites a
+  // hand-mangled record.
+  const selectedTemplateId =
+    catchAll?.templateId !== undefined && (deviceTemplates ?? []).some((t) => t.id === catchAll.templateId)
+      ? catchAll.templateId
+      : "";
+  return {
+    type: "select",
+    key: "deviceTemplateId",
+    label: "Device Template",
+    // Grows with the template list — filterable, with (None)/create pinned, same
+    // as the auth-profile select.
+    filterable: true,
+    options: [
+      { label: "(None)", value: "" },
+      ...(deviceTemplates ?? []).map((t) => ({ label: t.name, value: t.id })),
+      { label: "Create new device template…", value: DEVICE_TEMPLATE_CREATE_SENTINEL }
+    ],
+    value: selectedTemplateId,
+    hint: DEVICE_TEMPLATE_SOURCE_HINT
+  };
+}
+
+/**
+ * §7.2 — resolve what `templateRules` should become from a submitted source
+ * form. When the "Device Template" select was rendered (rule set representable),
+ * the form submits a `deviceTemplateId` key and this returns the new list: `[]`
+ * for `(None)`, or exactly ONE catch-all rule (reusing the existing catch-all
+ * rule's id if there was one, so a no-op edit doesn't churn the id). When the
+ * read-only fallback was shown instead, NO key is submitted, so this returns
+ * `undefined` = "leave the existing rules untouched" — the guard that makes it
+ * impossible to widen or destroy a filtered rule the select could not represent
+ * (UX-M3). The `__create__` sentinel (never actually submitted as a value) and a
+ * not-currently-representable rule set both degrade to "leave unchanged". Pure
+ * (no `vscode`), so tests exercise it directly. */
+export function resolveSubmittedTemplateRules(
+  values: FormValues,
+  existingRules: readonly TemplateRule[] | undefined
+): TemplateRule[] | undefined {
+  if (!Object.prototype.hasOwnProperty.call(values, "deviceTemplateId")) {
+    return undefined; // the fallback was shown — never touch templateRules
+  }
+  const existing = existingRules ?? [];
+  // Defensive: never rewrite a rule set the select cannot faithfully represent.
+  if (!deviceTemplateSelectRepresentable(existing)) {
+    return undefined;
+  }
+  const chosen = typeof values.deviceTemplateId === "string" ? values.deviceTemplateId : "";
+  if (chosen === DEVICE_TEMPLATE_CREATE_SENTINEL) {
+    return undefined; // a stray sentinel is not a selection — leave rules as they are
+  }
+  if (chosen === "") {
+    return []; // (None) removes the catch-all rule
+  }
+  const existingCatchAll = existing.find((r) => isCatchAllFilter(r.filter));
+  return [{ id: existingCatchAll?.id ?? randomUUID(), templateId: chosen }];
+}
+
 /** UX §6, verbatim. Explains both halves of the select in one breath: what a
  *  linked profile does, and what `(None)` leaves in place. */
 const INVENTORY_SOURCE_AUTH_PROFILE_HINT =
@@ -940,7 +1277,8 @@ export function inventorySourceFormDefinition(
   provider: InventoryProvider,
   seed?: InventorySourceConfig,
   defaultUsernameSeed?: string,
-  authProfiles?: AuthProfile[]
+  authProfiles?: AuthProfile[],
+  deviceTemplates?: DeviceTemplateProfile[]
 ): FormDefinition {
   const isEdit = Boolean(seed);
   const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
@@ -1035,6 +1373,10 @@ export function inventorySourceFormDefinition(
         displacedValues: managed.displaced
       }),
       ...managed.fields,
+      // Device Template (PR-T1b, §7.2) — sibling to the Auth Profile select,
+      // reading/writing a single catch-all rule in `templateRules`, or a
+      // read-only fallback when the rule set is not select-representable.
+      deviceTemplateSourceField(deviceTemplates, seed?.templateRules),
       {
         type: "select",
         key: "prunePolicy",

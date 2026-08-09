@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
-import type { AuthProfile, HttpConnectProxy, ProxyConfig, ServerConfig, Socks5Proxy } from "../models/config";
+import type { AuthProfile, ProxyConfig, ServerConfig } from "../models/config";
 import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps } from "../models/config";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
@@ -31,12 +31,18 @@ import {
 import type { SecretVault } from "../services/ssh/contracts";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { configMutationLock } from "../services/configMutationLock";
-import { inventoryConfigFieldPrefixedKey, inventorySourceFormDefinition } from "../ui/formDefinitions";
+import {
+  clearStaleProxyPasswordSecretsBeforeApply,
+  restoreProxyPasswordSecrets
+} from "../services/inventory/proxySecretHygiene";
+import { inventoryConfigFieldPrefixedKey, inventorySourceFormDefinition, resolveSubmittedTemplateRules } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import type { TemplateRule } from "../models/inventory";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { mostCommonUsername } from "./configCommands";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
+import { createInlineDeviceTemplateCreation } from "./inlineDeviceTemplateCreation";
 
 /**
  * F1 — server runtime teardown, injected from extension.ts (mirrors the
@@ -166,196 +172,6 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
     await vault.delete(key);
   } catch (error) {
     console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
-  }
-}
-
-/**
- * FIX B (issue #48 PR-T1 / PR #61 Codex review rounds 9+10, SECURITY) — clear the
- * stale per-server `proxy-password-{id}` when an inventory update moves the
- * server's proxy identity AWAY from the authenticated SOCKS5/HTTP endpoint that
- * secret was entered for, BEFORE the apply publishes the new proxy.
- *
- * `ProxySshFactory` reads `proxy-password-{serverId}` by server id and sends it
- * to whatever proxy the record now names whenever that proxy carries a username.
- * A device template that repoints a server's proxy from one authenticated
- * socks5/http endpoint to a DIFFERENT one — or to an ssh/none proxy — leaves the
- * OLD password in the vault, so the factory would send the old proxy's password
- * to the NEW endpoint: a credential leak to the wrong host.
- *
- * ROUND 10 — WHY BEFORE THE APPLY, NOT AFTER. `nexus.server.connect` deliberately
- * does NOT take `configMutationLock` (out of scope to change — a much larger
- * refactor). Round 9 cleared the secret AFTER `applyInventorySyncPlan` had already
- * published the new proxy into the core map: a connect landing in the awaited
- * apply/save/cleanup window would read the NEW proxy config with the OLD
- * `proxy-password-{id}` still in the vault and send it to the new endpoint — the
- * exact leak, only now through a race instead of a persistent stale key. Because
- * connect can't be serialized against the apply, the ONLY way to close the window
- * is to delete the stale secret BEFORE the new proxy becomes reachable. Moving the
- * delete before publish shrinks the worst case from a credential leak to at most a
- * transient "old proxy can't authenticate until the next connect prompt" window —
- * the fail-SAFE direction.
- *
- * FAIL CLOSED ON DELETE, RESTORE ON APPLY FAILURE. The delete is security-critical,
- * so it must NOT be best-effort: if `vault.delete` throws we cannot secure the
- * proxy change, so we restore any secret already deleted in this pass and rethrow
- * to ABORT the whole sync (the new proxy is never published) — fail closed, not
- * open. Conversely, when the delete succeeds but `applyInventorySyncPlan` then
- * throws, the plan did NOT commit: the OLD proxy config is still live and still
- * needs its password, so the caller restores the captured values (best-effort).
- * Ordering is therefore: capture+delete → publish → restore-on-failure.
- *
- * §5.3 of the device-template design: templates never carry proxy SECRETS — a
- * template-set socks5/http proxy relies on the per-connect prompt — so clearing
- * the stale secret is exactly right: the new proxy prompts per-connect rather
- * than reusing a password meant for a different endpoint.
- *
- * STALE (must be cleared) iff EITHER `before.proxy` OR `after.proxy` is a
- * password-bearing (`socks5`|`http`) endpoint AND the two are NOT the SAME
- * authenticated endpoint (same `type`+`host`+`port`+`username` — the identity
- * the password was entered for). The SAME-endpoint case KEEPS the secret — it
- * still applies. An ssh proxy never carries a password, so ssh↔ssh (and any
- * neither-side-bearing update, e.g. undefined↔ssh) needs no handling; a change
- * FROM socks5/http TO ssh/none clears the stale secret.
- *
- * ROUND 11 — WHY THE `after`-SIDE TRIGGER, not just `before`. A non-password-bearing
- * `before.proxy` (undefined or ssh) does NOT prove no `proxy-password-{id}` secret
- * exists: `configCommands.ts` restores every exported proxy password for an imported
- * server id WITHOUT requiring that server to currently carry a socks5/http proxy, so
- * a legacy backup can leave an ORPHANED entry sitting under an undefined/ssh proxy.
- * If a template then assigns that server a NEW authenticated socks5/http endpoint, a
- * `before`-only rule would early-return (before isn't password-bearing) and SKIP the
- * clear — sending the orphaned password to the new proxy. Triggering on EITHER side
- * closes that leak. It is a strict SUPERSET of the round-9 rule (every case it
- * cleared, this clears), and because the capture step reads the vault value first,
- * an update that newly matches but has no stored secret captures nothing and deletes
- * nothing — broadening the trigger costs nothing where there is no orphan.
- *
- * ROUND 12 — ALSO covers the plan's ADDS, not just its updates. A delete-pruned
- * device whose best-effort `proxy-password-{id}` delete FAILED can reappear as an
- * ADD under the same reused deterministic id; treating an add's `before` as "no
- * proxy" (undefined) makes the EITHER-side rule fire exactly when the add's proxy
- * is a password-bearing socks5/http endpoint, clearing the orphan before the add
- * is published. See the inline note on the helper for the reuse mechanism.
- *
- * Centralized so EVERY inventory apply site shares one rule (invoked before BOTH
- * the fast-path recompute apply AND the in-lock confirmed apply, passing BOTH the
- * plan's updates and its adds). Deliberately NOT
- * the server-form `syncProxyPasswordSecret` path — that governs hand-edited
- * proxies and bypasses this apply flow entirely.
- *
- * Returns the `{key,value}` pairs it captured+deleted so the caller can restore
- * them if the subsequent apply throws. On any delete error it restores what it
- * already deleted in this pass (capture-delete atomicity — a mid-loop failure
- * must not strip a password with no publish and no restore) and rethrows.
- */
-/**
- * A `proxy-password-{id}` secret only ever belongs to a `socks5`/`http` proxy —
- * the only kinds `ProxySshFactory` sends it to (an ssh jump proxy carries no
- * password). Narrows to that authenticated shape so both sides of an update can
- * be compared by identity below.
- */
-function isPasswordBearingProxy(proxy: ProxyConfig | undefined): proxy is Socks5Proxy | HttpConnectProxy {
-  return proxy !== undefined && (proxy.type === "socks5" || proxy.type === "http");
-}
-
-/**
- * Whether `before` and `after` are the SAME authenticated (socks5/http) endpoint —
- * same `type`+`host`+`port`+`username`, the identity the stored password was
- * entered for. This is the ONE case a proxy update KEEPS the secret: it still
- * applies. Both sides must be password-bearing to be "the same endpoint"; an
- * ssh/none on either side is never equal to a socks5/http one.
- */
-function isSameAuthenticatedEndpoint(before: ProxyConfig | undefined, after: ProxyConfig | undefined): boolean {
-  return (
-    isPasswordBearingProxy(before) &&
-    isPasswordBearingProxy(after) &&
-    before.type === after.type &&
-    before.host === after.host &&
-    before.port === after.port &&
-    before.username === after.username
-  );
-}
-
-async function clearStaleProxyPasswordSecretsBeforeApply(
-  vault: SecretVault,
-  updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>,
-  adds: ReadonlyArray<ServerConfig> = []
-): Promise<Array<{ key: string; value: string }>> {
-  // ROUND 12 — ADDS are scanned too, not just updates. Deterministic server ids
-  // are REUSED, and the delete-prune path clears `proxy-password-{id}` only
-  // best-effort — so a device delete-pruned with a FAILED secret delete can
-  // reappear as an ADD under the same id with the orphaned password still in the
-  // vault. A template can add it with a NEW authenticated socks5/http endpoint,
-  // and the first connect would send the orphan there. An add has no prior
-  // proxy, so its `before` is "no proxy" (undefined): the round-11 EITHER-side
-  // rule then fires exactly when the add's proxy is password-bearing. A fresh
-  // sync-added server never legitimately stores a proxy password (templates
-  // prompt per-connect, §5.3), so any secret under its id is an orphan — clearing
-  // it is correct.
-  const entries: Array<{ id: string; beforeProxy: ProxyConfig | undefined; afterProxy: ProxyConfig | undefined }> = [];
-  for (const { before, after } of updates) {
-    // before.id === after.id (same record through an update); use after.id.
-    entries.push({ id: after.id, beforeProxy: before.proxy, afterProxy: after.proxy });
-  }
-  for (const add of adds) {
-    entries.push({ id: add.id, beforeProxy: undefined, afterProxy: add.proxy });
-  }
-  const captured: Array<{ key: string; value: string }> = [];
-  for (const { id, beforeProxy: bp, afterProxy: ap } of entries) {
-    // ROUND 11 — trigger on EITHER side being a password-bearing endpoint. A
-    // non-password-bearing `before.proxy` does NOT prove no secret exists (an
-    // orphaned legacy-backup entry can sit under an undefined/ssh proxy, and an
-    // add's `before` is always undefined), so an `after`-side authenticated
-    // endpoint must trigger the clear too — see the function doc for why.
-    if (!isPasswordBearingProxy(bp) && !isPasswordBearingProxy(ap)) {
-      continue; // neither side carries a proxy password — nothing to leak (ssh proxies never send one)
-    }
-    if (isSameAuthenticatedEndpoint(bp, ap)) {
-      continue; // still the same authenticated endpoint — the stored password still applies
-    }
-    const key = proxyPasswordSecretKey(id);
-    let existing: string | undefined;
-    try {
-      existing = await vault.get(key);
-    } catch (error) {
-      // Cannot even read the secret — restore what we've deleted so far, abort.
-      await restoreProxyPasswordSecrets(vault, captured);
-      throw error;
-    }
-    // Capture BEFORE the delete so an aborting delete restores this key too (the
-    // delete may have partially applied; restoring the old value is fail-safe).
-    if (existing !== undefined) {
-      captured.push({ key, value: existing });
-    }
-    try {
-      await vault.delete(key);
-    } catch (error) {
-      // FAIL CLOSED — a proxy change we cannot secure must not be published.
-      await restoreProxyPasswordSecrets(vault, captured);
-      throw error;
-    }
-  }
-  return captured;
-}
-
-/**
- * ROUND 10 — put back the proxy-password secrets captured by
- * `clearStaleProxyPasswordSecretsBeforeApply` when the apply they preceded did
- * NOT commit (or a mid-pass delete aborted). The old proxy config is still live
- * and still needs its password, so restoring is the fail-safe recovery. Best
- * effort per key: a failed restore here costs at most a re-prompt on the next
- * connect, and must not mask the original failure that triggered the restore.
- */
-async function restoreProxyPasswordSecrets(
-  vault: SecretVault,
-  captured: ReadonlyArray<{ key: string; value: string }>
-): Promise<void> {
-  for (const { key, value } of captured) {
-    try {
-      await vault.store(key, value);
-    } catch (error) {
-      console.warn(`[Nexus] Failed to restore proxy password secret "${key}":`, error);
-    }
   }
 }
 
@@ -736,6 +552,7 @@ async function parseSourceFormValues(
   return { name, targetFolder, authProfileId, defaultUsername, prunePolicy, config, secrets };
 }
 
+
 /**
  * REVIEW FINDING (P2) — shared by both persist helpers below, which re-resolve
  * the form's selected auth profile against LIVE core state immediately before
@@ -958,6 +775,44 @@ function inventoryAuthProfileRejection(
 }
 
 /**
+ * MECHANISM 2 (P2 #3, PR #62 Codex round 1) — the template-side twin of
+ * `inventoryAuthProfileRejection`: re-resolve a SUBMITTED catch-all rule's
+ * `templateId` against LIVE core inside the persistence critical section, and
+ * refuse a selection that vanished while the source form sat open.
+ *
+ * WHY THE DELETION SWEEP DOES NOT COVER THIS. `removeDeviceTemplate` clears
+ * referencing rules from sources that ALREADY persist them (and re-revisions
+ * those sources, which trips the ITEM 4 `sourceConfigUnchanged` guard on an
+ * open Edit form). But a rule this Save is about to write for the FIRST time —
+ * an Add, or an Edit that newly points the catch-all rule at a template — is
+ * not yet in any persisted source, so the sweep cannot reach it. Absent this
+ * check the dangling `templateId` is persisted and then silently skipped by the
+ * sync engine (PR-T1 resolves rules against live templates and drops a missing
+ * one), leaving a source that references nothing with no visible reason.
+ *
+ * `undefined` rules (the read-only fallback was shown, or nothing was
+ * submitted) name nothing NEW to validate — the source keeps its existing
+ * rules untouched (UX-M3), which were valid when written and are swept on
+ * deletion — so this returns `undefined`. Returns a MISSING-style message that
+ * does NOT quote a name, mirroring `MISSING_AUTH_PROFILE_MESSAGE`: the template
+ * is gone, so there is no name left to quote.
+ */
+const MISSING_DEVICE_TEMPLATE_MESSAGE =
+  "The selected device template no longer exists — it was deleted while the form was open. Reopen the source and choose a device template, or set it to (None).";
+
+function submittedTemplateRuleRejection(core: NexusCore, templateRules: readonly TemplateRule[] | undefined): string | undefined {
+  if (templateRules === undefined) {
+    return undefined;
+  }
+  for (const rule of templateRules) {
+    if (core.getDeviceTemplate(rule.templateId) === undefined) {
+      return MISSING_DEVICE_TEMPLATE_MESSAGE;
+    }
+  }
+  return undefined;
+}
+
+/**
  * REVIEW FINDING (P2) — the fallback username a source records. Called by both
  * persist helpers with the profile they just re-resolved (above), i.e. at the
  * exact moment the record is written.
@@ -1079,6 +934,9 @@ export interface NewInventorySourceInput {
   provider: InventoryProvider;
   config: InventorySourceValues;
   secrets: InventorySourceSecrets;
+  /** DEVICE TEMPLATES (PR-T1b) — the catch-all rule (or `[]`) the Device
+   *  Template select resolved to, or `undefined` to store no rules. */
+  templateRules?: TemplateRule[];
 }
 
 /**
@@ -1099,7 +957,7 @@ async function persistNewInventorySource(
   vault: SecretVault,
   input: NewInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, secrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, secrets, templateRules } = input;
   const id = randomUUID();
   const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
 
@@ -1176,6 +1034,23 @@ async function persistNewInventorySource(
       throw new Error(authProfileRejection);
     }
 
+    // MECHANISM 2 (P2 #3) — reject a catch-all rule naming a template deleted
+    // while this Add form was open, in the SAME critical section (no `await`
+    // before the persist below). Best-effort rollback of this run's vault
+    // writes, exactly as the auth-profile rejection above: the source is not
+    // created on this path either, so nothing would ever enumerate these keys.
+    const templateRuleRejection = submittedTemplateRuleRejection(core, templateRules);
+    if (templateRuleRejection !== undefined) {
+      for (const fieldId of secretFieldIds) {
+        try {
+          await vault.delete(inventorySecretKey(id, fieldId));
+        } catch {
+          // best-effort rollback — ignore
+        }
+      }
+      throw new Error(templateRuleRejection);
+    }
+
     // ITEM A — stamp the provider's fingerprint at creation time: the user
     // is knowingly configuring against WHICHEVER registrant currently holds
     // `provider.id` right now, so that registrant's observable shape is the
@@ -1199,7 +1074,10 @@ async function persistNewInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider)
+      providerFingerprint: computeProviderFingerprint(provider),
+      // DEVICE TEMPLATES (PR-T1b) — a representable select resolved to `[]` or one
+      // catch-all rule; `undefined` (fallback shown / never touched) stores none.
+      ...(templateRules !== undefined ? { templateRules } : {})
     };
 
     // FINDING 1 — if persisting the new source record fails, the vault keys
@@ -1237,6 +1115,10 @@ export interface UpdatedInventorySourceInput {
   config: InventorySourceValues;
   /** Only fields the user actually re-typed this run — a blank/kept field is omitted. */
   reenteredSecrets: InventorySourceSecrets;
+  /** DEVICE TEMPLATES (PR-T1b) — the catch-all rule (or `[]`) the Device
+   *  Template select resolved to, or `undefined` to KEEP the source's existing
+   *  `templateRules` (fallback shown / non-representable). */
+  templateRules?: TemplateRule[];
 }
 
 /**
@@ -1257,7 +1139,7 @@ async function persistUpdatedInventorySource(
   source: InventorySourceConfig,
   input: UpdatedInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, reenteredSecrets } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, reenteredSecrets, templateRules } = input;
   const existingSecretFieldIds = new Set(source.secretFieldIds);
 
   return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
@@ -1346,6 +1228,20 @@ async function persistUpdatedInventorySource(
       throw new Error(authProfileRejection);
     }
 
+    // MECHANISM 2 (P2 #3) — reject a submitted catch-all rule whose template was
+    // deleted while this Edit form was open, in the SAME critical section (no
+    // `await` before the persist below). `templateRules` is `undefined` when the
+    // fallback was shown / rules were left untouched, in which case nothing NEW
+    // is referenced and this is a no-op; a source that already referenced the
+    // now-deleted template instead tripped the ITEM 4 guard above (the deletion
+    // sweep re-revisioned it), so this fires only for a rule newly pointed at a
+    // vanished template.
+    const templateRuleRejection = submittedTemplateRuleRejection(core, templateRules);
+    if (templateRuleRejection !== undefined) {
+      await rollbackThisRunsVaultWrites();
+      throw new Error(templateRuleRejection);
+    }
+
     // ITEM A — restamp on every save: the user has the form open against
     // `provider` (whichever registrant currently answers `source.providerId`)
     // and is knowingly interacting with it, exactly like at creation time.
@@ -1371,7 +1267,13 @@ async function persistUpdatedInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds: newSecretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider)
+      providerFingerprint: computeProviderFingerprint(provider),
+      // DEVICE TEMPLATES (PR-T1b) — a representable select supplies the new rule
+      // list; `undefined` (fallback shown / non-representable) keeps the source's
+      // existing rules, which `...source` above already carried forward. Assigned
+      // explicitly so a representable `[]` (cleared) overwrites, exactly as
+      // `authProfileId` is written unconditionally above.
+      templateRules: templateRules ?? source.templateRules
     };
 
     // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
@@ -2209,6 +2111,50 @@ function resolveAuthProfilesById(core: NexusCore): Map<string, AuthProfile> {
   return new Map(core.getSnapshot().authProfiles.map((p) => [p.id, p] as const));
 }
 
+/**
+ * MECHANISM 1 (P1 #2, PR #62 Codex round 1) — a snapshot of the `revision` of
+ * exactly the device templates a source's rules reference, keyed by templateId.
+ * A vanished template maps to `undefined`, which is itself a change worth
+ * catching. Captured at plan-preview time and re-read under the apply lock (see
+ * the two call sites in `syncNow`).
+ *
+ * WHY REVISION AND NOT THE RENDERED PLAN. The confirm modal's drift comparator
+ * (`planDetailDrift`) works off `describePlanDetail`, which renders COUNTS and
+ * identity/auth-switch sets — never the field VALUES a template supplies. A
+ * template edited between preview and confirm to new values that keep the plan's
+ * shape (an override proxy host A→B, a boolean flip) alters the fleet settings
+ * the confirmed plan would write while leaving every rendered line byte-for-byte
+ * identical, so the drift guard waves it through and the apply commits values
+ * the user never previewed. `addOrUpdateDeviceTemplate` mints a fresh `revision`
+ * on every write, so comparing it is the one signal that catches exactly that
+ * value-only edit. Fixed on THIS (sync) side rather than by serializing the
+ * independent template-save command — a source with no template rules snapshots
+ * nothing and behaves exactly as before.
+ */
+function referencedTemplateRevisions(core: NexusCore, source: InventorySourceConfig): Map<string, string | undefined> {
+  const revisions = new Map<string, string | undefined>();
+  for (const rule of source.templateRules ?? []) {
+    revisions.set(rule.templateId, core.getDeviceTemplate(rule.templateId)?.revision);
+  }
+  return revisions;
+}
+
+/** True if any referenced template's revision changed (or the template vanished)
+ *  between the preview snapshot and the in-lock re-read. Both maps are built from
+ *  the same rule set — `sourceConfigUnchanged` has already proven the rules did
+ *  not change — so a per-key comparison is exhaustive. */
+function referencedTemplatesChanged(shown: Map<string, string | undefined>, current: Map<string, string | undefined>): boolean {
+  if (shown.size !== current.size) {
+    return true;
+  }
+  for (const [templateId, revision] of shown) {
+    if (!current.has(templateId) || current.get(templateId) !== revision) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
@@ -2304,13 +2250,17 @@ export function registerInventoryCommands(
       provider,
       undefined,
       mostCommonUsername(snapshot.servers),
-      snapshot.authProfiles
+      snapshot.authProfiles,
+      snapshot.deviceTemplates
     );
     // Same controller/handler triple the server edit form uses
     // (serverCommands.ts) — the only difference is onAutofill's payload: this
     // form mirrors the profile's username into `defaultUsername`, not into
     // `username`/`authType`/`keyPath` (fields it doesn't have).
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    // DEVICE TEMPLATES (PR-T1b) — the source form's "Create new device template…"
+    // affordance, routed to whichever `onCreateInline` key fired.
+    const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
     // REVIEW FINDING (P2) — the profile whose username this form is currently
     // showing, checked against live state at Save by
     // `inventoryAuthProfileRejection`. Seeded as `undefined` and NOT from any
@@ -2332,7 +2282,10 @@ export function registerInventoryCommands(
           prunePolicy: parsed.prunePolicy,
           provider,
           config: parsed.config,
-          secrets: parsed.secrets
+          secrets: parsed.secrets,
+          // No existing rules on an Add — a representable submit either stores
+          // one catch-all rule or none.
+          templateRules: resolveSubmittedTemplateRules(values, undefined)
         });
 
         // F1 — onSubmit resolves as soon as persistence succeeds. The follow-up
@@ -2351,7 +2304,10 @@ export function registerInventoryCommands(
         })();
       },
       onTest: (values) => handleFormTest(values, provider, provider.label),
-      onCreateInline: inlineAuthProfile.handleCreateInline,
+      onCreateInline: (key) => {
+        inlineAuthProfile.handleCreateInline(key);
+        inlineDeviceTemplate.handleCreateInline(key);
+      },
       onAutofill: async (_key, value) => {
         // ONE lookup feeds both: what the form is about to show, and what Save
         // checks that against.
@@ -2361,6 +2317,7 @@ export function registerInventoryCommands(
       }
     });
     inlineAuthProfile.attachPanel(panel);
+    inlineDeviceTemplate.attachPanel(panel);
   }
 
   // `sourceIdArg` mirrors syncNow's: the manage hub (and any future caller
@@ -2491,7 +2448,8 @@ export function registerInventoryCommands(
     // seeded `source.authProfileId` survives sanitization, so a stale list
     // would render a real link as `(None)` and quietly drop it on Save.
     const authProfiles = core.getSnapshot().authProfiles;
-    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles);
+    const deviceTemplates = core.getSnapshot().deviceTemplates;
+    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles, deviceTemplates);
     // REVIEW FINDING (P2) — as addSource's, but seeded: this form opens already
     // showing the LINKED profile's username in Default SSH Username, locked
     // (`inventorySourceFormDefinition`'s render rule), so on Edit "rendered"
@@ -2509,6 +2467,7 @@ export function registerInventoryCommands(
     // record, so nothing this controller does can race the edit it is nested
     // in. The marker machinery below is untouched by this wiring.
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
     try {
       // F6 — WebviewFormPanel.open can throw synchronously (or reject — see
@@ -2543,7 +2502,11 @@ export function registerInventoryCommands(
               prunePolicy: parsed.prunePolicy,
               provider,
               config: parsed.config,
-              reenteredSecrets: parsed.secrets
+              reenteredSecrets: parsed.secrets,
+              // Representable submit → new rule list; fallback shown → undefined
+              // keeps `source.templateRules` untouched (a filtered/multi-rule set
+              // the select never rendered), byte-for-byte (UX-M3).
+              templateRules: resolveSubmittedTemplateRules(values, source.templateRules)
             });
 
             const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
@@ -2602,7 +2565,10 @@ export function registerInventoryCommands(
           return submitPromise;
         },
         onTest: (values) => handleFormTest(values, provider, source.name, source),
-        onCreateInline: inlineAuthProfile.handleCreateInline,
+        onCreateInline: (key) => {
+          inlineAuthProfile.handleCreateInline(key);
+          inlineDeviceTemplate.handleCreateInline(key);
+        },
         onAutofill: async (_key, value) => {
           // ONE lookup feeds both — see addSource's copy.
           const profile = core.getAuthProfile(value);
@@ -2616,6 +2582,7 @@ export function registerInventoryCommands(
     }
     panel.onDidDispose(releaseInFlight);
     inlineAuthProfile.attachPanel(panel);
+    inlineDeviceTemplate.attachPanel(panel);
   }
 
   /** `sourceIdArg` as in editSource/syncNow — see editSource's note. */
@@ -3775,6 +3742,18 @@ export function registerInventoryCommands(
         // it — so consent is for those pairings, and the drift check below is
         // what keeps either half from being swapped out under it.
         const shownAdoptionPairs = adoptionPairKeys(plan);
+        // MECHANISM 1 (P1 #2) — captured beside the other consent artifacts, at
+        // the same preview this attempt will apply: the revisions of the device
+        // templates this source's rules fold values in from. `shownDetail` above
+        // renders the plan's SHAPE (counts, switch/adoption identities) and
+        // cannot see a template's field values, so a value-only template edit
+        // landing while this modal sits open is invisible to `planDetailDrift`;
+        // re-read under the lock and compared, this revision snapshot is what
+        // aborts such an edit before the confirmed plan writes unseen values.
+        // Re-captured every loop iteration (a legitimate drift-retry re-shows the
+        // modal with the new template values and re-bases this snapshot to match),
+        // so it never false-aborts a change the user has just re-consented to.
+        const shownTemplateRevisions = referencedTemplateRevisions(core, source);
         // The button is keyed on the BUFFER, not on plan.warnings: a retro-apply
         // sync usually carries no engine warnings at all, and without this the
         // one place that names the servers about to switch would be unreachable
@@ -3820,6 +3799,25 @@ export function registerInventoryCommands(
           if (!sourceConfigUnchanged(source, freshSource)) {
             void vscode.window.showErrorMessage(
               `Inventory source "${source.name}" configuration changed while syncing — run Sync Now again.`
+            );
+            return { kind: "abort" };
+          }
+
+          // MECHANISM 1 (P1 #2) — the template-side twin of the source-config
+          // guard just above. `sourceConfigUnchanged` proves the source RECORD
+          // (and thus its `templateRules`) is unchanged; this proves the foreign
+          // DEVICE TEMPLATES those rules fold values in from are unchanged too.
+          // A template edited to new values (proxy host A→B, a boolean flip)
+          // between the preview and this apply keeps the plan's rendered detail
+          // identical, so `planDetailDrift` below cannot see it — but the in-lock
+          // `computeSyncPlan` recompute resolves the LATEST template values and
+          // would write them. Because `sourceConfigUnchanged` has fixed the rule
+          // set, both snapshots reference the same templates. Abort (same idiom
+          // as the source-drift guard) so nothing the user never previewed is
+          // applied; a plain re-run reflects the new values in a fresh preview.
+          if (referencedTemplatesChanged(shownTemplateRevisions, referencedTemplateRevisions(core, freshSource))) {
+            void vscode.window.showErrorMessage(
+              `A device template applied by "${source.name}" changed while the sync preview was open — nothing was applied, run Sync Now again.`
             );
             return { kind: "abort" };
           }
@@ -3996,6 +3994,29 @@ export function registerInventoryCommands(
           // answer given governs this plan, so this plan is checked against it.
           if (adoptionAnswerIsStale(finalPlan)) {
             reportStaleAdoptionAnswer();
+            return { kind: "abort" };
+          }
+          // MECHANISM 1 — TEMPLATE-REVISION TWIN OF GUARD SITE 3. The check at
+          // ~3818 is a cheap early-out that spares the teardown work in the
+          // common case, but it runs BEFORE the awaited teardown loop and the
+          // FINDING D vault re-read — and device-template saves do NOT take
+          // `configMutationLock`, so a value-only template edit (proxy host
+          // A→B, a boolean flip) can land in exactly that window, after the
+          // early check passed. `finalPlan` above resolves the LATEST template
+          // values via `resolveTemplatesById(core)` and would write them, while
+          // `finalDrift`/`adoptionAnswerIsStale` compare only counts and
+          // identities and never see the value. This is the same await window
+          // GUARD SITE 3 guards the adoption answer against — so re-run the
+          // revision guard here too, as the LAST thing before
+          // applyInventorySyncPlan. The comparand stays the PREVIEW-TIME
+          // `shownTemplateRevisions` baseline (never a re-snapshot from the
+          // ~3818 check): mirroring how `adoptionAnswerIsStale` compares against
+          // the originally-collected answer, an edit that lands between the two
+          // in-lock checks would otherwise be laundered by re-basing here.
+          if (referencedTemplatesChanged(shownTemplateRevisions, referencedTemplateRevisions(core, freshSource))) {
+            void vscode.window.showErrorMessage(
+              `A device template applied by "${source.name}" changed while the sync preview was open — nothing was applied, run Sync Now again.`
+            );
             return { kind: "abort" };
           }
           const finalApplication = planToApplication(finalPlan, freshSource);

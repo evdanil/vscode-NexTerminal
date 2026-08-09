@@ -870,6 +870,347 @@ describe("ProxySshFactory", () => {
     expect(socket.pause).toHaveBeenCalled();
   });
 
+  // Fix A (issue #48 PR-T1b / PR #62 Codex round 6) — the per-connect proxy-password
+  // prompt §5.3 assumed but was never built. Before the fix, a username-bearing
+  // socks5/http proxy with no stored secret sent an empty password (`?? ""`), so a
+  // template-applied authenticated proxy failed to connect. These falsify that gap.
+  function makeSimpleSocks5Socket() {
+    const socket: any = {
+      pause: vi.fn(),
+      on: vi.fn(() => socket),
+      removeListener: vi.fn(() => socket)
+    };
+    return socket;
+  }
+
+  async function createFactoryWithPrompt(
+    prompt: (server: ServerConfig, proxy: any) => Promise<{ password: string; save: boolean } | undefined>
+  ) {
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    return new ProxySshFactory(
+      authFactory,
+      (id: string) => servers.get(id),
+      vault,
+      60_000,
+      prompt
+    );
+  }
+
+  it("Fix A — SOCKS5 authenticated proxy with no stored secret prompts, connects with the entered password, and stores it", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    // Round 8: the deferred store now re-reads the live server and stores ONLY if it
+    // still names the same authenticated endpoint. Register the server so the lookup
+    // returns the SAME proxy this connect used — the happy path where the store fires.
+    servers.set(server.id, server);
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "pw" })
+      })
+    );
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("Fix A — HTTP CONNECT authenticated proxy with no stored secret prompts, uses the entered password, and stores it", async () => {
+    const server = makeServer({ proxy: { type: "http", host: "proxy.local", port: 3128, username: "puser" } });
+    // Round 8: register the server so the deferred store's endpoint re-check matches.
+    servers.set(server.id, server);
+    const socket = createMockHttpSocket();
+    await mockNetCreateConnectionWithSocket(socket);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    const promise = factory.connect(server);
+    await waitForSocketWrite(socket);
+    socket.emitData("HTTP/1.1 200 Connection Established\r\n\r\n");
+    await promise;
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    const request = String(socket.write.mock.calls[0][0]);
+    const headerMatch = request.match(/Proxy-Authorization: Basic ([^\r\n]+)/);
+    expect(headerMatch).toBeTruthy();
+    const decoded = Buffer.from(headerMatch![1], "base64").toString("utf8");
+    expect(decoded).toBe("puser:pw");
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("Fix A — a cancelled prompt (undefined) falls back to the empty password and stores nothing", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => undefined);
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "" })
+      })
+    );
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix A — no prompt dependency injected keeps today's empty-password behavior (backward-compatible)", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const factory = await createFactory(); // no prompt arg
+    await factory.connect(server);
+
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "" })
+      })
+    );
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix A — an already-stored secret is used without prompting", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    vault = createVault({ "proxy-password-srv-target": "stored-pw" });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "stored-pw" })
+      })
+    );
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix A — a proxy without a username never prompts", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080 } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  // Fix B (issue #48 PR-T1b / PR #62 Codex round 7) — the round-6 prompt stored the
+  // prompted password BEFORE the handshake, so a mistyped first-time password was
+  // persisted and every later connect took the `stored !== undefined` early-return
+  // → the proxy was locked out. The store is now deferred to AFTER
+  // `authFactory.connect` resolves, best-effort (a keychain-store failure never
+  // aborts a live connection). These falsify that regression.
+  it("Fix B — a wrong first-time password (connect rejects) is NOT stored, and the next connect re-prompts", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    // Round 8: register so the second (successful) connect's endpoint re-check matches and stores.
+    servers.set(server.id, server);
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    // First connect: proxy handshake runs but ssh auth rejects (mistyped password).
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      throw new Error("All configured authentication methods failed");
+    });
+
+    const prompt = vi.fn(async () => ({ password: "wrong", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    await expect(factory.connect(server)).rejects.toThrow("authentication methods failed");
+    expect(prompt).toHaveBeenCalledTimes(1);
+    // The bad password must NOT have been persisted before the handshake — otherwise
+    // the vault hit would suppress every later prompt and lock the proxy out.
+    expect(vault.store).not.toHaveBeenCalled();
+
+    // Second connect: the vault is still empty, so the prompt fires again (no lockout).
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return makeFakeConnection();
+    });
+    await factory.connect(server);
+    expect(prompt).toHaveBeenCalledTimes(2);
+    // This time the connect succeeded, so the (re-typed) password is stored after success.
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "wrong");
+  });
+
+  it("Fix B — a keychain-store failure after a successful connect is swallowed; the connection is still returned", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    // Round 8: register so the endpoint re-check matches and the (throwing) store is attempted.
+    servers.set(server.id, server);
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    // The post-connect store throws (locked keychain). It must not abort the live connection.
+    vault.store = vi.fn(async () => { throw new Error("keychain locked"); });
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    const connection = await factory.connect(server);
+    expect(connection).toBeInstanceOf(ProxiedSshConnection);
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("Fix B — a correct first-time password is stored exactly once after the connection succeeds, and the proxied connection is returned", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    // Round 8: register so the deferred store's endpoint re-check matches the connected proxy.
+    servers.set(server.id, server);
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    const connection = await factory.connect(server);
+
+    expect(connection).toBeInstanceOf(ProxiedSshConnection);
+    expect(vault.store).toHaveBeenCalledTimes(1);
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  // Fix C (issue #48 PR-T1b / PR #62 Codex round 8, SECURITY) — the round-7 deferred
+  // store uses a server-id-only key, so a concurrent connect that read the OLD server
+  // config can land its store AFTER a template apply cleared `proxy-password-{id}` and
+  // published a NEW proxy endpoint — repopulating the key with a credential for an
+  // endpoint the server no longer uses (the leak the pre-apply hygiene prevents,
+  // recreated on the store side). The store now re-reads the live server and persists
+  // ONLY IF it still names the SAME authenticated endpoint the connection used. These
+  // falsify that: without the re-check the endpoint-changed case stores unconditionally.
+  it("Fix C — endpoint changed under the store (live server now names a DIFFERENT authenticated proxy) does NOT store", async () => {
+    const connectedProxy = { type: "socks5" as const, host: "proxy.local", port: 1080, username: "puser" };
+    const server = makeServer({ proxy: connectedProxy });
+    // A concurrent template apply republished the server onto a DIFFERENT authenticated
+    // endpoint (new host) while this connect was mid-handshake with the old one.
+    servers.set(server.id, makeServer({
+      proxy: { type: "socks5", host: "new-proxy.local", port: 1080, username: "puser" }
+    }));
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    const connection = await factory.connect(server);
+
+    // The connect still succeeds — only the stale repopulation is suppressed.
+    expect(connection).toBeInstanceOf(ProxiedSshConnection);
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix C — endpoint unchanged (live server still names the same authenticated proxy) stores once", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(server.id, server);
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(vault.store).toHaveBeenCalledTimes(1);
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("Fix C — live server moved off an authenticated proxy (ssh) does NOT store", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set("srv-jump", makeServer({ id: "srv-jump", name: "Jump", host: "jump.example.com" }));
+    // Live server now uses an ssh jump proxy — no authenticated endpoint to hold the secret.
+    servers.set(server.id, makeServer({ proxy: { type: "ssh", jumpHostId: "srv-jump" } }));
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix C — live server has no proxy at store time does NOT store", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    // Live server was repointed to no proxy at all.
+    servers.set(server.id, makeServer({ proxy: undefined }));
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  // Fix D (issue #48 PR-T1b / PR #62 Codex round 9, SECURITY) — round 8's re-read
+  // closed the ordering hole but not the ATOMICITY hole: the sync serverLookup
+  // check and the async vault.store were two steps, not one critical section, so a
+  // template apply's clear+publish could land in the await window between them and
+  // the pending store would write the OLD credential back. The check+store now run
+  // inside configMutationLock.runExclusive — the SAME lock the template apply holds.
+  // This test holds that real singleton lock and asserts the store cannot run while
+  // it is held (falsifies 5273fbc, where the store took no lock → fired immediately).
+  it("Fix D — the endpoint re-check + store is serialized under configMutationLock (does not store while the lock is held; stores after release)", async () => {
+    const { configMutationLock } = await import("../../src/services/configMutationLock");
+
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(server.id, server); // endpoint unchanged → the store WOULD fire once the lock is free
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    // Hold the real singleton lock via a deferred runExclusive body, mimicking an
+    // in-flight template apply's clear+publish critical section.
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockDone = configMutationLock.runExclusive(() => lockHeld);
+
+    // Drive the connect. authFactory.connect resolves, the deferred store is reached,
+    // and it must queue behind the held lock rather than firing.
+    const connectPromise = factory.connect(server);
+
+    // Drain macrotasks (the sockFactory's setImmediate/resume gap) so the connect
+    // fully reaches the post-connect store. On 5273fbc the store runs here without
+    // taking any lock; with the fix it queues behind the held configMutationLock.
+    for (let i = 0; i < 10; i++) {
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    expect(vault.store).not.toHaveBeenCalled(); // FAILS on 5273fbc: store ran without the lock
+
+    // Release the apply's critical section; the store's runExclusive body now runs.
+    releaseLock();
+    await lockDone;
+    await connectPromise;
+
+    expect(vault.store).toHaveBeenCalledTimes(1);
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
   it("emits onClose when a SOCKS5 proxy socket closes after connection", async () => {
     const server = makeServer({
       proxy: { type: "socks5", host: "proxy.local", port: 1080 }

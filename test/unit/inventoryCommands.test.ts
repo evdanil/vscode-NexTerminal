@@ -7517,6 +7517,267 @@ describe("inventoryCommands", () => {
   // Every test below asserts the EXACT sentence at EVERY reporting site, for
   // each holder in turn: a substring/"some warning appeared" assertion cannot
   // tell the fixed code from the lie it replaced.
+  describe("PR #62 Codex round 1 — TOCTOU / stale-reference guards", () => {
+    // MECHANISM 2 (P2 #3) — source save with a device-template id deleted while
+    // the form was open. The deletion sweep (removeDeviceTemplate) only clears
+    // rules a source ALREADY persists, so a rule this save is writing for the
+    // first time slips through as a dangling id; re-resolving under the persist
+    // lock is what rejects it.
+    it("2a (add) — REJECTS a submitted catch-all rule whose template was deleted while the Add form was open; no dangling rule persisted", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Branch", fields: {} });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      // Deleted while the form sits open.
+      await core.removeDeviceTemplate("t1");
+      await expect(
+        onSubmit({
+          name: "My NetBox",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "secret-token",
+          deviceTemplateId: "t1"
+        })
+      ).rejects.toThrow(/device template no longer exists/i);
+      // Against b247d32 the source persists carrying templateRules:[{templateId:"t1"}]
+      // — a dangling rule the sync engine later skips. The fixed path persists
+      // nothing at all.
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+    });
+
+    it("2a (edit) — REJECTS a rule newly pointed at a template deleted mid-edit; the source keeps no dangling rule", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Branch", fields: {} });
+      // The source does NOT initially reference t1 — so removeDeviceTemplate's
+      // sweep never touches it (it would otherwise trip the ITEM 4 guard); the
+      // dangling reference is the one this edit is newly adding.
+      await core.addOrUpdateInventorySource(makeSource({ targetFolder: "Infra", config: { host: "netbox.local" }, secretFieldIds: ["apiToken"] }));
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      const { onSubmit } = latestFormCall();
+      await core.removeDeviceTemplate("t1"); // deleted while the Edit form is open
+      await expect(
+        onSubmit({
+          name: "My Source",
+          targetFolder: "Infra",
+          defaultUsername: "admin",
+          prunePolicy: "orphan",
+          cfg_host: "netbox.local",
+          cfg_apiToken: "",
+          deviceTemplateId: "t1"
+        })
+      ).rejects.toThrow(/device template no longer exists/i);
+      const persisted = core.getInventorySource("src-1")!;
+      // Against b247d32 the update persists a catch-all rule naming the vanished
+      // t1; the fixed path leaves the source with no such rule.
+      expect((persisted.templateRules ?? []).some((r) => r.templateId === "t1")).toBe(false);
+    });
+
+    it("2a sibling — a LIVE template id persists the catch-all rule normally (guard not over-firing)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Branch", fields: {} });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token",
+        deviceTemplateId: "t1"
+      });
+      const persisted = core.getSnapshot().inventorySources[0];
+      expect(persisted.templateRules).toEqual([expect.objectContaining({ templateId: "t1" })]);
+    });
+
+    // MECHANISM 1 (P1 #2) — a referenced template edited to new VALUES between the
+    // sync preview and the in-lock confirm. describePlanDetail renders only the
+    // plan's SHAPE (counts, switch/adoption identities), so a value-only template
+    // edit is invisible to planDetailDrift; the referenced-template revision
+    // snapshot is what aborts it.
+    function proxyAt(host: string) {
+      return { type: "socks5" as const, host, port: 1080 };
+    }
+    function renamedFetch(): InventoryProvider["fetchInventory"] {
+      // A device RENAME forces a non-empty update, so the plan reaches the preview
+      // modal (a pure proxy no-op would take the fast path and never preview).
+      return vi.fn(async () => ({
+        contractVersion: 1 as const,
+        devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+      }));
+    }
+    function ownedProxied(): ServerConfig {
+      return makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, templated: { proxy: proxyAt("10.9.9.1") } },
+        proxy: proxyAt("10.9.9.1") // template-applied baseline A
+      });
+    }
+
+    it("1b — a referenced template edited to new VALUES while the preview is open ABORTS the apply; nothing written", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository([ownedProxied()]));
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.1") } } });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: renamedFetch() }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      // While the preview modal is open, edit tmpl-1 IN PLACE to proxy B (host
+      // .2). Same field, same mode → describePlanDetail is byte-identical ("1
+      // server will be updated"), so planDetailDrift cannot see it.
+      mockShowInformationMessage.mockImplementationOnce(async () => {
+        await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.2") } } });
+        return "Apply";
+      });
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // NOTHING applied: the rename did not land and the proxy stays A. Against
+      // b247d32 the in-lock recompute silently writes proxy B (host .2) — the
+      // value the user never previewed.
+      expect(core.getServer("owned-1")?.name).toBe("old-sw");
+      expect(core.getServer("owned-1")?.proxy).toEqual(proxyAt("10.9.9.1"));
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the sync preview was open"));
+    });
+
+    it("1b sibling — an UNCHANGED referenced template applies as previewed (guard not over-firing)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository([ownedProxied()]));
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.1") } } });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: renamedFetch() }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply"); // no mid-preview edit
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The rename landed — the sync applied normally.
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw");
+    });
+
+    // MECHANISM 1 — TEMPLATE-REVISION TWIN OF GUARD SITE 3. The ~3818 early-out
+    // check runs BEFORE the awaited teardown loop / vault re-read; device-template
+    // saves do NOT take configMutationLock, so a value-only template edit can land
+    // in exactly that window, after the early check has already passed. This test
+    // drives the edit through the teardown callback (the same mid-await seam the
+    // ITEM 2 test uses) and asserts the FINAL-site recheck aborts before apply.
+    it("1b final-site — a referenced template edited to new VALUES DURING the teardown await window (after the early ~3818 check passed) ABORTS the apply at the final site; applyInventorySyncPlan is never called and nothing is written", async () => {
+      const updated = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, templated: { proxy: proxyAt("10.9.9.1") } },
+        proxy: proxyAt("10.9.9.1") // template-applied baseline A
+      });
+      const pruned = makeServer({
+        id: "owned-2",
+        name: "gone-sw",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([updated, pruned]));
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.1") } } });
+      const registry = new InventoryProviderRegistry();
+      // device:1 present + RENAMED -> update (reaches preview); device:2 absent -> prune "delete" -> teardown fires (the await window).
+      registry.register(makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+        }))
+      }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      // The seam: when the pruned server's runtime is torn down (an awaited hop
+      // AFTER the early ~3818 revision check has already passed), edit tmpl-1 IN
+      // PLACE to proxy B (host .2). Same field/mode → describePlanDetail stays
+      // byte-identical, so finalDrift cannot see it; only the final-site revision
+      // recheck can.
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          if (serverId === "owned-2") {
+            await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.2") } } });
+          }
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete", templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply"); // no mid-PREVIEW edit — the early check passes
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Aborted at the final site: applyInventorySyncPlan never ran, so NOTHING
+      // was written — the rename did not land and the proxy stays A. Against
+      // d0c8fa1 the final recompute folds in proxy B (host .2) and applies it,
+      // and the pruned server is deleted.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.name).toBe("old-sw");
+      expect(core.getServer("owned-1")?.proxy).toEqual(proxyAt("10.9.9.1"));
+      expect(core.getServer("owned-2")).toBeDefined();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the sync preview was open"));
+    });
+
+    it("1b final-site sibling — no template edit during the teardown window applies as previewed (final-site guard not over-firing)", async () => {
+      const updated = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, templated: { proxy: proxyAt("10.9.9.1") } },
+        proxy: proxyAt("10.9.9.1")
+      });
+      const pruned = makeServer({
+        id: "owned-2",
+        name: "gone-sw",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([updated, pruned]));
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.1") } } });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+        }))
+      }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown()); // teardown makes no edit
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete", templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The sync applied normally: the rename landed and the pruned server is gone.
+      expect(applySpy).toHaveBeenCalledTimes(1);
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw");
+      expect(core.getServer("owned-2")).toBeUndefined();
+    });
+  });
+
   describe("busy-marker refusals name the real holder", () => {
     async function setupBusyFixture(fetchInventory?: InventoryProvider["fetchInventory"]): Promise<{
       core: NexusCore;
