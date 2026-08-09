@@ -182,6 +182,40 @@ export interface ServerOrigin {
    * never-configured state the sync is free to fill.)
    */
   syncedIpmiHost?: string;
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T1) — per-field record of what the sync's
+   * TEMPLATE APPLICATION last wrote onto this server, one member per
+   * non-auth templatable field. Same `syncedUsername`/`syncedAuthProfileId`
+   * discipline: a key that is PRESENT means "the sync wrote this field, and
+   * this is exactly what it wrote"; a key that is ABSENT means "the sync never
+   * wrote this field". Templates never write `undefined` (no clear mode in v1),
+   * so absence is unambiguous — unlike `syncedAuthProfileId`, there is no
+   * unconditional-undefined recording here.
+   *
+   * BOOLEAN STAMPS ARE PRESENT-WHEN-FALSE (m12): `templated.multiplexing:
+   * false` is a PRESENT stamp carrying the value `false`. Every presence check
+   * on this record must be `!== undefined` / `in` / `hasOwnProperty`, NEVER
+   * truthiness — a truthiness check silently converts "sync wrote false" into
+   * "never wrote", flipping the write matrix's rows 3/6 into rows 1/7.
+   *
+   * A GROUPED MEMBER rather than flat `syncedProxy`/`syncedMultiplexing`/…
+   * siblings, deliberately: the update path's `afterOrigin` rebuild is the
+   * single most dangerous forget-point in the sync engine, and a grouped
+   * record is ONE carry-forward line, one `isValidServerOrigin` clause, one
+   * comparator term (templatedStampsEqual), one deep-copy site. Flat members
+   * multiply every one of those by field count.
+   *
+   * NOTE deliberately excluded: `authProfileId` — template-written links stamp
+   * the EXISTING `syncedAuthProfileId` member above, so opt-out,
+   * removeAuthProfile clearing, and the AUTH 2 clauses need no parallel twin.
+   */
+  templated?: {
+    proxy?: ProxyConfig;
+    multiplexing?: boolean;
+    legacyAlgorithms?: boolean;
+    logSession?: boolean;
+    // future: ipmiAuthProfileId?: string; ipmiGatewayServerId?: string;
+  };
 }
 
 /**
@@ -433,16 +467,36 @@ export interface ServerConfig {
  * (e.g. _renameFolderPath rewriting `server.group` on the very same object)
  * can change what the live map entry looks like out from under it.
  */
+/**
+ * DEVICE TEMPLATES (PR-T1) — deep-copies the nested `origin.templated` record,
+ * including its nested `ProxyConfig`. `{ ...origin }` copies `origin` one level
+ * deep, so it would still SHARE the `templated` object (and the proxy inside
+ * it) with the source — a mutation of the clone's `templated.proxy.jumpHostId`
+ * would then reach back into the original. `cloneServerConfig` /
+ * `mergeServerConfigFields` both capture structural snapshots that must survive
+ * later in-place mutation, so both go through this.
+ */
+export function cloneServerOrigin(origin: ServerOrigin): ServerOrigin {
+  const cloned: ServerOrigin = { ...origin };
+  if (origin.templated) {
+    cloned.templated = {
+      ...origin.templated,
+      proxy: origin.templated.proxy ? { ...origin.templated.proxy } : origin.templated.proxy
+    };
+  }
+  return cloned;
+}
+
 export function cloneServerConfig(server: ServerConfig): ServerConfig {
   return {
     ...server,
     proxy: server.proxy ? { ...server.proxy } : server.proxy,
-    origin: server.origin ? { ...server.origin } : server.origin,
+    origin: server.origin ? cloneServerOrigin(server.origin) : server.origin,
     formerlySynced: server.formerlySynced ? { ...server.formerlySynced } : server.formerlySynced
   };
 }
 
-function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
+export function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
   if (a === b) return true;
   if (!a || !b || a.type !== b.type) return false;
   switch (a.type) {
@@ -454,6 +508,30 @@ function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefine
       return a.host === other.host && a.port === other.port && a.username === other.username;
     }
   }
+}
+
+/**
+ * DEVICE TEMPLATES (PR-T1) — structural equality of two `origin.templated`
+ * stamp records. An ABSENT record and a PRESENT-but-empty `{}` compare equal:
+ * both carry no stamp for any field, which is exactly the same ownership
+ * information, so treating them apart would report spurious updates.
+ *
+ * Every field is compared with `===` (proxy via `proxyConfigsEqual`), which is
+ * what makes the PRESENT-when-false boolean rule work: `false === false` is
+ * equal, `false === undefined` is a DIFFERENCE. So a stamp that went from
+ * `false` to absent (a clear) reads as changed, and the two are never
+ * conflated the way a truthiness check would conflate them.
+ */
+export function templatedStampsEqual(a: ServerOrigin["templated"], b: ServerOrigin["templated"]): boolean {
+  if (a === b) return true;
+  const ap = a ?? {};
+  const bp = b ?? {};
+  return (
+    proxyConfigsEqual(ap.proxy, bp.proxy) &&
+    ap.multiplexing === bp.multiplexing &&
+    ap.legacyAlgorithms === bp.legacyAlgorithms &&
+    ap.logSession === bp.logSession
+  );
 }
 
 /**
@@ -495,7 +573,14 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // discarded as "unchanged" there would throw the new stamp away — leaving
     // that server permanently stampless, i.e. read as a hand entry by every
     // later sync and never updated when the BMC is re-addressed.
-    a.syncedIpmiHost === b.syncedIpmiHost
+    a.syncedIpmiHost === b.syncedIpmiHost &&
+    // DEVICE TEMPLATES (PR-T1) — the per-field template stamps join for the
+    // same reason: a template application whose value already equals the
+    // record must still land in `updates` to persist the stamp (AUTH 3a's
+    // stamp-only-change precedent), and the rollback merge in
+    // mergeServerConfigFields must be able to tell a fresh/cleared template
+    // stamp apart from the pre-batch one. Structural, PRESENT-when-false.
+    templatedStampsEqual(a.templated, b.templated)
   );
 }
 
@@ -647,7 +732,10 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
     merged.proxy = current.proxy ? { ...current.proxy } : current.proxy;
   }
   if (!serverOriginsEqual(current.origin, batchSnapshot.origin)) {
-    merged.origin = current.origin ? { ...current.origin } : current.origin;
+    // DEVICE TEMPLATES (PR-T1) — deep clone via `cloneServerOrigin`, not a
+    // one-level `{ ...current.origin }`: the nested `templated` record (and the
+    // `ProxyConfig` inside it) would otherwise be shared with `current`.
+    merged.origin = current.origin ? cloneServerOrigin(current.origin) : current.origin;
   }
   // ADOPT 1 — `formerlySynced` merges on exactly the same terms as `origin`
   // above, and needs to for the same reason: a concurrent Remove Source → Keep

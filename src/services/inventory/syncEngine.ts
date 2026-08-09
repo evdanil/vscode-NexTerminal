@@ -1,10 +1,21 @@
 import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin } from "../../models/config";
-import { authProfileNeedsServerKeyPath, serverOriginStampsEqual } from "../../models/config";
+import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../models/inventory";
+import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
 import { isAddressValue } from "../profileTokens";
 import { deterministicServerId } from "./deterministicId";
+import {
+  applyTemplateMatrix,
+  authFillEligible,
+  composeDesiredFields,
+  computeProfilesNeedingServerKey,
+  decideTemplateAuthWrite,
+  selectFieldWinners,
+  type DesiredNonAuthFields,
+  type ProfilesNeedingServerKey
+} from "./templateApply";
 
 export const ORPHAN_FOLDER_NAME = "_orphaned";
 
@@ -77,6 +88,26 @@ export interface ComputeSyncPlanInput {
    * the provider id — is the defect this input exists to remove.
    */
   providerInstanceKey?: string;
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T1) — every `DeviceTemplateProfile` this
+   * source's rules might reference, resolved by the caller (the engine is pure
+   * and has no core access, same as `authProfile`). Optional: a caller with no
+   * templates, or a source with no rules, passes none and the engine behaves
+   * bit-for-bit as before.
+   */
+  templatesById?: Map<string, DeviceTemplateProfile>;
+  /**
+   * DEVICE TEMPLATES (PR-T1) — the WHOLE auth-profile store (rev3), a superset
+   * of `authProfile` (which stays for the source-level slot). The unusable
+   * -profile scan can name a profile reachable only through a RETAINED link on
+   * an owned server (§4.4), and a profile missing from this map would read as
+   * "usable" by omission. The store is a handful of records; passing all of it
+   * is cheaper and safer than passing exactly enough. Optional for legacy
+   * callers — term (a) of the scan still names the source keyless profile from
+   * `authProfile`, so the shipped single-id behaviour is preserved when this is
+   * absent.
+   */
+  authProfilesById?: Map<string, AuthProfile>;
 }
 
 /**
@@ -441,15 +472,14 @@ function qualifiesForSourceProfileRetroApply(
   resolvedProfileId: string | undefined,
   defaultUsername: string
 ): boolean {
-  const stampedUsername = server.origin?.syncedUsername ?? defaultUsername;
-  return (
-    resolvedProfileId !== undefined &&
-    server.authProfileId === undefined &&
-    lastSyncAppliedProfileId(server) === undefined &&
-    server.authType === "agent" &&
-    !hasOwnKeyPath(server) &&
-    server.username === stampedUsername
-  );
+  // DEVICE TEMPLATES (PR-T1) — delegates to the shared `authFillEligible`
+  // predicate (services/inventory/templateApply.ts), so the six clauses exist in
+  // exactly ONE place and the sync path, the adoption path and the future manual
+  // folder-apply cannot drift apart. `authFillEligible` reproduces this
+  // function's own `lastSyncAppliedProfileId` fallback (origin stamp, else a kept
+  // server's preserved marker) and the `syncedUsername ?? defaultUsername`
+  // baseline exactly.
+  return authFillEligible(server, resolvedProfileId, defaultUsername);
 }
 
 /**
@@ -470,10 +500,16 @@ function qualifiesForSourceProfileRetroApply(
  * shared with retro-apply for exactly that reason (a server unlinked by one rule
  * and refused a re-link by another is unlinked forever).
  *
+ * DEVICE TEMPLATES (PR-T1 / A-M2) — the single `unusableProfileId` widened to a
+ * SET (`unusableProfileIds`), so a link applied by a RULE TEMPLATE or by a
+ * RETAINED link (whose rule is gone) is rolled back too, not only the
+ * source-level profile. Membership selects which servers are examined; the
+ * per-server `hasOwnKeyPath` split (`retain-own-key` vs `unlink`) is unchanged.
+ *
  * The clauses, and what each refuses to touch:
- *  - `unusableProfileId !== undefined`: only the keyless-key case. A DELETED
- *    profile never reaches here — NexusCore.removeAuthProfile already clears link
- *    and stamp together — and a healthy profile has nothing to undo.
+ *  - `unusableProfileIds.has(server.authProfileId)`: only the keyless-key case.
+ *    A DELETED profile never reaches here — NexusCore.removeAuthProfile already
+ *    clears link and stamp together — and a healthy profile is not in the set.
  *  - `authProfileId === id && origin.syncedAuthProfileId === id`: the link is
  *    THIS SYNC'S OWN, still exactly as it wrote it. A hand-set link carries no
  *    matching stamp and is not the sync's to clear (the same opt-out rule
@@ -493,12 +529,9 @@ function qualifiesForSourceProfileRetroApply(
  */
 type SourceAuthRollback = "unlink" | "retain-own-key" | "none";
 
-function decideSourceAuthRollback(server: ServerConfig, unusableProfileId: string | undefined): SourceAuthRollback {
-  if (
-    unusableProfileId === undefined ||
-    server.authProfileId !== unusableProfileId ||
-    server.origin?.syncedAuthProfileId !== unusableProfileId
-  ) {
+function decideSourceAuthRollback(server: ServerConfig, unusableProfileIds: ReadonlySet<string>): SourceAuthRollback {
+  const id = server.authProfileId;
+  if (id === undefined || !unusableProfileIds.has(id) || server.origin?.syncedAuthProfileId !== id) {
     return "none";
   }
   return hasOwnKeyPath(server) ? "retain-own-key" : "unlink";
@@ -653,10 +686,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const keylessKeyProfile = matchedProfile !== undefined && authProfileNeedsServerKeyPath(matchedProfile);
   const resolvedProfileId = keylessKeyProfile ? undefined : matchedProfile?.id;
   // AUTH 1c (REVIEW FINDING, P1) — the id whose SOURCE-APPLIED links this plan
-  // must UNDO, and `undefined` whenever there is nothing to undo. See
-  // `decideSourceAuthRollback` for the per-server rule and why it is scoped this
-  // narrowly.
-  const unusableProfileId = keylessKeyProfile ? matchedProfile?.id : undefined;
+  // must UNDO. DEVICE TEMPLATES (PR-T1 / A-M2): this single id is now one term of
+  // the widened `profilesNeedingServerKey` set (built by the pre-pass below,
+  // term (a)), which both rollback passes consume; the source keyless id is
+  // recovered for the source-level warning as `sourceUnusableId` at composition
+  // time. See `decideSourceAuthRollback` for the per-server rule.
   // The warning below is composed here (where the reason is known) but pushed
   // AFTER both rollback passes, because its closing sentences have to state how
   // many servers this sync actually unlinked and how many it deliberately left
@@ -666,19 +700,63 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const authWarningIndex = warnings.length;
   const emitAuthWarning = source.authProfileId !== undefined && resolvedProfileId === undefined;
 
+  // DEVICE TEMPLATES (issue #48 PR-T1) — the per-field cascade, resolved ONCE.
+  // In T1 it is degenerate on filters (no matcher), so every catch-all rule
+  // matches every device and the winners are device-independent; the filtered
+  // -rule fail-closed skip and dangling-template warnings are emitted here, once
+  // per rule. `source.authProfileId` enters as the implicit specificity −1 fill
+  // candidate, so PR #53's behaviour falls out unchanged when no explicit rule
+  // sets the field.
+  const cascade = selectFieldWinners(source.templateRules ?? [], source.authProfileId, input.templatesById, source.name);
+  for (const w of cascade.warnings) {
+    warnings.push(w);
+  }
+  // Compose the non-auth desired fields (§4.2 layer 2) once; applied by the
+  // §4.3 matrix on both the add and update paths.
+  const desiredNonAuth: DesiredNonAuthFields = composeDesiredFields(cascade.winners);
+  // Resolve the auth winner against the WHOLE profile store (falling back to
+  // the source's own `matchedProfile` for legacy callers that pass no map, so
+  // the implicit rule always resolves). A dangling winner drops the field:
+  // the implicit-source dangle is already covered by `emitAuthWarning`; an
+  // explicit-rule dangle gets its own skip warning.
+  const resolveAuthProfileById = (id: string): AuthProfile | undefined =>
+    input.authProfilesById?.get(id) ?? (matchedProfile?.id === id ? matchedProfile : undefined);
+  const authWinnerField = cascade.winners.authProfileId;
+  const winnerProfile = authWinnerField !== undefined ? resolveAuthProfileById(authWinnerField.value) : undefined;
+  if (authWinnerField !== undefined && winnerProfile === undefined && !cascade.authFromImplicit) {
+    warnings.push(
+      `A device template rule on "${source.name}" links an auth profile that no longer exists — the auth field was skipped.`
+    );
+  }
+  // The winner used for WRITES: dropped when it dangles. The add/fill row-1
+  // write additionally drops a keyless winner (blanket per-profile refusal),
+  // exactly like the source path zeroes a keyless key profile.
+  const effectiveAuthWinner =
+    authWinnerField !== undefined && winnerProfile !== undefined
+      ? { mode: authWinnerField.mode, profileId: authWinnerField.value }
+      : undefined;
+  const winnerKeyless = winnerProfile !== undefined && authProfileNeedsServerKeyPath(winnerProfile);
+  const winnerResolvedId = effectiveAuthWinner !== undefined && !winnerKeyless ? effectiveAuthWinner.profileId : undefined;
+
   const adds: ServerConfig[] = [];
   const updates: Array<{ before: ServerConfig; after: ServerConfig }> = [];
   const prunes: InventorySyncPlan["prunes"] = [];
   let unchangedCount = 0;
-  /** AUTH 2b — how many source-applied links this plan UNDOES (see `decideSourceAuthRollback`). */
-  let clearedLinkCount = 0;
   /**
-   * AUTH 2b — how many source-applied links this plan deliberately LEAVES IN
-   * PLACE because the server brings its own key file (REVIEW FINDING, P2). Those
-   * servers go on using the profile, so the warning must not describe them as
-   * having no key and falling back to SSH agent authentication.
+   * AUTH 2b — per-profile counts of the links this plan UNDOES / deliberately
+   * LEAVES in place (the server brings its own key file). Keyed by profile id so
+   * the source-level warning and the referrer-specific template/retained-link
+   * warnings each report only their own profile's servers (§4.4). The warning
+   * must not describe a retained server as having no key and falling back to SSH
+   * agent authentication.
    */
-  let retainedOwnKeyLinkCount = 0;
+  const unlinkedByProfile = new Map<string, number>();
+  const retainedByProfile = new Map<string, number>();
+  /** §4.4 rev7 — servers whose OVERRIDE MOVE onto a keyless profile was refused per target (no own key), by profile id → names. */
+  const overrideRefusedByProfile = new Map<string, string[]>();
+  const bump = (map: Map<string, number>, id: string): void => {
+    map.set(id, (map.get(id) ?? 0) + 1);
+  };
   const folderSet = new Set<string>();
 
   const serversById = new Map(currentServers.map((s) => [s.id, s] as const));
@@ -700,6 +778,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     ownedByExternalId.set(externalId, server);
   }
+
+  // DEVICE TEMPLATES (PR-T1 / §4.4) — the widened unusable-profile set, built by
+  // a PRE-PASS over the owned servers BEFORE the device loop (never during it:
+  // the mapped rollback runs inside the loop and would read a half-built,
+  // order-dependent set). Supersedes the single source-derived id: it also names
+  // every rule-template-referenced keyless profile and every keyless profile
+  // reachable only through a RETAINED sync-owned link. `matchedProfile` is passed
+  // as term (a)'s source profile PRE-1b-zeroing, so a keyless source profile is
+  // named here even though it is refused a fresh stamp above.
+  const profilesNeedingServerKey: ProfilesNeedingServerKey = computeProfilesNeedingServerKey({
+    source,
+    ownedServers: [...ownedByExternalId.values()],
+    sourceProfile: matchedProfile,
+    templatesById: input.templatesById,
+    authProfilesById: input.authProfilesById
+  });
+  const unusableProfileIds = profilesNeedingServerKey.ids;
 
   // F5: manual (non-owned-by-this-source) servers indexed by host:port, so a
   // planned add that collides with a hand-added server is flagged — Phase 1
@@ -948,6 +1043,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // `syncOwnsIpmiHost` for the write rule and the whole matrix.
       const takesIpmiHost =
         mgmtHost !== undefined && syncOwnsIpmiHost(ownedServer.ipmiHost, ownedServer.origin?.syncedIpmiHost, mgmtHost);
+      // DEVICE TEMPLATES (PR-T1) — the §4.3 matrix for the four non-auth fields.
+      // `templateMatrix.templated` is the carried-forward stamp record with the
+      // written fields updated (the one-line `templated:` carry-forward
+      // load-bearing §5.2 regression lives here — it must go INTO the origin
+      // literal, like every other stamp, since the auth branches below rebuild
+      // the origin). `templateMatrix.values` are the field writes for `after`.
+      const templateMatrix = applyTemplateMatrix(ownedServer, desiredNonAuth);
       const afterOrigin: ServerOrigin = {
         sourceId: source.id,
         externalId: device.externalId,
@@ -1011,7 +1113,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // erase the user's cleared-value opt-out (matrix row 2) and let the very
         // next sync refill the field they emptied. Carried forward as
         // `undefined` too, which is what keeps a Phase-1 hand entry hands-off.
-        syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedServer.origin?.syncedIpmiHost
+        syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedServer.origin?.syncedIpmiHost,
+        // DEVICE TEMPLATES (PR-T1) — the per-field template stamps, carried
+        // forward with this run's writes already folded in by the matrix above.
+        // The one-line carry-forward the whole feature turns on (§5.2 / fixture
+        // 11): an update fired for an unrelated reason rebuilds this literal from
+        // scratch, and a rebuild that dropped this member would erase the fleet's
+        // template ownership.
+        templated: templateMatrix.templated
       };
       const after: ServerConfig = {
         ...ownedServer,
@@ -1019,6 +1128,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         host: endpoint.host,
         port,
         group,
+        ...templateMatrix.values,
         origin: afterOrigin
       };
       if (endpoint.username !== undefined) {
@@ -1173,13 +1283,30 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // kept server and the two must not be able to answer it differently. The
       // reasoning stays HERE, where the rule is applied to the population it was
       // written about; the function carries only a pointer back to it.
-      if (qualifiesForSourceProfileRetroApply(ownedServer, resolvedProfileId, source.defaultUsername)) {
-        after.authProfileId = resolvedProfileId;
-        // The stamp is written HERE and only here on the update path, in the same
-        // breath as the link itself — that is what makes a LATER clear of this
-        // link visible to the next sync as an opt-out instead of reading as
-        // "never linked" and being reattached forever.
-        after.origin = { ...afterOrigin, syncedAuthProfileId: resolvedProfileId };
+      //
+      // DEVICE TEMPLATES (PR-T1) — this retro-apply is now the FILL branch of the
+      // general cascade auth write: the winning candidate is the implicit
+      // source-level rule (fill) when no explicit rule sets `authProfileId`, so
+      // when there are no template rules this is bit-for-bit the shipped
+      // behaviour. `decideTemplateAuthWrite` folds in the override MOVE (rows 3/4,
+      // per-target usability) and the fill write-once mode gate; the six-clause
+      // fill eligibility is the same `authFillEligible` predicate this function
+      // (`qualifiesForSourceProfileRetroApply`) now delegates to.
+      const authDecision = decideTemplateAuthWrite(ownedServer, effectiveAuthWinner, winnerProfile, source.defaultUsername);
+      if (authDecision.kind === "write") {
+        after.authProfileId = authDecision.profileId;
+        // The stamp is written HERE, in the same breath as the link itself —
+        // that is what makes a LATER clear of this link visible to the next sync
+        // as an opt-out instead of reading as "never linked" and being
+        // reattached forever. `{ ...afterOrigin }` preserves the template stamps.
+        after.origin = { ...afterOrigin, syncedAuthProfileId: authDecision.profileId };
+      } else if (authDecision.kind === "skip-usability") {
+        // §4.4 rev7 — an OVERRIDE move onto a keyless key profile the target
+        // cannot satisfy (no own key). The link stays put and un-re-stamped; the
+        // plan names the profile and the reason after both rollback passes.
+        const names = overrideRefusedByProfile.get(authDecision.profileId) ?? [];
+        names.push(ownedServer.name);
+        overrideRefusedByProfile.set(authDecision.profileId, names);
       }
 
       // AUTH 2b (REVIEW FINDING, P1) — RETRO-UNAPPLY, for the servers this run
@@ -1233,17 +1360,26 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // PRUNED is out of the sync's active set by the policy the user chose —
       // "keep in place" and "move to _orphaned" both mean stop reconfiguring it —
       // and a "delete" prune removes it outright.
-      const mappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileId);
-      if (mappedRollback === "unlink") {
+      //
+      // DEVICE TEMPLATES (PR-T1) — decided on `after` (the post-template-write
+      // link), not `ownedServer`: an override rule that just moved this server's
+      // link to a USABLE profile must not then be second-guessed by a rollback
+      // reading the pre-move link. `after` and `ownedServer` differ here only
+      // when a template auth write fired, and that write only lands a usable
+      // link, so the two agree in every shipped-behaviour case. The set is the
+      // widened `profilesNeedingServerKey` (source + template + retained links).
+      const rolledBackProfileId = after.authProfileId;
+      const mappedRollback = decideSourceAuthRollback(after, unusableProfileIds);
+      if (mappedRollback === "unlink" && rolledBackProfileId !== undefined) {
         after.authProfileId = undefined;
         // The stamp goes with the link it describes — leaving it behind would
         // read as a per-server opt-out nobody chose and lock the server out of
         // retro-apply forever, which is exactly the reasoning removeAuthProfile
         // applies when a deleted profile's links are cleared.
         after.origin = { ...afterOrigin, syncedAuthProfileId: undefined };
-        clearedLinkCount++;
-      } else if (mappedRollback === "retain-own-key") {
-        retainedOwnKeyLinkCount++;
+        bump(unlinkedByProfile, rolledBackProfileId);
+      } else if (mappedRollback === "retain-own-key" && rolledBackProfileId !== undefined) {
+        bump(retainedByProfile, rolledBackProfileId);
       }
 
       // AUTH 3 — authProfileId joins the comparison because a retro-apply stamp
@@ -1281,6 +1417,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // The value clause is kept beside it because it states the plainly-visible
       // half of the change (rows 1 and 3) and does not depend on the stamp
       // comparator's membership list staying correct.
+      //
+      // DEVICE TEMPLATES (PR-T1) — the four non-auth template value fields join
+      // the comparison, because the matrix can now change any of them on an
+      // otherwise-unchanged device; the origin half (the `templated` stamps)
+      // rides in on the `serverOriginStampsEqual` line, which — like the AUTH 3a
+      // shape — can be the ONLY difference between `before` and `after` (a
+      // template first attaching, or a stamp-only re-record).
       const changed =
         ownedServer.name !== after.name ||
         ownedServer.host !== after.host ||
@@ -1288,6 +1431,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.group !== after.group ||
         ownedServer.authProfileId !== after.authProfileId ||
         ownedServer.ipmiHost !== after.ipmiHost ||
+        !proxyConfigsEqual(ownedServer.proxy, after.proxy) ||
+        ownedServer.multiplexing !== after.multiplexing ||
+        ownedServer.legacyAlgorithms !== after.legacyAlgorithms ||
+        ownedServer.logSession !== after.logSession ||
         !serverOriginStampsEqual(ownedServer.origin, after.origin) ||
         (endpoint.username !== undefined && ownedServer.username !== after.username);
       if (changed) {
@@ -1836,6 +1983,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       manualDuplicateCount++;
     }
 
+    // DEVICE TEMPLATES (PR-T1) — a fresh record is unset in every field, so every
+    // desired non-auth field is matrix row 1 (write + stamp, both modes); the
+    // link is the cascade winner's keyless-dropped id (§4.5: fresh device → write
+    // T + stamp, there is nothing to override yet). `winnerResolvedId` equals the
+    // source's own `resolvedProfileId` when no explicit rule sets auth, so a
+    // template-less sync adds exactly the record it did before.
+    const addMatrix = applyTemplateMatrix(undefined, desiredNonAuth);
     adds.push({
       id,
       name: device.name,
@@ -1848,12 +2002,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // server it owns; a copy taken here would rot the moment the profile
       // changed. `authType: "agent"` above stays inert while the link holds and
       // is the exact fallback if the profile is later deleted, which is why it
-      // is still stamped unconditionally. Undefined when the source has no
-      // profile or its reference is dangling (AUTH 1) — the pre-feature record,
+      // is still stamped unconditionally. Undefined when the source/winner has no
+      // profile or its reference is dangling/keyless — the pre-feature record,
       // field for field.
-      authProfileId: resolvedProfileId,
+      authProfileId: winnerResolvedId,
       isHidden: false,
       group,
+      // DEVICE TEMPLATES (PR-T1) — the non-auth template field VALUES (proxy,
+      // multiplexing, legacyAlgorithms, logSession) this fresh record starts
+      // with; absent when the template sets none of them.
+      ...addMatrix.values,
       // OOB — the device's out-of-band address, or `undefined` when it supplies
       // none. A new record has nothing to protect, so there is no matrix here:
       // whatever this fetch offers is what the field starts as, and the stamp
@@ -1887,7 +2045,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // detach copies THIS value into the marker rather than re-deriving one.
         syncedInstanceKey: providerInstanceKey,
         syncedUsername: endpoint.username ?? source.defaultUsername,
-        syncedAuthProfileId: resolvedProfileId,
+        syncedAuthProfileId: winnerResolvedId,
         // Mirrors the `ipmiHost` written above, and recorded UNCONDITIONALLY —
         // `undefined` included — on the same "a source whose devices gain an
         // address later must find the stamps already there" argument the two
@@ -1895,7 +2053,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // stamp is matrix row 1 (fill it in) rather than row 5 (hands off),
         // which is the right state for a server the user has never typed into:
         // an add that supplies no address must not be mistaken for a hand entry.
-        syncedIpmiHost: mgmtHost
+        syncedIpmiHost: mgmtHost,
+        // DEVICE TEMPLATES (PR-T1) — the template stamps for the non-auth fields
+        // written above (row 1), so every LATER sync has the ownership question
+        // already answered. Absent when the template set none of them.
+        templated: addMatrix.templated
       }
     });
     if (group !== undefined) {
@@ -1941,12 +2103,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (decidedOwnedExternalIds.has(externalId) || !presentExternalIds.has(externalId)) {
       continue;
     }
-    const unmappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileId);
+    const unmappedRollback = decideSourceAuthRollback(ownedServer, unusableProfileIds);
+    const unmappedProfileId = ownedServer.authProfileId;
     if (unmappedRollback === "retain-own-key") {
-      retainedOwnKeyLinkCount++;
+      if (unmappedProfileId !== undefined) {
+        bump(retainedByProfile, unmappedProfileId);
+      }
       continue;
     }
-    if (unmappedRollback !== "unlink") {
+    if (unmappedRollback !== "unlink" || unmappedProfileId === undefined) {
       continue;
     }
     // Straight into `updates`, so this unlink is disclosed by the same machinery
@@ -1961,7 +2126,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // ignores it), and the unlink does not repeat next sync — the link it keys on
     // is gone.
     updates.push({ before: ownedServer, after: withSourceLinkCleared(ownedServer) });
-    clearedLinkCount++;
+    bump(unlinkedByProfile, unmappedProfileId);
   }
 
   if (emitAuthWarning) {
@@ -1977,6 +2142,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // fact unable to connect at all. Spliced (not pushed) so the position among
     // the other warnings is exactly what it was before the count made the text
     // depend on the loop.
+    // DEVICE TEMPLATES (PR-T1) — the counts are now PER PROFILE: the source
+    // warning reports only servers unlinked from / retained on the SOURCE
+    // profile, so a template- or retained-link-referenced keyless profile does
+    // not inflate this sentence (those get their own referrer-specific warnings
+    // below). When the source profile is the only unusable one — the shipped
+    // case — these equal the totals and the wording is bit-for-bit unchanged.
+    const sourceUnusableId = keylessKeyProfile ? matchedProfile?.id : undefined;
+    const clearedLinkCount = sourceUnusableId !== undefined ? (unlinkedByProfile.get(sourceUnusableId) ?? 0) : 0;
+    const retainedOwnKeyLinkCount = sourceUnusableId !== undefined ? (retainedByProfile.get(sourceUnusableId) ?? 0) : 0;
     const clearedNote =
       clearedLinkCount > 0
         ? ` ${clearedLinkCount} server${clearedLinkCount === 1 ? "" : "s"} this sync had already linked to it ${clearedLinkCount === 1 ? "is" : "are"} unlinked here so ${clearedLinkCount === 1 ? "it can connect" : "they can connect"} again; a later sync re-links ${clearedLinkCount === 1 ? "it" : "them"} once the profile has a key file.`
@@ -2001,6 +2175,53 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       keylessKeyProfile && matchedProfile !== undefined
         ? `The auth profile "${matchedProfile.name}" for "${source.name}" uses private key authentication but has no key file — servers this source creates have no key of their own, so the sync does not apply it: they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.${clearedNote}${retainedNote}`
         : `The auth profile for "${source.name}" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.`
+    );
+  }
+
+  // DEVICE TEMPLATES (PR-T1, §4.4 rev7) — referrer-specific AUTH 2b warnings for
+  // every keyless profile OTHER than the source's own (which the block above
+  // covers). Each names its referrer — a device TEMPLATE, or a RETAINED link an
+  // earlier sync applied whose rule is now gone (the case where nothing in the
+  // current config explains why the server was linked) — so the repair points at
+  // the right editor. Silent unless this sync actually unlinked or retained on
+  // that profile.
+  const linkNote = (unlinked: number, retained: number): string => {
+    const cleared =
+      unlinked > 0
+        ? ` ${unlinked} server${unlinked === 1 ? "" : "s"} this sync had already linked to it ${unlinked === 1 ? "is" : "are"} unlinked here so ${unlinked === 1 ? "it can connect" : "they can connect"} again; a later sync re-links ${unlinked === 1 ? "it" : "them"} once the profile has a key file.`
+        : "";
+    const retain =
+      retained > 0
+        ? ` ${retained} server${retained === 1 ? "" : "s"} this sync had already linked to it ${retained === 1 ? "keeps" : "keep"} the link, because ${retained === 1 ? "it carries a key file of its own" : "they carry key files of their own"} and still ${retained === 1 ? "connects" : "connect"} through the profile.`
+        : "";
+    return `${cleared}${retain}`;
+  };
+  for (const [id, ref] of profilesNeedingServerKey.referrer.entries()) {
+    if (ref.kind === "source") {
+      continue; // handled by the emitAuthWarning block above
+    }
+    const unlinked = unlinkedByProfile.get(id) ?? 0;
+    const retained = retainedByProfile.get(id) ?? 0;
+    if (unlinked === 0 && retained === 0) {
+      continue;
+    }
+    const profileName = resolveAuthProfileById(id)?.name ?? id;
+    if (ref.kind === "template") {
+      warnings.push(
+        `The auth profile "${profileName}" applied by a device template rule on "${source.name}" uses private key authentication but has no key file.${linkNote(unlinked, retained)}`
+      );
+    } else {
+      warnings.push(
+        `The auth profile "${profileName}" — linked to one or more servers by an earlier sync whose device template rule is no longer configured — uses private key authentication but has no key file.${linkNote(unlinked, retained)}`
+      );
+    }
+  }
+  // §4.4 rev7 — an OVERRIDE move refused per target (the profile needs a key file
+  // the server does not have). Names the profile and the servers left unchanged.
+  for (const [id, names] of overrideRefusedByProfile.entries()) {
+    const profileName = resolveAuthProfileById(id)?.name ?? id;
+    warnings.push(
+      `A device template would apply the auth profile "${profileName}" to ${namedExamples(names)}, but it uses private key authentication and has no key file while ${names.length === 1 ? "that server brings" : "those servers bring"} no key of their own — ${names.length === 1 ? "its link was" : "their links were"} left unchanged.`
     );
   }
 

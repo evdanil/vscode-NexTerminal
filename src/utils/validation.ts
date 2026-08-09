@@ -9,6 +9,7 @@ import type {
   LocalShellProfile
 } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
+import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import { normalizeFolderPath } from "./folderPaths";
 
 function isNonEmptyString(value: unknown): value is string {
@@ -56,11 +57,40 @@ export function validateProxyConfig(proxy: unknown): proxy is ProxyConfig {
   return false;
 }
 
+/**
+ * DEVICE TEMPLATES (PR-T1) — shape guard for `ServerOrigin.templated`. Every
+ * member is optional; when present each boolean must be a real boolean (a
+ * PRESENT `false` stamp is legitimate — m12) and `proxy` a valid ProxyConfig.
+ * A malformed `templated` makes the whole origin untrustworthy, so
+ * `isValidServerOrigin` rejects on it and its callers strip the WHOLE origin —
+ * the same loud disposition every other origin member gets.
+ */
+function isValidTemplatedStamps(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  if (obj.proxy !== undefined && !validateProxyConfig(obj.proxy)) {
+    return false;
+  }
+  return (
+    (obj.multiplexing === undefined || typeof obj.multiplexing === "boolean") &&
+    (obj.legacyAlgorithms === undefined || typeof obj.legacyAlgorithms === "boolean") &&
+    (obj.logSession === undefined || typeof obj.logSession === "boolean")
+  );
+}
+
 export function isValidServerOrigin(value: unknown): value is ServerOrigin {
   if (typeof value !== "object" || value === null) {
     return false;
   }
   const obj = value as Record<string, unknown>;
+  // DEVICE TEMPLATES (PR-T1) — `templated` is optional (absent on every server
+  // synced before it existed) but shape-checked like the rest; a malformed
+  // record strips the whole origin (§1.3 bookkeeping / risk 3).
+  if (obj.templated !== undefined && !isValidTemplatedStamps(obj.templated)) {
+    return false;
+  }
   // `syncedInstanceKey`, `syncedUsername`, `syncedAuthProfileId` and
   // `syncedIpmiHost` are optional
   // (absent on every server synced before each field existed) but shape-checked
@@ -351,7 +381,73 @@ export function validateInventorySource(item: unknown): item is InventorySourceC
   if (obj.authProfileId !== undefined && !isNonEmptyString(obj.authProfileId)) {
     return false;
   }
+  // DEVICE TEMPLATES (PR-T1) — optional, tolerant SHAPE check, same reasoning
+  // as `revision`/`managedFolders` above: absent means "no rules". When
+  // present it must be an array of `{ id, templateId }` (non-empty strings) with
+  // an optional string `filter`. A malformed value rejects the whole source
+  // here, exactly as a malformed `authProfileId` does — this is user-authored
+  // config, not extension bookkeeping.
+  if (obj.templateRules !== undefined) {
+    if (!Array.isArray(obj.templateRules)) {
+      return false;
+    }
+    for (const rule of obj.templateRules) {
+      if (typeof rule !== "object" || rule === null) {
+        return false;
+      }
+      const r = rule as Record<string, unknown>;
+      if (!isNonEmptyString(r.id) || !isNonEmptyString(r.templateId)) {
+        return false;
+      }
+      if (r.filter !== undefined && typeof r.filter !== "string") {
+        return false;
+      }
+    }
+  }
   return true;
+}
+
+/**
+ * DEVICE TEMPLATES (PR-T1) — shape guard for a persisted `DeviceTemplateProfile`.
+ * Same trust boundary and tolerant disposition as `validateInventorySource`:
+ * `id`/`name` non-empty strings, optional non-empty `revision`, and a `fields`
+ * object each of whose present members is a well-formed `{ mode, value }`
+ * (mode ∈ {fill, override}). A whole template is skipped by the storage getter
+ * if this fails — never a partial one — so nothing hands the engine a field it
+ * cannot read.
+ */
+export function validateDeviceTemplate(item: unknown): item is DeviceTemplateProfile {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  if (!(isNonEmptyString(obj.id) && isNonEmptyString(obj.name))) {
+    return false;
+  }
+  if (obj.revision !== undefined && !isNonEmptyString(obj.revision)) {
+    return false;
+  }
+  if (typeof obj.fields !== "object" || obj.fields === null || Array.isArray(obj.fields)) {
+    return false;
+  }
+  const fields = obj.fields as Record<string, unknown>;
+  const validField = (value: unknown, valueOk: (v: unknown) => boolean): boolean => {
+    if (value === undefined) {
+      return true;
+    }
+    if (typeof value !== "object" || value === null) {
+      return false;
+    }
+    const f = value as Record<string, unknown>;
+    return (f.mode === "fill" || f.mode === "override") && valueOk(f.value);
+  };
+  return (
+    validField(fields.proxy, (v) => validateProxyConfig(v)) &&
+    validField(fields.authProfileId, (v) => isNonEmptyString(v)) &&
+    validField(fields.multiplexing, (v) => typeof v === "boolean") &&
+    validField(fields.legacyAlgorithms, (v) => typeof v === "boolean") &&
+    validField(fields.logSession, (v) => typeof v === "boolean")
+  );
 }
 
 export function validateTunnelProfile(item: unknown): item is TunnelProfile {

@@ -6,6 +6,7 @@ import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
+import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { stripImportedCapabilityFields } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
@@ -38,6 +39,7 @@ import {
   validateSerialProfile,
   validateLocalShellProfile,
   validateInventorySource,
+  validateDeviceTemplate,
   isValidServerOrigin,
   isValidDetachedServerOrigin
 } from "../utils/validation";
@@ -93,6 +95,13 @@ interface NexusConfigExport {
   authProfiles?: AuthProfile[];
   /** Backup-only (§B6) — never present on a share export; secrets live under `encryptedSecrets.inventorySourceSecrets`. */
   inventorySources?: InventorySourceConfig[];
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T1) — backup-only, EXCLUDED from a share
+   * export exactly like `inventorySources` (A-M5): a template is fleet-specific
+   * wiring (jump-host ids, auth-profile ids) with no meaning in a stranger's
+   * workspace. No secrets, so no vault section.
+   */
+  deviceTemplates?: DeviceTemplateProfile[];
   groups?: string[];
   macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
   /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
@@ -487,6 +496,9 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
     return false;
   }
   if (obj.inventorySources !== undefined && !Array.isArray(obj.inventorySources)) {
+    return false;
+  }
+  if (obj.deviceTemplates !== undefined && !Array.isArray(obj.deviceTemplates)) {
     return false;
   }
   if (
@@ -1277,6 +1289,8 @@ export async function captureBackupStateForExport(
   };
   inventorySources: InventorySourceConfig[];
   inventorySourceSecrets: Record<string, Record<string, string>>;
+  // DEVICE TEMPLATES (PR-T1) — captured in the same lock; no secrets, so no vault section.
+  deviceTemplates: DeviceTemplateProfile[];
   // FINDING 1 (P2, secrets review) — count of sources for which at least one declared
   // secretFieldId came back empty from vault.get (a locked/unavailable keychain, most
   // commonly). Previously these secrets were just omitted from the bucket with no signal
@@ -1296,6 +1310,7 @@ export async function captureBackupStateForExport(
     const servers = snapshot.servers;
     const authProfiles = snapshot.authProfiles;
     const inventorySources = snapshot.inventorySources;
+    const deviceTemplates = snapshot.deviceTemplates;
 
     const passwords: Record<string, string> = {};
     const passphrases: Record<string, string> = {};
@@ -1339,6 +1354,7 @@ export async function captureBackupStateForExport(
       authProfileSecrets: { passwords: authProfilePasswords, passphrases: authProfilePassphrases },
       inventorySources,
       inventorySourceSecrets,
+      deviceTemplates,
       sourcesWithMissingSecrets
     };
   });
@@ -1424,6 +1440,7 @@ export function registerConfigCommands(
           localShellProfiles: snapshot.localShellProfiles,
           authProfiles: captured.authProfiles,
           inventorySources: captured.inventorySources,
+          deviceTemplates: captured.deviceTemplates,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
           macroFolders: getMacroFolders(),
@@ -1955,6 +1972,13 @@ export function registerConfigCommands(
         }
         await core.removeInventorySource(source.id);
       }
+      // DEVICE TEMPLATES (PR-T1) — no secrets, so a plain record drop. Runs
+      // AFTER the sources above so `removeDeviceTemplate`'s templateRules sweep
+      // has fewer sources to walk (they are already gone); order is otherwise
+      // immaterial since every source is being removed anyway.
+      for (const template of snapshot.deviceTemplates) {
+        await core.removeDeviceTemplate(template.id);
+      }
     }
 
     // F14 — merge mode: existing inventory source ids join the existing-id set so
@@ -1967,7 +1991,10 @@ export function registerConfigCommands(
           ...snapshot.serialProfiles.map((p) => p.id),
           ...snapshot.localShellProfiles.map((p) => p.id),
           ...snapshot.authProfiles.map((p) => p.id),
-          ...snapshot.inventorySources.map((s) => s.id)
+          ...snapshot.inventorySources.map((s) => s.id),
+          // DEVICE TEMPLATES (PR-T1) — join the existing-id set so merge mode
+          // never silently overwrites a local template with a same-id one.
+          ...snapshot.deviceTemplates.map((t) => t.id)
         ])
       : new Set<string>();
 
@@ -1992,7 +2019,11 @@ export function registerConfigCommands(
     );
     const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
     const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
-    for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally]) {
+    // DEVICE TEMPLATES (PR-T1) — imported id-preserving like every other bucket.
+    const deviceTemplateTally = await importPreservingIds(data.deviceTemplates, existingIds, validateDeviceTemplate, (e) =>
+      core.addOrUpdateDeviceTemplate(e)
+    );
+    for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally, deviceTemplateTally]) {
       imported += tally.imported;
       skipped += tally.skipped;
     }
@@ -2058,6 +2089,31 @@ export function registerConfigCommands(
     for (const source of postImportSnapshot.inventorySources) {
       if (source.authProfileId && !knownProfileIds.has(source.authProfileId)) {
         await core.addOrUpdateInventorySource({ ...source, authProfileId: undefined });
+      }
+    }
+    // DEVICE TEMPLATES (PR-T1, §8.2) — post-import dangling sweeps. Read a FRESH
+    // snapshot: the source-authProfileId sweep just above may have re-written
+    // sources, so the stale `postImportSnapshot` would resurrect a link it just
+    // cleared. Checked against post-import state (a reference this machine
+    // already satisfies is kept). (a) a template's `fields.authProfileId` naming
+    // a profile that was never brought along is cleared, exactly like the source
+    // and server links above. (b) a source's `templateRules` entry naming a
+    // template that does not exist is removed, so the sync engine never receives
+    // a rule it cannot resolve.
+    const sweepSnapshot = core.getSnapshot();
+    const knownTemplateIds = new Set(sweepSnapshot.deviceTemplates.map((t) => t.id));
+    for (const template of sweepSnapshot.deviceTemplates) {
+      const linkedProfileId = template.fields.authProfileId?.value;
+      if (linkedProfileId !== undefined && !knownProfileIds.has(linkedProfileId)) {
+        const { authProfileId: _authProfileId, ...restFields } = template.fields;
+        await core.addOrUpdateDeviceTemplate({ ...template, fields: restFields });
+      }
+    }
+    for (const source of sweepSnapshot.inventorySources) {
+      const rules = source.templateRules;
+      if (rules && rules.some((rule) => !knownTemplateIds.has(rule.templateId))) {
+        const remaining = rules.filter((rule) => knownTemplateIds.has(rule.templateId));
+        await core.addOrUpdateInventorySource({ ...source, templateRules: remaining });
       }
     }
 

@@ -1,6 +1,7 @@
 import type { ConfigRepository } from "../core/contracts";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
+import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
@@ -10,7 +11,8 @@ export class InMemoryConfigRepository implements ConfigRepository {
     private groups: string[] = [],
     private authProfiles: AuthProfile[] = [],
     private localShellProfiles: LocalShellProfile[] = [],
-    private inventorySources: InventorySourceConfig[] = []
+    private inventorySources: InventorySourceConfig[] = [],
+    private deviceTemplates: DeviceTemplateProfile[] = []
   ) {}
 
   public async getServers(): Promise<ServerConfig[]> {
@@ -69,5 +71,15 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveInventorySources(sources: InventorySourceConfig[]): Promise<void> {
     this.inventorySources = [...sources];
+  }
+
+  public async getDeviceTemplates(): Promise<DeviceTemplateProfile[]> {
+    // DEVICE TEMPLATES (PR-T1) — mirrors VscodeConfigRepository's load-time
+    // backfill for legacy (pre-revision) records.
+    return this.deviceTemplates.map(ensureDeviceTemplateRevision);
+  }
+
+  public async saveDeviceTemplates(templates: DeviceTemplateProfile[]): Promise<void> {
+    this.deviceTemplates = [...templates];
   }
 }

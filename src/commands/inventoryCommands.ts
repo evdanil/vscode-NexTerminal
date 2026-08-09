@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../models/config";
 import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials } from "../models/config";
+import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
   InventoryProviderError,
@@ -1868,6 +1869,23 @@ function resolveSourceAuthProfile(core: NexusCore, source: InventorySourceConfig
   return core.getAuthProfile(source.authProfileId);
 }
 
+/**
+ * DEVICE TEMPLATES (issue #48 PR-T1) — the two maps `computeSyncPlan` consumes,
+ * resolved from the current core snapshot alongside `resolveSourceAuthProfile`
+ * (the engine is pure and has no core access). `authProfilesById` is the WHOLE
+ * store (rev3), a superset of `authProfile`, so the engine's unusable-profile
+ * scan can name a profile reachable only through a retained link. Re-derived at
+ * every recompute site, exactly like `planAuthProfile`, so a plan always sees
+ * the templates/profiles that were live when it was computed.
+ */
+function resolveTemplatesById(core: NexusCore): Map<string, DeviceTemplateProfile> {
+  return new Map(core.getSnapshot().deviceTemplates.map((t) => [t.id, t] as const));
+}
+
+function resolveAuthProfilesById(core: NexusCore): Map<string, AuthProfile> {
+  return new Map(core.getSnapshot().authProfiles.map((p) => [p.id, p] as const));
+}
+
 export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
@@ -2878,7 +2896,9 @@ export function registerInventoryCommands(
         currentServers: core.getSnapshot().servers,
         now: Date.now(),
         authProfile: planAuthProfile,
-        providerInstanceKey: planInstanceKey
+        providerInstanceKey: planInstanceKey,
+        templatesById: resolveTemplatesById(core),
+        authProfilesById: resolveAuthProfilesById(core)
       });
 
       // Nothing to do AND nothing to ask: apply an empty application to bump
@@ -2943,7 +2963,9 @@ export function registerInventoryCommands(
             currentServers: core.getSnapshot().servers,
             now: Date.now(),
             authProfile: freshAuthProfile,
-            providerInstanceKey: freshInstanceKey
+            providerInstanceKey: freshInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core)
           });
           // THE SAME PREDICATE AS THE OUTER GATE, deliberately — a second gate
           // asking a narrower question is the first one's blindness moved rather
@@ -3284,6 +3306,8 @@ export function registerInventoryCommands(
             now: Date.now(),
             authProfile: planAuthProfile,
             providerInstanceKey: planInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core),
             adoptionChoice
           });
           // GUARD SITE 1 of 3 (REVIEW FINDING, P1) — this recompute is the first
@@ -3464,6 +3488,8 @@ export function registerInventoryCommands(
             now: Date.now(),
             authProfile: freshAuthProfile,
             providerInstanceKey: freshInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core),
             // ADOPT 1 — the answer given once above governs EVERY recompute of
             // this run. Omitted here, this plan would render adds where the
             // preview rendered adoptions and drift on every pass, looping the
@@ -3587,6 +3613,8 @@ export function registerInventoryCommands(
             // adoptions must be the one derived from the source it applies
             // against.
             providerInstanceKey: freshInstanceKey,
+            templatesById: resolveTemplatesById(core),
+            authProfilesById: resolveAuthProfilesById(core),
             // ADOPT 1 — same answer, same run. This is the plan that is actually
             // APPLIED, so an answer missed here would not merely loop: it would
             // apply duplicate adds against consent collected for adoptions
