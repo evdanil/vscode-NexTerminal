@@ -3996,6 +3996,29 @@ export function registerInventoryCommands(
             reportStaleAdoptionAnswer();
             return { kind: "abort" };
           }
+          // MECHANISM 1 — TEMPLATE-REVISION TWIN OF GUARD SITE 3. The check at
+          // ~3818 is a cheap early-out that spares the teardown work in the
+          // common case, but it runs BEFORE the awaited teardown loop and the
+          // FINDING D vault re-read — and device-template saves do NOT take
+          // `configMutationLock`, so a value-only template edit (proxy host
+          // A→B, a boolean flip) can land in exactly that window, after the
+          // early check passed. `finalPlan` above resolves the LATEST template
+          // values via `resolveTemplatesById(core)` and would write them, while
+          // `finalDrift`/`adoptionAnswerIsStale` compare only counts and
+          // identities and never see the value. This is the same await window
+          // GUARD SITE 3 guards the adoption answer against — so re-run the
+          // revision guard here too, as the LAST thing before
+          // applyInventorySyncPlan. The comparand stays the PREVIEW-TIME
+          // `shownTemplateRevisions` baseline (never a re-snapshot from the
+          // ~3818 check): mirroring how `adoptionAnswerIsStale` compares against
+          // the originally-collected answer, an edit that lands between the two
+          // in-lock checks would otherwise be laundered by re-basing here.
+          if (referencedTemplatesChanged(shownTemplateRevisions, referencedTemplateRevisions(core, freshSource))) {
+            void vscode.window.showErrorMessage(
+              `A device template applied by "${source.name}" changed while the sync preview was open — nothing was applied, run Sync Now again.`
+            );
+            return { kind: "abort" };
+          }
           const finalApplication = planToApplication(finalPlan, freshSource);
 
           // FINDING 1 — compare the post-teardown final recompute's rendered

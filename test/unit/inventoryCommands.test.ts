@@ -7676,6 +7676,106 @@ describe("inventoryCommands", () => {
       // The rename landed — the sync applied normally.
       expect(core.getServer("owned-1")?.name).toBe("renamed-sw");
     });
+
+    // MECHANISM 1 — TEMPLATE-REVISION TWIN OF GUARD SITE 3. The ~3818 early-out
+    // check runs BEFORE the awaited teardown loop / vault re-read; device-template
+    // saves do NOT take configMutationLock, so a value-only template edit can land
+    // in exactly that window, after the early check has already passed. This test
+    // drives the edit through the teardown callback (the same mid-await seam the
+    // ITEM 2 test uses) and asserts the FINAL-site recheck aborts before apply.
+    it("1b final-site — a referenced template edited to new VALUES DURING the teardown await window (after the early ~3818 check passed) ABORTS the apply at the final site; applyInventorySyncPlan is never called and nothing is written", async () => {
+      const updated = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, templated: { proxy: proxyAt("10.9.9.1") } },
+        proxy: proxyAt("10.9.9.1") // template-applied baseline A
+      });
+      const pruned = makeServer({
+        id: "owned-2",
+        name: "gone-sw",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([updated, pruned]));
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.1") } } });
+      const registry = new InventoryProviderRegistry();
+      // device:1 present + RENAMED -> update (reaches preview); device:2 absent -> prune "delete" -> teardown fires (the await window).
+      registry.register(makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+        }))
+      }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      // The seam: when the pruned server's runtime is torn down (an awaited hop
+      // AFTER the early ~3818 revision check has already passed), edit tmpl-1 IN
+      // PLACE to proxy B (host .2). Same field/mode → describePlanDetail stays
+      // byte-identical, so finalDrift cannot see it; only the final-site revision
+      // recheck can.
+      const teardown = {
+        teardownServerRuntime: vi.fn(async (serverId: string) => {
+          if (serverId === "owned-2") {
+            await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.2") } } });
+          }
+        })
+      };
+      registerInventoryCommands(core, registry, vault, teardown);
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete", templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply"); // no mid-PREVIEW edit — the early check passes
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Aborted at the final site: applyInventorySyncPlan never ran, so NOTHING
+      // was written — the rename did not land and the proxy stays A. Against
+      // d0c8fa1 the final recompute folds in proxy B (host .2) and applies it,
+      // and the pruned server is deleted.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.name).toBe("old-sw");
+      expect(core.getServer("owned-1")?.proxy).toEqual(proxyAt("10.9.9.1"));
+      expect(core.getServer("owned-2")).toBeDefined();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the sync preview was open"));
+    });
+
+    it("1b final-site sibling — no template edit during the teardown window applies as previewed (final-site guard not over-firing)", async () => {
+      const updated = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, templated: { proxy: proxyAt("10.9.9.1") } },
+        proxy: proxyAt("10.9.9.1")
+      });
+      const pruned = makeServer({
+        id: "owned-2",
+        name: "gone-sw",
+        host: "10.0.0.2",
+        origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([updated, pruned]));
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({ id: "tmpl-1", name: "T", fields: { proxy: { mode: "override", value: proxyAt("10.9.9.1") } } });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+        }))
+      }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown()); // teardown makes no edit
+      await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete", templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The sync applied normally: the rename landed and the pruned server is gone.
+      expect(applySpy).toHaveBeenCalledTimes(1);
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw");
+      expect(core.getServer("owned-2")).toBeUndefined();
+    });
   });
 
   describe("busy-marker refusals name the real holder", () => {
