@@ -519,13 +519,14 @@ describe("device template auth cascade — §4.4", () => {
   });
 });
 
-// -------- Fail-closed filtered-rule skip (§7.2) --------
+// -------- Filtered-rule skip LIFTS in PR-T2 (§7.2 rev11, fixture 19b sibling) --------
 
-describe("fail-closed filtered-rule skip — §7.2 rev11", () => {
-  it("Fixture 19b — a filtered rule (no matcher in T1) is SKIPPED, a catch-all rule applies, and exactly one warning names the filtered rule (kills treat-unparseable-as-catch-all)", () => {
-    // The filtered rule F would WIN proxy if wrongly treated as a catch-all (its
-    // id sorts first), and its value differs from the catch-all C's — so the
-    // outcome is visibly wrong under the bug.
+describe("PR-T2 lifts the fail-closed filtered-rule skip — §7.2 rev11 / fixture 19b", () => {
+  it("Fixture 19b (T2 sibling) — the filtered OVERRIDE rule F applies to MATCHING devices only, the catch-all C supplies the rest, and NO 'cannot evaluate' warning remains (kills a skip that outlives the matcher)", () => {
+    // F is an override proxy scoped to role=switch; C is a catch-all override
+    // proxy. Under the LIFTED skip: the switch matches F (spec 1 beats C's spec 0),
+    // the server does not match F so it takes C. Under a T1 skip the switch would
+    // wrongly take C too and a warning would fire — both asserted against here.
     const F = template({ proxy: { mode: "override", value: P_B } }, "tmpl-F", "F");
     const C = template({ proxy: { mode: "override", value: P_C } }, "tmpl-C", "C");
     const p = plan({
@@ -535,14 +536,265 @@ describe("fail-closed filtered-rule skip — §7.2 rev11", () => {
           { id: "zzz", templateId: "tmpl-C" }
         ]
       }),
-      devices: [makeDevice({ externalId: "device:new", name: "new-sw" })],
+      devices: [
+        makeDevice({ externalId: "device:sw", name: "sw-1", attributes: { role: ["switch"] } }),
+        makeDevice({ externalId: "device:srv", name: "srv-1", attributes: { role: ["server"] } })
+      ],
       servers: [],
       templates: [F, C]
     });
+    expect(p.adds.length).toBe(2);
+    const sw = p.adds.find((a) => a.name === "sw-1")!;
+    const srv = p.adds.find((a) => a.name === "srv-1")!;
+    expect(sw.proxy).toEqual(P_B); // F applied to the matching device
+    expect(srv.proxy).toEqual(P_C); // C supplied the non-matching one
+    // The skip is gone: no rule was held back for being un-evaluable.
+    expect(p.warnings.filter((w) => w.includes("cannot evaluate")).length).toBe(0);
+  });
+});
+
+// -------- Per-field cascade / filter / specificity (§3, fixtures 15–22b) --------
+
+describe("device template cascade — filter, specificity, per-field ties (§3)", () => {
+  it("Fixture 15 — owner acceptance: a broad role=switch rule (proxy+auth A) and a narrower role=switch&site=syd rule (auth B only) → auth from the narrow rule, proxy from the broad, both stamped (kills winner-takes-all-fields)", () => {
+    const broad = template({ proxy: { mode: "override", value: P_A }, authProfileId: { mode: "override", value: "A" } }, "tmpl-broad", "Broad");
+    const narrow = template({ authProfileId: { mode: "override", value: "B" } }, "tmpl-narrow", "Narrow");
+    const p = plan({
+      source: makeSource({
+        templateRules: [
+          { id: "r-broad", templateId: "tmpl-broad", filter: "role=switch" },
+          { id: "r-narrow", templateId: "tmpl-narrow", filter: "role=switch&site=syd" }
+        ]
+      }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1", attributes: { role: ["switch"], site: ["syd"] } })],
+      servers: [],
+      templates: [broad, narrow],
+      authProfiles: [authProfile("A"), authProfile("B")]
+    });
     expect(p.adds.length).toBe(1);
-    expect(p.adds[0].proxy).toEqual(P_C); // C applied; F skipped
-    const skipWarnings = p.warnings.filter((w) => w.includes("cannot evaluate") && w.includes("role=switch"));
-    expect(skipWarnings.length).toBe(1);
+    const add = p.adds[0];
+    // The narrow rule wins ONLY auth; the broad rule still supplies proxy. Auth is
+    // B (not A) — different profiles, or narrow-wins and broad-wins read identical.
+    expect(add.authProfileId).toBe("B");
+    expect(add.proxy).toEqual(P_A);
+    expect(add.origin?.syncedAuthProfileId).toBe("B"); // stamped independently
+    expect(add.origin?.templated?.proxy).toEqual(P_A);
+  });
+
+  it("Fixture 16 — a later sync flips ONLY the auth winner (device gains a rack matching a narrower rule) → auth rewritten, proxy value AND stamp untouched (kills re-deciding/re-stamping all fields when one flips)", () => {
+    const broad = template({ proxy: { mode: "override", value: P_A } }, "tmpl-broad", "Broad");
+    const narrow = template({ authProfileId: { mode: "override", value: "B" } }, "tmpl-narrow", "Narrow");
+    const narrower = template({ authProfileId: { mode: "override", value: "C" } }, "tmpl-narrower", "Narrower");
+    const p = plan({
+      source: makeSource({
+        templateRules: [
+          { id: "r-broad", templateId: "tmpl-broad", filter: "role=switch" },
+          { id: "r-narrow", templateId: "tmpl-narrow", filter: "role=switch&site=syd" },
+          { id: "r-narrower", templateId: "tmpl-narrower", filter: "role=switch&site=syd&rack=r1" }
+        ]
+      }),
+      // device now carries rack=r1, moving it into the narrower auth rule.
+      devices: [makeDevice({ attributes: { role: ["switch"], site: ["syd"], rack: ["r1"] } })],
+      servers: [ownedServer({ proxy: P_A, authProfileId: "B" }, { templated: { proxy: P_A }, syncedAuthProfileId: "B" })],
+      templates: [broad, narrow, narrower],
+      authProfiles: [authProfile("A"), authProfile("B"), authProfile("C")]
+    });
+    const after = afterFor(p, ownedServer().id)!;
+    expect(after.authProfileId).toBe("C"); // auth winner flipped B → C
+    expect(after.origin?.syncedAuthProfileId).toBe("C");
+    expect(after.proxy).toEqual(P_A); // proxy untouched
+    expect(after.origin?.templated?.proxy).toEqual(P_A); // and its stamp intact
+  });
+
+  it("Fixture 17 — a one-field (auth-only) narrow rule matches while the broad (proxy) rule does NOT → auth written, proxy NOT written (kills a matched rule dragging its template's absent fields in as defaults)", () => {
+    const broad = template({ proxy: { mode: "override", value: P_A } }, "tmpl-broad", "Broad");
+    const narrow = template({ authProfileId: { mode: "override", value: "B" } }, "tmpl-narrow", "Narrow");
+    const p = plan({
+      source: makeSource({
+        templateRules: [
+          { id: "r-broad", templateId: "tmpl-broad", filter: "role=router" }, // does NOT match a switch
+          { id: "r-narrow", templateId: "tmpl-narrow", filter: "role=switch&site=syd" }
+        ]
+      }),
+      devices: [makeDevice({ attributes: { role: ["switch"], site: ["syd"] } })],
+      servers: [],
+      templates: [broad, narrow],
+      authProfiles: [authProfile("B")]
+    });
+    expect(p.adds.length).toBe(1);
+    expect(p.adds[0].authProfileId).toBe("B");
+    expect(p.adds[0].proxy).toBeUndefined(); // the non-matching broad rule's proxy is not applied
+  });
+
+  it("Fixture 18 — specificity is order-independent: spec-2 wins proxy over spec-1 even when the spec-1 rule is stored FIRST (kills first-match / order-sensitive resolution)", () => {
+    const t1 = template({ proxy: { mode: "override", value: P_A } }, "tmpl-1", "T1");
+    const t2 = template({ proxy: { mode: "override", value: P_B } }, "tmpl-2", "T2");
+    const spec1 = { id: "r1", templateId: "tmpl-1", filter: "role=switch" };
+    const spec2 = { id: "r2", templateId: "tmpl-2", filter: "role=switch&site=syd" };
+    for (const order of [[spec1, spec2], [spec2, spec1]]) {
+      const p = plan({
+        source: makeSource({ templateRules: order }),
+        devices: [makeDevice({ attributes: { role: ["switch"], site: ["syd"] } })],
+        servers: [],
+        templates: [t1, t2]
+      });
+      expect(p.adds[0].proxy).toEqual(P_B); // the 2-key rule wins regardless of storage order
+    }
+  });
+
+  it("Fixture 19 — distinct-KEY counting: role=switch&role=router (1 key) loses to site=syd&tag=prod (2 keys) (kills counting conditions instead of distinct keys)", () => {
+    const tx = template({ proxy: { mode: "override", value: P_A } }, "tmpl-x", "X");
+    const ty = template({ proxy: { mode: "override", value: P_B } }, "tmpl-y", "Y");
+    const p = plan({
+      source: makeSource({
+        templateRules: [
+          { id: "rx", templateId: "tmpl-x", filter: "role=switch&role=router" }, // 1 key, 2 OR values
+          { id: "ry", templateId: "tmpl-y", filter: "site=syd&tag=prod" } // 2 keys
+        ]
+      }),
+      devices: [makeDevice({ attributes: { role: ["switch"], site: ["syd"], tags: ["prod"] } })],
+      servers: [],
+      templates: [tx, ty]
+    });
+    expect(p.adds[0].proxy).toEqual(P_B); // the genuinely 2-key rule wins
+  });
+
+  it("Fixture 20 — per-field tie: two spec-1 rules set proxy to DIFFERENT values → same normalized-lex winner in BOTH storage orders, one tie warning naming the field + both rules; a third field set by only one rule applies with NO tie warning (kills stored-order tiebreak, silent ties, per-rule ties)", () => {
+    const ta = template({ proxy: { mode: "override", value: P_A }, multiplexing: { mode: "override", value: true } }, "tmpl-a", "A");
+    const tb = template({ proxy: { mode: "override", value: P_B } }, "tmpl-b", "B");
+    const ra = { id: "ra", templateId: "tmpl-a", filter: "role=switch" };
+    const rb = { id: "rb", templateId: "tmpl-b", filter: "site=syd" };
+    for (const order of [[ra, rb], [rb, ra]]) {
+      const p = plan({
+        source: makeSource({ templateRules: order }),
+        devices: [makeDevice({ attributes: { role: ["switch"], site: ["syd"] } })],
+        servers: [],
+        templates: [ta, tb]
+      });
+      // "role=switch" normalizes before "site=syd", so it wins in either order.
+      expect(p.adds[0].proxy).toEqual(P_A);
+      const tie = p.warnings.filter((w) => w.includes("tie for Proxy"));
+      expect(tie.length).toBe(1);
+      expect(tie[0]).toContain("role=switch");
+      expect(tie[0]).toContain("site=syd");
+      // The third field (multiplexing) is set by only one rule → no tie there.
+      expect(p.adds[0].multiplexing).toBe(true);
+      expect(p.warnings.some((w) => w.includes("tie for Multiplexing"))).toBe(false);
+    }
+  });
+
+  it("Fixture 20b — tie-warning suppression (m9d): two tied rules supplying an IDENTICAL {mode, value} for the field → applied, NO tie warning (kills warning on unobservable ties)", () => {
+    const ta = template({ proxy: { mode: "override", value: P_A } }, "tmpl-a", "A");
+    const tb = template({ proxy: { mode: "override", value: P_A } }, "tmpl-b", "B"); // same value + mode
+    const p = plan({
+      source: makeSource({
+        templateRules: [
+          { id: "ra", templateId: "tmpl-a", filter: "role=switch" },
+          { id: "rb", templateId: "tmpl-b", filter: "site=syd" }
+        ]
+      }),
+      devices: [makeDevice({ attributes: { role: ["switch"], site: ["syd"] } })],
+      servers: [],
+      templates: [ta, tb]
+    });
+    expect(p.adds[0].proxy).toEqual(P_A);
+    expect(p.warnings.some((w) => w.includes("tie for Proxy"))).toBe(false);
+  });
+
+  it("Fixture 21 — attribute churn: a device whose role changed switch→server takes the server rule's override proxy over its sync-owned value (row 3); a sibling with a HAND-edited proxy keeps it (kills match-once-forever, and filter-beats-hand)", () => {
+    const tSw = template({ proxy: { mode: "override", value: P_A } }, "tmpl-sw", "SW");
+    const tSrv = template({ proxy: { mode: "override", value: P_B } }, "tmpl-srv", "SRV");
+    const src = makeSource({
+      templateRules: [
+        { id: "r-sw", templateId: "tmpl-sw", filter: "role=switch" },
+        { id: "r-srv", templateId: "tmpl-srv", filter: "role=server" }
+      ]
+    });
+    // sync-owned proxy P_A (stamp P_A); device is now role=server.
+    const churned = plan({
+      source: src,
+      devices: [makeDevice({ attributes: { role: ["server"] } })],
+      servers: [ownedServer({ proxy: P_A }, { templated: { proxy: P_A } })],
+      templates: [tSw, tSrv]
+    });
+    expect(afterFor(churned, ownedServer().id)!.proxy).toEqual(P_B); // rewritten to the new winner
+
+    // Sibling: hand-edited proxy (cur ≠ stamp) is kept — a filter change never beats a hand edit.
+    const handEdited = plan({
+      source: src,
+      devices: [makeDevice({ attributes: { role: ["server"] } })],
+      servers: [ownedServer({ proxy: P_C }, { templated: { proxy: P_A } })],
+      templates: [tSw, tSrv]
+    });
+    const handAfter = afterFor(handEdited, ownedServer().id);
+    expect((handAfter ?? ownedServer({ proxy: P_C })).proxy).toEqual(P_C);
+  });
+
+  it("§3.4 provenance — the plan carries a per-(field, rule) provenance line naming the count, field, template, and rule (kills a plan that applies templates with no provenance surface)", () => {
+    const t = template({ proxy: { mode: "override", value: P_A } }, "tmpl-sw", "Switch defaults");
+    const p = plan({
+      source: makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-sw", filter: "role=switch" }] }),
+      devices: [makeDevice({ attributes: { role: ["switch"] } })],
+      servers: [],
+      templates: [t]
+    });
+    expect(p.warnings).toContain('1 server: Proxy ← "Switch defaults" (rule role=switch)');
+  });
+
+  it("§3.4 provenance (Codex round 2 #3) — two DISTINCT provenance signatures whose `templateName`/`ruleFilter` collide under the old `::`/`|` join stay on SEPARATE lines with correct per-signature counts (kills the ambiguous key that merged server counts and mis-attributed writes)", () => {
+    // The collision: template `A::name=x` + filter `name=y` and template `A` +
+    // filter `name=x::name=y` both flatten to `proxy=A::name=x::name=y` under the
+    // former `${name}::${filter}` join, combining into one "2 servers" line naming a
+    // single (wrong) template. An unambiguous serialization keeps them distinct.
+    const tA1 = template({ proxy: { mode: "override", value: P_A } }, "t-a1", "A::name=x");
+    const tA = template({ proxy: { mode: "override", value: P_A } }, "t-a", "A");
+    const p = plan({
+      source: makeSource({
+        templateRules: [
+          { id: "r1", templateId: "t-a1", filter: "name=y" },
+          { id: "r2", templateId: "t-a", filter: "name=x::name=y" }
+        ]
+      }),
+      devices: [
+        makeDevice({ externalId: "device:1", name: "y" }),
+        makeDevice({ externalId: "device:2", name: "x::name=y" })
+      ],
+      servers: [],
+      templates: [tA1, tA]
+    });
+    // Two separate lines, each attributing ONE server to its own (template, rule).
+    expect(p.warnings).toContain('1 server: Proxy ← "A::name=x" (rule name=y)');
+    expect(p.warnings).toContain('1 server: Proxy ← "A" (rule name=x::name=y)');
+    // No combined line collapsing the two distinct signatures into one count.
+    expect(p.warnings.some((w) => w.startsWith("2 servers: Proxy"))).toBe(false);
+  });
+
+  it("§3.4 provenance — servers with a GENUINELY IDENTICAL signature still aggregate to one line (the unambiguous key must not over-split)", () => {
+    const t = template({ proxy: { mode: "override", value: P_A } }, "tmpl-sw", "Switch defaults");
+    const p = plan({
+      source: makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-sw", filter: "role=switch" }] }),
+      devices: [
+        makeDevice({ externalId: "device:1", name: "sw-1", attributes: { role: ["switch"] } }),
+        makeDevice({ externalId: "device:2", name: "sw-2", attributes: { role: ["switch"] } })
+      ],
+      servers: [],
+      templates: [t]
+    });
+    expect(p.warnings).toContain('2 servers: Proxy ← "Switch defaults" (rule role=switch)');
+  });
+
+  it("Fixture 22b — zero-match info: a rule that matches no device this fetch produces exactly one plan info line naming the rule and source (kills silent dead rules)", () => {
+    const t = template({ proxy: { mode: "override", value: P_A } }, "tmpl-1", "T");
+    const p = plan({
+      source: makeSource({ templateRules: [{ id: "r-fw", templateId: "tmpl-1", filter: "role=firewall" }] }),
+      devices: [makeDevice({ attributes: { role: ["switch"] } })], // no firewall in the tree
+      servers: [],
+      templates: [t]
+    });
+    const info = p.warnings.filter((w) => w === 'Rule "role=firewall" on "NetBox" matched no devices this sync.');
+    expect(info.length).toBe(1);
+    // The rule applied to nothing, so the switch is added with no template proxy.
+    expect(p.adds[0].proxy).toBeUndefined();
   });
 });
 
@@ -1616,5 +1868,173 @@ describe("clearTemplatedStamps — §5.1 (manual path helper; not wired in T1)",
 
   it("is a no-op on a server with no origin", () => {
     expect(clearTemplatedStamps(undefined, ["proxy"])).toBeUndefined();
+  });
+});
+
+// -------- PR-T2 review B1 — the survivor pass validates FILTERED-rule proxies too --------
+
+describe("PR-T2 review B1 — the jump-host survivor pass owns every WRITTEN template proxy, filtered rules included", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const S_ID = deterministicServerId("source-1", "device:1");
+  const A_JUMP_ID = deterministicServerId("source-1", "device:ajump-unused"); // plain survivor, never a device this run
+  const B_JUMP_ID = deterministicServerId("source-1", "device:bjump"); // owned, device absent → delete-pruned
+  const survivorJump = (): ServerConfig => ({
+    id: A_JUMP_ID,
+    name: "a-jump",
+    host: "10.0.0.8",
+    port: 22,
+    username: "admin",
+    authType: "agent",
+    isHidden: false
+  });
+  const danglingJump = (): ServerConfig => ownedServer({ id: B_JUMP_ID }, { externalId: "device:bjump" });
+  const swRule = { id: "r-sw", templateId: "tmpl-sw", filter: "role=switch" };
+
+  it("Fixture 60 — PROBE B (update, RESTORE): a FILTERED role=switch OVERRIDE moves S's working template-owned proxy A→B, B is delete-pruned this run → A is RESTORED (+ stamp A), NOT dropped; one survivor warning (kills the baseline-only part 1 — 9ed743c lets a filtered proxy fall to part 2's destructive DROP, stripping A fleet-wide)", () => {
+    const s = ownedServer({ proxy: sshProxy(A_JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(A_JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [swRule] }),
+      devices: [makeDevice({ attributes: { role: ["switch"] } })], // device:1 → S (role switch); device:bjump absent → B pruned
+      servers: [s, survivorJump(), danglingJump()],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) }, multiplexing: { mode: "fill", value: true } }, "tmpl-sw", "SW")]
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    const after = afterFor(p, S_ID)!;
+    expect(after.proxy).toEqual(sshProxy(A_JUMP_ID)); // RESTORED — not dropped to absent
+    expect(after.origin?.templated?.proxy).toEqual(sshProxy(A_JUMP_ID)); // stamp follows the restored value
+    expect(after.multiplexing).toBe(true); // the sibling write still landed
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 61 — PROBE D (add, DROP + WARN): a FILTERED role=switch add ships proxy → B where B is delete-pruned → proxy DROPPED to absent + stamp cleared + one survivor warning at plan time (kills the false adds exemption — 9ed743c ships a dangling stamped proxy with NO warning)", () => {
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [swRule] }),
+      devices: [makeDevice({ attributes: { role: ["switch"] } })], // device:1 → fresh add; device:bjump absent → B pruned
+      servers: [danglingJump()],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) } }, "tmpl-sw", "SW")]
+    });
+    const added = p.adds.find((a) => a.origin?.externalId === "device:1")!;
+    expect(added.proxy).toBeUndefined(); // dropped to absent
+    expect("proxy" in added).toBe(false); // never a written undefined
+    expect(added.origin?.templated?.proxy).toBeUndefined(); // stamp cleared with it
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 62 — CONTROL: the same FILTERED add where B SURVIVES (its device is present) → proxy is written and kept, no survivor warning (guards against an over-broad drop of a filtered proxy)", () => {
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [swRule] }),
+      devices: [
+        makeDevice({ attributes: { role: ["switch"] } }),
+        makeDevice({ externalId: "device:bjump", name: "b-jump", endpoints: [{ kind: "ssh", host: "10.0.0.9" }] }) // fresh add → survivor
+      ],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) } }, "tmpl-sw", "SW")]
+    });
+    const added = p.adds.find((a) => a.origin?.externalId === "device:1")!;
+    expect(added.proxy).toEqual(sshProxy(B_JUMP_ID)); // written — jump host survives
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
+  });
+});
+
+// -------- PR-T2 review B2 — §3.4 provenance gated on WRITES, not cascade winners --------
+
+describe("PR-T2 review B2 — provenance reports what the matrix WROTE, never a winner it did not apply", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const S_ID = deterministicServerId("source-1", "device:1");
+  const swRule = { id: "r-sw", templateId: "tmpl-sw", filter: "role=switch" };
+  const provLines = (p: InventorySyncPlan): string[] => p.warnings.filter((w) => /^\d+ server/.test(w));
+
+  it("Fixture 63 — PROBE A (row-6 hand-edit): a HAND-EDITED proxy the override leaves untouched produces NO `Proxy ←` line, though a sibling write DOES get its line (kills provenance-on-winners — 9ed743c prints `Proxy ←` for a value it never applied, contradicting §7.3's 'kept hand-configured')", () => {
+    // cur P_C ≠ stamp P_A → row 6 leave; mux fill true IS a genuine write → an update exists.
+    const s = ownedServer({ proxy: P_C, multiplexing: undefined }, { externalId: "device:1", templated: { proxy: P_A } });
+    const p = plan({
+      source: makeSource({ templateRules: [swRule] }),
+      devices: [makeDevice({ attributes: { role: ["switch"] } })],
+      servers: [s],
+      templates: [template({ proxy: { mode: "override", value: P_B }, multiplexing: { mode: "fill", value: true } }, "tmpl-sw", "SW")]
+    });
+    const after = afterFor(p, S_ID)!;
+    expect(after.proxy).toEqual(P_C); // hand proxy kept (row 6)
+    expect(after.multiplexing).toBe(true); // the genuine write
+    expect(provLines(p).some((w) => w.includes("Proxy ←"))).toBe(false); // NO proxy line
+    expect(provLines(p).some((w) => w.includes("Multiplexing ←"))).toBe(true); // the written field IS reported
+  });
+
+  it("Fixture 64 — PROBE C (dropped dangling winner): a catch-all OVERRIDE moves proxy A→B, B is delete-pruned → part 1 restores A AND the server's `Proxy ←` line is stripped, so the plan never both says 'not applied' and prints `Proxy ←` for the same field (kills the report contradicting the plan)", () => {
+    const A_JUMP_ID = deterministicServerId("source-1", "device:ajump-unused");
+    const B_JUMP_ID = deterministicServerId("source-1", "device:bjump");
+    const survivorJump: ServerConfig = { id: A_JUMP_ID, name: "a-jump", host: "10.0.0.8", port: 22, username: "admin", authType: "agent", isHidden: false };
+    const danglingJump = ownedServer({ id: B_JUMP_ID }, { externalId: "device:bjump" });
+    const s = ownedServer({ proxy: sshProxy(A_JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(A_JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-sw")] }),
+      devices: [makeDevice()],
+      servers: [s, survivorJump, danglingJump],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) }, multiplexing: { mode: "fill", value: true } }, "tmpl-sw", "SW")]
+    });
+    const after = afterFor(p, S_ID)!;
+    expect(after.proxy).toEqual(sshProxy(A_JUMP_ID)); // restored
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1); // the "not applied" warning
+    expect(provLines(p).some((w) => w.includes("Proxy ←"))).toBe(false); // ...and NO contradicting proxy provenance line
+    expect(provLines(p).some((w) => w.includes("Multiplexing ←"))).toBe(true); // the genuinely-written sibling still reported
+  });
+
+  it("Fixture 65 — GENUINE WRITE still reported: a filtered override proxy that IS applied keeps its `Proxy ←` line (guards the gate did not swallow real writes)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [swRule] }),
+      devices: [makeDevice({ attributes: { role: ["switch"] } })],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: P_A } }, "tmpl-sw", "Switch defaults")]
+    });
+    expect(p.adds[0].proxy).toEqual(P_A);
+    expect(p.warnings).toContain('1 server: Proxy ← "Switch defaults" (rule role=switch)');
+  });
+});
+
+// -------- PR-T2 review M1/M2 — zero-match honesty + source-level dangling warning floor --------
+
+describe("PR-T2 review M1 — a rule matching only unsyncable devices is not a false zero-match", () => {
+  it("M1 — a rule that matches a device PRESENT but SKIPPED (no SSH endpoint) is NOT reported as matching zero devices (kills the spurious typo alarm — 9ed743c evaluates the cascade only for syncable devices)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [{ id: "r-sw", templateId: "tmpl-1", filter: "role=switch" }] }),
+      devices: [makeDevice({ externalId: "device:pdu", name: "pdu-1", endpoints: [], attributes: { role: ["switch"] } })],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: P_A } })]
+    });
+    expect(p.warnings.some((w) => w.includes("matched no devices this sync"))).toBe(false);
+  });
+
+  it("M1 — a genuinely dead filter (matches NO present device) still gets its zero-match info (guards the fix did not silence real dead rules)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [{ id: "r-fw", templateId: "tmpl-1", filter: "role=firewall" }] }),
+      devices: [makeDevice({ attributes: { role: ["switch"] } })],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: P_A } })]
+    });
+    expect(p.warnings.filter((w) => w === 'Rule "role=firewall" on "NetBox" matched no devices this sync.').length).toBe(1);
+  });
+});
+
+describe("PR-T2 review M2 — a source-level dangling reference warns even with zero syncable devices", () => {
+  it("M2 — a catch-all template's DANGLING jump host warns once even when the fetch is EMPTY (kills the warning lost when the per-device path never runs — 9ed743c discards the baseline warnings)", () => {
+    const DEAD = deterministicServerId("source-1", "device:nonexist"); // never a live server / device
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [], // nothing syncable → the per-device dangling path never runs
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: { type: "ssh", jumpHostId: DEAD } } })]
+    });
+    expect(p.warnings.filter((w) => w.includes("jump host no longer exists")).length).toBe(1);
+  });
+
+  it("M2 — with syncable devices the dangling warning is NOT double-emitted (per-device + baseline dedupe to one)", () => {
+    const DEAD = deterministicServerId("source-1", "device:nonexist");
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice(), makeDevice({ externalId: "device:2", name: "sw-2", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: { type: "ssh", jumpHostId: DEAD } } })]
+    });
+    expect(p.warnings.filter((w) => w.includes("jump host no longer exists")).length).toBe(1);
   });
 });

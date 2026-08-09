@@ -1,6 +1,6 @@
 import type { AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../models/config";
 import { authProfileNeedsServerKeyPath } from "../../models/config";
-import type { InventorySourceConfig, TemplateRule } from "../../models/inventory";
+import type { InventoryDevice, InventorySourceConfig, TemplateRule } from "../../models/inventory";
 import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "../../models/deviceTemplate";
 
 /**
@@ -102,13 +102,209 @@ export function isCatchAllFilter(filter: string | undefined): boolean {
 }
 
 /**
- * Distinct-key count of a filter — the specificity used to rank cascade
- * candidates (§3.1). PR-T1 STUB: only catch-all (0) is meaningful because
- * filtered rules are skipped before they are ever ranked; the real distinct-key
- * parser lands in PR-T2 with the matcher.
+ * DEVICE TEMPLATES (issue #48 PR-T2, §2.3) — a filter parsed into the normalized
+ * structure the matcher, specificity, and per-field tie-break all consume.
+ *
+ * `conditions`: attribute key → OR-set of values. Keys are case-folded to
+ * lowercase (m9a) and `tag` is aliased to `tags` (m10, declared ONCE here);
+ * values are trimmed + lowercased (§2.3 case-insensitive comparison). A repeated
+ * key OR-broadens (`role=switch&role=router`); distinct keys AND. The reserved
+ * `name` key's values are `*` globs, not attribute values.
  */
+export interface ParsedFilter {
+  conditions: Map<string, Set<string>>;
+  /** Distinct-key count (§3.1): repeated values on one key count once; a bare `name=*` counts 0 (m9b). */
+  specificity: number;
+  /** Tie-break key (§3.3): keys sorted, values sorted within key, lowercased. Empty for a catch-all. */
+  normalized: string;
+  /** Keys carrying an empty value (`role=`) — a dead condition refused at save (§2.3 m9c). */
+  emptyValueKeys: string[];
+}
+
+/** A `name` OR-set matches every device when one of its globs is a bare `*` (m9b). */
+function nameMatchesEverything(values: Set<string>): boolean {
+  for (const v of values) {
+    if (v === "*") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * §2.3 — parse a rule filter into {@link ParsedFilter}. `new URLSearchParams`,
+ * case-fold keys (m9a), alias `tag`→`tags` (m10), OR within a repeated key, AND
+ * across distinct keys. Empty-valued conditions are surfaced in `emptyValueKeys`
+ * for the save layer to reject rather than silently stored. A bare `name=*` (or
+ * any filter with zero effective conditions) is catch-all / zero specificity.
+ */
+export function parseTemplateFilter(filter: string | undefined): ParsedFilter {
+  const conditions = new Map<string, Set<string>>();
+  const emptyValueKeys = new Set<string>();
+  const params = new URLSearchParams(filter ?? "");
+  for (const [rawKey, rawValue] of params) {
+    let key = rawKey.trim().toLowerCase(); // m9a — case-fold BEFORE distinct-key counting / lookup
+    if (key === "") {
+      continue;
+    }
+    if (key === "tag") {
+      key = "tags"; // m10 — the filter key is `tag`; the attribute is `tags`. Aliased once, here.
+    }
+    const value = rawValue.trim().toLowerCase(); // §2.3 — comparison is case-insensitive + trimmed
+    if (value === "") {
+      emptyValueKeys.add(key); // §2.3 m9c — a condition that can never match; refused at save
+      continue;
+    }
+    let set = conditions.get(key);
+    if (set === undefined) {
+      set = new Set<string>();
+      conditions.set(key, set);
+    }
+    set.add(value);
+  }
+  let specificity = 0;
+  for (const [key, values] of conditions) {
+    if (key === "name" && nameMatchesEverything(values)) {
+      continue; // m9b — a match-everything glob constrains nothing
+    }
+    specificity++;
+  }
+  // Tie-break key (§3.3): a purely internal comparison string, never shown. Values
+  // are `encodeURIComponent`-escaped before joining on "," so a value containing a
+  // literal comma can't collide with two distinct values (Codex round 1 #3):
+  // `role=a%2Cb` (one value "a,b") and `role=a&role=b` (values "a","b") must NOT
+  // normalize alike, or a genuine per-field tie between them is silently suppressed.
+  // encodeURIComponent escapes the comma to %2C, so only genuinely identical filters
+  // collide. Key is encoded too (for safety); sort AFTER encode, kept deterministic.
+  const normalized = [...conditions.keys()]
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}=${[...conditions.get(k)!].map(encodeURIComponent).sort().join(",")}`)
+    .join("&");
+  return { conditions, specificity, normalized, emptyValueKeys: [...emptyValueKeys] };
+}
+
+/** Distinct-key count of a filter string — §3.1 specificity, via {@link parseTemplateFilter}. */
 export function filterSpecificity(filter: string | undefined): number {
-  return isCatchAllFilter(filter) ? 0 : 0;
+  return parseTemplateFilter(filter).specificity;
+}
+
+/**
+ * §2.2/§2.3 — a `name` glob: an ANCHORED regex built by escaping everything
+ * except `*` (positive construction — no user regex reaches `RegExp`). Matching
+ * is case-insensitive to match the value comparison rule.
+ */
+function nameGlobMatches(name: string, glob: string): boolean {
+  const pattern = "^" + glob.replace(/[.*+?^${}()|[\]\\]/g, (c) => (c === "*" ? ".*" : "\\" + c)) + "$";
+  return new RegExp(pattern, "i").test(name);
+}
+
+/**
+ * Case-insensitive attribute lookup fallback for {@link deviceMatchesFilter}: scan
+ * the device's attribute keys for one whose lowercased form equals the (already
+ * lowercased) filter `key`. Only reached when a direct hit misses, so the common
+ * lowercase-key provider never scans. Returns the first case-insensitive match.
+ */
+function lookupAttributeCaseInsensitive(
+  attributes: Record<string, string | string[]> | undefined,
+  key: string
+): string | string[] | undefined {
+  if (attributes === undefined) {
+    return undefined;
+  }
+  for (const attrKey of Object.keys(attributes)) {
+    if (attrKey.toLowerCase() === key) {
+      return attributes[attrKey];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * §2.3 — does a device match a parsed filter? AND across distinct keys, OR within
+ * a key. The reserved `name` key globs `device.name`; every other key looks up
+ * `device.attributes[key]` (string OR string[], set-valued matches if ANY element
+ * matches — which gives name-OR-slug for free, §2.2). A key the device has no
+ * attribute for fails the condition (the rule does not match). An empty-valued
+ * condition can never match, so it fails closed. A filter with zero conditions
+ * (catch-all, or a bare `name=*`) matches every device.
+ */
+export function deviceMatchesFilter(device: Pick<InventoryDevice, "name" | "attributes">, parsed: ParsedFilter): boolean {
+  if (parsed.emptyValueKeys.length > 0) {
+    return false; // §2.3 m9c — a dead condition slipped past save (import/rollback); never match
+  }
+  for (const [key, values] of parsed.conditions) {
+    if (key === "name") {
+      if (![...values].some((glob) => nameGlobMatches(device.name, glob))) {
+        return false;
+      }
+      continue;
+    }
+    // §2.3 — filter keys are lowercased at parse (m9a), but a third-party
+    // provider may emit a mixed-case attribute key (`Role`) that `unknownFilterKeys`
+    // accepted case-insensitively. Look the attribute up case-insensitively too so
+    // it actually matches (Codex round 1 #2). NetBox already emits lowercase, so a
+    // direct hit short-circuits the scan; only mixed-case providers pay for it.
+    // Codex round 2 #1 — the direct lookup must be OWN-property-only: a rule key that
+    // collides with an `Object.prototype` member (`constructor`, `__proto__`,
+    // `toString`, …) would otherwise read the inherited function/object, and the
+    // `.trim()` below would throw and abort the WHOLE sync. Unknown keys are
+    // non-blocking (§2.2), so a non-own key must fail the condition, not crash. The
+    // case-insensitive fallback already scans own keys only (`Object.keys`).
+    const direct =
+      device.attributes !== undefined && Object.hasOwn(device.attributes, key) ? device.attributes[key] : undefined;
+    const attr = direct ?? lookupAttributeCaseInsensitive(device.attributes, key);
+    if (attr === undefined) {
+      return false; // §2.3 — no attribute for this key ⇒ condition fails
+    }
+    const attrValues = (Array.isArray(attr) ? attr : [attr]).map((a) => a.trim().toLowerCase());
+    if (![...values].some((v) => attrValues.includes(v))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** A filter's human label for warnings/UI: the raw filter, or "(all devices)" for a catch-all. */
+export function filterLabel(filter: string | undefined): string {
+  return filter !== undefined && filter.trim() !== "" ? filter : "(all devices)";
+}
+
+/**
+ * §7.2 (UX-S2) — the live Info-severity description of a filter for the rule
+ * InputBox: "role is 'switch' AND site is 'syd'". OR within a key reads "or".
+ * Keys sorted for determinism. Empty for a catch-all / zero-condition filter.
+ */
+export function describeFilterConditions(parsed: ParsedFilter): string {
+  const parts: string[] = [];
+  for (const key of [...parsed.conditions.keys()].sort()) {
+    const values = [...parsed.conditions.get(key)!].sort();
+    // P1 (PR-T2 review) — un-alias the internal `tags` attribute back to the `tag`
+    // filter key the prompt teaches and the user typed, so the description matches
+    // the input dialect (m10: the filter key is `tag`, the attribute is `tags`).
+    const displayKey = key === "tags" ? "tag" : key;
+    parts.push(`${displayKey} is ${values.map((v) => `'${v}'`).join(" or ")}`);
+  }
+  return parts.join(" AND ");
+}
+
+/**
+ * §2.2 — the filter keys used by a filter that are NOT in the provider's declared
+ * `attributeKeys` (case-insensitive). `name` is always known (provider-agnostic).
+ * A provider that declares no list yields no unknown keys (nothing to check).
+ */
+export function unknownFilterKeys(parsed: ParsedFilter, attributeKeys: readonly string[] | undefined): string[] {
+  if (attributeKeys === undefined) {
+    return [];
+  }
+  const known = new Set(attributeKeys.map((k) => (k.trim().toLowerCase() === "tag" ? "tags" : k.trim().toLowerCase())));
+  known.add("name");
+  const unknown: string[] = [];
+  for (const key of parsed.conditions.keys()) {
+    if (!known.has(key)) {
+      unknown.push(key);
+    }
+  }
+  return unknown;
 }
 
 /** The per-field winners of the cascade — the {mode, value} each field resolves to. */
@@ -120,11 +316,20 @@ export interface CascadeWinners {
   logSession?: TemplateField<boolean>;
 }
 
+/** §3.4 — where one field's applied value came from, for the plan-report provenance lines. */
+export interface FieldProvenance {
+  templateName: string;
+  /** The winning rule's raw filter; undefined for a catch-all rule or the implicit source rule. */
+  ruleFilter?: string;
+  /** True when the value came from the implicit source-level auth rule (§4.2), not an explicit rule. */
+  implicit: boolean;
+}
+
 export interface CascadeResult {
   winners: CascadeWinners;
   /** True when `winners.authProfileId` came from the IMPLICIT source-level rule (§4.2), not an explicit rule. */
   authFromImplicit: boolean;
-  /** Filtered-rule-skip (fail-closed) and dangling-template warnings, once per rule. */
+  /** Per-field tie warnings (§3.3.2), device-named — the AUTHORITATIVE tie signal. */
   warnings: string[];
   /**
    * The NAME of the template that supplied `winners.proxy`, so the §5.3 proxy
@@ -134,93 +339,155 @@ export interface CascadeResult {
    * ONLY for the plan warning — it never reaches storage.
    */
   proxyTemplateName?: string;
+  /** Rule ids whose filter MATCHED this device (candidates) — for the zero-match info (§2.3). */
+  matchedRuleIds: string[];
+  /** §3.4 — per applied field, which rule/template supplied it. Report-only, never persisted. */
+  provenance: Partial<Record<TemplatableField, FieldProvenance>>;
+}
+
+/** A rule with its template resolved and filter pre-parsed — device-independent, so prepared ONCE. */
+export interface PreparedRule {
+  rule: TemplateRule;
+  template: DeviceTemplateProfile;
+  parsed: ParsedFilter;
+  /** `isCatchAllFilter(rule.filter)` — a catch-all is a candidate for EVERY device without a match test. */
+  isCatchAll: boolean;
+}
+
+export interface PrepareRulesResult {
+  prepared: PreparedRule[];
+  /** Dangling-template warnings (once per rule, device-independent). */
+  warnings: string[];
 }
 
 /**
- * The per-field cascade (§3.2) — the ONLY resolution algorithm from day one.
- *
- * PR-T1 is DEGENERATE ON FILTERS. With no matcher, a filtered rule cannot be
- * evaluated, so it is SKIPPED (fail-closed, §7.2) rather than treated as a
- * catch-all — treating an un-evaluable `role=switch` rule as "matches every
- * device" would silently apply it fleet-wide, the exact privilege-escalation
- * shape fail-closed exists to prevent. Only catch-all rules (filter
- * absent/empty/whitespace) participate, plus the implicit source-level auth rule
- * at specificity −1. Because every catch-all matches every device, the winners
- * are DEVICE-INDEPENDENT in T1, so the engine resolves them ONCE per source.
- *
- * PR-T2 adds the `device` argument and `deviceMatchesFilter`, at which point
- * candidacy becomes per-device and filtered rules start applying (their skip
- * warning lifts). The cascade's shape here does not change — only which rules
- * are candidates — because stamps record VALUES, never which rule wrote them
- * (§1.3), so nothing below the composition step can see which rule won a field.
- *
- * Tie-break among catch-all candidates for one field is deterministic — all
- * catch-alls normalize to the empty filter, so the tie resolves on rule `id`
- * lexicographic order (§3.3's final resort). Per-field TIE WARNINGS are PR-T2
- * (they need the general matcher's specificity), so none are emitted here.
+ * §5.1 — resolve each rule's template and pre-parse its filter, ONCE per source
+ * (device-independent). A rule whose `templateId` resolves to nothing is dropped
+ * with a warning (AUTH 1's degrade-don't-abort posture). PR-T2: there is NO
+ * filtered-rule fail-closed skip here — the matcher exists now, so filtered rules
+ * are kept and evaluated per device by {@link selectFieldWinners}. (The skip
+ * `selectFieldWinners` used to carry, §7.2 rev11, has LIFTED.)
  */
-export function selectFieldWinners(
+export function prepareTemplateRules(
   rules: readonly TemplateRule[],
-  implicitAuthProfileId: string | undefined,
   templatesById: Map<string, DeviceTemplateProfile> | undefined,
   sourceName: string
-): CascadeResult {
+): PrepareRulesResult {
+  const prepared: PreparedRule[] = [];
   const warnings: string[] = [];
-  const resolved: Array<{ rule: TemplateRule; template: DeviceTemplateProfile }> = [];
   for (const rule of rules) {
-    if (!isCatchAllFilter(rule.filter)) {
-      // FAIL CLOSED (§7.2 rev11) — the matcher is PR-T2, so a build that
-      // receives a filtered rule (by import or rollback) skips it with a plan
-      // warning rather than acting on scope it cannot establish.
-      warnings.push(
-        `Rule "${rule.filter}" on "${sourceName}" uses a device filter this version cannot evaluate — the rule was skipped and none of its settings were applied. Update Nexus to use filtered rules.`
-      );
-      continue;
-    }
     const template = templatesById?.get(rule.templateId);
     if (template === undefined) {
-      // Degrade, don't abort (AUTH 1's posture) — a rule whose template no
-      // longer resolves is skipped, its siblings proceed.
       warnings.push(`A device template rule on "${sourceName}" references a template that no longer exists — the rule was skipped.`);
       continue;
     }
-    resolved.push({ rule, template });
+    prepared.push({ rule, template, parsed: parseTemplateFilter(rule.filter), isCatchAll: isCatchAllFilter(rule.filter) });
   }
+  return { prepared, warnings };
+}
 
-  // All catch-alls tie on specificity (0); break by rule id so the winner is
-  // order-free and stable across reorder / backup round-trips (§3.3).
-  const ordered = [...resolved].sort((a, b) => (a.rule.id < b.rule.id ? -1 : a.rule.id > b.rule.id ? 1 : 0));
+/**
+ * The per-field cascade (§3.2) for ONE device — the ONLY resolution algorithm.
+ *
+ * PR-T2: candidacy is PER DEVICE. A rule is a candidate iff it is a catch-all OR
+ * its filter matches this device (`deviceMatchesFilter`). For each templatable
+ * field INDEPENDENTLY, among the candidates whose template SETS that field, the
+ * winner is the highest specificity (§3.1); a per-field TIE (equal specificity,
+ * DISTINCT filters) is broken by normalized-filter lexicographic order then rule
+ * `id` (§3.3), and a warning fires unless every tied candidate supplies an
+ * identical `{mode, value}` for the field (m9d — an unobservable tie). The
+ * implicit source-level auth rule enters at specificity −1, below every explicit
+ * rule (§4.2). Per-field independence means a one-field rule never suppresses the
+ * other fields a broader rule sets — the owner's driving scenario.
+ *
+ * Stamps record VALUES, never which rule wrote them (§1.3), so nothing below the
+ * composition step sees which rule won a field — the matrix rides the cascade
+ * untouched. `provenance` and `matchedRuleIds` are report-only, never persisted.
+ */
+export function selectFieldWinners(
+  device: Pick<InventoryDevice, "name" | "attributes">,
+  prepared: readonly PreparedRule[],
+  implicitAuthProfileId: string | undefined
+): CascadeResult {
+  const warnings: string[] = [];
+  const matchedRuleIds: string[] = [];
+  const candidates: PreparedRule[] = [];
+  for (const p of prepared) {
+    if (p.isCatchAll || deviceMatchesFilter(device, p.parsed)) {
+      candidates.push(p);
+      matchedRuleIds.push(p.rule.id);
+    }
+  }
 
   const winners: CascadeWinners = {};
-  const firstSetter = <T>(pick: (t: DeviceTemplateProfile) => TemplateField<T> | undefined): TemplateField<T> | undefined => {
-    for (const { template } of ordered) {
-      const field = pick(template);
-      if (field !== undefined) {
-        return field;
-      }
-    }
-    return undefined;
-  };
-  // Proxy resolves like the other non-auth fields, but additionally captures the
-  // winning template's NAME for the §5.3 reference-validation warnings — the
-  // scalar `firstSetter` cannot return it, so proxy uses the template-aware loop.
-  let proxyTemplateName: string | undefined;
-  for (const { template } of ordered) {
-    const field = template.fields.proxy;
-    if (field !== undefined) {
-      winners.proxy = field;
-      proxyTemplateName = template.name;
-      break;
-    }
-  }
-  winners.multiplexing = firstSetter((t) => t.fields.multiplexing);
-  winners.legacyAlgorithms = firstSetter((t) => t.fields.legacyAlgorithms);
-  winners.logSession = firstSetter((t) => t.fields.logSession);
+  const provenance: Partial<Record<TemplatableField, FieldProvenance>> = {};
 
-  const explicitAuth = firstSetter((t) => t.fields.authProfileId);
+  const resolveField = <T>(
+    fieldKey: Exclude<TemplatableField, "authProfileId"> | "authProfileId",
+    pick: (t: DeviceTemplateProfile) => TemplateField<T> | undefined,
+    valuesEqual: (a: T, b: T) => boolean
+  ): { field: TemplateField<T>; templateName: string } | undefined => {
+    const setters = candidates.filter((c) => pick(c.template) !== undefined);
+    if (setters.length === 0) {
+      return undefined;
+    }
+    // Winner: highest specificity, then normalized-filter lex, then rule id — all
+    // order-free and stable across reorder / backup round-trips (§3.3).
+    const sorted = [...setters].sort((a, b) => {
+      if (a.parsed.specificity !== b.parsed.specificity) {
+        return b.parsed.specificity - a.parsed.specificity;
+      }
+      if (a.parsed.normalized !== b.parsed.normalized) {
+        return a.parsed.normalized < b.parsed.normalized ? -1 : 1;
+      }
+      return a.rule.id < b.rule.id ? -1 : a.rule.id > b.rule.id ? 1 : 0;
+    });
+    const winner = sorted[0];
+    const winField = pick(winner.template)!;
+    // §3.3.2 tie warning: among the SAME top-specificity setters with a DISTINCT
+    // normalized filter, if any disagrees on {mode,value} the tie is observable.
+    // m9d suppresses it when every tied candidate supplies an identical outcome
+    // (a same-filter duplicate — identical `normalized` — is the redundant case
+    // the save-time warning covers, and is deliberately excluded here).
+    const disagreeing = sorted.find(
+      (c) =>
+        c !== winner &&
+        c.parsed.specificity === winner.parsed.specificity &&
+        c.parsed.normalized !== winner.parsed.normalized &&
+        !(pick(c.template)!.mode === winField.mode && valuesEqual(pick(c.template)!.value, winField.value))
+    );
+    if (disagreeing !== undefined) {
+      warnings.push(
+        `Device "${device.name}": rules "${filterLabel(winner.rule.filter)}" and "${filterLabel(disagreeing.rule.filter)}" tie for ${TEMPLATE_FIELD_SHORT_LABELS[fieldKey]}; applied "${filterLabel(winner.rule.filter)}" (rule order is not used — make one rule more specific to choose deliberately).`
+      );
+    }
+    provenance[fieldKey] = { templateName: winner.template.name, ruleFilter: winner.rule.filter, implicit: false };
+    return { field: winField, templateName: winner.template.name };
+  };
+
+  const proxyWin = resolveField<ProxyConfig>("proxy", (t) => t.fields.proxy, proxyEqual);
+  if (proxyWin !== undefined) {
+    winners.proxy = proxyWin.field;
+  }
+  const proxyTemplateName = proxyWin?.templateName;
+
+  const muxWin = resolveField<boolean>("multiplexing", (t) => t.fields.multiplexing, (a, b) => a === b);
+  if (muxWin !== undefined) {
+    winners.multiplexing = muxWin.field;
+  }
+  const legacyWin = resolveField<boolean>("legacyAlgorithms", (t) => t.fields.legacyAlgorithms, (a, b) => a === b);
+  if (legacyWin !== undefined) {
+    winners.legacyAlgorithms = legacyWin.field;
+  }
+  const logWin = resolveField<boolean>("logSession", (t) => t.fields.logSession, (a, b) => a === b);
+  if (logWin !== undefined) {
+    winners.logSession = logWin.field;
+  }
+
+  const authWin = resolveField<string>("authProfileId", (t) => t.fields.authProfileId, (a, b) => a === b);
   let authFromImplicit = false;
-  if (explicitAuth !== undefined) {
-    winners.authProfileId = explicitAuth;
+  if (authWin !== undefined) {
+    winners.authProfileId = authWin.field;
   } else if (implicitAuthProfileId !== undefined) {
     // The implicit source-level rule (§4.2): a catch-all FILL rule at
     // specificity −1, below every explicit rule. When no explicit rule sets
@@ -228,8 +495,13 @@ export function selectFieldWinners(
     // unchanged — fill semantics gated by the six AUTH 2 clauses.
     winners.authProfileId = { mode: "fill", value: implicitAuthProfileId };
     authFromImplicit = true;
+    // Deliberately NO provenance entry for the implicit source rule: §3.4
+    // provenance is a device-TEMPLATE report ("which rule set this?"), and the
+    // implicit source-level auth link is the pre-template PR #53 behaviour, not a
+    // template rule — surfacing it would add a line to every source that merely
+    // carries a source auth profile and no templates at all.
   }
-  return { winners, authFromImplicit, warnings, proxyTemplateName };
+  return { winners, authFromImplicit, warnings, proxyTemplateName, matchedRuleIds, provenance };
 }
 
 /** One non-auth field's composed desired value + the mode that governs its matrix write. */

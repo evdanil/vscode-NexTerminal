@@ -4303,6 +4303,7 @@ export function registerInventoryCommands(
     const actions: SourceActionItem[] = [
       { label: "$(sync) Sync Now", description: "Fetch devices and preview changes", commandId: "nexus.inventory.syncNow" },
       { label: "$(edit) Edit…", description: "Change settings, credentials, or the auth profile", commandId: "nexus.inventory.editSource" },
+      { label: "$(list-tree) Edit Template Rules…", description: "Attach device templates to filtered subsets of devices", commandId: "nexus.deviceTemplate.editRules" },
       { label: "$(trash) Remove…", description: "Choose what happens to its synced servers", commandId: "nexus.inventory.removeSource" }
     ];
     const action = await vscode.window.showQuickPick(actions, { title: source.name });

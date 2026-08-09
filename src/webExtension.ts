@@ -134,6 +134,7 @@ const unsupportedCommands = [
   "nexus.deviceTemplate.add",
   "nexus.deviceTemplate.manage",
   "nexus.deviceTemplate.applyToFolder",
+  "nexus.deviceTemplate.editRules",
   "nexus.script.run",
   "nexus.script.runQuick",
   "nexus.script.stop",

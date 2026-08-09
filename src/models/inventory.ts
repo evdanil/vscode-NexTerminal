@@ -26,6 +26,23 @@ export interface InventoryDevice {
   name: string;
   folderPath?: string; // slash path RELATIVE to source targetFolder; ""/undefined = at targetFolder
   endpoints: InventoryEndpoint[];
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T2, §2.2) — provider-supplied MATCHING
+   * metadata a template rule's `filter` is evaluated against (client-side, never
+   * sent to the provider). String values are single-valued attributes; string[]
+   * values are set-valued (a filter condition matches if ANY element matches).
+   * Providers SHOULD emit BOTH the display name and the slug of an attribute as
+   * elements of one set-valued entry (so a filter copied from a NetBox URL, which
+   * speaks slugs, matches the same device a display-name filter does), and MUST
+   * omit empty-string values entirely. Additive to contractVersion 1 — absent is
+   * valid, and matches only catch-all rules.
+   *
+   * NAMING ADJACENCY (rev5): this is a DIFFERENT member from
+   * `InventoryEndpoint.attributes` above — per-device rather than per-endpoint,
+   * `string | string[]` rather than `string | number | boolean`, matched against
+   * by rule filters rather than ignored. The two are never merged.
+   */
+  attributes?: Record<string, string | string[]>;
 }
 
 export interface InventoryTree {
@@ -57,6 +74,17 @@ export interface InventoryProvider {
   id: string; // e.g. "netbox"; unique in registry
   label: string;
   configFields: InventoryConfigField[];
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T2, §2.2 A-M4) — OPTIONAL. The filter keys
+   * this provider's `InventoryDevice.attributes` can carry, so the rule-save flow
+   * can warn when a filter uses a key outside this list ("Key 'sites' is not one
+   * this source's provider reports…"). The reserved `name` key is provider-agnostic
+   * and always available, so a provider that matches only on name may list just
+   * `["name"]` (or nothing). A provider that declares NO list gets no key warning
+   * (nothing to check against); the sync-time zero-match info covers it instead.
+   * Additive, like every provider-contract extension.
+   */
+  attributeKeys?: string[];
   testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void>;
   fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree>;
   /**

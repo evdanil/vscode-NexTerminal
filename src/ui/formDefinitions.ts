@@ -1169,12 +1169,11 @@ export function deviceTemplateSelectRepresentable(rules: readonly TemplateRule[]
  * `type: "html"` fallback that submits NO template key (so Save cannot mutate
  * `templateRules`, UX-M3). Fallback copy pluralized on the rule count, VERBATIM.
  *
- * NOTE (PR-T1b, U4): the fallback names "Edit Template Rules…", which is a PR-T2
- * command that does not exist yet. So the sentence appends the engine's companion
- * repair idiom — "(requires a newer version of Nexus)" — staying true in a T1b
- * build (where there is no such menu item) and still correct in T2 (where the
- * command lands). The string is doc-adopted (§7.2, kept in sync with the design
- * doc) — no command is registered or pointed at here.
+ * NOTE (PR-T2, U4 de-gate): the fallback names "Edit Template Rules…", now a REAL
+ * command (`nexus.deviceTemplate.editRules`, registered in deviceTemplateCommands
+ * .ts and on the inventory-source context menu). The T1b "(requires a newer
+ * version of Nexus)" qualifier is DROPPED — the command exists, so pointing at it
+ * is honest. The string stays doc-adopted (§7.2, kept in sync with the design doc).
  */
 function deviceTemplateSourceField(
   deviceTemplates: DeviceTemplateProfile[] | undefined,
@@ -1184,8 +1183,8 @@ function deviceTemplateSourceField(
   if (!deviceTemplateSelectRepresentable(list)) {
     const content =
       list.length === 1
-        ? "A filtered template rule is configured for this source. Manage it with <strong>Edit Template Rules…</strong> (requires a newer version of Nexus)."
-        : `${list.length} template rules are configured for this source. Manage them with <strong>Edit Template Rules…</strong> (requires a newer version of Nexus).`;
+        ? "A filtered template rule is configured for this source. Manage it with <strong>Edit Template Rules…</strong>."
+        : `${list.length} template rules are configured for this source. Manage them with <strong>Edit Template Rules…</strong>.`;
     return {
       type: "html",
       content: `<div style="padding: 12px; border-left: 4px solid var(--vscode-inputValidation-infoBorder, #3794ff); background: var(--vscode-inputValidation-infoBackground, rgba(55,148,255,0.1)); border-radius: 6px; line-height: 1.5;">${content}</div>`

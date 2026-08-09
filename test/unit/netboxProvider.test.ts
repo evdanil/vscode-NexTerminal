@@ -7,6 +7,7 @@ import {
   stripCidr,
   renderFolderTemplate
 } from "../../src/services/inventory/providers/netboxProvider";
+import { deviceMatchesFilter, parseTemplateFilter } from "../../src/services/inventory/templateApply";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
   const text = typeof body === "string" ? body : JSON.stringify(body);
@@ -717,6 +718,81 @@ describe("createNetboxProvider", () => {
 
       await expect(provider.testConnection({ baseUrl: "https://netbox.local" }, { apiToken: "bad" })).rejects.toMatchObject({ kind: "auth" });
       expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // DEVICE TEMPLATES (issue #48 PR-T2, §2.2 A-M4) — fixture 22.
+  describe("device attributes — names AND slugs (fixture 22)", () => {
+    it("declares its attributeKeys", () => {
+      const provider = createNetboxProvider(vi.fn() as unknown as typeof fetch);
+      expect(provider.attributeKeys).toEqual(["role", "site", "location", "rack", "tenant", "status", "platform", "tag", "name"]);
+    });
+
+    it("emits BOTH display names and slugs as set values, omits empties, and matches on either vocabulary (kills single-vocabulary matching — A-M4's silent-no-op trap)", async () => {
+      const fetchImpl = vi.fn(async (url: string) =>
+        String(url).includes("virtualization")
+          ? makeResponse(200, { count: 0, results: [] })
+          : makeResponse(200, {
+              count: 1,
+              results: [
+                {
+                  id: 1,
+                  name: "core-sw-1",
+                  primary_ip: { address: "10.0.0.1/24" },
+                  role: { name: "Core Switch", slug: "core-switch" },
+                  site: { name: "Sydney", slug: "syd" },
+                  rack: { name: "R1", slug: "" }, // slug empty → omitted (m9c)
+                  status: { value: "active", label: "Active" },
+                  tags: [{ name: "Prod", slug: "prod" }, { name: "Critical", slug: "critical" }]
+                }
+              ]
+            })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      const attrs = tree.devices[0].attributes!;
+      expect(attrs.role).toEqual(["Core Switch", "core-switch"]);
+      expect(attrs.site).toEqual(["Sydney", "syd"]);
+      expect(attrs.rack).toEqual(["R1"]); // empty slug omitted, single element survives
+      expect(attrs.status).toEqual(["active", "Active"]);
+      expect(attrs.tags).toEqual(["Prod", "prod", "Critical", "critical"]);
+
+      // site=syd (slug) AND site=Sydney (display name) both match the same device.
+      expect(deviceMatchesFilter(tree.devices[0], parseTemplateFilter("site=syd"))).toBe(true);
+      expect(deviceMatchesFilter(tree.devices[0], parseTemplateFilter("site=Sydney"))).toBe(true);
+      // tag=core (filter key `tag`) matches the `tags` attribute by name or slug.
+      expect(deviceMatchesFilter(tree.devices[0], parseTemplateFilter("tag=critical"))).toBe(true);
+      expect(deviceMatchesFilter(tree.devices[0], parseTemplateFilter("tag=Prod"))).toBe(true);
+    });
+
+    it("VMs carry the same attributes MINUS rack/location, mirroring vmVars' asymmetry", async () => {
+      const fetchImpl = vi.fn(async (url: string) =>
+        String(url).includes("virtualization")
+          ? makeResponse(200, {
+              count: 1,
+              results: [
+                {
+                  id: 1,
+                  name: "vm-1",
+                  primary_ip: { address: "10.0.0.9/24" },
+                  role: { name: "App", slug: "app" },
+                  site: { name: "Sydney", slug: "syd" },
+                  rack: { name: "R1", slug: "r1" }, // present in the row but VMs don't map it
+                  location: { name: "Row A", slug: "row-a" }
+                }
+              ]
+            })
+          : makeResponse(200, { count: 0, results: [] })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local", includeVms: true }, { apiToken: "tok" });
+
+      const vm = tree.devices.find((d) => d.externalId.startsWith("vm:"))!;
+      expect(vm.attributes!.role).toEqual(["App", "app"]);
+      expect(vm.attributes!.site).toEqual(["Sydney", "syd"]);
+      expect(vm.attributes!.rack).toBeUndefined();
+      expect(vm.attributes!.location).toBeUndefined();
     });
   });
 });
