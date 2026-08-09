@@ -1325,6 +1325,121 @@ describe("Codex round 4 — unchangedCount decrements ONLY for servers that were
   });
 });
 
+// -------- Codex round 7 (P1) — a RETAINED dangling template proxy on an ALREADY-UPDATED server is cleaned IN PLACE --------
+
+describe("Codex round 7 — the survivor part-2 cleans a retained dangling template proxy on an already-planned UPDATE, instead of skipping it", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const S_ID = deterministicServerId("source-1", "device:1");
+  const JUMP_ID = deterministicServerId("source-1", "device:jump"); // owned, device absent → delete-pruned
+  const A_JUMP_ID = deterministicServerId("source-1", "device:ajump-unused"); // a plain survivor jump host
+  const B_JUMP_ID = deterministicServerId("source-1", "device:bjump"); // owned, device absent → delete-pruned
+
+  // A plain live server (NOT a device of this source this run) that survivor A resolves against.
+  const survivorJump = (): ServerConfig => ({
+    id: A_JUMP_ID,
+    name: "a-jump",
+    host: "10.0.0.8",
+    port: 22,
+    username: "admin",
+    authType: "agent",
+    isHidden: false
+  });
+
+  it("Fixture 54 — THE GAP: S RETAINS a template-owned proxy → J (row-5 carry, no rule sets proxy), J is delete-pruned, AND S is RENAMED this run → the update's after.proxy is ABSENT + stamp cleared + rename preserved + one warning (kills the round-6 `continue` that skips a planned server, leaving the dangling proxy)", () => {
+    // J: owned, device absent from the tree → delete-pruned this run.
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    // S: retained template-owned proxy → J (proxy === templated.proxy). NO rule
+    // sets proxy this run, so it is carried by row 5 — part 1 never looks at it.
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }), // no template rules — the proxy is a retained receipt
+      devices: [makeDevice({ name: "renamed-sw" })], // device:1 → S, renamed (unrelated update); device:jump absent → J pruned
+      servers: [jumpHost, s]
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === JUMP_ID)).toBe(true);
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined(); // the rename put S in updates
+    expect(after!.name).toBe("renamed-sw"); // the unrelated update is preserved
+    expect(after!.proxy).toBeUndefined(); // THE FIX: the retained dangling proxy is dropped IN PLACE
+    expect("proxy" in after!).toBe(false); // absent, never a written undefined
+    expect(after!.origin?.templated?.proxy).toBeUndefined(); // the ownership stamp cleared with it
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 55 — ENDPOINT-CHANGE variant: the unrelated update is a host change (not a rename) → same in-place cleanup, endpoint change preserved", () => {
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ endpoints: [{ kind: "ssh", host: "10.9.9.9" }] })], // host change → update
+      servers: [jumpHost, s]
+    });
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined();
+    expect(after!.host).toBe("10.9.9.9"); // endpoint change preserved
+    expect(after!.proxy).toBeUndefined(); // retained dangling proxy dropped in place
+    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 56 — NOT-PLANNED still promoted (round-2 path unchanged): a retained dangling proxy with NO other change is promoted to a new update + dropped + unchangedCount decremented (guards the existing path survives the rework)", () => {
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice()], // device:1 → S, name/endpoint unchanged → counted unchanged
+      servers: [jumpHost, s]
+    });
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined(); // promoted to a new update
+    expect(after!.proxy).toBeUndefined();
+    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(p.unchangedCount).toBe(0); // counted unchanged, then decremented on promotion
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 57 — §8.4 HAND proxy on an UPDATED server is LEFT ALONE: S renamed this run carries a HAND-set proxy → J (no templated.proxy stamp), J pruned → proxy KEPT on after, rename applied, no dangling warning (guards the template-owned scope through the in-place path)", () => {
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    // Hand proxy: value present, NO templated.proxy stamp → sync does not own it.
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: undefined });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ name: "renamed-sw" })], // rename → S is an update
+      servers: [jumpHost, s]
+    });
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined();
+    expect(after!.name).toBe("renamed-sw"); // the rename landed
+    expect(after!.proxy).toEqual(sshProxy(JUMP_ID)); // hand proxy untouched — §8.4
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
+  });
+
+  it("Fixture 58 — ROUND-6 COMPOSITION: this run's OVERRIDE proxy A→B (B dangling) AND a rename → round 6 restores A (a survivor), part 2 sees no dangling proxy → proxy is A, rename kept, exactly ONE warning (no double-drop, no double-warn)", () => {
+    // S carries a working template-owned proxy A (stamp A). An OVERRIDE moves it to
+    // B; B is delete-pruned; and the device is renamed — so both a proxy move and
+    // an unrelated change happen at once.
+    const s = ownedServer(
+      { proxy: sshProxy(A_JUMP_ID) },
+      { externalId: "device:1", templated: { proxy: sshProxy(A_JUMP_ID) } }
+    );
+    const bJump = ownedServer({ id: B_JUMP_ID }, { externalId: "device:bjump" }); // device absent → pruned
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice({ name: "renamed-sw" })], // device:1 → S renamed; device:bjump absent → B pruned
+      servers: [s, survivorJump(), bJump],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) } })]
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined();
+    expect(after!.name).toBe("renamed-sw"); // the rename kept the update alive (no collapse)
+    expect(after!.proxy).toEqual(sshProxy(A_JUMP_ID)); // round 6 restored A; part 2 left it (A survives)
+    expect(after!.origin?.templated?.proxy).toEqual(sshProxy(A_JUMP_ID)); // A's stamp restored, not cleared
+    // Only round 6's aggregate warning — part 2 must NOT add a second.
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+});
+
 // -------- clearTemplatedStamps (§5.1, unit-tested, wired to nothing) --------
 
 describe("clearTemplatedStamps — §5.1 (manual path helper; not wired in T1)", () => {

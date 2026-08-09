@@ -2620,82 +2620,141 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
   }
 
-  // FIX B (PR #61 Codex review round 2) — the survivor pass above walks only
-  // `adds` + `updates`, so it misses an UNCHANGED template-owned server: one
-  // whose desired proxy already equals its current value and whose other fields
-  // do not change is counted UNCHANGED and is absent from both arrays. When its
-  // stamped jump host is delete-pruned in the SAME plan, that server keeps a
-  // template-stamped proxy pointing at a record that will not exist after apply —
-  // the same coherence the round-1 fix established for WRITTEN proxies, left
-  // incomplete for the unchanged case. Promote each such server to an update that
-  // drops the proxy and clears the `templated.proxy` stamp (record and ownership
-  // receipt stay consistent, exactly like the drop above), with one warning.
+  // FIX B (PR #61 Codex review round 2) — the survivor pass above (round 6's
+  // part 1) only ever inspects THIS RUN's desired proxy on `adds` + `updates`
+  // afters, so it misses two template-owned dangling proxies whose jump host is
+  // delete-pruned in the SAME plan:
+  //  - an UNCHANGED server (round 2): desired proxy equals its current value and
+  //    no other field changes, so it is counted UNCHANGED and is absent from both
+  //    arrays; and
+  //  - the ROUND 7 GAP: an ALREADY-UPDATED server that RETAINS a template-owned
+  //    proxy (§6.3 row-5 carry — its rule was removed, so value + stamp are kept)
+  //    while also getting an UNRELATED change this run (a rename, an endpoint
+  //    move). Part 1 never looked at the retained proxy (it is not this run's
+  //    desired proxy, and may name a different jump host), and the old part 2
+  //    `continue`d on every server already in `plannedServerIds` — so the update
+  //    carried a broken proxy pointing at a record that will not exist post-apply.
+  //
+  // This pass therefore cleans the dangling retained proxy on the EFFECTIVE
+  // record: the `updates` entry's `after` when the server is already being
+  // updated (cleaned IN PLACE), else the owned server itself (promoted to a new
+  // update). Either way the proxy field goes ABSENT and its `templated.proxy`
+  // stamp is cleared, so record and ownership receipt stay consistent.
+  //
+  // WHY A DROP, NOT A ROUND-6 RESTORE. Round 6 (part 1) RESTORES the pre-matrix
+  // proxy A because a row-3 override MOVE clobbered a still-working proxy and A is
+  // the value to fall back to. A RETAINED proxy has no such fallback: its rule is
+  // gone, the stamped value IS the dangling jump host, and there is no prior
+  // working value beneath it — so absent is the repair, identical to the
+  // unchanged-server promotion and to composition-time §4.3 handling.
   //
   // SCOPE, strictly (§8.4): a TEMPLATE-STAMPED proxy only — `cur.proxy` present,
-  // `type:"ssh"`, and `proxyConfigsEqual(cur.proxy, origin.templated.proxy)` so
-  // the sync still OWNS it (`cur === stamp`). A HAND-SET proxy (stamp absent or
-  // ≠) pointing at a pruned jump host is LEFT ALONE — that is §8.4's deliberate
-  // "no sweep on prune, matches server-held proxy behavior" posture; this pass
-  // keeps template ownership coherent within one plan without becoming a general
-  // fleet proxy sweep. The jump host must be a NON-survivor and not the record's
-  // own id (self-reference is the composition-time guard's business, and a self
-  // id is a survivor anyway).
+  // `type:"ssh"`, and `proxyConfigsEqual(cur.proxy, record.origin.templated.proxy)`
+  // so the sync still OWNS it (`cur === stamp`). A HAND-SET proxy (stamp absent or
+  // ≠) pointing at a pruned jump host is LEFT ALONE — §8.4's deliberate "no sweep
+  // on prune" posture — even on a server this run renames. The jump host must be a
+  // NON-survivor and not the record's own id (self-reference is the composition
+  // -time guard's business, and a self id is a survivor anyway).
   //
-  // DEDUPE against everything the plan already decided — `adds`, the `updates`
-  // afters (incl. the survivor pass's own drops and the AUTH 2b unmapped pushes),
-  // and `prunes` (a delete-pruned server must never be resurrected as an update,
-  // and a keep/orphan prune is handled by its own branch) — so no server is
-  // double-dropped, double-warned, or has a prior update for its id lost.
-  const plannedServerIds = new Set<string>();
-  for (const a of adds) {
-    plannedServerIds.add(a.id);
-  }
+  // DISPOSITION by where the server already sits (no double-handling):
+  //  - PRUNE: skip — being removed / handled by its own prune branch (a delete
+  //    -prune must never be resurrected as an update; keep/orphan handled there).
+  //  - ADD: skip — a fresh add has no retained proxy, and its this-run-written
+  //    proxy was already validated by round 6 / part 1 (defensive skip).
+  //  - UPDATE: clean the proxy on that `after` IN PLACE — no promotion, no new
+  //    update. Do NOT touch `unchangedCount`: the server was already an update,
+  //    and the round-4 decrement gate only concerns promotions of servers that
+  //    were counted unchanged.
+  //  - NOT PLANNED: promote to a NEW update dropping the proxy, with the round-4
+  //    `unchangedServerIds` decrement gate (a device SKIPPED this fetch reaches
+  //    here without ever hitting `unchangedCount++`, so an unconditional decrement
+  //    would understate the count or drive it negative).
+  //
+  // COMPOSITION WITH ROUND 6 (no double-handling, no double-warning): part 1 runs
+  // FIRST and only when `desiredNonAuth.proxy` is itself the dangling reference;
+  // after it, an update's `after.proxy` for the this-run-desired case is either a
+  // survivor (row-5 carry) or absent, so this pass sees no dangling proxy there
+  // and skips. It only catches proxies part 1 didn't look at (retained ones, a
+  // different jump host). If a round-6 restore left a STILL-dangling prior proxy A
+  // (A itself pruned), this pass correctly drops it — belt-and-suspenders — and
+  // warnings are deduped by server + jump host so a single drop is never announced
+  // twice.
+  const updateById = new Map<string, { before: ServerConfig; after: ServerConfig }>();
   for (const u of updates) {
-    plannedServerIds.add(u.before.id);
+    updateById.set(u.before.id, u);
   }
+  const prunedServerIds = new Set<string>();
   for (const pr of prunes) {
-    plannedServerIds.add(pr.server.id);
+    prunedServerIds.add(pr.server.id);
   }
+  const addedServerIds = new Set<string>();
+  for (const a of adds) {
+    addedServerIds.add(a.id);
+  }
+  // Drops the template-owned proxy off a record: the field goes ABSENT (never a
+  // written `undefined`) and the `templated.proxy` stamp is cleared, so the record
+  // and its ownership receipt stay consistent. The remaining templated stamps
+  // decide whether `templated` survives at all.
+  const dropTemplateProxy = (record: ServerConfig): ServerConfig => {
+    const origin = record.origin!;
+    const templated = origin.templated !== undefined ? { ...origin.templated } : {};
+    delete templated.proxy;
+    const stillStamped =
+      templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
+    const { proxy: _droppedProxy, ...withoutProxy } = record;
+    return { ...withoutProxy, origin: { ...origin, templated: stillStamped ? templated : undefined } };
+  };
+  const warnedRetainedProxyKeys = new Set<string>();
   for (const ownedServer of ownedByExternalId.values()) {
-    if (plannedServerIds.has(ownedServer.id)) {
-      continue; // already added / updated / pruned this run — never touch twice
+    if (prunedServerIds.has(ownedServer.id)) {
+      continue; // being removed / handled by its own prune branch
     }
-    const cur = ownedServer.proxy;
-    const stampedProxy = ownedServer.origin?.templated?.proxy;
+    if (addedServerIds.has(ownedServer.id)) {
+      continue; // a fresh add — no retained proxy; this-run proxy validated by round 6
+    }
+    const updateEntry = updateById.get(ownedServer.id);
+    // The EFFECTIVE record — the already-planned update's `after` when this server
+    // is being updated, else the owned server itself. Testing the `after` is what
+    // lets an ALREADY-UPDATED server (round 7 gap) be cleaned instead of skipped.
+    const record = updateEntry !== undefined ? updateEntry.after : ownedServer;
+    const cur = record.proxy;
+    const stampedProxy = record.origin?.templated?.proxy;
     if (
       cur === undefined ||
       cur.type !== "ssh" ||
       stampedProxy === undefined ||
       !proxyConfigsEqual(cur, stampedProxy) || // §8.4 — template-stamped proxies only; a hand proxy is left alone
-      cur.jumpHostId === ownedServer.id ||
+      cur.jumpHostId === record.id ||
       survivorIds.has(cur.jumpHostId)
     ) {
       continue;
     }
-    const origin = ownedServer.origin!;
-    const templated = origin.templated !== undefined ? { ...origin.templated } : {};
-    delete templated.proxy;
-    const stillStamped =
-      templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
-    const { proxy: _droppedProxy, ...withoutProxy } = ownedServer;
-    const after: ServerConfig = {
-      ...withoutProxy,
-      origin: { ...origin, templated: stillStamped ? templated : undefined }
-    };
-    updates.push({ before: ownedServer, after });
-    plannedServerIds.add(ownedServer.id);
-    // Codex round 4 (P2) — gate the decrement on actually-counted-unchanged.
-    // The promotion above is unconditional (any owned survivor-cleanup server
-    // leaves its dangling template proxy behind), but a server whose device was
-    // SKIPPED this fetch reaches here without ever having hit `unchangedCount++`,
-    // so decrementing for it would understate the count or drive it negative.
-    // Only servers this set records left the unchanged bucket.
-    if (unchangedServerIds.has(ownedServer.id)) {
-      unchangedCount--; // this device was counted unchanged in the loop; it is now an update
+    const warnKey = `${record.id}::${cur.jumpHostId}`;
+    const shouldWarn = !warnedRetainedProxyKeys.has(warnKey);
+    warnedRetainedProxyKeys.add(warnKey);
+    if (updateEntry !== undefined) {
+      // ROUND 7 — clean the dangling retained proxy IN PLACE on the existing
+      // update's `after`. A DROP, not a round-6 restore (see the header): the
+      // retained value IS the dangling jump host, so there is nothing beneath it
+      // to fall back to. `unchangedCount` is untouched — the server was already an
+      // update, not a counted-unchanged promotion.
+      updateEntry.after = dropTemplateProxy(record);
+    } else {
+      // NOT PLANNED — promote to a new proxy-dropping update.
+      updates.push({ before: ownedServer, after: dropTemplateProxy(ownedServer) });
+      // Codex round 4 (P2) — gate the decrement on actually-counted-unchanged. A
+      // server whose device was SKIPPED this fetch reaches here without ever
+      // having hit `unchangedCount++`, so decrementing for it would understate the
+      // count or drive it negative. Only servers this set records left the bucket.
+      if (unchangedServerIds.has(ownedServer.id)) {
+        unchangedCount--; // this device was counted unchanged in the loop; it is now an update
+      }
     }
-    warnings.push(
-      `Server "${ownedServer.name}" on "${source.name}" carries a device-template jump-host proxy whose jump host will not survive this sync (it is being pruned) — the proxy field was removed.`
-    );
+    if (shouldWarn) {
+      warnings.push(
+        `Server "${record.name}" on "${source.name}" carries a device-template jump-host proxy whose jump host will not survive this sync (it is being pruned) — the proxy field was removed.`
+      );
+    }
   }
 
   const hiddenPruneCount = prunes.filter((p) => p.server.isHidden).length;
