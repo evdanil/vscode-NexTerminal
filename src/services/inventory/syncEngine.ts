@@ -1757,7 +1757,29 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // branch rebuilds the origin as `{ ...adoptionOrigin, syncedAuthProfileId }`
         // and would silently discard anything stamped onto `after.origin` after the
         // literal — exactly the discipline the OOB/AUTH stamps already follow here.
-        const templateMatrix = applyTemplateMatrix(adoptee, desiredNonAuth, {
+        // FIX A (PR #61 Codex review round 2) — RESTORE `origin.templated` from
+        // the marker BEFORE the matrix runs. The matrix reads ownership off
+        // `ownedServer.origin?.templated` (the `carried` baseline), but a kept
+        // server has no `origin` at all, so without this every template-managed
+        // field would read as `cur set, stamp absent` → row 7 (hand-owned) and an
+        // override template could never reclaim or re-stamp it — the auth/OOB
+        // receipts closed that failure for their fields, `templated` reopens it
+        // for the non-auth ones unless restored here. Feed a synthetic origin
+        // carrying only the receipt's `templated` (the sole member the matrix
+        // reads from `origin`); the matrix then composes its this-run writes ON
+        // TOP of this restored baseline, carrying forward the fields it does not
+        // write (a fill winner leaves a configured field; a field the template no
+        // longer sets keeps its old stamp). Restored VERBATIM — a marker carrying
+        // none yields the unchanged adoptee, bit-identical to a server no template
+        // ever touched. No clone needed on this READ-ONLY input: the matrix
+        // deep-copies `carried` into its own result, so the receipt is never
+        // aliased into `adoptionOrigin.templated`.
+        const restoredTemplated = adoptee.formerlySynced?.templated;
+        const adopteeForMatrix: ServerConfig =
+          restoredTemplated !== undefined
+            ? { ...adoptee, origin: { sourceId: source.id, externalId: device.externalId, syncedAt: now, templated: restoredTemplated } }
+            : adoptee;
+        const templateMatrix = applyTemplateMatrix(adopteeForMatrix, desiredNonAuth, {
           targetServerId: adoptee.id,
           targetServerName: device.name,
           proxyTemplateName: cascade.proxyTemplateName
@@ -2505,6 +2527,76 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         `Device template "${cascade.proxyTemplateName ?? "?"}" on "${source.name}" sets a jump-host proxy whose jump host will not survive this sync (it is being pruned, or its device was skipped) — the proxy field was not applied.`
       );
     }
+  }
+
+  // FIX B (PR #61 Codex review round 2) — the survivor pass above walks only
+  // `adds` + `updates`, so it misses an UNCHANGED template-owned server: one
+  // whose desired proxy already equals its current value and whose other fields
+  // do not change is counted UNCHANGED and is absent from both arrays. When its
+  // stamped jump host is delete-pruned in the SAME plan, that server keeps a
+  // template-stamped proxy pointing at a record that will not exist after apply —
+  // the same coherence the round-1 fix established for WRITTEN proxies, left
+  // incomplete for the unchanged case. Promote each such server to an update that
+  // drops the proxy and clears the `templated.proxy` stamp (record and ownership
+  // receipt stay consistent, exactly like the drop above), with one warning.
+  //
+  // SCOPE, strictly (§8.4): a TEMPLATE-STAMPED proxy only — `cur.proxy` present,
+  // `type:"ssh"`, and `proxyConfigsEqual(cur.proxy, origin.templated.proxy)` so
+  // the sync still OWNS it (`cur === stamp`). A HAND-SET proxy (stamp absent or
+  // ≠) pointing at a pruned jump host is LEFT ALONE — that is §8.4's deliberate
+  // "no sweep on prune, matches server-held proxy behavior" posture; this pass
+  // keeps template ownership coherent within one plan without becoming a general
+  // fleet proxy sweep. The jump host must be a NON-survivor and not the record's
+  // own id (self-reference is the composition-time guard's business, and a self
+  // id is a survivor anyway).
+  //
+  // DEDUPE against everything the plan already decided — `adds`, the `updates`
+  // afters (incl. the survivor pass's own drops and the AUTH 2b unmapped pushes),
+  // and `prunes` (a delete-pruned server must never be resurrected as an update,
+  // and a keep/orphan prune is handled by its own branch) — so no server is
+  // double-dropped, double-warned, or has a prior update for its id lost.
+  const plannedServerIds = new Set<string>();
+  for (const a of adds) {
+    plannedServerIds.add(a.id);
+  }
+  for (const u of updates) {
+    plannedServerIds.add(u.before.id);
+  }
+  for (const pr of prunes) {
+    plannedServerIds.add(pr.server.id);
+  }
+  for (const ownedServer of ownedByExternalId.values()) {
+    if (plannedServerIds.has(ownedServer.id)) {
+      continue; // already added / updated / pruned this run — never touch twice
+    }
+    const cur = ownedServer.proxy;
+    const stampedProxy = ownedServer.origin?.templated?.proxy;
+    if (
+      cur === undefined ||
+      cur.type !== "ssh" ||
+      stampedProxy === undefined ||
+      !proxyConfigsEqual(cur, stampedProxy) || // §8.4 — template-stamped proxies only; a hand proxy is left alone
+      cur.jumpHostId === ownedServer.id ||
+      survivorIds.has(cur.jumpHostId)
+    ) {
+      continue;
+    }
+    const origin = ownedServer.origin!;
+    const templated = origin.templated !== undefined ? { ...origin.templated } : {};
+    delete templated.proxy;
+    const stillStamped =
+      templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
+    const { proxy: _droppedProxy, ...withoutProxy } = ownedServer;
+    const after: ServerConfig = {
+      ...withoutProxy,
+      origin: { ...origin, templated: stillStamped ? templated : undefined }
+    };
+    updates.push({ before: ownedServer, after });
+    plannedServerIds.add(ownedServer.id);
+    unchangedCount--; // this device was counted unchanged in the loop; it is now an update
+    warnings.push(
+      `Server "${ownedServer.name}" on "${source.name}" carries a device-template jump-host proxy whose jump host will not survive this sync (it is being pruned) — the proxy field was removed.`
+    );
   }
 
   const hiddenPruneCount = prunes.filter((p) => p.server.isHidden).length;

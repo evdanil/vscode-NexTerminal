@@ -710,6 +710,94 @@ describe("FIX 1 — adoption branch consumes the template cascade (proxy / boole
   });
 });
 
+// -------- FIX A (PR #61 Codex round 2) — the detach preserves `templated`, adoption restores it --------
+
+describe("FIX A — `origin.templated` survives the Keep-Servers detach and is restored on adoption", () => {
+  it("Fixture 41 — a kept server whose marker preserves `templated.proxy` = P is re-adopted; an OVERRIDE template that edited the proxy to P′ RECLAIMS it (row 3) and re-stamps (kills the round-2 slip where the stamp was lost and the field read row 7, refusing P′)", () => {
+    // The kept record still carries the sync-applied proxy P_A, and the marker
+    // preserves that the SYNC wrote it — the receipt member Fix A adds.
+    const kept = keptServer({
+      proxy: P_A,
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: DEVICE_INSTANCE,
+        externalId: "device:1",
+        templated: { proxy: P_A },
+        detachedAt: 900
+      }
+    });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [kept],
+      templates: [template({ proxy: { mode: "override", value: P_B } })],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    // Reclaimed: the override winner rewrites the still-sync-owned proxy...
+    expect(after.proxy).toEqual(P_B);
+    // ...AND re-stamps it, so ownership is preserved for the next sync too.
+    expect(after.origin?.templated?.proxy).toEqual(P_B);
+  });
+
+  it("Fixture 42 — a HAND-EDITED field the sync never template-managed stays row 7 after adoption; an override does NOT reclaim it (guards against restoring provenance too broadly)", () => {
+    // The kept record carries proxy P_A that was NEVER a template write: the
+    // marker preserves no `templated` for it (only a boolean stamp, to prove the
+    // marker itself is well-formed and does carry templated for other fields).
+    const kept = keptServer({
+      proxy: P_A,
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: DEVICE_INSTANCE,
+        externalId: "device:1",
+        templated: { multiplexing: true }, // a stamp for a DIFFERENT field — proxy is hand-owned
+        detachedAt: 900
+      }
+    });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [kept],
+      templates: [template({ proxy: { mode: "override", value: P_B } })],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    // Hand-owned proxy (no proxy stamp in the marker) is left untouched by the override.
+    expect(after.proxy).toEqual(P_A);
+    expect(after.origin?.templated?.proxy).toBeUndefined();
+  });
+
+  it("Fixture 43 — a marker carrying NO `templated` restores none: a fresh template fills an unset field (row 1) and leaves a pre-existing hand value (row 7) (guards the 'restore verbatim, never invent' rule)", () => {
+    // No `templated` in the marker at all — bit-identical to a server no template
+    // ever touched. The adoptee has a hand proxy P_A (unstamped) and an UNSET
+    // multiplexing.
+    const kept = keptServer({ proxy: P_A, multiplexing: undefined });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [kept],
+      templates: [
+        template({ proxy: { mode: "fill", value: P_B }, multiplexing: { mode: "fill", value: true } })
+      ],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    // Hand proxy left (fill never rewrites a configured field — and nothing was restored to claim it either).
+    expect(after.proxy).toEqual(P_A);
+    expect(after.origin?.templated?.proxy).toBeUndefined();
+    // Unset boolean filled + stamped (row 1).
+    expect(after.multiplexing).toBe(true);
+    expect(after.origin?.templated?.multiplexing).toBe(true);
+  });
+});
+
 // -------- FIX 2 (PR #61 Codex) — post-plan jump-host survivor validation --------
 
 describe("FIX 2 — jump-host references validated against the POST-PLAN survivor set", () => {
@@ -794,6 +882,73 @@ describe("FIX 2 — jump-host references validated against the POST-PLAN survivo
     // The template-owned proxy on the fresh add is dropped.
     const added = p.adds.find((s) => s.origin?.externalId === "device:1")!;
     expect(added.proxy).toBeUndefined();
+  });
+});
+
+// -------- FIX B (PR #61 Codex round 2) — survivor pass covers UNCHANGED template-owned servers --------
+
+describe("FIX B — an UNCHANGED template-owned server whose stamped jump host is pruned is promoted to a proxy-dropping update", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const JUMP_ID = deterministicServerId("source-1", "device:jump");
+  const S_ID = deterministicServerId("source-1", "device:1");
+
+  it("Fixture 44 — S has proxy P (ssh, jump J) with a MATCHING `templated.proxy` stamp; the template still wants P (so S is UNCHANGED); the SAME plan delete-prunes J → S is promoted to an update dropping proxy + clearing the stamp + one warning (kills the round-1 pass missing the unchanged case — S keeps a dangling proxy)", () => {
+    // J: owned, its device absent from the tree → delete-pruned this run.
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    // S: owned + present + otherwise unchanged; its still-sync-owned proxy points at J.
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()], // device:1 → S, still matched → unchanged; device:jump absent → J pruned
+      servers: [jumpHost, s],
+      // The template still wants exactly P, so S computes no change in the device loop.
+      templates: [template({ proxy: { mode: "override", value: sshProxy(JUMP_ID) } })]
+    });
+    // J is delete-pruned...
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === JUMP_ID)).toBe(true);
+    // ...and S — absent from the loop's adds/updates as UNCHANGED — is promoted to an update.
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined();
+    expect(after!.proxy).toBeUndefined();
+    expect("proxy" in after!).toBe(false); // absent, never a written undefined
+    expect(after!.origin?.templated?.proxy).toBeUndefined(); // the ownership stamp cleared with it
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 45 — S has a HAND-SET proxy P (ssh, jump J) with NO `templated.proxy` stamp; J is pruned → S is LEFT ALONE, no update, proxy kept (guards §8.4 — the cleanup must not sweep hand proxies)", () => {
+    const jumpHost = ownedServer({ id: JUMP_ID }, { externalId: "device:jump" });
+    // Hand proxy: value present, NO templated.proxy stamp → row 7, sync does not own it.
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: undefined });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [jumpHost, s],
+      // The template names the same proxy, but with no stamp the loop leaves it (row 7),
+      // so S is still UNCHANGED — the only difference from Fixture 44 is the missing stamp.
+      templates: [template({ proxy: { mode: "override", value: sshProxy(JUMP_ID) } })]
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === JUMP_ID)).toBe(true);
+    // Left entirely alone — no update promoted, so its hand proxy is never touched.
+    expect(afterFor(p, S_ID)).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
+  });
+
+  it("Fixture 46 — S's stamped jump host J is a device freshly ADDED this run (a survivor, not pruned) → S UNCHANGED, proxy kept, no warning (guards against an over-broad drop)", () => {
+    // device:jump is PRESENT → J is a fresh add, hence a survivor.
+    const s = ownedServer({ proxy: sshProxy(JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [
+        makeDevice(), // device:1 → S, unchanged
+        makeDevice({ externalId: "device:jump", name: "jump", endpoints: [{ kind: "ssh", host: "10.0.0.9" }] }) // fresh add → survivor
+      ],
+      servers: [s],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(JUMP_ID) } })]
+    });
+    expect(p.adds.some((a) => a.id === JUMP_ID)).toBe(true); // J was added
+    // S is left alone: its jump host survives, so there is nothing to clean up.
+    expect(afterFor(p, S_ID)).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
   });
 });
 

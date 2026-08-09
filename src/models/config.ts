@@ -365,6 +365,39 @@ export interface DetachedServerOrigin {
    * when something else is deleted.
    */
   syncedIpmiHost?: string;
+  /**
+   * DEVICE TEMPLATES (issue #48 PR-T1) — the per-field record of what the
+   * REMOVED SOURCE'S TEMPLATE APPLICATION last wrote onto this server's non-auth
+   * fields (proxy / booleans), copied verbatim from the server's own
+   * `ServerOrigin.templated` at detach time, and absent when that sync wrote
+   * none. Same shape as `ServerOrigin.templated` (four non-auth fields; nested
+   * `ProxyConfig`).
+   *
+   * NOT a matching input — like `syncedAuthProfileId` and `syncedIpmiHost` beside
+   * it, it decides nothing about adoption. It is the third part of the origin
+   * that has to OUTLIVE the strip, and for exactly their reason: it is the only
+   * record of whether the proxy/booleans this server still carries were the
+   * SYNC'S doing or the USER'S, which is what the §4.3 write matrix decides every
+   * template-managed field on. Dropped here, a re-adopted server's
+   * template-managed fields arrive looking hand-owned (matrix row 7), so an
+   * override template could never reclaim or re-stamp them — permanently, and
+   * silently, for values the sync itself had put there. Round 1 made adoption
+   * apply the template matrix but this member was simply missed, which is what
+   * reopened that exact failure for the non-auth fields the auth/OOB receipts had
+   * already closed for theirs.
+   *
+   * Carries NO auth link: `authProfileId` rides the shared `syncedAuthProfileId`
+   * receipt above, so — unlike that receipt — this one names no other record and
+   * needs no `removeAuthProfile` / dangling-profile sweep clause.
+   *
+   * Optional and restored, never invented: adoption copies it back into the new
+   * `origin` (services/inventory/syncEngine.ts) BEFORE the matrix runs, and a
+   * marker that carries none restores none — bit-identical to a server the sync
+   * never wrote any of these fields on. Deep-copied at detach (it holds a nested
+   * object) so the receipt does not alias the live origin's `templated`; see
+   * `cloneTemplatedStamps`.
+   */
+  templated?: ServerOrigin["templated"];
   detachedAt: number;
 }
 
@@ -479,12 +512,29 @@ export interface ServerConfig {
 export function cloneServerOrigin(origin: ServerOrigin): ServerOrigin {
   const cloned: ServerOrigin = { ...origin };
   if (origin.templated) {
-    cloned.templated = {
-      ...origin.templated,
-      proxy: origin.templated.proxy ? { ...origin.templated.proxy } : origin.templated.proxy
-    };
+    cloned.templated = cloneTemplatedStamps(origin.templated);
   }
   return cloned;
+}
+
+/**
+ * DEVICE TEMPLATES (PR-T1) — deep-copies a `templated` stamp record and its
+ * nested `ProxyConfig`, so a copy can be persisted or restored without the two
+ * ends sharing the mutable proxy object. The single deep-copy site the grouped
+ * member's bookkeeping bill promised: `cloneServerOrigin` uses it, and the
+ * "Keep Servers" detach uses it when it preserves `templated` into the
+ * `DetachedServerOrigin` receipt (the receipt is stored verbatim and must not
+ * alias the live origin's object — a later mutation of one would otherwise
+ * corrupt the other), on exactly the terms `cloneServerConfig`'s own
+ * one-level-deep spread would otherwise violate.
+ */
+export function cloneTemplatedStamps(
+  templated: NonNullable<ServerOrigin["templated"]>
+): NonNullable<ServerOrigin["templated"]> {
+  return {
+    ...templated,
+    proxy: templated.proxy ? { ...templated.proxy } : templated.proxy
+  };
 }
 
 export function cloneServerConfig(server: ServerConfig): ServerConfig {

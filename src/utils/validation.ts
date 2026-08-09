@@ -177,6 +177,15 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
  * that stamp only in the same breath as a non-empty address, and this value is
  * restored into a real origin at adoption, where the write rule compares it
  * against the record's own field.
+ *
+ * DEVICE TEMPLATES (issue #48 PR-T1) — `templated` is the fourth optional
+ * member, on the same terms and with the same disposition as its sibling on the
+ * live origin: the detach copies it from `origin.templated` and a source that
+ * applied no proxy/boolean template leaves nothing to copy, so absent is the
+ * ordinary case. PRESENT it must satisfy `isValidTemplatedStamps` exactly as
+ * `isValidServerOrigin` checks the stamp it mirrors, because it is restored into
+ * a real origin at adoption where the §4.3 matrix reads it — and a malformed
+ * record strips the WHOLE marker (the loud disposition every member here shares).
  */
 export function isValidDetachedServerOrigin(value: unknown): value is DetachedServerOrigin {
   if (typeof value !== "object" || value === null) {
@@ -190,6 +199,9 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
     return false;
   }
   if (obj.syncedIpmiHost !== undefined && !isNonEmptyString(obj.syncedIpmiHost)) {
+    return false;
+  }
+  if (obj.templated !== undefined && !isValidTemplatedStamps(obj.templated)) {
     return false;
   }
   return (

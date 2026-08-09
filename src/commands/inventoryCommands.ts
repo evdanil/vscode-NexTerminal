@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../models/config";
-import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials } from "../models/config";
+import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps } from "../models/config";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
@@ -2712,6 +2712,20 @@ export function registerInventoryCommands(
                     // rather than written as `undefined` for the reason
                     // `instanceKey` is.
                     ...(origin.syncedIpmiHost !== undefined ? { syncedIpmiHost: origin.syncedIpmiHost } : {}),
+                    // DEVICE TEMPLATES (issue #48 PR-T1) — the third part of the
+                    // origin that has to SURVIVE the strip, on exactly the terms
+                    // of the auth/OOB provenance above. It says whether the
+                    // proxy/booleans this server keeps were the SYNC'S doing or
+                    // the USER'S, which is the whole of the §4.3 template write
+                    // matrix. Dropped here, a re-adopted server's
+                    // template-managed fields arrived looking hand-owned (row 7)
+                    // and an override template could never reclaim them. Unlike
+                    // the two scalar siblings this holds a NESTED object, so it is
+                    // DEEP-COPIED (`cloneTemplatedStamps`) rather than shared by
+                    // reference — the receipt is persisted verbatim and must not
+                    // alias the live origin's `templated`. Omitted rather than
+                    // written as `undefined` for the reason `instanceKey` is.
+                    ...(origin.templated !== undefined ? { templated: cloneTemplatedStamps(origin.templated) } : {}),
                     detachedAt
                   }
                 } as ServerConfig)
