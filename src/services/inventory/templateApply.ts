@@ -237,7 +237,11 @@ export function describeFilterConditions(parsed: ParsedFilter): string {
   const parts: string[] = [];
   for (const key of [...parsed.conditions.keys()].sort()) {
     const values = [...parsed.conditions.get(key)!].sort();
-    parts.push(`${key} is ${values.map((v) => `'${v}'`).join(" or ")}`);
+    // P1 (PR-T2 review) — un-alias the internal `tags` attribute back to the `tag`
+    // filter key the prompt teaches and the user typed, so the description matches
+    // the input dialect (m10: the filter key is `tag`, the attribute is `tags`).
+    const displayKey = key === "tags" ? "tag" : key;
+    parts.push(`${displayKey} is ${values.map((v) => `'${v}'`).join(" or ")}`);
   }
   return parts.join(" AND ");
 }

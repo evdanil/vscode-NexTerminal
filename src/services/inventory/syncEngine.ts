@@ -11,11 +11,11 @@ import {
   composeDesiredFields,
   computeProfilesNeedingServerKey,
   decideTemplateAuthWrite,
+  deviceMatchesFilter,
   filterLabel,
   prepareTemplateRules,
   selectFieldWinners,
   TEMPLATE_FIELD_SHORT_LABELS,
-  type DesiredNonAuthFields,
   type FieldProvenance,
   type PreparedRule,
   type ProfilesNeedingServerKey,
@@ -702,22 +702,20 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     input.authProfilesById?.get(id) ?? (matchedProfile?.id === id ? matchedProfile : undefined);
 
   // The BASELINE cascade — the catch-all-only winners a device carrying NO
-  // attributes resolves (only catch-all / name=* rules match it). Used ONLY by
-  // the post-loop jump-host SURVIVOR pass (part 1), which restores/drops THIS
-  // run's catch-all-derived proxy against the definitive survivor set, and by its
-  // warning (`cascade.proxyTemplateName`). Per-device writes use the per-device
-  // cascade computed inside the loop; a per-device proxy that only a FILTERED rule
-  // set is still caught by the survivor pass's general PART 2 (drop). Its
-  // warnings / provenance / matches are DISCARDED here — they are re-emitted per
-  // device — so nothing is double-counted.
+  // attributes resolves (only catch-all / name=* rules match it). PR-T2 review
+  // (M2): its dangling-reference warnings are emitted ONCE after the device loop,
+  // deduped against the per-device path, so a source whose catch-all/implicit
+  // template references a dangling jump host or auth profile still warns even when
+  // ZERO devices are syncable (the per-device path never runs then). Its
+  // provenance / matches / non-auth desired are NOT consumed — the survivor pass
+  // is now per-record (PART 1 below) and needs no baseline desired proxy.
   const baselineDevice: Pick<InventoryDevice, "name" | "attributes"> = { name: "", attributes: undefined };
-  const cascade = selectFieldWinners(baselineDevice, prepared, source.authProfileId);
-  const composed = composeDesiredFields(cascade.winners, {
+  const baselineCascade = selectFieldWinners(baselineDevice, prepared, source.authProfileId);
+  const baselineComposed = composeDesiredFields(baselineCascade.winners, {
     hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
-    proxyTemplateName: cascade.proxyTemplateName,
+    proxyTemplateName: baselineCascade.proxyTemplateName,
     sourceName: source.name
   });
-  const desiredNonAuth: DesiredNonAuthFields = composed.desired;
 
   // DEVICE TEMPLATES (PR-T2) — per-device warning dedupe. The dangling-jump-host
   // and dangling-auth-profile warnings name the TEMPLATE/source, not the device,
@@ -736,7 +734,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const matchedRuleIds = new Set<string>();
   // §3.4 provenance — per server that received a templated field this run, which
   // rule/template supplied each field. Aggregated into report lines after the loop.
-  const provenanceByServer: Array<{ serverName: string; provenance: Partial<Record<TemplatableField, FieldProvenance>> }> = [];
+  // PR-T2 review (B2): keyed by serverId and gated on the fields the matrix
+  // ACTUALLY WROTE (not the cascade winners) for a device that produces a plan
+  // entry, so a hand-edited (row 6) / left (rows 2/4/5/7) / dropped (dangling
+  // jump host, keyless auth) field never claims a value flow that did not happen —
+  // and the §3.4 line never contradicts the plan's own "not applied" / "kept
+  // hand-configured" lines. The survivor pass strips a proxy entry it later
+  // restores or drops, keyed by this same serverId.
+  const provenanceByServer = new Map<string, { serverName: string; provenance: Partial<Record<TemplatableField, FieldProvenance>> }>();
+  // PR-T2 review (B1/MINOR-6) — per-record name of the template that WROTE this
+  // run's proxy, so the survivor pass's dangling warning names the template that
+  // actually set THIS proxy (per-record), not the baseline catch-all's.
+  const proxyTemplateNameByServerId = new Map<string, string>();
 
   const adds: ServerConfig[] = [];
   const updates: Array<{ before: ServerConfig; after: ServerConfig }> = [];
@@ -943,6 +952,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       continue;
     }
     presentExternalIds.add(device.externalId);
+    // M1 (PR-T2 review) — a rule counts as MATCHED if it matches any device
+    // PRESENT in this fetch, even one later skipped for a syncability reason
+    // (empty name / no usable endpoint / invalid port / duplicate). The per-device
+    // cascade below runs only for SYNCABLE devices, so without this a rule whose
+    // only matches are endpoint-less rows (PDUs, patch panels, ...) would falsely
+    // report "matched no devices this sync." — a spurious typo alarm on a filter
+    // that is in fact matching, just on unsyncable devices.
+    for (const pr of prepared) {
+      if (pr.isCatchAll || deviceMatchesFilter(device, pr.parsed)) {
+        matchedRuleIds.add(pr.rule.id);
+      }
+    }
     const isOwned = ownedByExternalId.has(device.externalId);
 
     if (!device.name) {
@@ -1077,13 +1098,44 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const deviceWinnerKeyless = deviceWinnerProfile !== undefined && authProfileNeedsServerKeyPath(deviceWinnerProfile);
     const deviceWinnerResolvedId =
       deviceEffectiveAuthWinner !== undefined && !deviceWinnerKeyless ? deviceEffectiveAuthWinner.profileId : undefined;
-    // §3.4 provenance — collected for any device the cascade resolved a field for;
-    // aggregated into report lines after the loop. Records the winners, which is
-    // the "where did this value come from" answer regardless of the matrix's
-    // per-row write decision.
-    if (Object.keys(deviceCascade.provenance).length > 0) {
-      provenanceByServer.push({ serverName: device.name, provenance: deviceCascade.provenance });
-    }
+    // §3.4 provenance (B2, PR-T2 review) — recorded per WRITE, not per winner. A
+    // §3.4 line asserts a value FLOWED from a template onto the record, so it is
+    // gated on the matrix having ACTUALLY WRITTEN that field for a device that
+    // produces a plan entry: a row-6 hand-edit / rows 2/4/5/7 leave nothing to
+    // report, and a dangling or keyless winner is dropped before any write. Each
+    // write branch below calls this with exactly the fields it wrote; the survivor
+    // pass strips a proxy entry it later restores or drops (`dropProxyProvenance`).
+    const recordWrittenProvenance = (
+      serverId: string,
+      serverName: string,
+      matrixValues: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession">>,
+      authWritten: boolean
+    ): void => {
+      const provenance: Partial<Record<TemplatableField, FieldProvenance>> = {};
+      const nonAuthFields: Array<"proxy" | "multiplexing" | "legacyAlgorithms" | "logSession"> = [
+        "proxy",
+        "multiplexing",
+        "legacyAlgorithms",
+        "logSession"
+      ];
+      for (const f of nonAuthFields) {
+        if (matrixValues[f] !== undefined) {
+          const entry = deviceCascade.provenance[f];
+          if (entry !== undefined) {
+            provenance[f] = entry;
+          }
+        }
+      }
+      if (authWritten) {
+        const entry = deviceCascade.provenance.authProfileId;
+        if (entry !== undefined) {
+          provenance.authProfileId = entry;
+        }
+      }
+      if (Object.keys(provenance).length > 0) {
+        provenanceByServer.set(serverId, { serverName, provenance });
+      }
+    };
 
     const ownedServer = ownedByExternalId.get(device.externalId);
     if (ownedServer) {
@@ -1128,6 +1180,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       });
       for (const w of templateMatrix.warnings) {
         warnings.push(w);
+      }
+      // PR-T2 review (B1/MINOR-6) — record which template set THIS run's proxy, so
+      // the survivor pass can (a) validate it per-record (part 1 owns every written
+      // template proxy) and (b) name the right template if its jump host does not
+      // survive.
+      if (templateMatrix.values.proxy !== undefined && deviceProxyTemplateName !== undefined) {
+        proxyTemplateNameByServerId.set(ownedServer.id, deviceProxyTemplateName);
       }
       const afterOrigin: ServerOrigin = {
         sourceId: source.id,
@@ -1528,6 +1587,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         if (group !== undefined) {
           folderSet.add(group);
         }
+        // §3.4 (B2) — only the fields the matrix wrote, and the auth link only if
+        // it was actually written AND survived any AUTH 2b rollback (a rolled-back
+        // link was dropped, so it flowed nowhere).
+        recordWrittenProvenance(
+          ownedServer.id,
+          device.name,
+          templateMatrix.values,
+          authDecision.kind === "write" && after.authProfileId === authDecision.profileId
+        );
       } else {
         unchangedCount++;
         unchangedServerIds.add(ownedServer.id);
@@ -1825,6 +1893,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         for (const w of templateMatrix.warnings) {
           warnings.push(w);
         }
+        // PR-T2 review (B1/MINOR-6) — same per-record proxy-template capture as the
+        // owned-update path, keyed by the adoptee's (preserved) id.
+        if (templateMatrix.values.proxy !== undefined && deviceProxyTemplateName !== undefined) {
+          proxyTemplateNameByServerId.set(adoptee.id, deviceProxyTemplateName);
+        }
         const adoptionOrigin: ServerOrigin = {
           sourceId: source.id,
           externalId: device.externalId,
@@ -2085,6 +2158,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         if (group !== undefined) {
           folderSet.add(group);
         }
+        // §3.4 (B2) — only the fields this adoption actually wrote.
+        recordWrittenProvenance(
+          adoptee.id,
+          device.name,
+          templateMatrix.values,
+          authDecision.kind === "write" && after.authProfileId === authDecision.profileId
+        );
         // Deliberately BEFORE the duplicate warning below: an adopted server is
         // at the device's own endpoint by construction, so it would otherwise
         // warn (and count) that this device "will be added as a duplicate" —
@@ -2204,6 +2284,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     for (const w of addMatrix.warnings) {
       warnings.push(w);
     }
+    // PR-T2 review (B1/MINOR-6) — capture the proxy-template name so the survivor
+    // pass validates this fresh add's proxy per-record and names the right template
+    // if its jump host does not survive (an add ships a dangling proxy otherwise).
+    if (addMatrix.values.proxy !== undefined && deviceProxyTemplateName !== undefined) {
+      proxyTemplateNameByServerId.set(id, deviceProxyTemplateName);
+    }
     adds.push({
       id,
       name: device.name,
@@ -2277,6 +2363,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (group !== undefined) {
       folderSet.add(group);
     }
+    // §3.4 (B2) — the fresh add's written fields. The link is written iff a usable
+    // (non-keyless) winner resolved (`deviceWinnerResolvedId`); the implicit
+    // source rule sets no §3.4 entry, so an implicit-only link records nothing.
+    recordWrittenProvenance(id, device.name, addMatrix.values, deviceWinnerResolvedId !== undefined);
   }
 
   // AUTH 2b, SECOND PASS (REVIEW FINDING, P1) — the same rollback decision for
@@ -2560,128 +2650,148 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   for (const a of adds) {
     survivorIds.add(a.id);
   }
-  // Only THIS run's template proxy is re-validated. `desiredNonAuth.proxy` is the
-  // single (device-independent, T1) proxy winner this run's cascade produced; if
-  // there is none, no field the template wrote this run can dangle, so a proxy an
-  // earlier run's template left behind (§6.3 retained, row-5 carry) is left
-  // entirely alone. When it IS an ssh reference whose jump host is not a survivor,
-  // walk `adds` and the `updates` afters and drop it from every record the
-  // template actually OWNS this run — guarded on the record's `origin.templated.proxy`
-  // stamp matching the written proxy, so a hand-set or previously-stamped proxy
-  // the template did not touch is never disturbed. Dropping means the field goes
-  // ABSENT (never a written `undefined`), and the stamp goes with it so the record
-  // and its ownership receipt stay consistent. The self-reference case is handled
-  // inline per-device (the jump host is the record itself, hence a survivor).
-  const desiredProxy = desiredNonAuth.proxy;
-  if (desiredProxy !== undefined && desiredProxy.value.type === "ssh" && !survivorIds.has(desiredProxy.value.jumpHostId)) {
-    const danglingJumpHostId = desiredProxy.value.jumpHostId;
-    let droppedAny = false;
-    // Codex round 6 (P1) — REJECT the late-discovered-invalid winner the way the
-    // composition-time rejection does (§5.3 / §4.3 row 5, "desired none → keep
-    // existing"): RESTORE the pre-matrix proxy + stamp, NOT delete to absent. The
-    // composition dangling check ran against the OPTIMISTIC `liveServerIds`, which
-    // admitted a jump host B this plan later prunes or skips; the matrix then
-    // performed a row-3 override MOVE of a working template-owned proxy A → B and
-    // stamped B. Deleting B to absent here (the round-2 code) would strip a
-    // previously-working proxy from EVERY matching server — a fleet-wide
-    // regression. So mirror composition: on a dangling winner `composeDesiredFields`
-    // leaves `desired.proxy` unset, and the matrix then carries the EXISTING
-    // sync-owned proxy A forward (row 5). The pre-matrix state is `before` — A on an
-    // override move (updates), and NOTHING on a row-1 write (adds). An add therefore
-    // still drops to absent (nothing to restore); an update restores A + A's stamp.
-    const rejectTemplateProxy = (after: ServerConfig, before: ServerConfig | undefined): boolean => {
-      const p = after.proxy;
-      const stampedProxy = after.origin?.templated?.proxy;
-      if (
-        p === undefined ||
-        p.type !== "ssh" ||
-        p.jumpHostId !== danglingJumpHostId ||
-        stampedProxy === undefined ||
-        !proxyConfigsEqual(p, stampedProxy)
-      ) {
-        return false; // not a proxy THIS run's template wrote/owns on this record — leave alone
-      }
-      const priorProxy = before?.proxy; // pre-matrix value: A on a row-3 override move, undefined on a row-1 add
-      const priorStamp = before?.origin?.templated?.proxy;
-      if (priorProxy !== undefined) {
-        after.proxy = { ...priorProxy }; // restore A (row 5 carry) — never delete a previously-working proxy
+  // PR-T2 review (B2) — a proxy the survivor pass drops or restores did NOT flow
+  // from this run's template onto the record, so its §3.4 provenance line must go
+  // with it, or the consent report would claim a value flow the plan simultaneously
+  // says was "not applied" / "removed". Shared by part 1 and part 2.
+  const dropProxyProvenance = (serverId: string): void => {
+    const entry = provenanceByServer.get(serverId);
+    if (entry !== undefined) {
+      delete entry.provenance.proxy;
+    }
+  };
+  // PR-T2 review (B1) — deduped by `server::jumpHost`, SHARED across part 1 (this
+  // run's WRITTEN proxies) and part 2 (RETAINED proxies), so a single record is
+  // never warned about twice for the same dangling jump host.
+  const warnedRetainedProxyKeys = new Set<string>();
+
+  // PART 1 (PR-T2 review, B1) — per-record survivor validation of the proxies THIS
+  // RUN's matrix WROTE. GENERALIZES the round-6 baseline-catch-all pass: every add
+  // or update whose proxy the matrix wrote this run is recorded in
+  // `proxyTemplateNameByServerId`, so a proxy set by a FILTERED rule is validated
+  // exactly like a catch-all one. The old pass gated solely on the BASELINE
+  // catch-all cascade's desired proxy, so a proxy a FILTERED rule set never tripped
+  // it and fell through to part 2's destructive DROP — data loss on an override
+  // MOVE (the pre-existing working proxy A was stripped) and a silent dangling
+  // proxy shipped on an add (no warning, connect fails). This pass now OWNS every
+  // WRITTEN template proxy; retained proxies (row-5 carry, never written this run,
+  // not in the map) are left to part 2.
+  //
+  // For each such record whose written `after.proxy` is a template-OWNED ssh proxy
+  // (`proxyConfigsEqual(cur, stamp)`, so the sync owns it — §8.4) pointing at a
+  // NON-survivor jump host, REJECT it as §4.3 row 5 does ("desired none → keep
+  // existing"):
+  //  - UPDATE: RESTORE the pre-matrix proxy `before.proxy` + before's stamp — a
+  //    row-3 override MOVE clobbered a still-working proxy A → B, and A is the value
+  //    to fall back to (deleting to absent would strip a working proxy fleet-wide).
+  //    A row-1 write on an update has no prior proxy → drops to absent.
+  //  - ADD: DROP to absent (nothing beneath to restore) + warn — this is the add
+  //    path the old code shipped a dangling proxy on.
+  // Self-reference never reaches here: the matrix skips a self-proxy so it is never
+  // written, and a record's own id is itself a survivor. The warning names the
+  // template that ACTUALLY set THIS proxy per-record (fixes MINOR-6's
+  // mis-attribution to the baseline catch-all), deduped by `server::jumpHost`.
+  const rejectWrittenProxy = (after: ServerConfig, before: ServerConfig | undefined): string | undefined => {
+    const p = after.proxy;
+    const stampedProxy = after.origin?.templated?.proxy;
+    if (
+      p === undefined ||
+      p.type !== "ssh" ||
+      stampedProxy === undefined ||
+      !proxyConfigsEqual(p, stampedProxy) || // §8.4 — template-OWNED only; a hand proxy is left alone
+      p.jumpHostId === after.id || // self is always a survivor (owned, not a delete-prune)
+      survivorIds.has(p.jumpHostId)
+    ) {
+      return undefined; // not a written template proxy this pass must reject
+    }
+    const danglingJumpHostId = p.jumpHostId;
+    const priorProxy = before?.proxy; // A on a row-3 override move; undefined on a row-1 write
+    const priorStamp = before?.origin?.templated?.proxy;
+    if (priorProxy !== undefined) {
+      after.proxy = { ...priorProxy }; // restore A (row 5 carry) — never delete a previously-working proxy
+    } else {
+      delete after.proxy; // nothing prior → absent (never a written `undefined`)
+    }
+    const origin = after.origin;
+    if (origin?.templated !== undefined) {
+      const templated = { ...origin.templated };
+      if (priorStamp !== undefined) {
+        templated.proxy = { ...priorStamp };
       } else {
-        delete after.proxy; // row-1 write had nothing prior → absent (never a written `undefined`)
+        delete templated.proxy;
       }
-      // The stamp follows the restored value: A's stamp on restore, cleared on
-      // delete — so the record and its ownership receipt stay consistent either way.
-      const origin = after.origin;
-      if (origin?.templated !== undefined) {
-        const templated = { ...origin.templated };
-        if (priorStamp !== undefined) {
-          templated.proxy = { ...priorStamp };
-        } else {
-          delete templated.proxy;
-        }
-        // `templated.proxy` joins the presence test now that this pass can RESTORE
-        // it: on a restore the stamp record must survive (it carries A's proxy
-        // stamp), where the round-2 delete-only path could omit it (proxy always
-        // gone). On the delete branch `templated.proxy` is undefined and drops out.
-        const stillStamped =
-          templated.proxy !== undefined ||
-          templated.multiplexing !== undefined ||
-          templated.legacyAlgorithms !== undefined ||
-          templated.logSession !== undefined;
-        after.origin = { ...origin, templated: stillStamped ? templated : undefined };
-      }
-      return true;
-    };
-    for (const a of adds) {
-      if (rejectTemplateProxy(a, undefined)) {
-        droppedAny = true;
+      const stillStamped =
+        templated.proxy !== undefined ||
+        templated.multiplexing !== undefined ||
+        templated.legacyAlgorithms !== undefined ||
+        templated.logSession !== undefined;
+      after.origin = { ...origin, templated: stillStamped ? templated : undefined };
+    }
+    // The template's NEW proxy did not flow onto this record — strip its §3.4 line.
+    dropProxyProvenance(after.id);
+    return danglingJumpHostId;
+  };
+  const warnWrittenProxy = (record: ServerConfig, jumpHostId: string): void => {
+    const warnKey = `${record.id}::${jumpHostId}`;
+    if (warnedRetainedProxyKeys.has(warnKey)) {
+      return;
+    }
+    warnedRetainedProxyKeys.add(warnKey);
+    // Names the template that ACTUALLY wrote this proxy on this record (MINOR-6).
+    const name = proxyTemplateNameByServerId.get(record.id) ?? "?";
+    warnings.push(
+      `Device template "${name}" on "${source.name}" set a jump-host proxy on "${record.name}" whose jump host will not survive this sync (it is being pruned, or its device was skipped) — the template's new proxy was not applied.`
+    );
+  };
+  for (const a of adds) {
+    if (!proxyTemplateNameByServerId.has(a.id)) {
+      continue; // this run wrote no proxy on this add
+    }
+    const rejectedJump = rejectWrittenProxy(a, undefined);
+    if (rejectedJump !== undefined) {
+      warnWrittenProxy(a, rejectedJump);
+    }
+  }
+  // Codex round 4/6 — NO-OP COLLAPSE (keep the plan counts exact). Restoring A can
+  // revert an update whose ONLY change was the proxy A→B, making `after` byte-equal
+  // to `before` — a genuine no-op. Remove it from `updates` and count the server
+  // UNCHANGED (the round-4 promotion decrement in the other direction); if OTHER
+  // fields also changed the update is KEPT and the count is left alone.
+  // `unchangedServerIds` is updated so the later promotion loop's decrement gate
+  // stays coherent for a collapsed server.
+  const updateStillChanged = (before: ServerConfig, after: ServerConfig): boolean =>
+    before.name !== after.name ||
+    before.host !== after.host ||
+    before.port !== after.port ||
+    before.group !== after.group ||
+    before.authProfileId !== after.authProfileId ||
+    before.ipmiHost !== after.ipmiHost ||
+    !proxyConfigsEqual(before.proxy, after.proxy) ||
+    before.multiplexing !== after.multiplexing ||
+    before.legacyAlgorithms !== after.legacyAlgorithms ||
+    before.logSession !== after.logSession ||
+    !serverOriginStampsEqual(before.origin, after.origin) ||
+    before.username !== after.username;
+  const collapsedIds = new Set<string>();
+  for (const u of updates) {
+    if (!proxyTemplateNameByServerId.has(u.after.id)) {
+      continue; // this run wrote no proxy on this update — a retained proxy is part 2's job
+    }
+    const rejectedJump = rejectWrittenProxy(u.after, u.before);
+    if (rejectedJump !== undefined) {
+      warnWrittenProxy(u.after, rejectedJump);
+      if (!updateStillChanged(u.before, u.after)) {
+        collapsedIds.add(u.before.id);
       }
     }
-    // Codex round 4/6 — NO-OP COLLAPSE (keep the plan counts exact). Restoring A can
-    // revert an update whose ONLY change was the proxy A→B, making `after`
-    // byte-equal to `before`. That update is now a genuine no-op: remove it from
-    // `updates` and count the server UNCHANGED — the same count bookkeeping as the
-    // round-4 promotion decrement, run in the other direction. If OTHER fields also
-    // changed this run the update is KEPT (proxy restored to A, other changes
-    // intact) and the count is left alone. `unchangedServerIds` is updated so the
-    // later promotion loop's decrement gate stays coherent for a collapsed server.
-    const updateStillChanged = (before: ServerConfig, after: ServerConfig): boolean =>
-      before.name !== after.name ||
-      before.host !== after.host ||
-      before.port !== after.port ||
-      before.group !== after.group ||
-      before.authProfileId !== after.authProfileId ||
-      before.ipmiHost !== after.ipmiHost ||
-      !proxyConfigsEqual(before.proxy, after.proxy) ||
-      before.multiplexing !== after.multiplexing ||
-      before.legacyAlgorithms !== after.legacyAlgorithms ||
-      before.logSession !== after.logSession ||
-      !serverOriginStampsEqual(before.origin, after.origin) ||
-      before.username !== after.username;
-    const collapsedIds = new Set<string>();
-    for (const u of updates) {
-      if (rejectTemplateProxy(u.after, u.before)) {
-        droppedAny = true;
-        if (!updateStillChanged(u.before, u.after)) {
-          collapsedIds.add(u.before.id);
-        }
+  }
+  if (collapsedIds.size > 0) {
+    for (let i = updates.length - 1; i >= 0; i--) {
+      if (collapsedIds.has(updates[i].before.id)) {
+        const [removed] = updates.splice(i, 1);
+        unchangedCount++;
+        unchangedServerIds.add(removed.before.id);
       }
-    }
-    if (collapsedIds.size > 0) {
-      for (let i = updates.length - 1; i >= 0; i--) {
-        if (collapsedIds.has(updates[i].before.id)) {
-          const [removed] = updates.splice(i, 1);
-          unchangedCount++;
-          unchangedServerIds.add(removed.before.id);
-        }
-      }
-    }
-    if (droppedAny) {
-      // Wording covers both dispositions honestly: an add loses the proxy, while an
-      // update may KEEP its previous proxy A (only the template's NEW proxy B was
-      // rejected). "The template's new proxy was not applied" is true for both.
-      warnings.push(
-        `Device template "${cascade.proxyTemplateName ?? "?"}" on "${source.name}" sets a jump-host proxy whose jump host will not survive this sync (it is being pruned, or its device was skipped) — the template's new proxy was not applied.`
-      );
     }
   }
 
@@ -2819,10 +2929,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     return { self: cur.jumpHostId === record.id, jumpHostId: cur.jumpHostId };
   };
-  const warnedRetainedProxyKeys = new Set<string>();
   const warnRetainedProxy = (record: ServerConfig, self: boolean, jumpHostId: string): void => {
     // Dedupe by server + jump host so a single drop is never announced twice,
-    // including across composition with part 1 / round 6.
+    // including across composition with part 1 / round 6 (`warnedRetainedProxyKeys`
+    // is the set shared with part 1, declared above).
     const warnKey = `${record.id}::${jumpHostId}`;
     if (warnedRetainedProxyKeys.has(warnKey)) {
       return;
@@ -2875,6 +2985,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     warnRetainedProxy(u.after, invalid.self, invalid.jumpHostId);
     u.after = dropTemplateProxy(u.after); // a DROP (retained value IS the dangling/self host — nothing beneath to restore)
+    dropProxyProvenance(u.after.id); // B2 — no §3.4 line for a proxy that was removed
   }
 
   // PART 2b — the UNPLANNED set. Snapshot the planned ids (adds ∪ updates-before
@@ -2910,6 +3021,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     warnRetainedProxy(candidate, invalid.self, invalid.jumpHostId);
     // NOT PLANNED — promote to a new proxy-dropping update.
     updates.push({ before: candidate, after: dropTemplateProxy(candidate) });
+    dropProxyProvenance(candidate.id); // B2 — no §3.4 line for a proxy that was removed
+
     // Codex round 4 (P2) — gate the decrement on actually-counted-unchanged. A
     // server whose device was SKIPPED this fetch reaches here without ever having
     // hit `unchangedCount++`, so decrementing for it would understate the count or
@@ -2917,6 +3030,28 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (unchangedServerIds.has(candidate.id)) {
       unchangedCount--; // this device was counted unchanged in the loop; it is now an update
     }
+  }
+
+  // M2 (PR-T2 review) — SOURCE-LEVEL dangling-reference warnings, emitted ONCE
+  // after the loop and deduped against the per-device path (`pushDedupTemplateWarning`).
+  // The per-device dangling warnings only fire for devices the loop reached, so a
+  // source whose catch-all/implicit template names a dangling jump host or a
+  // deleted auth profile would warn NOWHERE when zero devices are syncable (T1
+  // warned once). Running the baseline catch-all cascade's warnings here restores
+  // that: when devices DID run, the identical strings are already seen and the
+  // dedup swallows these; when none did, this is the only surface.
+  for (const w of baselineComposed.warnings) {
+    pushDedupTemplateWarning(w);
+  }
+  const baselineAuthWinner = baselineCascade.winners.authProfileId;
+  if (
+    baselineAuthWinner !== undefined &&
+    !baselineCascade.authFromImplicit &&
+    resolveAuthProfileById(baselineAuthWinner.value) === undefined
+  ) {
+    pushDedupTemplateWarning(
+      `A device template rule on "${source.name}" links an auth profile that no longer exists — the auth field was skipped.`
+    );
   }
 
   // DEVICE TEMPLATES (§2.3 A-M4) — ZERO-MATCH info: a rule that matched no device
@@ -2931,21 +3066,30 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
   // DEVICE TEMPLATES (§3.4) — plan-report PROVENANCE lines: per (field, rule),
   // aggregated so the plan stays readable at fleet scale. Servers with an
-  // identical provenance signature (same fields ← same rules) collapse to one
-  // line naming the count and each field's origin. Report-only, inferred here for
-  // free from the winners the cascade already held while composing.
-  if (provenanceByServer.length > 0) {
+  // identical provenance signature (same fields ← same rules) collapse to one line
+  // naming the count and each field's origin. Report-only. PR-T2 review (B2): the
+  // entries here are already gated on the matrix's ACTUAL WRITES (a hand-edit / a
+  // dropped or restored dangling proxy leaves no entry), so every line names a
+  // value that genuinely flowed this run. The implicit source-level auth rule sets
+  // no §3.4 entry (`selectFieldWinners` records `implicit: false` on every entry it
+  // makes and none at all for the implicit rule), so `FieldProvenance.implicit` is
+  // always false here — the former `implicit ? "(source default)"` branches were
+  // dead and are removed.
+  if (provenanceByServer.size > 0) {
     const groups = new Map<string, { count: number; provenance: Partial<Record<TemplatableField, FieldProvenance>> }>();
     const fieldOrder: TemplatableField[] = ["proxy", "authProfileId", "multiplexing", "legacyAlgorithms", "logSession"];
-    for (const entry of provenanceByServer) {
+    for (const entry of provenanceByServer.values()) {
       const parts: string[] = [];
       for (const field of fieldOrder) {
         const prov = entry.provenance[field];
         if (prov !== undefined) {
-          parts.push(`${field}=${prov.implicit ? "@source" : `${prov.templateName}::${prov.ruleFilter ?? ""}`}`);
+          parts.push(`${field}=${prov.templateName}::${prov.ruleFilter ?? ""}`);
         }
       }
       const key = parts.join("|");
+      if (key === "") {
+        continue; // no written template field survived — nothing to report for this server
+      }
       const g = groups.get(key);
       if (g === undefined) {
         groups.set(key, { count: 1, provenance: entry.provenance });
@@ -2961,13 +3105,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         if (prov === undefined) {
           continue;
         }
-        const origin = prov.implicit
-          ? "(source default)"
-          : prov.ruleFilter !== undefined && prov.ruleFilter.trim() !== ""
-            ? `(rule ${prov.ruleFilter})`
-            : "(catch-all rule)";
-        const from = prov.implicit ? "the source auth profile" : `"${prov.templateName}"`;
-        segments.push(`${TEMPLATE_FIELD_SHORT_LABELS[field]} ← ${from} ${origin}`);
+        const origin =
+          prov.ruleFilter !== undefined && prov.ruleFilter.trim() !== "" ? `(rule ${prov.ruleFilter})` : "(catch-all rule)";
+        segments.push(`${TEMPLATE_FIELD_SHORT_LABELS[field]} ← "${prov.templateName}" ${origin}`);
       }
       if (segments.length > 0) {
         warnings.push(`${g.count} server${g.count === 1 ? "" : "s"}: ${segments.join("; ")}`);

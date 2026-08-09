@@ -575,17 +575,32 @@ function createTemplateInteractively(ctx: CommandContext): Promise<DeviceTemplat
 
 /** The template a rule applies — an existing one, or a freshly created one (UX-M5 zero-template empty state). */
 async function pickRuleTemplate(ctx: CommandContext, seedTemplateId: string | undefined): Promise<DeviceTemplateProfile | undefined> {
-  const templates = ctx.core.getSnapshot().deviceTemplates.slice().sort((a, b) => naturalCompare(a.name, b.name));
+  // U1 (PR-T2 review) — the rule's CURRENT template sorts FIRST and is marked, so
+  // an Edit visibly opens on the value the rule already carries (VS Code honours
+  // `picked` only for canPickMany, so this single-select needs a visible marker
+  // AND ordering, not a no-op `picked:`, or a mis-pick silently rewires the rule).
+  const templates = ctx.core.getSnapshot().deviceTemplates.slice().sort((a, b) => {
+    if (a.id === seedTemplateId && b.id !== seedTemplateId) {
+      return -1;
+    }
+    if (b.id === seedTemplateId && a.id !== seedTemplateId) {
+      return 1;
+    }
+    return naturalCompare(a.name, b.name);
+  });
   interface TemplateRow extends vscode.QuickPickItem {
     template?: DeviceTemplateProfile;
     create?: boolean;
   }
-  const rows: TemplateRow[] = templates.map((t) => ({
-    label: t.name,
-    description: describeTemplateFields(t),
-    template: t,
-    picked: t.id === seedTemplateId
-  }));
+  const rows: TemplateRow[] = templates.map((t) => {
+    const isCurrent = t.id === seedTemplateId;
+    const fields = describeTemplateFields(t);
+    return {
+      label: isCurrent ? `$(check) ${t.name}` : t.name,
+      description: isCurrent ? (fields ? `current • ${fields}` : "current") : fields,
+      template: t
+    };
+  });
   if (rows.length > 0) {
     rows.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
   }
@@ -622,29 +637,61 @@ async function promptRuleFilter(seed: string | undefined, attributeKeys: readonl
   });
 }
 
-/** Persist the source's `templateRules` under the config lock, then surface the non-blocking save-time warnings (§7.2). */
+/**
+ * M3 (PR-T2 review) — persist a rule DELTA under the config lock, resolving it
+ * against the source read FRESH INSIDE the lock (the T1b resolve-under-lock
+ * discipline). `apply` receives the current `templateRules` and returns the new
+ * array, or `"diverged"` when the specific rule this flow set out to edit has
+ * itself changed or vanished under a concurrent edit — in which case nothing is
+ * saved and the user gets the house "changed while open, re-run" message rather
+ * than a wholesale overwrite that silently drops the other window's edit. The
+ * unknown-key warning is raised only for `changedRule` (the rule just written),
+ * not every rule in the source (P4).
+ */
 async function saveTemplateRules(
   ctx: CommandContext,
   live: InventorySourceConfig,
-  rules: TemplateRule[],
+  apply: (freshRules: TemplateRule[]) => TemplateRule[] | "diverged",
+  changedRule: TemplateRule | undefined,
   attributeKeys: readonly string[] | undefined
 ): Promise<void> {
+  let savedRules: TemplateRule[] | undefined;
+  let diverged = false;
   await configMutationLock.runExclusive(async () => {
     const fresh = ctx.core.getInventorySource(live.id);
     if (fresh === undefined) {
+      return; // source removed underneath us
+    }
+    const next = apply(fresh.templateRules ?? []);
+    if (next === "diverged") {
+      diverged = true;
       return;
     }
-    await ctx.core.addOrUpdateInventorySource({ ...fresh, templateRules: rules.length > 0 ? rules : undefined });
+    savedRules = next;
+    await ctx.core.addOrUpdateInventorySource({ ...fresh, templateRules: next.length > 0 ? next : undefined });
   });
+  if (diverged) {
+    void vscode.window.showWarningMessage(
+      "These template rules were changed in another window while this editor was open — nothing was saved. Re-run Edit Template Rules and try again."
+    );
+    return;
+  }
+  if (savedRules === undefined) {
+    return;
+  }
   const templatesById = new Map(ctx.core.getSnapshot().deviceTemplates.map((t) => [t.id, t] as const));
-  for (const w of saveOverlapWarnings(rules, templatesById)) {
+  for (const w of saveOverlapWarnings(savedRules, templatesById)) {
     void vscode.window.showWarningMessage(w);
   }
-  for (const r of rules) {
-    const unknown = unknownFilterKeys(parseTemplateFilter(r.filter), attributeKeys);
+  // P4 — warn only about the rule just written, not every rule on the source.
+  if (changedRule !== undefined) {
+    const unknown = unknownFilterKeys(parseTemplateFilter(changedRule.filter), attributeKeys);
     if (unknown.length > 0) {
+      // U2 — carry §2.2's actionable "Known keys: …" clause the live-feedback path
+      // (templateRulesView.filterFeedback) already shows; the save-time toast must too.
+      const known = (attributeKeys ?? []).join(", ");
       void vscode.window.showWarningMessage(
-        `Rule "${filterLabel(r.filter)}": key '${unknown[0]}' is not one this source's provider reports — this rule will never match.`
+        `Rule "${filterLabel(changedRule.filter)}": key '${unknown[0]}' is not one this source's provider reports — this rule will never match. Known keys: ${known}`
       );
     }
   }
@@ -668,16 +715,38 @@ async function addOrEditTemplateRule(
   // Empty / whitespace canonicalizes to a catch-all (absent filter), §2.3.
   const filter = raw.trim() === "" ? undefined : raw.trim();
   const newRule: TemplateRule = { id: existing?.id ?? randomUUID(), templateId: template.id, filter };
-  const current = live.templateRules ?? [];
-  const next = existing ? current.map((r) => (r.id === existing.id ? newRule : r)) : [...current, newRule];
-  await saveTemplateRules(ctx, live, next, attributeKeys);
+  await saveTemplateRules(
+    ctx,
+    live,
+    (freshRules) => {
+      if (existing === undefined) {
+        return [...freshRules, newRule]; // ADD — a fresh UUID, so no id collision with concurrent edits
+      }
+      // EDIT — replace by id, preserving a concurrent edit to any OTHER rule. If
+      // the rule we set out to edit is gone or was concurrently changed, refuse
+      // rather than resurrect/clobber it.
+      if (!freshRules.some((r) => r.id === existing.id)) {
+        return "diverged";
+      }
+      return freshRules.map((r) => (r.id === existing.id ? newRule : r));
+    },
+    newRule,
+    attributeKeys
+  );
 }
 
 /** The source whose rules to edit — the arg, the only source, or a picker. */
 async function pickSourceForRules(ctx: CommandContext): Promise<InventorySourceConfig | undefined> {
   const sources = ctx.core.getSnapshot().inventorySources;
   if (sources.length === 0) {
-    void vscode.window.showWarningMessage("No inventory sources configured. Add one first.");
+    // P5 (PR-T2 review) — house style: offer the action, not a dead end.
+    const choice = await vscode.window.showWarningMessage(
+      "Template rules live on an inventory source, and none is configured yet.",
+      "Add Inventory Source"
+    );
+    if (choice === "Add Inventory Source") {
+      await vscode.commands.executeCommand("nexus.inventory.addSource");
+    }
     return undefined;
   }
   if (sources.length === 1) {
@@ -748,7 +817,10 @@ async function editTemplateRules(ctx: CommandContext, registry: InventoryProvide
         continue;
       }
       if (action.act === "remove") {
-        await saveTemplateRules(ctx, live, rules.filter((r) => r.id !== existing.id), attributeKeys);
+        // REMOVE is idempotent and commutes with a concurrent edit to any other
+        // rule, so it applies onto fresh with no divergence check — filtering an
+        // already-gone id is a harmless no-op. No unknown-key check on a removal.
+        await saveTemplateRules(ctx, live, (freshRules) => freshRules.filter((r) => r.id !== existing.id), undefined, attributeKeys);
       } else {
         await addOrEditTemplateRule(ctx, live, existing, attributeKeys);
       }

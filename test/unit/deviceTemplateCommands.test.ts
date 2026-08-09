@@ -1114,4 +1114,85 @@ describe("Edit Template Rules… flow (§7.2)", () => {
     expect(row.detail).toContain("Sets: Proxy");
     expect(core.getInventorySource("src-1")!.templateRules).toBeUndefined(); // removed
   });
+
+  it("U1 — Editing a rule marks its CURRENT template and sorts it first in the template picker (kills the no-op `picked:` that shows no current value, letting a mis-pick silently rewire the rule)", async () => {
+    const core = makeCore();
+    // Two templates; `bravo` sorts AFTER `alpha` by name but is the rule's current one.
+    await core.addOrUpdateDeviceTemplate({ id: "t-alpha", name: "Alpha", fields: { proxy: { mode: "override", value: PROXY } } });
+    await core.addOrUpdateDeviceTemplate({ id: "t-bravo", name: "Bravo", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core, { templateRules: [{ id: "r1", templateId: "t-bravo", filter: "role=switch" }] });
+    registerWithRegistry(core, regWith());
+    let templateItems: Array<{ label: string; description?: string; template?: { id: string } }> = [];
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ ruleId?: string }>) => items.find((i) => i.ruleId === "r1"))
+      .mockImplementationOnce(async (items: Array<{ act?: string }>) => items.find((i) => i.act === "edit"))
+      .mockImplementationOnce(async (items: typeof templateItems) => {
+        templateItems = items;
+        return undefined; // inspect the rows, then abort — no rewire
+      })
+      .mockResolvedValueOnce(undefined); // loop → exit
+
+    await editRules();
+
+    const templateRows = templateItems.filter((i) => i.template !== undefined);
+    // The current template (Bravo) is FIRST despite sorting after Alpha by name...
+    expect(templateRows[0].template!.id).toBe("t-bravo");
+    // ...and is visibly marked as current.
+    expect(templateRows[0].label).toContain("Bravo");
+    expect(templateRows[0].label).toContain("$(check)");
+    expect(templateRows[0].description).toContain("current");
+    // The non-current row carries no marker.
+    const alphaRow = templateRows.find((i) => i.template!.id === "t-alpha")!;
+    expect(alphaRow.label).not.toContain("$(check)");
+    // Aborting the pick left the rule untouched.
+    expect(core.getInventorySource("src-1")!.templateRules).toEqual([{ id: "r1", templateId: "t-bravo", filter: "role=switch" }]);
+  });
+
+  it("U2 — the save-time unknown-key warning carries the actionable 'Known keys: …' clause (kills the truncated toast that omits §2.2's remedy)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core);
+    registerWithRegistry(core, regWith(["role", "site", "name"]));
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    mockShowInputBox.mockResolvedValueOnce("sites=syd"); // 'sites' is unknown (known are role/site/name)
+
+    await editRules();
+
+    const warned = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
+    const keyWarn = warned.find((w) => w.includes("is not one this source's provider reports"));
+    expect(keyWarn).toBeDefined();
+    expect(keyWarn).toContain("Known keys: role, site, name");
+  });
+
+  it("M3 — a concurrent rule added in another window between the picker and the save is PRESERVED, not clobbered (resolve-under-lock delta; kills the wholesale overwrite from the pre-QuickPick snapshot)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core, { templateRules: [{ id: "r1", templateId: "t1", filter: "role=switch" }] });
+    registerWithRegistry(core, regWith(["role", "site", "name"]));
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    // The filter InputBox stands in for the unbounded wait during which ANOTHER
+    // window edits the same source, adding r2. The old code snapshotted templateRules
+    // BEFORE this and overwrote wholesale, dropping r2.
+    mockShowInputBox.mockImplementationOnce(async () => {
+      const fresh = core.getInventorySource("src-1")!;
+      await core.addOrUpdateInventorySource({ ...fresh, templateRules: [...(fresh.templateRules ?? []), { id: "r2", templateId: "t1", filter: "site=syd" }] });
+      return "role=router"; // the new rule this flow is adding
+    });
+
+    await editRules();
+
+    const rules = core.getInventorySource("src-1")!.templateRules!;
+    expect(rules).toHaveLength(3); // r1, the concurrent r2, and this flow's new rule — none clobbered
+    expect(rules.some((r) => r.id === "r1" && r.filter === "role=switch")).toBe(true); // original untouched
+    expect(rules.some((r) => r.id === "r2" && r.filter === "site=syd")).toBe(true); // concurrent edit survived
+    expect(rules.some((r) => r.filter === "role=router")).toBe(true); // this flow's add landed
+  });
 });

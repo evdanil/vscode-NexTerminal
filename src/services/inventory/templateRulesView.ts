@@ -126,10 +126,14 @@ export function filterFeedback(filterInput: string, attributeKeys: readonly stri
     };
   }
   if (parsed.specificity === 0) {
-    if (filterInput.trim() === "") {
+    // P2 (PR-T2 review) — the `name=*` note is claimed ONLY for an actual name
+    // glob. A filter with zero PARSED conditions (`""`, `&`, `=x`) carries no
+    // `name=*` at all, so it is a genuine catch-all; only a filter whose sole
+    // remaining condition is a match-everything `name` glob gets the name=* note
+    // (the old `trim() === ""` test mis-labelled every degenerate input as name=*).
+    if (parsed.conditions.size === 0) {
       return { severity: "info", message: "Matches every device (catch-all).", blocking: false };
     }
-    // A non-empty filter that still parses to zero conditions is a bare `name=*`.
     return { severity: "info", message: "`name=*` matches every device — it adds no specificity.", blocking: false };
   }
   return {
@@ -189,7 +193,10 @@ export function saveOverlapWarnings(
         continue; // every shared field identical → unobservable (fixture 20d(d))
       }
       warnings.push(
-        `Rules \`${filterLabel(a.rule.filter)}\` and \`${filterLabel(b.rule.filter)}\` have the same specificity and both set ${TEMPLATE_FIELD_SHORT_LABELS[differing[0]]}. ` +
+        // P3 (PR-T2 review) — name each rule's TEMPLATE so two identical filters
+        // (`(all devices)` twice, or the same literal) are distinguishable.
+        `Rules \`${filterLabel(a.rule.filter)}\` (→ "${a.template.name}") and \`${filterLabel(b.rule.filter)}\` (→ "${b.template.name}") ` +
+          `have the same specificity and both set ${TEMPLATE_FIELD_SHORT_LABELS[differing[0]]}. ` +
           `If a device matches both, the winner is decided by a tie-break rather than by the order of these rules — make one more specific to choose deliberately.`
       );
     }
