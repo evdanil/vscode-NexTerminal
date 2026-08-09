@@ -36,6 +36,20 @@ export type ProxyPasswordPrompt = (
   proxy: Socks5Proxy | HttpConnectProxy
 ) => Promise<{ password: string; save: boolean } | undefined>;
 
+/**
+ * Resolution of the per-connect proxy password. `password` is fed to the
+ * handshake exactly as before. `storeOnSuccess`, when present, is a deferred
+ * best-effort persist descriptor: the caller stores it ONLY after
+ * `authFactory.connect` resolves (proxy handshake + ssh auth both succeeded),
+ * so a mistyped first-time password is never persisted (which would otherwise
+ * lock the proxy out of every later connect via the `stored !== undefined`
+ * early-return).
+ */
+interface ResolvedProxyPassword {
+  password: string | undefined;
+  storeOnSuccess?: { key: string; value: string };
+}
+
 function normalizeProxyTimeoutMs(timeoutMs: number): number {
   return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 5_000, 300_000) : 60_000;
 }
@@ -146,7 +160,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     proxy: Socks5Proxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const proxyPassword = await this.resolveProxyPassword(target, proxy);
+    const { password: proxyPassword, storeOnSuccess } = await this.resolveProxyPassword(target, proxy);
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -188,6 +202,18 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       sockFactory,
       ...(onAuthMessage && { onAuthMessage })
     });
+    // The connection succeeded (proxy handshake + ssh auth). Now persist a freshly
+    // prompted, save-flagged password — deferred to here so a mistyped first-time
+    // secret is never stored before the handshake, and kept OUT of the timing-
+    // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
+    // keychain-store failure must not abort an already-established connection.
+    if (storeOnSuccess) {
+      try {
+        await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
+      } catch {
+        /* best-effort — a keychain-store failure must not abort an established connection */
+      }
+    }
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -198,7 +224,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     proxy: HttpConnectProxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const proxyPassword = await this.resolveProxyPassword(target, proxy);
+    const { password: proxyPassword, storeOnSuccess } = await this.resolveProxyPassword(target, proxy);
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -221,6 +247,18 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       sockFactory,
       ...(onAuthMessage && { onAuthMessage })
     });
+    // The connection succeeded (proxy handshake + ssh auth). Now persist a freshly
+    // prompted, save-flagged password — deferred to here so a mistyped first-time
+    // secret is never stored before the handshake, and kept OUT of the timing-
+    // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
+    // keychain-store failure must not abort an already-established connection.
+    if (storeOnSuccess) {
+      try {
+        await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
+      } catch {
+        /* best-effort — a keychain-store failure must not abort an established connection */
+      }
+    }
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -231,32 +269,37 @@ export class ProxySshFactory implements ContextAwareSshFactory {
    * call `vault.get` (do NOT move — it preserves the documented socket/banner IPC
    * ordering). Realizes the §5.3 per-connect prompt that was assumed-but-unbuilt:
    * a username-bearing proxy whose vault lookup returns nothing consults the
-   * optional prompt (when wired); a saved success is stored under
-   * `proxyPasswordSecretKey(target.id)` so it is one-time. A cancelled prompt, an
-   * absent prompt dependency, or a proxy without a username all fall back to the
-   * prior behavior (`undefined` → `?? ""` downstream) with no behavior change.
+   * optional prompt (when wired). A saved success is NOT stored here — it is
+   * returned as a `storeOnSuccess` descriptor and persisted by the caller ONLY
+   * after `authFactory.connect` resolves (deferred, post-connect, best-effort),
+   * so a mistyped first-time password is never persisted before the handshake
+   * (which would lock the proxy out of every later connect). A cancelled prompt,
+   * an absent prompt dependency, or a proxy without a username all fall back to
+   * the prior behavior (`undefined` → `?? ""` downstream) with no behavior change.
    */
   private async resolveProxyPassword(
     target: ServerConfig,
     proxy: Socks5Proxy | HttpConnectProxy
-  ): Promise<string | undefined> {
+  ): Promise<ResolvedProxyPassword> {
     if (!proxy.username) {
-      return undefined;
+      return { password: undefined };
     }
     const stored = await this.vault.get(proxyPasswordSecretKey(target.id));
     if (stored !== undefined) {
-      return stored;
+      return { password: stored };
     }
     if (this.promptProxyPassword) {
       const result = await this.promptProxyPassword(target, proxy);
       if (result) {
-        if (result.save) {
-          await this.vault.store(proxyPasswordSecretKey(target.id), result.password);
-        }
-        return result.password;
+        return {
+          password: result.password,
+          ...(result.save && {
+            storeOnSuccess: { key: proxyPasswordSecretKey(target.id), value: result.password }
+          })
+        };
       }
     }
-    return undefined;
+    return { password: undefined };
   }
 
   private addToVisited(visited: ReadonlySet<string>, server: ServerConfig): Set<string> {

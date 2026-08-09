@@ -1006,6 +1006,77 @@ describe("ProxySshFactory", () => {
     expect(vault.store).not.toHaveBeenCalled();
   });
 
+  // Fix B (issue #48 PR-T1b / PR #62 Codex round 7) — the round-6 prompt stored the
+  // prompted password BEFORE the handshake, so a mistyped first-time password was
+  // persisted and every later connect took the `stored !== undefined` early-return
+  // → the proxy was locked out. The store is now deferred to AFTER
+  // `authFactory.connect` resolves, best-effort (a keychain-store failure never
+  // aborts a live connection). These falsify that regression.
+  it("Fix B — a wrong first-time password (connect rejects) is NOT stored, and the next connect re-prompts", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    // First connect: proxy handshake runs but ssh auth rejects (mistyped password).
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      throw new Error("All configured authentication methods failed");
+    });
+
+    const prompt = vi.fn(async () => ({ password: "wrong", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    await expect(factory.connect(server)).rejects.toThrow("authentication methods failed");
+    expect(prompt).toHaveBeenCalledTimes(1);
+    // The bad password must NOT have been persisted before the handshake — otherwise
+    // the vault hit would suppress every later prompt and lock the proxy out.
+    expect(vault.store).not.toHaveBeenCalled();
+
+    // Second connect: the vault is still empty, so the prompt fires again (no lockout).
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+      await opts?.sockFactory?.();
+      return makeFakeConnection();
+    });
+    await factory.connect(server);
+    expect(prompt).toHaveBeenCalledTimes(2);
+    // This time the connect succeeded, so the (re-typed) password is stored after success.
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "wrong");
+  });
+
+  it("Fix B — a keychain-store failure after a successful connect is swallowed; the connection is still returned", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    // The post-connect store throws (locked keychain). It must not abort the live connection.
+    vault.store = vi.fn(async () => { throw new Error("keychain locked"); });
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    const connection = await factory.connect(server);
+    expect(connection).toBeInstanceOf(ProxiedSshConnection);
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("Fix B — a correct first-time password is stored exactly once after the connection succeeds, and the proxied connection is returned", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    const connection = await factory.connect(server);
+
+    expect(connection).toBeInstanceOf(ProxiedSshConnection);
+    expect(vault.store).toHaveBeenCalledTimes(1);
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
   it("emits onClose when a SOCKS5 proxy socket closes after connection", async () => {
     const server = makeServer({
       proxy: { type: "socks5", host: "proxy.local", port: 1080 }
