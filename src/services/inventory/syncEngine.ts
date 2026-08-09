@@ -2651,10 +2651,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // SCOPE, strictly (§8.4): a TEMPLATE-STAMPED proxy only — `cur.proxy` present,
   // `type:"ssh"`, and `proxyConfigsEqual(cur.proxy, record.origin.templated.proxy)`
   // so the sync still OWNS it (`cur === stamp`). A HAND-SET proxy (stamp absent or
-  // ≠) pointing at a pruned jump host is LEFT ALONE — §8.4's deliberate "no sweep
-  // on prune" posture — even on a server this run renames. The jump host must be a
-  // NON-survivor and not the record's own id (self-reference is the composition
-  // -time guard's business, and a self id is a survivor anyway).
+  // ≠) pointing at a pruned jump host — or at itself — is LEFT ALONE — §8.4's
+  // deliberate "no sweep on prune" posture — even on a server this run renames.
+  //
+  // INVALID = jump host is a NON-SURVIVOR **or** the jump host is the record's OWN
+  // id (ROUND 8). The record's own id IS a survivor (it is owned, not a delete
+  // -prune), so a plain survivor test would treat a self-proxy as valid and retain
+  // it forever — but a RETAINED self-proxy no current rule wins is exactly the
+  // §5.3 circular reference the connect-time guard refuses. Round 5's MATRIX repair
+  // (composition time, `clearProxy`) only fires when there IS a desired proxy this
+  // run; this pass additionally cleans the NO-winner retained self case, on both
+  // dispositions below. The self-ref case is ALWAYS a drop (a self-proxy has no
+  // valid value to restore, the same as a dangling one).
   //
   // DISPOSITION by where the server already sits (no double-handling):
   //  - PRUNE: skip — being removed / handled by its own prune branch (a delete
@@ -2679,6 +2687,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // (A itself pruned), this pass correctly drops it — belt-and-suspenders — and
   // warnings are deduped by server + jump host so a single drop is never announced
   // twice.
+  //
+  // COMPOSITION WITH ROUND 5 (the with-winner self case, no double-handling): the
+  // matrix's `clearProxy` (composition time) has already deleted `after.proxy` and
+  // dropped its stamp for a server whose DESIRED proxy self-references, so this
+  // pass sees `cur === undefined` on that record and skips. Part 2 only reaches a
+  // self-proxy that NO current rule sets (a retained §6.3 carry). Together the two
+  // now cover the whole proxy-cleanup surface: {dangling, self} × {this-run
+  // -written, retained} × {add, update-in-place, unplanned-promote, unchanged} —
+  // write-time round 6 + with-winner round-5 self repair for the this-run-written
+  // column, this survivor pass (post-plan dangling + retained-self repair) for the
+  // retained column.
   const updateById = new Map<string, { before: ServerConfig; after: ServerConfig }>();
   for (const u of updates) {
     updateById.set(u.before.id, u);
@@ -2719,13 +2738,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const record = updateEntry !== undefined ? updateEntry.after : ownedServer;
     const cur = record.proxy;
     const stampedProxy = record.origin?.templated?.proxy;
+    // ROUND 8 — a template-owned ssh proxy is INVALID (and cleaned) when its
+    // jump host is a NON-survivor OR the jump host is the record's OWN id (a
+    // self-reference). The record's own id is itself a survivor (owned, not a
+    // delete-prune), so a bare `survivorIds.has(cur.jumpHostId)` skip would keep
+    // a RETAINED self-proxy no current rule wins forever — every connection then
+    // hits the runtime circular-proxy guard. Excluding self from the survivor
+    // skip is what lets part 2 drop it. `!==` here rather than folding self into
+    // the survivor test so the self case is caught regardless of whether the id
+    // happens to sit in `survivorIds`.
+    const selfProxy = cur !== undefined && cur.type === "ssh" && cur.jumpHostId === record.id;
     if (
       cur === undefined ||
       cur.type !== "ssh" ||
       stampedProxy === undefined ||
       !proxyConfigsEqual(cur, stampedProxy) || // §8.4 — template-stamped proxies only; a hand proxy is left alone
-      cur.jumpHostId === record.id ||
-      survivorIds.has(cur.jumpHostId)
+      (cur.jumpHostId !== record.id && survivorIds.has(cur.jumpHostId))
     ) {
       continue;
     }
@@ -2752,7 +2780,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     if (shouldWarn) {
       warnings.push(
-        `Server "${record.name}" on "${source.name}" carries a device-template jump-host proxy whose jump host will not survive this sync (it is being pruned) — the proxy field was removed.`
+        selfProxy
+          ? `Server "${record.name}" on "${source.name}" carries a device-template jump-host proxy that points at itself (a circular proxy no rule now sets) — the proxy field was removed.`
+          : `Server "${record.name}" on "${source.name}" carries a device-template jump-host proxy whose jump host will not survive this sync (it is being pruned) — the proxy field was removed.`
       );
     }
   }

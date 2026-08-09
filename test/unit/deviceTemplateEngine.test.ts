@@ -1440,6 +1440,82 @@ describe("Codex round 7 — the survivor part-2 cleans a retained dangling templ
   });
 });
 
+// -------- Codex round 8 (P2) — the survivor part-2 cleans a RETAINED template-owned SELF-proxy that no current rule wins --------
+
+describe("Codex round 8 — the survivor part-2 cleans a retained template-owned self-proxy no rule now sets, on both dispositions", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const S_ID = deterministicServerId("source-1", "device:1");
+
+  it("Fixture 60 — NOT-PLANNED promote: S RETAINS a template-owned SELF-proxy (proxy === templated.proxy, jumpHost === own id), NO rule sets proxy, S otherwise unchanged → promoted to a new update, proxy ABSENT + stamp cleared + unchangedCount decremented + one self-reference warning (kills the round-7 guard that treats the record's own id as a survivor and skips the retained self-proxy forever)", () => {
+    // A self-referential template-owned proxy retained by §6.3 row-5 carry: its
+    // rule was removed (no templateRules), so value + stamp are kept but no
+    // current winner sets it. The record's own id IS a survivor, so the round-7
+    // survivor test skipped it — leaving a circular proxy the runtime refuses.
+    const s = ownedServer({ proxy: sshProxy(S_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(S_ID) } });
+    const p = plan({
+      source: makeSource(), // no template rules — the proxy is a retained receipt
+      devices: [makeDevice()], // device:1 → S, name/endpoint unchanged → counted unchanged
+      servers: [s]
+    });
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined(); // THE FIX: promoted to a new update instead of skipped-as-survivor
+    expect(after!.proxy).toBeUndefined(); // self-proxy DROPPED
+    expect("proxy" in after!).toBe(false); // absent, never a written undefined
+    expect(after!.origin?.templated?.proxy).toBeUndefined(); // stamp cleared with it
+    expect(p.unchangedCount).toBe(0); // counted unchanged, then decremented on promotion
+    expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(1);
+    // The self case is NOT a prune — the dangling wording must not appear.
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
+  });
+
+  it("Fixture 61 — IN-PLACE update: the same retained self-proxy on a server also RENAMED this run is cleaned on the existing update's after (proxy absent + stamp cleared + rename preserved + one self warning, unchangedCount untouched) (kills skipping an already-planned update whose retained proxy self-references)", () => {
+    const s = ownedServer({ proxy: sshProxy(S_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(S_ID) } });
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice({ name: "renamed-sw" })], // rename → S is an update
+      servers: [s]
+    });
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined();
+    expect(after!.name).toBe("renamed-sw"); // the unrelated update is preserved
+    expect(after!.proxy).toBeUndefined(); // self-proxy dropped IN PLACE
+    expect("proxy" in after!).toBe(false);
+    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(p.unchangedCount).toBe(0); // S was an update from the start, never counted unchanged
+    expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
+  });
+
+  it("Fixture 62 — §8.4 guard: a HAND self-proxy (proxy self-ref, NO templated.proxy stamp), no winner → LEFT ALONE, server unchanged, no warning (kills an over-broad clear that sweeps a hand proxy)", () => {
+    const s = ownedServer({ proxy: sshProxy(S_ID) }, { externalId: "device:1", templated: undefined });
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()], // unchanged
+      servers: [s]
+    });
+    expect(afterFor(p, S_ID)).toBeUndefined(); // untouched — no update
+    expect(p.unchangedCount).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(0);
+  });
+
+  it("Fixture 63 — round-5 composition: a DESIRED self-proxy (template override to self, matching stamp) is repaired by the MATRIX at write time; part 2 sees no self-proxy and does NOT double-handle (exactly one 'through itself … was cleared' warning, zero part-2 'points at itself')", () => {
+    const s = ownedServer({ proxy: sshProxy(S_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(S_ID) } });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [s],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(S_ID) } })]
+    });
+    const after = afterFor(p, S_ID);
+    expect(after).toBeDefined();
+    expect(after!.proxy).toBeUndefined();
+    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    // The matrix's own repair warning, once — and NOT part 2's, which would be a double-handle.
+    expect(p.warnings.filter((w) => w.includes("through itself") && w.includes("was cleared")).length).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(0);
+  });
+});
+
 // -------- clearTemplatedStamps (§5.1, unit-tested, wired to nothing) --------
 
 describe("clearTemplatedStamps — §5.1 (manual path helper; not wired in T1)", () => {

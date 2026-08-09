@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   adoptionCandidateKeys,
   adoptionPairKeys,
+  authProfileSwitchIds,
   describePlanDetail,
   planDetailDrift,
   planWarningsBuffer,
@@ -4854,6 +4855,140 @@ describe("inventoryCommands", () => {
       // An unlink must never be rendered by the switch branch — that line claims
       // the opposite of what the plan does.
       expect(describePlanDetail(planWithClears(2), [], "Lab credentials")).not.toContain("will switch to");
+    });
+
+    // ROUND 8 (P1) — the switch/clear lines and the drift signature must name
+    // the ACTUAL target each planned update writes (`after.authProfileId`), not
+    // the single source-level profile. A catch-all template can set a profile B
+    // that differs from the source's A, and the engine writes B.
+    describe("Codex round 8 (P1) — the auth-switch line names each update's REAL target profile, not the source-level one", () => {
+      const B_PROFILE: AuthProfile = { id: "p2", name: "Datacenter creds", username: "dcuser", authType: "password" };
+      const C_PROFILE: AuthProfile = { id: "p3", name: "Edge creds", username: "edgeuser", authType: "password" };
+      // Two distinct profile ids that resolve to the SAME display name — the case
+      // only the target-id-in-signature guard can tell apart, not the text.
+      const B_TWIN: AuthProfile = { id: "p2b", name: "Datacenter creds", username: "dcuser2", authType: "password" };
+      const profilesById = new Map<string, AuthProfile>([
+        ["p1", LAB_PROFILE],
+        ["p2", B_PROFILE],
+        ["p2b", B_TWIN],
+        ["p3", C_PROFILE]
+      ]);
+
+      function switchTo(profileId: string | undefined, count: number): InventorySyncPlan {
+        const updates = Array.from({ length: count }, (_, i) => {
+          const before = ownedServer({ id: `owned-${i}`, externalId: `device:${i}`, name: `sw${i}` });
+          return { before, after: { ...before, authProfileId: profileId } };
+        });
+        return makeSyncPlan({ updates });
+      }
+
+      it("names the template's target B, not the source-level A, when the plan writes B onto every switch (kills rendering the source's profile name)", () => {
+        const detail = describePlanDetail(switchTo("p2", 2), [], undefined, profilesById);
+        expect(detail).toContain('2 servers will switch to auth profile "Datacenter creds".');
+        expect(detail).not.toContain("Lab credentials");
+      });
+
+      it("regression: source-level A with no template (every switch writes A) still names A", () => {
+        expect(describePlanDetail(switchTo("p1", 1), [], undefined, profilesById)).toContain(
+          '1 server will switch to auth profile "Lab credentials".'
+        );
+      });
+
+      it("a target id that resolves to no profile renders the nameless fallback, and a mixed plan renders one line per distinct target", () => {
+        expect(describePlanDetail(switchTo("gone", 1), [], undefined, profilesById)).toContain(
+          "1 server will switch to a different auth profile."
+        );
+        // One switch to B, one to a dangling id → two lines: the named target and
+        // the nameless fallback, one per distinct target.
+        const before0 = ownedServer({ id: "owned-0", externalId: "device:0", name: "sw0" });
+        const before1 = ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1" });
+        const mixed = makeSyncPlan({
+          updates: [
+            { before: before0, after: { ...before0, authProfileId: "p2" } },
+            { before: before1, after: { ...before1, authProfileId: "gone" } }
+          ]
+        });
+        const mixedDetail = describePlanDetail(mixed, [], undefined, profilesById);
+        expect(mixedDetail).toContain('1 server will switch to auth profile "Datacenter creds".');
+        expect(mixedDetail).toContain("1 server will switch to a different auth profile.");
+      });
+
+      it("the confirm modal (through syncNow) names the TEMPLATE'S target B, not the source's A — a catch-all override template on a source linked to A (kills the modal claiming 'switch to A' while the plan applies B)", async () => {
+        const { core } = await makeHarness({
+          profiles: [LAB_PROFILE, B_PROFILE],
+          source: {
+            targetFolder: "",
+            authProfileId: "p1",
+            templateRules: [{ id: "rule-1", templateId: "tmpl-1" }]
+          },
+          servers: [
+            ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" }),
+            ownedServer({ id: "owned-2", externalId: "device:2", name: "sw2", host: "10.0.0.2" })
+          ],
+          provider: {
+            fetchInventory: vi.fn(async () => ({
+              contractVersion: 1,
+              devices: [
+                { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
+                { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
+              ]
+            }))
+          }
+        });
+        // A catch-all template that OVERRIDES the auth link to B (p2), beating the
+        // source-level A (p1) the servers would otherwise retro-apply.
+        await core.addOrUpdateDeviceTemplate({
+          id: "tmpl-1",
+          name: "DC override",
+          fields: { authProfileId: { mode: "override", value: "p2" } }
+        });
+
+        await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+        const [, options] = modalCalls()[0];
+        expect(options.detail).toContain('2 servers will switch to auth profile "Datacenter creds".');
+        // The now-wrong source-level name must NOT appear.
+        expect(options.detail).not.toContain("Lab credentials");
+      });
+
+      it("planDetailDrift reports drift when the target changes B→C between renders, same count and same server ids (kills a signature that ignores the actual target — a B→C template change while the modal is open would evade drift)", () => {
+        const planB = switchTo("p2", 2);
+        const planC = switchTo("p3", 2); // same server ids, different target
+        const shownDetail = describePlanDetail(planB, [], undefined, profilesById);
+        const shown = {
+          detail: shownDetail,
+          deleteIds: new Set<string>(),
+          authSwitchIds: authProfileSwitchIds(planB),
+          adoptionPairs: adoptionPairKeys(planB)
+        };
+        expect(planDetailDrift(shown, planC, [], undefined, profilesById).drift).toBe(true);
+        // Control: the SAME captured tuple re-based on planC's own signature does
+        // not drift, so the assertion above is about the target change and nothing
+        // incidental.
+        const rebased = {
+          detail: describePlanDetail(planC, [], undefined, profilesById),
+          deleteIds: new Set<string>(),
+          authSwitchIds: authProfileSwitchIds(planC),
+          adoptionPairs: adoptionPairKeys(planC)
+        };
+        expect(planDetailDrift(rebased, planC, [], undefined, profilesById).drift).toBe(false);
+      });
+
+      it("planDetailDrift still catches a target change when the two profiles share a NAME (kills relying on the rendered text alone — the target ids are in the signature)", () => {
+        const planB = switchTo("p2", 2);
+        const planTwin = switchTo("p2b", 2); // distinct id, SAME name "Datacenter creds"
+        // The rendered text is byte-identical — the non-vacuity check.
+        expect(describePlanDetail(planTwin, [], undefined, profilesById)).toBe(
+          describePlanDetail(planB, [], undefined, profilesById)
+        );
+        const shown = {
+          detail: describePlanDetail(planB, [], undefined, profilesById),
+          deleteIds: new Set<string>(),
+          authSwitchIds: authProfileSwitchIds(planB),
+          adoptionPairs: adoptionPairKeys(planB)
+        };
+        expect(planDetailDrift(shown, planTwin, [], undefined, profilesById).drift).toBe(true);
+      });
     });
 
     it("syncNow retro-applies the source's profile to a server still on the bare agent default: the confirm modal appears (not the nothing-to-change fast path) and Apply stamps the link (kills a caller that never resolves/passes authProfile into computeSyncPlan)", async () => {

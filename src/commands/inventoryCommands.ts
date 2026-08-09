@@ -1286,20 +1286,62 @@ function adoptionUpdates(plan: InventorySyncPlan): Array<{ before: ServerConfig;
 }
 
 /**
+ * ROUND 8 (P1) — group auth-profile switches / clears by the profile id each one
+ * ACTUALLY targets, preserving first-seen order. A catch-all device template can
+ * set a profile B that differs from the source-level profile A, and the engine
+ * writes B onto the update's `after`; the consent line and the drift signature
+ * must therefore name what the plan WRITES, not the source's profile. For a
+ * switch the target is `after.authProfileId` (the profile adopted); for a clear
+ * it is `before.authProfileId` (the profile stopped). Returned as arrays, not
+ * just counts, so `planWarningsBuffer` can list the servers under each distinct
+ * target heading.
+ */
+function groupByAuthTarget(
+  switches: Array<{ before: ServerConfig; after: ServerConfig }>,
+  targetOf: (u: { before: ServerConfig; after: ServerConfig }) => string | undefined
+): Map<string | undefined, Array<{ before: ServerConfig; after: ServerConfig }>> {
+  const groups = new Map<string | undefined, Array<{ before: ServerConfig; after: ServerConfig }>>();
+  for (const u of switches) {
+    const id = targetOf(u);
+    const existing = groups.get(id);
+    if (existing !== undefined) {
+      existing.push(u);
+    } else {
+      groups.set(id, [u]);
+    }
+  }
+  return groups;
+}
+
+/**
  * m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync
  * plan for the confirm modal's `detail`.
  *
- * `authProfileName` is the name of the profile the plan was computed against —
- * the caller's `resolveSourceAuthProfile` result for the SAME source snapshot
- * that produced `plan` (see syncNow's pairing rule). It is a render-time
- * argument rather than something derived from the plan because the plan carries
- * only ids and this file's modal copy is names-never-UUIDs (m3).
+ * `authProfilesById` is the WHOLE profile store (the caller's
+ * `resolveAuthProfilesById(core)` — the same map `computeSyncPlan` consumed),
+ * used to resolve each planned update's ACTUAL target auth profile to a name
+ * (ROUND 8 P1): the switch/clear lines are grouped by the real target id
+ * (`after.authProfileId` / `before.authProfileId`), NOT by the single
+ * source-level profile, because a template can make the two differ. It is a
+ * render-time argument rather than something derived from the plan because the
+ * plan carries only ids and this file's modal copy is names-never-UUIDs (m3).
+ *
+ * `authProfileName` is the legacy single-profile fallback, retained for the
+ * direct unit tests that build synthetic plans with no profile map: when
+ * `authProfilesById` is absent the switch/clear lines fall back to this single
+ * name (or the nameless branch when it too is absent). Production always passes
+ * the map.
  *
  * Exported for direct unit testing: the nameless-switch branch below is
  * unreachable through syncNow (every call site pairs plan and resolution), and
  * a guard that cannot be exercised is a guard nobody can prove still works.
  */
-export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerConfig[], authProfileName?: string): string {
+export function describePlanDetail(
+  plan: InventorySyncPlan,
+  allServers: ServerConfig[],
+  authProfileName?: string,
+  authProfilesById?: ReadonlyMap<string, AuthProfile>
+): string {
   const lines: string[] = [];
   if (plan.adds.length > 0) {
     const n = plan.adds.length;
@@ -1391,26 +1433,43 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
   // subset-annotation placement manualDuplicateCount uses after adds — because
   // every auth switch is also counted there.
   //
-  // A switch with no name is unreachable by construction: an update can only
-  // change authProfileId when computeSyncPlan resolved the source's profile,
-  // and every call site passes the resolution produced for the very same source
-  // snapshot as the plan (see resolveSourceAuthProfile's pairing rule in
-  // syncNow). It still renders, namelessly, because the alternative fails
-  // SILENTLY: a future caller that breaks the pairing CONSISTENTLY — no name to
-  // the modal render and none to either drift render — produces matching texts
-  // with no switch line anywhere, so planDetailDrift sees no drift and the
-  // stamps apply with zero disclosure. (Drift only catches the INCONSISTENT
-  // case, where one render has the name and another doesn't.) A line naming no
-  // profile is less useful than one that does, but it is still consent: the
-  // user is told how many servers change auth, and can cancel.
-  const authProfileSwitchCount = authProfileAdoptions(plan).length;
-  if (authProfileSwitchCount > 0) {
-    const n = authProfileSwitchCount;
-    lines.push(
-      authProfileName !== undefined
-        ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${authProfileName}".`
-        : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
-    );
+  // ROUND 8 (P1) — the TARGET each switch names is that update's OWN
+  // `after.authProfileId`, resolved through `authProfilesById`, NOT the single
+  // source-level profile. A catch-all device template can set a profile B that
+  // differs from the source's A, and the engine writes B; naming A here would
+  // tell the user "switch to A" while the plan applies B (and a B→C template
+  // change while the modal is open would evade drift, since the count and the
+  // wrong name A would both be unchanged). Grouped by real target id — normally
+  // one line in the T1 single-winner cascade, but correct if a plan ever writes
+  // more than one target.
+  //
+  // A switch with no name is still reachable — a dangling target id that
+  // resolves to no profile — and still honest consent: the user is told how many
+  // servers change auth, and can cancel. The nameless branch also protects the
+  // legacy single-name fallback used by the synthetic-plan unit tests (no map):
+  // a caller that lost the name renders namelessly rather than dropping the line
+  // SILENTLY, which would let the stamps apply past the modal with no disclosure
+  // and no drift to catch it.
+  const switches = authProfileAdoptions(plan);
+  if (switches.length > 0) {
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(switches, (u) => u.after.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const n = group.length;
+        lines.push(
+          name !== undefined
+            ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${name}".`
+            : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
+        );
+      }
+    } else {
+      const n = switches.length;
+      lines.push(
+        authProfileName !== undefined
+          ? `${n} server${n === 1 ? "" : "s"} will switch to auth profile "${authProfileName}".`
+          : `${n} server${n === 1 ? "" : "s"} will switch to a different auth profile.`
+      );
+    }
   }
   // REVIEW FINDING (P1) — the other direction, on its own line and in the same
   // place: unlinking a server the source had linked is a credential change to an
@@ -1420,14 +1479,31 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
   // server's point of view, and the reason the line does not promise SSH agent
   // authentication specifically: what a server falls back to is whatever its own
   // record holds.
-  const authProfileClearCount = authProfileClears(plan).length;
-  if (authProfileClearCount > 0) {
-    const n = authProfileClearCount;
-    lines.push(
-      authProfileName !== undefined
-        ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${authProfileName}" and revert to their own stored credentials.`
-        : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
-    );
+  //
+  // ROUND 8 (P1) — the profile named here is the one each server STOPS using,
+  // i.e. that clear's own `before.authProfileId`, resolved through
+  // `authProfilesById` and grouped per real target — never the source-level
+  // profile, for the same reason the switch line groups by its target.
+  const clears = authProfileClears(plan);
+  if (clears.length > 0) {
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(clears, (u) => u.before.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const n = group.length;
+        lines.push(
+          name !== undefined
+            ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${name}" and revert to their own stored credentials.`
+            : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
+        );
+      }
+    } else {
+      const n = clears.length;
+      lines.push(
+        authProfileName !== undefined
+          ? `${n} server${n === 1 ? "" : "s"} will stop using auth profile "${authProfileName}" and revert to their own stored credentials.`
+          : `${n} server${n === 1 ? "" : "s"} will stop using their auth profile and revert to their own stored credentials.`
+      );
+    }
   }
   const orphaned = plan.prunes.filter((p) => p.policy === "orphan").length;
   const deleted = plan.prunes.filter((p) => p.policy === "delete").length;
@@ -1520,7 +1596,11 @@ export function describePlanDetail(plan: InventorySyncPlan, allServers: ServerCo
  * call it on synthetic plans rather than to reconstruct every plan shape through
  * a provider fetch.
  */
-export function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: string): string[] {
+export function planWarningsBuffer(
+  plan: InventorySyncPlan,
+  authProfileName?: string,
+  authProfilesById?: ReadonlyMap<string, AuthProfile>
+): string[] {
   const buffer = [...plan.warnings];
   // The adoption pair list, in the established heading-plus-indented-names
   // shape and for the same reason the switch list exists: adoption changes WHICH
@@ -1558,17 +1638,35 @@ export function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: st
       buffer.push(`  "${u.before.name}" — device "${u.after.name}" (${u.after.host}:${u.after.port})${hiddenSuffix}`);
     }
   }
+  // ROUND 8 (P1) — one heading per DISTINCT target profile the plan actually
+  // writes (`after.authProfileId`), resolved through `authProfilesById`, so the
+  // Show Warnings audit names the same real target the modal now does rather than
+  // the source-level profile. Grouped by real target — one heading in the T1
+  // single-winner cascade, but truthful if a plan ever switches to more than one.
+  // Heading keeps the count (the modal's own line is an aggregate too, and the
+  // two must agree at a glance); the colon marks the lines below as belonging to
+  // it, and the indent keeps them from reading as sibling warnings when the plan
+  // also carries engine warnings above. `authProfileName` is the legacy
+  // single-name fallback for the synthetic-plan unit tests (no map).
   const switches = authProfileAdoptions(plan);
   if (switches.length > 0) {
-    const n = switches.length;
-    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
-    // Heading keeps the count (the modal's own line is an aggregate too, and the
-    // two must agree at a glance); the colon marks the lines below as belonging
-    // to it, and the indent keeps them from reading as sibling warnings when the
-    // plan also carries engine warnings above.
-    buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
-    for (const u of switches) {
-      buffer.push(`  "${u.before.name}"`);
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(switches, (u) => u.after.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const target = name !== undefined ? `auth profile "${name}"` : "a different auth profile";
+        const n = group.length;
+        buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
+        for (const u of group) {
+          buffer.push(`  "${u.before.name}"`);
+        }
+      }
+    } else {
+      const n = switches.length;
+      const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
+      buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
+      for (const u of switches) {
+        buffer.push(`  "${u.before.name}"`);
+      }
     }
   }
   // REVIEW FINDING (P1) — the unlink list, in the same shape and for the same
@@ -1576,14 +1674,27 @@ export function planWarningsBuffer(plan: InventorySyncPlan, authProfileName?: st
   // answerable one click before Apply. Its own heading rather than a shared one,
   // because a plan can in principle carry both (the engine's two rules are
   // mutually exclusive per sync today, but the render must not depend on that to
-  // stay truthful).
+  // stay truthful). ROUND 8 (P1) — grouped by each clear's own
+  // `before.authProfileId` (the profile stopped), for the same reason.
   const clears = authProfileClears(plan);
   if (clears.length > 0) {
-    const n = clears.length;
-    const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "their auth profile";
-    buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
-    for (const u of clears) {
-      buffer.push(`  "${u.before.name}"`);
+    if (authProfilesById !== undefined) {
+      for (const [targetId, group] of groupByAuthTarget(clears, (u) => u.before.authProfileId)) {
+        const name = targetId !== undefined ? authProfilesById.get(targetId)?.name : undefined;
+        const target = name !== undefined ? `auth profile "${name}"` : "their auth profile";
+        const n = group.length;
+        buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
+        for (const u of group) {
+          buffer.push(`  "${u.before.name}"`);
+        }
+      }
+    } else {
+      const n = clears.length;
+      const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "their auth profile";
+      buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
+      for (const u of clears) {
+        buffer.push(`  "${u.before.name}"`);
+      }
     }
   }
   return buffer;
@@ -1636,19 +1747,37 @@ function planHasNothingToDo(plan: InventorySyncPlan): boolean {
 }
 
 /**
- * REVIEW FINDING (P2) — the set of server ids the plan would move onto a
- * different auth profile, the identity behind `authProfileSwitches`' count.
- * Read off `before.id` for the same reason `planWarningsBuffer` names
- * `before.name`: it is the record as it exists right now, which is what the
- * user is being asked to consent to.
+ * REVIEW FINDING (P2) — the captured signature of the plan's auth switches, the
+ * identity behind `authProfileSwitches`' count. One key per switch, carrying the
+ * record (`before.id` — the server as it exists right now, what the user
+ * consents to) AND both ends of the credential move (`before.authProfileId` →
+ * `after.authProfileId`).
+ *
+ * ROUND 8 (P1) — the from/to profile ids are in the key, not just the server id.
+ * `describePlanDetail` now names the ACTUAL target (`after.authProfileId`, a
+ * catch-all template can make it differ from the source-level profile), so a
+ * B→C change of that target between the shown render and the fresh recompute
+ * MUST drift and re-prompt. The rendered text catches it whenever the two
+ * targets resolve to different NAMES; encoding the target ids here catches it
+ * even when two distinct profiles happen to share a name.
  *
  * Deliberately the UNION of both directions (`authProfileSwitches`, not just the
  * adoptions): an unlink is a credential change to a named, disclosed server too,
- * so a mid-modal swap of WHICH server gets unlinked has to drift exactly as an
- * adoption swap does.
+ * so a mid-modal swap of WHICH server gets unlinked — or of WHICH profile it
+ * stops using — has to drift exactly as an adoption swap does. Space-joined, and
+ * the empty string stands in for `undefined` (a clear's `after`, a bare
+ * `before`), unambiguous because server and profile ids are uuids / deterministic
+ * hashes that contain no space and are never empty.
+ *
+ * Exported for direct unit testing alongside `planDetailDrift`: the target-id
+ * swap it now catches renders identical text whenever two profiles share a name,
+ * so the derivation has to be assertable — and buildable into a captured tuple —
+ * on its own.
  */
-function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
-  return new Set(authProfileSwitches(plan).map((u) => u.before.id));
+export function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
+  return new Set(
+    authProfileSwitches(plan).map((u) => `${u.before.id} ${u.before.authProfileId ?? ""} ${u.after.authProfileId ?? ""}`)
+  );
 }
 
 /**
@@ -1808,12 +1937,15 @@ function capturedSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): bool
 // device: same record, different claimant, same counts, same text, same ids (see
 // `adoptionPairKeys`).
 //
-// `nextAuthProfileName` follows the same rule as `nextServers`: it is the
-// resolution taken FRESH alongside `nextPlan`, not the one the shown modal
-// rendered with. That is what makes a mid-modal profile rename (same plan,
-// different name → different text) and a mid-modal profile delete (no
-// resolution → no switch line, plus a dangling-profile warning) both surface
-// as ordinary drift, with no dedicated comparison of their own.
+// `nextAuthProfilesById` (and the legacy `nextAuthProfileName`) follow the same
+// rule as `nextServers`: they are the resolution taken FRESH alongside
+// `nextPlan`, not the one the shown modal rendered with. That is what makes a
+// mid-modal profile rename (same plan, different name → different text), a
+// mid-modal profile delete (no resolution → nameless switch line + a
+// dangling-profile warning) and — ROUND 8 (P1) — a mid-modal TEMPLATE change of
+// the actual target (A/B→C, caught by the fresh render naming the new target and
+// by the target ids `authProfileSwitchIds` now carries) all surface as ordinary
+// drift, with no dedicated comparison of their own.
 //
 // Exported for direct unit testing: an identity swap is by definition the case
 // where every rendered artifact is identical, so the only way to prove the
@@ -1824,9 +1956,10 @@ export function planDetailDrift(
   previous: { detail: string; deleteIds: ReadonlySet<string>; authSwitchIds: ReadonlySet<string>; adoptionPairs: ReadonlySet<string> },
   nextPlan: InventorySyncPlan,
   nextServers: ServerConfig[],
-  nextAuthProfileName: string | undefined
+  nextAuthProfileName: string | undefined,
+  nextAuthProfilesById?: ReadonlyMap<string, AuthProfile>
 ): { drift: boolean; detail: string } {
-  const nextDetail = describePlanDetail(nextPlan, nextServers, nextAuthProfileName);
+  const nextDetail = describePlanDetail(nextPlan, nextServers, nextAuthProfileName, nextAuthProfilesById);
   if (nextDetail !== previous.detail) {
     return { drift: true, detail: nextDetail };
   }
@@ -3422,7 +3555,12 @@ export function registerInventoryCommands(
         // plan and the same server snapshot describePlanDetail was called
         // with here, not a re-derived approximation of either.
         const shownServers = core.getSnapshot().servers;
-        const shownDetail = describePlanDetail(plan, shownServers, planAuthProfile?.name);
+        // ROUND 8 (P1) — the whole-profile map is captured HERE, at shown time,
+        // alongside `shownServers`, so `shownDetail` names each switch's real
+        // target (`after.authProfileId`) as it stood when the modal opened; the
+        // in-lock drift render below uses a FRESH map, so a template retarget or
+        // a profile rename between the two surfaces as ordinary drift.
+        const shownDetail = describePlanDetail(plan, shownServers, planAuthProfile?.name, resolveAuthProfilesById(core));
         const shownDeleteIds = deletePruneIds(plan);
         // Captured alongside the delete set, from the SAME plan this modal
         // renders — these are the servers `shownWarnings` is about to name.
@@ -3438,7 +3576,7 @@ export function registerInventoryCommands(
         // in exactly the case it exists for. Nothing here feeds the drift
         // comparison — choosing Show Warnings ends the command (below), so the
         // names are never a consent artifact something later applies against.
-        const shownWarnings = planWarningsBuffer(plan, planAuthProfile?.name);
+        const shownWarnings = planWarningsBuffer(plan, planAuthProfile?.name, resolveAuthProfilesById(core));
         const buttons = shownWarnings.length > 0 ? ["Apply", "Show Warnings"] : ["Apply"];
         const choice = await vscode.window.showInformationMessage(
           `Apply inventory sync from "${source.name}"?`,
@@ -3529,7 +3667,11 @@ export function registerInventoryCommands(
             { detail: shownDetail, deleteIds: shownDeleteIds, authSwitchIds: shownAuthSwitchIds, adoptionPairs: shownAdoptionPairs },
             recomputed,
             freshServersForRecompute,
-            freshAuthProfile?.name
+            freshAuthProfile?.name,
+            // ROUND 8 (P1) — fresh map, so a template retarget or profile rename
+            // landing while the modal was open renders a different target here
+            // than `shownDetail` captured and drifts.
+            resolveAuthProfilesById(core)
           );
           if (recomputedDrift.drift) {
             return { kind: "retry", plan: recomputed, authProfile: freshAuthProfile };
@@ -3670,7 +3812,10 @@ export function registerInventoryCommands(
             },
             finalPlan,
             finalServersForRecompute,
-            finalAuthProfile?.name
+            finalAuthProfile?.name,
+            // ROUND 8 (P1) — fresh map again; the awaited teardown / vault re-read
+            // above are a window a template retarget or profile rename can land in.
+            resolveAuthProfilesById(core)
           );
           if (finalDrift.drift) {
             finalRecomputeMismatchCount++;
