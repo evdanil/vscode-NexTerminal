@@ -2511,9 +2511,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   if (desiredProxy !== undefined && desiredProxy.value.type === "ssh" && !survivorIds.has(desiredProxy.value.jumpHostId)) {
     const danglingJumpHostId = desiredProxy.value.jumpHostId;
     let droppedAny = false;
-    const dropTemplateProxy = (record: ServerConfig): void => {
-      const p = record.proxy;
-      const stampedProxy = record.origin?.templated?.proxy;
+    // Codex round 6 (P1) — REJECT the late-discovered-invalid winner the way the
+    // composition-time rejection does (§5.3 / §4.3 row 5, "desired none → keep
+    // existing"): RESTORE the pre-matrix proxy + stamp, NOT delete to absent. The
+    // composition dangling check ran against the OPTIMISTIC `liveServerIds`, which
+    // admitted a jump host B this plan later prunes or skips; the matrix then
+    // performed a row-3 override MOVE of a working template-owned proxy A → B and
+    // stamped B. Deleting B to absent here (the round-2 code) would strip a
+    // previously-working proxy from EVERY matching server — a fleet-wide
+    // regression. So mirror composition: on a dangling winner `composeDesiredFields`
+    // leaves `desired.proxy` unset, and the matrix then carries the EXISTING
+    // sync-owned proxy A forward (row 5). The pre-matrix state is `before` — A on an
+    // override move (updates), and NOTHING on a row-1 write (adds). An add therefore
+    // still drops to absent (nothing to restore); an update restores A + A's stamp.
+    const rejectTemplateProxy = (after: ServerConfig, before: ServerConfig | undefined): boolean => {
+      const p = after.proxy;
+      const stampedProxy = after.origin?.templated?.proxy;
       if (
         p === undefined ||
         p.type !== "ssh" ||
@@ -2521,28 +2534,88 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         stampedProxy === undefined ||
         !proxyConfigsEqual(p, stampedProxy)
       ) {
-        return; // not a proxy THIS run's template owns on this record — leave alone
+        return false; // not a proxy THIS run's template wrote/owns on this record — leave alone
       }
-      delete record.proxy;
-      const origin = record.origin;
+      const priorProxy = before?.proxy; // pre-matrix value: A on a row-3 override move, undefined on a row-1 add
+      const priorStamp = before?.origin?.templated?.proxy;
+      if (priorProxy !== undefined) {
+        after.proxy = { ...priorProxy }; // restore A (row 5 carry) — never delete a previously-working proxy
+      } else {
+        delete after.proxy; // row-1 write had nothing prior → absent (never a written `undefined`)
+      }
+      // The stamp follows the restored value: A's stamp on restore, cleared on
+      // delete — so the record and its ownership receipt stay consistent either way.
+      const origin = after.origin;
       if (origin?.templated !== undefined) {
         const templated = { ...origin.templated };
-        delete templated.proxy;
+        if (priorStamp !== undefined) {
+          templated.proxy = { ...priorStamp };
+        } else {
+          delete templated.proxy;
+        }
+        // `templated.proxy` joins the presence test now that this pass can RESTORE
+        // it: on a restore the stamp record must survive (it carries A's proxy
+        // stamp), where the round-2 delete-only path could omit it (proxy always
+        // gone). On the delete branch `templated.proxy` is undefined and drops out.
         const stillStamped =
-          templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
-        record.origin = { ...origin, templated: stillStamped ? templated : undefined };
+          templated.proxy !== undefined ||
+          templated.multiplexing !== undefined ||
+          templated.legacyAlgorithms !== undefined ||
+          templated.logSession !== undefined;
+        after.origin = { ...origin, templated: stillStamped ? templated : undefined };
       }
-      droppedAny = true;
+      return true;
     };
     for (const a of adds) {
-      dropTemplateProxy(a);
+      if (rejectTemplateProxy(a, undefined)) {
+        droppedAny = true;
+      }
     }
+    // Codex round 4/6 — NO-OP COLLAPSE (keep the plan counts exact). Restoring A can
+    // revert an update whose ONLY change was the proxy A→B, making `after`
+    // byte-equal to `before`. That update is now a genuine no-op: remove it from
+    // `updates` and count the server UNCHANGED — the same count bookkeeping as the
+    // round-4 promotion decrement, run in the other direction. If OTHER fields also
+    // changed this run the update is KEPT (proxy restored to A, other changes
+    // intact) and the count is left alone. `unchangedServerIds` is updated so the
+    // later promotion loop's decrement gate stays coherent for a collapsed server.
+    const updateStillChanged = (before: ServerConfig, after: ServerConfig): boolean =>
+      before.name !== after.name ||
+      before.host !== after.host ||
+      before.port !== after.port ||
+      before.group !== after.group ||
+      before.authProfileId !== after.authProfileId ||
+      before.ipmiHost !== after.ipmiHost ||
+      !proxyConfigsEqual(before.proxy, after.proxy) ||
+      before.multiplexing !== after.multiplexing ||
+      before.legacyAlgorithms !== after.legacyAlgorithms ||
+      before.logSession !== after.logSession ||
+      !serverOriginStampsEqual(before.origin, after.origin) ||
+      before.username !== after.username;
+    const collapsedIds = new Set<string>();
     for (const u of updates) {
-      dropTemplateProxy(u.after);
+      if (rejectTemplateProxy(u.after, u.before)) {
+        droppedAny = true;
+        if (!updateStillChanged(u.before, u.after)) {
+          collapsedIds.add(u.before.id);
+        }
+      }
+    }
+    if (collapsedIds.size > 0) {
+      for (let i = updates.length - 1; i >= 0; i--) {
+        if (collapsedIds.has(updates[i].before.id)) {
+          const [removed] = updates.splice(i, 1);
+          unchangedCount++;
+          unchangedServerIds.add(removed.before.id);
+        }
+      }
     }
     if (droppedAny) {
+      // Wording covers both dispositions honestly: an add loses the proxy, while an
+      // update may KEEP its previous proxy A (only the template's NEW proxy B was
+      // rejected). "The template's new proxy was not applied" is true for both.
       warnings.push(
-        `Device template "${cascade.proxyTemplateName ?? "?"}" on "${source.name}" sets a jump-host proxy whose jump host will not survive this sync (it is being pruned, or its device was skipped) — the proxy field was not applied.`
+        `Device template "${cascade.proxyTemplateName ?? "?"}" on "${source.name}" sets a jump-host proxy whose jump host will not survive this sync (it is being pruned, or its device was skipped) — the template's new proxy was not applied.`
       );
     }
   }

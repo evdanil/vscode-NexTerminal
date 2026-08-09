@@ -1063,6 +1063,104 @@ describe("FIX 2 — jump-host references validated against the POST-PLAN survivo
   });
 });
 
+// -------- Codex round 6 (P1) — an UPDATE whose matrix MOVED a working proxy A→B (B dangling) RESTORES A, does not delete --------
+
+describe("Codex round 6 — the survivor pass RESTORES the pre-matrix proxy A on a rejected override move, instead of deleting to absent", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const S_ID = deterministicServerId("source-1", "device:1");
+  const A_JUMP_ID = deterministicServerId("source-1", "device:ajump-unused"); // never a device this run
+  const B_JUMP_ID = deterministicServerId("source-1", "device:bjump");
+
+  // A survivor jump host that is NOT a device of this source this run — a plain
+  // live server, so it is never pruned and never a template target, only a live id
+  // the pre-existing proxy A resolves against.
+  const survivorJump = (): ServerConfig => ({
+    id: A_JUMP_ID,
+    name: "a-jump",
+    host: "10.0.0.8",
+    port: 22,
+    username: "admin",
+    authType: "agent",
+    isHidden: false
+  });
+
+  // B_JUMP: owned by this source, device ABSENT from the tree → delete-pruned this
+  // run, hence in the OPTIMISTIC composition set but NOT a post-plan survivor.
+  const danglingJump = (): ServerConfig => ownedServer({ id: B_JUMP_ID }, { externalId: "device:bjump" });
+
+  it("Fixture 50 — REGRESSION: S has a working template-owned proxy A; an OVERRIDE template moves it to B; B is delete-pruned → S.after.proxy is RESTORED to A (+ stamp A), not deleted; a survivor warning fires (kills the round-2 delete-to-absent, which strips A fleet-wide)", () => {
+    // S already carries a working template-owned proxy A (stamp = A). A boolean
+    // template write also lands, so the update SURVIVES the no-op collapse and
+    // `after` is observable.
+    const s = ownedServer({ proxy: sshProxy(A_JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(A_JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()], // device:1 → S; device:bjump absent → B_JUMP delete-pruned
+      servers: [s, survivorJump(), danglingJump()],
+      templates: [
+        template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) }, multiplexing: { mode: "fill", value: true } })
+      ]
+    });
+    // B_JUMP is delete-pruned (a non-survivor).
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    const after = afterFor(p, S_ID)!;
+    expect(after).toBeDefined();
+    // THE FIX: the pre-matrix proxy A is restored, NOT deleted to absent.
+    expect(after.proxy).toEqual(sshProxy(A_JUMP_ID));
+    expect(after.origin?.templated?.proxy).toEqual(sshProxy(A_JUMP_ID)); // stamp follows the restored value
+    expect(after.multiplexing).toBe(true); // the other template write still landed
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 51 — NO-OP COLLAPSE: A→B was the ONLY change; restoring A reverts it → S is removed from `updates` and counted UNCHANGED (kills leaving a now-no-op update in the plan, and kills the round-2 delete which keeps S in updates with proxy absent)", () => {
+    const s = ownedServer({ proxy: sshProxy(A_JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(A_JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [s, survivorJump(), danglingJump()],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) } })] // proxy is the ONLY change
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    // Restoring A made after === before → the update collapsed away entirely.
+    expect(afterFor(p, S_ID)).toBeUndefined();
+    expect(p.updates.some((u) => u.before.id === S_ID)).toBe(false);
+    // ...and the server is counted unchanged (S is the only owned device; B_JUMP is pruned).
+    expect(p.unchangedCount).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 52 — OTHER FIELD CHANGED: A→B AND a boolean also changed → proxy restored to A, the boolean change kept, S STAYS in `updates`, unchangedCount untouched (kills a collapse that fires when other fields genuinely changed)", () => {
+    const s = ownedServer({ proxy: sshProxy(A_JUMP_ID) }, { externalId: "device:1", templated: { proxy: sshProxy(A_JUMP_ID) } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [s, survivorJump(), danglingJump()],
+      templates: [
+        template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) }, legacyAlgorithms: { mode: "fill", value: true } })
+      ]
+    });
+    const after = afterFor(p, S_ID)!;
+    expect(after).toBeDefined(); // update kept — a genuine field changed
+    expect(after.proxy).toEqual(sshProxy(A_JUMP_ID)); // proxy still restored to A
+    expect(after.legacyAlgorithms).toBe(true); // the genuine change intact
+    expect(p.unchangedCount).toBe(0); // no collapse → count untouched
+  });
+
+  it("Fixture 53 — ROW-1 ADD still drops to absent: a FRESH add whose template proxy B is dangling has NO prior proxy → proxy absent, stamp cleared (kills restoring a phantom prior on the add path)", () => {
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()], // device:1 → fresh add; device:bjump absent → B_JUMP pruned
+      servers: [danglingJump()], // only the (to-be-pruned) jump host pre-exists
+      templates: [template({ proxy: { mode: "override", value: sshProxy(B_JUMP_ID) } })]
+    });
+    const added = p.adds.find((a) => a.origin?.externalId === "device:1")!;
+    expect(added.proxy).toBeUndefined(); // nothing prior to restore → absent
+    expect("proxy" in added).toBe(false); // never a written undefined
+    expect(added.origin?.templated?.proxy).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+});
+
 // -------- FIX B (PR #61 Codex round 2) — survivor pass covers UNCHANGED template-owned servers --------
 
 describe("FIX B — an UNCHANGED template-owned server whose stamped jump host is pruned is promoted to a proxy-dropping update", () => {
