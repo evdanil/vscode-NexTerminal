@@ -289,10 +289,25 @@ async function deleteDeviceTemplateFlow(ctx: CommandContext): Promise<void> {
     // The picked template must still exist — a concurrent delete/reset could have
     // removed it while the confirm sat open. Name the change rather than silently
     // reporting a deletion of nothing.
-    if (ctx.core.getDeviceTemplate(pick.template.id) === undefined) {
+    const live = ctx.core.getDeviceTemplate(pick.template.id);
+    if (live === undefined) {
       refusal =
         `The device template "${pick.template.name}" was changed while the confirmation was open — nothing was deleted. ` +
         "Reopen Manage Device Templates to review the current templates.";
+      return;
+    }
+    // FIX (issue #48 PR-T1b / PR #62 Codex review round 6) — existence alone is not
+    // enough: an editor Save (e.g. a rename) that completes while the confirm modal
+    // sits open serializes behind this lock, but leaves a NEWLY-EDITED incarnation of
+    // the same id. The existence check would wave it through and this delete would
+    // sweep a template whose edit the confirmation never disclosed. `revision` is
+    // minted fresh on every `addOrUpdateDeviceTemplate`, so it is the signal that the
+    // record diverged from the one the modal named. This is the delete-side twin of
+    // the round-2 edit-save revision guard (and the round-1 apply revision guard).
+    if (live.revision !== pick.template.revision) {
+      refusal =
+        `The device template "${pick.template.name}" was changed while the confirmation was open — nothing was deleted. ` +
+        "Run Delete again to review the current version.";
       return;
     }
     // The disclosed referencing-source set must still match what the confirm modal

@@ -838,7 +838,7 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     };
   }
 
-  it("a concurrent editor Save + delete of the SAME template never resurrects it on disk (persist ordering)", async () => {
+  it("a concurrent editor Save + delete of the SAME template aborts the delete (round-6 revision guard) and never tears disk state", async () => {
     const repo = new InMemoryConfigRepository();
     const core = new NexusCore(repo);
     await core.initialize();
@@ -891,11 +891,16 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     // DISK is the authority — reload a fresh core.
     const reloaded = new NexusCore(repo);
     await reloaded.initialize();
-    // Lock-free: the Save's late [incl T] snapshot overwrites the delete's sweep →
-    // T resurrected while its rule stays swept (torn). The lock forces the delete to
-    // wait for the Save, then remove → consistent.
-    expect(reloaded.getDeviceTemplate("t1")).toBeUndefined();
-    expect(reloaded.getInventorySource("src-1")!.templateRules).toEqual([]);
+    // Round-6 revision guard (PR #62 round 6) — the delete picked T at its pre-Save
+    // revision; the concurrent Save re-minted the revision under the serialized lock.
+    // The delete's in-lock revalidation now sees the moved revision and ABORTS rather
+    // than removing an incarnation the confirmation never showed. T therefore survives
+    // (as the Save's incarnation) and its referencing rule stays intact.
+    // Against fb07263 (lock-free, no revision guard) the delete swept T and its rule,
+    // then the Save's late [incl T] persist resurrected T while the rule stayed swept —
+    // a torn state (rule []). The rule assertion below is what discriminates the two.
+    expect(reloaded.getDeviceTemplate("t1")).toBeDefined();
+    expect(reloaded.getInventorySource("src-1")!.templateRules).toEqual([{ id: "r1", templateId: "t1" }]);
   });
 
   it("delete ABORTS when the referencing-source set changed under the open confirm modal (removeDeviceTemplate not called)", async () => {
@@ -922,6 +927,43 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     expect(core.getDeviceTemplate("t1")).toBeDefined();
     expect(core.getInventorySource("src-1")!.templateRules).toEqual([{ id: "r1", templateId: "t1" }]);
     expect(core.getInventorySource("src-2")!.templateRules).toEqual([{ id: "r2", templateId: "t1" }]);
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
+      expect.stringContaining("changed while the confirmation was open — nothing was deleted")
+    );
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("deleted."));
+    removeSpy.mockRestore();
+  });
+
+  it("delete ABORTS when the picked template is edited (revision moves) under the open confirm modal (removeDeviceTemplate not called)", async () => {
+    // Fix (PR #62 Codex round 6) — the delete-side twin of the round-2 edit-save
+    // revision guard. An editor Save (a rename here) that completes while the confirm
+    // modal sits open leaves a newly-edited incarnation of the SAME id; the existence
+    // check waves it through and the delete would sweep an edit the confirmation never
+    // showed. Referencing set is unchanged, so ONLY the revision guard catches this.
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
+    await core.addOrUpdateInventorySource(referencingSource("src-1", "t1", "r1"));
+    register(core);
+    const removeSpy = vi.spyOn(core, "removeDeviceTemplate");
+    const picked = core.getSnapshot().deviceTemplates[0];
+    mockShowQuickPick
+      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
+      .mockResolvedValueOnce({ label: "Core", template: picked });
+    // While the confirm modal is open, the SAME template is renamed elsewhere — a
+    // fresh revision, but the referencing set ([src-1]) is untouched.
+    mockShowWarningMessage.mockImplementationOnce(async () => {
+      await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Renamed", fields: {} });
+      return "Delete";
+    });
+
+    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+
+    // Against 1190e5d (existence-only revalidation) removeDeviceTemplate runs and
+    // deletes the renamed incarnation. The revision guard aborts instead.
+    expect(removeSpy).not.toHaveBeenCalled();
+    expect(core.getDeviceTemplate("t1")).toBeDefined();
+    expect(core.getDeviceTemplate("t1")!.name).toBe("Renamed");
+    expect(core.getInventorySource("src-1")!.templateRules).toEqual([{ id: "r1", templateId: "t1" }]);
     expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
       expect.stringContaining("changed while the confirmation was open — nothing was deleted")
     );

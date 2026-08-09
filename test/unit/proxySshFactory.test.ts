@@ -870,6 +870,142 @@ describe("ProxySshFactory", () => {
     expect(socket.pause).toHaveBeenCalled();
   });
 
+  // Fix A (issue #48 PR-T1b / PR #62 Codex round 6) — the per-connect proxy-password
+  // prompt §5.3 assumed but was never built. Before the fix, a username-bearing
+  // socks5/http proxy with no stored secret sent an empty password (`?? ""`), so a
+  // template-applied authenticated proxy failed to connect. These falsify that gap.
+  function makeSimpleSocks5Socket() {
+    const socket: any = {
+      pause: vi.fn(),
+      on: vi.fn(() => socket),
+      removeListener: vi.fn(() => socket)
+    };
+    return socket;
+  }
+
+  async function createFactoryWithPrompt(
+    prompt: (server: ServerConfig, proxy: any) => Promise<{ password: string; save: boolean } | undefined>
+  ) {
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    return new ProxySshFactory(
+      authFactory,
+      (id: string) => servers.get(id),
+      vault,
+      60_000,
+      prompt
+    );
+  }
+
+  it("Fix A — SOCKS5 authenticated proxy with no stored secret prompts, connects with the entered password, and stores it", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "pw" })
+      })
+    );
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("Fix A — HTTP CONNECT authenticated proxy with no stored secret prompts, uses the entered password, and stores it", async () => {
+    const server = makeServer({ proxy: { type: "http", host: "proxy.local", port: 3128, username: "puser" } });
+    const socket = createMockHttpSocket();
+    await mockNetCreateConnectionWithSocket(socket);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    const promise = factory.connect(server);
+    await waitForSocketWrite(socket);
+    socket.emitData("HTTP/1.1 200 Connection Established\r\n\r\n");
+    await promise;
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    const request = String(socket.write.mock.calls[0][0]);
+    const headerMatch = request.match(/Proxy-Authorization: Basic ([^\r\n]+)/);
+    expect(headerMatch).toBeTruthy();
+    const decoded = Buffer.from(headerMatch![1], "base64").toString("utf8");
+    expect(decoded).toBe("puser:pw");
+    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("Fix A — a cancelled prompt (undefined) falls back to the empty password and stores nothing", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => undefined);
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "" })
+      })
+    );
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix A — no prompt dependency injected keeps today's empty-password behavior (backward-compatible)", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const factory = await createFactory(); // no prompt arg
+    await factory.connect(server);
+
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "" })
+      })
+    );
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix A — an already-stored secret is used without prompting", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    vault = createVault({ "proxy-password-srv-target": "stored-pw" });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxy: expect.objectContaining({ userId: "puser", password: "stored-pw" })
+      })
+    );
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("Fix A — a proxy without a username never prompts", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080 } });
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    await factory.connect(server);
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
   it("emits onClose when a SOCKS5 proxy socket closes after connection", async () => {
     const server = makeServer({
       proxy: { type: "socks5", host: "proxy.local", port: 1080 }

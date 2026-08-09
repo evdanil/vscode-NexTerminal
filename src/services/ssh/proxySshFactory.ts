@@ -1,7 +1,7 @@
 import * as net from "node:net";
 import type { Duplex } from "node:stream";
 import { SocksClient } from "socks";
-import type { ServerConfig, ProxyConfig } from "../../models/config";
+import type { ServerConfig, ProxyConfig, Socks5Proxy, HttpConnectProxy } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import type {
   ContextAwareSshFactory,
@@ -15,6 +15,27 @@ import { proxyPasswordSecretKey } from "./silentAuth";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
+/**
+ * Per-connect proxy-password prompt (design doc §5.3; §11 OQ2). §5.3 said a
+ * template's authenticated socks5/http proxy "gets the existing per-connect
+ * password prompt behavior" — but that prompt was assumed-but-never-built:
+ * `connectViaSocks5` / `connectViaHttpConnect` only did `vault.get` and sent
+ * `proxyPassword ?? ""`, so after a template applied an authenticated proxy
+ * (templates carry no secret, and the round-2 hygiene sweeps any stale
+ * `proxy-password-{id}`) the connection sent an empty password and failed. This
+ * OPTIONAL dependency realizes that prompt: when present it is fired only for a
+ * username-bearing proxy whose vault lookup returned nothing, at the SAME await
+ * point the `vault.get` already happens (preserving the socket/banner IPC
+ * ordering). Absent ⇒ exactly the prior behavior (backward-compatible). On a
+ * saved success the password is stored under `proxyPasswordSecretKey(id)` so it
+ * is one-time; a later template endpoint change re-clears it via the existing
+ * hygiene → re-prompt next connect, exactly §5.3.
+ */
+export type ProxyPasswordPrompt = (
+  server: ServerConfig,
+  proxy: Socks5Proxy | HttpConnectProxy
+) => Promise<{ password: string; save: boolean } | undefined>;
+
 function normalizeProxyTimeoutMs(timeoutMs: number): number {
   return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 5_000, 300_000) : 60_000;
 }
@@ -27,7 +48,11 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     private readonly authFactory: SilentAuthSshFactory,
     private readonly serverLookup: (id: string) => ServerConfig | undefined,
     private readonly vault: SecretVault,
-    proxyTimeoutMs: number = 60_000
+    proxyTimeoutMs: number = 60_000,
+    // OPTIONAL — see `ProxyPasswordPrompt`. Absent ⇒ today's `?? ""` behavior
+    // unchanged (backward-compatible; existing constructions and tests keep
+    // working). Only the socks5/http (password-bearing) paths consult it.
+    private readonly promptProxyPassword?: ProxyPasswordPrompt
   ) {
     this.proxyTimeoutMs = normalizeProxyTimeoutMs(proxyTimeoutMs);
   }
@@ -118,12 +143,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
   private async connectViaSocks5(
     target: ServerConfig,
-    proxy: { host: string; port: number; username?: string },
+    proxy: Socks5Proxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const proxyPassword = proxy.username
-      ? await this.vault.get(proxyPasswordSecretKey(target.id))
-      : undefined;
+    const proxyPassword = await this.resolveProxyPassword(target, proxy);
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -172,12 +195,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
 
   private async connectViaHttpConnect(
     target: ServerConfig,
-    proxy: { host: string; port: number; username?: string },
+    proxy: HttpConnectProxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const proxyPassword = proxy.username
-      ? await this.vault.get(proxyPasswordSecretKey(target.id))
-      : undefined;
+    const proxyPassword = await this.resolveProxyPassword(target, proxy);
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -203,6 +224,39 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
+  }
+
+  /**
+   * Resolve the proxy password at the SAME await point the connect paths used to
+   * call `vault.get` (do NOT move — it preserves the documented socket/banner IPC
+   * ordering). Realizes the §5.3 per-connect prompt that was assumed-but-unbuilt:
+   * a username-bearing proxy whose vault lookup returns nothing consults the
+   * optional prompt (when wired); a saved success is stored under
+   * `proxyPasswordSecretKey(target.id)` so it is one-time. A cancelled prompt, an
+   * absent prompt dependency, or a proxy without a username all fall back to the
+   * prior behavior (`undefined` → `?? ""` downstream) with no behavior change.
+   */
+  private async resolveProxyPassword(
+    target: ServerConfig,
+    proxy: Socks5Proxy | HttpConnectProxy
+  ): Promise<string | undefined> {
+    if (!proxy.username) {
+      return undefined;
+    }
+    const stored = await this.vault.get(proxyPasswordSecretKey(target.id));
+    if (stored !== undefined) {
+      return stored;
+    }
+    if (this.promptProxyPassword) {
+      const result = await this.promptProxyPassword(target, proxy);
+      if (result) {
+        if (result.save) {
+          await this.vault.store(proxyPasswordSecretKey(target.id), result.password);
+        }
+        return result.password;
+      }
+    }
+    return undefined;
   }
 
   private addToVisited(visited: ReadonlySet<string>, server: ServerConfig): Set<string> {

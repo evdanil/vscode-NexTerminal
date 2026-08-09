@@ -374,7 +374,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     sshFactory,
     (id) => core.getServer(id),
     secretVault,
-    readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300)
+    readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300),
+    // Per-connect proxy-password prompt (design doc §5.3; §11 OQ2) — realizes the
+    // prompt §5.3 assumed for a template's authenticated socks5/http proxy, which
+    // carries no secret. Fired by ProxySshFactory only for a username-bearing proxy
+    // with no stored `proxy-password-{id}`. Masked, never logged (matching the
+    // VscodePasswordPrompt discipline); on entry it stores the secret per-server so
+    // it is one-time (the per-server vault entry IS the §5.3 model), and returns
+    // undefined on cancel (ProxySshFactory then falls back to the prior behavior).
+    async (server, proxy) => {
+      const label = proxy.type === "socks5" ? "SOCKS5" : "HTTP";
+      const endpoint = proxy.username
+        ? `${proxy.username}@${proxy.host}:${proxy.port}`
+        : `${proxy.host}:${proxy.port}`;
+      const password = await vscode.window.showInputBox({
+        title: `Nexus ${label} Proxy Password`,
+        prompt: `Enter password for ${label} proxy ${endpoint}`,
+        password: true,
+        ignoreFocusOut: true
+      });
+      if (password === undefined) {
+        return undefined;
+      }
+      return { password, save: true };
+    }
   );
   const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
   const pool = new SshConnectionPool(proxiedFactory, {
