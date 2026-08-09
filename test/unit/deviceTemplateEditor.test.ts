@@ -127,6 +127,30 @@ describe("builder parameter extensions (UX-M4/m13)", () => {
     expect(editorAuth.hint).not.toContain("matching servers");
     expect(editorAuth.hint).toContain("the servers it applies to");
   });
+
+  it("Fix C (PR #62 Codex round 2) — proxyFields `includePasswords: false`: the template editor OMITS both proxy-password inputs; the server form keeps them", () => {
+    // The template editor renders proxy controls but NOT the two password fields:
+    // `parseDeviceTemplateFormValues` calls only `formValuesToProxy`, which
+    // discards proxy passwords (§5.3 — templates carry no secrets), so a rendered
+    // password input would silently throw away whatever the user typed. Against
+    // 5cdc83e the shared `proxyFields` always emitted both, so both finds are
+    // defined and this test fails on the two `toBeUndefined` assertions.
+    const editor = deviceTemplateFormDefinition();
+    expect(field(editor, "proxySocks5Password")).toBeUndefined();
+    expect(field(editor, "proxyHttpPassword")).toBeUndefined();
+    // The proxy host/username controls are still there — only the password
+    // controls are dropped, so the proxy is still fully templatable.
+    expect(field(editor, "proxySocks5Host")).toBeDefined();
+    expect(field(editor, "proxySocks5Username")).toBeDefined();
+    // The omitted password is replaced by a per-server hint on the username field.
+    const socks5User = field(editor, "proxySocks5Username") as Extract<FormFieldDescriptor, { type: "text" }>;
+    expect(socks5User.hint).toContain("Proxy passwords aren't stored in templates");
+
+    // The server form is untouched: both password controls remain.
+    const server = serverFormDefinition({ id: "s1", name: "s", host: "h", port: 22, username: "u", authType: "agent" });
+    expect(field(server, "proxySocks5Password")).toBeDefined();
+    expect(field(server, "proxyHttpPassword")).toBeDefined();
+  });
 });
 
 describe("shared short-label map (§7.3/§7.4)", () => {

@@ -529,6 +529,14 @@ export interface ServerListEntry {
   name: string;
 }
 
+// Device templates (PR-T1b, UX-M4/m13) — per-server proxy passwords are never
+// stored in a template (§5.3: templates carry no SECRETS); a template-set
+// socks5/http proxy prompts for its password per-connect. This hint replaces the
+// password control the template editor omits, so a user isn't left wondering
+// where to type one.
+const TEMPLATE_PROXY_PASSWORD_HINT =
+  "Proxy passwords aren't stored in templates — each server prompts for its own the first time it connects.";
+
 function proxyFields(
   seed?: Partial<ServerConfig>,
   servers?: ServerListEntry[],
@@ -537,7 +545,15 @@ function proxyFields(
   // call site is byte-identical. The template editor passes `false`: the proxy
   // controls ARE the field being templated, so burying them under the Advanced
   // chevron would hide the editor's main content.
-  advanced = true
+  advanced = true,
+  // Device templates (PR-T1b, PR #62 Codex round 2, Fix C) — defaults to `true`
+  // so the server form and every other caller keep both password controls. The
+  // template editor passes `false`: `parseDeviceTemplateFormValues` calls only
+  // `formValuesToProxy`, which silently DISCARDS the proxy passwords (§5.3 —
+  // templates carry no secrets), so rendering the two password inputs would let a
+  // user type a value that Save throws away, then hit an unexpected auth prompt at
+  // connect. Omitting them, plus the per-server hint above, states the real model.
+  includePasswords = true
 ): FormFieldDescriptor[] {
   const proxy = seed?.proxy;
   const proxyType = proxy?.type ?? "none";
@@ -602,13 +618,17 @@ function proxyFields(
     // SOCKS5 fields
     { type: "text", key: "proxySocks5Host", label: "SOCKS5 Proxy Host", required: true, placeholder: "proxy.example.com", value: socks5Host, advanced, visibleWhen: compoundVw(socks5Vw) },
     { type: "number", key: "proxySocks5Port", label: "SOCKS5 Proxy Port", required: true, min: 1, max: 65535, value: socks5Port, advanced, visibleWhen: compoundVw(socks5Vw) },
-    { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, advanced, visibleWhen: compoundVw(socks5Vw) },
-    { type: "password", key: "proxySocks5Password", label: "SOCKS5 Password", placeholder: "Leave blank to keep existing", advanced, visibleWhen: compoundVw(socks5Vw) },
+    { type: "text", key: "proxySocks5Username", label: "SOCKS5 Username", placeholder: "Optional", value: socks5Username, advanced, ...(includePasswords ? {} : { hint: TEMPLATE_PROXY_PASSWORD_HINT }), visibleWhen: compoundVw(socks5Vw) },
+    ...(includePasswords
+      ? [{ type: "password" as const, key: "proxySocks5Password", label: "SOCKS5 Password", placeholder: "Leave blank to keep existing", advanced, visibleWhen: compoundVw(socks5Vw) }]
+      : []),
     // HTTP CONNECT fields
     { type: "text", key: "proxyHttpHost", label: "HTTP Proxy Host", required: true, placeholder: "proxy.example.com", value: httpHost, advanced, visibleWhen: compoundVw(httpVw) },
     { type: "number", key: "proxyHttpPort", label: "HTTP Proxy Port", required: true, min: 1, max: 65535, value: httpPort, advanced, visibleWhen: compoundVw(httpVw) },
-    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, advanced, visibleWhen: compoundVw(httpVw) },
-    { type: "password", key: "proxyHttpPassword", label: "HTTP Proxy Password", placeholder: "Leave blank to keep existing", advanced, visibleWhen: compoundVw(httpVw) }
+    { type: "text", key: "proxyHttpUsername", label: "HTTP Proxy Username", placeholder: "Optional", value: httpUsername, advanced, ...(includePasswords ? {} : { hint: TEMPLATE_PROXY_PASSWORD_HINT }), visibleWhen: compoundVw(httpVw) },
+    ...(includePasswords
+      ? [{ type: "password" as const, key: "proxyHttpPassword", label: "HTTP Proxy Password", placeholder: "Leave blank to keep existing", advanced, visibleWhen: compoundVw(httpVw) }]
+      : [])
   ];
 }
 
@@ -698,7 +718,10 @@ export function deviceTemplateFormDefinition(
 
       // Proxy
       templateModeSelect("proxy", modeOf("proxy")),
-      ...proxyFields({ proxy: seed?.fields.proxy?.value }, servers, proxyVw, false),
+      // Fix C (PR #62 Codex round 2) — `includePasswords: false`: §5.3 templates
+      // carry no proxy SECRETS, and `parseDeviceTemplateFormValues` discards them,
+      // so the password inputs are omitted (a per-server hint replaces them).
+      ...proxyFields({ proxy: seed?.fields.proxy?.value }, servers, proxyVw, false, false),
       templateOverridePreemption("proxy"),
 
       // Auth Profile — autofill OFF (no server SSH form to mirror into, m13).

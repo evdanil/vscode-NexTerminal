@@ -10,6 +10,11 @@ import {
   type TemplatableField
 } from "../services/inventory/templateApply";
 import { configMutationLock } from "../services/configMutationLock";
+import {
+  clearStaleProxyPasswordSecretsBeforeApply,
+  restoreProxyPasswordSecrets,
+  type CapturedProxyPasswordSecret
+} from "../services/inventory/proxySecretHygiene";
 import { deviceTemplateFormDefinition, type ServerListEntry } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -110,9 +115,44 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
   const snapshot = ctx.core.getSnapshot();
   const definition = deviceTemplateFormDefinition(seed, serverListEntries(ctx), snapshot.authProfiles);
   const formId = seed?.id ? `device-template-edit-${seed.id}` : "device-template-add";
+  // FIX B (issue #48 PR-T1b / PR #62 Codex review round 2) — the revision of the
+  // record this Edit editor is seeded from, captured before the (unbounded) time
+  // the form sits open. `revision` is minted fresh on every
+  // `addOrUpdateDeviceTemplate`, so it is the signal that distinguishes "still the
+  // record I opened" from "deleted" or "edited elsewhere" at save time. Add-mode
+  // (no seed) has no revision and nothing to compare — a fresh id is minted on save.
+  const seedRevision = seed?.revision;
   WebviewFormPanel.open(formId, definition, {
     onSubmit: async (values) => {
       const template = parseDeviceTemplateFormValues(values, seed?.id);
+      // FIX B (PR #62 Codex round 2) — an Edit whose template was DELETED while the
+      // editor sat open must not resurrect it, and one edited ELSEWHERE must not be
+      // silently clobbered. `addOrUpdateDeviceTemplate` treats a now-missing id as a
+      // brand-new template (it upserts by id), so without this guard a Save re-creates
+      // the deleted record — detached from the source rules the deletion swept. Extend
+      // the round-1 revision mechanism to the edit save: re-resolve the seeded id
+      // against LIVE core immediately before persisting and reject a missing record
+      // (deleted) or a changed revision (stale edit), keeping the form open with the
+      // reason. This resolve-and-compare has NO `await` before `addOrUpdateDeviceTemplate`
+      // below (getDeviceTemplate/getAuthProfile are synchronous), so on the extension
+      // host's single thread nothing interleaves between the check and the write — the
+      // same synchronous-check-then-persist atomicity the round-1 resolve-under-lock
+      // fixes use. Add-mode (no `seed?.id`) is unaffected: there is no prior record.
+      if (seed?.id !== undefined) {
+        const liveTemplate = ctx.core.getDeviceTemplate(seed.id);
+        if (liveTemplate === undefined) {
+          throw new Error(
+            "This device template was deleted while the editor was open — nothing was saved. " +
+              "Reopen Manage Device Templates to create it again if you still need it."
+          );
+        }
+        if (liveTemplate.revision !== seedRevision) {
+          throw new Error(
+            "This device template was changed elsewhere while the editor was open — nothing was saved. " +
+              "Reopen it to pick up the current version, then redo your edit."
+          );
+        }
+      }
       // MECHANISM 2 (P2 #4, PR #62 Codex round 1) — resolve a submitted
       // `authProfileId` against LIVE core immediately before persisting. The
       // profile-deletion sweep (`removeAuthProfile`) only clears the link off
@@ -505,7 +545,60 @@ export function registerDeviceTemplateCommands(ctx: CommandContext): vscode.Disp
                 "Run Apply Device Template again to review the current plan.";
               return;
             }
-            applied = await applyPlanWrites(ctx, plan);
+            // FIX A (issue #48 PR-T1b / PR #62 Codex review round 2, SECURITY) — the
+            // manual apply is the SECOND writer of server proxy config, and until now
+            // it published `write.proxy` (applyPlanWrites, below) without clearing the
+            // server's stale `proxy-password-{id}`. `ProxySshFactory` reads that secret
+            // by server id and would send the OLD endpoint's password to the NEW proxy
+            // — the exact round-9/11 leak the sync path already closes. Route this path
+            // through the SAME shared hygiene helper (proxySecretHygiene.ts), clearing
+            // BEFORE applyPlanWrites publishes, inside this same locked section,
+            // fail-closed with restore-on-failure — mirroring the sync ordering exactly
+            // (capture+delete → publish → restore-on-failure). §5.3: templates never
+            // carry proxy SECRETS, so the new proxy prompts per-connect and clearing
+            // the stale secret loses nothing the new proxy should have.
+            //
+            // The change list is built only from writes that actually set the proxy
+            // (`write.proxy !== undefined`): a write that touches no proxy field, or a
+            // server the apply doesn't touch, contributes nothing. `before` is the live
+            // server's current proxy; `after` is that server with the incoming proxy.
+            const vault = ctx.secretVault;
+            const proxyChanges: Array<{ before: ServerConfig; after: ServerConfig }> = [];
+            for (const write of plan.serverWrites) {
+              if (write.proxy === undefined) {
+                continue;
+              }
+              const liveServer = ctx.core.getServer(write.serverId);
+              if (!liveServer) {
+                continue;
+              }
+              proxyChanges.push({ before: liveServer, after: { ...liveServer, proxy: write.proxy } });
+            }
+            let capturedProxySecrets: CapturedProxyPasswordSecret[] = [];
+            if (vault && proxyChanges.length > 0) {
+              try {
+                // Fail closed — the helper restores anything it deleted in this pass and
+                // rethrows on a delete/read error, so a proxy change we cannot secure is
+                // never published. Abort with the house "run again" wording.
+                capturedProxySecrets = await clearStaleProxyPasswordSecretsBeforeApply(vault, proxyChanges);
+              } catch {
+                refusal =
+                  `Could not securely update the proxy settings for "${folderPath}" — nothing was applied. ` +
+                  "Run Apply Device Template again.";
+                return;
+              }
+            }
+            try {
+              applied = await applyPlanWrites(ctx, plan);
+            } catch (error) {
+              // The apply did NOT (fully) commit — the old proxy config is still live and
+              // needs its password, so restore what we captured before surfacing the
+              // failure (best-effort, mirroring the sync path's restore-on-apply-failure).
+              if (vault) {
+                await restoreProxyPasswordSecrets(vault, capturedProxySecrets);
+              }
+              throw error;
+            }
           })
       );
       if (refusal !== undefined) {

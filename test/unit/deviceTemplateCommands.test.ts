@@ -63,6 +63,7 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 // Imported AFTER the mocks so the command module binds to them.
 const { registerDeviceTemplateCommands, parseDeviceTemplateFormValues } = await import("../../src/commands/deviceTemplateCommands");
 const { FolderTreeItem } = await import("../../src/ui/nexusTreeProvider");
+const { proxyPasswordSecretKey } = await import("../../src/services/ssh/silentAuth");
 
 const P: ProxyConfig = { type: "socks5", host: "10.0.0.9", port: 1080 };
 
@@ -77,6 +78,49 @@ function ctxFor(core: NexusCore): CommandContext {
 function register(core: NexusCore): void {
   registeredCommands.clear();
   registerDeviceTemplateCommands(ctxFor(core));
+}
+
+/**
+ * A minimal in-memory SecretVault that records the delete order (and, per key,
+ * the server's proxy at delete time) so Fix A can assert the stale secret is
+ * DELETED before the new proxy publishes. `failDeleteFor` makes one key's delete
+ * throw (the fail-closed-abort variant).
+ */
+function makeVault(
+  core: NexusCore,
+  initial: Record<string, string> = {},
+  opts: { failDeleteFor?: string } = {}
+) {
+  const store = new Map(Object.entries(initial));
+  const deleted: string[] = [];
+  const proxyAtDelete = new Map<string, unknown>();
+  return {
+    async get(key: string): Promise<string | undefined> {
+      return store.get(key);
+    },
+    async store(key: string, value: string): Promise<void> {
+      store.set(key, value);
+    },
+    async delete(key: string): Promise<void> {
+      if (key.startsWith("proxy-password-")) {
+        const serverId = key.slice("proxy-password-".length);
+        proxyAtDelete.set(key, core.getServer(serverId)?.proxy);
+      }
+      if (opts.failDeleteFor === key) {
+        throw new Error("vault delete failed");
+      }
+      deleted.push(key);
+      store.delete(key);
+    },
+    _store: store,
+    _deleted: deleted,
+    _proxyAtDelete: proxyAtDelete
+  };
+}
+
+function registerWithVault(core: NexusCore, vault: unknown): void {
+  registeredCommands.clear();
+  registerDeviceTemplateCommands({ core, secretVault: vault } as unknown as CommandContext);
 }
 
 beforeEach(() => {
@@ -483,5 +527,158 @@ describe("2b — template save rejects a vanished auth-profile reference (PR #62
     const templates = core.getSnapshot().deviceTemplates;
     expect(templates).toHaveLength(1);
     expect(templates[0].fields.authProfileId).toEqual({ mode: "fill", value: "prof-1" });
+  });
+});
+
+describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the stale proxy-password before publishing the new proxy", () => {
+  // An authenticated SOCKS5 endpoint X the server's proxy-password was entered for.
+  const X: ProxyConfig = { type: "socks5", host: "10.9.9.1", port: 1080, username: "u" };
+  // A DIFFERENT authenticated endpoint Y the override moves the proxy to.
+  const Y: ProxyConfig = { type: "socks5", host: "10.9.9.2", port: 1080, username: "u" };
+
+  async function seedProxyServer(core: NexusCore): Promise<void> {
+    await core.addOrUpdateServer({
+      id: "srv-1",
+      name: "sw",
+      host: "h",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      group: "DC",
+      proxy: X,
+      origin: { sourceId: "src", externalId: "d", templated: { proxy: X } }
+    });
+  }
+
+  it("DELETES proxy-password-{id} BEFORE the write publishes when an override moves the proxy to a different endpoint", async () => {
+    const core = makeCore();
+    await seedProxyServer(core);
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: Y } } });
+    const key = proxyPasswordSecretKey("srv-1");
+    const vault = makeVault(core, { [key]: "topsecret" });
+    registerWithVault(core, vault);
+
+    mockShowQuickPick.mockResolvedValue({ label: "Reproxy", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+    mockShowInformationMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    // The stale secret was deleted (against 5cdc83e it survives → the old proxy's
+    // password would be sent to the new endpoint Y).
+    expect(vault._deleted).toContain(key);
+    expect(vault._store.has(key)).toBe(false);
+    // Delete-BEFORE-publish: at the moment of deletion the server still carried the
+    // OLD proxy X — proving the clear ran before applyPlanWrites published Y.
+    expect(vault._proxyAtDelete.get(key)).toEqual(X);
+    // And the new proxy did publish.
+    expect(core.getServer("srv-1")!.proxy).toEqual(Y);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith('Applied device template "Reproxy" to 1 server.');
+  });
+
+  it("fail-closed — a delete failure ABORTS the apply: nothing published, secret intact, house 'run again' message", async () => {
+    const core = makeCore();
+    await seedProxyServer(core);
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: Y } } });
+    const key = proxyPasswordSecretKey("srv-1");
+    const vault = makeVault(core, { [key]: "topsecret" }, { failDeleteFor: key });
+    registerWithVault(core, vault);
+
+    mockShowQuickPick.mockResolvedValue({ label: "Reproxy", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    // The proxy change was NEVER published — the server keeps X (against 5cdc83e it
+    // becomes Y regardless, leaking the old password to the new endpoint).
+    expect(core.getServer("srv-1")!.proxy).toEqual(X);
+    // The secret is still present (the helper restored what it captured on abort).
+    expect(vault._store.get(key)).toBe("topsecret");
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
+      expect.stringContaining("Could not securely update the proxy settings")
+    );
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Applied device template"));
+  });
+
+  it("does NOT over-clear — an override to the SAME authenticated endpoint keeps the secret", async () => {
+    const core = makeCore();
+    await seedProxyServer(core);
+    // Override to the SAME endpoint X (same type/host/port/username) — the stored
+    // password still applies, so it must be kept.
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "SameProxy", fields: { proxy: { mode: "override", value: X } } });
+    const key = proxyPasswordSecretKey("srv-1");
+    const vault = makeVault(core, { [key]: "topsecret" });
+    registerWithVault(core, vault);
+
+    mockShowQuickPick.mockResolvedValue({ label: "SameProxy", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+    mockShowInformationMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    expect(vault._deleted).not.toContain(key);
+    expect(vault._store.get(key)).toBe("topsecret");
+  });
+});
+
+describe("Fix B (PR #62 Codex round 2) — edit save re-resolves the seeded template and refuses a deleted/stale record", () => {
+  async function openEdit(core: NexusCore): Promise<{ onSubmit: (v: FormValues) => Promise<void> | void }> {
+    register(core);
+    mockShowQuickPick.mockResolvedValue({ label: "Core", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
+    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    const editOpen = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!;
+    return editOpen.options;
+  }
+
+  it("DELETED while the editor was open → Save rejected, template NOT resurrected", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { logSession: { mode: "fill", value: true } } });
+    const edit = await openEdit(core);
+    // The template is deleted while the editor sits open.
+    await core.removeDeviceTemplate("t1");
+    // Against 5cdc83e, onSubmit re-creates the record (addOrUpdateDeviceTemplate
+    // upserts by id) — a resurrected template detached from the swept source rules,
+    // with no error. The guard rejects and keeps the form open.
+    await expect(edit.onSubmit({ name: "Core", mode_logSession: "fill", logSession: true })).rejects.toThrow(
+      /deleted while the editor was open/i
+    );
+    expect(core.getDeviceTemplate("t1")).toBeUndefined();
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(0);
+  });
+
+  it("CHANGED elsewhere (revision moved) → Save rejected as a stale edit", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { logSession: { mode: "fill", value: true } } });
+    const edit = await openEdit(core);
+    // Someone edits the SAME template elsewhere → a fresh revision.
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { logSession: { mode: "override", value: false } } });
+    const revisionBefore = core.getDeviceTemplate("t1")!.revision;
+    await expect(edit.onSubmit({ name: "Core", mode_logSession: "fill", logSession: true })).rejects.toThrow(
+      /changed elsewhere while the editor was open/i
+    );
+    // The concurrent edit is NOT clobbered — the record still holds the other edit.
+    expect(core.getDeviceTemplate("t1")!.revision).toBe(revisionBefore);
+    expect(core.getDeviceTemplate("t1")!.fields.logSession).toEqual({ mode: "override", value: false });
+  });
+
+  it("sibling — a normal edit (unchanged revision) saves through", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { logSession: { mode: "fill", value: true } } });
+    const edit = await openEdit(core);
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await edit.onSubmit({ name: "Renamed", mode_logSession: "override", logSession: false });
+    const live = core.getDeviceTemplate("t1")!;
+    expect(live.name).toBe("Renamed");
+    expect(live.fields.logSession).toEqual({ mode: "override", value: false });
+  });
+
+  it("sibling — Add-mode (no seed) is unaffected: it still saves a brand-new template", async () => {
+    const core = makeCore();
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await formPanelOpens[0].options.onSubmit({ name: "Fresh", mode_logSession: "fill", logSession: true });
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
+    expect(core.getSnapshot().deviceTemplates[0].name).toBe("Fresh");
   });
 });
