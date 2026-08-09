@@ -513,6 +513,77 @@ describe("fail-closed filtered-rule skip — §7.2 rev11", () => {
   });
 });
 
+// -------- §5.3 proxy reference validation (skip-and-warn) --------
+
+describe("§5.3 proxy reference validation — dangling / self-referential jumpHostId", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  // The id a fresh add for the default device:1 will carry — a proxy pointing
+  // here routes the server through itself.
+  const SELF_ID = deterministicServerId("source-1", "device:1");
+
+  it("Fixture 29 — a catch-all override proxy whose jumpHostId IS the target's own id is SKIPPED per-device, its sibling fields still apply, one self-reference warning (kills 'write the self-proxy')", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()], // fresh add of device:1
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(SELF_ID) }, multiplexing: { mode: "fill", value: true } })]
+    });
+    expect(p.adds.length).toBe(1);
+    expect(p.adds[0].proxy).toBeUndefined(); // self-proxy NOT written
+    expect(p.adds[0].multiplexing).toBe(true); // sibling field still applied
+    const selfWarnings = p.warnings.filter((w) => w.includes("through itself"));
+    expect(selfWarnings.length).toBe(1);
+  });
+
+  it("Fixture 30 — a catch-all override proxy with a DANGLING jumpHostId is SKIPPED, its sibling fields still apply, one dangling warning (kills 'write the dangling proxy')", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [],
+      templates: [template({ proxy: { mode: "override", value: sshProxy("no-such-server") }, multiplexing: { mode: "fill", value: true } })]
+    });
+    expect(p.adds.length).toBe(1);
+    expect(p.adds[0].proxy).toBeUndefined(); // dangling proxy NOT written
+    expect(p.adds[0].multiplexing).toBe(true);
+    const dangleWarnings = p.warnings.filter((w) => w.includes("jump host no longer exists"));
+    expect(dangleWarnings.length).toBe(1);
+  });
+
+  it("Fixture 31 — a catch-all override proxy with a VALID, non-self jumpHostId is written unchanged (kills an over-broad skip)", () => {
+    const bastion: ServerConfig = {
+      id: "bastion-1",
+      name: "bastion",
+      host: "10.0.0.99",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false
+    };
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice({ externalId: "device:2", name: "sw-2" })],
+      servers: [bastion],
+      templates: [template({ proxy: { mode: "override", value: sshProxy("bastion-1") } })]
+    });
+    const added = p.adds.find((s) => s.name === "sw-2")!;
+    expect(added.proxy).toEqual(sshProxy("bastion-1"));
+    expect(p.warnings.filter((w) => w.includes("through itself") || w.includes("jump host no longer exists")).length).toBe(0);
+  });
+
+  it("Fixture 32 — an existing sync-owned proxy is KEPT (row 5 carry) when a new override rule's proxy is dangling; 'desired none' is NOT a written undefined (kills clobber-to-undefined)", () => {
+    const server = ownedServer({ proxy: P_A }, { templated: { proxy: P_A } }); // sync-owned socks5 proxy
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [server],
+      templates: [template({ proxy: { mode: "override", value: sshProxy("no-such-server") } })]
+    });
+    const after = afterFor(p, server.id) ?? server;
+    expect(after.proxy).toEqual(P_A); // existing proxy kept, NOT clobbered to the dangling proxy or to undefined
+    expect(after.origin?.templated?.proxy).toEqual(P_A); // stamp carried forward
+  });
+});
+
 // -------- clearTemplatedStamps (§5.1, unit-tested, wired to nothing) --------
 
 describe("clearTemplatedStamps — §5.1 (manual path helper; not wired in T1)", () => {

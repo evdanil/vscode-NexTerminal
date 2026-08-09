@@ -386,11 +386,27 @@ export class NexusCore {
     // DEVICE TEMPLATES (PR-T1, §8.4) — a template's `fields.authProfileId` names
     // this same AuthProfile store, so a deletion must clear it there too: a link
     // naming a profile that no longer exists resolves to nothing on every sync,
-    // with nothing on screen to say why. Re-revisioned like the sources, so a
-    // sync in flight against the old template incarnation aborts on the drift
-    // fast-fail rather than trying to stamp a deleted profile. The server-side
-    // stamp (`syncedAuthProfileId`) is already handled above via the shared
-    // stamp; this is the SOURCE of the link, not the record of it.
+    // with nothing on screen to say why. The template is re-revisioned like the
+    // sources — but note what that does and does NOT buy in T1. The full mid-sync
+    // template-revision drift fast-fail (capturing each referenced template's
+    // revision at fetch time and comparing it before apply) is DEFERRED TO T1b,
+    // and NOT because no T1 path mutates a template: THIS method re-revisions
+    // every template that links the deleted profile, and `removeDeviceTemplate`
+    // re-revisions the sources that reference the deleted template — both are
+    // reachable in T1. It is deferred because (i) the window is narrow (a
+    // `removeAuthProfile` landing mid-apply of an already-in-flight plan),
+    // (ii) the worst outcome is a dangling `authProfileId` that degrades to SSH
+    // agent auth at connect time — not data loss or a security hole — and
+    // (iii) the fuller guard belongs with T1b's template-authoring UI, which is
+    // when templates first become user-mutable at all (in T1 they arrive only by
+    // import). KNOWN RESIDUAL the T1b guard closes: when a profile is referenced
+    // ONLY by a template (never by a `source.authProfileId`), deleting it
+    // re-revisions the template but NOT any source, so the shipped
+    // `sourceConfigUnchanged` pre-apply guard does not catch it, and it does not
+    // self-heal — the profile is not in `profilesNeedingServerKey`, so no AUTH 2b
+    // rollback fires; only an override rule or a manual edit reclaims the link.
+    // The server-side stamp (`syncedAuthProfileId`) is already handled above via
+    // the shared stamp; this is the SOURCE of the link, not the record of it.
     const previousTemplates = new Map<string, DeviceTemplateProfile>();
     for (const [id, template] of this.deviceTemplates.entries()) {
       if (template.fields.authProfileId?.value === profileId) {
@@ -562,8 +578,11 @@ export class NexusCore {
    * in-memory-first pattern), with a rejected persist leaving NO trace, exactly
    * like `addOrUpdateInventorySource`. Every write is a new INCARNATION: a fresh
    * `revision` is assigned here, unconditionally (even if `template` already
-   * carries one), so a sync in flight against the old incarnation aborts on the
-   * mid-sync template drift fast-fail rather than stamping a stale value.
+   * carries one), so the mid-sync template-revision drift fast-fail can tell an
+   * old incarnation from a new one. That comparison itself is DEFERRED TO T1b
+   * (see `removeAuthProfile` for why, and for the residual it leaves): T1 mints
+   * the revision but does not yet compare it, so this write does not by itself
+   * abort an in-flight sync today.
    */
   public async addOrUpdateDeviceTemplate(template: DeviceTemplateProfile): Promise<void> {
     const hadPrevious = this.deviceTemplates.has(template.id);

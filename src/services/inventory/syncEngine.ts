@@ -711,9 +711,28 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   for (const w of cascade.warnings) {
     warnings.push(w);
   }
+  // §5.3 proxy jump-host resolution set: every server that exists AFTER this
+  // sync — the current servers plus the deterministic ids of the devices this
+  // fetch adds (so a jump host being freshly synced this run resolves, and a
+  // self-reference on a brand-new device is judged a self-reference, not a
+  // dangle). A `jumpHostId` outside this set is dangling; the equality against
+  // the target device's own id is the self-reference, checked per-device below.
+  const liveServerIds = new Set(currentServers.map((s) => s.id));
+  for (const device of tree.devices) {
+    liveServerIds.add(deterministicServerId(source.id, device.externalId));
+  }
   // Compose the non-auth desired fields (§4.2 layer 2) once; applied by the
-  // §4.3 matrix on both the add and update paths.
-  const desiredNonAuth: DesiredNonAuthFields = composeDesiredFields(cascade.winners);
+  // §4.3 matrix on both the add and update paths. A dangling jump-host proxy is
+  // dropped to "desired none" here (device-independent) with one plan warning.
+  const composed = composeDesiredFields(cascade.winners, {
+    hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
+    proxyTemplateName: cascade.proxyTemplateName,
+    sourceName: source.name
+  });
+  const desiredNonAuth: DesiredNonAuthFields = composed.desired;
+  for (const w of composed.warnings) {
+    warnings.push(w);
+  }
   // Resolve the auth winner against the WHOLE profile store (falling back to
   // the source's own `matchedProfile` for legacy callers that pass no map, so
   // the implicit rule always resolves). A dangling winner drops the field:
@@ -1049,7 +1068,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // load-bearing §5.2 regression lives here — it must go INTO the origin
       // literal, like every other stamp, since the auth branches below rebuild
       // the origin). `templateMatrix.values` are the field writes for `after`.
-      const templateMatrix = applyTemplateMatrix(ownedServer, desiredNonAuth);
+      const templateMatrix = applyTemplateMatrix(ownedServer, desiredNonAuth, {
+        targetServerId: id,
+        targetServerName: device.name,
+        proxyTemplateName: cascade.proxyTemplateName
+      });
+      for (const w of templateMatrix.warnings) {
+        warnings.push(w);
+      }
       const afterOrigin: ServerOrigin = {
         sourceId: source.id,
         externalId: device.externalId,
@@ -1989,7 +2015,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // T + stamp, there is nothing to override yet). `winnerResolvedId` equals the
     // source's own `resolvedProfileId` when no explicit rule sets auth, so a
     // template-less sync adds exactly the record it did before.
-    const addMatrix = applyTemplateMatrix(undefined, desiredNonAuth);
+    const addMatrix = applyTemplateMatrix(undefined, desiredNonAuth, {
+      targetServerId: id,
+      targetServerName: device.name,
+      proxyTemplateName: cascade.proxyTemplateName
+    });
+    for (const w of addMatrix.warnings) {
+      warnings.push(w);
+    }
     adds.push({
       id,
       name: device.name,

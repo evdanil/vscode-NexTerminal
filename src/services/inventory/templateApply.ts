@@ -78,6 +78,14 @@ export interface CascadeResult {
   authFromImplicit: boolean;
   /** Filtered-rule-skip (fail-closed) and dangling-template warnings, once per rule. */
   warnings: string[];
+  /**
+   * The NAME of the template that supplied `winners.proxy`, so the §5.3 proxy
+   * reference-validation warnings (dangling jump host / self-reference) can name
+   * the template the way the design's house style requires. Undefined when no
+   * rule set `proxy`. Stamps record VALUES, not writers (§1.3), so this is used
+   * ONLY for the plan warning — it never reaches storage.
+   */
+  proxyTemplateName?: string;
 }
 
 /**
@@ -145,7 +153,18 @@ export function selectFieldWinners(
     }
     return undefined;
   };
-  winners.proxy = firstSetter((t) => t.fields.proxy);
+  // Proxy resolves like the other non-auth fields, but additionally captures the
+  // winning template's NAME for the §5.3 reference-validation warnings — the
+  // scalar `firstSetter` cannot return it, so proxy uses the template-aware loop.
+  let proxyTemplateName: string | undefined;
+  for (const { template } of ordered) {
+    const field = template.fields.proxy;
+    if (field !== undefined) {
+      winners.proxy = field;
+      proxyTemplateName = template.name;
+      break;
+    }
+  }
   winners.multiplexing = firstSetter((t) => t.fields.multiplexing);
   winners.legacyAlgorithms = firstSetter((t) => t.fields.legacyAlgorithms);
   winners.logSession = firstSetter((t) => t.fields.logSession);
@@ -162,7 +181,7 @@ export function selectFieldWinners(
     winners.authProfileId = { mode: "fill", value: implicitAuthProfileId };
     authFromImplicit = true;
   }
-  return { winners, authFromImplicit, warnings };
+  return { winners, authFromImplicit, warnings, proxyTemplateName };
 }
 
 /** One non-auth field's composed desired value + the mode that governs its matrix write. */
@@ -179,17 +198,59 @@ export interface DesiredNonAuthFields {
 }
 
 /**
+ * §5.3 proxy reference-validation context. `hasServer` resolves an SSH
+ * jump-host reference against the set of servers that will be live after this
+ * sync (current servers ∪ this fetch's deterministic adds); a `jumpHostId`
+ * outside it is DANGLING. `proxyTemplateName`/`sourceName` name the disposition
+ * in the house style. Absent (legacy callers) ⇒ no proxy validation, the
+ * shipped behaviour before this guard.
+ */
+export interface ProxyReferenceContext {
+  hasServer: (jumpHostId: string) => boolean;
+  proxyTemplateName: string | undefined;
+  sourceName: string;
+}
+
+export interface ComposedDesiredFields {
+  desired: DesiredNonAuthFields;
+  /** §5.3 dangling-jump-host skip warnings (device-independent — emitted once). */
+  warnings: string[];
+}
+
+/**
  * §4.2 layer 2 (mode vs source data), for the four non-auth v1 fields. `srcX`
  * (device/provider-supplied data) is EMPTY for all of them, so this reduces to
  * `desiredX = tmplX.value` carrying `tmplX.mode` for the matrix's row-3 gate.
  * Written explicitly as the layer anyway, because it is where `port` (§4.6) and
  * any future endpoint-supplied field slot in — `desiredPort` would be
  * `override → tmpl, else endpoint.port, else fill → tmpl`.
+ *
+ * §5.3 REFERENCE VALIDATION (the PR-A §2.4 skip-and-warn posture — storing a
+ * value the runtime will refuse helps nobody). A desired SSH-jump proxy whose
+ * `jumpHostId` resolves to no live server is DROPPED to "desired none" here plus
+ * one plan warning. "Desired none" means the field is NOT A CANDIDATE this run —
+ * `desired.proxy` is left UNSET so the matrix carries an existing sync-owned
+ * proxy forward (row 5); it never becomes a written `undefined`. The
+ * SELF-reference check (`jumpHostId === targetServerId`) is per-device and lives
+ * in `applyTemplateMatrix`, because the dangling check is device-independent
+ * (resolved once, mirroring the dangling-auth-profile skip) while a
+ * self-reference can only be judged against the specific device being written.
+ * A resolvable, non-self reference — and any `socks5`/`http` proxy, which carry
+ * no server reference — passes through unchanged.
  */
-export function composeDesiredFields(winners: CascadeWinners): DesiredNonAuthFields {
+export function composeDesiredFields(winners: CascadeWinners, proxyRef?: ProxyReferenceContext): ComposedDesiredFields {
   const desired: DesiredNonAuthFields = {};
+  const warnings: string[] = [];
   if (winners.proxy !== undefined) {
-    desired.proxy = { value: winners.proxy.value, mode: winners.proxy.mode };
+    const value = winners.proxy.value;
+    if (value.type === "ssh" && proxyRef !== undefined && !proxyRef.hasServer(value.jumpHostId)) {
+      warnings.push(
+        `Device template "${proxyRef.proxyTemplateName ?? "?"}" on "${proxyRef.sourceName}" sets a jump-host proxy whose jump host no longer exists — the proxy field was skipped.`
+      );
+      // desired none — leave `desired.proxy` unset (NOT written undefined).
+    } else {
+      desired.proxy = { value, mode: winners.proxy.mode };
+    }
   }
   if (winners.multiplexing !== undefined) {
     desired.multiplexing = { value: winners.multiplexing.value, mode: winners.multiplexing.mode };
@@ -200,7 +261,7 @@ export function composeDesiredFields(winners: CascadeWinners): DesiredNonAuthFie
   if (winners.logSession !== undefined) {
     desired.logSession = { value: winners.logSession.value, mode: winners.logSession.mode };
   }
-  return desired;
+  return { desired, warnings };
 }
 
 function proxyEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
@@ -254,6 +315,22 @@ export interface TemplateMatrixResult {
   values: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession">>;
   /** The full new `origin.templated` record — carried-forward stamps with the written fields updated. */
   templated: ServerOrigin["templated"];
+  /** §5.3 per-device self-reference skip warnings (a proxy routing the target through itself). */
+  warnings: string[];
+}
+
+/**
+ * §5.3 self-reference context for ONE target device. `targetServerId` is the id
+ * the record will carry (`ownedServer.id` on the update path, the fresh
+ * deterministic id on the add path); a desired SSH-jump proxy whose `jumpHostId`
+ * equals it would route the server through itself and is skipped per-device.
+ * `targetServerName`/`proxyTemplateName` name the disposition. Absent ⇒ no
+ * self-reference check (the shipped behaviour before this guard).
+ */
+export interface ProxySelfReferenceContext {
+  targetServerId: string;
+  targetServerName: string;
+  proxyTemplateName: string | undefined;
 }
 
 /**
@@ -266,20 +343,36 @@ export interface TemplateMatrixResult {
  * 5). `undefined` when there is nothing to stamp, so the origin's presence
  * semantics stay clean.
  */
-export function applyTemplateMatrix(ownedServer: ServerConfig | undefined, desired: DesiredNonAuthFields): TemplateMatrixResult {
+export function applyTemplateMatrix(
+  ownedServer: ServerConfig | undefined,
+  desired: DesiredNonAuthFields,
+  proxyRef?: ProxySelfReferenceContext
+): TemplateMatrixResult {
   const values: TemplateMatrixResult["values"] = {};
+  const warnings: string[] = [];
   const carried = ownedServer?.origin?.templated;
   const templated: NonNullable<ServerOrigin["templated"]> = carried
     ? { ...carried, proxy: carried.proxy ? { ...carried.proxy } : carried.proxy }
     : {};
 
   if (desired.proxy !== undefined) {
-    const cur = ownedServer?.proxy;
-    const stamp = carried?.proxy;
-    const write = ownedServer === undefined ? true : matrixWrites(cur !== undefined, cur, stamp !== undefined, stamp, desired.proxy, proxyEqual);
-    if (write) {
-      values.proxy = { ...desired.proxy.value };
-      templated.proxy = { ...desired.proxy.value };
+    const value = desired.proxy.value;
+    // §5.3 SELF-REFERENCE hard-skip (per-device): a jump host that IS the device
+    // being written routes it through itself. Drop to "desired none" — do NOT
+    // write, so any existing sync-owned proxy carries forward (row 5) rather than
+    // being clobbered. The dangling check already ran once in composeDesiredFields.
+    if (value.type === "ssh" && proxyRef !== undefined && value.jumpHostId === proxyRef.targetServerId) {
+      warnings.push(
+        `Device template "${proxyRef.proxyTemplateName ?? "?"}" would route "${proxyRef.targetServerName}" through itself — the proxy field was skipped.`
+      );
+    } else {
+      const cur = ownedServer?.proxy;
+      const stamp = carried?.proxy;
+      const write = ownedServer === undefined ? true : matrixWrites(cur !== undefined, cur, stamp !== undefined, stamp, desired.proxy, proxyEqual);
+      if (write) {
+        values.proxy = { ...value };
+        templated.proxy = { ...value };
+      }
     }
   }
   const boolEqual = (a: boolean | undefined, b: boolean | undefined): boolean => a === b;
@@ -301,7 +394,7 @@ export function applyTemplateMatrix(ownedServer: ServerConfig | undefined, desir
   applyBool("logSession");
 
   const hasStamp = templated.proxy !== undefined || templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
-  return { values, templated: hasStamp ? templated : undefined };
+  return { values, templated: hasStamp ? templated : undefined, warnings };
 }
 
 /**

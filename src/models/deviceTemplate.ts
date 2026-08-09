@@ -34,8 +34,10 @@ export interface DeviceTemplateProfile {
    * Incarnation token, same contract as `InventorySourceConfig.revision`
    * (models/inventory.ts): assigned fresh by NexusCore on every write,
    * backfilled at load for legacy records (see ensureDeviceTemplateRevision).
-   * Lets the sync's pre-apply fast-fail detect "template edited mid-sync" the
-   * same way `sourceConfigUnchanged` detects a source edit.
+   * Exists so a pre-apply fast-fail can detect "template edited mid-sync" the
+   * same way `sourceConfigUnchanged` detects a source edit — but that comparison
+   * lands with T1b (deferred; see NexusCore.removeAuthProfile), so in T1 the
+   * revision is recorded and not yet compared.
    */
   revision?: string;
   /**
