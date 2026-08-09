@@ -218,13 +218,20 @@ describe("resolveProfileTokens — injection defense", () => {
 
   it("still allows a free-form display name — it is a label, not an address", () => {
     expect(resolved("# ${profile.name}", server({ name: "Core Switch DC1" }))).toBe("# Core Switch DC1");
-    // Spaces, accents, slashes and dots stay legal: `name` is a blacklist, not a
-    // charset, and refusing these would break ordinary profile names. With glob
-    // syntax refused (see below) they are inert text — a "/" expands into
-    // nothing. Square brackets USED to be in this list and no longer are.
+    // Spaces, accents, slashes and dots stay legal. `name` is now a POSITIVE
+    // charset (Unicode letters/marks/digits, a space, and `. - _ / : , +`), so
+    // these are legal because they are ON the list, not because nobody thought
+    // to forbid them — see the `NAME_CHARSET` comment for why the blacklist that
+    // used to live here was abandoned.
     expect(resolved("# ${profile.name}", server({ name: "Rack 4 / Ünit 2" }))).toBe("# Rack 4 / Ünit 2");
     expect(resolved("# ${profile.name}", server({ name: "Rack A - Spare" }))).toBe("# Rack A - Spare");
     expect(resolved("# ${profile.name}", server({ name: "Ærø-Süd Ünit 2" }))).toBe("# Ærø-Süd Ünit 2");
+    expect(resolved("# ${profile.name}", server({ name: "Rack 4, Unit 2" }))).toBe("# Rack 4, Unit 2");
+    // A decomposed accent is a combining MARK, not a letter — `\p{M}` is in the
+    // class so "Ünit" typed as U + U+0308 is not refused for being spelled
+    // differently from the identical-looking precomposed form.
+    const decomposed = "U\u0308nit 2";
+    expect(resolved("# ${profile.name}", server({ name: decomposed }))).toBe(`# ${decomposed}`);
   });
 
   it("refuses parentheses in a display name, which USED TO BE ACCEPTED as \"Core Switch (DC1)\"", () => {
@@ -242,8 +249,10 @@ describe("resolveProfileTokens — injection defense", () => {
     expect(outcome.error.token).toBe("name");
     // The exact executable line the pre-fix implementation produced.
     expect(JSON.stringify(outcome)).not.toContain("Write-Output (Start-Process calc)");
-    // And the message names what to remove, or it is a dead end.
-    expect(outcome.error.message).toContain("parentheses");
+    // And the message names what the field ACCEPTS, or it is a dead end. It no
+    // longer enumerates what to remove: under a positive charset that list is
+    // "everything else", so the guidance is phrased the only way it still can be.
+    expect(outcome.error.message).toContain("Use letters, digits, spaces");
     // The ordinary label, minus the parens, still runs.
     expect(resolved("Write-Output ${profile.name}\n", server({ name: "Core Switch DC1" }))).toBe(
       "Write-Output Core Switch DC1\n"
@@ -258,7 +267,7 @@ describe("resolveProfileTokens — injection defense", () => {
     if (outcome.ok) return;
     expect(outcome.error.token).toBe("name");
     expect(JSON.stringify(outcome)).not.toContain(".{Start-Process calc}\\n");
-    expect(outcome.error.message).toContain("braces");
+    expect(outcome.error.message).toContain("Use letters, digits, spaces");
   });
 
   it("refuses `%` in a display name — cmd.exe expands `%VAR%` at command position", () => {
@@ -274,8 +283,8 @@ describe("resolveProfileTokens — injection defense", () => {
     expect(outcome.error.token).toBe("name");
     // The exact executable line the pre-fix implementation produced.
     expect(JSON.stringify(outcome)).not.toContain("%COMSPEC% /c calc\\n");
-    // The message names what to remove, or it is a dead end.
-    expect(outcome.error.message).toContain("%");
+    // The message names the allowed set, or it is a dead end.
+    expect(outcome.error.message).toContain("Use letters, digits, spaces");
     // An ordinary label is unaffected — this is not a new charset for `name`.
     expect(resolved("# ${profile.name}", server({ name: "Rack 4 / Ünit 2" }))).toBe("# Rack 4 / Ünit 2");
   });
@@ -289,15 +298,71 @@ describe("resolveProfileTokens — injection defense", () => {
     if (outcome.ok) return;
     expect(outcome.error.token).toBe("name");
     expect(JSON.stringify(outcome)).not.toContain("echo DC1!!");
-    expect(outcome.error.message).toContain("!");
+    expect(outcome.error.message).toContain("Use letters, digits, spaces");
   });
 
-  it("keeps `^` legal — cmd's escape character can only REMOVE meaning, never add it", () => {
-    // The other half of the cmd.exe decision, asserted so a later "refuse
-    // everything cmd looks at" sweep has to argue with it: `^` cannot turn
-    // plain text into syntax, and `^^` is a literal caret. In bash and
-    // PowerShell it is an ordinary character.
-    expect(resolved("# ${profile.name}", server({ name: "Rack 4 ^ Spare" }))).toBe("# Rack 4 ^ Spare");
+  it("refuses `^` — bash QUICK SUBSTITUTION rewrites and runs the previous command line", () => {
+    // DELIBERATE FLIP of the assertion that used to stand here ("keeps `^`
+    // legal"). That decision reasoned only about cmd.exe, where `^` is an escape
+    // character and escaping can only REMOVE meaning, and then called `^`
+    // "an ordinary character" in bash. It is not. At the START OF A LINE bash
+    // performs quick substitution: `^old^new^` is shorthand for `!!:s/old/new/`,
+    // which rewrites the PREVIOUS history entry and executes the result.
+    // Confirmed against interactive bash 5.2.
+    const name = "^echo SAFE MODE^printf PWNED^";
+    const outcome = resolveProfileTokens("${profile.name}\n", server({ name }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("name");
+    // The exact line the pre-fix implementation produced — a quick substitution
+    // sitting at line start, which bash expands against history before running.
+    // The message quotes the offending VALUE (that is its job), so what must be
+    // absent is the value followed by the macro's own newline: the executable
+    // line, not the diagnostic.
+    expect(JSON.stringify(outcome)).not.toContain("PWNED^\\n");
+
+    // The character alone, anywhere in the value: a whitelist does not condition
+    // on position, and it is the FOURTH single-character hole this blacklist
+    // sprang, which is why `name` is now a positive charset instead.
+    for (const bad of ["^", "Rack 4 ^ Spare", "DC1^", "^^"]) {
+      expect(resolveProfileTokens("cmd ${profile.name}\n", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+  });
+
+  it("refuses the characters the ZSH lens adds — `=` at word start is `=command` expansion", () => {
+    // The shell the old blacklist never considered, and macOS's default: zsh's
+    // EQUALS option is on by default, so `=ls` at word start expands to the
+    // `$PATH` lookup `/bin/ls`. One character, one substituted path — the same
+    // class as cmd's `%VAR%`, and a positive charset refuses it by simply not
+    // listing it.
+    const outcome = resolveProfileTokens("${profile.name}\n", server({ name: "=cmd" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.token).toBe("name");
+    expect(JSON.stringify(outcome)).not.toContain("=cmd\\n");
+    for (const bad of ["=", "=cmd", "DC1=A", "rack=4"]) {
+      expect(resolveProfileTokens("cmd ${profile.name}\n", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+    // `@` goes for the PowerShell reason: `@name` in argument position SPLATS a
+    // session variable's contents into the command's arguments. It stays legal
+    // in `username`, where `user@REALM` is a real account form and the value
+    // cannot contain a space, and that difference is deliberate.
+    for (const bad of ["@", "@args", "rack@dc1"]) {
+      expect(resolveProfileTokens("cmd ${profile.name}\n", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
+    expect(resolved("-U ${profile.username}", server({ username: "user@REALM.EXAMPLE.COM" }))).toBe(
+      "-U user@REALM.EXAMPLE.COM"
+    );
+  });
+
+  it("refuses anything simply NOT on the list — the property a blacklist could not have", () => {
+    // The whole point of the flip. None of these was ever enumerated by the old
+    // blacklist, and every one of them is refused now for the same reason: it is
+    // not a letter, a mark, a digit, a space, or one of `. - _ / : , +`.
+    for (const bad of ["Rack 20\u00B0C", "Cost \u20AC5", "8\u00D712", "a\u00A0b", "\u2013dash", "rack\uFF1Fone"]) {
+      expect(resolveProfileTokens("cmd ${profile.name}\n", server({ name: bad })).ok, `name ${bad}`).toBe(false);
+    }
   });
 
   it("refuses `#` in a display name — a comment character DELETES the rest of the author's command", () => {
@@ -313,7 +378,7 @@ describe("resolveProfileTokens — injection defense", () => {
     if (outcome.ok) return;
     expect(outcome.error.kind).toBe("invalid");
     expect(outcome.error.token).toBe("name");
-    expect(outcome.error.message).toContain("#");
+    expect(outcome.error.message).toContain("Use letters, digits, spaces");
 
     // THE SHAPE OF THE BUG, spelled out: this is the exact line the pre-fix
     // implementation substituted — a safety flag sitting AFTER a comment
@@ -333,12 +398,13 @@ describe("resolveProfileTokens — injection defense", () => {
   });
 
   it("keeps hyphenated, dotted, slashed and colon-bearing labels legal — `#` did not narrow the rest", () => {
-    // The truncation lens was applied to every character still allowed and
-    // produced exactly one addition. `:` in particular STAYS: it is inert in an
-    // argument for bash and PowerShell, and cmd's `::` comment is a LABEL, only
+    // The pinned allowed set, one label per punctuation mark the charset keeps.
+    // `Rack 4 ^ Spare` USED TO BE IN THIS LIST and has moved to the refusal test
+    // above — that is the deliberate flip. `:` stays: it is inert in an argument
+    // for bash, zsh and PowerShell, and cmd's `::` comment is a LABEL, only
     // recognised as the first token of a command, so it is not reachable from a
     // single character mid-line.
-    for (const good of ["Rack A - Spare", "dc1.rack4.unit2", "Rack 4 / Ünit 2", "DC1: Core Switch", "Rack 4 ^ Spare"]) {
+    for (const good of ["Rack A - Spare", "dc1.rack4.unit2", "Rack 4 / Ünit 2", "DC1: Core Switch", "Rack 4, Unit 2"]) {
       expect(resolved("tool ${profile.name} --required-check\n", server({ name: good }))).toBe(
         `tool ${good} --required-check\n`
       );
@@ -386,7 +452,7 @@ describe("resolveProfileTokens — injection defense", () => {
     // The exact line the pre-fix implementation produced — a glob at command
     // position, which the shell resolves to a file it then executes.
     expect(JSON.stringify(outcome)).not.toContain("./scripts/*\\n");
-    expect(outcome.error.message).toContain("*");
+    expect(outcome.error.message).toContain("Use letters, digits, spaces");
 
     // Each glob metacharacter alone, including the bracket expression that the
     // previous version of this file explicitly permitted as "Rack A [Spare]".
@@ -401,7 +467,7 @@ describe("resolveProfileTokens — injection defense", () => {
     if (outcome.ok) return;
     expect(outcome.error.token).toBe("name");
     expect(JSON.stringify(outcome)).not.toContain("ls ~backup\\n");
-    expect(outcome.error.message).toContain("~");
+    expect(outcome.error.message).toContain("Use letters, digits, spaces");
     for (const bad of ["~", "DC1 ~", "~/dc1"]) {
       expect(resolveProfileTokens("ls ${profile.name}\n", server({ name: bad })).ok, `name ${bad}`).toBe(false);
     }
@@ -609,6 +675,75 @@ describe("resolveProfileTokens — URL form brackets a bare IPv6 address", () =>
     }
     // …and a missing field still refuses rather than substituting empty brackets.
     expect(resolveProfileTokens("https://${profile.ipmiHost}/", server(), URL_FORM).ok).toBe(false);
+  });
+
+  it("brackets ONLY inside the URL authority — a token in the QUERY is left alone", () => {
+    // REVIEW FINDING (P2). Bracketing is a rule of the AUTHORITY component, not
+    // of URLs: RFC 3986 needs `[...]` there so the address's colons are not read
+    // as the port delimiter, and that ambiguity exists nowhere else. The first
+    // version of this feature bracketed every bare IPv6 in URL form regardless
+    // of position, so a gateway macro received a corrupted parameter value.
+    const text = resolved(
+      "https://gateway/connect?target=${profile.host}",
+      server({ host: "fe80::1" }),
+      URL_FORM
+    );
+    expect(text).toBe("https://gateway/connect?target=fe80::1");
+    // The exact string the always-bracket implementation produced.
+    expect(text).not.toContain("target=[fe80::1]");
+    expect(new URL(text).searchParams.get("target")).toBe("fe80::1");
+  });
+
+  it("does not bracket a token in the PATH either", () => {
+    expect(resolved("https://gateway/host/${profile.host}/status", server({ host: "fe80::1" }), URL_FORM)).toBe(
+      "https://gateway/host/fe80::1/status"
+    );
+    // …nor one in the fragment.
+    expect(resolved("https://gateway/#${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe(
+      "https://gateway/#fe80::1"
+    );
+  });
+
+  it("decides each token in one macro independently — authority bracketed, query not", () => {
+    // The case a per-RUN flag cannot get right, and the reason the decision is
+    // made per match offset against the template's authority spans.
+    const text = resolved(
+      "https://${profile.ipmiHost}/redirect?peer=${profile.host}",
+      server({ ipmiHost: "fe80::1", host: "fe80::2" }),
+      URL_FORM
+    );
+    expect(text).toBe("https://[fe80::1]/redirect?peer=fe80::2");
+    // Exactly one bracketed occurrence, so neither an always-bracket nor a
+    // never-bracket implementation passes.
+    expect(text.match(/\[/g)?.length).toBe(1);
+    expect(new URL(text).hostname).toBe("[fe80::1]");
+    expect(new URL(text).searchParams.get("peer")).toBe("fe80::2");
+  });
+
+  it("brackets an authority token that ends the URL, with no trailing delimiter", () => {
+    // The authority runs to end-of-string when no `/`, `?` or `#` follows — an
+    // off-by-one here would silently stop bracketing the commonest shape.
+    expect(resolved("https://${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("https://[fe80::1]");
+    expect(resolved("https://${profile.host}?x=1", server({ host: "fe80::1" }), URL_FORM)).toBe(
+      "https://[fe80::1]?x=1"
+    );
+    expect(resolved("https://${profile.host}#f", server({ host: "fe80::1" }), URL_FORM)).toBe("https://[fe80::1]#f");
+  });
+
+  it("brackets NOTHING when the template has no parseable scheme", () => {
+    // There is no authority to be in, so there is no bracketing to do. The text
+    // is not a URL either way, and `resolveMacroBrowserUrl()` refuses it with an
+    // actionable message — guessing here would only change which wrong thing
+    // that message describes.
+    expect(resolved("gateway/${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("gateway/fe80::1");
+    expect(resolved("${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("fe80::1");
+  });
+
+  it("COMMAND FORM IS UNTOUCHED BY THE AUTHORITY RULE — no brackets anywhere", () => {
+    // A command-form macro that happens to contain a URL still gets the raw
+    // value: `curl https://fe80::1/` is the author's problem, not a place to
+    // start rewriting values a shell command line never asked us to change.
+    expect(resolved("curl https://${profile.host}/", server({ host: "fe80::1" }))).toBe("curl https://fe80::1/");
   });
 
   it("leaves an ESCAPED token literal in URL form too", () => {

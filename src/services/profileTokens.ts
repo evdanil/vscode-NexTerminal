@@ -64,8 +64,9 @@ const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
   port: "Use the port number only — digits, nothing else.",
   username: 'Use letters, digits, ".", "_", "-" and "@" only.',
   name:
-    'Remove $, `, %, "#", "!", "~", "*", "?", quotes, ";", "|", "&", "<", ">", "\\", parentheses, square brackets ' +
-    'and braces from the name — spaces, "/", ".", ":", "^" and accents are fine.'
+    'Use letters, digits, spaces and ".", "-", "_", "/", ":", "," and "+" only — accents are fine. ' +
+    "Every other punctuation mark is refused, because some shell reads it as syntax. " +
+    "Rename the server, or write $${profile.name} to send the token text literally."
 };
 
 /** The server-form label for a token, so pickers and errors name the same field. */
@@ -145,11 +146,12 @@ function isProfileTokenName(name: string): name is ProfileTokenName {
  * `:`. Deliberately narrower than "valid hostname" — the point is not to
  * validate DNS, it is that nothing which survives this can act as shell syntax.
  *
- * NOTE what is NOT in this set and never has been: `*`, `?` and `~`. The glob
- * and tilde expansions that `NAME_FORBIDDEN_CHARS` now refuses were already
- * unreachable here, because this is a positive charset rather than a blacklist.
- * `[` and `]` are the exception that had to be handled separately — see
- * `isAddressValue()`.
+ * NOTE what is NOT in this set and never has been: `*`, `?`, `~`, `%`, `!`, `#`
+ * and `^`. Every hole this PR's review found in the old `name` BLACKLIST was
+ * already unreachable here, because this is a positive charset — which is
+ * precisely the argument that eventually flipped `name` to one too (see
+ * `NAME_CHARSET`). `[` and `]` are the exception that had to be handled
+ * separately — see `isAddressValue()`.
  */
 const ADDRESS_CHARSET = /^[A-Za-z0-9._\-:]+$/;
 
@@ -261,147 +263,148 @@ const DIGITS_ONLY = /^[0-9]+$/;
  */
 const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
 /**
- * `name` is a genuinely free-form label — "Rack 4 / Ünit 2" must keep working —
- * so it gets a blacklist rather than a charset: everything a shell would read as
- * syntax is refused, while spaces, accents, "/" and "." are not.
+ * `name` IS A POSITIVE CHARSET — Unicode letters, marks and digits, a space, and
+ * eight punctuation marks that survive bash, zsh, PowerShell and cmd.exe. It was
+ * a BLACKLIST until the review finding recorded at the bottom of this comment,
+ * and the flip is the finding's real conclusion; the blacklist's history is kept
+ * below because it is the evidence for why.
  *
- * REVIEW FINDING (P1) — PARENTHESES AND BRACES ARE REFUSED, which means
- * "Core Switch (DC1)" no longer resolves. The shell this list has to survive is
- * not only bash: a `localTerminal` macro's resolved text goes to a FRESH
- * `vscode.window.createTerminal()`, whose default shell on Windows is
- * PowerShell, and PowerShell evaluates a parenthesised subexpression even in
- * ARGUMENT position — `Write-Output (Start-Process calc)` starts calc before
- * Write-Output is ever handed an argument. A server name arrives from a backup
- * import and from inventory sync, so `(Start-Process calc)` is a value someone
- * else can put in the config, and it used no character this list refused.
+ * WHY THE BLACKLIST LOST. Four rounds of review, four single-character holes, in
+ * a rule whose whole job is to have no holes:
  *
- * BRACES go with them, for the invocation one character away: `{ … }` is a
- * scriptblock literal, and the operators that RUN one are `&` (already refused)
- * and `.` — and `.` has to stay legal, every site-code-ish label has dots. So
- * `.{Start-Process calc}` executes wherever the token starts a statement, out of
- * characters this list used to permit. A display name needs neither form.
+ *   1. `(` `)` `{` `}` — PowerShell evaluates a parenthesised subexpression in
+ *      ARGUMENT position, and `.{…}` invokes a scriptblock using a `.` that has
+ *      to stay legal. `Write-Output (Start-Process calc)` ran calc.
+ *   2. `%` and `!` — cmd.exe expands `%VAR%` while PARSING (`%COMSPEC% /c calc`),
+ *      and interactive bash expands `!!` into a previous command line, that
+ *      line's punctuation included.
+ *   3. `*` `?` `[` `]` `~` — POSIX pathname expansion replaces the word with
+ *      matching FILENAMES before anything runs, and tilde expansion replaces one
+ *      character with a home-directory path. The earlier rationale had weighed
+ *      `[abc]` only as a PowerShell type literal and never as a glob.
+ *   4. `#` — not execution and not expansion but TRUNCATION: a comment in
+ *      interactive bash and in PowerShell, so `tool ${profile.name} --dry-run`
+ *      silently drops the author's own flag.
  *
- * REVIEW FINDING (P1) — SQUARE BRACKETS ARE NOW REFUSED, REVERSING the decision
- * this comment used to record. The earlier reasoning ran: "`[Type]::Member` puts
- * PowerShell into expression mode, but a type literal is not by itself an
- * invocation — reaching a method needs `(` or `{`, and both are gone; what is
- * left is at worst a glob pattern in a POSIX shell. Neither runs anything."
+ *   5. `^` — and this one is what forced the flip. The list explicitly ARGUED
+ *      that `^` was safe, reasoning only about cmd.exe (an escape character can
+ *      remove meaning, never add it) and calling it "an ordinary character" in
+ *      bash. It is not: at the START OF A LINE, bash performs QUICK SUBSTITUTION,
+ *      where `^old^new^` is shorthand for `!!:s/old/new/` — it rewrites the
+ *      PREVIOUS history entry and executes the result. A name of
+ *      `^echo SAFE MODE^printf PWNED^` at the start of a `localTerminal` macro
+ *      line runs the rewritten command. Confirmed empirically against
+ *      interactive bash 5.2.
  *
- * The second half of that sentence is the mistake. It weighed a POSIX glob only
- * as a PATTERN and never asked what pathname expansion DOES with one, which is
- * to consult the working directory and REPLACE the word with the names it
- * matched. No method call, no PowerShell, no second character needed: `[abc]`
- * at command position in a `localTerminal` macro becomes the file `a`, `b` or
- * `c` if one exists in the terminal's cwd, and the shell then executes it.
- * "Neither runs anything" was true of the type literal and false of the glob,
- * and the glob is the one that reaches a default bash.
+ * Every one of those is the same shape: a character nobody had thought about, in
+ * a shell role nobody had enumerated, reaching a default configuration. Mean-
+ * while the three tokens that use a POSITIVE charset (`host`, `port`,
+ * `username`) have produced ZERO findings across the same review — not because
+ * anyone reasoned better about them, but because a whitelist's default answer to
+ * an un-enumerated character is NO. That is the property this rule needed and a
+ * blacklist structurally cannot have: a blacklist is only as good as the
+ * exhaustiveness of a metacharacter survey across four shells, and five rounds
+ * of evidence say that survey does not converge.
  *
- * SO `*`, `?`, `[` AND `]` ALL GO — the whole of POSIX glob syntax, held to the
- * same "one character causes expansion in a default shell" bar that took `%` and
- * `!`. `*` and `?` are worse than brackets in argument position, where one word
- * expands into as MANY operands as there are matching files: a name of `*`
- * pasted after a command turns `cmd ${profile.name}` into `cmd` applied to every
- * file in the directory.
+ * THE BAR, unchanged, now applied to decide what gets IN rather than what stays
+ * out: "can this ONE character, from inside a substituted value, cause
+ * EXECUTION, EXPANSION or TRUNCATION in a DEFAULT-configuration shell?" The
+ * shells are bash, zsh (macOS's default login shell since Catalina, so a
+ * `localTerminal` macro lands in it on every stock Mac), PowerShell and cmd.exe.
+ * A character earns a place only if the answer is no in ALL FOUR.
  *
- * `~` GOES WITH THEM. Tilde expansion is not glob, but it is the same shape of
- * bug: one character, at word start, in a default shell, expanding into a path
- * that is not what the value says. A blacklist cannot condition on whether the
- * value happens to land at a word start in the macro's text, so it goes
- * unconditionally.
+ * WHAT IS ALLOWED, and why each one clears all four shells:
  *
- * `/`, `.`, SPACES AND ACCENTS STAY LEGAL. With glob syntax gone they are inert
- * text — `Rack 4 / Ünit 2` is a label, not a path, because nothing expands it.
- * A name that is a LITERAL path or command (`/bin/sh`, `reboot`) placed at
- * command position still runs, but that is the macro author choosing to put a
- * display name where a command goes; it is not this charset converting data into
- * syntax, and refusing `/` or `.` would break every site-code label without
- * closing anything. Out of scope here, as it is for `host` (`10.0.0.1` at
- * command position is likewise just a template mistake).
+ *   LETTERS, MARKS, DIGITS (`\p{L}\p{M}\p{N}`, hence the `u` flag) — data, in
+ *   every shell. The Unicode classes are what keep `Ærø-Süd` and `Ünit` working;
+ *   `\p{M}` is there so a decomposed accent (`U+0301` after a base letter) is not
+ *   refused for being a combining mark rather than a letter.
  *
- * REVIEW FINDING (P1) — `%` IS REFUSED, because the third default shell had not
- * been accounted for. `terminal.integrated.defaultProfile.windows` can be
- * Command Prompt (it is on plenty of machines, and it was the VS Code default
- * before PowerShell took over), and cmd.exe expands `%VAR%` while PARSING the
- * line, before anything is executed: a name of `%COMSPEC% /c calc` becomes
- * `C:\Windows\system32\cmd.exe /c calc` and runs, at command position, using no
- * character this list refused. Same reachability as the rest — a name arrives
- * from inventory sync and from backup import.
+ *   SPACE — separates one argument from the next, which is exactly what a
+ *   multi-word label is FOR ("Core Switch DC1"). It cannot introduce a word that
+ *   was not already in the value.
  *
- * THE STANDARD APPLIED to cmd.exe's other two active characters — "can this
- * character ALONE cause execution or expansion in a DEFAULT-configuration
- * shell?":
+ *   `.` — inert in argument position everywhere. At the start of a COMMAND it
+ *   sources a file in bash/zsh and dot-sources in PowerShell, but that is a value
+ *   standing where a command goes, which is the macro template's choice and out
+ *   of scope here exactly as it is for `host` (`10.0.0.1` at command position is
+ *   likewise just a template mistake). Non-negotiable in practice: every
+ *   site-code label has dots.
  *
- *   `!` IS REFUSED. Delayed expansion (`!VAR!`) is indeed off by default in
- *   cmd, so cmd is not the reason. Bash is: history expansion is ON by default
- *   in every INTERACTIVE bash, and an interactive shell is exactly what a macro
- *   send lands in. `!` starts an event designator (`!!`, `!string`, `!-2`), and
- *   what it splices in is a PREVIOUS COMMAND LINE — text that may itself carry
- *   `;` or `|`, so a name of `DC1!!` can execute the tail of whatever the user
- *   ran last. That is expansion into executable syntax from one character, so it
- *   goes, on the same reasoning that took the parentheses. (`!` followed by a
- *   space or by end-of-line is inert, but a blacklist cannot condition on what
- *   follows the value in the macro's text.)
+ *   `-` — inert in all four. It can make a value LOOK like an option to the
+ *   invoked program, but that is the program's argument parsing, not the shell's
+ *   syntax, and `Rack A - Spare` is an ordinary label.
  *
- *   `^` IS NOT REFUSED. It is cmd's ESCAPE character, and escaping only ever
- *   REMOVES a metacharacter's meaning — `^` cannot turn plain text into syntax,
- *   and `^^` is a literal caret. Its other role, line continuation at end of
- *   line, can only JOIN the macro's own next line onto this one, which turns a
- *   second command into arguments of the first rather than introducing anything
- *   new (and control characters, newlines included, are refused in the value
- *   itself). In bash and PowerShell `^` is an ordinary character. Nothing it can
- *   do meets the bar, and "Rack 4 ^ Spare" stays a legal label.
+ *   `_` — inert in all four; a word character everywhere.
  *
- * REVIEW FINDING (P2) — `#` IS REFUSED, AND THE BAR GAINS A SECOND CLAUSE. Every
- * character above earned its place by causing EXECUTION or EXPANSION in a
- * default-configuration shell. `#` does neither: it starts a COMMENT — in every
- * interactive bash (`interactive_comments` is on by default) and in PowerShell,
- * where a `#` at the start of a token comments out the rest of the line. So a
- * macro of `tool ${profile.name} --required-check` with a name of `device #`
- * sends `tool device # --required-check`, and the shell runs `tool device`. The
- * flag the macro's author wrote is gone, with no error anywhere.
+ *   `/` — a path separator, and nothing expands it: with glob syntax refused
+ *   there is no pattern for it to be part of. `Rack 4 / Ünit 2` is a label, not a
+ *   path. (Command position, as for `.`, is the template's business.)
  *
- * TRUNCATION JOINS THE BAR because its integrity impact is comparable to
- * expansion's: externally supplied data (a name arrives from inventory sync and
- * from backup import, same as every other token) silently DELETES part of the
- * author's command. What gets deleted is chosen by whoever supplied the value —
- * `--dry-run`, `--required-check`, a `--confirm`, a redirect that was meant to
- * capture the output. The macro then does something other than what it says,
- * and the only signal is its absence. That is not code execution, but "the
- * command that ran is not the command that was written" is the same failure this
- * whole list exists to prevent.
+ *   `:` — inert in an argument for bash, zsh and PowerShell (bash's `:` is the
+ *   null command, only at command position; PowerShell's scope/drive qualifiers
+ *   need a `$`, refused). cmd.exe's `::` comment is a LABEL, recognised only as
+ *   the FIRST token of a command. Also required for symmetry with
+ *   `ADDRESS_CHARSET`, and site labels use it ("DC1: Core Switch").
  *
- * THE SAME TRUNCATION LENS, APPLIED TO EVERYTHING STILL ALLOWED — the question
- * being "can this ONE character, from inside a substituted value, make a default
- * shell discard the rest of the author's line?":
+ *   `,` — inert in bash and zsh outside brace expansion, whose `{`/`}` are
+ *   refused. PowerShell's array operator and cmd.exe's delimiter role can both
+ *   SPLIT one word into two, but a space already does that and is allowed, so
+ *   splitting is a consequence of free-form labels rather than a new capability:
+ *   neither can introduce text the value did not contain.
  *
- *   `:` IS NOT REFUSED. In bash and PowerShell it is inert in argument position
- *   (bash's `:` is the null command, and PowerShell uses `:` only in `label:`
- *   and in scope/drive qualifiers like `$env:X`, which need a `$`, refused).
- *   cmd.exe HAS a comment form spelled with colons, but `::` is a LABEL, and a
- *   label is only recognised as the FIRST token of a command — mid-line, after
- *   a command name, `::x` is an ordinary argument. So it is not reachable from
- *   one character in the middle of a line, and reaching it at line start would
- *   need the value to be BOTH the whole first word and two colons, in which case
- *   the value already occupies command position (a case this list has always
- *   left to the macro author — see `/` and `.` below). `:` also has to stay:
- *   it is in `ADDRESS_CHARSET` for IPv6, and site labels use it.
+ *   `+` — inert in all four. Nothing in bash, zsh, PowerShell argument mode or
+ *   cmd gives it a parsing role.
  *
- *   `^` STAYS, on the reasoning above plus this one: cmd's line continuation
- *   JOINS the following line, it never discards this one.
+ * WHAT WAS A CANDIDATE AND WAS DROPPED — the whitelist earning its keep:
  *
- *   `/`, `.`, `,`, `+`, `=`, `@`, SPACES AND ACCENTS STAY. None of the three
- *   shells gives any of them a comment meaning. cmd's other comment form is the
- *   WORD `REM`, which is not a character and cannot be reached from a charset
- *   rule at all. PowerShell's block comment is `<#`, whose `<` is already
- *   refused. At command position `.` sources a file and `/` starts a path — but
- *   that is a value standing where a COMMAND goes, which is the macro template's
- *   choice and out of scope here, exactly as it is for `host`.
+ *   `=` — DROPPED because of zsh, which is the shell this file had never
+ *   considered. `=command` EXPANSION is on by default (the `EQUALS` option): at
+ *   word start, `=ls` expands to `/bin/ls`. One character, one path substituted
+ *   from `$PATH`, in the DEFAULT shell of every stock macOS. (bash's assignment
+ *   form is only a prefix of a command word, and cmd treats `=` as a delimiter —
+ *   but zsh alone is disqualifying.)
  *
- * So `#` is the only addition the truncation lens produces; nothing else that is
- * currently legal can comment out a line, and a name of `Rack 4 / Ünit 2` is
- * still fine.
+ *   `@` — DROPPED because of PowerShell SPLATTING. `@name` in argument position
+ *   inserts the contents of the session variable `name` into the command's
+ *   arguments, which is expansion of data from outside the value — the same class
+ *   as cmd's `%VAR%`. Its other `@` forms (`@(…)`, `@{…}`, `@'…'@`) all need a
+ *   second character that is already refused, but splatting needs only `@` plus
+ *   name characters. Nothing about a display label needs `@`, so the whitelist's
+ *   default answer stands. (`USERNAME_CHARSET` keeps `@` on purpose: `user@REALM`
+ *   is a real account form and that token is additionally constrained to a single
+ *   word with no space, so it cannot become `@name` as its own argument. That is
+ *   a narrow, load-bearing exception, not an inconsistency to copy here.)
+ *
+ *   `^` — DROPPED, per the finding above.
+ *
+ * ACCEPTED CONSEQUENCES, stated rather than discovered later:
+ *
+ *   Symbols outside letters/marks/digits are now refused — emoji, `°`, `€`, `×`,
+ *   `&` (which was already out). A name like `Rack 20°C` stops resolving and the
+ *   error names the allowed set. That is the whitelist behaving as designed: a
+ *   character nobody has argued for is refused by default, and the fix is a
+ *   rename or `$${profile.name}` for the literal token. Widening the class later
+ *   is one edit plus the per-character argument above — the same bar every
+ *   character here had to clear.
+ *
+ *   Only U+0020 counts as a space; U+00A0 and other Unicode separators are
+ *   refused. They are invisible in a form field, and "looks identical, behaves
+ *   differently" is the last property this rule should have.
+ *
+ *   CONTROL CHARACTERS fall out for free — none of them is a letter, a mark, a
+ *   digit or one of the eight punctuation marks. `validateTokenValue()` still
+ *   checks `CONTROL_CHARS` first for every token, so the refusal does not depend
+ *   on this observation, but the two now agree instead of overlapping by luck.
+ *
+ * The per-character essays that used to fill the rest of this comment are gone;
+ * the numbered history above is their summary, and the whitelist above is what
+ * replaced their conclusions. Under a positive charset every one of those
+ * characters is refused for the same reason — it is not on the list — so the
+ * essays no longer carry a rule, only a lesson, and the lesson is the numbered
+ * list.
  */
-const NAME_FORBIDDEN_CHARS = /["'$`;|&<>\\(){}%!*?\[\]~#]/;
+const NAME_CHARSET = /^[\p{L}\p{M}\p{N} ._\-\/:,+]+$/u;
 /**
  * Refused in EVERY token, no exceptions. `$` and a backtick are what turn a
  * substituted value into syntax rather than data — for the shell, and for this
@@ -428,9 +431,10 @@ const CONTROL_CHARS_GLOBAL = /[\u0000-\u001F\u007F-\u009F]/g;
  * a host of `1.2.3.4; rm -rf ~` is command execution on the user's own machine.
  * WHICH local shell is not ours to choose: a fresh `vscode.window.createTerminal()`
  * uses the configured default profile, which on Windows is PowerShell or
- * Command Prompt and on a session terminal is an interactive remote shell — so
- * "reads as syntax" means the UNION of what bash, PowerShell and cmd.exe read as
- * syntax, not what bash alone does (see `NAME_FORBIDDEN_CHARS`).
+ * Command Prompt, on macOS is zsh, and on a session terminal is an interactive
+ * remote shell — so "reads as syntax" means the UNION of what bash, zsh,
+ * PowerShell and cmd.exe read as syntax, not what bash alone does (see
+ * `NAME_CHARSET`).
  *
  * The answer is a charset, not quoting: quoting rules differ per shell, and a
  * half-implemented quoter creates confidence it cannot back. So a value that
@@ -444,8 +448,10 @@ const CONTROL_CHARS_GLOBAL = /[\u0000-\u001F\u007F-\u009F]/g;
  * metacharacter required), and so are `$` and a backtick (see
  * `SHELL_EXPANSION_CHARS`). On top of that each token gets the narrowest rule
  * its content allows: an address charset for `host`/`ipmiHost`, digits for
- * `port`, a real-username charset for `username`, and — because a display name
- * is genuinely free-form — a metacharacter blacklist for `name`.
+ * `port`, a real-username charset for `username`, and a letters-digits-and-eight-
+ * punctuation-marks charset for the free-form `name` (see `NAME_CHARSET` — it
+ * used to be a blacklist, and the four rounds of holes that cost are recorded
+ * there). EVERY token is now a positive charset; nothing here is a blacklist.
  */
 function validateTokenValue(token: ProfileTokenName, value: string): boolean {
   if (CONTROL_CHARS.test(value) || SHELL_EXPANSION_CHARS.test(value)) {
@@ -460,7 +466,7 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
     case "username":
       return USERNAME_CHARSET.test(value);
     case "name":
-      return !NAME_FORBIDDEN_CHARS.test(value);
+      return NAME_CHARSET.test(value);
     default:
       // A token added to the whitelist without a rule of its own refuses rather
       // than passes: the charset decision is part of adding it, not optional.
@@ -484,9 +490,38 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
  *
  * So the bracketing happens HERE rather than as a post-hoc patch of the finished
  * URL. A post-hoc fix would have to re-find which span of the resolved text came
- * from which token — the information this function has for free, and the reason
- * `${profile.host}` in a URL's PATH or query is (correctly) left alone by a
- * command-form run and bracketed by a URL-form one.
+ * from which token — the information this function has for free.
+ *
+ * REVIEW FINDING (P2) — BRACKETS BELONG TO THE AUTHORITY, NOT TO THE URL. The
+ * first version of this function bracketed EVERY bare-IPv6 `host`/`ipmiHost` in
+ * URL form regardless of WHERE the token sat, and a URL is not uniformly a place
+ * where an IPv6 address wants brackets. Only the AUTHORITY component (the
+ * `host[:port]` between `://` and the next `/`, `?` or `#`) has the grammar that
+ * requires them — RFC 3986's `IP-literal` exists to stop the address's colons
+ * from being read as the port delimiter, and that ambiguity only exists there.
+ * Everywhere else the address is ordinary data:
+ *
+ *   `https://gateway/connect?target=${profile.host}` with `fe80::1` became
+ *   `?target=[fe80::1]`, and the brackets are now part of the VALUE the gateway
+ *   receives — a corrupted parameter, silently, with no error anywhere.
+ *
+ * So the decision is per-MATCH, not per-run: `authoritySpans()` computes the
+ * authority region(s) of the AUTHOR-OWNED template text once, before any
+ * substitution, and each match is bracketed only if its offset falls inside one.
+ * Two tokens in one template are decided independently — an authority token is
+ * bracketed while a query token in the same macro is not.
+ *
+ * The template text is the right thing to parse, and the resolved text is not:
+ * the template is written by the macro's author, so its `/`, `?` and `#` are
+ * structure, whereas a substituted value could contribute characters that only
+ * LOOK like structure. Parsing before substitution also means a value can never
+ * move the boundary that decides its own treatment.
+ *
+ * NO PARSEABLE SCHEME → NO BRACKETING ANYWHERE. A URL-form macro whose text has
+ * no `scheme://` is not a URL, and `resolveMacroBrowserUrl()` already refuses it
+ * with an actionable "not an http:// or https:// URL — Edit Macro". Guessing at
+ * an authority in text that has no scheme would only change WHICH wrong thing
+ * that error describes.
  *
  * WHAT IS AND IS NOT BRACKETED, and why the test is `isIpv6Literal()` on the raw
  * value rather than "contains a colon":
@@ -509,11 +544,67 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
  * brackets there would break the shipped SOL template. That is why this takes a
  * form rather than always bracketing.
  */
-function substitutionValue(token: ProfileTokenName, value: string, form: ProfileTokenForm): string {
-  if (form !== "url" || (token !== "host" && token !== "ipmiHost")) {
+function substitutionValue(
+  token: ProfileTokenName,
+  value: string,
+  form: ProfileTokenForm,
+  inAuthority: boolean
+): string {
+  if (form !== "url" || !inAuthority || (token !== "host" && token !== "ipmiHost")) {
     return value;
   }
   return isIpv6Literal(value) ? `[${value}]` : value;
+}
+
+/**
+ * `scheme://` — RFC 3986's `scheme` production (a letter, then letters, digits,
+ * `+`, `-`, `.`) followed by the authority's `//`. Deliberately not restricted to
+ * http/https: this only decides WHERE the authority is, and the scheme check
+ * that decides whether the URL may be opened at all lives in
+ * `resolveMacroBrowserUrl()`.
+ */
+const URL_SCHEME_PREFIX = /[A-Za-z][A-Za-z0-9+.\-]*:\/\//g;
+
+/** Half-open `[start, end)` offsets of an authority component in the template. */
+interface AuthoritySpan {
+  start: number;
+  end: number;
+}
+
+/**
+ * Every authority region of `text`: from just after a `scheme://` up to the next
+ * `/`, `?` or `#`, or the end of the string. Computed on the TEMPLATE, before
+ * substitution — see the comment on `substitutionValue()` for why that is the
+ * only text with the authority to say where the authority is.
+ *
+ * A profile token cannot contain `/`, `?` or `#` (`PROFILE_TOKEN_SOURCE` allows
+ * only `${profile.<word>}`), so a token that STARTS inside a span is wholly
+ * inside it, and an unsubstituted token can never hide a delimiter.
+ */
+function authoritySpans(text: string): AuthoritySpan[] {
+  const spans: AuthoritySpan[] = [];
+  const re = new RegExp(URL_SCHEME_PREFIX.source, "g");
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const start = match.index + match[0].length;
+    let end = text.length;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === "/" || ch === "?" || ch === "#") {
+        end = i;
+        break;
+      }
+    }
+    spans.push({ start, end });
+    // Resume after the authority rather than inside it — a `//` within the
+    // authority itself is not a second URL.
+    re.lastIndex = end;
+  }
+  return spans;
+}
+
+function isInAuthority(spans: AuthoritySpan[], offset: number): boolean {
+  return spans.some((span) => offset >= span.start && offset < span.end);
 }
 
 /** The offending value, made safe and short enough to show inside a notification. */
@@ -569,6 +660,12 @@ interface ProfileTokenMatch {
   escaped: boolean;
   /** The dotted name as written, whitelisted or not. */
   name: string;
+  /**
+   * Offset of `full` in the ORIGINAL text — the template, since the walker never
+   * rescans what a rewriter produced. That is what lets a rewriter ask where in
+   * the author's text this occurrence sits (see `authoritySpans()`).
+   */
+  index: number;
   /** The whitelisted token this names, or `undefined` when it names none. */
   token?: ProfileTokenName;
   /**
@@ -621,6 +718,7 @@ function rewriteProfileTokens<E>(
       full,
       escaped: match[1] === "$",
       name,
+      index: match.index,
       token: isProfileTokenName(name) ? name : undefined,
       unescaped: full.slice(1)
     });
@@ -712,6 +810,9 @@ export function resolveProfileTokens(
   const serverName = typeof server.name === "string" && server.name.trim() !== "" ? server.name : "this server";
   const unknownTokens: string[] = [];
   const seenUnknown = new Set<string>();
+  // Computed once, from the template, and only when it can matter. Command form
+  // never brackets, so it never needs to know where a URL's authority would be.
+  const spans = form === "url" ? authoritySpans(text) : [];
 
   const rewritten = rewriteProfileTokens<ProfileTokenError>(text, (match) => {
     if (match.token === undefined) {
@@ -736,7 +837,7 @@ export function resolveProfileTokens(
     if (!validateTokenValue(match.token, value)) {
       return { refuse: invalidError(match.token, serverName, value) };
     }
-    return substitutionValue(match.token, value, form);
+    return substitutionValue(match.token, value, form, isInAuthority(spans, match.index));
   });
 
   return rewritten.ok

@@ -287,7 +287,7 @@ checked:
 | `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:` — the address only, no `https://` and no path. `[` and `]` only as a whole bracketed IPv6 literal, with an optional port: `[fe80::1]`, `[::ffff:10.0.0.1]`, `[fe80::1]:623` |
 | `${profile.port}` | digits |
 | `${profile.username}` | letters, digits, `.`, `_`, `-`, `@` |
-| `${profile.name}` | anything except `$`, a backtick, `#`, `%`, `!`, `~`, `*`, `?`, `[`, `]`, quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `(`, `)`, `{`, `}` — spaces, `/`, `.`, `:`, `^` and accents are fine |
+| `${profile.name}` | letters, digits (any language — accents included), spaces, and `.`, `-`, `_`, `/`, `:`, `,`, `+`. Everything else is refused |
 
 No value may contain a `$` or a backtick, in any token. A profile carrying shell
 syntax — which can reach your config through an inventory sync or an imported
@@ -297,48 +297,47 @@ quoting: the rest of the command line is still yours to quote (see **No
 automatic quoting**).
 
 The shell a **Local terminal** macro lands in is whichever default profile you
-have configured — PowerShell or Command Prompt on Windows — so the accepted set
-is the intersection of what bash, PowerShell and cmd.exe treat as plain text.
-That is why a profile **name** may not contain:
+have configured — PowerShell or Command Prompt on Windows, zsh on macOS, usually
+bash on Linux — so a profile **name** is checked against an *allowed* set rather
+than a list of banned characters. A character is on that list only if it does
+nothing in *any* of those four shells: it cannot make one execute something,
+expand something, or throw away the rest of your command line.
 
-- **parentheses or braces** — PowerShell evaluates `(…)` even in argument
-  position, so a server named `(Start-Process calc)` would otherwise run it, and
-  `.{…}` invokes a scriptblock out of characters that are otherwise legal;
-- **`%`** — cmd.exe expands `%VAR%` while parsing the line, so a name of
-  `%COMSPEC% /c calc` would run at command position;
-- **`!`** — interactive bash expands history references (`!!`, `!string`) by
-  default, and what they splice in is a previous command line, punctuation
-  included;
-- **`*`, `?`, `[`, `]`** — glob syntax. A default bash expands these against the
-  working directory *before* running anything, so a name of `./scripts/*` at
-  command position runs whatever file that matches, and a name of `*` in
-  argument position turns one operand into one per file in the directory. (An
-  earlier version of this page said square brackets were fine because
-  `[Type]::Member` needs a `(` or `{` to become a PowerShell invocation — true,
-  but it missed that `[abc]` is *also* a POSIX bracket expression, which
-  pathname expansion resolves to a filename with no method call involved.)
-- **`~`** — tilde expansion, for the same reason in one character: at the start
-  of a word a default shell replaces it with a home directory path.
-- **`#`** — a comment. This one does not execute or expand anything; it
-  *truncates*. Interactive bash and PowerShell both end the line at a `#` that
-  starts a word, so a macro of `tool ${profile.name} --required-check` run
-  against a server named `device #` sends `tool device # --required-check` and
-  the shell runs `tool device` — the flag is silently dropped. A value that
-  arrives from an inventory sync or an imported backup therefore gets to choose
-  which part of *your* command line disappears (a `--dry-run`, a `--confirm`, a
-  redirect that was meant to capture the output), with nothing to see afterwards
-  but the missing behaviour. Deleting part of the author's command counts the
-  same as adding to it.
+That allowed set is: letters, digits and accents in any language, a space, and
+the eight punctuation marks `.`, `-`, `_`, `/`, `:`, `,`, `+`. Anything else —
+`(`, `)`, `{`, `}`, `%`, `!`, `*`, `?`, `[`, `]`, `~`, `#`, `^`, `=`, `@`,
+quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `$`, a backtick, and symbols such as `°`
+or an emoji — is refused, and the message tells you what *is* accepted.
+
+**Why an allowed set and not a banned one.** Earlier versions of Nexus banned a
+list of shell metacharacters in a profile name, and that list needed widening
+four times, each time because one more character turned out to have a role
+somebody had not enumerated: PowerShell evaluates `(…)` even in argument
+position; cmd.exe expands `%VAR%` while it parses the line; bash expands `!!`
+into a previous command, and `*`, `?`, `[`, `]` and `~` into filenames and home
+directories, before anything runs; `#` starts a comment, so it silently *deletes*
+the rest of the command your macro was written to send. The fifth was the one
+that settled it: a `^` at the start of a line is bash **quick substitution**
+(`^old^new^`, shorthand for `!!:s/old/new/`), which rewrites your previous
+command and runs the result — and the old list had explicitly reasoned that `^`
+was harmless because it is only an escape character in cmd.exe.
+
+Meanwhile the *address*, *port* and *username* fields, which have always used an
+allowed set, needed no such widening. An allowed set refuses a character nobody
+has thought about yet; a banned list waves it through. `=` and `@` show what that
+buys: `=ls` at the start of a word is a zsh path expansion (on by default, and
+zsh is the default shell on macOS), and `@name` in PowerShell splices the
+contents of a session variable into a command's arguments. Neither was on any
+banned list; both are simply absent from the allowed one. (`@` stays legal in
+**Username**, where `user@REALM` is a real account name and the value cannot
+contain a space.)
 
 Rename the profile — `Core Switch DC1` rather than `Core Switch (DC1)`,
 `Rack A - Spare` rather than `Rack A [Spare]`, `Device 4` rather than
-`Device #4` — or escape the token (`$${profile.name}`) if you only want the
-literal text. Spaces, `/`, `.` and accents stay legal: with glob syntax gone they
-are plain text, so `Rack 4 / Ünit 2` is fine. A caret (`^`) is legal too: it is
-cmd's escape character, and escaping can only ever *remove* a metacharacter's
-meaning. So is a colon (`:`): it is inert in an argument for both bash and
-PowerShell, and cmd's colon-spelled comment (`::`) is a *label*, which only
-counts as one at the start of a command, not in the middle of a line.
+`Device #4`, `Rack 4 - Spare` rather than `Rack 4 ^ Spare` — or escape the token
+(`$${profile.name}`) if you only want the literal text. Ordinary labels are
+unaffected: `Rack 4 / Ünit 2`, `dc1.rack4.unit2`, `DC1: Core Switch` and
+`Ærø-Süd Ünit 2` all resolve.
 
 `${profile.host}` and `${profile.ipmiHost}` still accept square brackets, but
 only as a **whole bracketed IPv6 literal** — `[fe80::1]` or `[fe80::1]:623`, and
@@ -350,12 +349,27 @@ bracket anywhere else (`a[b]c`) or a bracket expression dressed up as an address
 
 Store the address the way you would type it anywhere else — `fe80::1`, no
 brackets. In a **Browser** macro the whole text is a URL, and a URL needs an
-IPv6 address bracketed, so Nexus adds the brackets when it substitutes:
-`https://${profile.ipmiHost}/` on a server whose IPMI / BMC Host is `fe80::1`
-opens `https://[fe80::1]/`. Nothing else changes shape — a value you already
-stored bracketed (`[fe80::1]`, `[fe80::1]:623`) is used as written and never
-double-bracketed, and a host:port that merely contains a colon
+IPv6 address bracketed *where the address is the host*, so Nexus adds the
+brackets there: `https://${profile.ipmiHost}/` on a server whose IPMI / BMC Host
+is `fe80::1` opens `https://[fe80::1]/`. Nothing else changes shape — a value you
+already stored bracketed (`[fe80::1]`, `[fe80::1]:623`) is used as written and
+never double-bracketed, and a host:port that merely contains a colon
 (`bmc.example.com:8443`) is left exactly as it is.
+
+The brackets are added **only in the host part of the URL** — between `://` and
+the next `/`, `?` or `#`. A token anywhere else is a value, not a host, and gets
+the address exactly as you stored it:
+
+```
+https://${profile.host}/status           →  https://[fe80::1]/status
+https://gateway/connect?to=${profile.host}  →  https://gateway/connect?to=fe80::1
+https://gateway/host/${profile.host}     →  https://gateway/host/fe80::1
+```
+
+Each token in a macro is decided on its own, so a macro that uses one in the host
+and one in the query gets brackets on the first and not the second. If the macro
+text has no `scheme://` at all, nothing is bracketed — the text is not a URL, and
+Nexus refuses it with that message instead.
 
 **Session terminal** and **Local terminal** macros get the raw value, with no
 brackets added: `-H fe80::1` is what `ipmitool` expects. If you need the
