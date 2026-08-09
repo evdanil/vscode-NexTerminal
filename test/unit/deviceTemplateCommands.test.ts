@@ -1195,4 +1195,75 @@ describe("Edit Template Rules… flow (§7.2)", () => {
     expect(rules.some((r) => r.id === "r2" && r.filter === "site=syd")).toBe(true); // concurrent edit survived
     expect(rules.some((r) => r.filter === "role=router")).toBe(true); // this flow's add landed
   });
+
+  it("M4 (Codex round 1 #1) — editing rule R while another window concurrently changes R's OWN filter DIVERGES: nothing is saved and R keeps the concurrent value, not this editor's stale write", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core, { templateRules: [{ id: "r1", templateId: "t1", filter: "role=switch" }] });
+    registerWithRegistry(core, regWith(["role", "site", "name"]));
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    // list → pick r1, action → edit, template → t1 (unchanged), loop → exit.
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ ruleId?: string }>) => items.find((i) => i.ruleId === "r1"))
+      .mockImplementationOnce(async (items: Array<{ act?: string }>) => items.find((i) => i.act === "edit"))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    // During the filter InputBox, another window changes r1's OWN filter to site=nyc.
+    // The existence-only check (1bc6dd8) still finds r1 by id and clobbers it with
+    // this editor's newRule (role=router). The content check must DIVERGE instead.
+    mockShowInputBox.mockImplementationOnce(async () => {
+      const fresh = core.getInventorySource("src-1")!;
+      await core.addOrUpdateInventorySource({
+        ...fresh,
+        templateRules: (fresh.templateRules ?? []).map((r) => (r.id === "r1" ? { ...r, filter: "site=nyc" } : r))
+      });
+      return "role=router"; // this editor's (now stale) intended write
+    });
+
+    await editRules();
+
+    const rules = core.getInventorySource("src-1")!.templateRules!;
+    expect(rules).toHaveLength(1);
+    // The concurrent edit is preserved; this editor's stale write did NOT land.
+    expect(rules.find((r) => r.id === "r1")!.filter).toBe("site=nyc");
+    expect(rules.some((r) => r.filter === "role=router")).toBe(false);
+    // The house "changed in another window" warning fired.
+    const warned = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
+    expect(warned.some((w) => w.includes("changed in another window"))).toBe(true);
+  });
+
+  it("M4b (Codex round 1 #1 sibling) — editing rule R while another window changes a DIFFERENT rule still COMMUTES: R's edit lands and the other rule keeps its concurrent value", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core, {
+      templateRules: [
+        { id: "r1", templateId: "t1", filter: "role=switch" },
+        { id: "r2", templateId: "t1", filter: "site=syd" }
+      ]
+    });
+    registerWithRegistry(core, regWith(["role", "site", "name"]));
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ ruleId?: string }>) => items.find((i) => i.ruleId === "r1"))
+      .mockImplementationOnce(async (items: Array<{ act?: string }>) => items.find((i) => i.act === "edit"))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    // Concurrent change to the OTHER rule (r2) — must NOT block r1's edit.
+    mockShowInputBox.mockImplementationOnce(async () => {
+      const fresh = core.getInventorySource("src-1")!;
+      await core.addOrUpdateInventorySource({
+        ...fresh,
+        templateRules: (fresh.templateRules ?? []).map((r) => (r.id === "r2" ? { ...r, filter: "site=nyc" } : r))
+      });
+      return "role=router";
+    });
+
+    await editRules();
+
+    const rules = core.getInventorySource("src-1")!.templateRules!;
+    expect(rules.find((r) => r.id === "r1")!.filter).toBe("role=router"); // this edit landed
+    expect(rules.find((r) => r.id === "r2")!.filter).toBe("site=nyc"); // concurrent edit preserved
+    const warned = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
+    expect(warned.some((w) => w.includes("changed in another window"))).toBe(false);
+  });
 });

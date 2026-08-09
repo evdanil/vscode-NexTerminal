@@ -55,6 +55,18 @@ describe("parseTemplateFilter / filterSpecificity — §2.3 / §3.1 (fixture 20c
     expect(filterSpecificity("site=syd&tag=x")).toBe(2);
   });
 
+  it("Codex round 1 #3 — the normalized tie-break key encodes values, so a comma-bearing single value does NOT collide with two distinct values (kills the unescaped join that suppressed a real tie warning)", () => {
+    // `role=a%2Cb` is ONE value "a,b"; `role=a&role=b` is two values "a","b".
+    // With an unescaped comma join both become `role=a,b` and their tie is silently
+    // rule-id-ordered instead of warned. Encoding the values keeps them distinct.
+    const single = parseTemplateFilter("role=a%2Cb").normalized;
+    const pair = parseTemplateFilter("role=a&role=b").normalized;
+    expect(single).not.toBe(pair);
+    // Genuinely identical filters still collide (dedup / same-filter suppression preserved).
+    expect(parseTemplateFilter("role=a&role=b").normalized).toBe(parseTemplateFilter("role=b&role=a").normalized);
+    expect(parseTemplateFilter("role=switch&site=syd").normalized).toBe(parseTemplateFilter("site=syd&role=switch").normalized);
+  });
+
   it("catch-all (absent/empty/whitespace) is specificity 0 and matches everything", () => {
     for (const f of [undefined, "", "   "]) {
       const parsed = parseTemplateFilter(f);
@@ -86,6 +98,17 @@ describe("deviceMatchesFilter — §2.3 semantics", () => {
 
   it("a key the device has no attribute for fails the condition (the rule does not match)", () => {
     expect(deviceMatchesFilter(dev({ attributes: { role: ["switch"] } }), parseTemplateFilter("tenant=acme"))).toBe(false);
+  });
+
+  it("Codex round 1 #2 — a mixed-case device attribute key (`Role`) from a third-party provider matches a lowercased `role=` filter (kills the case-sensitive `attributes[key]` lookup that returned undefined → no match)", () => {
+    // `unknownFilterKeys` accepts `Role` case-insensitively, so the filter is
+    // considered valid; the lookup must match it case-insensitively too.
+    expect(deviceMatchesFilter(dev({ attributes: { Role: "switch" } }), parseTemplateFilter("role=switch"))).toBe(true);
+    expect(deviceMatchesFilter(dev({ attributes: { Role: ["switch", "router"] } }), parseTemplateFilter("role=router"))).toBe(true);
+    // A direct lowercase hit is unaffected (regression: NetBox path stays green).
+    expect(deviceMatchesFilter(dev({ attributes: { role: "switch" } }), parseTemplateFilter("role=switch"))).toBe(true);
+    // Genuinely absent key still fails, mixed-case or not.
+    expect(deviceMatchesFilter(dev({ attributes: { Role: "switch" } }), parseTemplateFilter("tenant=acme"))).toBe(false);
   });
 
   it("the reserved `name` key globs device.name — a `*` glob, anchored, no user regex", () => {

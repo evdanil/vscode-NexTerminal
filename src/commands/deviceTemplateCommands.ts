@@ -723,10 +723,17 @@ async function addOrEditTemplateRule(
         return [...freshRules, newRule]; // ADD — a fresh UUID, so no id collision with concurrent edits
       }
       // EDIT — replace by id, preserving a concurrent edit to any OTHER rule. If
-      // the rule we set out to edit is gone or was concurrently changed, refuse
-      // rather than resurrect/clobber it.
-      if (!freshRules.some((r) => r.id === existing.id)) {
-        return "diverged";
+      // the rule we set out to edit is gone OR its own filter/template was
+      // concurrently changed while this editor sat in the prompts, refuse rather
+      // than resurrect/clobber it — existence alone is not enough (Codex round 1
+      // #1): a same-rule concurrent edit passes `some` yet must not be overwritten
+      // by this editor's `newRule`, which was seeded from the now-stale `existing`.
+      const freshExisting = freshRules.find((r) => r.id === existing.id);
+      if (freshExisting === undefined) {
+        return "diverged"; // deleted underneath us
+      }
+      if (freshExisting.filter !== existing.filter || freshExisting.templateId !== existing.templateId) {
+        return "diverged"; // concurrently changed — do not clobber the other edit
       }
       return freshRules.map((r) => (r.id === existing.id ? newRule : r));
     },

@@ -169,9 +169,16 @@ export function parseTemplateFilter(filter: string | undefined): ParsedFilter {
     }
     specificity++;
   }
+  // Tie-break key (§3.3): a purely internal comparison string, never shown. Values
+  // are `encodeURIComponent`-escaped before joining on "," so a value containing a
+  // literal comma can't collide with two distinct values (Codex round 1 #3):
+  // `role=a%2Cb` (one value "a,b") and `role=a&role=b` (values "a","b") must NOT
+  // normalize alike, or a genuine per-field tie between them is silently suppressed.
+  // encodeURIComponent escapes the comma to %2C, so only genuinely identical filters
+  // collide. Key is encoded too (for safety); sort AFTER encode, kept deterministic.
   const normalized = [...conditions.keys()]
     .sort()
-    .map((k) => `${k}=${[...conditions.get(k)!].sort().join(",")}`)
+    .map((k) => `${encodeURIComponent(k)}=${[...conditions.get(k)!].map(encodeURIComponent).sort().join(",")}`)
     .join("&");
   return { conditions, specificity, normalized, emptyValueKeys: [...emptyValueKeys] };
 }
@@ -189,6 +196,27 @@ export function filterSpecificity(filter: string | undefined): number {
 function nameGlobMatches(name: string, glob: string): boolean {
   const pattern = "^" + glob.replace(/[.*+?^${}()|[\]\\]/g, (c) => (c === "*" ? ".*" : "\\" + c)) + "$";
   return new RegExp(pattern, "i").test(name);
+}
+
+/**
+ * Case-insensitive attribute lookup fallback for {@link deviceMatchesFilter}: scan
+ * the device's attribute keys for one whose lowercased form equals the (already
+ * lowercased) filter `key`. Only reached when a direct hit misses, so the common
+ * lowercase-key provider never scans. Returns the first case-insensitive match.
+ */
+function lookupAttributeCaseInsensitive(
+  attributes: Record<string, string | string[]> | undefined,
+  key: string
+): string | string[] | undefined {
+  if (attributes === undefined) {
+    return undefined;
+  }
+  for (const attrKey of Object.keys(attributes)) {
+    if (attrKey.toLowerCase() === key) {
+      return attributes[attrKey];
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -211,7 +239,12 @@ export function deviceMatchesFilter(device: Pick<InventoryDevice, "name" | "attr
       }
       continue;
     }
-    const attr = device.attributes?.[key];
+    // §2.3 — filter keys are lowercased at parse (m9a), but a third-party
+    // provider may emit a mixed-case attribute key (`Role`) that `unknownFilterKeys`
+    // accepted case-insensitively. Look the attribute up case-insensitively too so
+    // it actually matches (Codex round 1 #2). NetBox already emits lowercase, so a
+    // direct hit short-circuits the scan; only mixed-case providers pay for it.
+    const attr = device.attributes?.[key] ?? lookupAttributeCaseInsensitive(device.attributes, key);
     if (attr === undefined) {
       return false; // §2.3 — no attribute for this key ⇒ condition fails
     }
