@@ -2588,6 +2588,160 @@ describe("inventoryCommands", () => {
       expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // no proxy-secret op
     });
 
+    // -------- Codex round 10 (P1, SECURITY) — the stale proxy-password clear must
+    // run BEFORE applyInventorySyncPlan publishes the new proxy (nexus.server.connect
+    // does NOT take configMutationLock, so an after-apply clear leaves a leak window),
+    // must FAIL CLOSED on a delete error (abort the sync, don't swallow), and must
+    // RESTORE the captured secret if the apply throws (old proxy still live). --------
+
+    // Sets up the standard "template moves owned-1's socks5 proxy X→Y" scenario the
+    // round-9 tests use, then returns the wired-up pieces so each round-10 test can
+    // vary the vault / apply behaviour. A confirm-modal ("Apply") run drives the
+    // in-lock confirmed apply site (the one that actually carries a proxy update).
+    async function setupProxyMoveScenario(): Promise<{ core: NexusCore; registry: InventoryProviderRegistry }> {
+      const repo = new InMemoryConfigRepository([ownedWithTemplateProxyX()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+      return { core, registry };
+    }
+
+    it("(round 10, SECURITY — ordering) the stale proxy-password DELETE happens BEFORE applyInventorySyncPlan publishes the new proxy — falsifies the round-9 after-apply clear (connect never takes the lock, so an after-apply clear leaks the old password to the new endpoint)", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+
+      const callOrder: string[] = [];
+      const store = new Map<string, string>([
+        [proxyKey, "old-proxy-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) callOrder.push("delete");
+          store.delete(k);
+        })
+      };
+      // Log the apply relative to the delete, then call the real method through.
+      const applyReal = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        callOrder.push("apply");
+        return applyReal(application);
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The new proxy IS published (Y)...
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      // ...but only AFTER the stale secret was deleted. Against bc4df87 the clear ran
+      // after apply → order would be ["apply", "delete"].
+      expect(callOrder).toEqual(["delete", "apply"]);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+    });
+
+    it("(round 10, SECURITY — delete fails CLOSED) a vault.delete throw for the stale proxy key ABORTS the sync (applyInventorySyncPlan never called, new proxy never published) and RESTORES the captured secret — falsifies the round-9 best-effort swallow", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+
+      const store = new Map<string, string>([
+        [proxyKey, "old-proxy-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) throw new Error("vault delete failed"); // throws WITHOUT mutating the store
+          store.delete(k);
+        })
+      };
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Fail closed: the proxy change was never published — the record still points
+      // at the OLD endpoint X. Against bc4df87 the delete ran (and swallowed) AFTER a
+      // committed apply, so the proxy would already be Y here.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" });
+      // The captured secret is restored — the still-live old proxy keeps its password.
+      expect(vault.store).toHaveBeenCalledWith(proxyKey, "old-proxy-pw");
+      expect(await vault.get(proxyKey)).toBe("old-proxy-pw");
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+    });
+
+    it("(round 10, SECURITY — apply fails, restore) delete succeeds but applyInventorySyncPlan throws → the captured secret is RESTORED (old proxy config is still live and needs its password) and the failure surfaces", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+
+      const store = new Map<string, string>([
+        [proxyKey, "old-proxy-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          store.delete(k);
+        })
+      };
+      vi.spyOn(core, "applyInventorySyncPlan").mockRejectedValue(new Error("apply boom"));
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The secret was deleted before the (failing) apply, then put back on failure.
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(vault.store).toHaveBeenCalledWith(proxyKey, "old-proxy-pw");
+      expect(await vault.get(proxyKey)).toBe("old-proxy-pw");
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+    });
+
+    it("(round 10, SECURITY — happy path) delete succeeds and apply succeeds → the stale secret is gone, the new proxy is live, and nothing is restored", async () => {
+      const { core, registry } = await setupProxyMoveScenario();
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const vault = makeVault({
+        [proxyKey]: "old-proxy-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+      // No restore on the success path.
+      expect(vault.store).not.toHaveBeenCalledWith(proxyKey, expect.anything());
+    });
+
     it("(ITEM B) a rack rename that empties its old folder appends the empty-folder count to the completion toast", async () => {
       const owned = makeServer({
         id: "owned-1",

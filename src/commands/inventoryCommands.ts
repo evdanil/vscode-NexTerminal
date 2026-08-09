@@ -170,20 +170,39 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
 }
 
 /**
- * FIX B (issue #48 PR-T1 / PR #61 Codex review round 9, SECURITY) — clear the
- * stale per-server `proxy-password-{id}` when an APPLIED inventory update moves
- * the server's proxy identity AWAY from the authenticated SOCKS5/HTTP endpoint
- * that secret was entered for.
+ * FIX B (issue #48 PR-T1 / PR #61 Codex review rounds 9+10, SECURITY) — clear the
+ * stale per-server `proxy-password-{id}` when an inventory update moves the
+ * server's proxy identity AWAY from the authenticated SOCKS5/HTTP endpoint that
+ * secret was entered for, BEFORE the apply publishes the new proxy.
  *
  * `ProxySshFactory` reads `proxy-password-{serverId}` by server id and sends it
  * to whatever proxy the record now names whenever that proxy carries a username.
  * A device template that repoints a server's proxy from one authenticated
  * socks5/http endpoint to a DIFFERENT one — or to an ssh/none proxy — leaves the
  * OLD password in the vault, so the factory would send the old proxy's password
- * to the NEW endpoint: a credential leak to the wrong host. The inventory apply
- * path writes the new proxy config (via `applyInventorySyncPlan`) but never
- * touches the secret, so we clear it HERE, at the apply boundary where the vault
- * is reachable, before the updated record can be used to connect.
+ * to the NEW endpoint: a credential leak to the wrong host.
+ *
+ * ROUND 10 — WHY BEFORE THE APPLY, NOT AFTER. `nexus.server.connect` deliberately
+ * does NOT take `configMutationLock` (out of scope to change — a much larger
+ * refactor). Round 9 cleared the secret AFTER `applyInventorySyncPlan` had already
+ * published the new proxy into the core map: a connect landing in the awaited
+ * apply/save/cleanup window would read the NEW proxy config with the OLD
+ * `proxy-password-{id}` still in the vault and send it to the new endpoint — the
+ * exact leak, only now through a race instead of a persistent stale key. Because
+ * connect can't be serialized against the apply, the ONLY way to close the window
+ * is to delete the stale secret BEFORE the new proxy becomes reachable. Moving the
+ * delete before publish shrinks the worst case from a credential leak to at most a
+ * transient "old proxy can't authenticate until the next connect prompt" window —
+ * the fail-SAFE direction.
+ *
+ * FAIL CLOSED ON DELETE, RESTORE ON APPLY FAILURE. The delete is security-critical,
+ * so it must NOT be best-effort: if `vault.delete` throws we cannot secure the
+ * proxy change, so we restore any secret already deleted in this pass and rethrow
+ * to ABORT the whole sync (the new proxy is never published) — fail closed, not
+ * open. Conversely, when the delete succeeds but `applyInventorySyncPlan` then
+ * throws, the plan did NOT commit: the OLD proxy config is still live and still
+ * needs its password, so the caller restores the captured values (best-effort).
+ * Ordering is therefore: capture+delete → publish → restore-on-failure.
  *
  * §5.3 of the device-template design: templates never carry proxy SECRETS — a
  * template-set socks5/http proxy relies on the per-connect prompt — so clearing
@@ -196,18 +215,23 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
  * `host`/`port`/`username` (the identity the password was entered for). The
  * SAME-endpoint case (host+port+username unchanged) KEEPS the secret — it still
  * applies. An ssh proxy never carries a password, so ssh↔ssh needs no handling;
- * a change FROM socks5/http TO ssh clears the stale secret. Best-effort per key,
- * since the plan has already committed by the time this runs.
+ * a change FROM socks5/http TO ssh clears the stale secret.
  *
- * Centralized so EVERY inventory apply site shares one rule (invoked after the
- * fast-path recompute apply AND the in-lock confirmed apply). Deliberately NOT
+ * Centralized so EVERY inventory apply site shares one rule (invoked before BOTH
+ * the fast-path recompute apply AND the in-lock confirmed apply). Deliberately NOT
  * the server-form `syncProxyPasswordSecret` path — that governs hand-edited
  * proxies and bypasses this apply flow entirely.
+ *
+ * Returns the `{key,value}` pairs it captured+deleted so the caller can restore
+ * them if the subsequent apply throws. On any delete error it restores what it
+ * already deleted in this pass (capture-delete atomicity — a mid-loop failure
+ * must not strip a password with no publish and no restore) and rethrows.
  */
-async function clearStaleProxyPasswordSecrets(
+async function clearStaleProxyPasswordSecretsBeforeApply(
   vault: SecretVault,
   updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>
-): Promise<void> {
+): Promise<Array<{ key: string; value: string }>> {
+  const captured: Array<{ key: string; value: string }> = [];
   for (const { before, after } of updates) {
     const bp = before.proxy;
     if (bp === undefined || (bp.type !== "socks5" && bp.type !== "http")) {
@@ -224,7 +248,49 @@ async function clearStaleProxyPasswordSecrets(
       continue; // still the same authenticated endpoint — the stored password still applies
     }
     // before.id === after.id (same record through an update); use after.id.
-    await deleteSecretBestEffort(vault, proxyPasswordSecretKey(after.id));
+    const key = proxyPasswordSecretKey(after.id);
+    let existing: string | undefined;
+    try {
+      existing = await vault.get(key);
+    } catch (error) {
+      // Cannot even read the secret — restore what we've deleted so far, abort.
+      await restoreProxyPasswordSecrets(vault, captured);
+      throw error;
+    }
+    // Capture BEFORE the delete so an aborting delete restores this key too (the
+    // delete may have partially applied; restoring the old value is fail-safe).
+    if (existing !== undefined) {
+      captured.push({ key, value: existing });
+    }
+    try {
+      await vault.delete(key);
+    } catch (error) {
+      // FAIL CLOSED — a proxy change we cannot secure must not be published.
+      await restoreProxyPasswordSecrets(vault, captured);
+      throw error;
+    }
+  }
+  return captured;
+}
+
+/**
+ * ROUND 10 — put back the proxy-password secrets captured by
+ * `clearStaleProxyPasswordSecretsBeforeApply` when the apply they preceded did
+ * NOT commit (or a mid-pass delete aborted). The old proxy config is still live
+ * and still needs its password, so restoring is the fail-safe recovery. Best
+ * effort per key: a failed restore here costs at most a re-prompt on the next
+ * connect, and must not mask the original failure that triggered the restore.
+ */
+async function restoreProxyPasswordSecrets(
+  vault: SecretVault,
+  captured: ReadonlyArray<{ key: string; value: string }>
+): Promise<void> {
+  for (const { key, value } of captured) {
+    try {
+      await vault.store(key, value);
+    } catch (error) {
+      console.warn(`[Nexus] Failed to restore proxy password secret "${key}":`, error);
+    }
   }
 }
 
@@ -3184,20 +3250,29 @@ export function registerInventoryCommands(
           if (!planHasNothingToDo(recomputed)) {
             return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile, instanceKey: freshInstanceKey };
           }
+          // FIX B (round 10, SECURITY) — capture+delete any stale proxy-password
+          // secret BEFORE the apply publishes the new proxy (see the helper's doc:
+          // connect doesn't take the lock, so an after-apply clear leaks). A delete
+          // failure throws out of the helper (fail closed) → the shared catch below
+          // restores + aborts; an apply failure likewise restores `cleared` so the
+          // still-live old proxy keeps its password. This fast-path only fires on a
+          // nothing-to-do plan (no updates), so `cleared` is empty here — routed for
+          // uniform coverage. `cleared` stays `[]` if the helper itself throws (it
+          // restores internally), so the catch's restore is then a harmless no-op.
+          let cleared: Array<{ key: string; value: string }> = [];
           try {
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, recomputed.updates);
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
-            // FIX B (round 9, SECURITY) — clear any proxy-password secret this
-            // apply just made stale (proxy identity moved off its socks5/http
-            // endpoint). Centralized helper, same rule as the confirmed-apply
-            // site below. This fast-path only fires on a nothing-to-do plan (no
-            // updates), so it is a no-op here — invoked for uniform coverage.
-            await clearStaleProxyPasswordSecrets(vault, recomputed.updates);
             // F5 — `freshSource` (the exact incarnation this apply just ran
             // against), not the outer `source` captured before this sync
             // started, is what the post-lock restamp below must compare
             // against.
             return { kind: "done", plan: recomputed, removedEmptyFolderCount: applyResult.removedEmptyFolderCount, source: freshSource };
           } catch (error) {
+            // The apply did NOT commit (or a stale-secret delete failed) — the old
+            // proxy config is still live and needs its password; put back what we
+            // deleted before surfacing the failure.
+            await restoreProxyPasswordSecrets(vault, cleared);
             // m4 — a source-record replacement race surfaces the same
             // friendly, name-bearing wording as the pre-apply fast-fail check
             // just above, never core's raw "...uuid..." message.
@@ -3900,11 +3975,26 @@ export function registerInventoryCommands(
           // is the only thing that can still catch that — surface its rejection
           // the same way as the fast-fail check above rather than letting it
           // propagate as an unhandled command rejection.
+          // FIX B (round 10, SECURITY) — capture+delete any stale proxy-password
+          // secret BEFORE the apply publishes the new proxy. connect doesn't take
+          // configMutationLock, so clearing after the apply (round 9) left a leak
+          // window where a connect reads the new proxy config while the old
+          // proxy-password-{id} is still in the vault; see the helper's doc. A
+          // delete failure throws out of the helper (fail closed) → the catch below
+          // restores + aborts; an apply failure restores `cleared` so the still-live
+          // old proxy keeps its password.
           let applyResult: { skippedCount: number; removedServerIds: string[]; removedEmptyFolderCount: number };
+          let cleared: Array<{ key: string; value: string }> = [];
           try {
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, finalPlan.updates);
             applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
-            // (secret cleanup below runs only after a successful apply)
+            // The apply did NOT commit (or a stale-secret delete failed) — the old
+            // proxy config is still live and needs its password. `cleared` stays
+            // `[]` when the helper itself throws (it restores internally), so this
+            // restore is a no-op in that case and puts the captured values back
+            // when the apply is what threw.
+            await restoreProxyPasswordSecrets(vault, cleared);
             // m4 — same friendly rewording as the fast-path apply above.
             void vscode.window.showErrorMessage(
               isSourceConfigMismatchError(error)
@@ -3913,12 +4003,7 @@ export function registerInventoryCommands(
             );
             return { kind: "abort" };
           }
-
-          // FIX B (round 9, SECURITY) — the confirmed apply just committed; clear
-          // any proxy-password secret it made stale (a template moved the proxy
-          // off its socks5/http endpoint), before the updated record can be used
-          // to connect. Same centralized rule as the fast-path apply above.
-          await clearStaleProxyPasswordSecrets(vault, finalPlan.updates);
+          // (stale proxy secrets were already cleared BEFORE the apply above)
 
           // FINDING 1 (P2, reconnect-during-prune review) — nexus.server.connect
           // deliberately doesn't (and shouldn't) take configMutationLock, so a
