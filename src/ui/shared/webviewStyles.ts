@@ -155,6 +155,42 @@ export function baseWebviewCss(): string {
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, #fff);
     }
+    /* Keyboard highlight while filtering — distinct from the persisted
+       .selected so the user can see which option Enter would pick. */
+    .custom-select-option.highlighted {
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+    }
+    /* The type-to-filter box pinned to the top of a filterable dropdown. Higher
+       specificity than the base input[type="text"] rule so its flat, borderless
+       look wins — it must read as a filter, not a value field. */
+    .custom-select-dropdown .custom-select-filter {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 5px 8px;
+      margin: 0;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      border: none;
+      border-bottom: 1px solid var(--vscode-dropdown-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      border-radius: 0;
+      background: var(--vscode-input-background, var(--vscode-dropdown-background));
+      color: var(--vscode-input-foreground, var(--vscode-dropdown-foreground));
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+    }
+    .custom-select-dropdown .custom-select-filter:focus {
+      border-bottom-color: var(--vscode-focusBorder);
+    }
+    .custom-select-no-matches {
+      padding: 6px 8px;
+      font-size: 12px;
+      font-style: italic;
+      opacity: 0.7;
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+      cursor: default;
+    }
     .custom-select-option-desc {
       font-size: 11px;
       opacity: 0.75;

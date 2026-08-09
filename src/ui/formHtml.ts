@@ -3,6 +3,29 @@ import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 
+/** A select option, mirrored from the `select` field descriptor's shape. */
+type SelectOption = { label: string; value: string; description?: string };
+
+/**
+ * Orders a FILTERABLE select's options. "Sentinel" options — the empty-value
+ * `(None)` choice and any `__create__*` inline-create affordance — stay pinned
+ * at the top in their DECLARED order; every other option is sorted by label,
+ * case-insensitive and locale-aware. The pin rule reads the option's VALUE
+ * shape, never a hardcoded label, so a differently-worded `(Select …)` /
+ * `(Assign later)` sentinel (value `""`) still pins and a renamed create option
+ * still leads. Non-filterable selects never reach here — their declared order
+ * is emitted untouched.
+ */
+export function sortFilterableOptions(options: SelectOption[]): SelectOption[] {
+  const isPinned = (value: string): boolean => value === "" || value.startsWith("__create__");
+  const pinned = options.filter((opt) => isPinned(opt.value));
+  const rest = options.filter((opt) => !isPinned(opt.value));
+  // Copy before sort: `filter` already returned a fresh array, but keep the
+  // intent explicit — the caller's `field.options` is never reordered in place.
+  rest.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
+  return [...pinned, ...rest];
+}
+
 function renderHint(field: FormFieldDescriptor): string {
   if (!("hint" in field) || !field.hint) {
     return "";
@@ -102,12 +125,39 @@ function renderField(field: FormFieldDescriptor): string {
       const displacedAttr = field.autofillDisplacedValues && Object.keys(field.autofillDisplacedValues).length > 0
         ? ` data-autofill-displaced='${escapeHtml(JSON.stringify(field.autofillDisplacedValues))}'`
         : "";
-      const optionsHtml = field.options.map((opt) =>
+      // A filterable select sorts+pins its options at render time; a plain one
+      // emits them in declared order, byte-for-byte as before.
+      const renderedOptions = field.filterable ? sortFilterableOptions(field.options) : field.options;
+      const optionsHtml = renderedOptions.map((opt) =>
         `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">` +
         `<div class="custom-select-option-label">${escapeHtml(opt.label)}</div>` +
         (opt.description ? `<div class="custom-select-option-desc">${escapeHtml(opt.description)}</div>` : "") +
         `</div>`
       ).join("\n      ");
+      if (field.filterable) {
+        // The filter input carries NO `name`, so the submit loop skips it and
+        // the value the form posts stays the hidden input's — a filterable
+        // select still CONSTRAINS its value to an option (unlike the combobox).
+        // The `custom-select-no-matches` row starts hidden; the client shows it
+        // only when the filter hides every real option and no create affordance
+        // applies (see initCustomSelects in webviewScripts.ts).
+        const filterLabel = escapeHtml(`Filter ${field.label} options`);
+        return `<div class="form-group"${vw}>
+  <label>${escapeHtml(field.label)}</label>
+  <div class="custom-select filterable" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}>
+    <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
+    <div class="custom-select-trigger" tabindex="0">
+      <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
+    </div>
+    <div class="custom-select-dropdown">
+      <input type="text" class="custom-select-filter" placeholder="Type to filter…" aria-label="${filterLabel}" autocomplete="off" />
+      ${optionsHtml}
+      <div class="custom-select-no-matches" style="display: none;">No matches</div>
+    </div>
+  </div>${renderHint(field)}
+  <div class="field-error" id="error-${key}"></div>
+</div>`;
+      }
       return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>
   <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}>

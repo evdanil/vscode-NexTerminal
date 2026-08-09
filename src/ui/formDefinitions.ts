@@ -175,6 +175,11 @@ function authProfileSelectField(
     key: "authProfileId",
     label: "Auth Profile",
     options,
+    // Grows with the auth-profile list; type-to-filter with (None)/create
+    // pinned (PR-F1). The inline-create round trip survives — the filter input
+    // is a distinct node, so addSelectOption still injects before the pinned
+    // __create__ option.
+    filterable: true,
     value: selectedId ?? "",
     hint: opts?.hint ?? AUTH_PROFILE_HINT,
     advanced: opts?.advanced ?? true,
@@ -207,6 +212,9 @@ function ipmiAuthProfileSelectField(
     type: "select",
     key: "ipmiAuthProfileId",
     label: "IPMI Auth Profile",
+    // Same growth problem and same (None)/__create__ sentinels as the SSH
+    // select — filterable (PR-F1).
+    filterable: true,
     options: [
       { label: "(None)", value: "" },
       ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
@@ -546,6 +554,10 @@ function proxyFields(
       type: "select",
       key: "proxyJumpHostId",
       label: "Jump Host Server",
+      // The headline fix (PR-F1): lists every server, so it grows with the
+      // fleet. Type-to-filter, sorted, with the "(Select jump host)" sentinel
+      // (value "") pinned on top.
+      filterable: true,
       options: serverOptions,
       value: jumpHostId,
       advanced: true,
@@ -667,6 +679,10 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
         type: "select",
         key: "defaultServerId",
         label: "Server",
+        // The tunnel's target-server picker — same server-list growth as the
+        // jump-host select, with an "(Assign later)" (value "") and a
+        // "Create new server…" (__create__server) sentinel. Filterable (PR-F1).
+        filterable: true,
         options: serverOptions,
         value: seed?.defaultServerId ?? ""
       },

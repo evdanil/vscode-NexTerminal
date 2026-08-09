@@ -33,7 +33,16 @@ export type FormFieldDescriptor =
    * back, exactly as a mid-session switch does. A key the option supplies no
    * usable value for is not overwritten, so it has no entry and needs none.
    */
-  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string> } & FormFieldCommon)
+  /**
+   * `filterable` opts a select into the type-to-filter + sorted-options
+   * treatment (a filter input at the top of the dropdown, options rendered
+   * locale-sorted with `(None)`/`__create__*` sentinels pinned). Default
+   * false → today's markup and ordering, byte-for-byte. Reach for it on
+   * selects whose option list grows unbounded (server / auth-profile pickers),
+   * never on small fixed-domain ones (auth type, proxy type) where a filter is
+   * noise.
+   */
+  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; filterable?: boolean; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string> } & FormFieldCommon)
   | ({ type: "combobox"; key: string; label: string; suggestions: string[]; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
   | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)

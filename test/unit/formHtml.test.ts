@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderFormHtml } from "../../src/ui/formHtml";
+import { renderFormHtml, sortFilterableOptions } from "../../src/ui/formHtml";
 import type { FormDefinition } from "../../src/ui/formTypes";
 import { inventorySourceFormDefinition, serverFormDefinition, tunnelFormDefinition } from "../../src/ui/formDefinitions";
 import type { AuthProfile } from "../../src/models/config";
@@ -1106,5 +1106,188 @@ describe("renderFormHtml", () => {
     expect(html).toContain("function parseVisibleWhen");
     expect(html).toContain("try {");
     expect(html).toContain("catch (_error)");
+  });
+});
+
+/** The option data-values, in the exact order they appear in the rendered
+ *  dropdown. Options carry `data-value`; the filter input and hidden input do
+ *  not, so this reads the option order alone. */
+function renderedOptionOrder(html: string): string[] {
+  const out: string[] = [];
+  const re = /class="custom-select-option[^"]*" data-value="([^"]*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(html)) !== null) {
+    out.push(match[1]);
+  }
+  return out;
+}
+
+describe("sortFilterableOptions — pin sentinels, locale-sort the rest", () => {
+  it("pins (None)/empty and __create__ at the top in declared order, sorts the rest case-insensitively (falsifies a case-sensitive/code-unit sort, which puts Zeta before alpha)", () => {
+    const ordered = sortFilterableOptions([
+      { label: "Zeta", value: "z" },
+      { label: "alpha", value: "a" },
+      { label: "(None)", value: "" },
+      { label: "Create new…", value: "__create__x" }
+    ]);
+    expect(ordered.map((o) => o.value)).toEqual(["", "__create__x", "a", "z"]);
+    // The load-bearing case-insensitivity: a code-unit sort (uppercase Z=90 <
+    // lowercase a=97) would order these ["", "__create__x", "z", "a"].
+    const alphaIdx = ordered.findIndex((o) => o.value === "a");
+    const zetaIdx = ordered.findIndex((o) => o.value === "z");
+    expect(alphaIdx).toBeLessThan(zetaIdx);
+  });
+
+  it("reads the pin rule from the VALUE, not a hardcoded label — a reworded empty-value sentinel still pins", () => {
+    const ordered = sortFilterableOptions([
+      { label: "web-server-1", value: "s1" },
+      { label: "(Select jump host)", value: "" },
+      { label: "app-server-1", value: "s2" }
+    ]);
+    // The differently-worded sentinel (value "") leads despite sorting after
+    // the real labels alphabetically.
+    expect(ordered[0].value).toBe("");
+    expect(ordered.slice(1).map((o) => o.label)).toEqual(["app-server-1", "web-server-1"]);
+  });
+
+  it("keeps two pinned sentinels in their DECLARED order, not sorted among themselves", () => {
+    const ordered = sortFilterableOptions([
+      { label: "Create new…", value: "__create__x" },
+      { label: "(None)", value: "" }
+    ]);
+    // Declared __create__ before (None) — preserved, no reordering of pins.
+    expect(ordered.map((o) => o.value)).toEqual(["__create__x", ""]);
+  });
+});
+
+describe("renderFormHtml — filterable select", () => {
+  const filterableDef: FormDefinition = {
+    title: "Test",
+    fields: [
+      {
+        type: "select",
+        key: "proxyJumpHostId",
+        label: "Jump Host Server",
+        filterable: true,
+        options: [
+          { label: "Zeta host", value: "z" },
+          { label: "alpha host", value: "a" },
+          { label: "(Select jump host)", value: "" }
+        ],
+        value: ""
+      }
+    ]
+  };
+
+  it("emits a filter input with placeholder, aria-label and no name (so it is never submitted)", () => {
+    const html = renderFormHtml(filterableDef);
+    expect(html).toContain('class="custom-select-filter"');
+    expect(html).toContain('placeholder="Type to filter…"');
+    expect(html).toContain('aria-label="Filter Jump Host Server options"');
+    // The filter input must carry no name — otherwise the submit loop would
+    // post the filter text as a form value.
+    const filterMatch = html.match(/<input type="text" class="custom-select-filter"[^>]*>/);
+    expect(filterMatch).not.toBeNull();
+    expect(filterMatch![0]).not.toContain("name=");
+  });
+
+  it("marks the wrapper filterable and renders the No matches row hidden", () => {
+    const html = renderFormHtml(filterableDef);
+    expect(html).toContain('class="custom-select filterable"');
+    expect(html).toContain('<div class="custom-select-no-matches" style="display: none;">No matches</div>');
+  });
+
+  it("renders options sorted with the empty-value sentinel pinned (falsifies dropping the sort: declared order z,a,'' would render unchanged)", () => {
+    const html = renderFormHtml(filterableDef);
+    expect(renderedOptionOrder(html)).toEqual(["", "a", "z"]);
+  });
+
+  it("filters against label AND description via the option's full text (client rule lives in initCustomSelects)", () => {
+    // The rendered dropdown carries the description text the client filter reads.
+    const html = renderFormHtml({
+      title: "Test",
+      fields: [
+        {
+          type: "select",
+          key: "authProfileId",
+          label: "Auth Profile",
+          filterable: true,
+          options: [
+            { label: "Prod", value: "p1", description: "root@prod" },
+            { label: "(None)", value: "" }
+          ],
+          value: ""
+        }
+      ]
+    });
+    expect(html).toContain("root@prod");
+  });
+});
+
+describe("renderFormHtml — non-filterable select is unchanged (default guard)", () => {
+  const baseFields = (filterable: boolean): FormDefinition => ({
+    title: "Test",
+    fields: [
+      {
+        type: "select",
+        key: "mode",
+        label: "Mode",
+        filterable: filterable || undefined,
+        options: [
+          { label: "Zeta", value: "z" },
+          { label: "alpha", value: "a" }
+        ],
+        value: "z"
+      }
+    ]
+  });
+
+  it("emits no filter input and no filterable class when the flag is absent", () => {
+    const html = renderFormHtml(baseFields(false));
+    // Assert on the MARKUP form (class="…"), not bare substrings — the embedded
+    // client script legitimately references `.custom-select-filter` as a
+    // selector whether or not any select on the page is filterable.
+    expect(html).not.toContain('class="custom-select-filter"');
+    expect(html).not.toContain('class="custom-select-no-matches"');
+    expect(html).toContain('class="custom-select"');
+    expect(html).not.toContain('class="custom-select filterable"');
+  });
+
+  it("leaves a non-filterable select's options in DECLARED order (no sort applied)", () => {
+    const html = renderFormHtml(baseFields(false));
+    // Declared order preserved — the sort is filterable-only.
+    expect(renderedOptionOrder(html)).toEqual(["z", "a"]);
+  });
+
+  it("renders byte-for-byte the pre-PR-F1 markup for a plain select (filterable branch cannot leak into the default)", () => {
+    const html = renderFormHtml(baseFields(false));
+    expect(html).toContain(`<div class="custom-select" id="field-mode" data-name="mode">
+    <input type="hidden" name="mode" value="z" />
+    <div class="custom-select-trigger" tabindex="0">
+      <span class="custom-select-text">Zeta</span>
+    </div>
+    <div class="custom-select-dropdown">`);
+  });
+});
+
+describe("renderFormHtml — filterable client wiring is present in the emitted script", () => {
+  // The filter BEHAVIOR lives in initCustomSelects (webviewScripts.ts), which
+  // the form-script harness stubs out — so these are smoke checks that the
+  // wiring ships, not behavior tests. The behavior gap is noted in the commit.
+  const html = renderFormHtml({ title: "Test", fields: [] });
+
+  it("detects filterable selects by the filter input and always keeps the create affordance visible while filtering", () => {
+    expect(html).toContain("var filterInput = wrapper.querySelector('.custom-select-filter');");
+    expect(html).toContain("var show = isCreateOption(opt) ? true : match;");
+  });
+
+  it("wires keyboard nav on the filter input (Arrow highlight, Enter select, Esc close)", () => {
+    expect(html).toContain("filterInput.addEventListener('keydown'");
+    expect(html).toContain("if (target) chooseOption(target);");
+    expect(html).toContain("setCustomSelectOpen(wrapper, false);");
+  });
+
+  it("shows the No matches row only when no real option matches and no create affordance exists", () => {
+    expect(html).toContain("noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';");
   });
 });
