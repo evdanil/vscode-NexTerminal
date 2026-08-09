@@ -20,6 +20,7 @@
  * it later is one line plus a charset decision.
  */
 import { serializeForInlineScript } from "../ui/shared/inlineScriptData";
+import { MACRO_PLACEHOLDER_SOURCE } from "./macroVariables";
 import type { ServerConfig } from "../models/config";
 
 export const PROFILE_TOKEN_WHITELIST = ["host", "port", "username", "name", "ipmiHost"] as const;
@@ -62,7 +63,10 @@ const PROFILE_TOKEN_CHARSET_GUIDANCE: Record<ProfileTokenName, string> = {
   host: ADDRESS_GUIDANCE,
   ipmiHost: ADDRESS_GUIDANCE,
   port: "Use the port number only — digits, nothing else.",
-  username: 'Use letters, digits, ".", "_", "-" and "@" only.',
+  username:
+    'Use letters, digits, ".", "_" and "-", with at most one "@" between name and realm ' +
+    "(e.g. admin, or user@REALM.EXAMPLE.COM). " +
+    'A leading or trailing "@" is refused.',
   name:
     'Use letters, digits, spaces and ".", "-", "_", "/", ":", "," and "+" only — accents are fine. ' +
     "Every other punctuation mark is refused, because some shell reads it as syntax. " +
@@ -253,15 +257,34 @@ function isAddressValue(value: string): boolean {
 }
 const DIGITS_ONLY = /^[0-9]+$/;
 /**
- * Usernames: letters, digits, `.`, `_`, `-` and `@` — enough for every real
- * account name including the email-style `user@realm` form, and nothing a shell
- * reads as syntax. A username reaches a LOCAL command line through the shipped
- * ipmitool template (`-U ${profile.username}`) and arrives in the config from
- * inventory sync (`syncEngine.ts` writes `after.username` straight from the
- * endpoint) and from backup import, so it needs the same use-time check as the
- * address fields.
+ * Usernames: letters, digits, `.`, `_` and `-`, plus at most one `@` BETWEEN two
+ * nonempty components — `user`, `user@REALM`, `svc-acct@corp.example.com`. Enough
+ * for every real account name including the email-style realm form, and nothing a
+ * shell reads as syntax. A username reaches a LOCAL command line through the
+ * shipped ipmitool template (`-U ${profile.username}`) and arrives in the config
+ * from inventory sync (`syncEngine.ts` writes `after.username` straight from the
+ * endpoint), from backup import, and from a LINKED AUTH PROFILE, so it needs the
+ * same use-time check as the address fields.
+ *
+ * REVIEW FINDING (P2) — WHY `@` IS POSITIONAL AND NOT MERELY A MEMBER. This used
+ * to be `/^[A-Za-z0-9._@\-]+$/`, i.e. `@` anywhere, and it was documented as the
+ * "narrow, load-bearing exception" to `NAME_CHARSET` dropping `@` for PowerShell
+ * SPLATTING (see the `@` paragraph there). The exception's argument was that a
+ * username is a single word with no space, so it "cannot become `@name` as its
+ * own argument" — but that reasoning silently assumed a position the rule never
+ * enforced. A username of `@args` IS a whole word beginning with `@`: dropped
+ * into `ipmitool -U ${profile.username}` under PowerShell it splats the session
+ * variable `$args`, expanding data from outside the value into the command's
+ * argument list. That is exactly the capability `@` was refused from `name` for,
+ * reached through the field that kept it.
+ *
+ * So the rule now says what the exception always meant: one `@`, never leading,
+ * never trailing, never repeated. `user@REALM` keeps working — splatting needs
+ * the `@` at the START of a word, and this grammar guarantees at least one name
+ * character before it. `a@b@c` goes too: no real account form needs it, and a
+ * whitelist's default answer to an unargued shape is no.
  */
-const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
+const USERNAME_CHARSET = /^[A-Za-z0-9._\-]+(?:@[A-Za-z0-9._\-]+)?$/;
 /**
  * `name` IS A POSITIVE CHARSET — Unicode letters, marks and digits, a space, and
  * eight punctuation marks that survive bash, zsh, PowerShell and cmd.exe. It was
@@ -372,9 +395,11 @@ const USERNAME_CHARSET = /^[A-Za-z0-9._@\-]+$/;
  *   second character that is already refused, but splatting needs only `@` plus
  *   name characters. Nothing about a display label needs `@`, so the whitelist's
  *   default answer stands. (`USERNAME_CHARSET` keeps `@` on purpose: `user@REALM`
- *   is a real account form and that token is additionally constrained to a single
- *   word with no space, so it cannot become `@name` as its own argument. That is
- *   a narrow, load-bearing exception, not an inconsistency to copy here.)
+ *   is a real account form. That exception is now POSITIONAL — one `@`, never
+ *   leading or trailing — because "a username is one word, so it cannot become
+ *   `@name`" was an assumption the old charset never enforced: `@args` is one
+ *   word too. See `USERNAME_CHARSET`. It is a narrow, load-bearing exception with
+ *   its edge closed, not an inconsistency to copy here.)
  *
  *   `^` — DROPPED, per the finding above.
  *
@@ -521,7 +546,8 @@ function validateTokenValue(token: ProfileTokenName, value: string): boolean {
  * no `scheme://` is not a URL, and `resolveMacroBrowserUrl()` already refuses it
  * with an actionable "not an http:// or https:// URL — Edit Macro". Guessing at
  * an authority in text that has no scheme would only change WHICH wrong thing
- * that error describes.
+ * that error describes. "Has a scheme" includes one a MACRO VARIABLE supplies
+ * (`${scheme}://…`) — see `authorityCandidates()`.
  *
  * WHAT IS AND IS NOT BRACKETED, and why the test is `isIpv6Literal()` on the raw
  * value rather than "contains a colon":
@@ -572,6 +598,73 @@ interface AuthoritySpan {
 }
 
 /**
+ * One place an authority COULD begin: `matchStart` is where the thing that
+ * introduces it (a literal scheme, or a macro-variable placeholder standing in
+ * for one) starts, and `start` is the first character after its `://`.
+ */
+interface AuthorityCandidate {
+  matchStart: number;
+  start: number;
+}
+
+/**
+ * REVIEW FINDING (P2) — A SCHEME CAN COME FROM A MACRO VARIABLE, and scanning
+ * only for a LITERAL `scheme://` made the authority invisible when it did.
+ *
+ *   `${scheme}://${profile.ipmiHost}/`, with `scheme` declared as a macro
+ *   variable the user answers with `https`, has no literal scheme at all. The
+ *   profile pass therefore opened NO span, left a bare `fe80::1` unbracketed, and
+ *   the later variable pass produced `https://fe80::1/` — which `new URL()`
+ *   rejects, so `resolveMacroBrowserUrl()` refused the run with "not an http://
+ *   or https:// URL — Edit Macro". The macro text is right, the server record is
+ *   right, and the message points at neither.
+ *
+ * The two passes run in a fixed order (profile tokens, then variables), so the
+ * profile pass can see the SHAPE the variable pass will produce even though it
+ * cannot see the value: a placeholder immediately followed by `://` becomes a
+ * scheme delimiter, wherever the answer comes from. The placeholder grammar is
+ * imported from `macroVariables.ts` rather than re-derived here — one definition
+ * of what a placeholder is, so the two files cannot drift about it.
+ *
+ * AN ESCAPED PLACEHOLDER DOES NOT COUNT. `$${scheme}://…` renders to the literal
+ * text `${scheme}://…` (see `substituteMacroVariables()`), and a literal `${…}`
+ * is not a scheme — bracketing there would corrupt text that was never a URL.
+ * The escape is read from group 1 of the shared pattern, exactly as both passes
+ * read it.
+ *
+ * A PROFILE TOKEN BEFORE `://` IS DELIBERATELY NOT A CANDIDATE. `${profile.x}://`
+ * is not matched by the literal scan either (`{` is outside RFC 3986's scheme
+ * charset), so this is an exclusion, not an oversight: no whitelisted token is a
+ * URL scheme — they are a host, a port, a username and a display name — and a
+ * macro would have to store the string `https` in one of those fields for the
+ * shape to mean anything. Nothing in the product produces that, and admitting it
+ * would widen the rule for a case with no user.
+ */
+function authorityCandidates(text: string): AuthorityCandidate[] {
+  const candidates: AuthorityCandidate[] = [];
+
+  const scheme = new RegExp(URL_SCHEME_PREFIX.source, "g");
+  let match: RegExpExecArray | null;
+  while ((match = scheme.exec(text)) !== null) {
+    candidates.push({ matchStart: match.index, start: match.index + match[0].length });
+  }
+
+  const placeholder = new RegExp(MACRO_PLACEHOLDER_SOURCE, "g");
+  while ((match = placeholder.exec(text)) !== null) {
+    if (match[1] === "$") continue; // escaped — renders literal, so it is no scheme
+    const after = match.index + match[0].length;
+    if (text.startsWith("://", after)) {
+      candidates.push({ matchStart: match.index, start: after + "://".length });
+    }
+  }
+
+  // Left to right, so the "already inside an authority" test below only ever has
+  // to look at the span it most recently opened.
+  candidates.sort((a, b) => a.matchStart - b.matchStart || a.start - b.start);
+  return candidates;
+}
+
+/**
  * Every authority region of `text`: from just after a `scheme://` up to the next
  * `/`, `?` or `#`, or the end of the string. Computed on the TEMPLATE, before
  * substitution — see the comment on `substitutionValue()` for why that is the
@@ -579,14 +672,23 @@ interface AuthoritySpan {
  *
  * A profile token cannot contain `/`, `?` or `#` (`PROFILE_TOKEN_SOURCE` allows
  * only `${profile.<word>}`), so a token that STARTS inside a span is wholly
- * inside it, and an unsubstituted token can never hide a delimiter.
+ * inside it, and an unsubstituted token can never hide a delimiter. The same is
+ * true of a macro-variable placeholder, whose grammar is `$name` / `${name}`.
+ *
+ * A candidate that BEGINS inside a span already opened is dropped — a `//` (or a
+ * `$name://`) within an authority is not a second URL. That is also what makes
+ * the two scanners in `authorityCandidates()` safe to merge: the bare form
+ * `$s://` is matched BOTH as a placeholder (from the `$`) and, by coincidence of
+ * character classes, as the literal scheme `s://`, and the duplicate collapses
+ * here because the second candidate starts inside the span the first opened.
  */
 function authoritySpans(text: string): AuthoritySpan[] {
   const spans: AuthoritySpan[] = [];
-  const re = new RegExp(URL_SCHEME_PREFIX.source, "g");
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const start = match.index + match[0].length;
+  for (const candidate of authorityCandidates(text)) {
+    const open = spans[spans.length - 1];
+    if (open !== undefined && candidate.matchStart < open.end) continue;
+
+    const start = candidate.start;
     let end = text.length;
     for (let i = start; i < text.length; i++) {
       const ch = text[i];
@@ -596,9 +698,6 @@ function authoritySpans(text: string): AuthoritySpan[] {
       }
     }
     spans.push({ start, end });
-    // Resume after the authority rather than inside it — a `//` within the
-    // authority itself is not a second URL.
-    re.lastIndex = end;
   }
   return spans;
 }

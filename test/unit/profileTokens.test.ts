@@ -557,12 +557,57 @@ describe("resolveProfileTokens — injection defense", () => {
   });
 
   it("accepts the usernames people actually have, including the email-style form", () => {
-    for (const good of ["admin", "svc_nexus", "first.last", "ADMIN-2", "user@REALM.EXAMPLE.COM"]) {
+    for (const good of [
+      "admin",
+      "svc_nexus",
+      "first.last",
+      "ADMIN-2",
+      "user@REALM.EXAMPLE.COM",
+      "svc-acct@corp.example.com"
+    ]) {
       expect(resolved("-U ${profile.username}", server({ username: good }))).toBe(`-U ${good}`);
     }
     // A space is not part of any real username, and it is what separates one
     // argument from the next.
     expect(resolveProfileTokens("-U ${profile.username}", server({ username: "two words" })).ok).toBe(false);
+  });
+
+  it("refuses a LEADING `@` in a username — a whole word starting with `@` is PowerShell splatting", () => {
+    // REVIEW FINDING (P2). `USERNAME_CHARSET` used to allow `@` ANYWHERE, and its
+    // comment justified the exception by saying a username is a single word with
+    // no space, so it "cannot become `@name` as its own argument". `@args` is a
+    // single word with no space. Under PowerShell — the default profile of a
+    // fresh terminal on Windows, which is where the shipped ipmitool macro runs —
+    // `@args` in argument position SPLATS the session variable `$args`, expanding
+    // outside data into the command's argument list. Exactly the capability `@`
+    // was refused from `name` for, reached through the field that kept it.
+    const macro = " ipmitool -U ${profile.username} -H 10.0.0.1 sol activate\n";
+    const outcome = resolveProfileTokens(macro, server({ username: "@args" }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.error.kind).toBe("invalid");
+    expect(outcome.error.token).toBe("username");
+    expect(outcome.error.message).toContain('one "@" between name and realm');
+
+    // THE SPLATTING SHAPE, pinned: this is the line the old charset produced —
+    // `@args` standing as its own word where an account name belongs. Asserting
+    // only the refusal would pass against a rule that rejected the value for some
+    // unrelated reason, so name the string that must never be built.
+    const preFix = macro.replace("${profile.username}", "@args");
+    expect(preFix).toBe(" ipmitool -U @args -H 10.0.0.1 sol activate\n");
+    expect(preFix.split(" ")).toContain("@args");
+    expect(JSON.stringify(outcome)).not.toContain("-U @args -H");
+
+    // Leading, trailing and repeated — the `@` is legal only BETWEEN two nonempty
+    // components. A username arrives from inventory sync, backup import and a
+    // linked auth profile, so every one of these is externally supplied.
+    for (const bad of ["@", "@args", "@admin", "user@", "a@b@c", "@user@realm", "admin@@realm"]) {
+      expect(resolveProfileTokens("-U ${profile.username}", server({ username: bad })).ok, `username ${bad}`).toBe(
+        false
+      );
+    }
+    // …and the form the exception exists for is untouched.
+    expect(resolved("-U ${profile.username}", server({ username: "user@REALM" }))).toBe("-U user@REALM");
   });
 
   it("names the offending value and what the field accepts, so the message is not a dead end", () => {
@@ -737,6 +782,98 @@ describe("resolveProfileTokens — URL form brackets a bare IPv6 address", () =>
     // that message describes.
     expect(resolved("gateway/${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("gateway/fe80::1");
     expect(resolved("${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("fe80::1");
+  });
+
+  it("sees a scheme supplied by a MACRO VARIABLE — `${scheme}://` opens an authority too", () => {
+    // REVIEW FINDING (P2). The span scan reads the PRE-substitution template, and
+    // it used to look only for a LITERAL `scheme://`. A macro written as
+    // `${scheme}://${profile.ipmiHost}/` (with `scheme` declared and answered
+    // `https`) has no literal scheme, so no span opened, the bare IPv6 was left
+    // unbracketed, and the VARIABLE pass then produced `https://fe80::1/` — which
+    // `new URL()` rejects, so the run was refused with "not an http:// or
+    // https:// URL — Edit Macro", blaming a macro that is correct.
+    const text = resolved("${scheme}://${profile.ipmiHost}/", server({ ipmiHost: "fe80::1" }), URL_FORM);
+    expect(text).toBe("${scheme}://[fe80::1]/");
+    // The string the pre-fix implementation produced, and the reason it broke.
+    expect(text).not.toBe("${scheme}://fe80::1/");
+
+    // …and the end-to-end property: the variable pass runs next, and what it
+    // yields must parse.
+    const url = substituteMacroVariables(text, { scheme: "https" }, ["scheme"]);
+    expect(url).toBe("https://[fe80::1]/");
+    expect(new URL(url).hostname).toBe("[fe80::1]");
+    // What the pre-fix output became — the throw behind the misdirected error.
+    expect(() => new URL("https://fe80::1/")).toThrow();
+  });
+
+  it("sees the BARE placeholder form as well — `$s_://` is a scheme the literal scan cannot see", () => {
+    // The variable grammar has two forms and both reach `://`. `$s://` happens to
+    // be caught by the literal scheme scan by coincidence (`s://` is itself a
+    // legal scheme production), so the shape that actually pins the fix is a name
+    // ending in `_`, which RFC 3986's scheme charset excludes: nothing in
+    // `$s_://` matches `[A-Za-z][A-Za-z0-9+.\-]*://`.
+    expect(resolved("$s_://${profile.host}/", server({ host: "fe80::1" }), URL_FORM)).toBe("$s_://[fe80::1]/");
+    // The coincidental form must keep working too — the merge of the two scanners
+    // must not double-count it into a wrong span.
+    expect(resolved("$s://${profile.host}/", server({ host: "fe80::1" }), URL_FORM)).toBe("$s://[fe80::1]/");
+    expect(substituteMacroVariables(resolved("$s://${profile.host}/", server({ host: "fe80::1" }), URL_FORM), { s: "https" }, ["s"])).toBe(
+      "https://[fe80::1]/"
+    );
+  });
+
+  it("does NOT treat an ESCAPED placeholder as a scheme — it renders as literal text", () => {
+    // `$${scheme}` is documented to send the literal `${scheme}`, so the rendered
+    // text is `${scheme}://…` — not a URL at all, and certainly not one whose host
+    // wants brackets. A fix that matched the placeholder grammar without reading
+    // the escape group would bracket here.
+    // This pass leaves the escape alone (un-escaping is the variable pass's job),
+    // so what it must get right is only the bracketing decision.
+    const text = resolved("$${scheme}://${profile.host}/", server({ host: "fe80::1" }), URL_FORM);
+    expect(text).toBe("$${scheme}://fe80::1/");
+    expect(text).not.toContain("[fe80::1]");
+    // And this is what the variable pass then renders — a literal `${scheme}`,
+    // which is no scheme, so there was never a host to bracket.
+    expect(substituteMacroVariables(text, { scheme: "https" }, ["scheme"])).toBe("${scheme}://fe80::1/");
+  });
+
+  it("opens nothing for a placeholder that is not followed by `://`", () => {
+    // A variable is only a scheme when it sits exactly where a scheme sits. A
+    // rule of "any placeholder opens an authority" would bracket both of these.
+    expect(resolved("${a} ${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("${a} fe80::1");
+    expect(resolved("$a ${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("$a fe80::1");
+    expect(resolved("${a}:/${profile.host}", server({ host: "fe80::1" }), URL_FORM)).toBe("${a}:/fe80::1");
+  });
+
+  it("still stops the authority at the first delimiter when the scheme came from a variable", () => {
+    // The span END rule is unchanged, so a token in the QUERY of a
+    // variable-schemed URL is a value, exactly as it is under a literal scheme.
+    const text = resolved(
+      "${scheme}://gateway/connect?target=${profile.host}",
+      server({ host: "fe80::1" }),
+      URL_FORM
+    );
+    expect(text).toBe("${scheme}://gateway/connect?target=fe80::1");
+    expect(text).not.toContain("[fe80::1]");
+
+    // Both at once: authority bracketed, query not, under one variable scheme.
+    const both = resolved(
+      "${scheme}://${profile.ipmiHost}/redirect?peer=${profile.host}",
+      server({ ipmiHost: "fe80::1", host: "fe80::2" }),
+      URL_FORM
+    );
+    expect(both).toBe("${scheme}://[fe80::1]/redirect?peer=fe80::2");
+    expect(both.match(/\[/g)?.length).toBe(1);
+  });
+
+  it("COMMAND FORM IS UNTOUCHED BY A VARIABLE-SUPPLIED SCHEME — no brackets anywhere", () => {
+    // Span detection only ever runs in URL form; a command-form macro containing
+    // `${scheme}://` still gets the raw value ipmitool wants.
+    expect(resolved("curl ${scheme}://${profile.host}/", server({ host: "fe80::1" }))).toBe(
+      "curl ${scheme}://fe80::1/"
+    );
+    expect(resolved(" ipmitool -H ${profile.ipmiHost} sol activate\n", server({ ipmiHost: "fe80::1" }))).toBe(
+      " ipmitool -H fe80::1 sol activate\n"
+    );
   });
 
   it("COMMAND FORM IS UNTOUCHED BY THE AUTHORITY RULE — no brackets anywhere", () => {

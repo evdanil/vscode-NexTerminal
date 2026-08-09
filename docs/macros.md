@@ -286,7 +286,7 @@ checked:
 |---|---|
 | `${profile.host}`, `${profile.ipmiHost}` | letters, digits, `.`, `-`, `_`, `:` — the address only, no `https://` and no path. `[` and `]` only as a whole bracketed IPv6 literal, with an optional port: `[fe80::1]`, `[::ffff:10.0.0.1]`, `[fe80::1]:623` |
 | `${profile.port}` | digits |
-| `${profile.username}` | letters, digits, `.`, `_`, `-`, `@` |
+| `${profile.username}` | letters, digits, `.`, `_`, `-`, and at most one `@` *between* the name and the realm — `admin`, `first.last`, `user@REALM.EXAMPLE.COM`. A leading, trailing or repeated `@` is refused |
 | `${profile.name}` | letters, digits (any language — accents included), spaces, and `.`, `-`, `_`, `/`, `:`, `,`, `+`. Everything else is refused |
 
 No value may contain a `$` or a backtick, in any token. A profile carrying shell
@@ -329,8 +329,10 @@ buys: `=ls` at the start of a word is a zsh path expansion (on by default, and
 zsh is the default shell on macOS), and `@name` in PowerShell splices the
 contents of a session variable into a command's arguments. Neither was on any
 banned list; both are simply absent from the allowed one. (`@` stays legal in
-**Username**, where `user@REALM` is a real account name and the value cannot
-contain a space.)
+**Username**, where `user@REALM` is a real account name — but only *between* the
+name and the realm. A username of `@args` is a single word beginning with `@`,
+which is the splatting form itself, so a leading, trailing or repeated `@` is
+refused there too.)
 
 Rename the profile — `Core Switch DC1` rather than `Core Switch (DC1)`,
 `Rack A - Spare` rather than `Rack A [Spare]`, `Device 4` rather than
@@ -367,9 +369,12 @@ https://gateway/host/${profile.host}     →  https://gateway/host/fe80::1
 ```
 
 Each token in a macro is decided on its own, so a macro that uses one in the host
-and one in the query gets brackets on the first and not the second. If the macro
-text has no `scheme://` at all, nothing is bracketed — the text is not a URL, and
-Nexus refuses it with that message instead.
+and one in the query gets brackets on the first and not the second. The scheme
+may itself come from a prompted variable — `${scheme}://${profile.ipmiHost}/` is
+recognised as a URL and its host bracketed, exactly as a literal `https://` one
+is (an *escaped* `$${scheme}` is literal text, so it is not a scheme). If the
+macro text has no `scheme://` at all, nothing is bracketed — the text is not a
+URL, and Nexus refuses it with that message instead.
 
 **Session terminal** and **Local terminal** macros get the raw value, with no
 brackets added: `-H fe80::1` is what `ipmitool` expects. If you need the
