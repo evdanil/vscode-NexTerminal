@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
-import type { AuthProfile, ServerConfig } from "../models/config";
+import type { AuthProfile, HttpConnectProxy, ProxyConfig, ServerConfig, Socks5Proxy } from "../models/config";
 import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps } from "../models/config";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
@@ -209,13 +209,26 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
  * the stale secret is exactly right: the new proxy prompts per-connect rather
  * than reusing a password meant for a different endpoint.
  *
- * STALE (must be cleared) iff `before.proxy` was `socks5`|`http` (the only proxy
- * kinds a `proxy-password-{id}` belongs to) AND `after.proxy` is NOT the SAME
- * authenticated endpoint — i.e. undefined, a different `type`, or a different
- * `host`/`port`/`username` (the identity the password was entered for). The
- * SAME-endpoint case (host+port+username unchanged) KEEPS the secret — it still
- * applies. An ssh proxy never carries a password, so ssh↔ssh needs no handling;
- * a change FROM socks5/http TO ssh clears the stale secret.
+ * STALE (must be cleared) iff EITHER `before.proxy` OR `after.proxy` is a
+ * password-bearing (`socks5`|`http`) endpoint AND the two are NOT the SAME
+ * authenticated endpoint (same `type`+`host`+`port`+`username` — the identity
+ * the password was entered for). The SAME-endpoint case KEEPS the secret — it
+ * still applies. An ssh proxy never carries a password, so ssh↔ssh (and any
+ * neither-side-bearing update, e.g. undefined↔ssh) needs no handling; a change
+ * FROM socks5/http TO ssh/none clears the stale secret.
+ *
+ * ROUND 11 — WHY THE `after`-SIDE TRIGGER, not just `before`. A non-password-bearing
+ * `before.proxy` (undefined or ssh) does NOT prove no `proxy-password-{id}` secret
+ * exists: `configCommands.ts` restores every exported proxy password for an imported
+ * server id WITHOUT requiring that server to currently carry a socks5/http proxy, so
+ * a legacy backup can leave an ORPHANED entry sitting under an undefined/ssh proxy.
+ * If a template then assigns that server a NEW authenticated socks5/http endpoint, a
+ * `before`-only rule would early-return (before isn't password-bearing) and SKIP the
+ * clear — sending the orphaned password to the new proxy. Triggering on EITHER side
+ * closes that leak. It is a strict SUPERSET of the round-9 rule (every case it
+ * cleared, this clears), and because the capture step reads the vault value first,
+ * an update that newly matches but has no stored secret captures nothing and deletes
+ * nothing — broadening the trigger costs nothing where there is no orphan.
  *
  * Centralized so EVERY inventory apply site shares one rule (invoked before BOTH
  * the fast-path recompute apply AND the in-lock confirmed apply). Deliberately NOT
@@ -227,6 +240,34 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
  * already deleted in this pass (capture-delete atomicity — a mid-loop failure
  * must not strip a password with no publish and no restore) and rethrows.
  */
+/**
+ * A `proxy-password-{id}` secret only ever belongs to a `socks5`/`http` proxy —
+ * the only kinds `ProxySshFactory` sends it to (an ssh jump proxy carries no
+ * password). Narrows to that authenticated shape so both sides of an update can
+ * be compared by identity below.
+ */
+function isPasswordBearingProxy(proxy: ProxyConfig | undefined): proxy is Socks5Proxy | HttpConnectProxy {
+  return proxy !== undefined && (proxy.type === "socks5" || proxy.type === "http");
+}
+
+/**
+ * Whether `before` and `after` are the SAME authenticated (socks5/http) endpoint —
+ * same `type`+`host`+`port`+`username`, the identity the stored password was
+ * entered for. This is the ONE case a proxy update KEEPS the secret: it still
+ * applies. Both sides must be password-bearing to be "the same endpoint"; an
+ * ssh/none on either side is never equal to a socks5/http one.
+ */
+function isSameAuthenticatedEndpoint(before: ProxyConfig | undefined, after: ProxyConfig | undefined): boolean {
+  return (
+    isPasswordBearingProxy(before) &&
+    isPasswordBearingProxy(after) &&
+    before.type === after.type &&
+    before.host === after.host &&
+    before.port === after.port &&
+    before.username === after.username
+  );
+}
+
 async function clearStaleProxyPasswordSecretsBeforeApply(
   vault: SecretVault,
   updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>
@@ -234,17 +275,16 @@ async function clearStaleProxyPasswordSecretsBeforeApply(
   const captured: Array<{ key: string; value: string }> = [];
   for (const { before, after } of updates) {
     const bp = before.proxy;
-    if (bp === undefined || (bp.type !== "socks5" && bp.type !== "http")) {
-      continue; // no password-bearing proxy secret was ever entered for this record's before-state
-    }
     const ap = after.proxy;
-    const sameEndpoint =
-      ap !== undefined &&
-      ap.type === bp.type &&
-      ap.host === bp.host &&
-      ap.port === bp.port &&
-      ap.username === bp.username;
-    if (sameEndpoint) {
+    // ROUND 11 — trigger on EITHER side being a password-bearing endpoint. A
+    // non-password-bearing `before.proxy` does NOT prove no secret exists (an
+    // orphaned legacy-backup entry can sit under an undefined/ssh proxy), so an
+    // `after`-side authenticated endpoint must trigger the clear too — see the
+    // function doc for why.
+    if (!isPasswordBearingProxy(bp) && !isPasswordBearingProxy(ap)) {
+      continue; // neither side carries a proxy password — nothing to leak (ssh proxies never send one)
+    }
+    if (isSameAuthenticatedEndpoint(bp, ap)) {
       continue; // still the same authenticated endpoint — the stored password still applies
     }
     // before.id === after.id (same record through an update); use after.id.

@@ -2742,6 +2742,158 @@ describe("inventoryCommands", () => {
       expect(vault.store).not.toHaveBeenCalledWith(proxyKey, expect.anything());
     });
 
+    // -------- Codex round 11 (P1, SECURITY) — the WHICH-secrets predicate must
+    // trigger on EITHER side being a password-bearing (socks5/http) endpoint, not
+    // just `before`. A legacy backup restores an exported proxy-password-{id}
+    // WITHOUT requiring the server to currently carry a socks5/http proxy
+    // (configCommands.ts), so an ORPHANED entry can sit under an undefined/ssh
+    // proxy; a template assigning a NEW authenticated endpoint would otherwise skip
+    // the clear (before isn't password-bearing) and send the orphan to it. --------
+
+    // Owned server whose proxy is UNSET and unstamped — an override template writes
+    // it (matrix row 1). The orphaned proxy-password-{id} is a legacy-backup relic.
+    function ownedWithNoProxy(): ServerConfig {
+      return makeServer({
+        id: "owned-1",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+      });
+    }
+
+    it("(round 11, SECURITY — orphan) a template assigning a NEW socks5 proxy to a server whose before.proxy is UNDEFINED clears an ORPHANED proxy-password-{id} BEFORE the apply publishes — otherwise the orphan is sent to the new endpoint (kills the before-only predicate)", async () => {
+      const repo = new InMemoryConfigRepository([ownedWithNoProxy()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      // The template assigns an authenticated socks5 endpoint Y to a server that
+      // had NO proxy before — before.proxy is undefined, after.proxy is bearing.
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const callOrder: string[] = [];
+      const store = new Map<string, string>([
+        [proxyKey, "orphan-pw"], // legacy-backup orphan, no current socks5/http proxy behind it
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) callOrder.push("delete");
+          store.delete(k);
+        })
+      };
+      const applyReal = core.applyInventorySyncPlan.bind(core);
+      vi.spyOn(core, "applyInventorySyncPlan").mockImplementation(async (application) => {
+        callOrder.push("apply");
+        return applyReal(application);
+      });
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The new authenticated proxy IS published (Y)...
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      // ...but only AFTER the orphaned secret was deleted. Against 2c9d009 the
+      // before-only predicate early-returns (before.proxy is undefined) → no
+      // delete → order would be ["apply"] and the orphan "orphan-pw" would survive
+      // to be sent to Y on the next connect.
+      expect(callOrder).toEqual(["delete", "apply"]);
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+    });
+
+    it("(round 11, SECURITY — orphan, delete fails CLOSED) a vault.delete throw for the orphaned proxy key ABORTS the sync (applyInventorySyncPlan never called, new proxy never published) and RESTORES the orphan", async () => {
+      const repo = new InMemoryConfigRepository([ownedWithNoProxy()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+
+      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const store = new Map<string, string>([
+        [proxyKey, "orphan-pw"],
+        [inventorySecretKey("src-1", "apiToken"), "tok"]
+      ]);
+      const vault = {
+        get: vi.fn(async (k: string) => store.get(k)),
+        store: vi.fn(async (k: string, v: string) => {
+          store.set(k, v);
+        }),
+        delete: vi.fn(async (k: string) => {
+          if (k === proxyKey) throw new Error("vault delete failed"); // throws WITHOUT mutating the store
+          store.delete(k);
+        })
+      };
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // Fail closed: the new proxy was never published — the record still has no proxy.
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("owned-1")?.proxy).toBeUndefined();
+      // The captured orphan is restored (best-effort) so the pass is atomic.
+      expect(vault.store).toHaveBeenCalledWith(proxyKey, "orphan-pw");
+      expect(await vault.get(proxyKey)).toBe("orphan-pw");
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+    });
+
+    it("(round 11, SECURITY — over-clear guard) an ssh↔ssh update (device renamed, jump host unchanged) leaves an orphaned proxy-password-{id} ALONE — neither side is password-bearing, so an ssh proxy never sends it (kills clearing on any stored secret regardless of proxy kind)", async () => {
+      const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 });
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 },
+        proxy: { type: "ssh", jumpHostId: "bastion-1" } // ssh proxy — carries no password
+      });
+      const repo = new InMemoryConfigRepository([owned, bastion]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          // Rename forces an UPDATE (before.proxy ssh, after.proxy ssh carried unchanged).
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          }))
+        })
+      );
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "orphan-pw", // orphan under an ssh proxy
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // the update landed
+      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // orphan KEPT
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("orphan-pw");
+    });
+
     it("(ITEM B) a rack rename that empties its old folder appends the empty-folder count to the completion toast", async () => {
       const owned = makeServer({
         id: "owned-1",
