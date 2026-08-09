@@ -33,6 +33,18 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * to declare an identical label/configFields (or a user who clicks through
  * the warning) is indistinguishable from the original. It closes the SILENT
  * handover, not the trust boundary itself.
+ *
+ * ADOPT-ON-ADD AND `instanceKey` (REVIEW FINDING, P1): a provider that does not
+ * implement the optional `instanceKey(config)` method gets no adoption — a
+ * server kept when one of its sources was removed is added again as a new server
+ * rather than reclaimed. That is a deliberate refusal, not an oversight. Nexus
+ * cannot tell two DEPLOYMENTS of one provider apart on its own
+ * (`InventoryDevice.externalId` is unique only within one of them), and the
+ * fallback — treating the provider id as the instance identity — is what let one
+ * deployment's device claim another deployment's kept server, stored credentials
+ * included. Implementing `instanceKey` opts a provider back in; see its contract
+ * in `models/inventory.ts`, in particular that the key is persisted and exported
+ * in backups and must therefore never carry a secret.
  */
 export interface NexusExtensionApi {
   readonly contractVersion: 1;

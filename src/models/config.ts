@@ -119,9 +119,9 @@ export interface ServerOrigin {
  *
  * `sourceId`/`sourceName`/`detachedAt` are receipts — for copy and diagnosis,
  * never matching inputs (the whole problem is that a re-added source mints a
- * NEW id). `providerId` and `externalId` ARE the matching inputs; see the
- * ADOPT 1 eligibility rule in the sync engine for the endpoint corroboration
- * that goes with them.
+ * NEW id). `providerId`, `instanceKey` and `externalId` ARE the matching inputs;
+ * see the ADOPT 1 eligibility rule in the sync engine for the endpoint
+ * corroboration that goes with them.
  */
 export interface DetachedServerOrigin {
   /** The removed source's id. A re-added source never matches it — receipt only. */
@@ -130,6 +130,34 @@ export interface DetachedServerOrigin {
   sourceName: string;
   /** MATCHING INPUT — only a source of the same provider may adopt this record. */
   providerId: string;
+  /**
+   * MATCHING INPUT (REVIEW FINDING, P1 — cross-instance adoption) — WHICH
+   * DEPLOYMENT of `providerId` this server was synced from, as
+   * `InventoryProvider.instanceKey` reported it at detach time (for NetBox, the
+   * normalized base URL — see models/inventory.ts for the contract and for why
+   * it can never contain a secret).
+   *
+   * `providerId` alone does not scope `externalId`: it is unique only within one
+   * deployment, so a lab NetBox and a production NetBox both emit "device:1",
+   * and private addresses overlap freely — 10.0.0.1:22 is the most ordinary
+   * endpoint there is. Without this field the endpoint corroboration was the
+   * only thing standing between the two, and it does not stand: the same id at
+   * the same address across two instances is a coincidence a homelab reproduces
+   * on the first try, and the consequence is a server changing owner, after
+   * which the new owner's prune policy can delete it and its saved credentials.
+   *
+   * OPTIONAL, AND ITS ABSENCE MEANS NOT ADOPTABLE. Two ways a marker can lack
+   * it: the provider offers no instance identity at all (the public provider API
+   * is experimental, and `instanceKey` is optional on it), or the marker was
+   * written by a build of this unreleased branch from before this field existed
+   * (developer machines only — no shipped release contains `formerlySynced` in
+   * any form). Both land in the same safe state, and the engine treats them
+   * identically: a marker with no instance key matches nothing, so its server is
+   * added as a duplicate and the plan says why. It is never compared as "equal
+   * to another absent key" — that would re-create the exact collision this field
+   * removes.
+   */
+  instanceKey?: string;
   /** MATCHING INPUT — the device this server was mapped to. */
   externalId: string;
   detachedAt: number;
@@ -255,6 +283,13 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     a.sourceId === b.sourceId &&
     a.sourceName === b.sourceName &&
     a.providerId === b.providerId &&
+    // Present-vs-absent reads as a difference here for the same reason the
+    // `!a || !b` line above does, one field down: `instanceKey` is what makes a
+    // marker adoptable AT ALL, so a comparator that shrugged at "one has it, the
+    // other doesn't" would let a rollback replace a marker carrying an instance
+    // with one that carries none — permanently unadoptable — and call the two
+    // records identical while doing it.
+    a.instanceKey === b.instanceKey &&
     a.externalId === b.externalId &&
     a.detachedAt === b.detachedAt
   );

@@ -8,6 +8,7 @@ import {
   InventoryProviderError,
   inventorySecretKey,
   inventorySourceValuesEqual,
+  resolveProviderInstanceKey,
   sourceConfigUnchanged,
   type InventoryConfigField,
   type InventoryPrunePolicy,
@@ -2528,6 +2529,32 @@ export function registerInventoryCommands(
           // records were detached by a single user action, and a per-server
           // Date.now() would imply an ordering that does not exist.
           const detachedAt = Date.now();
+          // REVIEW FINDING (P1, cross-instance adoption) — WHICH DEPLOYMENT of
+          // the provider these servers came from, recorded now because after
+          // this removal nothing else remembers: `source.config` is about to be
+          // deleted with the record, and the marker is all that is left.
+          //
+          // `providerId` alone cannot scope the marker's `externalId` — two
+          // instances of one provider both emit "device:1" — so a marker without
+          // this is refused by the adoption rule rather than adopted on the
+          // strength of the provider kind. See DetachedServerOrigin
+          // (models/config.ts) and `sameProviderInstance` (syncEngine.ts).
+          //
+          // Resolved against the CURRENTLY-REGISTERED provider, and `undefined`
+          // when there is none. A provider can be gone at removal time (its
+          // extension uninstalled or disabled — nothing in this flow requires
+          // one, deliberately, since a user must always be able to remove a
+          // source whose provider has vanished) or can simply not implement
+          // `instanceKey`. Both leave the marker without an instance key, which
+          // means the receipt is still written — the UI can still say which
+          // source kept this server — but the record is not adoptable. That is
+          // the safe direction: an un-adoptable kept server costs a duplicate
+          // the next sync explains, while a marker claiming an instance nobody
+          // verified is how a record changes owner.
+          const removalInstanceKey = ((): string | undefined => {
+            const removalProvider = registry.get(source.providerId);
+            return removalProvider === undefined ? undefined : resolveProviderInstanceKey(removalProvider, source.config);
+          })();
           const strippedServers = owned.map(({ origin, ...rest }) =>
             // `owned` is filtered on `origin?.sourceId === source.id`, so every
             // entry HAS an origin — but that is a filter, not a type narrowing,
@@ -2542,6 +2569,14 @@ export function registerInventoryCommands(
                     sourceId: source.id,
                     sourceName: source.name,
                     providerId: source.providerId,
+                    // Omitted entirely rather than written as `undefined` when
+                    // the provider names no instance: `formerlySynced` is
+                    // persisted verbatim, and an explicit `instanceKey:
+                    // undefined` survives into globalState as a key with no
+                    // value on some JSON paths. Absent and absent-valued mean
+                    // the same thing to every reader here, so write the one that
+                    // cannot be misread.
+                    ...(removalInstanceKey !== undefined ? { instanceKey: removalInstanceKey } : {}),
                     externalId: origin.externalId,
                     detachedAt
                   }
@@ -2709,7 +2744,26 @@ export function registerInventoryCommands(
       // with `plan` at every point below where `plan` itself is reassigned
       // (the fast-path fall-through and the retry loop).
       let planAuthProfile = resolveSourceAuthProfile(core, source);
-      let plan = computeSyncPlan({ source, tree, currentServers: core.getSnapshot().servers, now: Date.now(), authProfile: planAuthProfile });
+      // ADOPT 1 / REVIEW FINDING (P1, cross-instance adoption) — which DEPLOYMENT
+      // of `provider` this sync is talking to, derived from the same source
+      // config the fetch above used. Only a kept server whose marker names this
+      // same deployment may be adopted (see `ComputeSyncPlanInput
+      // .providerInstanceKey`); `undefined` — a provider that names no instance —
+      // means no adoption at all, never a fall back to the provider id.
+      //
+      // Re-derived, like `planAuthProfile`, at every point below where `plan` is
+      // recomputed against a re-read source record, so it always describes the
+      // config that plan was computed from rather than the one this run started
+      // with.
+      let planInstanceKey = resolveProviderInstanceKey(provider, source.config);
+      let plan = computeSyncPlan({
+        source,
+        tree,
+        currentServers: core.getSnapshot().servers,
+        now: Date.now(),
+        authProfile: planAuthProfile,
+        providerInstanceKey: planInstanceKey
+      });
 
       // Nothing to do: apply an empty application to bump lastSyncAt without a confirm modal.
       if (plan.adds.length === 0 && plan.updates.length === 0 && plan.prunes.length === 0) {
@@ -2735,7 +2789,16 @@ export function registerInventoryCommands(
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
           | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number; source: InventorySourceConfig }
-          | { kind: "not-empty"; plan: InventorySyncPlan; authProfile: AuthProfile | undefined }
+          | {
+              kind: "not-empty";
+              plan: InventorySyncPlan;
+              authProfile: AuthProfile | undefined;
+              // REVIEW FINDING (P1) — carried out with the plan for the same
+              // reason `authProfile` is: the caller keeps computing plans after
+              // this, and each of them must be computed against the same
+              // instance identity this recompute used.
+              instanceKey: string | undefined;
+            }
           | { kind: "abort" };
         const fastPathResult: FastPathResult = await configMutationLock.runExclusive(async (): Promise<FastPathResult> => {
           const freshSource = core.getInventorySource(source.id);
@@ -2750,15 +2813,20 @@ export function registerInventoryCommands(
             return { kind: "abort" };
           }
           const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          // Derived from `freshSource.config`, not the outer `source`'s — the
+          // pairing rule `planAuthProfile` follows, for the same reason: this
+          // plan is about the record as it stands now.
+          const freshInstanceKey = resolveProviderInstanceKey(provider, freshSource.config);
           const recomputed = computeSyncPlan({
             source: freshSource,
             tree,
             currentServers: core.getSnapshot().servers,
             now: Date.now(),
-            authProfile: freshAuthProfile
+            authProfile: freshAuthProfile,
+            providerInstanceKey: freshInstanceKey
           });
           if (recomputed.adds.length > 0 || recomputed.updates.length > 0 || recomputed.prunes.length > 0) {
-            return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile };
+            return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile, instanceKey: freshInstanceKey };
           }
           try {
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
@@ -2808,6 +2876,7 @@ export function registerInventoryCommands(
         // normal confirmation flow below with the freshly recomputed plan.
         plan = fastPathResult.plan;
         planAuthProfile = fastPathResult.authProfile;
+        planInstanceKey = fastPathResult.instanceKey;
       }
 
       // ADOPT 1 — THE QUESTION. Asked at most once per run, here: after the
@@ -2908,6 +2977,7 @@ export function registerInventoryCommands(
           // lockstep with `plan`, immediately before the call it feeds, against
           // the same `source` snapshot the initial computation used.
           planAuthProfile = resolveSourceAuthProfile(core, source);
+          planInstanceKey = resolveProviderInstanceKey(provider, source.config);
           // RECOMPUTED ON BOTH ANSWERS, not just on Adopt. `plan` above was
           // computed with no answer at all, and the answer changes the engine's
           // WARNINGS as well as its updates: a declined run says nothing about
@@ -2922,6 +2992,7 @@ export function registerInventoryCommands(
             currentServers: core.getSnapshot().servers,
             now: Date.now(),
             authProfile: planAuthProfile,
+            providerInstanceKey: planInstanceKey,
             adoptionChoice
           });
           // No fast-path re-entry after this recompute, and none is needed: a
@@ -3053,12 +3124,21 @@ export function registerInventoryCommands(
           // point of the pairing rule: a profile renamed or deleted while the
           // modal was open changes this render and drifts.
           const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
+          // REVIEW FINDING (P1) — derived fresh beside the profile, from
+          // `freshSource.config`. `sourceConfigUnchanged` above has already
+          // refused a changed config, so this cannot differ from
+          // `planInstanceKey` today; deriving it here anyway keeps the plan's
+          // inputs coming from ONE record rather than two, which is what stops a
+          // later loosening of that check from quietly pairing this tree with
+          // another deployment's identity.
+          const freshInstanceKey = resolveProviderInstanceKey(provider, freshSource.config);
           const recomputed = computeSyncPlan({
             source: freshSource,
             tree,
             currentServers: freshServersForRecompute,
             now: Date.now(),
             authProfile: freshAuthProfile,
+            providerInstanceKey: freshInstanceKey,
             // ADOPT 1 — the answer given once above governs EVERY recompute of
             // this run. Omitted here, this plan would render adds where the
             // preview rendered adoptions and drift on every pass, looping the
@@ -3162,6 +3242,11 @@ export function registerInventoryCommands(
             currentServers: finalServersForRecompute,
             now: Date.now(),
             authProfile: finalAuthProfile,
+            // Same record, same derivation as the recompute above — this is the
+            // plan that is actually APPLIED, so the identity that decided its
+            // adoptions must be the one derived from the source it applies
+            // against.
+            providerInstanceKey: freshInstanceKey,
             // ADOPT 1 — same answer, same run. This is the plan that is actually
             // APPLIED, so an answer missed here would not merely loop: it would
             // apply duplicate adds against consent collected for adoptions

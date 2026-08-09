@@ -14,6 +14,7 @@ import {
   inventorySecretKey,
   type InventoryProvider,
   type InventorySourceConfig,
+  type InventorySourceValues,
   type InventoryTree
 } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
@@ -149,6 +150,16 @@ function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProv
     ],
     testConnection: vi.fn(async () => {}),
     fetchInventory: vi.fn(async (): Promise<InventoryTree> => ({ contractVersion: 1, devices: [] })),
+    // REVIEW FINDING (P1, cross-instance adoption) — the fake provider names its
+    // DEPLOYMENT the way the real NetBox one does: from its own non-secret
+    // config, here the `host` field declared above. Sources built by
+    // `makeSource` carry no host, so they all resolve to one shared instance
+    // ("fake://default"), which is what makes every existing single-source test
+    // read as "one deployment, removed and re-added". A test that needs two
+    // deployments gives its sources different `config.host` values, and one that
+    // needs a provider with no instance identity overrides this with
+    // `instanceKey: undefined`.
+    instanceKey: (config: InventorySourceValues) => `fake://${String(config.host ?? "default")}`,
     ...overrides
   };
 }
@@ -5331,12 +5342,21 @@ describe("inventoryCommands", () => {
     const ADOPTION_LINE_SINGULAR =
       "The updated server will be adopted by this source — it was kept from a removed inventory source, and it keeps its saved credentials.";
 
-    /** The receipt "Keep Servers" leaves behind: this device, this provider, a source that is gone. */
+    /**
+     * REVIEW FINDING (P1, cross-instance adoption) — what `makeProvider`'s
+     * `instanceKey` returns for a source built by `makeSource` (whose `config`
+     * carries no `host`). Every marker below records it, so this block reads as
+     * "one deployment throughout" unless a test says otherwise.
+     */
+    const DEFAULT_INSTANCE = "fake://default";
+
+    /** The receipt "Keep Servers" leaves behind: this device, this provider, this INSTANCE of it, a source that is gone. */
     function keptMarker(overrides: Partial<NonNullable<ServerConfig["formerlySynced"]>> = {}): NonNullable<ServerConfig["formerlySynced"]> {
       return {
         sourceId: "old-src",
         sourceName: "My Source (removed)",
         providerId: "fake",
+        instanceKey: DEFAULT_INSTANCE,
         externalId: "device:1",
         detachedAt: 900,
         ...overrides
@@ -5362,13 +5382,18 @@ describe("inventoryCommands", () => {
         servers?: ServerConfig[];
         devices?: InventoryTree["devices"];
         sources?: Array<Partial<InventorySourceConfig>>;
+        /** REVIEW FINDING (P1) — for the one test that needs a provider naming no instance at all. */
+        provider?: Partial<InventoryProvider>;
       } = {}
     ): Promise<{ core: NexusCore }> {
       const core = new NexusCore(new InMemoryConfigRepository(options.servers ?? [keptServer()]));
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       registry.register(
-        makeProvider({ fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: options.devices ?? [DEVICE_1] })) })
+        makeProvider({
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: options.devices ?? [DEVICE_1] })),
+          ...options.provider
+        })
       );
       const sources = options.sources ?? [{}];
       const vault = makeVault(Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id ?? "src-1", "apiToken"), "tok"])));
@@ -5708,6 +5733,12 @@ describe("inventoryCommands", () => {
         sourceId: "src-1",
         sourceName: "My Source",
         providerId: "fake",
+        // REVIEW FINDING (P1, cross-instance adoption) — stamped from the
+        // provider, at the only moment it can still be asked: `source.config` is
+        // deleted with the record a line later, so a removal that forgets this
+        // leaves a marker no future sync may act on. `toEqual` (not a subset
+        // check) is what makes the omission visible here.
+        instanceKey: DEFAULT_INSTANCE,
         externalId: "device:7",
         detachedAt: expect.any(Number)
       });
@@ -5731,7 +5762,16 @@ describe("inventoryCommands", () => {
         ],
         // Both incarnations exist from the start; the removal below takes the
         // first one out, exactly as re-adding after a removal would.
-        sources: [{}, { id: "src-2", name: "My Source B" }]
+        //
+        // REVIEW FINDING (P1, cross-instance adoption) — both are pointed at the
+        // SAME deployment, spelled out rather than left to the fixture default,
+        // because that is now the thing making this round trip work: the source
+        // id changes (src-1 -> src-2) and the instance key does not, which is
+        // exactly the asymmetry the feature depends on.
+        sources: [
+          { config: { host: "netbox-a" } },
+          { id: "src-2", name: "My Source B", config: { host: "netbox-a" } }
+        ]
       });
 
       mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
@@ -5757,6 +5797,100 @@ describe("inventoryCommands", () => {
       expect(servers[0].origin?.sourceId).toBe("src-2");
       expect(servers[0].name).toBe("core-sw-01");
       expect(servers[0].formerlySynced).toBeUndefined();
+    });
+
+    it("CROSS-INSTANCE ROUND TRIP — a second deployment of the SAME provider is never offered the first one's kept server, and never takes it (kills the providerId-only identity check end to end: the marker, the question and the apply all agree)", async () => {
+      // The whole reported scenario, driven through the real commands: a lab
+      // instance beside a production one. Both are "fake" providers, both report
+      // "device:1", and the kept record sits at exactly the address the second
+      // instance's device reports — the coincidence a homelab reproduces on the
+      // first try, since NetBox numbers devices from 1 and 10.0.0.11 is nobody's
+      // idea of a unique address.
+      const { core } = await harness({
+        sources: [
+          { config: { host: "netbox-prod" } },
+          { id: "src-2", name: "Lab NetBox", config: { host: "netbox-lab" } }
+        ],
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            username: "labuser",
+            authType: "password",
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+      // The marker records WHICH deployment kept it — this is what the sync
+      // below has to disagree with.
+      expect(core.getServer("owned-1")?.formerlySynced?.instanceKey).toBe("fake://netbox-prod");
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      const shown = modals();
+      // ONE modal, and it is the preview: the question is never raised, because
+      // a question the user answers "Adopt" to is a transfer as surely as a
+      // silent one — the modal cannot say which deployment the record came from.
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe('Apply inventory sync from "Lab NetBox"?');
+      expect(shown[0][1].detail).not.toContain("adopted by this source");
+
+      // Two servers: the untouched record kept from production, and the lab
+      // instance's own new one. The pre-fix build applied ONE — `owned-1`
+      // re-homed onto src-2, at which point the lab source's Removed-Device
+      // Policy governed a production server and its saved credentials.
+      const servers = core.getSnapshot().servers;
+      expect([...servers].map((s) => s.id).sort()).toEqual(["owned-1", deterministicServerId("src-2", "device:1")].sort());
+      const keptFromProd = core.getServer("owned-1")!;
+      expect(keptFromProd.origin).toBeUndefined();
+      expect(keptFromProd.username).toBe("labuser");
+      expect(keptFromProd.formerlySynced?.instanceKey).toBe("fake://netbox-prod");
+      expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("a provider that reports no instance at all writes a receipt-only marker and adopts nothing (kills stamping an instance key the provider never supplied, and kills falling back to the provider id when it has none)", async () => {
+      const { core } = await harness({
+        provider: { instanceKey: undefined },
+        sources: [{}, { id: "src-2", name: "My Source B" }],
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+      // The receipt still exists — the UI can still say where this server came
+      // from — but it names no instance, so it is not an adoption key.
+      const marker = core.getServer("owned-1")?.formerlySynced;
+      expect(marker?.sourceName).toBe("My Source");
+      expect(marker?.externalId).toBe("device:1");
+      expect(marker).not.toHaveProperty("instanceKey");
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      // No question, and a duplicate add rather than a reclaim — the deliberate
+      // cost of a provider that cannot say which deployment it is talking to.
+      expect(modals()).toHaveLength(1);
+      expect([...core.getSnapshot().servers].map((s) => s.id).sort()).toEqual(
+        ["owned-1", deterministicServerId("src-2", "device:1")].sort()
+      );
+      expect(core.getServer("owned-1")?.origin).toBeUndefined();
     });
   });
 

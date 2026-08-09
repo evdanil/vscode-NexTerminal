@@ -3,6 +3,7 @@ import {
   NETBOX_PROVIDER_ID,
   DEFAULT_FOLDER_TEMPLATE,
   createNetboxProvider,
+  netboxInstanceKey,
   stripCidr,
   renderFolderTemplate
 } from "../../src/services/inventory/providers/netboxProvider";
@@ -41,6 +42,75 @@ describe("renderFolderTemplate", () => {
 
   it("returns an empty string when every segment is empty", () => {
     expect(renderFolderTemplate("{site}/{rack}", {})).toBe("");
+  });
+});
+
+/**
+ * REVIEW FINDING (P1, cross-instance adoption) — this key decides whether a
+ * server kept from a removed source may be reclaimed by a later one (see
+ * `DetachedServerOrigin.instanceKey`, models/config.ts). Two deployments must
+ * never collide onto one key, and one deployment must not fragment into several
+ * — the first loses a record to a source that never synced it, the second breaks
+ * the re-add this whole feature exists for.
+ */
+describe("netboxInstanceKey", () => {
+  it("collapses every spelling of ONE deployment onto ONE key — trailing slashes, an /api suffix, host case, and the scheme's default port (kills a raw-string key, which fragments one instance into five and refuses the re-add it is supposed to allow)", () => {
+    const canonical = "https://netbox.example.com";
+    for (const spelling of [
+      "https://netbox.example.com",
+      "https://netbox.example.com/",
+      "https://netbox.example.com///",
+      "https://netbox.example.com/api",
+      "https://netbox.example.com/api/",
+      "https://NetBox.Example.COM",
+      "https://netbox.example.com:443",
+      "  https://netbox.example.com  ",
+      "https://netbox.example.com?foo=bar",
+      "https://netbox.example.com#frag"
+    ]) {
+      expect(netboxInstanceKey({ baseUrl: spelling })).toBe(canonical);
+    }
+  });
+
+  it("keeps everything that actually distinguishes two deployments: host, non-default port, path prefix and path case, and the scheme (kills over-normalizing, which is the failure that transfers a record)", () => {
+    const keys = [
+      "https://netbox.example.com",
+      "https://netbox-lab.example.com",
+      "https://netbox.example.com:8443",
+      "https://netbox.example.com/netbox",
+      "https://netbox.example.com/NetBox",
+      "http://netbox.example.com"
+    ].map((baseUrl) => netboxInstanceKey({ baseUrl }));
+
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys[2]).toBe("https://netbox.example.com:8443");
+    expect(keys[3]).toBe("https://netbox.example.com/netbox");
+    expect(keys[5]).toBe("http://netbox.example.com");
+  });
+
+  it("NEVER carries userinfo — a credential typed into the non-secret base URL must not be persisted onto every kept server or copied into a backup (kills returning the base URL as typed)", () => {
+    expect(netboxInstanceKey({ baseUrl: "https://admin:s3cr3t@netbox.example.com/" })).toBe("https://netbox.example.com");
+    expect(netboxInstanceKey({ baseUrl: "https://token@netbox.example.com/" })).toBe("https://netbox.example.com");
+    // The whole point, stated as the property that matters rather than as an
+    // equality: no fragment of the credential survives into the persisted key.
+    expect(netboxInstanceKey({ baseUrl: "https://admin:s3cr3t@netbox.example.com/" })).not.toContain("s3cr3t");
+    expect(netboxInstanceKey({ baseUrl: "https://admin:s3cr3t@netbox.example.com/" })).not.toContain("admin");
+  });
+
+  it("returns undefined — no instance identity, therefore no adoption — for a base URL nothing could be fetched from (kills inventing a key for an endpoint that does not resolve)", () => {
+    // A scheme-less host is the common typo, and `new URL` rejects it; the fetch
+    // path builds its URLs from the same string, so such a source cannot sync at
+    // all and must not claim an identity either.
+    expect(netboxInstanceKey({ baseUrl: "netbox.example.com" })).toBeUndefined();
+    expect(netboxInstanceKey({ baseUrl: "" })).toBeUndefined();
+    expect(netboxInstanceKey({ baseUrl: "   " })).toBeUndefined();
+    expect(netboxInstanceKey({})).toBeUndefined();
+  });
+
+  it("is exposed ON the provider, since that is the only way the engine ever reaches it (kills an implementation that exists but is never wired up)", () => {
+    const provider = createNetboxProvider(vi.fn() as unknown as typeof fetch);
+    expect(typeof provider.instanceKey).toBe("function");
+    expect(provider.instanceKey?.({ baseUrl: "https://netbox.example.com/api/" })).toBe("https://netbox.example.com");
   });
 });
 

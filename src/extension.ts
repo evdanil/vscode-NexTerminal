@@ -1226,7 +1226,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
   const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
-  const configDisposables = registerConfigCommands(core, secretVault, context);
+  const configDisposables = registerConfigCommands(core, secretVault, context, inventoryProviderRegistry);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
   });

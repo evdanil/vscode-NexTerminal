@@ -1,4 +1,4 @@
-import type { AuthProfile, ServerConfig, ServerOrigin } from "../../models/config";
+import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin } from "../../models/config";
 import { authProfileNeedsServerKeyPath, serverOriginStampsEqual } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../models/inventory";
 import type { InventorySyncApplication } from "../../core/nexusCore";
@@ -53,6 +53,28 @@ export interface ComputeSyncPlanInput {
    * computed before there is an answer at all.
    */
   adoptionChoice?: InventoryAdoptionChoice;
+  /**
+   * ADOPT 1 / REVIEW FINDING (P1, cross-instance adoption) — WHICH DEPLOYMENT of
+   * `source.providerId` this sync is talking to, as
+   * `resolveProviderInstanceKey(provider, source.config)` reports it
+   * (models/inventory.ts). Compared against `formerlySynced.instanceKey` to
+   * decide adoption eligibility.
+   *
+   * SUPPLIED BY THE CALLER, for the reason `authProfile` is: only the provider
+   * can derive it, and this function is pure with no registry access. Derived
+   * FRESH from the source config each plan is computed against — never stamped
+   * on the source record — so it always describes the endpoint the fetch that
+   * produced `tree` actually came from, and cannot be left behind by an edit or
+   * forged by a hand-written import that changes `config` without changing a
+   * cached copy beside it.
+   *
+   * `undefined` means "this provider offers no instance identity" (it does not
+   * implement `instanceKey`, or its answer was rejected — see
+   * `resolveProviderInstanceKey`). NOTHING IS ADOPTED in that state: see the
+   * eligibility rule in the device loop for why the alternative — falling back to
+   * the provider id — is the defect this input exists to remove.
+   */
+  providerInstanceKey?: string;
 }
 
 /**
@@ -273,17 +295,61 @@ function withSourceLinkCleared(server: ServerConfig): ServerConfig {
   };
 }
 
+/**
+ * ADOPT 1 / REVIEW FINDING (P1, cross-instance adoption) — "was this marker left
+ * by a source pointed at the SAME provider deployment this sync is talking to?".
+ * The single sentence the whole adoption-ownership rule now turns on, extracted
+ * so it cannot be written twice and answered two ways.
+ *
+ * BOTH SIDES MUST BE PRESENT AND EQUAL. Written as a plain `===` this would read
+ * `undefined === undefined` as a match, which is precisely the wrong answer in
+ * the two states where a key is missing:
+ *  - the marker has none — a provider with no instance identity wrote it, or a
+ *    build of this unreleased branch from before the field existed did;
+ *  - this source has none — `resolveProviderInstanceKey` returned `undefined`,
+ *    i.e. the provider does not implement `instanceKey` (or returned something
+ *    unusable).
+ * In either state Nexus does not know whether the two name the same deployment, and
+ * "we cannot tell" must never be spelled the same way as "we checked, they
+ * match" — that is the same class of mistake as `providerId`-only matching, just
+ * reached by an absent field instead of a coarse one.
+ *
+ * THE THIRD-PARTY QUESTION, DECIDED HERE AND VISIBLE HERE: a provider that
+ * offers no instance identity gets NO adoption, rather than falling back to the
+ * old provider-kind check for it. The public provider API is experimental
+ * (services/inventory/publicApi.ts) and binds by string id with no publisher
+ * check, so the fallback would leave the defect fully intact for exactly the
+ * providers Nexus can verify least about, and would do it silently. The cost of
+ * refusing is bounded and self-explaining — the sync adds the device as a new
+ * server, the plan says why, and no record changes hands — while the cost of the
+ * fallback is a server, and its credentials, moving to a source that never
+ * synced it. Adoption is a convenience; not losing a record is not. Providers
+ * opt back in by implementing one pure method.
+ */
+function sameProviderInstance(kept: DetachedServerOrigin, providerInstanceKey: string | undefined): boolean {
+  return providerInstanceKey !== undefined && kept.instanceKey !== undefined && kept.instanceKey === providerInstanceKey;
+}
+
+/**
+ * Up to 3 quoted names, in the order they were collected — the example-list
+ * shape every aggregate warning in this file uses. Extracted so the adoption
+ * refusal summaries (REVIEW FINDING, P1) render their examples exactly as
+ * `pushSkipSummary` renders its own, rather than approximately.
+ */
+function namedExamples(names: string[]): string {
+  return names
+    .slice(0, 3)
+    .map((s) => `"${s}"`)
+    .join(", ");
+}
+
 /** N1 — appends one summary warning for a category of non-owned device skips, naming up to 3 examples. No-op when the category is empty. */
 function pushSkipSummary(warnings: string[], reason: string, examples: string[]): void {
   const count = examples.length;
   if (count === 0) {
     return;
   }
-  const shown = examples
-    .slice(0, 3)
-    .map((s) => `"${s}"`)
-    .join(", ");
-  warnings.push(`${count} device${count === 1 ? "" : "s"} ${reason} and ${count === 1 ? "was" : "were"} skipped (e.g. ${shown}).`);
+  warnings.push(`${count} device${count === 1 ? "" : "s"} ${reason} and ${count === 1 ? "was" : "were"} skipped (e.g. ${namedExamples(examples)}).`);
 }
 
 /**
@@ -298,6 +364,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // third state (never asked) is false for both.
   const adoptKeptServers = input.adoptionChoice === "adopt";
   const adoptionDeclined = input.adoptionChoice === "decline";
+  /** REVIEW FINDING (P1) — see `ComputeSyncPlanInput.providerInstanceKey` and `sameProviderInstance`. */
+  const providerInstanceKey = input.providerInstanceKey;
   const warnings: string[] = [...(tree.warnings ?? [])];
 
   // AUTH 1 — the source names a profile by id; the caller supplies the profile
@@ -430,32 +498,75 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
    * therefore never adoptable, however exactly its address matches — that is the
    * whole rule, and the reason the index is keyed by device rather than address.
    *
-   * Two clauses scope it:
+   * Three clauses scope it:
    *  - `origin === undefined`: a server owned by ANY source (this one, another
    *    live one, or a dangling reference) is never adopted. Two sources tugging
    *    at one record is what the ownership model (F6, first-owner-wins) exists
    *    to prevent, and it also makes a record carrying BOTH `origin` and a stale
    *    marker inert rather than dangerous.
-   *  - `providerId`: only a source of the same provider may claim a marker.
-   *    `externalId` is provider-scoped and nothing more — two NetBox instances
-   *    both emit "device:1" — so without this a marker left by one provider's
-   *    source could be claimed by an entirely different kind of source.
+   *  - `providerId`: only a source of the same provider may claim a marker, so a
+   *    marker left by one KIND of source can never be claimed by another.
+   *  - `instanceKey`: and only a source pointed at the same DEPLOYMENT of that
+   *    provider — see `sameProviderInstance` below, which is where the real work
+   *    of this rule now lives.
+   *
+   * REVIEW FINDING (P1, cross-instance adoption) — `providerId` used to be the
+   * whole of the identity clause, and it is not enough. `externalId` is unique
+   * only within one deployment: two NetBox instances both emit "device:1", and
+   * the endpoint corroboration below cannot separate them either, because
+   * 10.0.0.1:22 is the most ordinary private endpoint there is. A lab instance
+   * beside a production one — this extension's own audience — was therefore
+   * enough to make instance B's "device:1 at 10.0.0.1:22" adopt the server
+   * instance A had kept, silently transferring a record (and its stored
+   * password, passphrase and proxy credentials, which follow the surviving id)
+   * to a source that had never seen that machine and whose prune policy could
+   * then delete it.
    */
   const keptByExternalId = new Map<string, ServerConfig[]>();
+  /**
+   * REVIEW FINDING (P1) — the markers this source is REFUSED, not the ones it
+   * ignores: same provider, naming a device in this tree, but from a different
+   * deployment (or from one nothing recorded). Kept separately from
+   * `keptByExternalId` purely so the refusal can EXPLAIN ITSELF — see the
+   * aggregate warnings after the device loop. Nothing in this map is ever
+   * adoptable; membership is a reason to talk, never a reason to act.
+   */
+  const foreignInstanceByExternalId = new Map<string, ServerConfig[]>();
   for (const server of currentServers) {
     const kept = server.formerlySynced;
     if (server.origin !== undefined || kept === undefined || kept.providerId !== source.providerId) {
       continue;
     }
-    const bucket = keptByExternalId.get(kept.externalId);
+    const index = sameProviderInstance(kept, providerInstanceKey) ? keptByExternalId : foreignInstanceByExternalId;
+    const bucket = index.get(kept.externalId);
     if (bucket) {
       bucket.push(server);
     } else {
-      keptByExternalId.set(kept.externalId, [server]);
+      index.set(kept.externalId, [server]);
     }
   }
   /** ADOPT 1 — see `InventorySyncPlan.adoptionCandidateNames`. Filled in BOTH modes. */
   const adoptionCandidateNames: string[] = [];
+  /**
+   * REVIEW FINDING (P1, cross-instance adoption) — the two refusal buckets, both
+   * aggregated into ONE warning each after the loop rather than one line per
+   * device. The population here is systematically large in the exact scenario
+   * the rule exists for: a second instance of the same provider assigns the same
+   * ids from 1, so EVERY device can match a kept marker, and a per-device
+   * sentence would bury the rest of the plan under hundreds of identical lines.
+   *
+   * Both are recorded only for markers whose ADDRESS also still matches the
+   * device — the population that would have been adopted if the instance had
+   * matched, and therefore the only one whose refusal a user could otherwise
+   * mistake for a bug. A kept record from another instance at some unrelated
+   * address is not something adoption was ever going to touch, and saying so
+   * would be noise about a non-event.
+   */
+  const instanceMismatchDeviceNames: string[] = [];
+  const noInstanceIdentityDeviceNames: string[] = [];
+  /** The instances those refused markers DID name, so the warning can show what to compare against. */
+  const recordedForeignInstances = new Set<string>();
+  let sawUnrecordedInstance = false;
 
   // m10 — maps externalId -> the first-seen device's name, so a later
   // duplicate's warning can name which device was kept, not just its id.
@@ -900,18 +1011,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // waiting for it — reordering these two would change a corner nobody asked
     // to change, on the strength of a feature about a different problem.
     //
-    // ELIGIBILITY, all of it: the server carries this provider's "Keep Servers"
-    // marker naming THIS device (the index above), AND its CURRENT address is
-    // still the device's address. The marker establishes identity; the address
-    // corroborates it.
+    // ELIGIBILITY, all of it: the server carries a "Keep Servers" marker naming
+    // THIS device, left by a source of this provider pointed at the SAME
+    // DEPLOYMENT of it (the index above, and `sameProviderInstance`), AND its
+    // CURRENT address is still the device's address. The marker plus the
+    // instance establishes identity; the address corroborates it.
     //
-    // WHY CORROBORATE AT ALL. `externalId` is unique only within one provider
-    // INSTANCE: two NetBox deployments both emit "device:1", so a marker left by
-    // one could otherwise be claimed by a device from the other — silently
-    // handing a server to a source that has never seen that machine. With the
-    // address check, a false match needs the same externalId AND the same
-    // address across two instances of one provider, which effectively means the
-    // same machine.
+    // WHY CORROBORATE AT ALL, now that the instance is checked. The instance key
+    // is what makes "device:1" mean one machine instead of one machine per
+    // deployment, so it carries the identity argument that the address check
+    // used to be asked to carry alone — and could not: `externalId` is unique
+    // only within one instance, two NetBox deployments both emit "device:1", and
+    // 10.0.0.1:22 is the most ordinary private endpoint there is, so "same id
+    // AND same address" was satisfied by a lab instance sitting beside a
+    // production one (REVIEW FINDING, P1). The address check stays as a SECOND
+    // signal, doing the job it is actually good at: catching a marker that has
+    // drifted from the record it describes — a kept server hand-edited to a
+    // different host, or a device re-IP'd at the source — where re-linking would
+    // point this source at a machine the user has since moved.
     //
     // WHAT THIS DELIBERATELY GIVES UP, so nobody "fixes" it by dropping the
     // clause: a device that legitimately CHANGED ADDRESS while the source was
@@ -1068,6 +1185,41 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ? `Device "${device.name}" was previously synced onto server "${keptMatches[0].name}", but that server is now at ${keptMatches[0].host}:${keptMatches[0].port} and the device is at ${endpoint.host}:${port} — it will be added as a new server instead.`
           : `Device "${device.name}" was previously synced onto ${keptMatches.length} servers in your list, none of which is still at ${endpoint.host}:${port} — it will be added as a new server instead.`
       );
+    } else if (!adoptionDeclined) {
+      // REVIEW FINDING (P1, cross-instance adoption) — LAST in the chain, and
+      // that position is the rule: a device with an eligible marker (adopted,
+      // ambiguous, or re-addressed) has already been decided and explained by
+      // one of the branches above, so a stale marker from some other instance is
+      // not worth a second sentence about the same device. Only a device whose
+      // ONLY same-provider markers are foreign reaches here.
+      //
+      // Recorded, not pushed: these are aggregated after the loop (see the
+      // buckets' declaration). The address filter matches the eligibility rule's
+      // corroboration exactly, so what is reported is "this looked adoptable and
+      // was refused on instance identity", never "some unrelated old record
+      // mentions this device id".
+      const foreignAtThisAddress = (foreignInstanceByExternalId.get(device.externalId) ?? []).filter(
+        (s) => s.host.toLowerCase() === endpoint.host.toLowerCase() && s.port === port
+      );
+      if (foreignAtThisAddress.length > 0) {
+        if (providerInstanceKey === undefined) {
+          // Not "a different instance" — Nexus has no idea WHICH instance this
+          // source is, so it cannot claim the marker names another one. The two
+          // states get different copy because they have different repairs: this
+          // one is the provider author's to fix, the other is the user's.
+          noInstanceIdentityDeviceNames.push(device.name);
+        } else {
+          instanceMismatchDeviceNames.push(device.name);
+          for (const foreign of foreignAtThisAddress) {
+            const recorded = foreign.formerlySynced?.instanceKey;
+            if (recorded === undefined) {
+              sawUnrecordedInstance = true;
+            } else {
+              recordedForeignInstances.add(recorded);
+            }
+          }
+        }
+      }
     }
 
     const hostPortKey = `${endpoint.host.toLowerCase()}:${port}`;
@@ -1220,6 +1372,34 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       keylessKeyProfile && matchedProfile !== undefined
         ? `The auth profile "${matchedProfile.name}" for "${source.name}" uses private key authentication but has no key file — servers this source creates have no key of their own, so the sync does not apply it: they use the default username with SSH agent authentication instead. Add a key file to the profile, or choose another.${clearedNote}${retainedNote}`
         : `The auth profile for "${source.name}" no longer exists — synced servers use the default username with SSH agent authentication. Edit the source to choose another profile.`
+    );
+  }
+
+  // REVIEW FINDING (P1, cross-instance adoption) — the refusals, aggregated.
+  // Placed with the other summaries, and BEFORE them so the sentence about
+  // records that already exist precedes the ones about devices that were
+  // skipped. Both are silent when nothing was refused, and both stay silent on a
+  // `"decline"` run for the reason the other adoption refusals do: the user who
+  // has just chosen Add Separately does not need adoption explained to them.
+  if (instanceMismatchDeviceNames.length > 0) {
+    const n = instanceMismatchDeviceNames.length;
+    // Distinct recorded instances, capped like every other example list here.
+    // "an unrecorded instance" covers a marker that named none at all — a
+    // third-party provider without `instanceKey`, or a marker written before
+    // this field existed — which is a different thing from naming a different
+    // one and must not be printed as an empty pair of quotes.
+    const recorded = [...recordedForeignInstances].slice(0, 3).map((key) => `"${key}"`);
+    if (sawUnrecordedInstance) {
+      recorded.push("an unrecorded instance");
+    }
+    warnings.push(
+      `${n} device${n === 1 ? "" : "s"} ${n === 1 ? "matches a server" : "match servers"} kept from a removed inventory source of this provider, but ${n === 1 ? "that server was" : "those servers were"} synced from ${recorded.join(", ")} rather than this source's "${providerInstanceKey}" — ${n === 1 ? "it" : "they"} will be added as ${n === 1 ? "a new server" : "new servers"} instead (e.g. ${namedExamples(instanceMismatchDeviceNames)}).`
+    );
+  }
+  if (noInstanceIdentityDeviceNames.length > 0) {
+    const n = noInstanceIdentityDeviceNames.length;
+    warnings.push(
+      `${n} device${n === 1 ? "" : "s"} ${n === 1 ? "matches a server" : "match servers"} kept from a removed inventory source, but the "${source.providerId}" provider does not report which instance a device came from, so Nexus cannot tell whether ${n === 1 ? "that server belongs" : "those servers belong"} to this source — ${n === 1 ? "it" : "they"} will be added as ${n === 1 ? "a new server" : "new servers"} instead (e.g. ${namedExamples(noInstanceIdentityDeviceNames)}).`
     );
   }
 

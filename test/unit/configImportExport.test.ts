@@ -135,6 +135,8 @@ import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
 import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import { isValidDetachedServerOrigin } from "../../src/utils/validation";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { createNetboxProvider } from "../../src/services/inventory/providers/netboxProvider";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
@@ -814,8 +816,18 @@ describe("config import command (legacy)", () => {
     expect(snapshot.servers[0].formerlySynced).toBeUndefined();
   });
 
-  it("(ADOPT 1) a backup-imported server keeps a WELL-FORMED formerlySynced marker (kills stripping it unconditionally at the import boundary, which would make every restored kept server permanently unadoptable)", async () => {
-    const marker = { sourceId: "src1", sourceName: "NetBox", providerId: "netbox", externalId: "device:1", detachedAt: 1717000000000 };
+  it("(ADOPT 1) a backup-imported server keeps a WELL-FORMED formerlySynced marker, instanceKey and all (kills stripping it unconditionally at the import boundary, which would make every restored kept server permanently unadoptable, and kills dropping the one member that decides which deployment may claim it)", async () => {
+    const marker = {
+      sourceId: "src1",
+      sourceName: "NetBox",
+      providerId: "netbox",
+      // REVIEW FINDING (P1, cross-instance adoption) — asserted by `toEqual`, so
+      // a boundary that quietly dropped this member would show up here rather
+      // than as a mysteriously un-adoptable server three flows later.
+      instanceKey: "https://netbox.example.com",
+      externalId: "device:1",
+      detachedAt: 1717000000000
+    };
     const exportData = makeExportData({
       servers: [{ ...makeServer(), formerlySynced: marker }],
       tunnels: [],
@@ -826,6 +838,40 @@ describe("config import command (legacy)", () => {
     const snapshot = core.getSnapshot();
     expect(snapshot.servers).toHaveLength(1);
     expect(snapshot.servers[0].formerlySynced).toEqual(marker);
+  });
+
+  it("(REVIEW FINDING, P1) a marker with NO instanceKey survives import as a receipt, while one carrying an EMPTY instanceKey is stripped whole (kills requiring the member — which would discard the only record of where a legacy kept server came from — and kills accepting a blank one, which compares equal to another blank one and re-creates the cross-instance collision)", async () => {
+    const legacyMarker = { sourceId: "src1", sourceName: "NetBox", providerId: "netbox", externalId: "device:1", detachedAt: 1717000000000 };
+    const exportData = makeExportData({
+      servers: [
+        { ...makeServer(), id: "s-legacy", formerlySynced: legacyMarker },
+        {
+          ...makeServer(),
+          id: "s-blank",
+          formerlySynced: { ...legacyMarker, instanceKey: "" }
+        },
+        {
+          ...makeServer(),
+          id: "s-nonstring",
+          formerlySynced: { ...legacyMarker, instanceKey: 42 }
+        }
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+    await runImport(exportData, "merge");
+
+    const byId = new Map(core.getSnapshot().servers.map((s) => [s.id, s] as const));
+    // Kept, unchanged: the sync engine refuses to adopt it anyway (no instance
+    // key means no match), so there is nothing to protect against by throwing
+    // away its `sourceName`/`detachedAt` receipts.
+    expect(byId.get("s-legacy")?.formerlySynced).toEqual(legacyMarker);
+    // Stripped whole, the same disposition every other malformed member gets —
+    // and the servers themselves are still here.
+    expect(byId.get("s-blank")).toBeDefined();
+    expect(byId.get("s-blank")?.formerlySynced).toBeUndefined();
+    expect(byId.get("s-nonstring")).toBeDefined();
+    expect(byId.get("s-nonstring")?.formerlySynced).toBeUndefined();
   });
 
   /**
@@ -6234,6 +6280,85 @@ describe("backup export round-trip", () => {
     const manual = core.getServer("srv-manual")!;
     expect(manual.origin).toBeUndefined();
     expect(manual.formerlySynced).toBeUndefined();
+  });
+
+  /**
+   * REVIEW FINDING (P1, cross-instance adoption) — the rollback marker's INSTANCE
+   * member, which the test above cannot see: it registers no provider, so the
+   * marker it asserts is deliberately the degraded one (a receipt naming no
+   * deployment, therefore not adoptable). This is the same flow with a registry
+   * wired in, which is how `extension.ts` runs it.
+   *
+   * Both halves matter and each kills a different mistake. Stamping nothing when
+   * a provider IS available re-creates the un-adoptable rollback the marker was
+   * added to fix, one level down. Stamping something when it is NOT — a
+   * placeholder, the provider id, an empty string — hands out an identity nobody
+   * derived, which is the whole class of defect this finding is about.
+   */
+  it("(REVIEW FINDING, P1) a rolled-back source's marker records the provider INSTANCE when a registry is wired in, and records none when it is not (kills a rollback that forgets the instance — leaving every rolled-back server permanently unadoptable — and kills inventing one when no provider can be asked)", async () => {
+    async function rollbackMarkerWith(registry?: InventoryProviderRegistry) {
+      vi.clearAllMocks();
+      registeredCommands.clear();
+      configStore.clear();
+      const { encrypt } = await import("../../src/utils/configCrypto");
+
+      const backingStore = new Map<string, string>();
+      const vault: SecretVault = {
+        get: vi.fn(async (key: string) => backingStore.get(key)),
+        store: vi.fn(async (key: string, value: string) => {
+          if (key === inventorySecretKey("src1", "apiToken")) {
+            throw new Error("secret storage unavailable");
+          }
+          backingStore.set(key, value);
+        }),
+        delete: vi.fn(async (key: string) => {
+          backingStore.delete(key);
+        })
+      };
+
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      registerConfigCommands(core, vault, undefined, registry);
+
+      const secrets = { inventorySourceSecrets: { src1: { apiToken: "src1-token" } } };
+      const importData = {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [makeServer({ id: "srv-owned", name: "Owned", origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1 } })],
+        tunnels: [],
+        serialProfiles: [],
+        authProfiles: [],
+        // config.baseUrl is "https://netbox.example.com" — the value the
+        // registered provider below derives its instance key from.
+        inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
+        encryptedSecrets: encrypt(JSON.stringify(secrets), "masterpass1")
+      };
+
+      mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+      mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+      mockShowInputBox.mockResolvedValueOnce("masterpass1");
+      mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+      mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await registeredCommands.get("nexus.config.import")!();
+      return core.getServer("srv-owned")!.formerlySynced;
+    }
+
+    const registry = new InventoryProviderRegistry();
+    registry.register(createNetboxProvider(vi.fn() as unknown as typeof fetch));
+    const withProvider = await rollbackMarkerWith(registry);
+    expect(withProvider?.instanceKey).toBe("https://netbox.example.com");
+    expect(isValidDetachedServerOrigin(withProvider)).toBe(true);
+
+    // No registry — the module still works, and the marker is honest about
+    // knowing nothing: written as an ABSENT member rather than an empty or
+    // placeholder string, because the sync engine reads absent as "not
+    // adoptable" and would read a placeholder as an instance to match on.
+    const withoutProvider = await rollbackMarkerWith(undefined);
+    expect(withoutProvider?.externalId).toBe("dev-a");
+    expect(withoutProvider).not.toHaveProperty("instanceKey");
   });
 
   /**

@@ -102,12 +102,30 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
  * a stripped marker is proportionate and self-repairing in the safe direction:
  * the server simply stops being adoptable, so the next sync adds a duplicate and
  * says so, instead of re-homing a record on the strength of a field nobody wrote.
+ *
+ * REVIEW FINDING (P1, cross-instance adoption) — `instanceKey` is the ONE member
+ * that is optional, and the asymmetry is deliberate. Absent, it means "this
+ * marker names no provider instance", which the engine already refuses to adopt
+ * on (see DetachedServerOrigin in models/config.ts): requiring it here would
+ * discard the marker's `sourceName`/`detachedAt` receipts — the only record of
+ * where such a server came from — to enforce a rule the engine enforces anyway.
+ * PRESENT it must be well-formed, because a present key is compared for equality
+ * and decides an adoption: a non-string or an empty string cannot have come from
+ * `resolveProviderInstanceKey` (models/inventory.ts, which rejects both), and an
+ * empty one would compare equal to another empty one — the very collision the
+ * field exists to prevent. Length and control characters are not re-checked
+ * here: those bound what this extension WRITES, and a marker that merely carries
+ * an over-long key still names a real instance, which is a worse thing to
+ * discard than to keep.
  */
 export function isValidDetachedServerOrigin(value: unknown): value is DetachedServerOrigin {
   if (typeof value !== "object" || value === null) {
     return false;
   }
   const obj = value as Record<string, unknown>;
+  if (obj.instanceKey !== undefined && !isNonEmptyString(obj.instanceKey)) {
+    return false;
+  }
   return (
     isNonEmptyString(obj.sourceId) &&
     isNonEmptyString(obj.sourceName) &&

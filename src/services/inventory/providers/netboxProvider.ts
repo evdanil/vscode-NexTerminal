@@ -86,6 +86,63 @@ function normalizeBaseUrl(raw: string): string {
   return url.replace(/\/+$/, "");
 }
 
+/**
+ * REVIEW FINDING (P1, cross-instance adoption) — this NetBox deployment's
+ * identity: "the NetBox at https://netbox.example.com", not "NetBox". See
+ * `InventoryProvider.instanceKey` (models/inventory.ts) for the contract and for
+ * what depends on it; this is the reference implementation.
+ *
+ * BUILT ON `normalizeBaseUrl`, THE SAME FUNCTION THAT BUILDS EVERY REQUEST. The
+ * key has to mean "the endpoint this source actually talks to", so it must be
+ * derived from exactly the string the fetch is derived from — a second,
+ * independently-written normalizer is a second answer to the same question, and
+ * the two would drift. Everything below is canonicalization the URL parser does
+ * on top of it, so two spellings of one endpoint yield one key:
+ *  - SCHEME AND HOST are lower-cased (both are case-insensitive by RFC 3986, and
+ *    `new URL` does it), and a DEFAULT PORT is dropped — `https://nb:443` and
+ *    `https://NB` are the same deployment and now the same key.
+ *  - THE PATH IS KEPT AS TYPED, case included: NetBox is commonly mounted under
+ *    a prefix (`https://example.com/netbox`), those are different deployments,
+ *    and path case is server-significant in a way host case is not.
+ *  - USERINFO IS DROPPED, and this one is a hard requirement rather than tidiness
+ *    — `https://user:token@netbox` is a credential typed into a NON-secret field,
+ *    and this key is persisted on every kept server and copied into backups. The
+ *    method never sees `secrets`; this is the other half of keeping it clean.
+ *  - QUERY AND FRAGMENT ARE DROPPED: neither addresses a deployment, and leaving
+ *    them in would split one instance into as many keys as there are stray "?"
+ *    suffixes.
+ *
+ * SCHEME IS PART OF THE IDENTITY (`http://nb` !== `https://nb`), deliberately,
+ * even though it is usually the same box behind both. The two failure modes are
+ * not symmetrical: treating two instances as one is the finding being fixed and
+ * is silent and destructive, while treating one instance as two costs a refused
+ * adoption that the plan explains and that re-typing the URL repairs.
+ *
+ * `undefined` for an unparseable or empty base URL — including a bare
+ * `netbox.example.com` with no scheme, which `new URL` rejects. That is not a
+ * loss: the fetch path builds `new URL(`${baseUrl}/api/...`)` from the same
+ * string, so a source whose base URL cannot be parsed cannot sync at all, and
+ * claiming an identity for it would be claiming one for an endpoint that does
+ * not resolve.
+ */
+export function netboxInstanceKey(config: InventorySourceValues): string | undefined {
+  const normalized = normalizeBaseUrl(String(config.baseUrl ?? ""));
+  if (!normalized) {
+    return undefined;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    return undefined;
+  }
+  // `host` (not `hostname`) so a non-default port stays part of the identity;
+  // the parser has already dropped the scheme's default port and lower-cased
+  // both scheme and host.
+  const path = parsed.pathname.replace(/\/+$/, "");
+  return `${parsed.protocol}//${parsed.host}${path}`;
+}
+
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   const host = url.host || url.toString();
   if (err instanceof Error) {
@@ -550,6 +607,9 @@ export function createNetboxProvider(fetchImpl: typeof fetch = fetch): Inventory
     id: NETBOX_PROVIDER_ID,
     label: "NetBox",
     configFields: NETBOX_CONFIG_FIELDS,
+    instanceKey(config: InventorySourceValues): string | undefined {
+      return netboxInstanceKey(config);
+    },
     async testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
       const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
       const token = secrets.apiToken ?? "";

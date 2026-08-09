@@ -1809,12 +1809,38 @@ describe("computeSyncPlan — adopt-on-add", () => {
   /** What the ADD path would mint for makeDevice()'s externalId — the id an adoption must NOT produce. */
   const ADD_PATH_ID = deterministicServerId("source-1", "device:1");
 
-  /** The receipt "Keep Servers" leaves behind: this device, this provider, a source that no longer exists. */
+  /**
+   * REVIEW FINDING (P1, cross-instance adoption) — the NetBox deployment every
+   * fixture in this block is about, and `INSTANCE_B` is a SECOND deployment of
+   * the same provider. Every kept marker records `INSTANCE_A`, and `planFor`
+   * below computes plans for a source pointed at `INSTANCE_A`, so the whole
+   * block reads as "one instance, removed and re-added" — and any test that
+   * wants the cross-instance case has to say so explicitly.
+   */
+  const INSTANCE_A = "https://netbox.example.com";
+  const INSTANCE_B = "https://netbox-lab.example.com";
+
+  /**
+   * `computeSyncPlan` with this block's default provider instance supplied.
+   *
+   * A default rather than a per-call literal because the instance is a property
+   * of the FIXTURE, not of any individual test: these tests are all about one
+   * deployment's marker meeting one deployment's source, and spelling that out
+   * 25 times would bury the one thing each test actually varies. Tests about the
+   * instance rule itself pass `providerInstanceKey` explicitly, and an explicit
+   * `undefined` still wins — it is spread over the default, not merged with it.
+   */
+  function planFor(input: Parameters<typeof computeSyncPlan>[0]) {
+    return computeSyncPlan({ providerInstanceKey: INSTANCE_A, ...input });
+  }
+
+  /** The receipt "Keep Servers" leaves behind: this device, this provider, this INSTANCE of it, a source that no longer exists. */
   function keptMarker(overrides: Partial<ServerConfig["formerlySynced"] & object> = {}) {
     return {
       sourceId: "removed-source",
       sourceName: "NetBox (removed)",
       providerId: "netbox",
+      instanceKey: INSTANCE_A,
       externalId: "device:1",
       detachedAt: 900,
       ...overrides
@@ -1848,7 +1874,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const source = makeSource();
     // Identical to the canonical fixture in every respect EXCEPT the marker.
     const handMade = makeKeptServer({ formerlySynced: undefined });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [handMade], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [handMade], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -1864,7 +1890,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-1) flag on: the kept server is UPDATED in place — same id, credentials byte-for-byte, name/host/port/folder from the device, marker cleared (kills the duplicate add, the minted id, and the rebuilt-from-the-add-path record)", () => {
     const source = makeSource();
     const kept = makeKeptServer();
-    const plan = computeSyncPlan({
+    const plan = planFor({
       source,
       tree: makeTree([keptDevice({ folderPath: "Syd/R1" })]),
       currentServers: [kept],
@@ -1915,7 +1941,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // to avoid is neither added nor resolved.
     const source = makeSource();
     const kept = makeKeptServer({ name: "core-sw-1", host: "lab-sw-01", port: 22, group: "NetBox" });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.unchangedCount).toBe(0);
     expect(plan.adds).toHaveLength(0);
@@ -1927,7 +1953,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-2) no answer supplied: today's PLAN bit-for-bit — a duplicate add with the verbatim warning — yet the candidate list is still populated (kills a default-adopt answer, and a candidate list computed only for an adopting run)", () => {
     const source = makeSource();
     const kept = makeKeptServer();
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000 });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000 });
 
     expect(plan.adds).toHaveLength(1);
     expect(plan.adds[0].id).toBe(ADD_PATH_ID);
@@ -1950,7 +1976,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     // Same fixture as E-3's refusal, with no answer supplied: the device moved
     // while detached, which is the case this whole feature was written for.
-    const moved = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [makeKeptServer({ host: "10.9.9.9" })], now: 1000 });
+    const moved = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [makeKeptServer({ host: "10.9.9.9" })], now: 1000 });
     expect(moved.warnings).toContain(
       'Device "core-sw-1" was previously synced onto server "old-name", but that server is now at 10.9.9.9:22 and the device is at lab-sw-01:22 — it will be added as a new server instead.'
     );
@@ -1963,7 +1989,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // reachable through this feature's OWN happy path (Keep Servers → re-add →
     // Add Separately → apply → remove with Keep Servers again), and it is never
     // a candidate either, so this run cannot have been asked anything.
-    const ambiguous = computeSyncPlan({
+    const ambiguous = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [makeKeptServer({ id: "kept-a", name: "copy-a" }), makeKeptServer({ id: "kept-b", name: "copy-b" })],
@@ -1982,7 +2008,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-2c) DECLINED — the user was asked and chose Add Separately: the same two fixtures say NOTHING about adoption (kills emitting the refusals unconditionally, which would explain a refusal to the one user who has just decided on it, on this sync and every sync after it)", () => {
     const source = makeSource();
 
-    const moved = computeSyncPlan({
+    const moved = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [makeKeptServer({ host: "10.9.9.9" })],
@@ -1992,7 +2018,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(moved.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
     expect(moved.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([]);
 
-    const ambiguous = computeSyncPlan({
+    const ambiguous = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [makeKeptServer({ id: "kept-a", name: "copy-a" }), makeKeptServer({ id: "kept-b", name: "copy-b" })],
@@ -2016,7 +2042,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // Device host upper, kept server host lower — the mirror of E-1's fixture.
     const lowerServer = makeKeptServer({ host: "lab-sw-01" });
     const upperDevice = makeDevice({ endpoints: [{ kind: "ssh", host: "LAB-SW-01" }] });
-    const matched = computeSyncPlan({ source, tree: makeTree([upperDevice]), currentServers: [lowerServer], now: 1000, adoptionChoice: "adopt" });
+    const matched = planFor({ source, tree: makeTree([upperDevice]), currentServers: [lowerServer], now: 1000, adoptionChoice: "adopt" });
     expect(matched.adds).toHaveLength(0);
     expect(matched.updates).toHaveLength(1);
     expect(matched.updates[0].before.id).toBe("kept-1");
@@ -2025,7 +2051,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // enough: this is the clause that stops one provider instance's "device:1"
     // from claiming another instance's kept server.
     const moved = makeKeptServer({ host: "10.9.9.9" });
-    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [moved], now: 1000, adoptionChoice: "adopt" });
+    const refused = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [moved], now: 1000, adoptionChoice: "adopt" });
     expect(refused.updates).toHaveLength(0);
     expect(refused.adds).toHaveLength(1);
     expect(refused.adoptionCandidateNames).toHaveLength(0);
@@ -2041,13 +2067,13 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
     // The device's omitted port defaults to 22 and must not match a kept server on 2222.
     const otherPort = makeKeptServer({ port: 2222 });
-    const refused = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [otherPort], now: 1000, adoptionChoice: "adopt" });
+    const refused = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [otherPort], now: 1000, adoptionChoice: "adopt" });
     expect(refused.updates).toHaveLength(0);
     expect(refused.adds).toHaveLength(1);
     expect(refused.adoptionCandidateNames).toHaveLength(0);
 
     const twoMoved = [makeKeptServer({ id: "kept-a", name: "copy-a", host: "10.9.9.9" }), makeKeptServer({ id: "kept-b", name: "copy-b", host: "10.9.9.8" })];
-    const plural = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: twoMoved, now: 1000, adoptionChoice: "adopt" });
+    const plural = planFor({ source, tree: makeTree([keptDevice()]), currentServers: twoMoved, now: 1000, adoptionChoice: "adopt" });
     expect(plural.updates).toHaveLength(0);
     expect(plural.warnings).toContain(
       'Device "core-sw-1" was previously synced onto 2 servers in your list, none of which is still at lab-sw-01:22 — it will be added as a new server instead.'
@@ -2057,7 +2083,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-8) a marker from a DIFFERENT provider is never claimed (kills matching on externalId alone across provider kinds)", () => {
     const source = makeSource({ providerId: "netbox" });
     const kept = makeKeptServer({ formerlySynced: keptMarker({ providerId: "some-other-provider" }) });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -2066,10 +2092,251 @@ describe("computeSyncPlan — adopt-on-add", () => {
     expect(plan.warnings.some((w) => w.includes("previously synced onto"))).toBe(false);
   });
 
+  it("(E-15) HEADLINE for the cross-instance finding — two deployments of ONE provider, same device id, same address: instance B's device does NOT adopt instance A's kept server, and the refusal names both instances (kills the providerId-only identity check, which adopts here because every other clause is satisfied)", () => {
+    // The reported scenario, minus nothing: a lab NetBox beside a production
+    // one. Both call their first device "device:1" (NetBox numbers from 1), both
+    // sit on the same RFC1918 address (10.0.0.1:22 is the most ordinary endpoint
+    // there is), and the kept server was left behind by the OTHER instance.
+    // Under the old `providerId`-only rule the marker matched, the address
+    // corroborated, and this record — with its saved password, passphrase and
+    // proxy credentials, which follow the surviving id — changed owner silently.
+    const source = makeSource({ providerId: "netbox" });
+    const keptFromA = makeKeptServer({ host: "10.0.0.1", formerlySynced: keptMarker({ instanceKey: INSTANCE_A }) });
+    const deviceAtB = makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] });
+
+    const plan = planFor({
+      source,
+      tree: makeTree([deviceAtB]),
+      currentServers: [keptFromA],
+      now: 5000,
+      // The source doing the syncing is the OTHER deployment.
+      providerInstanceKey: INSTANCE_B,
+      adoptionChoice: "adopt"
+    });
+
+    // Nothing changes hands: the user's kept record is untouched and the device
+    // arrives as a new server under the add path's own id.
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].id).toBe(ADD_PATH_ID);
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    // And it is never even OFFERED — an adoption the user could approve is as
+    // much a transfer as one that happens by itself, because the question does
+    // not say which instance the record came from.
+    expect(plan.adoptionCandidateNames).toEqual([]);
+
+    // The refusal explains itself, naming BOTH deployments — the one diagnostic
+    // that separates "these really are two systems" from "I typed the URL
+    // differently this time", which is the only way a user could tell the
+    // legitimate re-add case apart from this one.
+    expect(plan.warnings).toContain(
+      `1 device matches a server kept from a removed inventory source of this provider, but that server was synced from "${INSTANCE_A}" rather than this source's "${INSTANCE_B}" — it will be added as a new server instead (e.g. "core-sw-1").`
+    );
+    // The address collision is still reported exactly as it is for any other
+    // duplicate — the instance line explains, it does not replace.
+    expect(plan.manualDuplicateCount).toBe(1);
+  });
+
+  it("(E-15b) the SAME deployment re-added under a brand-new source id still adopts — the instance key is what survives the id change, which is the whole point of the feature (kills matching on sourceId, and kills an instance check so strict it defeats the re-add it exists to allow)", () => {
+    // The marker names a source id that no longer exists ("removed-source"); the
+    // adopting source is "source-1". Nothing about the two records connects them
+    // except the provider, the device id, the address — and the deployment.
+    const source = makeSource({ id: "source-1", providerId: "netbox" });
+    const kept = makeKeptServer();
+    expect(kept.formerlySynced?.sourceId).not.toBe(source.id);
+
+    const adopted = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      providerInstanceKey: INSTANCE_A,
+      adoptionChoice: "adopt"
+    });
+    expect(adopted.adds).toHaveLength(0);
+    expect(adopted.updates).toHaveLength(1);
+    expect(adopted.updates[0].after.id).toBe("kept-1");
+    expect(adopted.adoptionCandidateNames).toEqual(["core-sw-1"]);
+
+    // The contrast that makes the assertion above mean something: change ONE
+    // character of the instance and the identical fixture stops adopting.
+    const refused = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      providerInstanceKey: INSTANCE_B,
+      adoptionChoice: "adopt"
+    });
+    expect(refused.updates).toHaveLength(0);
+    expect(refused.adds).toHaveLength(1);
+  });
+
+  it("(E-15c) a marker with NO instance key is never adoptable — including when this source has none either, where a bare `===` would call two absences a match (kills `kept.instanceKey === providerInstanceKey` without the presence checks, the one-line version of this rule that reads `undefined === undefined` as identity)", () => {
+    const source = makeSource({ providerId: "netbox" });
+    // Written by a build of this branch from before the field existed, or by a
+    // provider that names no instance. Every OTHER clause is satisfied: right
+    // provider, right device, right address.
+    const kept = makeKeptServer({ formerlySynced: keptMarker({ instanceKey: undefined }) });
+
+    const againstKnownInstance = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      providerInstanceKey: INSTANCE_A,
+      adoptionChoice: "adopt"
+    });
+    expect(againstKnownInstance.updates).toHaveLength(0);
+    expect(againstKnownInstance.adds).toHaveLength(1);
+    expect(againstKnownInstance.adoptionCandidateNames).toHaveLength(0);
+
+    // THE KILLER CASE. Both sides absent: a naive equality check matches here
+    // and adopts, which is the pre-fix defect reached through a missing field
+    // instead of a coarse one — any two providers with no instance identity
+    // would pool their kept servers.
+    const bothAbsent = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      providerInstanceKey: undefined,
+      adoptionChoice: "adopt"
+    });
+    expect(bothAbsent.updates).toHaveLength(0);
+    expect(bothAbsent.adds).toHaveLength(1);
+    expect(bothAbsent.adoptionCandidateNames).toHaveLength(0);
+  });
+
+  it("(E-15d) a provider that reports no instance identity gets NO adoption, and the plan says so in the provider's terms rather than the user's (kills falling back to the provider-kind check when instanceKey is unavailable — the decision this feature makes for third-party providers)", () => {
+    const source = makeSource({ providerId: "some-third-party" });
+    // A fully-formed marker from a source of this provider, at the device's
+    // address. Only the source's own instance identity is missing.
+    const kept = makeKeptServer({
+      formerlySynced: keptMarker({ providerId: "some-third-party", instanceKey: "recorded-when-it-still-had-one" })
+    });
+
+    const plan = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      providerInstanceKey: undefined,
+      adoptionChoice: "adopt"
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adoptionCandidateNames).toHaveLength(0);
+    // Different copy from the mismatch case, because it has a different repair:
+    // this one is the provider author's to fix, not the user's, and claiming
+    // "a different instance" would assert something Nexus cannot know.
+    expect(plan.warnings).toContain(
+      '1 device matches a server kept from a removed inventory source, but the "some-third-party" provider does not report which instance a device came from, so Nexus cannot tell whether that server belongs to this source — it will be added as a new server instead (e.g. "core-sw-1").'
+    );
+    expect(plan.warnings.some((w) => w.includes("rather than this source's"))).toBe(false);
+  });
+
+  it("(E-15e) the instance refusal is ONE aggregate line naming up to 3 devices and the distinct instances involved — not one line per device (kills a per-device warning, which in this rule's own scenario buries the plan under one sentence per device, since a second deployment re-uses every id)", () => {
+    const source = makeSource({ providerId: "netbox" });
+    // Five devices, five kept records from instance A, all at the addresses
+    // instance B reports — i.e. the finding's scenario at fleet scale.
+    const devices = [1, 2, 3, 4, 5].map((n) =>
+      makeDevice({ externalId: `device:${n}`, name: `sw-${n}`, endpoints: [{ kind: "ssh", host: `10.0.0.${n}` }] })
+    );
+    const kept = [1, 2, 3, 4, 5].map((n) =>
+      makeKeptServer({
+        id: `kept-${n}`,
+        name: `old-${n}`,
+        host: `10.0.0.${n}`,
+        formerlySynced: keptMarker({ externalId: `device:${n}`, instanceKey: n === 5 ? "https://third.example.com" : INSTANCE_A })
+      })
+    );
+
+    const plan = planFor({
+      source,
+      tree: makeTree(devices),
+      currentServers: kept,
+      now: 5000,
+      providerInstanceKey: INSTANCE_B
+    });
+
+    const instanceWarnings = plan.warnings.filter((w) => w.includes("rather than this source's"));
+    expect(instanceWarnings).toHaveLength(1);
+    expect(instanceWarnings[0]).toBe(
+      `5 devices match servers kept from a removed inventory source of this provider, but those servers were synced from "${INSTANCE_A}", "https://third.example.com" rather than this source's "${INSTANCE_B}" — they will be added as new servers instead (e.g. "sw-1", "sw-2", "sw-3").`
+    );
+    expect(plan.adds).toHaveLength(5);
+    expect(plan.updates).toHaveLength(0);
+  });
+
+  it("(E-15f) an unrecorded instance is described as unrecorded, never as an empty pair of quotes (kills rendering a missing instanceKey through the same slot as a recorded one)", () => {
+    const source = makeSource({ providerId: "netbox" });
+    const kept = makeKeptServer({ formerlySynced: keptMarker({ instanceKey: undefined }) });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, providerInstanceKey: INSTANCE_B });
+
+    expect(plan.warnings).toContain(
+      `1 device matches a server kept from a removed inventory source of this provider, but that server was synced from an unrecorded instance rather than this source's "${INSTANCE_B}" — it will be added as a new server instead (e.g. "core-sw-1").`
+    );
+  });
+
+  it("(E-15g) a kept record from another instance at an UNRELATED address says nothing, and a device with an eligible marker says nothing about a foreign one beside it (kills reporting every stale marker that merely shares a device id, which is noise about a non-event)", () => {
+    const source = makeSource({ providerId: "netbox" });
+
+    // Same device id, other instance, somewhere else entirely: adoption was
+    // never going to touch this record, so there is nothing to explain.
+    const elsewhere = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [makeKeptServer({ host: "10.9.9.9", formerlySynced: keptMarker({ instanceKey: INSTANCE_B }) })],
+      now: 5000,
+      providerInstanceKey: INSTANCE_A
+    });
+    expect(elsewhere.warnings.some((w) => w.includes("rather than this source's"))).toBe(false);
+    expect(elsewhere.warnings.some((w) => w.includes("does not report which instance"))).toBe(false);
+
+    // And a device that DID find its own instance's marker is decided by that;
+    // a foreign marker sitting at the same address is not a second story about
+    // the same device.
+    const adopted = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [
+        makeKeptServer({ id: "kept-a", name: "mine" }),
+        makeKeptServer({ id: "kept-b", name: "theirs", formerlySynced: keptMarker({ instanceKey: INSTANCE_B }) })
+      ],
+      now: 5000,
+      providerInstanceKey: INSTANCE_A,
+      adoptionChoice: "adopt"
+    });
+    expect(adopted.updates).toHaveLength(1);
+    expect(adopted.updates[0].after.id).toBe("kept-a");
+    expect(adopted.warnings.some((w) => w.includes("rather than this source's"))).toBe(false);
+  });
+
+  it("(E-15h) DECLINED silences the instance refusals too, exactly like the other two (kills explaining adoption to the one user who has just decided against it)", () => {
+    const source = makeSource({ providerId: "netbox" });
+    const kept = makeKeptServer({ formerlySynced: keptMarker({ instanceKey: INSTANCE_B }) });
+    const plan = planFor({
+      source,
+      tree: makeTree([keptDevice()]),
+      currentServers: [kept],
+      now: 5000,
+      providerInstanceKey: INSTANCE_A,
+      adoptionChoice: "decline"
+    });
+
+    expect(plan.warnings.some((w) => w.includes("rather than this source's"))).toBe(false);
+    // Today's duplicate notice is unaffected — declining changes what is SAID
+    // about adoption, never what the sync plans.
+    expect(plan.warnings).toContain('Device "core-sw-1" matches existing server "old-name" (lab-sw-01:22) — will be added as a duplicate.');
+    expect(plan.adds).toHaveLength(1);
+  });
+
   it("(E-8b) a marker naming a DIFFERENT device is never claimed (kills falling back to address matching when the externalId does not match)", () => {
     const source = makeSource();
     const kept = makeKeptServer({ formerlySynced: keptMarker({ externalId: "device:999" }) });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -2084,7 +2351,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       id: "foreign-1",
       origin: { sourceId: "other-source", externalId: "device:1", syncedAt: 1 }
     });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [foreignWithMarker], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [foreignWithMarker], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -2095,7 +2362,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const source = makeSource();
     const first = makeKeptServer({ id: "kept-a", name: "copy-a" });
     const second = makeKeptServer({ id: "kept-b", name: "copy-b" });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [first, second], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [first, second], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(0);
     expect(plan.adds).toHaveLength(1);
@@ -2122,7 +2389,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // Same externalId — the marker names exactly one device, so this is the ONLY
     // shape in which two devices could contend for one kept server.
     const tree = makeTree([keptDevice(), keptDevice({ name: "core-sw-2" })]);
-    const plan = computeSyncPlan({ source, tree, currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree, currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.updates).toHaveLength(1);
     expect(plan.updates[0].before.id).toBe("kept-1");
@@ -2139,7 +2406,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const source = makeSource({ authProfileId: "p1" });
     const kept = makeKeptServer({ username: "handpicked", authType: "agent", isHidden: false, proxy: undefined, keyPath: undefined });
 
-    const first = computeSyncPlan({
+    const first = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [kept],
@@ -2158,7 +2425,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // now, so it takes the ordinary update path. `syncedUsername` is absent, so
     // the retro-apply comparison falls back to defaultUsername ("admin") and the
     // hand-picked username still reads as a hand-edit — nothing happens.
-    const second = computeSyncPlan({
+    const second = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [adopted],
@@ -2172,7 +2439,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-5) same-plan retro-apply: a kept server in the add path's exact shape gains the source's profile AND the stamp that records it (kills blocking retro-apply on adoption, and linking without stamping — the opt-out hole)", () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
     const kept = makeKeptServer({ username: "admin", authType: "agent", isHidden: false, proxy: undefined });
-    const plan = computeSyncPlan({
+    const plan = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [kept],
@@ -2199,7 +2466,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-5b) a password-auth kept server gains the origin but NOT the profile link (kills 'adoption always links the source profile')", () => {
     const source = makeSource({ authProfileId: "p1" });
     const kept = makeKeptServer({ username: "admin" }); // authType "password" — the clause that must refuse
-    const plan = computeSyncPlan({
+    const plan = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [kept],
@@ -2218,7 +2485,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-10) a hidden kept server is eligible and stays hidden — isHidden is tree visibility, not identity (kills excluding hidden servers, and un-hiding on adoption)", () => {
     const source = makeSource();
     const kept = makeKeptServer({ isHidden: true });
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.adds).toHaveLength(0);
     expect(plan.updates).toHaveLength(1);
@@ -2232,7 +2499,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     // address so it is not itself involved in the match.
     const collider = makeManualServer({ id: ADD_PATH_ID, name: "hand-imported", host: "10.9.9.9" });
     const kept = makeKeptServer();
-    const plan = computeSyncPlan({
+    const plan = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [collider, kept],
@@ -2253,7 +2520,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
     const source = makeSource({ authProfileId: "p1" });
     // In the add path's exact shape, so ONLY the AUTH 1b degrade can stop the link.
     const kept = makeKeptServer({ username: "admin", authType: "agent", isHidden: false, proxy: undefined });
-    const plan = computeSyncPlan({
+    const plan = planFor({
       source,
       tree: makeTree([keptDevice()]),
       currentServers: [kept],
@@ -2273,7 +2540,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-13) planToApplication carries an adoption as an ordinary upsert under the SURVIVING id, and removes nothing (kills any 'adoptions need their own application channel' regression)", () => {
     const source = makeSource();
     const kept = makeKeptServer();
-    const plan = computeSyncPlan({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
     const application = planToApplication(plan, source);
 
     expect(application.upsertServers.map((s) => s.id)).toEqual(["kept-1"]);
@@ -2286,7 +2553,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
   it("(E-14) a kept server whose device is absent from the fetch is NOT pruned — it is nobody's to prune until it is adopted (kills treating markers as ownership)", () => {
     const source = makeSource({ prunePolicy: "delete" });
     const kept = makeKeptServer();
-    const plan = computeSyncPlan({ source, tree: makeTree([]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+    const plan = planFor({ source, tree: makeTree([]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
 
     expect(plan.prunes).toHaveLength(0);
     expect(plan.updates).toHaveLength(0);

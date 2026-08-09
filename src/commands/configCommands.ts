@@ -5,7 +5,8 @@ import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
-import { inventorySecretKey } from "../models/inventory";
+import { inventorySecretKey, resolveProviderInstanceKey } from "../models/inventory";
+import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
@@ -1315,7 +1316,26 @@ export async function captureBackupStateForExport(
   });
 }
 
-export function registerConfigCommands(core: NexusCore, vault: SecretVault, context?: import("vscode").ExtensionContext): vscode.Disposable[] {
+/**
+ * REVIEW FINDING (P1, cross-instance adoption) — `registry` is threaded in for
+ * ONE purpose: the import-rollback path below stamps a `formerlySynced` marker
+ * on servers whose source is being rolled back, and a marker needs the provider
+ * to say which DEPLOYMENT those servers came from (see DetachedServerOrigin in
+ * models/config.ts). Nothing else in this module consults a provider, and no
+ * secret is read through it.
+ *
+ * OPTIONAL, so the module still stands up in tests that have no registry — and
+ * absence degrades exactly like an unregistered provider does on the removal
+ * path: the marker is written without an instance key, i.e. as a receipt that
+ * says where the server came from but is not adoptable. Never as a marker
+ * claiming an instance nobody derived.
+ */
+export function registerConfigCommands(
+  core: NexusCore,
+  vault: SecretVault,
+  context?: import("vscode").ExtensionContext,
+  registry?: InventoryProviderRegistry
+): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
     if (!masterPassword) return;
@@ -2283,6 +2303,18 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
             // these records are detached by a single event, and a per-server Date.now() would
             // imply an ordering that does not exist.
             const detachedAt = Date.now();
+            // REVIEW FINDING (P1, cross-instance adoption) — the instance these
+            // servers were synced from, on the same terms as the Keep Servers
+            // stamp in inventoryCommands.ts: derived from the imported source's
+            // OWN config (that record is what these servers' origins named), via
+            // the currently-registered provider, and `undefined` when there is
+            // no registry, no registered provider, or no instance identity. A
+            // marker without it is a receipt, not an adoption key.
+            const rollbackInstanceKey = ((): string | undefined => {
+              if (registry === undefined || importedSource === undefined) return undefined;
+              const rollbackProvider = registry.get(importedSource.providerId);
+              return rollbackProvider === undefined ? undefined : resolveProviderInstanceKey(rollbackProvider, importedSource.config);
+            })();
             for (const serverId of serverTally.importedIds) {
               const server = core.getServer(serverId);
               const rolledBackOrigin = server?.origin;
@@ -2302,6 +2334,10 @@ export function registerConfigCommands(core: NexusCore, vault: SecretVault, cont
                       sourceId,
                       sourceName: importedSource.name,
                       providerId: importedSource.providerId,
+                      // Omitted rather than written as `undefined`, for the
+                      // reason the Keep Servers stamp gives: this object is
+                      // persisted verbatim.
+                      ...(rollbackInstanceKey !== undefined ? { instanceKey: rollbackInstanceKey } : {}),
                       externalId: rolledBackOrigin.externalId,
                       detachedAt
                     }
