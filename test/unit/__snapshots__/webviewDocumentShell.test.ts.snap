@@ -4616,7 +4616,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     <label for="macro-text">Text</label>
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">
 echo hi</textarea>
-    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline.</div>
+    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
   </div>
@@ -4652,10 +4652,31 @@ echo hi</textarea>
   </div>
 
   <div class="form-group">
+    <label for="macro-run-in-wrapper">Run in</label>
+    <div class="custom-select" id="macro-run-in-wrapper">
+      <input type="hidden" id="macro-run-in" value="session" />
+      <div class="custom-select-trigger" tabindex="0">
+        <span class="custom-select-text">Session terminal (default) - sends to the connected session</span>
+      </div>
+      <div class="custom-select-dropdown">
+        <div class="custom-select-option selected" data-value="session">Session terminal (default) - sends to the connected session</div>
+        <div class="custom-select-option" data-value="localTerminal">Local terminal - runs the text on this machine</div>
+        <div class="custom-select-option" data-value="browser">Browser - the text is a URL, opened externally</div>
+      </div>
+    </div>
+    <div class="field-error" id="error-runIn"></div>
+    <div class="hint">Local terminal and Browser macros are run from a server profile (Connectivity Hub → right-click a server → Run Macro on Server…). Neither can auto-trigger.</div>
+  </div>
+
+  <div class="form-group">
     <label for="macro-trigger">Auto-Trigger Pattern</label>
     <input type="text" id="macro-trigger" value="x" placeholder="e.g., [Pp]assword:\\s*$" />
     <div class="field-error" id="error-trigger"></div>
     <div class="variables-trigger-conflict" id="variables-trigger-conflict-2"></div>
+    <!-- Its own slot rather than a shared one: the variables/trigger conflict and the
+         profile-token/trigger conflict can both apply to the same macro, and a shared
+         element would let whichever handler ran last erase the other's message. -->
+    <div class="variables-trigger-conflict" id="profile-trigger-conflict"></div>
     <div class="hint">Enter the JavaScript regex pattern only, without surrounding /slashes/ or flags. Avoid risky shapes like (.*)+; use line-bounded text like [^\\n]*. When matched, this macro's text is sent automatically (expect/send).</div>
   </div>
 
@@ -4947,6 +4968,30 @@ echo hi</textarea>
         return { used: used, undeclared: undeclared };
       }
 
+      // Issue #48 — same precedent, same reason: the token grammar and the
+      // whitelist are interpolated from services/profileTokens.ts so the live
+      // hints below say exactly what a run will do.
+      var PROFILE_TOKEN_NAMES = ["host","port","username","name","ipmiHost"];
+      function scanProfileTokens(text) {
+        var re = new RegExp("\\\\$(\\\\$?)\\\\{profile\\\\.([A-Za-z][A-Za-z0-9_]*)\\\\}", "g");
+        var used = [];
+        var unknown = [];
+        var seenUsed = Object.create(null);
+        var seenUnknown = Object.create(null);
+        var match;
+        while ((match = re.exec(text)) !== null) {
+          if (match[1] === "$") continue;
+          var name = match[2];
+          if (PROFILE_TOKEN_NAMES.indexOf(name) !== -1) {
+            if (!seenUsed[name]) { seenUsed[name] = true; used.push(name); }
+          } else if (!seenUnknown[name]) {
+            seenUnknown[name] = true;
+            unknown.push(name);
+          }
+        }
+        return { used: used, unknown: unknown };
+      }
+
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
@@ -4995,6 +5040,29 @@ echo hi</textarea>
       var variablesList = document.getElementById("variables-list");
       var variableRowTemplate = document.getElementById("variable-row-template");
       var TRIGGER_CONFLICT_MESSAGE = "A macro can prompt for input or auto-trigger, not both. For prompts on an automated flow, use a Script with prompt().";
+      // The host enforces this same rule through validateMacroRunTarget()
+      // (models/terminalMacro.ts); the message is interpolated from there so the
+      // two cannot drift.
+      var RUN_IN_CONFLICT_MESSAGE = "A macro can auto-trigger or run outside its session, not both. Set \\"Run in\\" back to Session terminal, or clear the auto-trigger pattern.";
+      // The host enforces this one in MacroEditorPanel's save handler, and
+      // MacroAutoTrigger.reload() refuses to compile such a rule regardless.
+      var PROFILE_TRIGGER_CONFLICT_MESSAGE = "Macros using \${profile...} tokens resolve against a chosen server, so they cannot auto-trigger. Remove the trigger pattern or the profile tokens.";
+
+      function updateRunInConflictWarning() {
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var runInVal = document.getElementById("macro-run-in").value;
+        var errEl = document.getElementById("error-runIn");
+        errEl.textContent = triggerVal && runInVal !== "session" ? RUN_IN_CONFLICT_MESSAGE : "";
+      }
+
+      function updateProfileTriggerConflictWarning() {
+        var triggerVal = document.getElementById("macro-trigger").value.trim();
+        var usesProfile = scanProfileTokens(document.getElementById("macro-text").value).used.length > 0;
+        var el = document.getElementById("profile-trigger-conflict");
+        var show = !!triggerVal && usesProfile;
+        el.textContent = show ? PROFILE_TRIGGER_CONFLICT_MESSAGE : "";
+        el.classList.toggle("visible", show);
+      }
 
       // Row N's error slot is addressed by data-var-error="N" (§9.2). Renumbering
       // on every add/remove keeps that index equal to the row's DOM position,
@@ -5106,6 +5174,26 @@ echo hi</textarea>
           okLine.className = "diag-positive";
           okLine.textContent = "Will prompt for: " + scan.used.join(", ");
           lines.push(okLine);
+        }
+
+        // Issue #48 — the same three-shape treatment for profile tokens: what
+        // will be filled in from the server, and what looks like a token but is
+        // not one. A misspelled token is NOT an error (it is sent as-is, exactly
+        // like an undeclared placeholder), so it warns rather than blocks.
+        var profileScan = scanProfileTokens(text);
+        for (var pu = 0; pu < profileScan.unknown.length; pu++) {
+          var badLine = document.createElement("div");
+          badLine.className = "diag-hint";
+          badLine.textContent =
+            "\${profile." + profileScan.unknown[pu] + "} is not a profile token and will be sent as-is. Tokens: " +
+            PROFILE_TOKEN_NAMES.join(", ") + ".";
+          lines.push(badLine);
+        }
+        if (profileScan.used.length > 0) {
+          var profileLine = document.createElement("div");
+          profileLine.className = "diag-positive";
+          profileLine.textContent = "Filled from the server profile at run time: " + profileScan.used.join(", ");
+          lines.push(profileLine);
         }
 
         for (var li = 0; li < lines.length; li++) {
@@ -5313,6 +5401,7 @@ echo hi</textarea>
       document.getElementById("macro-text").addEventListener("input", function() {
         markDirty();
         scheduleDiagnostics();
+        updateProfileTriggerConflictWarning();
       });
       document.getElementById("macro-secret").addEventListener("change", markDirty);
       document.getElementById("macro-trigger").addEventListener("input", function() {
@@ -5321,6 +5410,12 @@ echo hi</textarea>
         var errorEl = document.getElementById("error-trigger");
         errorEl.textContent = validateTriggerPattern(val);
         updateTriggerConflictWarning();
+        updateRunInConflictWarning();
+        updateProfileTriggerConflictWarning();
+      });
+      document.getElementById("macro-run-in").addEventListener("change", function() {
+        markDirty();
+        updateRunInConflictWarning();
       });
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
@@ -5387,6 +5482,7 @@ echo hi</textarea>
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
+        var runInVal = document.getElementById("macro-run-in").value;
         var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
@@ -5430,6 +5526,22 @@ echo hi</textarea>
           document.getElementById("error-trigger-profile").textContent = "";
         }
 
+        if (triggerVal && runInVal !== "session") {
+          document.getElementById("error-runIn").textContent = RUN_IN_CONFLICT_MESSAGE;
+          valid = false;
+        } else {
+          document.getElementById("error-runIn").textContent = "";
+        }
+
+        if (triggerVal && scanProfileTokens(text).used.length > 0) {
+          valid = false;
+          // Same fallback discipline as the variables conflict below: never
+          // clobber a more specific regex error already sitting on the field.
+          if (!document.getElementById("error-trigger").textContent) {
+            document.getElementById("error-trigger").textContent = PROFILE_TRIGGER_CONFLICT_MESSAGE;
+          }
+        }
+
         var variablesForSave = collectVariablesForSave();
         if (!validateVariablesClientSide(variablesForSave)) {
           valid = false;
@@ -5471,6 +5583,7 @@ echo hi</textarea>
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
           triggerProfileId: triggerProfileId || null,
+          runIn: runInVal,
           variables: variablesForSave,
           group: folderVal || null
         });
@@ -5516,6 +5629,8 @@ echo hi</textarea>
       updateTriggerProfileState();
       computeDiagnostics();
       updateTriggerConflictWarning();
+      updateRunInConflictWarning();
+      updateProfileTriggerConflictWarning();
     })();
   </script>
 </body>

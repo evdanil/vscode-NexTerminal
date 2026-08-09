@@ -2,8 +2,15 @@ import * as vscode from "vscode";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
+import { macroRunTargetLabel, resolveMacroRunTarget } from "../models/terminalMacro";
 import { getMacroFolders, getMacros, saveMacros } from "../macroSettings";
-import { findAmbiguousMacroStateKeys, macroStateKey } from "../services/macroAutoTrigger";
+import {
+  findAmbiguousMacroStateKeys,
+  isCompilableTriggerMacro,
+  macroStateKey,
+  triggerCompileBlocker,
+  type TriggerCompileBlocker
+} from "../services/macroAutoTrigger";
 import { getValidMacroVariables, hasMacroVariables, scanPlaceholders } from "../services/macroVariables";
 import { collectMacroFolders, sanitizeMacroGroup } from "../services/macroFolders";
 import {
@@ -23,6 +30,24 @@ export { VARIABLE_MARKER };
 /** §4.10 — reuses the Hub's `FolderTreeItem`, parameterised (see its doc comment). */
 const MACRO_FOLDER_CONTEXT_VALUE = "nexus.folder.macros";
 const MACRO_FOLDER_ID_PREFIX = "macro-folder";
+
+/**
+ * §6.3 — one line per reason `MacroAutoTrigger.reload()` compiles nothing for a
+ * macro that nonetheless declares a `triggerPattern`. The keys ARE
+ * `TriggerCompileBlocker`, so adding a skip to the compiler makes this map fail to
+ * type-check until the sidebar has something to say about it — which is the whole
+ * point: the previous silent failure mode was a new compiler skip that the tree
+ * neither mirrored nor mentioned.
+ *
+ * Each line names the macro's own property, never a repair step: unlike an
+ * identity conflict (corrupt data, see below), these three are all states the user
+ * deliberately configured and can undo in the macro editor.
+ */
+const TRIGGER_SUPPRESSION_NOTES: Record<TriggerCompileBlocker, string> = {
+  variables: "Auto-trigger suppressed: macro has variables",
+  "run-target": "Auto-trigger suppressed: the macro runs outside its session",
+  "profile-tokens": "Auto-trigger suppressed: ${profile...} tokens need a chosen server"
+};
 
 export class MacroTreeItem extends vscode.TreeItem {
   public constructor(
@@ -79,6 +104,14 @@ export class MacroTreeItem extends vscode.TreeItem {
       this.tooltip = `${macro.name}${bindingHint}\n${macro.text.replace(/\n/g, "\\n")}`;
     }
 
+    // Issue #48 — where it runs, when that is not the session. A macro that
+    // opens a browser window or a local shell from a sidebar click is not the
+    // thing the rest of this row describes.
+    const runTarget = resolveMacroRunTarget(macro);
+    if (runTarget !== "session") {
+      this.tooltip += `\nRuns in: ${macroRunTargetLabel(runTarget)}`;
+    }
+
     // \u00a79.6 \u2014 names only; values do not exist at this point. Only names whose
     // placeholder actually appears (unescaped) in the text are ever prompted
     // for (\u00a75.3), so this mirrors runMacro()'s own scan rather than just
@@ -87,19 +120,36 @@ export class MacroTreeItem extends vscode.TreeItem {
       this.tooltip += `\nPrompts for: ${promptedNames.join(", ")}`;
     }
 
-    // \u00a76.3 \u2014 a macro with BOTH a triggerPattern and variables must never
-    // render as a live trigger macro: macroAutoTrigger.reload()'s in-loop
-    // `continue` means such a rule never compiles, so the zap icon,
-    // enable/disable toggle, and "active"/"paused" tooltip would all be dead
-    // controls for a rule that can never fire.
+    // \u00a76.3 \u2014 a macro must never render as a live trigger macro unless
+    // macroAutoTrigger.reload() would actually compile a rule for it. Otherwise the
+    // zap icon, the Pause/Resume items and the "active"/"paused" tooltip are all
+    // dead controls for a rule that can never fire.
     //
-    // `identityConflict` is the same situation for the same reason: another macro in
-    // this set resolves to the same `macroStateKey()`, so reload()'s ambiguity
-    // `continue` compiles no rule for it either. Keeping the plain contextValue is
-    // what removes the Pause/Resume items (their `when` clauses match only the
-    // `.triggered` context values), which in turn keeps `setDisabled()`'s refusal to
-    // write under an ambiguous key from ever reading as a dead button.
-    const isTriggerMacro = !!macro.triggerPattern && !hasVariables && !identityConflict;
+    // The per-macro half of that question is `isCompilableTriggerMacro()`, which IS
+    // reload()'s first three in-loop `continue`s (see its doc comment): variables
+    // (\u00a76.1), a non-session run target, and `${profile.\u2026}` tokens in the text. It is
+    // called rather than restated here, because restating it is exactly how this row
+    // came to show a zap icon for a browser macro with a trigger pattern \u2014 the
+    // predicate mirrored only the variables skip and had never heard of the other
+    // two. Such records reach this tree through legacy-settings absorption and
+    // backup import, both of which bypass the macro editor's validation (\u00a74.2).
+    //
+    // `identityConflict` is the same situation for a reason that is NOT per-macro:
+    // another macro in this set resolves to the same `macroStateKey()`, so reload()'s
+    // ambiguity `continue` compiles no rule for it either. It is measured over the
+    // whole list by `getChildren()` and passed in, which is why it stays a separate
+    // term here. Keeping the plain contextValue is what removes the Pause/Resume
+    // items (their `when` clauses match only the `.triggered` context values), which
+    // in turn keeps `setDisabled()`'s refusal to write under an ambiguous key from
+    // ever reading as a dead button.
+    //
+    // Still NOT mirrored, by design: reload()'s `triggerScope` validity check and its
+    // regex-safety / `new RegExp` / empty-match checks. A row can therefore claim a
+    // live trigger for a pattern that turns out not to compile; the errors this
+    // predicate exists to prevent are the ones visible from the macro's own stored
+    // fields.
+    const compileBlocker = macro.triggerPattern ? triggerCompileBlocker(macro) : undefined;
+    const isTriggerMacro = isCompilableTriggerMacro(macro) && !identityConflict;
 
     if (isTriggerMacro) {
       const state = triggerDisabled ? "paused" : "active";
@@ -110,8 +160,8 @@ export class MacroTreeItem extends vscode.TreeItem {
       this.iconPath = new vscode.ThemeIcon(triggerDisabled ? "circle-slash" : "zap");
     } else {
       // A suppressed auto-trigger must say so, or the macro is just silently broken.
-      // The identity conflict is reported ahead of the variables note when both apply:
-      // variables-vs-trigger is a documented design rule, an identity conflict is
+      // The identity conflict is reported ahead of the per-macro note when both apply:
+      // the per-macro blockers are documented design rules, an identity conflict is
       // corrupt data the user has to act on \u2014 and the action is stated, because it is
       // not guessable. Reorder rather than "edit this macro": any write re-keys
       // duplicates (MacroStore.save()), and Move Up / Move Down are the commands that
@@ -133,12 +183,17 @@ export class MacroTreeItem extends vscode.TreeItem {
       if (conflictSuppressed) {
         this.tooltip +=
           "\nAuto-trigger suppressed: another macro has the same internal id. Reorder any macro with Move Up / Move Down to assign fresh ids.";
-      } else if (hasVariables && macro.triggerPattern) {
-        this.tooltip += "\nAuto-trigger suppressed: macro has variables";
+      } else if (compileBlocker !== undefined) {
+        // Exactly ONE line, in `triggerCompileBlocker()`'s own precedence order
+        // (variables \u2192 run target \u2192 profile tokens), which is reload()'s order too.
+        // Stacking every applicable reason would describe a macro that has to be
+        // fixed three times; the first one reload() would stop at is the one to fix.
+        this.tooltip += `\n${TRIGGER_SUPPRESSION_NOTES[compileBlocker]}`;
       }
       // contextValue is intentionally UNCHANGED for variable macros (\u00a79.6) \u2014
       // only the icon and tooltip differ; the context menu stays the one for
-      // a plain (or secret) macro. Same for an identity conflict.
+      // a plain (or secret) macro. Same for an identity conflict, and for a
+      // macro suppressed by its run target or its profile tokens.
       this.contextValue = macro.secret ? "nexus.macro.secret" : "nexus.macro";
       this.iconPath = new vscode.ThemeIcon(
         conflictSuppressed ? "warning" : (willPrompt ? "symbol-parameter" : (macro.secret ? "lock" : "terminal"))

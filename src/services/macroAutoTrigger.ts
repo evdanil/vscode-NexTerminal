@@ -3,6 +3,9 @@ import { createAnsiRegex } from "../utils/ansi";
 import { clamp } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
+import { resolveMacroRunTarget } from "../models/terminalMacro";
+import { hasProfileTokens, unescapeProfileTokens } from "./profileTokens";
+import { hasMacroVariables } from "./macroVariables";
 import type { ScriptMacroFilter } from "./scripts/scriptMacroFilter";
 import { getMacros } from "../macroSettings";
 import {
@@ -97,6 +100,73 @@ export function findAmbiguousMacroStateKeys(macros: readonly TerminalMacro[]): S
   return ambiguous;
 }
 
+/**
+ * Why `reload()` will refuse to compile an auto-trigger rule for a macro that
+ * nonetheless declares a `triggerPattern`. `undefined` = nothing per-macro stands
+ * in the way.
+ */
+export type TriggerCompileBlocker = "variables" | "run-target" | "profile-tokens";
+
+/**
+ * The PER-MACRO half of "will this trigger ever fire?", factored out of
+ * `reload()`'s loop so that `MacroTreeProvider` cannot drift from what actually
+ * compiles. The tree used to re-state one of these three rules inline and knew
+ * nothing about the other two, so a browser macro (or a session macro naming
+ * `${profile.…}`) with a trigger pattern rendered a zap icon and live
+ * Pause/Resume items for a rule `reload()` had silently skipped — see §6.3 in
+ * ui/macroTreeProvider.ts.
+ *
+ * These three are exactly `reload()`'s first three in-loop `continue`s and they
+ * must stay applied together AT THAT POSITION — before `defaultDisabledKeys` is
+ * populated — so a macro that is both un-compilable and `triggerInitiallyDisabled`
+ * never records a default-disabled entry for a rule that will never compile (it
+ * should behave as if it is not a trigger macro at all). Sharing them as one call
+ * preserves that ordering rather than threatening it: the loop still makes the
+ * whole decision in one place, before anything is written.
+ *
+ * Deliberately NOT covered here, and therefore still inline in `reload()`:
+ *   - the `triggerScope` validity check — cheap, but a stored-value sanity check
+ *     rather than a property of the macro's design;
+ *   - the ambiguity check — a property of the WHOLE macro set, not of one macro;
+ *     the tree gets it from `findAmbiguousMacroStateKeys()` instead;
+ *   - `validateRegexSafety()` / `new RegExp()` / the empty-match test — expensive
+ *     enough that a tree repaint should not pay for it once per row.
+ * A tree row that survives this predicate can therefore still turn out to compile
+ * nothing; the reverse — a row this predicate passes that `reload()` skips for one
+ * of the three reasons below — is what it exists to rule out.
+ */
+export function triggerCompileBlocker(macro: TerminalMacro): TriggerCompileBlocker | undefined {
+  // §6.1 — variables and auto-trigger are mutually exclusive. Untrusted shape
+  // guard per §4.2 (Array.isArray + length, never `?.length`), which is precisely
+  // what `hasMacroVariables()` applies — shared with the tree so the two cannot
+  // disagree about what "has variables" means.
+  if (hasMacroVariables(macro)) return "variables";
+  // A macro that runs somewhere other than its session never auto-fires. The
+  // editor already refuses the combination, but legacy-settings absorption
+  // persists `nexus.terminal.macros` entries VERBATIM and bypasses that
+  // validation entirely (§4.2) — and the failure mode is a browser macro opening
+  // a URL, or a local shell command executing, on every line of matching terminal
+  // output. Read through `resolveMacroRunTarget()`, which treats a corrupt value
+  // as "session" rather than as a reason to suppress a working trigger.
+  if (resolveMacroRunTarget(macro) !== "session") return "run-target";
+  // The other half of issue #48: a SESSION macro whose text names `${profile.…}`.
+  // A compiled rule fires from terminal output, which names no server, so there is
+  // nothing to resolve the token against — the rule would send the literal
+  // `${profile.host}` to the device. The editor refuses this combination too; this
+  // is the guard for records that never went through it.
+  if (hasProfileTokens(macro.text)) return "profile-tokens";
+  return undefined;
+}
+
+/**
+ * Does this macro declare an auto-trigger that nothing about the macro ITSELF
+ * prevents from compiling? The predicate the sidebar renders live trigger controls
+ * from. See `triggerCompileBlocker()` for what it does and does not cover.
+ */
+export function isCompilableTriggerMacro(macro: TerminalMacro): boolean {
+  return !!macro.triggerPattern && triggerCompileBlocker(macro) === undefined;
+}
+
 export interface PtyOutputObserver {
   onOutput(text: string): void;
   pauseIntervalMacros(): void;
@@ -182,18 +252,22 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const activeRules = new Map<string, CompiledTriggerRule>();
     for (const macro of macros) {
       if (!macro.triggerPattern) continue;
-      // §6.1 — variables and auto-trigger are mutually exclusive. Untrusted shape
-      // guard per §4.2 (Array.isArray + length, not `?.length`); MUST be an in-loop
-      // `continue` at this exact position — before `defaultDisabledKeys` is
-      // populated below — so a macro that declares both `variables` and
-      // `triggerInitiallyDisabled` never gets a default-disabled entry recorded
-      // for a rule that will never compile (it should behave as if it is not a
-      // trigger macro at all). State here is keyed by `macroStateKey(macro)` — a
-      // stable per-macro identity, not array position — so pre-filtering `macros`
-      // before this loop would no longer corrupt keying the way it used to; the
-      // ordering requirement above is about the mutual-exclusivity semantics, not
-      // index integrity.
-      if (Array.isArray(macro.variables) && macro.variables.length > 0) continue;
+      // The three per-macro reasons a trigger never compiles — variables (§6.1),
+      // a non-session run target, and `${profile.…}` tokens (both halves of issue
+      // #48). Each one's own justification lives on `triggerCompileBlocker()`,
+      // which `MacroTreeProvider` calls too so the sidebar cannot render live
+      // trigger controls for a rule this loop skipped.
+      //
+      // MUST stay an in-loop `continue` at this exact position — before
+      // `defaultDisabledKeys` is populated below — so a macro that declares both a
+      // blocker and `triggerInitiallyDisabled` never gets a default-disabled entry
+      // recorded for a rule that will never compile (it should behave as if it is
+      // not a trigger macro at all). State here is keyed by `macroStateKey(macro)`
+      // — a stable per-macro identity, not array position — so pre-filtering
+      // `macros` before this loop would no longer corrupt keying the way it used
+      // to; the ordering requirement above is about the mutual-exclusivity
+      // semantics, not index integrity.
+      if (triggerCompileBlocker(macro) !== undefined) continue;
       if (macro.triggerScope !== undefined && !VALID_MACRO_TRIGGER_SCOPES.has(macro.triggerScope)) continue;
       const stateKey = macroStateKey(macro);
       // Ambiguous identity — two or more macros in this set resolve to `stateKey`, so
@@ -228,7 +302,14 @@ export class MacroAutoTrigger implements vscode.Disposable {
         const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
         const rule: CompiledTriggerRule = {
           regex,
-          macroText: macro.text,
+          // REVIEW FINDING (P2) — unescaped HERE, at compile, because a fired
+          // rule writes `macroText` straight to the pty with nothing in between.
+          // `triggerCompileBlocker()` above already refused every macro naming
+          // an UNESCAPED `${profile.…}` (a rule fires from terminal output,
+          // which names no server), so what survives to this line can only carry
+          // the `$${profile.…}` escape — which is documented to send the literal
+          // token and, without this, sent both dollars.
+          macroText: unescapeProfileTokens(macro.text),
           cooldownMs: cooldownSeconds !== undefined ? cooldownSeconds * 1000 : this.defaultCooldownMs,
           intervalMs: intervalSeconds !== undefined ? intervalSeconds * 1000 : undefined,
           stateKey,

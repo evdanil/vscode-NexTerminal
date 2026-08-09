@@ -3,6 +3,8 @@ import type { MacroTreeItem } from "../ui/macroTreeProvider";
 import { MacroEditorPanel } from "../ui/macroEditorPanel";
 import type { MacroProfileOptionInput } from "../ui/macroProfileOptions";
 import type { TerminalMacro } from "../models/terminalMacro";
+import { macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
+import { hasProfileTokens, unescapeProfileTokens } from "../services/profileTokens";
 import {
   bindingToContextKey,
   bindingToDisplayLabel,
@@ -109,19 +111,40 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
     // without an entry here the feature is discoverable only by opening the
     // editor and happening to notice the new Variables section.
     id: "prompted-command",
-    label: "Prompted command",
-    description: "Prompt for host, username, and password, then run a templated command (leading space keeps it out of remote shell history).",
+    label: "IPMI SOL console",
+    description: "Fill the BMC address in from the server profile, prompt for username and password, then run ipmitool (leading space keeps it out of shell history).",
     macro: {
       name: "IPMI SOL console",
       // Leading space intentional: docs/macros.md's "Avoiding remote shell
       // history" section documents `HISTCONTROL=ignorespace` — a shipped
       // example should follow its own documented practice.
-      text: " ipmitool -I lanplus -H $host -U $username -P $password sol activate\n",
+      //
+      // `${profile.ipmiHost}` (issue #48) rather than a prompted `$host`: the
+      // address is a fact about the server profile this macro is run against,
+      // so Run Macro on Server fills it in. The PASSWORD stays a masked
+      // prompt-at-run variable and must never become a literal `-P secret` in
+      // a template — an argv password is visible in `ps`, in the terminal
+      // scrollback, and in this extension's own TerminalCaptureBuffer, which
+      // `nexus.terminal.copyAll` will happily hand to the clipboard.
+      text: " ipmitool -I lanplus -H ${profile.ipmiHost} -U $username -P $password sol activate\n",
+      runIn: "localTerminal",
       variables: [
-        { name: "host", label: "Host" },
         { name: "username", label: "Username" },
         { name: "password", label: "Password", secret: true }
       ]
+    }
+  },
+  {
+    id: "ipmi-web-console",
+    label: "Launch IPMI web console",
+    description: "Open a server's BMC web interface in the browser, using the profile's IPMI / BMC Host.",
+    macro: {
+      name: "IPMI web console",
+      // No trailing newline, deliberately: an older build that does not know
+      // `runIn` treats this as an ordinary macro and PASTES the URL into a
+      // terminal without executing anything.
+      text: "https://${profile.ipmiHost}/",
+      runIn: "browser"
     }
   }
 ];
@@ -136,7 +159,7 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
  * needs its escapes resolved and its target pinned, both of which only happen
  * on the `runMacro()` path.
  */
-function macroWillPrompt(macro: TerminalMacro): boolean {
+export function macroWillPrompt(macro: TerminalMacro): boolean {
   if (!hasMacroVariables(macro)) return false;
   const declaredNames = getValidMacroVariables(macro).map((v) => v.name);
   return scanPlaceholders(macro.text, declaredNames).used.length > 0;
@@ -153,10 +176,47 @@ function sendMacroText(text: string): void {
  * see zero behavior change (§4.1).
  */
 async function runOrSendMacro(macro: TerminalMacro): Promise<void> {
+  // A macro that names a server profile (`${profile.…}`) or runs somewhere
+  // other than a session cannot be resolved from these entry points: they know
+  // which macro the user picked, not which SERVER it is aimed at. Sending
+  // anyway would put a literal `${profile.ipmiHost}` — or a bare URL — into
+  // whatever terminal happens to be active, which is never what was meant.
+  // Hand it to the one command that has a server: nexus.server.runMacro.
+  if (hasProfileTokens(macro.text) || resolveMacroRunTarget(macro) !== "session") {
+    const action = await vscode.window.showInformationMessage(
+      `"${macro.name}" runs against a server profile. Pick the server to run it on.`,
+      "Run Macro on Server…"
+    );
+    if (action) {
+      // The macro travels with the redirect: the user already chose it here,
+      // and the only thing the other command needs is the server.
+      await vscode.commands.executeCommand("nexus.server.runMacro", { macro });
+    }
+    return;
+  }
+  // REVIEW FINDING (P2) — `$${profile.host}` is documented to send the literal
+  // `${profile.host}`, but that unescape lived only in `resolveProfileTokens()`,
+  // which only `nexus.server.runMacro` calls. The redirect above (correctly)
+  // ignores escaped tokens — an escaped token names no field, so it constrains
+  // nothing about which server the macro can run on — so a macro whose text
+  // contains ONLY escaped tokens lands here, and BOTH dollars used to go out.
+  //
+  // PROFILE-UNESCAPE FIRST, then the variable engine — the same order
+  // `runMacroOnServer` uses, and safe in both directions because the two
+  // grammars cannot overlap: a macro variable's name is
+  // `/^[A-Za-z_][A-Za-z0-9_]*$/` with NO DOTS, so the variable engine can never
+  // match `${profile.x}` (before or after this pass), and this pass only ever
+  // deletes one `$` from a `$${profile.…}` run, which cannot manufacture a
+  // dotless placeholder for the second pass to expand.
+  const text = unescapeProfileTokens(macro.text);
+  // Identity preserved when there was nothing to unescape (the overwhelmingly
+  // common case): `runMacro`'s re-entrancy guard keys id-less macros on
+  // name+text, and a needless copy is a needless difference.
+  const toRun = text === macro.text ? macro : { ...macro, text };
   if (hasMacroVariables(macro)) {
-    await runMacro(macro);
+    await runMacro(toRun);
   } else {
-    sendMacroText(macro.text);
+    sendMacroText(text);
   }
 }
 
@@ -757,9 +817,13 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
           // sidebar: "click = sends immediately" and "click = opens prompts" are
           // different enough behaviors to flag here too.
           const marker = macroWillPrompt(m) ? VARIABLE_MARKER : "";
+          // Same badge, same helper, as the Run Macro on Server picker: "sends
+          // a line to this terminal" and "opens a browser window" must not look
+          // identical in a list.
+          const badge = macroRunTargetBadge(m);
           return {
             label: `${prefix}${m.name}`,
-            description: `${marker}${m.secret ? "***" : m.text.replace(/\n/g, "\\n")}`,
+            description: `${marker}${badge}${m.secret ? "***" : m.text.replace(/\n/g, "\\n")}`,
             detail: macroFolderDetail(m),
             index: i
           };

@@ -1088,6 +1088,140 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  describe("runIn (issue #48) — a macro that runs outside its session never auto-fires", () => {
+    it("a browser macro compiles no rule, even with an otherwise-valid trigger pattern", () => {
+      // Reachable despite the editor's refusal: `absorbLegacySettingsIfPresent()`
+      // persists `nexus.terminal.macros` entries verbatim on every activation.
+      // Without the reload() skip this opens a URL on every matching output line.
+      setConfig([
+        { name: "bmc", text: "https://10.0.0.9/", triggerPattern: "router#", runIn: "browser" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("a localTerminal macro compiles no rule", () => {
+      setConfig([
+        { name: "ipmi", text: " ipmitool power status\n", triggerPattern: "router#", runIn: "localTerminal" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it('an explicit runIn: "session" and a corrupt runIn both keep a valid trigger working', () => {
+      // The other direction: reading the field as "anything truthy suppresses"
+      // would silently kill working auto-triggers on records carrying a
+      // meaningless value — so the resolver treats both as "session".
+      setConfig([
+        { name: "explicit", text: "yes\n", triggerPattern: "Continue\\?", runIn: "session" },
+        { name: "corrupt", text: "no\n", triggerPattern: "Abort\\?", runIn: 42 }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("Continue?");
+      flush();
+      obs.onOutput("Abort?");
+      flush();
+
+      expect(sent).toEqual(["yes\n", "no\n"]);
+      obs.dispose();
+    });
+
+    it("a SESSION macro using ${profile.…} compiles no rule — the literal token would be sent", () => {
+      // The gap the `runIn` skip alone leaves open: this macro DOES run in the
+      // session, so nothing above stops it, but a rule fired by output has no
+      // server to resolve the token against. Without the profile-token skip the
+      // device receives `ping ${profile.host}` verbatim.
+      setConfig([
+        { name: "pingProfile", text: "ping ${profile.host}\n", triggerPattern: "router#" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual([]);
+      obs.dispose();
+    });
+
+    it("an ESCAPED profile token is just text, so that macro still auto-fires — UNESCAPED", () => {
+      // `$${profile.host}` resolves to the literal `${profile.host}` in every
+      // path, so it constrains nothing — suppressing it would kill a working
+      // trigger.
+      //
+      // REVIEW FINDING (P2) — and what fires must be the UNESCAPED text. The
+      // unescape used to live only in `resolveProfileTokens()` (the Run Macro on
+      // Server path), so this rule compiled `macro.text` verbatim and the device
+      // received both dollars.
+      setConfig([
+        { name: "literal", text: "echo $${profile.host}\n", triggerPattern: "router#" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual(["echo ${profile.host}\n"]);
+      obs.dispose();
+    });
+
+    it("an escaped token naming NO whitelisted field is left exactly as written", () => {
+      // `unescapeProfileTokens()` shares `resolveProfileTokens()`'s rule that an
+      // unknown token is verbatim escaped or not, so the trigger path and the
+      // server path cannot disagree about `$${profile.keyPath}`.
+      setConfig([
+        { name: "typo", text: "echo $${profile.keyPath}\n", triggerPattern: "router#" }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+
+      obs.onOutput("router#");
+      flush();
+
+      expect(sent).toEqual(["echo $${profile.keyPath}\n"]);
+      obs.dispose();
+    });
+
+    it("skip position: runIn + triggerInitiallyDisabled records no disabled-state entry either", () => {
+      // Same ordering requirement as the §6.1 variables skip: the `continue`
+      // must run BEFORE `defaultDisabledKeys.add(stateKey)`, or a macro that
+      // compiles no rule still claims a disabled-state entry — and whichever
+      // macro later owns that key inherits a toggle it never earned.
+      setConfig([
+        {
+          name: "bmcDisabled",
+          text: "https://10.0.0.9/",
+          triggerPattern: "router#",
+          runIn: "browser",
+          triggerInitiallyDisabled: true
+        }
+      ]);
+      const trigger = new MacroAutoTrigger();
+      expect(trigger.isDisabled(macroAt(0))).toBe(false);
+    });
+  });
+
   describe("macro variables (§6.1) — variables and auto-trigger are mutually exclusive", () => {
     it("a macro with variables compiles no rule, even with an otherwise-valid trigger pattern", () => {
       setConfig([
@@ -1825,6 +1959,117 @@ describe("MacroAutoTrigger", () => {
       expect(store.compiledTriggerIntervalSeconds(0.5)).toBe(0.5);
       expect(store.compiledTriggerIntervalSeconds(0)).toBeUndefined();
       expect(store.compiledTriggerIntervalSeconds("60")).toBeUndefined();
+    });
+  });
+
+  // PR #55 review — `triggerCompileBlocker()` was extracted from reload()'s first
+  // three in-loop `continue`s precisely so `MacroTreeProvider` could ask the
+  // compiler instead of restating one third of it. These tests pin the helper
+  // itself; macroTreeProvider.test.ts pins that the sidebar honours it, and the
+  // reload() suites above pin that the loop still skips the same macros.
+  describe("triggerCompileBlocker / isCompilableTriggerMacro", () => {
+    it("names the per-macro reason a trigger will never compile, and nothing else", async () => {
+      const { triggerCompileBlocker } = await import("../../src/services/macroAutoTrigger");
+
+      expect(triggerCompileBlocker({ name: "plain", text: "yes\n" })).toBeUndefined();
+      expect(
+        triggerCompileBlocker({ name: "vars", text: "run $host", variables: [{ name: "host" }] })
+      ).toBe("variables");
+      expect(triggerCompileBlocker({ name: "bmc", text: "https://x/", runIn: "browser" })).toBe("run-target");
+      expect(triggerCompileBlocker({ name: "sol", text: "ipmitool\n", runIn: "localTerminal" })).toBe("run-target");
+      expect(triggerCompileBlocker({ name: "ping", text: "ping ${profile.host}\n" })).toBe("profile-tokens");
+
+      // An escaped token is literal text — it needs no server, so it blocks nothing.
+      expect(triggerCompileBlocker({ name: "doc", text: "echo $${profile.host}\n" })).toBeUndefined();
+      // An UNKNOWN `${profile.…}` name resolves to itself and constrains nothing
+      // either — `profileTokensUsed()` reports whitelisted tokens only.
+      expect(triggerCompileBlocker({ name: "typo", text: "echo ${profile.hostt}\n" })).toBeUndefined();
+      // §4.2 — a corrupt `runIn` is read as "session", never as grounds to suppress
+      // a working trigger.
+      expect(
+        triggerCompileBlocker({ name: "corrupt", text: "yes\n", runIn: 42 as unknown as "session" })
+      ).toBeUndefined();
+      // §4.2 — a non-array `variables` is not "has variables".
+      expect(
+        triggerCompileBlocker({ name: "legacy", text: "yes\n", variables: "abc" as unknown as never })
+      ).toBeUndefined();
+    });
+
+    it("precedence is reload()'s own order, so the reason reported is the one that stops the loop first", async () => {
+      const { triggerCompileBlocker } = await import("../../src/services/macroAutoTrigger");
+      expect(
+        triggerCompileBlocker({
+          name: "all-three",
+          text: "run $host ${profile.host}",
+          runIn: "browser",
+          variables: [{ name: "host" }]
+        })
+      ).toBe("variables");
+      expect(
+        triggerCompileBlocker({ name: "two", text: "open ${profile.host}", runIn: "browser" })
+      ).toBe("run-target");
+    });
+
+    it("isCompilableTriggerMacro additionally requires a triggerPattern to exist at all", async () => {
+      const { isCompilableTriggerMacro } = await import("../../src/services/macroAutoTrigger");
+      // A perfectly ordinary macro is not "a trigger that compiles" — otherwise every
+      // macro in the sidebar would claim live trigger controls.
+      expect(isCompilableTriggerMacro({ name: "plain", text: "yes\n" })).toBe(false);
+      expect(isCompilableTriggerMacro({ name: "auto", text: "yes\n", triggerPattern: "Continue\\?" })).toBe(true);
+      expect(
+        isCompilableTriggerMacro({ name: "bmc", text: "https://x/", triggerPattern: "router#", runIn: "browser" })
+      ).toBe(false);
+      expect(
+        isCompilableTriggerMacro({ name: "ping", text: "ping ${profile.host}\n", triggerPattern: "router#" })
+      ).toBe(false);
+    });
+
+    it("agrees with what reload() actually compiles, macro for macro", async () => {
+      // The property the extraction exists to guarantee. A helper that drifted from
+      // the loop would still satisfy the assertions above; this compares the two
+      // directly over a set holding one macro of every shape. Every macro gets its
+      // OWN pattern and is provoked separately, because `evaluate()` breaks after
+      // the first rule that fires — one shared pattern would prove nothing about
+      // the macros further down the list.
+      const { isCompilableTriggerMacro } = await import("../../src/services/macroAutoTrigger");
+      const macros = [
+        { name: "plain-trigger", text: "plain\n", triggerPattern: "P1#" },
+        { name: "no-trigger", text: "none\n" },
+        { name: "vars", text: "run $host", triggerPattern: "P3#", variables: [{ name: "host" }] },
+        { name: "browser", text: "https://x/", triggerPattern: "P4#", runIn: "browser" },
+        { name: "local", text: "ipmitool\n", triggerPattern: "P5#", runIn: "localTerminal" },
+        { name: "profile", text: "ping ${profile.host}\n", triggerPattern: "P6#" },
+        { name: "escaped", text: "echo $${profile.host}\n", triggerPattern: "P7#" }
+      ];
+      setConfig(macros);
+      const trigger = new MacroAutoTrigger();
+
+      // `writeBack` receives a macro's text only when a rule compiled for it, so
+      // "was this macro's text ever sent" IS "did reload() compile it".
+      const sent: string[] = [];
+      const obs = trigger.createObserver((text) => sent.push(text));
+      for (const macro of macros) {
+        if (!macro.triggerPattern) continue;
+        obs.onOutput(macro.triggerPattern);
+        flush();
+      }
+      obs.dispose();
+
+      // A compiled rule carries the macro's text with `$${profile.…}` UNESCAPED
+      // (PR #55 review, P2), so the `escaped` macro is recognised by the text the
+      // rule actually sends rather than by its stored source. Spelled out rather
+      // than run through `unescapeProfileTokens()`: this test is about the two
+      // compile predicates agreeing, and must not inherit the unescape helper's
+      // own behaviour as its definition of "compiled".
+      const firedText = (m: { name: string; text: string }): string =>
+        m.name === "escaped" ? "echo ${profile.host}\n" : m.text;
+      const compiledNames = macros.filter((m) => sent.includes(firedText(m))).map((m) => m.name);
+      const predictedNames = macros
+        .filter((m) => isCompilableTriggerMacro(m as TerminalMacro))
+        .map((m) => m.name);
+      expect(predictedNames).toEqual(["plain-trigger", "escaped"]);
+      expect(compiledNames).toEqual(predictedNames);
+      trigger.dispose();
     });
   });
 });

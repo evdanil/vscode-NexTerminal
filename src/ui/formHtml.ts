@@ -165,7 +165,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   const advancedFields = definition.fields.filter((field) => field.advanced);
   const basicFieldsHtml = basicFields.map(renderField).join("\n");
   const advancedFieldsHtml = advancedFields.length > 0
-    ? `<details class="advanced-fields">
+    ? `<details class="advanced-fields"${definition.expandAdvanced ? " open" : ""}>
       <summary>Advanced options</summary>
       ${advancedFields.map(renderField).join("\n      ")}
     </details>`

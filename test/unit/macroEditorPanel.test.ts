@@ -780,6 +780,66 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       expect(getMacros()).toHaveLength(0);
     });
 
+    it("rejects a macro that both runs outside its session and auto-triggers, on the Run In field", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ triggerPattern: "foo", runIn: "browser" }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "runIn",
+        message: expect.stringContaining("auto-trigger or run outside its session")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("rejects a session macro that uses ${profile.…} and also auto-triggers", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      // Legal by the `runIn` rule (this one DOES run in the session), and still
+      // impossible: `MacroAutoTrigger.reload()` compiles no rule for it, so
+      // saving the pair produces a trigger that silently never fires.
+      await sendMessage(baseSaveMsg({ text: "ping ${profile.host}\n", triggerPattern: "router#" }));
+
+      expect(mockPostMessage).toHaveBeenCalledWith({
+        type: "saveError",
+        field: "trigger",
+        message: expect.stringContaining("cannot auto-trigger")
+      });
+      expect(getMacros()).toHaveLength(0);
+    });
+
+    it("saves a profile-token macro with no trigger, and a trigger macro that only ESCAPES a token", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+      await sendMessage(baseSaveMsg({ text: "ping ${profile.host}\n" }));
+      expect(getMacros()).toHaveLength(1);
+
+      const { sendMessage: sendAgain } = await openPanel();
+      await sendAgain(baseSaveMsg({ name: "Literal", text: "echo $${profile.host}\n", triggerPattern: "router#" }));
+      expect(getMacros()).toHaveLength(2);
+    });
+
+    it("persists a non-default runIn and drops it again when the macro goes back to the session", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ text: "https://${profile.ipmiHost}/", runIn: "browser" }));
+      expect(getMacros()[0].runIn).toBe("browser");
+
+      const macroId = getMacros()[0].id!;
+      const { sendMessage: sendAgain } = await openPanel(0);
+      await sendAgain(baseSaveMsg({ index: 0, id: macroId, text: "https://x/", runIn: "session" }));
+
+      // Absent MEANS session — a stored "session" would put a field on the
+      // record that no build before this one understands, and leaving the old
+      // value alive through the `{ ...existingMacro }` spread would keep the
+      // macro opening a browser after the user said not to.
+      expect(getMacros()[0].runIn).toBeUndefined();
+    });
+
     it("persists a valid variables array, dropping empty label/default fields", async () => {
       await harness([]);
       const { sendMessage } = await openPanel();
