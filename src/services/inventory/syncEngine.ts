@@ -1145,6 +1145,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ...templateMatrix.values,
         origin: afterOrigin
       };
+      // §5.3 REPAIR — the matrix found a TEMPLATE-OWNED self-proxy already on the
+      // record and asks for its removal (a value the connect-time circular guard
+      // refuses, cleared rather than carried, mirroring the survivor cleanup).
+      // The stamp is already dropped (matrix omitted `templated.proxy`), so the
+      // `changed` comparison sees both the proxy removal and the stamp change.
+      if (templateMatrix.clearProxy) {
+        delete after.proxy;
+      }
       if (endpoint.username !== undefined) {
         after.username = endpoint.username;
       }
@@ -1871,6 +1879,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // by the next source of the same provider.
           formerlySynced: undefined
         };
+        // §5.3 REPAIR — an adopted server whose restored receipt carried a
+        // template-owned self-proxy is repaired at adoption, same as the update
+        // path: the matrix dropped the stamp and asks the caller to remove the
+        // record's `proxy` field (a value the connect-time circular guard refuses).
+        if (templateMatrix.clearProxy) {
+          delete after.proxy;
+        }
         // The ONE field outside the source's four that adoption may overwrite,
         // and the only place the "it keeps its saved credentials" copy could
         // ever fall short (REVIEW FINDING). Kept as-is deliberately, for the

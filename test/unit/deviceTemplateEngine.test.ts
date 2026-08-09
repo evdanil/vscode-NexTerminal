@@ -639,6 +639,90 @@ describe("FIX 3 — self-proxy detection on the update path uses ownedServer.id,
   });
 });
 
+// -------- Codex round 5 (P2) — a template-OWNED self-proxy already on the record is REPAIRED, not carried --------
+
+describe("§5.3 repair — a template-owned self-proxy already carried is cleared (not re-skipped forever)", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const SELF_ID = deterministicServerId("source-1", "device:1");
+
+  it("Fixture 45 — an owned server that ALREADY carries a template-owned self-proxy (proxy === origin.templated.proxy, both self-ref) is REPAIRED: after.proxy absent, stamp absent, 'cleared' warning, lands in updates (kills the row-5 carry that keeps a self-proxy the runtime refuses)", () => {
+    // Both the live proxy and the stamp are the same self-referential ssh proxy —
+    // an owned server imported from a backup written by a buggy earlier build, or
+    // an adopted server whose receipt carried one. b3181d3 skips + row-5-carries it.
+    const owned = ownedServer({ proxy: sshProxy(SELF_ID) }, { templated: { proxy: sshProxy(SELF_ID) } });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()], // maps to the owned server (update path)
+      servers: [owned],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(SELF_ID) } })]
+    });
+    const after = afterFor(p, SELF_ID);
+    expect(after).toBeDefined(); // promoted to an update — the repair lands
+    expect(after!.proxy).toBeUndefined(); // self-proxy CLEARED, not carried
+    expect(after!.origin?.templated?.proxy).toBeUndefined(); // stamp dropped with it
+    expect(p.warnings.filter((w) => w.includes("through itself") && w.includes("was cleared")).length).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("the proxy field was skipped")).length).toBe(0);
+  });
+
+  it("Fixture 46 — adoption variant: an adoptee whose RESTORED receipt carries a template-owned self-proxy is repaired at adoption (after.proxy absent, stamp absent, 'cleared' warning)", () => {
+    const kept = keptServer({
+      proxy: sshProxy("kept-1"), // self-referential: jumpHostId === adoptee's own id
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: DEVICE_INSTANCE,
+        externalId: "device:1",
+        templated: { proxy: sshProxy("kept-1") }, // the receipt says the sync wrote it
+        detachedAt: 900
+      }
+    });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [kept],
+      templates: [template({ proxy: { mode: "override", value: sshProxy("kept-1") } })],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    expect(after.proxy).toBeUndefined(); // repaired at adoption
+    expect(after.origin?.templated?.proxy).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("through itself") && w.includes("was cleared")).length).toBe(1);
+  });
+
+  it("Fixture 47 — §8.4 guard: a HAND-set self-proxy (proxy self-ref, origin.templated.proxy ABSENT) is LEFT ALONE — 'skipped' warning, not 'cleared', server unchanged (kills clearing a hand proxy)", () => {
+    // proxy is a self-ref but no template stamp names it → not template-owned.
+    const owned = ownedServer({ proxy: sshProxy(SELF_ID) }, { templated: undefined });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [owned],
+      templates: [template({ proxy: { mode: "override", value: sshProxy(SELF_ID) } })]
+    });
+    expect(afterFor(p, SELF_ID)).toBeUndefined(); // untouched — no update
+    expect(p.unchangedCount).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("the proxy field was skipped")).length).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("was cleared")).length).toBe(0);
+  });
+
+  it("Fixture 48 — a template-owned NON-self proxy (valid jump host, stamp matches) is carried untouched — the repair branch never fires for it (kills an over-broad clear)", () => {
+    const bastion: ServerConfig = { id: "bastion-1", name: "bastion", host: "10.0.0.99", port: 22, username: "admin", authType: "agent", isHidden: false };
+    // Owned server carries a template-owned valid ssh proxy; the template still wants it (row 4 no-op).
+    const owned = ownedServer({ proxy: sshProxy("bastion-1") }, { templated: { proxy: sshProxy("bastion-1") } });
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [owned, bastion],
+      templates: [template({ proxy: { mode: "override", value: sshProxy("bastion-1") } })]
+    });
+    const after = afterFor(p, SELF_ID);
+    // Row 4 no-op → unchanged; the proxy is neither cleared nor re-written.
+    expect(after).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("was cleared") || w.includes("through itself")).length).toBe(0);
+  });
+});
+
 // -------- FIX 1 (PR #61 Codex) — adoption applies the template matrix + auth winner --------
 
 describe("FIX 1 — adoption branch consumes the template cascade (proxy / booleans / auth), stamped", () => {

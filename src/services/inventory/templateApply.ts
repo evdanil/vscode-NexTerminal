@@ -317,6 +317,17 @@ export interface TemplateMatrixResult {
   templated: ServerOrigin["templated"];
   /** §5.3 per-device self-reference skip warnings (a proxy routing the target through itself). */
   warnings: string[];
+  /**
+   * §5.3 REPAIR SIGNAL — the record's own `proxy` field must be REMOVED: a
+   * template-owned proxy that resolves to a self-reference this run, repaired
+   * rather than carried. Set only when the CURRENT proxy is a template-owned
+   * self-proxy (`cur === carried.proxy`, both self-referential ssh) — a state
+   * the connect-time circular guard refuses, so carrying it forward (row 5) only
+   * re-skips it every sync. `values` never re-writes the field (a self-proxy is
+   * never written), so the caller does the removal itself: `delete after.proxy`.
+   * A HAND-set self-proxy is left untouched here (§8.4) and this stays falsey.
+   */
+  clearProxy?: boolean;
 }
 
 /**
@@ -350,6 +361,7 @@ export function applyTemplateMatrix(
 ): TemplateMatrixResult {
   const values: TemplateMatrixResult["values"] = {};
   const warnings: string[] = [];
+  let clearProxy = false;
   const carried = ownedServer?.origin?.templated;
   const templated: NonNullable<ServerOrigin["templated"]> = carried
     ? { ...carried, proxy: carried.proxy ? { ...carried.proxy } : carried.proxy }
@@ -357,14 +369,46 @@ export function applyTemplateMatrix(
 
   if (desired.proxy !== undefined) {
     const value = desired.proxy.value;
-    // §5.3 SELF-REFERENCE hard-skip (per-device): a jump host that IS the device
-    // being written routes it through itself. Drop to "desired none" — do NOT
-    // write, so any existing sync-owned proxy carries forward (row 5) rather than
-    // being clobbered. The dangling check already ran once in composeDesiredFields.
+    // §5.3 SELF-REFERENCE (per-device): a jump host that IS the device being
+    // written routes it through itself. Two distinct dispositions here (§5.3 vs
+    // survivor-cleanup philosophy):
+    //  - The template WANTS to write a self-proxy onto a record that does not
+    //    already carry one → SKIP (drop to "desired none"): do NOT write, so any
+    //    existing sync-owned proxy carries forward (row 5) rather than being
+    //    clobbered, and a HAND-set self-proxy is left alone (§8.4).
+    //  - The record ALREADY CARRIES a TEMPLATE-OWNED self-proxy (`cur` a
+    //    self-ref ssh proxy AND equal to the carried stamp `origin.templated
+    //    .proxy`) → REPAIR: clear the proxy + drop the stamp. Carrying it forward
+    //    (row 5) leaves the server routed through itself, which the connect-time
+    //    circular guard refuses — re-skipped, never repaired, every sync. Same
+    //    posture the survivor cleanup takes for a dangling template-owned jump
+    //    host: a template-owned proxy the runtime will refuse is CLEARED, not
+    //    carried. Scoped to template-OWNED (`proxyEqual(cur, stamp)`) so a hand
+    //    self-proxy stays the connect-time error, untouched (§8.4).
+    // The dangling check already ran once in composeDesiredFields.
     if (value.type === "ssh" && proxyRef !== undefined && value.jumpHostId === proxyRef.targetServerId) {
-      warnings.push(
-        `Device template "${proxyRef.proxyTemplateName ?? "?"}" would route "${proxyRef.targetServerName}" through itself — the proxy field was skipped.`
-      );
+      const cur = ownedServer?.proxy;
+      const stamp = carried?.proxy;
+      const curIsOwnedSelfProxy =
+        cur !== undefined &&
+        cur.type === "ssh" &&
+        cur.jumpHostId === proxyRef.targetServerId &&
+        stamp !== undefined &&
+        proxyEqual(cur, stamp); // §8.4 — template-OWNED only; a hand self-proxy is left alone
+      if (curIsOwnedSelfProxy) {
+        // Repair: drop the stamp (so it is not carried) and signal the caller to
+        // remove the record's `proxy` field. `values.proxy` is intentionally NOT
+        // set — a self-proxy is never a value to write.
+        delete templated.proxy;
+        clearProxy = true;
+        warnings.push(
+          `Device template "${proxyRef.proxyTemplateName ?? "?"}" routed "${proxyRef.targetServerName}" through itself — the invalid proxy was cleared.`
+        );
+      } else {
+        warnings.push(
+          `Device template "${proxyRef.proxyTemplateName ?? "?"}" would route "${proxyRef.targetServerName}" through itself — the proxy field was skipped.`
+        );
+      }
     } else {
       const cur = ownedServer?.proxy;
       const stamp = carried?.proxy;
@@ -394,7 +438,7 @@ export function applyTemplateMatrix(
   applyBool("logSession");
 
   const hasStamp = templated.proxy !== undefined || templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
-  return { values, templated: hasStamp ? templated : undefined, warnings };
+  return { values, templated: hasStamp ? templated : undefined, warnings, clearProxy };
 }
 
 /**
