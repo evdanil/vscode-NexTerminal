@@ -621,6 +621,144 @@ describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the sta
   });
 });
 
+describe("Fix A′ (PR #62 Codex round 3, SECURITY) — restore-on-apply-failure is per-server CONDITIONAL, not blanket", () => {
+  // Authenticated SOCKS5 endpoint X each server's proxy-password was entered for.
+  const X: ProxyConfig = { type: "socks5", host: "10.9.9.1", port: 1080, username: "u" };
+  // A DIFFERENT authenticated endpoint Y the override moves the proxy to.
+  const Y: ProxyConfig = { type: "socks5", host: "10.9.9.2", port: 1080, username: "u" };
+
+  async function seedTwoProxyServers(core: NexusCore): Promise<void> {
+    for (const id of ["srv-1", "srv-2"]) {
+      await core.addOrUpdateServer({
+        id,
+        name: id,
+        host: `h-${id}`,
+        port: 22,
+        username: "admin",
+        authType: "agent",
+        group: "DC",
+        proxy: X,
+        origin: { sourceId: "src", externalId: id, templated: { proxy: X } }
+      });
+    }
+  }
+
+  /**
+   * Runs the manual apply against a two-server folder where `applyPlanWrites`'
+   * per-server loop fails on its Nth `addOrUpdateServer` call. Returns the ids in
+   * the order the loop processed them: `committed` are the ones written before the
+   * failure (now on the NEW proxy Y), `failed` is the one whose write threw (still
+   * on the OLD proxy X). Installs the failing spy AFTER seeding so it counts only
+   * the apply loop's calls.
+   */
+  async function applyWithFailureOnCall(
+    core: NexusCore,
+    vault: unknown,
+    failOnCall: number
+  ): Promise<{ committed: string[]; failed?: string }> {
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: Y } } });
+    registerWithVault(core, vault);
+    mockShowQuickPick.mockResolvedValue({ label: "Reproxy", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+    mockShowInformationMessage.mockResolvedValue(undefined);
+
+    const original = core.addOrUpdateServer.bind(core);
+    const committed: string[] = [];
+    let failed: string | undefined;
+    let calls = 0;
+    vi.spyOn(core, "addOrUpdateServer").mockImplementation(async (server: ServerConfig) => {
+      calls++;
+      if (calls === failOnCall) {
+        // The boundary server: its own whole-array save is the one that rejects, so
+        // NOTHING of its write commits — it stays on the OLD proxy X.
+        failed = server.id;
+        throw new Error(`saveServers rejected on call ${failOnCall}`);
+      }
+      committed.push(server.id);
+      return original(server);
+    });
+
+    await expect(
+      registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"))
+    ).rejects.toThrow(/saveServers rejected/);
+
+    vi.restoreAllMocks();
+    return { committed, failed };
+  }
+
+  it("partial-commit leak — server committed on the NEW proxy must NOT be re-armed with the OLD endpoint's secret", async () => {
+    const core = makeCore();
+    await seedTwoProxyServers(core);
+    const k1 = proxyPasswordSecretKey("srv-1");
+    const k2 = proxyPasswordSecretKey("srv-2");
+    const vault = makeVault(core, { [k1]: "secret-1", [k2]: "secret-2" });
+
+    // Fail on the SECOND apply call: the first server commits to Y, the second stays on X.
+    const { committed, failed } = await applyWithFailureOnCall(core, vault, 2);
+    expect(committed).toHaveLength(1);
+    expect(failed).toBeDefined();
+    const committedId = committed[0];
+    const failedId = failed!;
+    const committedKey = proxyPasswordSecretKey(committedId);
+    const failedKey = proxyPasswordSecretKey(failedId);
+
+    // The committed server is now on the NEW proxy Y in the live core...
+    expect(core.getServer(committedId)!.proxy).toEqual(Y);
+    // ...so its stale secret MUST stay deleted — re-arming it would send the OLD
+    // proxy's password to the NEW endpoint. Against a7bcc22's blanket restore this
+    // key is put back → this assertion FAILS (the leak the fix closes).
+    expect((vault as ReturnType<typeof makeVault>)._store.has(committedKey)).toBe(false);
+
+    // The failed server never left the OLD proxy X, so its secret IS legitimately
+    // restored — the old proxy still needs it.
+    const secretByKey: Record<string, string> = { [k1]: "secret-1", [k2]: "secret-2" };
+    expect(core.getServer(failedId)!.proxy).toEqual(X);
+    expect((vault as ReturnType<typeof makeVault>)._store.get(failedKey)).toBe(secretByKey[failedKey]);
+  });
+
+  it("full success — both servers land on the NEW proxy, NEITHER secret is restored", async () => {
+    const core = makeCore();
+    await seedTwoProxyServers(core);
+    const k1 = proxyPasswordSecretKey("srv-1");
+    const k2 = proxyPasswordSecretKey("srv-2");
+    const vault = makeVault(core, { [k1]: "secret-1", [k2]: "secret-2" });
+
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: Y } } });
+    registerWithVault(core, vault);
+    mockShowQuickPick.mockResolvedValue({ label: "Reproxy", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+    mockShowInformationMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    expect(core.getServer("srv-1")!.proxy).toEqual(Y);
+    expect(core.getServer("srv-2")!.proxy).toEqual(Y);
+    // Both cleared, no restore — guards against over-restoring a fully-applied plan.
+    expect(vault._store.has(k1)).toBe(false);
+    expect(vault._store.has(k2)).toBe(false);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith('Applied device template "Reproxy" to 2 servers.');
+  });
+
+  it("full failure — the FIRST server's write throws, nothing commits, BOTH secrets restored", async () => {
+    const core = makeCore();
+    await seedTwoProxyServers(core);
+    const k1 = proxyPasswordSecretKey("srv-1");
+    const k2 = proxyPasswordSecretKey("srv-2");
+    const vault = makeVault(core, { [k1]: "secret-1", [k2]: "secret-2" });
+
+    // Fail on the FIRST apply call: no server ever commits, both stay on X.
+    const { committed } = await applyWithFailureOnCall(core, vault, 1);
+    expect(committed).toHaveLength(0);
+
+    expect(core.getServer("srv-1")!.proxy).toEqual(X);
+    expect(core.getServer("srv-2")!.proxy).toEqual(X);
+    // Both still on the OLD endpoint X → both secrets restored. Guards against the
+    // filter dropping a legitimately-needed restore.
+    expect(vault._store.get(k1)).toBe("secret-1");
+    expect(vault._store.get(k2)).toBe("secret-2");
+  });
+});
+
 describe("Fix B (PR #62 Codex round 2) — edit save re-resolves the seeded template and refuses a deleted/stale record", () => {
   async function openEdit(core: NexusCore): Promise<{ onSubmit: (v: FormValues) => Promise<void> | void }> {
     register(core);

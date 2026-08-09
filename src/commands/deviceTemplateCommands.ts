@@ -13,8 +13,10 @@ import { configMutationLock } from "../services/configMutationLock";
 import {
   clearStaleProxyPasswordSecretsBeforeApply,
   restoreProxyPasswordSecrets,
+  isSameAuthenticatedEndpoint,
   type CapturedProxyPasswordSecret
 } from "../services/inventory/proxySecretHygiene";
+import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { deviceTemplateFormDefinition, type ServerListEntry } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -591,11 +593,43 @@ export function registerDeviceTemplateCommands(ctx: CommandContext): vscode.Disp
             try {
               applied = await applyPlanWrites(ctx, plan);
             } catch (error) {
-              // The apply did NOT (fully) commit — the old proxy config is still live and
-              // needs its password, so restore what we captured before surfacing the
-              // failure (best-effort, mirroring the sync path's restore-on-apply-failure).
+              // FIX A′ (issue #48 PR-T1b / PR #62 Codex review round 3, SECURITY) — the
+              // restore here MUST be per-server CONDITIONAL, not blanket. Unlike the sync
+              // path's atomic `applyInventorySyncPlan` (on throw nothing committed, old
+              // proxy live everywhere → its unconditional restore is correct), the manual
+              // path's `applyPlanWrites` loops `core.addOrUpdateServer` per server, and
+              // that method installs the new record in memory then awaits `saveServers`
+              // with NO rollback on reject. A mid-loop failure therefore leaves the
+              // already-processed servers COMMITTED on their NEW proxy while the later
+              // ones stayed on the OLD one. A blanket restore would re-arm the committed
+              // (new-proxy) servers with the OLD endpoint's password — `ProxySshFactory`
+              // would then send that password to the new endpoint: the exact leak this
+              // whole path exists to prevent.
+              //
+              // So restore a captured secret ONLY for a server whose CURRENT live proxy
+              // is still the OLD authenticated endpoint that secret was captured for
+              // (`isSameAuthenticatedEndpoint(liveProxy, beforeProxy)`). A server now on
+              // the NEW proxy (its write landed) keeps its secret deleted — the new
+              // template proxy carries no stored secret and prompts per-connect (§5.3),
+              // so leaving it deleted is correct and leak-free. The boundary server (new
+              // proxy in memory but its own save was the failing one) reads "new" and is
+              // skipped: that fails SAFE — a per-connect password prompt, never a leak.
+              // Invariant: no server is ever left holding the NEW proxy AND the OLD
+              // endpoint's password.
               if (vault) {
-                await restoreProxyPasswordSecrets(vault, capturedProxySecrets);
+                const beforeProxyByKey = new Map<string, { id: string; beforeProxy: typeof proxyChanges[number]["before"]["proxy"] }>();
+                for (const { before } of proxyChanges) {
+                  beforeProxyByKey.set(proxyPasswordSecretKey(before.id), { id: before.id, beforeProxy: before.proxy });
+                }
+                const restorable = capturedProxySecrets.filter((secret) => {
+                  const origin = beforeProxyByKey.get(secret.key);
+                  if (!origin) {
+                    return false;
+                  }
+                  const liveProxy = ctx.core.getServer(origin.id)?.proxy;
+                  return isSameAuthenticatedEndpoint(liveProxy, origin.beforeProxy);
+                });
+                await restoreProxyPasswordSecrets(vault, restorable);
               }
               throw error;
             }
