@@ -62,6 +62,42 @@ describe("isValidDetachedServerOrigin", () => {
     expect(isValidDetachedServerOrigin({ ...valid, somethingNewer: "x" })).toBe(true);
   });
 
+  /**
+   * The two OPTIONAL members, and the asymmetry with the five above. Both are
+   * copied off the server's own `origin` at detach time, so both are legitimately
+   * absent — `instanceKey` when the sync recorded no deployment, and
+   * `syncedAuthProfileId` (REVIEW FINDING, P1 — adoption auth provenance) when
+   * the removed source had linked no profile, which is the ordinary case.
+   *
+   * PRESENT, each must be well-formed, because each is CONSUMED rather than
+   * merely displayed: `instanceKey` is compared for equality to decide an
+   * adoption (two empty strings would read as one deployment), and
+   * `syncedAuthProfileId` is restored into a live origin where AUTH 2b and
+   * retro-apply's opt-out compare it against a real profile id.
+   */
+  it.each(["instanceKey", "syncedAuthProfileId"])("accepts a marker WITHOUT %s — absence is a real state, not a malformed one", (member) => {
+    expect(isValidDetachedServerOrigin(valid)).toBe(true);
+    expect(isValidDetachedServerOrigin({ ...valid, [member]: undefined })).toBe(true);
+  });
+
+  it.each(["instanceKey", "syncedAuthProfileId"])("rejects a PRESENT but empty or non-string %s (kills `optional` meaning `unchecked` for a member that decides an adoption or an unlink)", (member) => {
+    // Empty specifically, because two empties compare EQUAL to each other —
+    // which for `instanceKey` is the exact cross-instance collision the field
+    // exists to remove. Whitespace is deliberately not re-checked here, on the
+    // same terms as length and control characters: those bound what this
+    // extension WRITES (`resolveProviderInstanceKey` trims and rejects blank, and
+    // an AuthProfile id is a UUID), and a blank key on one side can never meet a
+    // blank key on the other, because no source can ever resolve to one.
+    expect(isValidDetachedServerOrigin({ ...valid, [member]: "" })).toBe(false);
+    expect(isValidDetachedServerOrigin({ ...valid, [member]: 7 })).toBe(false);
+    expect(isValidDetachedServerOrigin({ ...valid, [member]: {} })).toBe(false);
+    expect(isValidDetachedServerOrigin({ ...valid, [member]: null })).toBe(false);
+  });
+
+  it("accepts both optional members when well-formed (control — the clauses above must not be a blanket rejection)", () => {
+    expect(isValidDetachedServerOrigin({ ...valid, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1" })).toBe(true);
+  });
+
   it("does not mutate the value it is asked to check", () => {
     const subject = { ...valid };
     const snapshot = JSON.stringify(subject);

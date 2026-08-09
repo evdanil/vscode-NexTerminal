@@ -87,9 +87,25 @@ describe("serverConfigsEqual — formerlySynced (ADOPT 1)", () => {
     expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, detachedAt: 2000 } }))).toBe(false);
   });
 
+  it("two markers differing only in the PRESERVED FIELDS the detach copies off the origin are not equal (kills leaving `instanceKey` or `syncedAuthProfileId` out of the comparison — a rollback would then replace a marker that names its deployment, or remembers the removed source's own auth link, with one that does not, and call the two records identical while doing it)", () => {
+    const a = server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1" } });
+    // `instanceKey` is what makes a marker adoptable AT ALL.
+    expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox-lab.example.com", syncedAuthProfileId: "p1" } }))).toBe(false);
+    expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, syncedAuthProfileId: "p1" } }))).toBe(false);
+    // REVIEW FINDING (P1, adoption auth provenance) — `syncedAuthProfileId` is
+    // what tells the sync's own link apart from the user's once adoption restores
+    // it, i.e. whether AUTH 2b may ever take that link back off.
+    expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p2" } }))).toBe(false);
+    expect(serverConfigsEqual(a, server({ formerlySynced: { ...MARKER, instanceKey: "https://netbox.example.com" } }))).toBe(false);
+  });
+
   it("identical markers (distinct objects) still compare equal, and so do two records with no marker at all (kills a comparator that compares by reference, which would report every unchanged kept server as changed)", () => {
     expect(serverConfigsEqual(server({ formerlySynced: MARKER }), server({ formerlySynced: { ...MARKER } }))).toBe(true);
     expect(serverConfigsEqual(server(), server())).toBe(true);
+    // Including the optional members, so the clause added for them cannot be a
+    // permanent "not equal".
+    const full = { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1" };
+    expect(serverConfigsEqual(server({ formerlySynced: full }), server({ formerlySynced: { ...full } }))).toBe(true);
   });
 });
 

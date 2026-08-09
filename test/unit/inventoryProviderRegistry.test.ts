@@ -192,4 +192,55 @@ describe("resolveProviderInstanceKey", () => {
     expect(resolveProviderInstanceKey({ instanceKey: () => "" }, { baseUrl: "a" })).toBeUndefined();
     expect(resolveProviderInstanceKey({ instanceKey: () => "" }, { baseUrl: "b" })).toBeUndefined();
   });
+
+  /**
+   * REVIEW FINDING (P2, defensive copy) — the same boundary rule `cloneForProvider`
+   * enforces for `fetchInventory` / `testConnection` (commands/inventoryCommands.ts),
+   * applied to the third place a provider is handed a config.
+   *
+   * WHY IT MATTERS HERE SPECIFICALLY: every caller passes a LIVE object — the
+   * `config` sitting on an InventorySourceConfig inside NexusCore. Because
+   * InventorySourceValues is all primitives, an in-place normalization by a
+   * third-party provider mutates the STORED record with no revision bump behind
+   * it, so `sourceConfigUnchanged` still calls the record the same incarnation and
+   * the apply persists the mutation while the tree it applies was fetched from
+   * the pre-mutation config.
+   *
+   * BOTH ASSERTIONS ARE LOAD-BEARING. The identity check alone would pass against
+   * a shallow `{...config}` that a nested value could still escape; the
+   * unchanged-original check alone would pass against a provider that happens not
+   * to mutate on this run. Together they pin "the provider cannot reach the
+   * caller's object", which is the property.
+   */
+  it("hands the provider a COPY of the config, so an instanceKey that normalizes its argument in place cannot mutate stored source state (kills passing source.config straight through, where the mutation lands in globalState with no revision bump to notice it)", () => {
+    const live = { baseUrl: "HTTPS://NetBox.Example.COM/", port: 443 };
+    const seen: unknown[] = [];
+    const key = resolveProviderInstanceKey(
+      {
+        instanceKey: (config) => {
+          seen.push(config);
+          // The shape of third-party normalization this guards against: helpful,
+          // plausible, and destructive to the caller's record.
+          config.baseUrl = String(config.baseUrl).toLowerCase().replace(/\/$/, "");
+          return String(config.baseUrl);
+        }
+      },
+      live
+    );
+
+    expect(key).toBe("https://netbox.example.com");
+    // Not the caller's object.
+    expect(seen[0]).not.toBe(live);
+    // And the caller's object is untouched by what the provider did to its copy.
+    expect(live).toEqual({ baseUrl: "HTTPS://NetBox.Example.COM/", port: 443 });
+  });
+
+  it("degrades to undefined when the config cannot be cloned at all, rather than throwing into a sync or a source removal (kills cloning outside the guarded call)", () => {
+    // Only a hand-edited globalState row can put a function here — the type says
+    // string | number | boolean — but the cost of being wrong is a TypeError
+    // thrown after an inventory fetch, or mid-removal, so the clone lives inside
+    // the same try the provider call does.
+    const uncloneable = { baseUrl: (() => "nope") as unknown as string };
+    expect(resolveProviderInstanceKey({ instanceKey: () => "https://netbox.example.com" }, uncloneable)).toBeUndefined();
+  });
 });

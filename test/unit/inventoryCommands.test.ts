@@ -3259,7 +3259,12 @@ describe("inventoryCommands", () => {
         name: "old-sw",
         host: "10.0.0.1",
         port: 22,
-        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        // REVIEW FINDING (P1, adoption instance identity) — the origin already
+        // carries the instance this source's provider reports, because this test
+        // needs the pre-removal plan to be genuinely EMPTY (see below) and a
+        // missing instance stamp is a change the sync would write, i.e. an update
+        // that takes syncNow off the fast path this test is about.
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://default" }
       });
       const repo = new InMemoryConfigRepository([owned]);
       const core = new NexusCore(repo);
@@ -3712,7 +3717,20 @@ describe("inventoryCommands", () => {
       // carrying everything the add path stamped, the source's default username
       // included. A server whose username differs reads as hand-edited and is
       // deliberately left alone — see the hand-edited-username test below.
-      return makeServer({ username: "admin", origin: { sourceId: "src-1", externalId, syncedAt: 1 }, ...rest });
+      // REVIEW FINDING (P1, adoption instance identity) — `syncedInstanceKey`
+      // matches what `makeProvider`'s `instanceKey` reports for `makeHarness`'s
+      // source config (`host: "netbox.local"`), i.e. these servers are already
+      // stamped with the deployment they were synced from. Omitting it would make
+      // EVERY server in this block an update on every sync (the stamp would be
+      // computed for the first time), which is a real behaviour — the backfill
+      // for servers synced by an older build — but not the one these auth-profile
+      // tests are about: it inflates the "N servers will be updated" counts they
+      // assert on and takes the fast-path tests off the fast path.
+      return makeServer({
+        username: "admin",
+        origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedInstanceKey: "fake://netbox.local" },
+        ...rest
+      });
     }
 
     function modalCalls(): Array<[string, { detail: string }]> {
@@ -5718,8 +5736,18 @@ describe("inventoryCommands", () => {
     it("Remove Source → Keep Servers stamps each kept server with the device IT was mapped to (kills the strip-only removal that makes re-adding the source duplicate the whole fleet, and kills a stamp that copies one device's id onto every record)", async () => {
       const { core } = await harness({
         servers: [
-          makeServer({ id: "owned-1", name: "sw1", host: "10.0.0.11", origin: { sourceId: "src-1", externalId: "device:7", syncedAt: 1 } }),
-          makeServer({ id: "owned-2", name: "sw2", host: "10.0.0.12", origin: { sourceId: "src-1", externalId: "device:8", syncedAt: 1 } })
+          makeServer({
+            id: "owned-1",
+            name: "sw1",
+            host: "10.0.0.11",
+            origin: { sourceId: "src-1", externalId: "device:7", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+          }),
+          makeServer({
+            id: "owned-2",
+            name: "sw2",
+            host: "10.0.0.12",
+            origin: { sourceId: "src-1", externalId: "device:8", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+          })
         ]
       });
 
@@ -5733,11 +5761,12 @@ describe("inventoryCommands", () => {
         sourceId: "src-1",
         sourceName: "My Source",
         providerId: "fake",
-        // REVIEW FINDING (P1, cross-instance adoption) — stamped from the
-        // provider, at the only moment it can still be asked: `source.config` is
-        // deleted with the record a line later, so a removal that forgets this
-        // leaves a marker no future sync may act on. `toEqual` (not a subset
-        // check) is what makes the omission visible here.
+        // REVIEW FINDING (P1, cross-instance adoption), fed by REVIEW FINDING
+        // (P1, the instance guard fed from the wrong place) — copied off each
+        // server's own `origin.syncedInstanceKey`, which is the only record of
+        // the deployment its `externalId` came from once `source.config` is
+        // deleted with the source a line later. `toEqual` (not a subset check) is
+        // what makes an omission visible here.
         instanceKey: DEFAULT_INSTANCE,
         externalId: "device:7",
         detachedAt: expect.any(Number)
@@ -5757,7 +5786,10 @@ describe("inventoryCommands", () => {
             port: 22,
             username: "labuser",
             authType: "password",
-            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+            // Synced from netbox-a, which is what the removal copies into the
+            // marker and what makes src-2 (pointed at the same deployment)
+            // eligible to reclaim it.
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://netbox-a" }
           })
         ],
         // Both incarnations exist from the start; the removal below takes the
@@ -5819,7 +5851,8 @@ describe("inventoryCommands", () => {
             port: 22,
             username: "labuser",
             authType: "password",
-            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+            // Synced from production, recorded on the record itself.
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://netbox-prod" }
           })
         ]
       });
@@ -5854,6 +5887,111 @@ describe("inventoryCommands", () => {
       expect(keptFromProd.username).toBe("labuser");
       expect(keptFromProd.formerlySynced?.instanceKey).toBe("fake://netbox-prod");
       expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("REPOINTED-BEFORE-REMOVAL — a source edited to point at a SECOND deployment and then removed with Keep Servers stamps the deployment its servers were actually SYNCED from, and a source at the second deployment does not adopt them (kills deriving the marker from the source's current config, which hands the servers of instance A to a source of instance B — the instance guard fed from the wrong place)", async () => {
+      // THE WINDOW THIS LIVES IN: Edit Source can be repointed at any time, and
+      // until a sync against the new deployment succeeds the owned servers'
+      // externalIds are still the OLD deployment's. Removing in that window used
+      // to stamp every marker with the new deployment's key, so the instance
+      // guard — real, and correct as written — was simply fed the wrong value.
+      const { core } = await harness({
+        sources: [
+          { config: { host: "netbox-a" } },
+          { id: "src-2", name: "Lab NetBox", config: { host: "netbox-b" } }
+        ],
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "core-sw-01",
+            host: "10.0.0.11",
+            port: 22,
+            username: "prod-account",
+            authType: "password",
+            // What a real sync against netbox-a stamped: device:1 is netbox-a's
+            // device:1, and this is the only record of that fact.
+            origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1, syncedInstanceKey: "fake://netbox-a" }
+          })
+        ]
+      });
+
+      // The repoint. No sync follows it — that is the entire point.
+      const repointed = core.getInventorySource("src-1")!;
+      await core.addOrUpdateInventorySource({ ...repointed, config: { host: "netbox-b" } });
+      expect(core.getInventorySource("src-1")?.config).toEqual({ host: "netbox-b" });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      // THE KILLER ASSERTION. A build that re-derives from `source.config` writes
+      // "fake://netbox-b" here, and every consequence below follows from it.
+      expect(core.getServer("owned-1")?.formerlySynced?.instanceKey).toBe("fake://netbox-a");
+      expect(core.getServer("owned-1")?.formerlySynced?.instanceKey).not.toBe("fake://netbox-b");
+
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+      // ONE modal, and it is the preview: the netbox-b source is never even
+      // OFFERED the netbox-a record, because an adoption the user approves is as
+      // much a transfer as a silent one.
+      const shown = modals();
+      expect(shown).toHaveLength(1);
+      expect(shown[0][0]).toBe('Apply inventory sync from "Lab NetBox"?');
+      expect(shown[0][1].detail).not.toContain("adopted by this source");
+
+      // Two servers: the untouched netbox-a record and netbox-b's own new one.
+      // The pre-fix build applied ONE — owned-1 re-homed onto src-2, after which
+      // the lab source's Removed-Device Policy governed a production server and
+      // its saved credentials.
+      const servers = core.getSnapshot().servers;
+      expect([...servers].map((s) => s.id).sort()).toEqual(["owned-1", deterministicServerId("src-2", "device:1")].sort());
+      const keptFromA = core.getServer("owned-1")!;
+      expect(keptFromA.origin).toBeUndefined();
+      expect(keptFromA.username).toBe("prod-account");
+      expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("Keep Servers carries the source's OWN auth-profile link record into the marker (kills a detach that drops `syncedAuthProfileId`, after which an adopted server's sync-applied profile can never be taken back off)", async () => {
+      const { core } = await harness({
+        servers: [
+          makeServer({
+            id: "owned-1",
+            name: "sw1",
+            host: "10.0.0.11",
+            authProfileId: "p1",
+            origin: {
+              sourceId: "src-1",
+              externalId: "device:1",
+              syncedAt: 1,
+              syncedInstanceKey: DEFAULT_INSTANCE,
+              // The sync's own record that IT applied p1.
+              syncedAuthProfileId: "p1"
+            }
+          }),
+          // The near-miss beside it: identical link, but the USER made it, so
+          // there is no receipt to carry and none must be invented.
+          makeServer({
+            id: "owned-2",
+            name: "sw2",
+            host: "10.0.0.12",
+            authProfileId: "p1",
+            origin: { sourceId: "src-1", externalId: "device:2", syncedAt: 1, syncedInstanceKey: DEFAULT_INSTANCE }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      // The link itself stays on both records — a detach removes ownership, not
+      // credentials.
+      expect(core.getServer("owned-1")?.authProfileId).toBe("p1");
+      expect(core.getServer("owned-2")?.authProfileId).toBe("p1");
+      // Only the sync's own link leaves a receipt.
+      expect(core.getServer("owned-1")?.formerlySynced?.syncedAuthProfileId).toBe("p1");
+      expect(core.getServer("owned-2")?.formerlySynced).not.toHaveProperty("syncedAuthProfileId");
     });
 
     it("a provider that reports no instance at all writes a receipt-only marker and adopts nothing (kills stamping an instance key the provider never supplied, and kills falling back to the provider id when it has none)", async () => {

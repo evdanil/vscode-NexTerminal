@@ -61,14 +61,18 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     return false;
   }
   const obj = value as Record<string, unknown>;
-  // `syncedUsername` and `syncedAuthProfileId` are optional (absent on every
-  // server synced before each field existed) but shape-checked like the rest:
+  // `syncedInstanceKey`, `syncedUsername` and `syncedAuthProfileId` are optional
+  // (absent on every server synced before each field existed) but shape-checked
+  // like the rest:
   // this guard is the ONLY thing standing between a hand-edited backup /
   // version-skewed globalState and the retro-apply rule that reads them, and an
   // origin member the engine did not write makes the whole marker untrustworthy.
   // Empty is rejected as well as non-string: neither ServerConfig.username nor
-  // AuthProfile.id can ever be empty, so an empty stamp could not have come from
-  // a sync. The disposition for a malformed origin is unchanged and
+  // AuthProfile.id can ever be empty, and `resolveProviderInstanceKey` rejects an
+  // empty/blank instance key outright, so an empty stamp could not have come from
+  // a sync. An empty `syncedInstanceKey` matters most of the three — it is COPIED
+  // into a detached marker and then compared for equality, where two empties
+  // would read as one deployment. The disposition for a malformed origin is unchanged and
   // deliberately loud — both callers of this guard strip the WHOLE origin (see
   // VscodeConfigRepository.getServers and addServerSanitizingOrigin), which costs
   // that server its sync ownership and makes the next sync report an id collision
@@ -77,6 +81,7 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     isNonEmptyString(obj.sourceId) &&
     isNonEmptyString(obj.externalId) &&
     typeof obj.syncedAt === "number" &&
+    isOptionalNonEmptyString(obj.syncedInstanceKey) &&
     isOptionalNonEmptyString(obj.syncedUsername) &&
     isOptionalNonEmptyString(obj.syncedAuthProfileId)
   );
@@ -103,8 +108,8 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
  * the server simply stops being adoptable, so the next sync adds a duplicate and
  * says so, instead of re-homing a record on the strength of a field nobody wrote.
  *
- * REVIEW FINDING (P1, cross-instance adoption) — `instanceKey` is the ONE member
- * that is optional, and the asymmetry is deliberate. Absent, it means "this
+ * REVIEW FINDING (P1, cross-instance adoption) — `instanceKey` is one of TWO
+ * optional members, and the asymmetry is deliberate. Absent, it means "this
  * marker names no provider instance", which the engine already refuses to adopt
  * on (see DetachedServerOrigin in models/config.ts): requiring it here would
  * discard the marker's `sourceName`/`detachedAt` receipts — the only record of
@@ -117,6 +122,15 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
  * here: those bound what this extension WRITES, and a marker that merely carries
  * an over-long key still names a real instance, which is a worse thing to
  * discard than to keep.
+ *
+ * REVIEW FINDING (P1, adoption auth provenance) — `syncedAuthProfileId` is the
+ * second optional member, and optional for a plainer reason than `instanceKey`:
+ * the detach copies it from the origin, and a source that had linked no profile
+ * leaves nothing to copy, so absent is the ordinary case rather than a legacy
+ * one. PRESENT it must be a non-empty string, exactly as the origin stamp it
+ * mirrors is checked by `isValidServerOrigin`: an `AuthProfile.id` is never
+ * empty, and this value is restored into a real origin at adoption, where AUTH 2b
+ * and retro-apply's opt-out both compare it against a live profile id.
  */
 export function isValidDetachedServerOrigin(value: unknown): value is DetachedServerOrigin {
   if (typeof value !== "object" || value === null) {
@@ -124,6 +138,9 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
   }
   const obj = value as Record<string, unknown>;
   if (obj.instanceKey !== undefined && !isNonEmptyString(obj.instanceKey)) {
+    return false;
+  }
+  if (obj.syncedAuthProfileId !== undefined && !isNonEmptyString(obj.syncedAuthProfileId)) {
     return false;
   }
   return (

@@ -135,8 +135,6 @@ import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
 import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import { isValidDetachedServerOrigin } from "../../src/utils/validation";
-import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
-import { createNetboxProvider } from "../../src/services/inventory/providers/netboxProvider";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
@@ -6284,19 +6282,33 @@ describe("backup export round-trip", () => {
 
   /**
    * REVIEW FINDING (P1, cross-instance adoption) — the rollback marker's INSTANCE
-   * member, which the test above cannot see: it registers no provider, so the
-   * marker it asserts is deliberately the degraded one (a receipt naming no
-   * deployment, therefore not adoptable). This is the same flow with a registry
-   * wired in, which is how `extension.ts` runs it.
+   * member, which the test above cannot see: its server carries no sync-time
+   * instance stamp, so the marker it asserts is deliberately the degraded one (a
+   * receipt naming no deployment, therefore not adoptable).
+   *
+   * REVIEW FINDING (P1, the instance guard fed from the wrong place) — and WHERE
+   * that member comes from, which is the whole point of this test now. It is
+   * copied off the rolled-back server's own `origin.syncedInstanceKey`, never
+   * re-derived from the imported source's `config` through a registered provider.
+   * The fixture is built so the two answers DIFFER: the origin says
+   * `https://netbox-a.example.com`, while the imported source's config says
+   * `https://netbox.example.com` (makeInventorySource's default, which is exactly
+   * what `createNetboxProvider`'s `instanceKey` would return from it). A backup
+   * can carry precisely that skew — a source repointed at a second deployment
+   * after the servers beside it were synced from a first — and the config-derived
+   * answer is the one that lets a later source of the second deployment adopt,
+   * and then prune, the first one's records.
    *
    * Both halves matter and each kills a different mistake. Stamping nothing when
-   * a provider IS available re-creates the un-adoptable rollback the marker was
-   * added to fix, one level down. Stamping something when it is NOT — a
-   * placeholder, the provider id, an empty string — hands out an identity nobody
-   * derived, which is the whole class of defect this finding is about.
+   * the origin HAS a stamp re-creates the un-adoptable rollback the marker was
+   * added to fix, one level down. Stamping something when it does NOT — a
+   * placeholder, the provider id, or the source config's own URL as a "fallback"
+   * — hands out an identity nobody verified, which is the whole class of defect
+   * this finding is about, and a fallback would be reached in exactly the
+   * repointed-config case that produces the wrong answer.
    */
-  it("(REVIEW FINDING, P1) a rolled-back source's marker records the provider INSTANCE when a registry is wired in, and records none when it is not (kills a rollback that forgets the instance — leaving every rolled-back server permanently unadoptable — and kills inventing one when no provider can be asked)", async () => {
-    async function rollbackMarkerWith(registry?: InventoryProviderRegistry) {
+  it("(REVIEW FINDING, P1) a rolled-back source's marker copies the instance the SERVER'S ORIGIN recorded, and records none when the origin recorded none — never the one the imported source's config names (kills a rollback that forgets the instance, and kills re-deriving it from a mutable config that may have been repointed since)", async () => {
+    async function rollbackMarkerWith(syncedInstanceKey?: string) {
       vi.clearAllMocks();
       registeredCommands.clear();
       configStore.clear();
@@ -6318,19 +6330,26 @@ describe("backup export round-trip", () => {
 
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
-      registerConfigCommands(core, vault, undefined, registry);
+      registerConfigCommands(core, vault);
 
       const secrets = { inventorySourceSecrets: { src1: { apiToken: "src1-token" } } };
       const importData = {
         version: 2,
         exportType: "backup",
         exportedAt: new Date().toISOString(),
-        servers: [makeServer({ id: "srv-owned", name: "Owned", origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1 } })],
+        servers: [
+          makeServer({
+            id: "srv-owned",
+            name: "Owned",
+            origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1, syncedInstanceKey }
+          })
+        ],
         tunnels: [],
         serialProfiles: [],
         authProfiles: [],
-        // config.baseUrl is "https://netbox.example.com" — the value the
-        // registered provider below derives its instance key from.
+        // config.baseUrl is "https://netbox.example.com" — the value a
+        // config-derived implementation would stamp, and deliberately NOT the
+        // value either assertion below expects.
         inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
         encryptedSecrets: encrypt(JSON.stringify(secrets), "masterpass1")
       };
@@ -6346,19 +6365,24 @@ describe("backup export round-trip", () => {
       return core.getServer("srv-owned")!.formerlySynced;
     }
 
-    const registry = new InventoryProviderRegistry();
-    registry.register(createNetboxProvider(vi.fn() as unknown as typeof fetch));
-    const withProvider = await rollbackMarkerWith(registry);
-    expect(withProvider?.instanceKey).toBe("https://netbox.example.com");
-    expect(isValidDetachedServerOrigin(withProvider)).toBe(true);
+    // THE KILLER ASSERTION: the deployment the SYNC recorded, which is not the
+    // one the imported source's config names. A build that re-derives from
+    // `importedSource.config` through the netbox provider stamps
+    // "https://netbox.example.com" here and fails.
+    const fromOrigin = await rollbackMarkerWith("https://netbox-a.example.com");
+    expect(fromOrigin?.instanceKey).toBe("https://netbox-a.example.com");
+    expect(fromOrigin?.instanceKey).not.toBe("https://netbox.example.com");
+    expect(isValidDetachedServerOrigin(fromOrigin)).toBe(true);
 
-    // No registry — the module still works, and the marker is honest about
-    // knowing nothing: written as an ABSENT member rather than an empty or
-    // placeholder string, because the sync engine reads absent as "not
-    // adoptable" and would read a placeholder as an instance to match on.
-    const withoutProvider = await rollbackMarkerWith(undefined);
-    expect(withoutProvider?.externalId).toBe("dev-a");
-    expect(withoutProvider).not.toHaveProperty("instanceKey");
+    // No sync-time stamp — the marker is honest about knowing nothing: written
+    // as an ABSENT member rather than an empty or placeholder string, because
+    // the sync engine reads absent as "not adoptable" and would read a
+    // placeholder as an instance to match on. A config-derived FALLBACK for this
+    // case fails here too, and would be reached in exactly the repointed-config
+    // scenario that makes the config-derived answer wrong.
+    const withoutStamp = await rollbackMarkerWith(undefined);
+    expect(withoutStamp?.externalId).toBe("dev-a");
+    expect(withoutStamp).not.toHaveProperty("instanceKey");
   });
 
   /**

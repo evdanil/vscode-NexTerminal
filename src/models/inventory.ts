@@ -141,6 +141,21 @@ const INSTANCE_KEY_CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
  * Trimming (rather than rejecting) surrounding whitespace matches how every
  * other config-derived value in this file is normalized, and cannot create a
  * false match: two keys equal after trimming named the same endpoint before it.
+ *
+ * REVIEW FINDING (P2, defensive copy) — the provider is handed its OWN COPY of
+ * `config`, on exactly the terms `cloneForProvider` gives `fetchInventory` and
+ * `testConnection` (commands/inventoryCommands.ts). Every caller here passes a
+ * LIVE object: `source.config` as stored on the record in NexusCore, or the
+ * config of a source record read straight out of core a line earlier. A
+ * third-party `instanceKey` that normalizes its argument in place — lowercasing a
+ * host, stripping a trailing slash — would therefore mutate stored state with no
+ * revision bump behind it, so `sourceConfigUnchanged` still reports the record as
+ * the same incarnation and the apply persists the mutated config while the tree
+ * it applies was fetched from the original. `structuredClone` is cheap here for
+ * the same reason it is there (every value is a string/number/boolean), and it is
+ * inside the try so a non-cloneable value smuggled into globalState degrades to
+ * "no instance identity" — the safe answer — instead of throwing into a sync or a
+ * source removal.
  */
 export function resolveProviderInstanceKey(
   provider: Pick<InventoryProvider, "instanceKey">,
@@ -151,7 +166,7 @@ export function resolveProviderInstanceKey(
   }
   let raw: unknown;
   try {
-    raw = provider.instanceKey(config);
+    raw = provider.instanceKey(structuredClone(config));
   } catch {
     return undefined;
   }

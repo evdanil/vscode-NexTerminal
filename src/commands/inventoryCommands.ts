@@ -139,6 +139,12 @@ function sourceBusyMessage(name: string, holder: SourceBusyReason, asking: Sourc
  * and a shallow copy for secrets (also a flat Record<string,string>). A tiny
  * shared helper so future provider call sites inherit this for free instead
  * of each having to remember it individually.
+ *
+ * THE THIRD BOUNDARY is `provider.instanceKey`, and it cannot use this helper —
+ * it is invoked from `resolveProviderInstanceKey` in models/inventory.ts, which
+ * must not import from the command layer. It clones inline on the same terms
+ * (REVIEW FINDING, P2); the rule is "no provider ever receives a live config",
+ * not "every caller uses this function".
  */
 function cloneForProvider(
   config: InventorySourceValues,
@@ -2540,21 +2546,28 @@ export function registerInventoryCommands(
           // strength of the provider kind. See DetachedServerOrigin
           // (models/config.ts) and `sameProviderInstance` (syncEngine.ts).
           //
-          // Resolved against the CURRENTLY-REGISTERED provider, and `undefined`
-          // when there is none. A provider can be gone at removal time (its
-          // extension uninstalled or disabled — nothing in this flow requires
-          // one, deliberately, since a user must always be able to remove a
-          // source whose provider has vanished) or can simply not implement
-          // `instanceKey`. Both leave the marker without an instance key, which
-          // means the receipt is still written — the UI can still say which
-          // source kept this server — but the record is not adoptable. That is
-          // the safe direction: an un-adoptable kept server costs a duplicate
+          // REVIEW FINDING (P1, the instance guard fed from the wrong place) —
+          // COPIED FROM EACH SERVER'S OWN `origin.syncedInstanceKey`, never
+          // re-derived here from `source.config` through the registered provider.
+          // The config is mutable and the origins are not: a source synced
+          // against deployment A and then EDITED to point at B — with no
+          // successful sync since, which is the entire window this bug lives in
+          // — still owns servers whose `externalId`s belong to A. Deriving the
+          // key from the current config stamped every one of those markers "B",
+          // so a later B source with the same id and address passed the instance
+          // guard and could adopt, then prune, A's servers and their saved
+          // credentials. The origin stamp is the only value that describes the
+          // deployment those ids actually came from, and no edit can move it.
+          //
+          // A server whose origin carries no stamp (synced before the field
+          // existed) yields a marker with no instance key: the receipt is still
+          // written — the UI can still say which source kept this server — but
+          // the record is not adoptable. Same safe direction as before, reached
+          // for one more reason: an un-adoptable kept server costs a duplicate
           // the next sync explains, while a marker claiming an instance nobody
-          // verified is how a record changes owner.
-          const removalInstanceKey = ((): string | undefined => {
-            const removalProvider = registry.get(source.providerId);
-            return removalProvider === undefined ? undefined : resolveProviderInstanceKey(removalProvider, source.config);
-          })();
+          // verified is how a record changes owner. Re-deriving as a FALLBACK for
+          // those was rejected outright — a fallback is available in exactly the
+          // repointed-config case that produces the wrong answer.
           const strippedServers = owned.map(({ origin, ...rest }) =>
             // `owned` is filtered on `origin?.sourceId === source.id`, so every
             // entry HAS an origin — but that is a filter, not a type narrowing,
@@ -2570,14 +2583,25 @@ export function registerInventoryCommands(
                     sourceName: source.name,
                     providerId: source.providerId,
                     // Omitted entirely rather than written as `undefined` when
-                    // the provider names no instance: `formerlySynced` is
+                    // the sync recorded no instance: `formerlySynced` is
                     // persisted verbatim, and an explicit `instanceKey:
                     // undefined` survives into globalState as a key with no
                     // value on some JSON paths. Absent and absent-valued mean
                     // the same thing to every reader here, so write the one that
                     // cannot be misread.
-                    ...(removalInstanceKey !== undefined ? { instanceKey: removalInstanceKey } : {}),
+                    ...(origin.syncedInstanceKey !== undefined ? { instanceKey: origin.syncedInstanceKey } : {}),
                     externalId: origin.externalId,
+                    // REVIEW FINDING (P1, adoption auth provenance) — the one
+                    // part of the origin that has to SURVIVE the strip. It says
+                    // whether the `authProfileId` this server keeps was the
+                    // SYNC'S doing or the USER'S, which is what AUTH 2b (the
+                    // unlink that rescues a server stranded by a key profile with
+                    // no key file) and retro-apply's per-server opt-out are both
+                    // decided on. Dropped here, an adopted server carried a
+                    // sync-applied link that nothing could prove was the sync's,
+                    // so nothing could ever take it back off. Omitted rather than
+                    // written as `undefined` for the reason `instanceKey` is.
+                    ...(origin.syncedAuthProfileId !== undefined ? { syncedAuthProfileId: origin.syncedAuthProfileId } : {}),
                     detachedAt
                   }
                 } as ServerConfig)

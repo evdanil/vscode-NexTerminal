@@ -685,6 +685,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         sourceId: source.id,
         externalId: device.externalId,
         syncedAt: now,
+        // REVIEW FINDING (P1, adoption instance identity) — REFRESHED from this
+        // run, never carried forward. The two stamps below record "what this sync
+        // WROTE" and carry forward where it wrote nothing; this one records
+        // "which deployment this sync READ the device from", and a sync that
+        // reaches this line has read it from `providerInstanceKey` by definition.
+        // So there is no carry-forward case: a source repointed from deployment A
+        // to B re-stamps every server it still owns on the first sync against B,
+        // which is what keeps the marker a later detach copies honest. Writing
+        // `undefined` when the provider names no instance is likewise the truth
+        // of this run — carrying A forward would re-assert an identity nothing
+        // verified, against a config that may since have moved.
+        syncedInstanceKey: providerInstanceKey,
         // AUTH 2a — `syncedUsername` records what the SYNC wrote, so it is
         // refreshed exactly when this sync writes `username` (the line below:
         // only when the endpoint supplies one) and otherwise carried forward
@@ -993,23 +1005,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       continue;
     }
 
-    // Never adopt/overwrite a server whose origin doesn't match this
-    // source, even if its id happens to collide with the deterministic id
-    // this device would produce (hand-imported fragment, or a collision
-    // across two different sources sharing a namespace by coincidence).
-    const collidingServer = serversById.get(id);
-    if (collidingServer) {
-      warnings.push(`Device "${device.name}" (${device.externalId}) maps to an id already used by unrelated server "${collidingServer.name}" — skipped.`);
-      continue;
-    }
-
     // ADOPT 1 — the kept-server match, and the adoption it can produce.
     //
-    // PLACEMENT IS LOAD-BEARING: strictly AFTER the id-collision guard above. A
-    // device whose deterministic id is already taken by an unrelated server is
-    // skipped today, and it stays skipped even when an adoptable server is
-    // waiting for it — reordering these two would change a corner nobody asked
-    // to change, on the strength of a feature about a different problem.
+    // COMPUTED BEFORE THE ID-COLLISION GUARD BELOW, and read by it. Deciding
+    // eligibility here does not act on it: nothing between this line and the
+    // adoption block writes a record, so the only thing moving the computation up
+    // buys is that the collision guard can ask whether the record it is about to
+    // refuse IS the adoptee (REVIEW FINDING, P2 — see there).
     //
     // ELIGIBILITY, all of it: the server carries a "Keep Servers" marker naming
     // THIS device, left by a source of this provider pointed at the SAME
@@ -1058,6 +1060,60 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // device at one address.
     const keptMatches = keptByExternalId.get(device.externalId) ?? [];
     const eligibleForAdoption = keptMatches.filter((s) => s.host.toLowerCase() === endpoint.host.toLowerCase() && s.port === port);
+
+    // Never adopt/overwrite a server whose origin doesn't match this
+    // source, even if its id happens to collide with the deterministic id
+    // this device would produce (hand-imported fragment, or a collision
+    // across two different sources sharing a namespace by coincidence).
+    //
+    // REVIEW FINDING (P2) — ONE record is exempt, and the exemption is written as
+    // narrowly as it can be written: the collider must BE the device's uniquely
+    // eligible adoptee, compared by object identity against the single entry of
+    // `eligibleForAdoption`. Anything wider re-opens the ownership transfer the
+    // two P1 findings above spent their whole argument closing, so the shape of
+    // this condition is the safety property — not the fact that some exemption
+    // exists.
+    //
+    // WHY IT IS NEEDED. Restore an ID-PRESERVING backup taken while a source was
+    // live, then remove that source with Keep Servers and add it back: the kept
+    // servers still carry `deterministicServerId(source.id, externalId)` from the
+    // sync that created them, and a restored source record carries its original
+    // id too. So the id this device computes is already taken — by the very
+    // record the marker points at. Refusing there meant the guard treated the
+    // intended adoptee as an unrelated collider, skipped before eligibility was
+    // ever consulted, and no adoption could be offered at all: the one path that
+    // reconnects a restored source to its own servers was closed by a rule about
+    // servers belonging to somebody else.
+    //
+    // WHY IT CANNOT BE WIDENED, clause by clause:
+    //  - `eligibleForAdoption.length === 1` — with two eligible records the plan
+    //    refuses to guess which is canonical (the ambiguity branch below), so
+    //    there is no "that exact server" to exempt; a collider among several is
+    //    an unrelated collider.
+    //  - `=== collidingServer` — the collider itself, not merely "some adoptable
+    //    server exists for this device". Drop this and a device with an eligible
+    //    adoptee ANYWHERE would be allowed to overwrite whatever unrelated record
+    //    happens to hold its id, which is precisely the claim the guard exists to
+    //    refuse.
+    //  - membership in `eligibleForAdoption` already carries the full eligibility
+    //    rule — no `origin`, a marker naming this device, this provider, this
+    //    deployment, and the device's current address — so the exemption can
+    //    never reach a hand-made server, a server owned by another source, or one
+    //    kept from a different instance. It is not a second, weaker path to
+    //    adoption; it is the same path, unblocked for the record it was about.
+    //
+    // AND IT STILL SKIPS UNLESS THE ADOPTION ACTUALLY HAPPENS. Passing this guard
+    // only lets the device reach the adoption block; if the user declined (or has
+    // not been asked yet) the fall-through below re-applies the skip, because the
+    // add path would otherwise mint a second record under an id that is already
+    // in use.
+    const collidingServer = serversById.get(id);
+    const collisionIsTheAdoptee = collidingServer !== undefined && eligibleForAdoption.length === 1 && eligibleForAdoption[0] === collidingServer;
+    if (collidingServer !== undefined && !collisionIsTheAdoptee) {
+      warnings.push(`Device "${device.name}" (${device.externalId}) maps to an id already used by unrelated server "${collidingServer.name}" — skipped.`);
+      continue;
+    }
+
     if (eligibleForAdoption.length === 1) {
       const adoptee = eligibleForAdoption[0];
       // Recorded whatever the answer — it changes what the plan DOES with a
@@ -1081,6 +1137,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           sourceId: source.id,
           externalId: device.externalId,
           syncedAt: now,
+          // REVIEW FINDING (P1, adoption instance identity) — this run's
+          // deployment, which is by construction the one the marker recorded:
+          // `sameProviderInstance` is what put this server in `keptByExternalId`
+          // at all, so it is defined and equal to `adoptee.formerlySynced
+          // .instanceKey` here. Stamped from `providerInstanceKey` rather than
+          // read back off the marker so every origin-writing path in this file
+          // states the same thing the same way — the marker is the copy, the
+          // origin is the original.
+          syncedInstanceKey: providerInstanceKey,
           // AUTH 2a, applied to a record this sync did not create: the stamps
           // record what THIS sync WROTE. It writes `username` only when the
           // endpoint supplies one, so otherwise it stamps none — never
@@ -1089,12 +1154,31 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // source's profile over it) and never `source.defaultUsername` (a
           // value this sync did not write onto the record).
           syncedUsername: endpoint.username,
+          // REVIEW FINDING (P1, adoption auth provenance) — RESTORED from the
+          // marker, which is the removed source's own stamp preserved across the
+          // detach (see `DetachedServerOrigin.syncedAuthProfileId`). Still never
+          // `adoptee.authProfileId`, for the reason that was always given: a
+          // hand-set link is history's doing and recording it would read as an
+          // opt-out the user never made. The marker is a different thing — it is
+          // a SYNC's record of a SYNC's link, and losing it at the detach is what
+          // made an adopted server unrescuable.
+          //
+          // What it buys, concretely. A kept server that arrives still carrying
+          // the profile its former source applied keeps `authProfileId` through
+          // the adoption (the `...adoptee` spread — a credential this sync did
+          // not choose), and retro-apply below cannot supply the matching stamp
+          // because it does not run while a link is set. Stamping `undefined`
+          // there produced a record that says "the user linked this", so if that
+          // key profile later lost its key file AUTH 2b refused to unlink it and
+          // the server could not connect at all, with no sync able to repair it;
+          // and clearing the link by hand did not read as an opt-out either, so
+          // the next sync reattached it. Restoring makes both rules see what
+          // actually happened.
+          //
           // Overwritten below if — and only if — retro-apply fires in this same
-          // plan, i.e. where this sync actually writes the link. Never
-          // `adoptee.authProfileId`: a kept server's surviving link is history's
-          // doing, not this sync's, and recording it would read as an opt-out
-          // the user never made.
-          syncedAuthProfileId: undefined
+          // plan, i.e. where this sync actually writes the link itself; the value
+          // it writes then is the one that is true of the record afterwards.
+          syncedAuthProfileId: adoptee.formerlySynced?.syncedAuthProfileId
         };
         const after: ServerConfig = {
           ...adoptee,
@@ -1146,10 +1230,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         }
         // No `changed` comparison, unlike the owned-update path above: gaining
         // `origin` guarantees before !== after, so an adoption is ALWAYS an
-        // update and never lands in `unchangedCount`. AUTH 2b/rollback likewise
-        // never sees a kept server — `decideSourceAuthRollback` requires
-        // `origin.syncedAuthProfileId === unusableProfileId` and a kept server
-        // has no origin to carry one, so its verdict is "none" by construction.
+        // update and never lands in `unchangedCount`.
+        //
+        // AUTH 2b/rollback is NOT run on this path, and after the provenance
+        // restore above that is a choice rather than a tautology (it used to be
+        // the latter: a kept server had no origin, so `decideSourceAuthRollback`
+        // answered "none" by construction). An adoptee that arrives still
+        // carrying a link the removed source applied is now provably in the
+        // sync's own shape — link and stamp both naming the same profile — so if
+        // that profile is already unusable, the unlink is one sync away rather
+        // than impossible: the record this adoption writes is exactly what the
+        // ordinary update path reads on the next run, and it fires there. The
+        // one sync of delay buys the same thing deferring retro-apply would have
+        // (it is deliberately NOT deferred, two lines below, for the mirror
+        // reason): the rollback's disclosure is written about servers "this sync
+        // had already linked", which is true of an owned server and not of one
+        // this run is meeting for the first time. Nothing is left unrepairable —
+        // that was the whole defect — only unrepaired for one run, on a server
+        // that was equally unable to connect before the adoption.
         updates.push({ before: adoptee, after });
         if (group !== undefined) {
           folderSet.add(group);
@@ -1222,6 +1320,36 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
     }
 
+    // REVIEW FINDING (P2) — the other half of the collision exemption above. The
+    // guard let this device through ONLY because its uniquely eligible adoptee is
+    // the record already holding the id; reaching here means the adoption did not
+    // fire, i.e. the user declined or has not been asked yet. The original skip
+    // therefore stands, with its original wording: continuing into the add below
+    // would push a record whose id is already in use, which is a strictly worse
+    // outcome than the duplicate this feature set out to remove — one id, two
+    // servers, and whichever the map keeps last silently wins.
+    //
+    // The device is still counted as a candidate (the adoption block above pushes
+    // its name before consulting the answer), so the run that gets the answer
+    // recomputes and adopts. That is the whole point: the question can now be
+    // asked at all.
+    //
+    // ITS OWN SENTENCE, not the "unrelated server" one the guard above pushes.
+    // The two describe different situations and lead to different repairs: that
+    // one is about a record this source has no claim on, while this one is about
+    // the very record the device came from, and the user reaching it has just
+    // asked for a separate add and is not going to get one. Saying "unrelated"
+    // here would be false about the server AND useless about the outcome. Fired
+    // regardless of `adoptionDeclined`, unlike the adoption REFUSAL warnings
+    // above: this is not an explanation of adoption, it is the only notice that
+    // this device produced nothing at all.
+    if (collidingServer !== undefined) {
+      warnings.push(
+        `Device "${device.name}" (${device.externalId}) was previously synced onto server "${collidingServer.name}", which still uses the id a new server for this device would need — so it is skipped rather than added separately. Sync again and choose Adopt Existing to reclaim that server.`
+      );
+      continue;
+    }
+
     const hostPortKey = `${endpoint.host.toLowerCase()}:${port}`;
     const manualMatch = manualByHostPort.get(hostPortKey);
     if (manualMatch) {
@@ -1265,6 +1393,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         sourceId: source.id,
         externalId: device.externalId,
         syncedAt: now,
+        // REVIEW FINDING (P1, adoption instance identity) — WHICH DEPLOYMENT this
+        // device was read from, recorded on the record itself because
+        // `externalId` above means nothing without it and because
+        // `source.config` — the only other place the answer lives — is mutable
+        // and can be repointed at another deployment before this server is ever
+        // synced again. See `ServerOrigin.syncedInstanceKey`; the "Keep Servers"
+        // detach copies THIS value into the marker rather than re-deriving one.
+        syncedInstanceKey: providerInstanceKey,
         syncedUsername: endpoint.username ?? source.defaultUsername,
         syncedAuthProfileId: resolvedProfileId
       }

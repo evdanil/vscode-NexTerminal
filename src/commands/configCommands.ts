@@ -5,8 +5,7 @@ import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
-import { inventorySecretKey, resolveProviderInstanceKey } from "../models/inventory";
-import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
+import { inventorySecretKey } from "../models/inventory";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
@@ -1322,24 +1321,23 @@ export async function captureBackupStateForExport(
 }
 
 /**
- * REVIEW FINDING (P1, cross-instance adoption) — `registry` is threaded in for
- * ONE purpose: the import-rollback path below stamps a `formerlySynced` marker
- * on servers whose source is being rolled back, and a marker needs the provider
- * to say which DEPLOYMENT those servers came from (see DetachedServerOrigin in
- * models/config.ts). Nothing else in this module consults a provider, and no
- * secret is read through it.
- *
- * OPTIONAL, so the module still stands up in tests that have no registry — and
- * absence degrades exactly like an unregistered provider does on the removal
- * path: the marker is written without an instance key, i.e. as a receipt that
- * says where the server came from but is not adoptable. Never as a marker
- * claiming an instance nobody derived.
+ * REVIEW FINDING (P1, cross-instance adoption) took a `registry` parameter here
+ * for ONE purpose — the import-rollback path stamped a `formerlySynced` marker
+ * and asked the registered provider which DEPLOYMENT the rolled-back servers
+ * came from. REVIEW FINDING (P1, the instance guard fed from the wrong place)
+ * removed the need: the marker now COPIES `ServerOrigin.syncedInstanceKey` off
+ * each server being detached, which is the deployment the sync that created it
+ * actually read from, rather than re-deriving one from a source config that may
+ * have been repointed since (or, on this path, restored from a backup that
+ * describes a different deployment entirely). Nothing in this module consults a
+ * provider any more, so the parameter is gone rather than left unused — a
+ * threaded-through dependency with no reader is an invitation to give it a
+ * second, unexamined job.
  */
 export function registerConfigCommands(
   core: NexusCore,
   vault: SecretVault,
-  context?: import("vscode").ExtensionContext,
-  registry?: InventoryProviderRegistry
+  context?: import("vscode").ExtensionContext
 ): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
@@ -1988,6 +1986,15 @@ export function registerConfigCommands(
         if (server.origin?.syncedAuthProfileId === server.authProfileId) {
           cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
         }
+        // REVIEW FINDING (P1, adoption auth provenance) — and the detached form
+        // of that stamp, for the reason NexusCore.removeAuthProfile gives: a
+        // kept server's marker carries the removed source's own link record, and
+        // adoption restores it into a live origin. Left naming a profile this
+        // import has just established does not exist, it would lock the record
+        // out of retro-apply the moment it is reclaimed.
+        if (server.formerlySynced?.syncedAuthProfileId === server.authProfileId) {
+          cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
+        }
         await core.addOrUpdateServer(cleared);
       }
     }
@@ -2308,18 +2315,6 @@ export function registerConfigCommands(
             // these records are detached by a single event, and a per-server Date.now() would
             // imply an ordering that does not exist.
             const detachedAt = Date.now();
-            // REVIEW FINDING (P1, cross-instance adoption) — the instance these
-            // servers were synced from, on the same terms as the Keep Servers
-            // stamp in inventoryCommands.ts: derived from the imported source's
-            // OWN config (that record is what these servers' origins named), via
-            // the currently-registered provider, and `undefined` when there is
-            // no registry, no registered provider, or no instance identity. A
-            // marker without it is a receipt, not an adoption key.
-            const rollbackInstanceKey = ((): string | undefined => {
-              if (registry === undefined || importedSource === undefined) return undefined;
-              const rollbackProvider = registry.get(importedSource.providerId);
-              return rollbackProvider === undefined ? undefined : resolveProviderInstanceKey(rollbackProvider, importedSource.config);
-            })();
             for (const serverId of serverTally.importedIds) {
               const server = core.getServer(serverId);
               const rolledBackOrigin = server?.origin;
@@ -2339,11 +2334,28 @@ export function registerConfigCommands(
                       sourceId,
                       sourceName: importedSource.name,
                       providerId: importedSource.providerId,
-                      // Omitted rather than written as `undefined`, for the
+                      // REVIEW FINDING (P1, cross-instance adoption), amended by
+                      // REVIEW FINDING (P1, the instance guard fed from the wrong
+                      // place) — the instance and the auth provenance are COPIED
+                      // FROM THE ORIGIN being stripped, on exactly the terms the
+                      // Keep Servers stamp in inventoryCommands.ts uses, and for
+                      // the same two reasons. The origin is what the sync that
+                      // created this server actually recorded; the imported
+                      // source record's `config` is only what the backup says it
+                      // is TODAY, and a backup can perfectly well carry a source
+                      // repointed at a second deployment after the servers beside
+                      // it were synced from a first. Re-deriving from that config
+                      // (through a provider registry this path may not even have)
+                      // would mint an adoption key nothing verified.
+                      //
+                      // Both omitted rather than written as `undefined`, for the
                       // reason the Keep Servers stamp gives: this object is
                       // persisted verbatim.
-                      ...(rollbackInstanceKey !== undefined ? { instanceKey: rollbackInstanceKey } : {}),
+                      ...(rolledBackOrigin.syncedInstanceKey !== undefined ? { instanceKey: rolledBackOrigin.syncedInstanceKey } : {}),
                       externalId: rolledBackOrigin.externalId,
+                      ...(rolledBackOrigin.syncedAuthProfileId !== undefined
+                        ? { syncedAuthProfileId: rolledBackOrigin.syncedAuthProfileId }
+                        : {}),
                       detachedAt
                     }
                   }

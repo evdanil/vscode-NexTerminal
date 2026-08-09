@@ -41,6 +41,52 @@ export interface ServerOrigin {
   externalId: string; // InventoryDevice.externalId within that source
   syncedAt: number;
   /**
+   * REVIEW FINDING (P1, adoption instance identity) — WHICH DEPLOYMENT of the
+   * source's provider the sync that last wrote this record was reading from, as
+   * `resolveProviderInstanceKey(provider, source.config)` reported it AT THAT
+   * MOMENT (for NetBox, the normalized base URL — see models/inventory.ts).
+   *
+   * It is what scopes `externalId`, which is unique only WITHIN one deployment:
+   * two NetBox instances both call their first device "device:1". So this field
+   * is the third member of the ownership key, not a receipt — and unlike the
+   * other two it records something about the SOURCE, which is exactly why it has
+   * to be stamped on the SERVER.
+   *
+   * WHY IT LIVES HERE AND NOT ON THE SOURCE RECORD. `InventorySourceConfig.config`
+   * is mutable: Edit Source can be pointed at a different deployment at any time,
+   * and the servers already synced still came from the old one until a sync
+   * against the new one actually rewrites them. Deriving the instance from the
+   * source's CURRENT config when a server is detached ("Keep Servers", and the
+   * import rollback's equivalent) therefore stamped every marker with a
+   * deployment those servers' `externalId`s were never scoped by — after which a
+   * source pointed at that second deployment could pass the instance guard and
+   * adopt, then prune, records it had never synced. Recording what the sync
+   * itself saw moves the identity onto a value no later edit can move underneath
+   * it — the same discipline `syncedUsername` and `syncedAuthProfileId` follow.
+   *
+   * Written by every path that writes `origin`: the add path, the update path and
+   * the adoption path all stamp the instance THIS run is talking to,
+   * unconditionally and without carry-forward. There is no "the sync did not
+   * write this field" case for it the way there is for `syncedUsername` — a sync
+   * always reads its devices from some deployment — so `undefined` here means
+   * only "the provider named no instance" (it does not implement `instanceKey`,
+   * or its answer was rejected), never "unchanged since last time". Carrying an
+   * older value forward when the current run cannot name an instance was rejected
+   * for that reason: it would re-assert an identity this sync did not verify,
+   * against a config that may since have been repointed.
+   *
+   * Optional for backward compat, exactly like the two stamps below: a server
+   * synced before this field existed carries none. Absent is NOT "matches
+   * anything" — it means a detach can copy no instance into the marker, so the
+   * marker is a receipt rather than an adoption key and the server is simply not
+   * adoptable (see DetachedServerOrigin.instanceKey, which reaches the same safe
+   * state from the other side). The first sync after upgrading stamps it — the
+   * origin-stamp comparison below counts a newly computed instance as a change,
+   * so the write is not discarded as "unchanged" — so the affected population is
+   * finite and only ever shrinks.
+   */
+  syncedInstanceKey?: string;
+  /**
    * The username the sync itself last WROTE onto this server — `endpoint.username`
    * when the provider supplied one, otherwise the source's `defaultUsername` as of
    * that write. Recorded so a later sync can tell "still exactly what I stamped"
@@ -132,10 +178,21 @@ export interface DetachedServerOrigin {
   providerId: string;
   /**
    * MATCHING INPUT (REVIEW FINDING, P1 — cross-instance adoption) — WHICH
-   * DEPLOYMENT of `providerId` this server was synced from, as
-   * `InventoryProvider.instanceKey` reported it at detach time (for NetBox, the
-   * normalized base URL — see models/inventory.ts for the contract and for why
-   * it can never contain a secret).
+   * DEPLOYMENT of `providerId` this server was synced from, copied verbatim from
+   * the server's own `ServerOrigin.syncedInstanceKey` at detach time (for NetBox,
+   * the normalized base URL — see models/inventory.ts for the contract and for
+   * why it can never contain a secret).
+   *
+   * COPIED FROM THE ORIGIN, NEVER RE-DERIVED FROM THE SOURCE'S CURRENT CONFIG
+   * (REVIEW FINDING, P1 — the instance guard fed from the wrong place). A source
+   * synced against deployment A and then edited to point at B — with no
+   * successful sync in between — still owns servers whose `externalId`s are A's.
+   * Re-deriving the key from `source.config` at removal time stamped all of them
+   * with B, so a later B source with the same id and address passed the instance
+   * guard and could adopt, and then prune, A's records and their credentials.
+   * `ServerOrigin.syncedInstanceKey` is the only value that describes the
+   * deployment those ids actually came from; see its doc for why it is recorded
+   * per server rather than per source.
    *
    * `providerId` alone does not scope `externalId`: it is unique only within one
    * deployment, so a lab NetBox and a production NetBox both emit "device:1",
@@ -146,20 +203,55 @@ export interface DetachedServerOrigin {
    * on the first try, and the consequence is a server changing owner, after
    * which the new owner's prune policy can delete it and its saved credentials.
    *
-   * OPTIONAL, AND ITS ABSENCE MEANS NOT ADOPTABLE. Two ways a marker can lack
+   * OPTIONAL, AND ITS ABSENCE MEANS NOT ADOPTABLE. Three ways a marker can lack
    * it: the provider offers no instance identity at all (the public provider API
-   * is experimental, and `instanceKey` is optional on it), or the marker was
-   * written by a build of this unreleased branch from before this field existed
-   * (developer machines only — no shipped release contains `formerlySynced` in
-   * any form). Both land in the same safe state, and the engine treats them
-   * identically: a marker with no instance key matches nothing, so its server is
-   * added as a duplicate and the plan says why. It is never compared as "equal
-   * to another absent key" — that would re-create the exact collision this field
-   * removes.
+   * is experimental, and `instanceKey` is optional on it); the server was synced
+   * by a build from before `ServerOrigin.syncedInstanceKey` existed, so the
+   * detach had nothing to copy; or the marker itself was written by a build of
+   * this unreleased branch from before this field existed (developer machines
+   * only — no shipped release contains `formerlySynced` in any form). All three
+   * land in the same safe state, and the engine treats them identically: a marker
+   * with no instance key matches nothing, so its server is added as a duplicate
+   * and the plan says why. It is never compared as "equal to another absent key"
+   * — that would re-create the exact collision this field removes. The middle
+   * case repairs itself on the next successful sync, which stamps the origin
+   * before there is anything to detach.
    */
   instanceKey?: string;
   /** MATCHING INPUT — the device this server was mapped to. */
   externalId: string;
+  /**
+   * REVIEW FINDING (P1, adoption auth provenance) — the auth profile the REMOVED
+   * SOURCE'S SYNC had last linked on this server, copied verbatim from the
+   * server's own `ServerOrigin.syncedAuthProfileId` at detach time, and
+   * `undefined` when that sync had linked none.
+   *
+   * NOT a matching input — it decides nothing about adoption. It is the one piece
+   * of the stripped origin that has to OUTLIVE the strip, because it is the only
+   * record of whether the `authProfileId` the server still carries was the SYNC'S
+   * doing or the USER'S, and both AUTH 2b (the unlink that rescues a server whose
+   * key profile has lost its key file) and retro-apply's per-server opt-out are
+   * decided on exactly that distinction.
+   *
+   * Without it, adoption re-stamped an origin whose `syncedAuthProfileId` was
+   * unconditionally `undefined` — retro-apply cannot fill it in, because it does
+   * not run while `authProfileId` is still set — leaving an adopted server
+   * carrying a sync-applied link that AUTH 2b would then refuse to touch. If that
+   * profile later lost its key file, the server could not connect and no sync
+   * could repair it; and clearing the link by hand did not read as an opt-out
+   * either, so the next sync reattached it.
+   *
+   * Optional and restored, never invented: adoption copies it back into the new
+   * `origin` (services/inventory/syncEngine.ts), and a marker that carries none
+   * restores none — which is bit-identical to a server the sync never linked
+   * anything on, exactly as it should be. Cleared alongside `authProfileId` by
+   * `NexusCore.removeAuthProfile` and by the backup-import dangling sweep when
+   * the named profile is DELETED, on the same terms and for the same reason as
+   * the origin stamp it mirrors: that clear is the system's doing, so a stamp
+   * naming a profile that no longer exists must not outlive it and lock a record
+   * nobody hand-configured out of retro-apply for good.
+   */
+  syncedAuthProfileId?: string;
   detachedAt: number;
 }
 
@@ -250,6 +342,15 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
   return (
     a.sourceId === b.sourceId &&
     a.externalId === b.externalId &&
+    // REVIEW FINDING (P1, adoption instance identity) — the instance joins the
+    // stamp comparison for exactly the reason AUTH 3a gave for `syncedUsername`:
+    // a legacy owned server whose every user-visible field is already correct
+    // computes this stamp for the FIRST time and changes nothing else, and an
+    // `after` discarded as "unchanged" there would throw the new stamp away — so
+    // that server would never gain one, and its marker would never be adoptable.
+    // It is also what makes a source REPOINTED at another deployment rewrite the
+    // stamps it owns on the very sync that first reads from the new one.
+    a.syncedInstanceKey === b.syncedInstanceKey &&
     a.syncedUsername === b.syncedUsername &&
     a.syncedAuthProfileId === b.syncedAuthProfileId
   );
@@ -304,6 +405,12 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // records identical while doing it.
     a.instanceKey === b.instanceKey &&
     a.externalId === b.externalId &&
+    // REVIEW FINDING (P1, adoption auth provenance) — compared for the reason
+    // every other member is: a rollback that called two markers equal while one
+    // remembers the removed source's link and the other does not would restore
+    // the forgetful one, and the adopted server would be back to carrying a
+    // sync-applied profile nothing can prove the sync applied.
+    a.syncedAuthProfileId === b.syncedAuthProfileId &&
     a.detachedAt === b.detachedAt
   );
 }
