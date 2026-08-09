@@ -3166,7 +3166,7 @@ describe("computeSyncPlan — adopt-on-add", () => {
       );
     });
 
-    it("an AMBIGUOUS pair is skipped even when one of the two holds the colliding id (kills dropping the uniqueness clause, which would resolve an ambiguity Nexus refuses to resolve by picking whichever record happens to own the id)", () => {
+    it("an AMBIGUOUS pair is skipped even when one of the two holds the colliding id, and the refusal names that record as this device's own (kills dropping the uniqueness clause, which would resolve an ambiguity Nexus refuses to resolve by picking whichever record happens to own the id — and kills the guard's blanket 'unrelated server' sentence, which is false about the very server this device was last synced onto and carries no repair)", () => {
       const source = makeSource();
       const first = restoredAdoptee({ name: "restored-copy" });
       const second = makeKeptServer({ id: "kept-2", name: "second-copy", host: "lab-sw-01" });
@@ -3183,10 +3183,93 @@ describe("computeSyncPlan — adopt-on-add", () => {
       expect(plan.adds).toHaveLength(0);
       expect(plan.adoptionCandidates).toHaveLength(0);
       // The COLLISION is what refuses it, not the ambiguity warning: the guard
-      // runs first and its wording is the one the user sees.
-      expect(plan.warnings).toContain(
-        'Device "core-sw-1" (device:1) maps to an id already used by unrelated server "restored-copy" — skipped.'
-      );
+      // runs first, so its sentence is the ONLY thing said about this device —
+      // which is why it has to carry the ambiguity's substance AND the collision's,
+      // and why calling "restored-copy" unrelated was false in the one sentence
+      // the user gets. `toEqual` on the filtered list, not `toContain`: an
+      // implementation that pushed both this and the plain ambiguity refusal
+      // would tell the user in the same breath that the device is skipped and
+      // that it will be added as a duplicate.
+      expect(plan.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
+        'Device "core-sw-1" (device:1) matches 2 servers kept from a removed inventory source at lab-sw-01:22, so Nexus cannot tell which to adopt — and server "restored-copy", kept from an earlier sync of this same device, still uses the id a new server for this device would need, so the device is skipped rather than added as a duplicate. Remove every server kept for this device except the one at lab-sw-01:22 you want to keep, then sync again and choose Adopt Existing.'
+      ]);
+
+      // THE REPAIR, TRACED — both ways round, because "the one you want to keep"
+      // is offered as a free choice and would be a false one if only the record
+      // holding the id could be reclaimed afterwards.
+      const keptTheColliding = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [first], now: 6000, adoptionChoice: "adopt" });
+      expect(keptTheColliding.adds).toHaveLength(0);
+      expect(keptTheColliding.updates.map((u) => u.after.id)).toEqual([ADD_PATH_ID]);
+
+      const keptTheOther = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [second], now: 6000, adoptionChoice: "adopt" });
+      expect(keptTheOther.adds).toHaveLength(0);
+      expect(keptTheOther.updates.map((u) => u.after.id)).toEqual(["kept-2"]);
+    });
+
+    it("a restored id-preserving backup whose DEVICE MOVED is skipped under a sentence naming its own former server, both addresses and the repair (kills the blanket 'unrelated server' wording in the one state where the moved-address explanation can never be reached: the guard continues before it, so the device's own kept record is reported as somebody else's and no repair is given at all)", () => {
+      const source = makeSource();
+      // The restored backup's own record — it holds the id the add path would
+      // mint — but the device has been re-IP'd since, so the address no longer
+      // corroborates and `eligibleForAdoption` is empty. Neither the exemption
+      // nor the moved-address refusal can fire.
+      const movedAway = restoredAdoptee({ host: "10.9.9.9" });
+      expect(movedAway.id).toBe(deterministicServerId("source-1", "device:1"));
+
+      const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [movedAway], now: 5000, adoptionChoice: "adopt" });
+
+      // Nothing is added (the id is taken) and nothing is adopted (the address
+      // moved) — the bind the sentence has to explain.
+      expect(plan.adds).toHaveLength(0);
+      expect(plan.updates).toHaveLength(0);
+      expect(plan.adoptionCandidates).toHaveLength(0);
+      expect(plan.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
+        'Device "core-sw-1" (device:1) was previously synced onto server "old-name", which is now at 10.9.9.9:22 while the device is at lab-sw-01:22 — and it still uses the id a new server for this device would need, so the device is skipped rather than added as a new server. Point "old-name" back at lab-sw-01:22 and sync again to reclaim it with Adopt Existing, or delete it and the next sync adds the device fresh.'
+      ]);
+
+      // REPAIR 1, TRACED: the user puts that server back at the device's address
+      // (the edit path preserves the marker) and syncs. The collider becomes the
+      // uniquely eligible adoptee, so the question is RAISED — which is the whole
+      // of the promise — and Adopt Existing reclaims it with its credentials.
+      const repaired: ServerConfig = { ...movedAway, host: "lab-sw-01" };
+      const asked = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [repaired], now: 6000 });
+      expect(asked.adoptionCandidates).toEqual([
+        { deviceName: "core-sw-1", externalId: "device:1", serverId: ADD_PATH_ID, separateAddBlocked: true }
+      ]);
+      const reclaimed = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [repaired], now: 6000, adoptionChoice: "adopt" });
+      expect(reclaimed.adds).toHaveLength(0);
+      expect(reclaimed.updates).toHaveLength(1);
+      expect(reclaimed.updates[0].after.id).toBe(ADD_PATH_ID);
+      expect(reclaimed.updates[0].after.username).toBe("handpicked");
+      expect(reclaimed.updates[0].after.origin?.sourceId).toBe("source-1");
+
+      // REPAIR 2, TRACED: delete it instead, and the next sync really does add
+      // the device fresh — under the very id that record was holding.
+      const deleted = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [], now: 6000 });
+      expect(deleted.adds.map((a) => a.id)).toEqual([ADD_PATH_ID]);
+    });
+
+    it("a STALE kept copy holding the id is named as this device's own record even though a DIFFERENT kept copy is the one at the device's address (kills a discriminator keyed on 'the collider is the adoptee' rather than on 'the collider is a kept record of this device', which reports one of two markers for the same device as unrelated)", () => {
+      const source = makeSource();
+      // Two sources pointed at one deployment, both removed with Keep Servers;
+      // the one restored under its old id is the copy that has since moved.
+      const adoptable = makeKeptServer({ id: "kept-1", name: "adoptable-copy" });
+      const stale = makeKeptServer({ id: ADD_PATH_ID, name: "stale-copy", host: "10.9.9.9" });
+
+      const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [adoptable, stale], now: 5000, adoptionChoice: "adopt" });
+
+      expect(plan.adds).toHaveLength(0);
+      expect(plan.updates).toHaveLength(0);
+      expect(plan.adoptionCandidates).toHaveLength(0);
+      expect(plan.warnings.filter((w) => w.includes("core-sw-1"))).toEqual([
+        'Device "core-sw-1" (device:1) matches server "adoptable-copy" kept from a removed inventory source at lab-sw-01:22, but server "stale-copy" — kept from an earlier sync of this same device, now at 10.9.9.9:22 — still uses the id a new server for this device would need, so the device is skipped rather than offered for adoption. Delete "stale-copy", then sync again and choose Adopt Existing to reclaim "adoptable-copy".'
+      ]);
+
+      // THE REPAIR, TRACED: deleting the id-holder leaves the other copy an
+      // ordinary candidate, and it is the one the sentence promised to reclaim.
+      const repaired = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [adoptable], now: 6000, adoptionChoice: "adopt" });
+      expect(repaired.adds).toHaveLength(0);
+      expect(repaired.updates.map((u) => u.after.id)).toEqual(["kept-1"]);
+      expect(repaired.updates[0].after.origin?.sourceId).toBe("source-1");
     });
 
     it("DECLINING an exempted collision skips rather than adding — no second record under an id already in use — and says what actually happened (kills falling through into the add path once the guard has been passed, which mints a duplicate id)", () => {

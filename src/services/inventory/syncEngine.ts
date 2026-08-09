@@ -1193,8 +1193,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // WHY IT CANNOT BE WIDENED, clause by clause:
     //  - `eligibleForAdoption.length === 1` — with two eligible records the plan
     //    refuses to guess which is canonical (the ambiguity branch below), so
-    //    there is no "that exact server" to exempt; a collider among several is
-    //    an unrelated collider.
+    //    there is no "that exact server" to exempt and the device is skipped.
+    //    Skipped, note, is all it is: the refusal below says WHOSE record the
+    //    collider is before it says anything else, so a collider among several
+    //    kept copies of this device is never reported as an unrelated one.
     //  - `=== collidingServer` — the collider itself, not merely "some adoptable
     //    server exists for this device". Drop this and a device with an eligible
     //    adoptee ANYWHERE would be allowed to overwrite whatever unrelated record
@@ -1215,7 +1217,81 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const collidingServer = serversById.get(id);
     const collisionIsTheAdoptee = collidingServer !== undefined && eligibleForAdoption.length === 1 && eligibleForAdoption[0] === collidingServer;
     if (collidingServer !== undefined && !collisionIsTheAdoptee) {
-      warnings.push(`Device "${device.name}" (${device.externalId}) maps to an id already used by unrelated server "${collidingServer.name}" — skipped.`);
+      // REVIEW FINDING — THE REFUSAL NAMES THE RECORD IT IS ABOUT, instead of
+      // asserting a relationship nothing had checked. "Unrelated" was pushed for
+      // EVERY collision the exemption above did not cover, and in three reachable
+      // states the record on the other end of the id is the device's own:
+      //  - AMBIGUITY PLUS COLLISION. Two kept records claim one device and one of
+      //    them holds the id. This guard runs before the ambiguity branch below,
+      //    so its sentence is the one the user actually sees — about the very
+      //    server their device was last synced onto.
+      //  - A RESTORED ID-PRESERVING BACKUP WHOSE DEVICE MOVED. `eligibleForAdoption`
+      //    is empty because the address no longer corroborates, so the exemption
+      //    cannot apply and the moved-address explanation further down is never
+      //    reached either (this branch `continue`s first). The single sentence the
+      //    user got called their device's former server unrelated and offered no
+      //    repair at all.
+      //  - A STALE KEPT COPY HOLDING THE ID while a DIFFERENT kept copy sits at
+      //    the device's address — two sources pointed at one deployment, both
+      //    removed with Keep Servers, one of them restored under its old id.
+      //
+      // `keptMatches` is the check that was missing, and it is adoption's own
+      // identity rule minus the address corroboration: no `origin`, this provider,
+      // this DEPLOYMENT of it, and a marker naming THIS device. Minus the address
+      // deliberately — the question this branch asks is "whose record is this?",
+      // not "may it be adopted?", and a kept server that has moved is still the
+      // record the device came from. A marker from ANOTHER deployment is not in
+      // `keptMatches` and therefore keeps the unrelated wording, which is exactly
+      // right: under the instance rule (the two P1 findings above) that record
+      // belongs to a different machine which merely shares an id, and "unrelated
+      // to this device" is what it is. The genuine cases — a hand-imported
+      // fragment, a namespace collision across two sources — are untouched, and
+      // their sentence stays as pointed as it was.
+      //
+      // EVERY REPAIR BELOW IS TRACED TO THE STATE IT PRODUCES, not merely offered
+      // (an earlier round of this feature shipped advice that only worked from a
+      // cancelled sync):
+      //  - nothing kept at the device's address: re-pointing the collider makes it
+      //    the UNIQUELY eligible adoptee — nothing else is at that address, or
+      //    this branch would not have been taken — so the next sync exempts it,
+      //    raises the question, and Adopt Existing reclaims it with its saved
+      //    credentials. Deleting it instead frees the id and the device is added
+      //    fresh. Editing a kept server preserves its marker (serverCommands.ts
+      //    restores `formerlySynced` from the live record), which is what makes
+      //    the first half of that advice work at all.
+      //  - one kept copy at the device's address that is NOT the collider:
+      //    deleting the collider leaves nothing holding the id, so the remaining
+      //    copy becomes an ordinary candidate on the next run. The device is NOT
+      //    adopted onto it today, deliberately — the exemption's shape is the
+      //    safety property, and the collision fall-through's "reclaim that server"
+      //    is only true while the collider IS the adoptee.
+      //  - two or more at the device's address: the ambiguity refusal's own
+      //    repair, restated for an outcome that is a skip rather than a duplicate,
+      //    and reaching past that address because the copy holding the id need not
+      //    be one of the ambiguous pair.
+      //
+      // NONE OF THEM SAYS "CANCEL", unlike the plain ambiguity refusal below:
+      // applying this plan does nothing to this device, so the repair is equally
+      // good before or after Apply. And the add is not withheld for want of a
+      // nicer id — minting a different one would leave the next sync computing the
+      // deterministic id again, finding it taken again, and adding another copy on
+      // every run.
+      const collisionIsOwnKeptRecord = keptMatches.includes(collidingServer);
+      if (!collisionIsOwnKeptRecord) {
+        warnings.push(`Device "${device.name}" (${device.externalId}) maps to an id already used by unrelated server "${collidingServer.name}" — skipped.`);
+      } else if (eligibleForAdoption.length === 0) {
+        warnings.push(
+          `Device "${device.name}" (${device.externalId}) was previously synced onto server "${collidingServer.name}", which is now at ${collidingServer.host}:${collidingServer.port} while the device is at ${endpoint.host}:${port} — and it still uses the id a new server for this device would need, so the device is skipped rather than added as a new server. Point "${collidingServer.name}" back at ${endpoint.host}:${port} and sync again to reclaim it with Adopt Existing, or delete it and the next sync adds the device fresh.`
+        );
+      } else if (eligibleForAdoption.length === 1) {
+        warnings.push(
+          `Device "${device.name}" (${device.externalId}) matches server "${eligibleForAdoption[0].name}" kept from a removed inventory source at ${endpoint.host}:${port}, but server "${collidingServer.name}" — kept from an earlier sync of this same device, now at ${collidingServer.host}:${collidingServer.port} — still uses the id a new server for this device would need, so the device is skipped rather than offered for adoption. Delete "${collidingServer.name}", then sync again and choose Adopt Existing to reclaim "${eligibleForAdoption[0].name}".`
+        );
+      } else {
+        warnings.push(
+          `Device "${device.name}" (${device.externalId}) matches ${eligibleForAdoption.length} servers kept from a removed inventory source at ${endpoint.host}:${port}, so Nexus cannot tell which to adopt — and server "${collidingServer.name}", kept from an earlier sync of this same device, still uses the id a new server for this device would need, so the device is skipped rather than added as a duplicate. Remove every server kept for this device except the one at ${endpoint.host}:${port} you want to keep, then sync again and choose Adopt Existing.`
+        );
+      }
       continue;
     }
 
