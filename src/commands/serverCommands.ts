@@ -727,6 +727,17 @@ export interface RenderedAuthProfile {
 const MISSING_AUTH_PROFILE_MESSAGE =
   "The selected auth profile no longer exists. Choose another, or clear the Auth Profile field.";
 
+/**
+ * REVIEW FINDING (P2) — the IPMI-link twin of `MISSING_AUTH_PROFILE_MESSAGE`,
+ * refused the same way (a thrown Save-failed with the panel left open). Worded
+ * in the same family and punctuation: name what vanished, then the one action
+ * that clears it. See `MISSING_IPMI_AUTH_PROFILE_MESSAGE`'s guard below for why
+ * the IPMI link needs only an existence check where the SSH link needs the full
+ * `serverAuthProfileRejection` signature.
+ */
+export const MISSING_IPMI_AUTH_PROFILE_MESSAGE =
+  "The selected IPMI auth profile no longer exists. Choose another, or clear the IPMI Auth Profile field.";
+
 function changedAuthProfileMessage(profile: AuthProfile): string {
   return `The auth profile "${profile.name}" changed which credentials it supplies while this form was open, so the fields on screen are no longer the ones a save would keep. Re-select it in the Auth Profile list (or reopen this server) to pick up its current credentials, then save again.`;
 }
@@ -1359,6 +1370,34 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             const authProfileRejection = serverAuthProfileRejection(candidate.authProfileId, renderedAuthProfile, linkedProfile);
             if (authProfileRejection) {
               throw new Error(authProfileRejection);
+            }
+            // REVIEW FINDING (P2) — the same dangling-link hazard as the SSH
+            // guard just above, for the BMC login (`ipmiAuthProfileId`, issue
+            // #48). If the user picked an IPMI auth profile and then deleted it
+            // (in the Auth Profiles UI) while this form sat open, the stale
+            // select value would be copied straight onto the server and
+            // persisted — `removeAuthProfile`'s own reference sweep has already
+            // run and never revisits this after-the-fact reference, so the
+            // record keeps a dangling id and `${profile.ipmiUsername}` /
+            // Connect BMC Serial Console fail to resolve the username until the
+            // server is edited again. Re-resolve against LIVE core state under
+            // the same lock every auth-profile write takes, before anything is
+            // written, so the profile cannot vanish between this check and the
+            // write.
+            //
+            // EXISTENCE ONLY — deliberately NOT the SSH link's full
+            // `serverAuthProfileRejection` signature machinery. That guard's
+            // ownership-signature half exists solely because
+            // `preserveLinkedServerCredentials` mirrors an SSH profile's
+            // credentials into read-only server fields and must catch a shape
+            // that moved underneath them. The IPMI link mirrors NOTHING into
+            // this form: it only supplies `${profile.ipmiUsername}` at
+            // macro-run time, resolved live then. So the one and only hazard is
+            // a link whose profile no longer exists — an existence check is
+            // sufficient and correct, and there is no rendered credential to
+            // compare a signature against. Do not "upgrade" it.
+            if (candidate.ipmiAuthProfileId !== undefined && ctx.core.getAuthProfile(candidate.ipmiAuthProfileId) === undefined) {
+              throw new Error(MISSING_IPMI_AUTH_PROFILE_MESSAGE);
             }
             // Which submitted credentials are this user's own, and which the
             // stored record keeps — see preserveLinkedServerCredentials.

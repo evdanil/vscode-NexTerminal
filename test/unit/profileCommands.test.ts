@@ -359,6 +359,69 @@ describe("openUnifiedForm SSH submit — the auth profile link is re-resolved un
       expect.objectContaining({ id: "srv-new", authProfileId: "ap1" })
     );
   });
+
+  // The BMC-login twin of the checks above (`ipmiAuthProfileId`, issue #48),
+  // same existence-only guard on the add path.
+  const MISSING_IPMI_AUTH_PROFILE_MESSAGE =
+    "The selected IPMI auth profile no longer exists. Choose another, or clear the IPMI Auth Profile field.";
+
+  it("refuses to create a server carrying an IPMI auth profile id that no longer resolves, and creates nothing (kills the IPMI guard being absent on the add path — a dangling BMC link on a brand-new record)", async () => {
+    const profiles = new Map<string, { id: string; name: string }>();
+    const { ctx, addOrUpdateServer } = ctxWithProfiles(profiles);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", ipmiAuthProfileId: "p-ipmi" });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+
+    await expect(
+      onSubmit({
+        profileType: "ssh",
+        name: "New Server",
+        host: "example.com",
+        username: "me",
+        ipmiAuthProfileId: "p-ipmi"
+      })
+    ).rejects.toThrow(MISSING_IPMI_AUTH_PROFILE_MESSAGE);
+
+    // The kill: without the guard the record is created, carrying "p-ipmi".
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(mockSyncProxyPasswordSecret).not.toHaveBeenCalled();
+  });
+
+  it("creates the server when the IPMI auth profile exists (kills an over-broad reject that blocks a legitimate BMC link)", async () => {
+    const profiles = new Map<string, { id: string; name: string }>([["p-ipmi", { id: "p-ipmi", name: "BMC login" }]]);
+    const { ctx, addOrUpdateServer } = ctxWithProfiles(profiles);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", ipmiAuthProfileId: "p-ipmi" });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+    await onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      ipmiAuthProfileId: "p-ipmi"
+    });
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "srv-new", ipmiAuthProfileId: "p-ipmi" })
+    );
+  });
+
+  it("creates the server when there is no IPMI link at all (kills rejecting the empty case)", async () => {
+    const profiles = new Map<string, { id: string; name: string }>();
+    const { ctx, addOrUpdateServer } = ctxWithProfiles(profiles);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server" });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+    await onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me" });
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "srv-new" })
+    );
+    expect(addOrUpdateServer.mock.calls.at(-1)![0].ipmiAuthProfileId).toBeUndefined();
+  });
 });
 
 describe("openUnifiedForm SSH submit — record+secret mutation locking (FINDING 2, P2 sibling)", () => {
