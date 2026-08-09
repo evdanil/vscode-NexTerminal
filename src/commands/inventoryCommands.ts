@@ -170,6 +170,65 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
 }
 
 /**
+ * FIX B (issue #48 PR-T1 / PR #61 Codex review round 9, SECURITY) — clear the
+ * stale per-server `proxy-password-{id}` when an APPLIED inventory update moves
+ * the server's proxy identity AWAY from the authenticated SOCKS5/HTTP endpoint
+ * that secret was entered for.
+ *
+ * `ProxySshFactory` reads `proxy-password-{serverId}` by server id and sends it
+ * to whatever proxy the record now names whenever that proxy carries a username.
+ * A device template that repoints a server's proxy from one authenticated
+ * socks5/http endpoint to a DIFFERENT one — or to an ssh/none proxy — leaves the
+ * OLD password in the vault, so the factory would send the old proxy's password
+ * to the NEW endpoint: a credential leak to the wrong host. The inventory apply
+ * path writes the new proxy config (via `applyInventorySyncPlan`) but never
+ * touches the secret, so we clear it HERE, at the apply boundary where the vault
+ * is reachable, before the updated record can be used to connect.
+ *
+ * §5.3 of the device-template design: templates never carry proxy SECRETS — a
+ * template-set socks5/http proxy relies on the per-connect prompt — so clearing
+ * the stale secret is exactly right: the new proxy prompts per-connect rather
+ * than reusing a password meant for a different endpoint.
+ *
+ * STALE (must be cleared) iff `before.proxy` was `socks5`|`http` (the only proxy
+ * kinds a `proxy-password-{id}` belongs to) AND `after.proxy` is NOT the SAME
+ * authenticated endpoint — i.e. undefined, a different `type`, or a different
+ * `host`/`port`/`username` (the identity the password was entered for). The
+ * SAME-endpoint case (host+port+username unchanged) KEEPS the secret — it still
+ * applies. An ssh proxy never carries a password, so ssh↔ssh needs no handling;
+ * a change FROM socks5/http TO ssh clears the stale secret. Best-effort per key,
+ * since the plan has already committed by the time this runs.
+ *
+ * Centralized so EVERY inventory apply site shares one rule (invoked after the
+ * fast-path recompute apply AND the in-lock confirmed apply). Deliberately NOT
+ * the server-form `syncProxyPasswordSecret` path — that governs hand-edited
+ * proxies and bypasses this apply flow entirely.
+ */
+async function clearStaleProxyPasswordSecrets(
+  vault: SecretVault,
+  updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>
+): Promise<void> {
+  for (const { before, after } of updates) {
+    const bp = before.proxy;
+    if (bp === undefined || (bp.type !== "socks5" && bp.type !== "http")) {
+      continue; // no password-bearing proxy secret was ever entered for this record's before-state
+    }
+    const ap = after.proxy;
+    const sameEndpoint =
+      ap !== undefined &&
+      ap.type === bp.type &&
+      ap.host === bp.host &&
+      ap.port === bp.port &&
+      ap.username === bp.username;
+    if (sameEndpoint) {
+      continue; // still the same authenticated endpoint — the stored password still applies
+    }
+    // before.id === after.id (same record through an update); use after.id.
+    await deleteSecretBestEffort(vault, proxyPasswordSecretKey(after.id));
+  }
+}
+
+/**
  * ITEM A (restamp ordering) — restamps the source's providerFingerprint as
  * its OWN locked write, strictly AFTER a sync has already committed
  * successfully, rather than mid-flow (before/during the fetch+apply). The
@@ -3127,6 +3186,12 @@ export function registerInventoryCommands(
           }
           try {
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
+            // FIX B (round 9, SECURITY) — clear any proxy-password secret this
+            // apply just made stale (proxy identity moved off its socks5/http
+            // endpoint). Centralized helper, same rule as the confirmed-apply
+            // site below. This fast-path only fires on a nothing-to-do plan (no
+            // updates), so it is a no-op here — invoked for uniform coverage.
+            await clearStaleProxyPasswordSecrets(vault, recomputed.updates);
             // F5 — `freshSource` (the exact incarnation this apply just ran
             // against), not the outer `source` captured before this sync
             // started, is what the post-lock restamp below must compare
@@ -3839,6 +3904,7 @@ export function registerInventoryCommands(
           try {
             applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
+            // (secret cleanup below runs only after a successful apply)
             // m4 — same friendly rewording as the fast-path apply above.
             void vscode.window.showErrorMessage(
               isSourceConfigMismatchError(error)
@@ -3847,6 +3913,12 @@ export function registerInventoryCommands(
             );
             return { kind: "abort" };
           }
+
+          // FIX B (round 9, SECURITY) — the confirmed apply just committed; clear
+          // any proxy-password secret it made stale (a template moved the proxy
+          // off its socks5/http endpoint), before the updated record can be used
+          // to connect. Same centralized rule as the fast-path apply above.
+          await clearStaleProxyPasswordSecrets(vault, finalPlan.updates);
 
           // FINDING 1 (P2, reconnect-during-prune review) — nexus.server.connect
           // deliberately doesn't (and shouldn't) take configMutationLock, so a

@@ -2433,6 +2433,161 @@ describe("inventoryCommands", () => {
       expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
     });
 
+    // -------- Codex round 9 (P1, SECURITY) — the inventory apply clears a stale
+    // per-server proxy-password when a template moves the proxy identity AWAY from
+    // the SOCKS5/HTTP endpoint that secret belongs to. Otherwise ProxySshFactory
+    // would send the old proxy's password to the NEW endpoint (a credential leak
+    // to the wrong host). --------
+
+    // A template-OWNED socks5 proxy → X on the owned server (stamp === value, so an
+    // override can MOVE it — a truly hand-set/unstamped proxy is row-7 protected).
+    // The stored proxy-password was saved on-connect for endpoint X.
+    function ownedWithTemplateProxyX(): ServerConfig {
+      return makeServer({
+        id: "owned-1",
+        host: "10.0.0.1",
+        origin: {
+          sourceId: "src-1",
+          externalId: "device:1",
+          syncedAt: 1,
+          templated: { proxy: { type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" } }
+        },
+        proxy: { type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" }
+      });
+    }
+    const deviceMappingOwned1 = () => ({
+      contractVersion: 1 as const,
+      devices: [{ externalId: "device:1", name: "old-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+    });
+
+    it("(round 9, SECURITY) an applied template override that MOVES a server's SOCKS5 proxy to a DIFFERENT socks5 endpoint clears the stale proxy-password-{id} — otherwise ProxySshFactory sends the old proxy's password to the new host (kills retaining the secret across a proxy-identity change)", async () => {
+      const repo = new InMemoryConfigRepository([ownedWithTemplateProxyX()]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      // The template edit: move the proxy to a DIFFERENT socks5 endpoint (host Y).
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      // The record's proxy moved X → Y...
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.2", port: 1080, username: "puser" });
+      // ...so the password saved for X is stale and MUST be cleared. Against
+      // e2553fe the apply never touched the secret → the old X password would be
+      // sent to Y.
+      expect(vault.delete).toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1"));
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+    });
+
+    it("(round 9, SECURITY) an applied template override that changes a SOCKS5 proxy to an SSH jump-host proxy clears the stale proxy-password-{id} (the ssh proxy never uses it)", async () => {
+      const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 }); // hand-added → a survivor
+      const repo = new InMemoryConfigRepository([ownedWithTemplateProxyX(), bastion]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      await core.addOrUpdateDeviceTemplate({
+        id: "tmpl-1",
+        name: "T",
+        fields: { proxy: { mode: "override", value: { type: "ssh", jumpHostId: "bastion-1" } } }
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ templateRules: [{ id: "r1", templateId: "tmpl-1" }] }));
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "ssh", jumpHostId: "bastion-1" });
+      expect(vault.delete).toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1"));
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+    });
+
+    it("(round 9, SECURITY — over-clear guard) an update that KEEPS the SAME socks5 host+port+username (a rename, proxy unchanged) does NOT clear the still-valid proxy-password-{id}", async () => {
+      // Hand-set socks5 X, no template moving it; a device rename forces an update
+      // whose proxy is carried unchanged → same endpoint → secret KEPT.
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 },
+        proxy: { type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" }
+      });
+      const repo = new InMemoryConfigRepository([owned]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          }))
+        })
+      );
+      const vault = makeVault({
+        [proxyPasswordSecretKey("owned-1")]: "still-valid-pw",
+        [inventorySecretKey("src-1", "apiToken")]: "tok"
+      });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // the update landed
+      expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" }); // proxy unchanged
+      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // secret KEPT
+      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("still-valid-pw");
+    });
+
+    it("(round 9, SECURITY — no-op guard) an update on an SSH-proxied server (ssh↔ssh, no socks5/http before) performs no proxy-secret operation", async () => {
+      const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 });
+      const owned = makeServer({
+        id: "owned-1",
+        name: "old-sw",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 },
+        proxy: { type: "ssh", jumpHostId: "bastion-1" } // ssh proxy — carries no password
+      });
+      const repo = new InMemoryConfigRepository([owned, bastion]);
+      const core = new NexusCore(repo);
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          fetchInventory: vi.fn(async () => ({
+            contractVersion: 1,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          }))
+        })
+      );
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // update landed
+      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // no proxy-secret op
+    });
+
     it("(ITEM B) a rack rename that empties its old folder appends the empty-folder count to the completion toast", async () => {
       const owned = makeServer({
         id: "owned-1",

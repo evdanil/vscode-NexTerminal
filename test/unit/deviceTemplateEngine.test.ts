@@ -1516,6 +1516,80 @@ describe("Codex round 8 — the survivor part-2 cleans a retained template-owned
   });
 });
 
+// -------- Codex round 9 (P1) — the survivor part-2 UNIFICATION covers ADOPTION updates (built from keptByExternalId, never in ownedByExternalId) --------
+
+describe("Codex round 9 — the survivor part-2 cleans a retained template-owned proxy on an ADOPTION update, which the ownedByExternalId iteration missed", () => {
+  const sshProxy = (jumpHostId: string): ProxyConfig => ({ type: "ssh", jumpHostId });
+  const JUMP_ID = deterministicServerId("source-1", "device:jump"); // owned, device absent → delete-pruned
+
+  it("Fixture 64 — ADOPTION + RETAINED DANGLING PROXY: an adopted server whose restored receipt carries a template-owned proxy → J (no current rule wins, so it is a row-5 retained carry), J delete-pruned this plan → the adoption update's after.proxy is ABSENT + stamp cleared + one survivor warning (kills the ownedByExternalId iteration that never sees an adoptee → the proxy ships broken)", () => {
+    // J: owned by this source, device absent from the tree → delete-pruned.
+    const jumpHost = ownedServer({ id: JUMP_ID, host: "10.0.0.8" }, { externalId: "device:jump" });
+    // The adoptee: a kept server whose marker preserves a template-owned proxy → J.
+    // With NO template rule this run, the adoption matrix carries the proxy (row 5)
+    // and retains the restored stamp — a RETAINED dangling proxy, exactly what part
+    // 2 must clean, but on a record that lives in `updates` via adoption, never in
+    // the owned map the pre-round-9 loop walked.
+    const kept = keptServer({
+      proxy: sshProxy(JUMP_ID),
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: DEVICE_INSTANCE,
+        externalId: "device:1",
+        templated: { proxy: sshProxy(JUMP_ID) }, // the receipt says the sync wrote it
+        detachedAt: 900
+      }
+    });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }), // no template rules — the proxy is a retained receipt
+      devices: [makeDevice()], // device:1 → adopts kept-1; device:jump absent → J delete-pruned
+      servers: [jumpHost, kept],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === JUMP_ID)).toBe(true);
+    const after = afterFor(p, "kept-1");
+    expect(after).toBeDefined(); // the adoption put kept-1 in updates
+    expect(after!.origin?.externalId).toBe("device:1"); // it really is the adoption update
+    expect(after!.proxy).toBeUndefined(); // THE FIX: the retained dangling proxy is cleaned on the adoption update
+    expect("proxy" in after!).toBe(false); // absent, never a written undefined
+    expect(after!.origin?.templated?.proxy).toBeUndefined(); // the ownership stamp cleared with it
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("Fixture 65 — ADOPTION + RETAINED SELF-PROXY: an adopted server whose restored receipt carries a template-owned SELF-proxy (jumpHost === own id), no current rule wins → the adoption update's after.proxy is ABSENT + stamp cleared + one self-reference warning (kills the ownedByExternalId iteration that skips the adoptee → the circular proxy ships)", () => {
+    const kept = keptServer({
+      proxy: sshProxy("kept-1"), // self-referential: jumpHostId === adoptee's own id
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: DEVICE_INSTANCE,
+        externalId: "device:1",
+        templated: { proxy: sshProxy("kept-1") },
+        detachedAt: 900
+      }
+    });
+    const p = plan({
+      source: makeSource(), // no template rules → no winner → the self-proxy is a retained carry (no matrix repair)
+      devices: [makeDevice()],
+      servers: [kept],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1");
+    expect(after).toBeDefined();
+    expect(after!.origin?.externalId).toBe("device:1");
+    expect(after!.proxy).toBeUndefined(); // THE FIX: the retained self-proxy is cleaned on the adoption update
+    expect("proxy" in after!).toBe(false);
+    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(1);
+    expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
+  });
+});
+
 // -------- clearTemplatedStamps (§5.1, unit-tested, wired to nothing) --------
 
 describe("clearTemplatedStamps — §5.1 (manual path helper; not wired in T1)", () => {
