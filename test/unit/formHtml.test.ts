@@ -1306,6 +1306,28 @@ describe("renderFormHtml — filterable client wiring is present in the emitted 
     expect(html).toContain("setCustomSelectOpen(wrapper, false);");
   });
 
+  it("PR #60 Codex: the __create__ branch closes through setCustomSelectOpen + restores trigger focus (not a bare classList.remove)", () => {
+    // STRING-LEVEL GUARD (honest ceiling — no jsdom env in this repo, per the
+    // filterableSelectLogic.ts note). The click behavior is pure DOM
+    // focus/aria side effects, so we can only assert the emitted client script
+    // carries the fix. Falsifies the pre-fix 199ed75 branch, which did
+    // `wrapper.classList.remove('open')` with no trigger focus — stranding
+    // focus on the hidden filter input and leaving aria-expanded="true" stale
+    // when the inline-create editor was cancelled.
+    expect(html).toContain(
+      "if (value && value.indexOf('__create__') === 0) {\n" +
+        "          setCustomSelectOpen(wrapper, false);\n" +
+        "          var trigger = wrapper.querySelector('.custom-select-trigger');\n" +
+        "          if (trigger) trigger.focus();\n" +
+        "          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name });\n" +
+        "          return;\n" +
+        "        }",
+    );
+    // And the discarded bare-remove idiom must be gone entirely (it existed
+    // nowhere else in the emitted script).
+    expect(html).not.toContain("wrapper.classList.remove('open')");
+  });
+
   it("§A: auto-highlights the first real match while filtering (mirrors computeFilterableSelectState)", () => {
     // The shipped applyFilter must set the highlight from the first real visible
     // option — proving the client carries the same decision the pure helper is

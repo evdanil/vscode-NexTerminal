@@ -764,7 +764,9 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       initCustomSelects(function(wrapper, opt) {
         var value = opt.dataset.value;
         if (value && value.indexOf('__create__') === 0) {
-          wrapper.classList.remove('open');
+          setCustomSelectOpen(wrapper, false);
+          var trigger = wrapper.querySelector('.custom-select-trigger');
+          if (trigger) trigger.focus();
           vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name });
           return;
         }
