@@ -798,6 +798,100 @@ describe("FIX A — `origin.templated` survives the Keep-Servers detach and is r
   });
 });
 
+// -------- FIX A (PR #61 Codex round 3) — adoption applies an OVERRIDE auth winner, not only FILL --------
+
+describe("FIX A (round 3) — adoption runs the full auth matrix: an OVERRIDE winner MOVES a sync-owned link", () => {
+  /** A kept record still carrying the sync-applied link A, whose marker preserves that a SYNC linked A. */
+  const keptLinkedA = (over: Partial<ServerConfig> = {}, syncedAuthProfileId: string | undefined = "A"): ServerConfig =>
+    keptServer({
+      authProfileId: "A",
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: DEVICE_INSTANCE,
+        externalId: "device:1",
+        ...(syncedAuthProfileId === undefined ? {} : { syncedAuthProfileId }),
+        detachedAt: 900
+      },
+      ...over
+    });
+
+  it("Fixture 44 — a kept server whose marker proves the link A was sync-owned is MOVED A→B by an OVERRIDE template + re-stamped (kills the fill-only adoption path that leaves it at A until the next sync)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [keptLinkedA()],
+      templates: [template({ authProfileId: { mode: "override", value: "B" } })],
+      authProfiles: [authProfile("A"), authProfile("B")],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    // THE FIX — override reclaims the sync-owned link and re-stamps.
+    expect(after.authProfileId).toBe("B");
+    expect(after.origin?.syncedAuthProfileId).toBe("B");
+  });
+
+  it("Fixture 45 — a FILL winner naming B does NOT move the adoptee's configured sync-owned link A (fill write-once — guards the fix over-applying)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [keptLinkedA()],
+      templates: [template({ authProfileId: { mode: "fill", value: "B" } })],
+      authProfiles: [authProfile("A"), authProfile("B")],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    expect(after.authProfileId).toBe("A"); // fill never moves a configured link
+    expect(after.origin?.syncedAuthProfileId).toBe("A"); // restored stamp stands
+  });
+
+  it("Fixture 46 — a HAND-linked adoptee (marker stamp = C ≠ current link A) is left at A even by an OVERRIDE template (rows 6/7 on the adoption path)", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [keptLinkedA({}, "C")], // marker says the SYNC linked C; the current A is the user's hand edit
+      templates: [template({ authProfileId: { mode: "override", value: "B" } })],
+      authProfiles: [authProfile("A"), authProfile("B"), authProfile("C")],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    const after = afterFor(p, "kept-1")!;
+    expect(after.authProfileId).toBe("A"); // override never moves a hand link
+  });
+
+  it("Fixture 47 — the OVERRIDE move onto a KEYLESS profile is judged PER TARGET on adoption: an adoptee with its own key moves to B, one without stays A + warning (§4.4 rev7 on the adoption path)", () => {
+    const keylessB = authProfile("B", { authType: "key", keyPath: undefined });
+    const keptX = keptLinkedA({ id: "kept-x", host: "10.0.0.21", keyPath: "~/.ssh/id_x" });
+    keptX.formerlySynced = { ...keptX.formerlySynced!, externalId: "device:x" };
+    const keptY = keptLinkedA({ id: "kept-y", host: "10.0.0.22" });
+    keptY.formerlySynced = { ...keptY.formerlySynced!, externalId: "device:y" };
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [
+        makeDevice({ externalId: "device:x", name: "x-r", endpoints: [{ kind: "ssh", host: "10.0.0.21" }] }),
+        makeDevice({ externalId: "device:y", name: "y-r", endpoints: [{ kind: "ssh", host: "10.0.0.22" }] })
+      ],
+      servers: [keptX, keptY],
+      templates: [template({ authProfileId: { mode: "override", value: "B" } })],
+      authProfiles: [authProfile("A"), keylessB],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+    // X brings its own key → the keyless B is usable for it → moves + re-stamps.
+    const afterX = afterFor(p, "kept-x")!;
+    expect(afterX.authProfileId).toBe("B");
+    expect(afterX.origin?.syncedAuthProfileId).toBe("B");
+    // Y brings no key → refused per target → stays A (restored stamp stands) + plan warning.
+    const afterY = afterFor(p, "kept-y")!;
+    expect(afterY.authProfileId).toBe("A");
+    expect(afterY.origin?.syncedAuthProfileId).toBe("A");
+    expect(p.warnings.some((w) => w.includes('"B"') && w.includes("left unchanged"))).toBe(true);
+  });
+});
+
 // -------- FIX 2 (PR #61 Codex) — post-plan jump-host survivor validation --------
 
 describe("FIX 2 — jump-host references validated against the POST-PLAN survivor set", () => {

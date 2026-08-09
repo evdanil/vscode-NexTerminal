@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
+import { cloneTemplatedStamps } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
@@ -2463,6 +2464,22 @@ export function registerConfigCommands(
                       // the same reason: this object is persisted verbatim.
                       ...(rolledBackOrigin.syncedIpmiHost !== undefined
                         ? { syncedIpmiHost: rolledBackOrigin.syncedIpmiHost }
+                        : {}),
+                      // DEVICE TEMPLATES (issue #48 PR-T1, Codex review round 3) —
+                      // the template stamps, the fourth part of the origin that
+                      // must OUTLIVE the strip, on exactly the terms of the auth/
+                      // OOB provenance above. Round 2 added this to the Keep-Servers
+                      // detach (inventoryCommands.ts); this rollback-detach site was
+                      // the twin that still dropped it, so a server detached HERE
+                      // arrived at a later re-adoption looking hand-owned (row 7),
+                      // un-reclaimable by an override template. Unlike the scalar
+                      // siblings this holds a NESTED `ProxyConfig`, so it is
+                      // DEEP-COPIED (`cloneTemplatedStamps`) rather than shared by
+                      // reference — the marker is persisted verbatim and must not
+                      // alias the live origin's `templated`. Omitted rather than
+                      // written as `undefined` for the same reason `instanceKey` is.
+                      ...(rolledBackOrigin.templated !== undefined
+                        ? { templated: cloneTemplatedStamps(rolledBackOrigin.templated) }
                         : {}),
                       detachedAt
                     }

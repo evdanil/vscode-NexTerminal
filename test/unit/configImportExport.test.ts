@@ -6472,6 +6472,84 @@ describe("backup export round-trip", () => {
   });
 
   /**
+   * DEVICE TEMPLATES (issue #48 PR-T1, Codex review round 3) — the SAME rollback
+   * detach must also carry the origin's `templated` stamps into the marker. Round 2
+   * added that receipt to the Remove-Source → Keep-Servers path; this rollback-detach
+   * site was the twin that still dropped it, so a server converted HERE arrived at a
+   * later re-adoption with its template-managed fields looking hand-owned (matrix
+   * row 7) — un-reclaimable by an override template. The falsifier: `templated` is
+   * PRESENT on the marker; against the pre-fix tree it is absent.
+   */
+  it("(ADOPT 1, Codex round 3) a rolled-back source's Keep-Servers marker also preserves the origin's `templated` stamps (kills the round-2 slip that dropped `templated` at this second detach site, leaving a re-adopted server's template fields hand-owned)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+
+    const backingStore = new Map<string, string>();
+    const vault: SecretVault = {
+      get: vi.fn(async (key: string) => backingStore.get(key)),
+      store: vi.fn(async (key: string, value: string) => {
+        if (key === inventorySecretKey("src1", "apiToken")) {
+          throw new Error("secret storage unavailable");
+        }
+        backingStore.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        backingStore.delete(key);
+      })
+    };
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const templatedProxy = { type: "socks5" as const, host: "10.9.9.9", port: 1080 };
+    const secrets = { inventorySourceSecrets: { src1: { apiToken: "src1-token" } } };
+    const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
+    const importData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({
+          id: "srv-owned",
+          name: "Owned",
+          proxy: templatedProxy,
+          // The sync's own record that IT wrote this proxy via a template override —
+          // the receipt this detach path has to preserve (the fourth member, beside
+          // instance / auth / OOB) so a later adoption reads it as sync-owned (row 3).
+          origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1, templated: { proxy: templatedProxy } }
+        })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [makeInventorySource({ id: "src1", name: "Source One", secretFieldIds: ["apiToken"] })],
+      encryptedSecrets
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowInputBox.mockResolvedValueOnce("masterpass1"); // decrypt password
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" }); // import mode
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getInventorySource("src1")).toBeUndefined();
+    const owned = core.getServer("srv-owned")!;
+    expect(owned.origin).toBeUndefined();
+    // THE ASSERTION — the marker carries the template stamps forward (deep-cloned via
+    // `cloneTemplatedStamps`, exactly as the Keep-Servers path does), so a re-adoption
+    // sees the proxy as this sync's doing and an override can reclaim it.
+    expect(owned.formerlySynced?.templated).toEqual({ proxy: { type: "socks5", host: "10.9.9.9", port: 1080 } });
+    expect(isValidDetachedServerOrigin(owned.formerlySynced)).toBe(true);
+  });
+
+  /**
    * REVIEW FINDING (P1, cross-instance adoption) — the rollback marker's INSTANCE
    * member, which the test above cannot see: its server carries no sync-time
    * instance stamp, so the marker it asserts is deliberately the degraded one (a

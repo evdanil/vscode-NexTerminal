@@ -8,7 +8,6 @@ import { isAddressValue } from "../profileTokens";
 import { deterministicServerId } from "./deterministicId";
 import {
   applyTemplateMatrix,
-  authFillEligible,
   composeDesiredFields,
   computeProfilesNeedingServerKey,
   decideTemplateAuthWrite,
@@ -435,51 +434,6 @@ function hasOwnKeyPath(server: ServerConfig): boolean {
  */
 function lastSyncAppliedProfileId(server: ServerConfig): string | undefined {
   return server.origin !== undefined ? server.origin.syncedAuthProfileId : server.formerlySynced?.syncedAuthProfileId;
-}
-
-/**
- * AUTH 2 — "is this server still EXACTLY what the add path stamps, so the
- * source's profile may be retro-applied to it?". The six clauses and the whole
- * safety argument behind each one live at the update path's call site inside
- * `computeSyncPlan`; that comment block is the authority and is not repeated
- * here.
- *
- * EXTRACTED (ADOPT 1) because the adoption branch asks the same question of an
- * adoptee, and the one thing this rule cannot survive is its two halves
- * drifting — the exact precedent `decideSourceAuthRollback` sets for AUTH 2b,
- * and the reason `hasOwnKeyPath` is already shared between them. Two copies of
- * six clauses is two answers to one question, and a server admitted by one and
- * refused by the other is a server whose link nobody can explain.
- *
- * `defaultUsername` is a parameter rather than a source field read inside, so
- * the FALLBACK stays visible at both call sites: a server carrying no
- * `syncedUsername` stamp — a legacy synced server, or a kept server, which by
- * definition carries no origin at all — is compared against the source's
- * current default, which is the pre-stamp behavior and must never read as
- * "ineligible".
- *
- * REVIEW FINDING (P2, detached auth opt-outs) — the "did a sync link one here"
- * clause reads `lastSyncAppliedProfileId`, not the origin stamp directly, so a
- * kept server's answer comes from the receipt the detach preserved rather than
- * from the origin it no longer has. That is the ONE clause an adoptee could
- * previously never fail, and failing it is what makes an opt-out made before the
- * source was removed mean the same thing as one made after. See that function
- * for why absent-marker and absent-stamp must keep reading identically, and the
- * adoption call site for what the restored stamp then does on the NEXT sync.
- */
-function qualifiesForSourceProfileRetroApply(
-  server: ServerConfig,
-  resolvedProfileId: string | undefined,
-  defaultUsername: string
-): boolean {
-  // DEVICE TEMPLATES (PR-T1) — delegates to the shared `authFillEligible`
-  // predicate (services/inventory/templateApply.ts), so the six clauses exist in
-  // exactly ONE place and the sync path, the adoption path and the future manual
-  // folder-apply cannot drift apart. `authFillEligible` reproduces this
-  // function's own `lastSyncAppliedProfileId` fallback (origin stamp, else a kept
-  // server's preserved marker) and the `syncedUsername ?? defaultUsername`
-  // baseline exactly.
-  return authFillEligible(server, resolvedProfileId, defaultUsername);
 }
 
 /**
@@ -1327,11 +1281,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // it or retro-apply stops matching its own output.
       //
       // The six clauses (and the `stampedUsername` fallback the paragraphs above
-      // argue for) live in `qualifiesForSourceProfileRetroApply` at the top of
-      // this file, because the ADOPT 1 branch below asks the same question of a
-      // kept server and the two must not be able to answer it differently. The
-      // reasoning stays HERE, where the rule is applied to the population it was
-      // written about; the function carries only a pointer back to it.
+      // argue for) live in `authFillEligible` (services/inventory/templateApply.ts),
+      // because the ADOPT 1 branch below asks the same question of a kept server —
+      // it runs the SAME `decideTemplateAuthWrite` as of round 3 — and the two must
+      // not be able to answer it differently. The reasoning stays HERE, where the
+      // rule is applied to the population it was written about.
       //
       // DEVICE TEMPLATES (PR-T1) — this retro-apply is now the FILL branch of the
       // general cascade auth write: the winning candidate is the implicit
@@ -1339,8 +1293,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // when there are no template rules this is bit-for-bit the shipped
       // behaviour. `decideTemplateAuthWrite` folds in the override MOVE (rows 3/4,
       // per-target usability) and the fill write-once mode gate; the six-clause
-      // fill eligibility is the same `authFillEligible` predicate this function
-      // (`qualifiesForSourceProfileRetroApply`) now delegates to.
+      // fill eligibility is the `authFillEligible` predicate it delegates to.
       const authDecision = decideTemplateAuthWrite(ownedServer, effectiveAuthWinner, winnerProfile, source.defaultUsername);
       if (authDecision.kind === "write") {
         after.authProfileId = authDecision.profileId;
@@ -1960,23 +1913,61 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // opt-out from the origin on the next sync without needing the marker
         // that adoption spends.
         //
-        // FIX 1 (PR #61 Codex review) — the AUTH WINNER is now the CASCADE
-        // winner's resolved id (`winnerResolvedId`), not the source-level
-        // `resolvedProfileId`, so an explicit template auth rule beats the implicit
-        // source rule at adoption exactly as it does on the add/update paths (they
-        // both write `winnerResolvedId` / consume `effectiveAuthWinner`). Only the
-        // INPUT changed — the eligibility is still the six-clause FILL predicate,
-        // unweakened: an adoptee is a kept server with NO origin, so the update
-        // path's OVERRIDE MOVE (which keys on `origin.syncedAuthProfileId ===
-        // authProfileId`) is structurally unreachable for it here too, and its
-        // deferral to the first owned sync is the same one-sync delay the AUTH 2b
-        // rollback note below relies on. `winnerResolvedId` equals
-        // `resolvedProfileId` when no explicit rule sets auth, so a template-less
-        // adoption links exactly what it did before. Keyless winners are already
-        // dropped from `winnerResolvedId`, so a keyless profile stamps no link.
-        if (qualifiesForSourceProfileRetroApply(adoptee, winnerResolvedId, source.defaultUsername)) {
-          after.authProfileId = winnerResolvedId;
-          after.origin = { ...adoptionOrigin, syncedAuthProfileId: winnerResolvedId };
+        // FIX 1 (PR #61 Codex review) / FIX A (round 3) — adoption now runs the
+        // FULL auth matrix (FILL + the OVERRIDE MOVE), through the very same
+        // `decideTemplateAuthWrite` the update path uses (~1344), instead of the
+        // fill-only `qualifiesForSourceProfileRetroApply`. Round 2's restore of the
+        // receipt into `adoptionOrigin.syncedAuthProfileId` (above) is what makes
+        // the override move REACHABLE here: an adoptee that arrives still carrying
+        // the link A a removed source applied is now PROVABLY sync-owned
+        // (`authProfileId === origin.syncedAuthProfileId`, both naming A once the
+        // stamp is restored), so an OVERRIDE template winner naming a different
+        // profile B MOVES A→B at adoption (rows 3/4) exactly as the update path
+        // does — no longer left at A until the next sync. This is the auth twin of
+        // round 2's non-auth restore, which already lets an override winner reclaim
+        // proxy/booleans on adoption; the auth link was simply the one still on the
+        // fill-only path. An earlier revision of this comment asserted the move was
+        // "structurally unreachable because the adoptee has NO origin" — that
+        // premise was true BEFORE the round-2 restore and is now FALSE.
+        //
+        // The decision reads its ownership fields off an adoption VIEW, `{ ...adoptee,
+        // origin: adoptionOrigin }` — the retained link plus the restored stamps — so
+        // both the override move's `origin.syncedAuthProfileId === authProfileId`
+        // check and the FILL baseline (`origin.syncedUsername ?? source.defaultUsername`,
+        // which for every shipped provider — no endpoint username — is exactly the
+        // `defaultUsername` the fill-only call passed before) read the receipt rather
+        // than a missing origin. `winnerProfile` / `effectiveAuthWinner` are the same
+        // inputs the update path consumes, so the gates match it exactly: the FILL
+        // write drops a keyless winner per profile (blanket), while the OVERRIDE move
+        // gates PER TARGET via `authLinkUsableForTarget` (§4.4 rev7) — a keyless B
+        // still links an adoptee bringing its own key, and is refused (with the plan
+        // warning) for one that cannot. Semantics that fall out (verify, don't
+        // reimplement): override B over a sync-owned link A → move + re-stamp (THE
+        // FIX); fill winner over a never-configured server → link (six clauses); fill
+        // winner over a configured link → left (write-once); a hand link (stamp absent
+        // or ≠ cur) → left even by override (rows 6/7); a user-cleared link (row-2
+        // opt-out) → not re-linked by fill, override the deliberate way past.
+        //
+        // The write + re-stamp land in `after.origin`, rebuilt from `adoptionOrigin`
+        // so the round-2 non-auth `templated` stamp folded into it is preserved (not
+        // clobbered); a `leave`/`skip-usability` keeps `after.origin === adoptionOrigin`,
+        // which already carries the restored auth stamp. This is the ONLY change to
+        // the adoption auth path: the AUTH 2b rollback below is still NOT run here and
+        // its one-sync deferral is UNCHANGED and still correct — that deferral note now
+        // governs only the rollback, never this override move, which fires THIS run.
+        const adoptionAuthView: ServerConfig = { ...adoptee, origin: adoptionOrigin };
+        const authDecision = decideTemplateAuthWrite(adoptionAuthView, effectiveAuthWinner, winnerProfile, source.defaultUsername);
+        if (authDecision.kind === "write") {
+          after.authProfileId = authDecision.profileId;
+          after.origin = { ...adoptionOrigin, syncedAuthProfileId: authDecision.profileId };
+        } else if (authDecision.kind === "skip-usability") {
+          // §4.4 rev7 — an OVERRIDE move onto a keyless key profile this adoptee
+          // cannot satisfy (no own key). The link stays at A and the restored stamp
+          // stands; the same post-loop pass (`overrideRefusedByProfile`) names the
+          // profile and the reason, exactly as it does for the update path.
+          const names = overrideRefusedByProfile.get(authDecision.profileId) ?? [];
+          names.push(device.name);
+          overrideRefusedByProfile.set(authDecision.profileId, names);
         }
         // No `changed` comparison, unlike the owned-update path above: gaining
         // `origin` guarantees before !== after, so an adoption is ALWAYS an
