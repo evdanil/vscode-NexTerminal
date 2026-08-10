@@ -34,6 +34,12 @@ export interface ManagementListDescriptor {
   /** Maps a closed action key (or `"new"`) to the command id to dispatch, per
    * kind. The HOST owns this mapping — the webview never sees a command name. */
   commandFor(action: ManagementActionKey | "new"): string;
+  /** When the row descriptions carry a RELATIVE timestamp ("synced 3h ago") that
+   * ages with wall-clock time, set this so the panel re-renders on a low-frequency
+   * timer WHILE VISIBLE — otherwise, with the tab left active and no core change,
+   * the phrase would sit frozen for hours (PR #68 Codex round 2). Descriptors with
+   * only static descriptions (device templates) omit it. */
+  refreshWhileVisible?: boolean;
 }
 
 /**
@@ -95,10 +101,12 @@ export function resolveManagementMessage(descriptor: ManagementListDescriptor, m
  */
 export class ManagementListPanel {
   private static readonly instances = new Map<string, ManagementListPanel>();
+  private static readonly VISIBLE_REFRESH_MS = 60_000;
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private unsubscribe: () => void = () => {};
   private lastSignature: string;
+  private refreshTimer: ReturnType<typeof setInterval> | undefined;
 
   private constructor(private readonly core: NexusCore, private readonly descriptor: ManagementListDescriptor) {
     this.lastSignature = descriptor.signature();
@@ -118,6 +126,10 @@ export class ManagementListPanel {
     this.panel.onDidDispose(() => {
       this.disposed = true;
       this.unsubscribe();
+      if (this.refreshTimer !== undefined) {
+        clearInterval(this.refreshTimer);
+        this.refreshTimer = undefined;
+      }
       ManagementListPanel.instances.delete(descriptor.viewType);
     });
     this.unsubscribe = core.onDidChange(() => {
@@ -127,6 +139,19 @@ export class ManagementListPanel {
         this.render();
       }
     });
+    // Relative "synced N ago" descriptions age with wall-clock time; onDidChange
+    // (no core change) and onDidChangeViewState (no visibility transition) never
+    // fire while the tab sits open and active, so re-render on a low-frequency
+    // timer WHILE VISIBLE (PR #68 Codex round 2). `unref` keeps the timer from
+    // holding the host (or a test) alive; `clearInterval` on dispose stops it.
+    if (descriptor.refreshWhileVisible) {
+      this.refreshTimer = setInterval(() => {
+        if (!this.disposed && this.panel.visible) {
+          this.render();
+        }
+      }, ManagementListPanel.VISIBLE_REFRESH_MS);
+      (this.refreshTimer as unknown as { unref?: () => void }).unref?.();
+    }
   }
 
   public static open(core: NexusCore, descriptor: ManagementListDescriptor): void {
@@ -171,11 +196,17 @@ export class ManagementListPanel {
     // Dispatch the SAME command the QuickPick hub dispatched — with the id when the
     // action carries one. The command owns every race guard, busy-marker, revision
     // check, drift-refusal and disposition modal; this panel adds none and weakens
-    // none.
-    if (result.id !== undefined) {
-      void vscode.commands.executeCommand(result.command, result.id);
-    } else {
-      void vscode.commands.executeCommand(result.command);
-    }
+    // none. `executeCommand` returns a Thenable that REJECTS if the command handler
+    // throws (e.g. a delete whose persist fails); the QuickPick hub awaited its flow,
+    // so surface the failure here rather than leaving an unhandled rejection with no
+    // user feedback (PR #68 Codex round 2).
+    const dispatched =
+      result.id !== undefined
+        ? vscode.commands.executeCommand(result.command, result.id)
+        : vscode.commands.executeCommand(result.command);
+    Promise.resolve(dispatched).then(undefined, (error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`Action failed: ${detail}`);
+    });
   }
 }

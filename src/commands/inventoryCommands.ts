@@ -4351,7 +4351,10 @@ export function registerInventoryCommands(
             // "remove"
             return "nexus.inventory.removeSource";
         }
-      }
+      },
+      // sourceDescription embeds a relative "synced N ago" phrase that ages with
+      // wall-clock time, so keep it fresh while the tab sits visible (Codex R2).
+      refreshWhileVisible: true
     };
   }
 

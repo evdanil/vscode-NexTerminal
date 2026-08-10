@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // html do not touch it, but the module-level import must resolve. A minimal stub
 // is enough — no test here constructs the panel class.
 vi.mock("vscode", () => ({
-  window: { createWebviewPanel: vi.fn() },
+  window: { createWebviewPanel: vi.fn(), showErrorMessage: vi.fn() },
   commands: { executeCommand: vi.fn() },
   ViewColumn: { Active: -1 }
 }));
@@ -12,7 +12,7 @@ vi.mock("vscode", () => ({
 const { renderManagementListHtml } = await import("../../src/ui/managementListHtml");
 const { resolveManagementMessage, ManagementListPanel } = await import("../../src/ui/managementListPanel");
 const vscodeMock = (await import("vscode")) as unknown as {
-  window: { createWebviewPanel: ReturnType<typeof vi.fn> };
+  window: { createWebviewPanel: ReturnType<typeof vi.fn>; showErrorMessage: ReturnType<typeof vi.fn> };
   commands: { executeCommand: ReturnType<typeof vi.fn> };
 };
 import type { ManagementListView, ManagementRow } from "../../src/ui/managementListHtml";
@@ -232,6 +232,7 @@ describe("resolveManagementMessage — host action mapping (validate id in snaps
 interface CapturedPanel {
   viewType: string;
   title: string;
+  visible: boolean;
   htmlSetCount: number;
   revealCount: number;
   messageHandler?: (msg: unknown) => void;
@@ -248,6 +249,7 @@ function installWebviewPanelFactory(): void {
       {
         viewType,
         title,
+        visible: true,
         htmlSetCount: 0,
         revealCount: 0,
         webview: {
@@ -416,5 +418,63 @@ describe("ManagementListPanel — host message boundary (handleMessage → execu
     const after = panel.htmlSetCount;
     core.fire();
     expect(panel.htmlSetCount).toBe(after); // no re-render
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #68 Codex round 2 — dispatch-rejection surfacing + visible-refresh timer.
+// ---------------------------------------------------------------------------
+describe("ManagementListPanel — dispatch rejection + visible refresh (Codex R2)", () => {
+  beforeEach(() => {
+    createdPanels.length = 0;
+    vscodeMock.window.createWebviewPanel.mockReset();
+    vscodeMock.commands.executeCommand.mockReset();
+    vscodeMock.window.showErrorMessage.mockReset();
+    installWebviewPanelFactory();
+  });
+
+  afterEach(() => {
+    for (const p of createdPanels) p.fireDispose();
+    vi.useRealTimers();
+  });
+
+  it("surfaces a REJECTED command dispatch as an error toast (no silent unhandled rejection)", async () => {
+    // A delete whose persist fails rejects executeCommand. Falsification: the old
+    // `void executeCommand(...)` discards the rejection — showErrorMessage is never
+    // called and the failure is invisible (and unhandled).
+    vscodeMock.commands.executeCommand.mockRejectedValue(new Error("keychain locked"));
+    const core = makeFakeCore();
+    ManagementListPanel.open(asCore(core), panelDescriptor());
+    const panel = createdPanels[0];
+    panel.messageHandler!({ type: "action", action: "delete", id: "t1" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(vscodeMock.window.showErrorMessage).toHaveBeenCalledWith("Action failed: keychain locked");
+  });
+
+  it("re-renders on the visible-refresh timer ONLY when the descriptor opts in AND the panel is visible", () => {
+    vi.useFakeTimers();
+    const core = makeFakeCore();
+    ManagementListPanel.open(asCore(core), panelDescriptor({ viewType: "nexus.inventorySourcesPanel", refreshWhileVisible: true }));
+    const panel = createdPanels[0];
+    const before = panel.htmlSetCount; // 1 (constructor render)
+    vi.advanceTimersByTime(60_000);
+    // Falsification: without the timer this stays at `before`.
+    expect(panel.htmlSetCount).toBe(before + 1);
+    // Hidden → the tick is a no-op (the `panel.visible` guard).
+    panel.visible = false;
+    vi.advanceTimersByTime(60_000);
+    expect(panel.htmlSetCount).toBe(before + 1);
+  });
+
+  it("installs NO refresh timer for a descriptor without refreshWhileVisible (device templates — static descriptions)", () => {
+    vi.useFakeTimers();
+    const core = makeFakeCore();
+    ManagementListPanel.open(asCore(core), panelDescriptor()); // no refreshWhileVisible
+    const panel = createdPanels[0];
+    const before = panel.htmlSetCount;
+    vi.advanceTimersByTime(300_000);
+    // Falsification: an unconditional timer would re-render here.
+    expect(panel.htmlSetCount).toBe(before);
   });
 });
