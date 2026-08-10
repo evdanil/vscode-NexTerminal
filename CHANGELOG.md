@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.175] — 2026-08-10
+
+### Fixed
+
+- **Saving a macro now visibly confirms the save, matching the auth-profile editor.** The Macro editor keeps its panel open after **Save** (so you can edit several in a row) but, like the auth-profile editor before it, gave no sign the save landed — the same silent re-render that read as "nothing happened," for the same reason (its one success signal was posted after the webview reload and lost the race). Save now shows a green **"✓ Saved"** indicator beside the Save button — baked into the render so it can't be lost — fading after a few seconds or the moment you edit again, plus a notification naming the macro. Save-success feedback is now consistent across every editor reached from Settings: the ones that stay open (auth profiles, macros) show the indicator, and the ones that close on save (device templates, inventory sources) confirm with their existing toast.
+
 ## [2.8.174] — 2026-08-10
 
 ### Fixed

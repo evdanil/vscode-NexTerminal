@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockPostMessage = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowErrorMessage = vi.fn();
+const mockShowInformationMessage = vi.fn();
 let onDidReceiveMessageHandler: ((msg: Record<string, unknown>) => void) | undefined;
 let onDidDisposeHandler: (() => void) | undefined;
 let lastHtml = "";
@@ -39,7 +40,8 @@ vi.mock("vscode", () => ({
       dispose: vi.fn()
     })),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
-    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args)
+    showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
+    showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args)
   },
   ViewColumn: { Active: 1 },
   ConfigurationTarget: { Global: 1 },
@@ -205,7 +207,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(after[0].name).toBe("Alpha");
     expect(after[0].text).toBe("a");
     // No "saved" ack — the save was rejected
-    expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+    expect(mockShowInformationMessage).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalled();
   });
 
@@ -280,7 +282,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       // user was looking at.
       expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
       expect(macros().map((m) => m.text)).toEqual(["a", "b"]);
-      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
       expect(mockShowWarningMessage).toHaveBeenCalledWith(
         expect.stringContaining("same internal id")
       );
@@ -355,7 +357,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
 
         expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
         expect(macros().map((m) => m.text)).toEqual(["a", "b"]);
-        expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+        expect(mockShowInformationMessage).not.toHaveBeenCalled();
         expect(mockShowWarningMessage).toHaveBeenCalledWith(
           expect.stringContaining("same internal id")
         );
@@ -399,7 +401,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
 
           expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
           expect(macros().map((m) => m.text)).toEqual(["a", "b"]);
-          expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+          expect(mockShowInformationMessage).not.toHaveBeenCalled();
           expect(mockShowWarningMessage).toHaveBeenCalledWith(
             expect.stringContaining("changed externally")
           );
@@ -414,7 +416,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
 
           expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
           expect(macros().map((m) => m.text)).toEqual(["a", "b"]);
-          expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+          expect(mockShowInformationMessage).not.toHaveBeenCalled();
           expect(mockShowWarningMessage).toHaveBeenCalledWith(
             expect.stringContaining("same internal id")
           );
@@ -432,7 +434,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
 
           expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
           expect(macros().map((m) => m.text)).toEqual(["a", "b"]);
-          expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+          expect(mockShowInformationMessage).not.toHaveBeenCalled();
         });
 
         it("...and the same forgery on DELETE takes the same path", async () => {
@@ -454,7 +456,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         await sendMessage(dupSaveMsg({ renderGeneration: String(sharedPage) }));
 
         expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
-        expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+        expect(mockShowInformationMessage).not.toHaveBeenCalled();
       });
 
       it("a form rendered over a UNIQUE id still saves normally — the guard must not refuse every form", async () => {
@@ -474,7 +476,8 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
 
         expect(macros().find((m) => m.id === "b")?.name).toBe("Beta-edited");
         expect(macros().find((m) => m.id === "a")?.name).toBe("Alpha");
-        expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+        // Save now confirms visibly (panel stays open): a host toast naming the macro.
+        expect(mockShowInformationMessage).toHaveBeenCalledWith('Macro "Beta-edited" saved.');
       });
 
       it("keeps only the last few renders — a page far enough back fails closed", async () => {
@@ -498,7 +501,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         await sendMessage(dupSaveMsg({ id: "b", renderGeneration: betaPage }));
 
         expect(macros().map((m) => m.name)).toEqual(["Alpha", "Beta"]);
-        expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+        expect(mockShowInformationMessage).not.toHaveBeenCalled();
         expect(mockShowWarningMessage).toHaveBeenCalledWith(
           expect.stringContaining("changed externally")
         );
@@ -604,10 +607,10 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(mockPostMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: "saveError", field: "save" })
     );
-    // The save did not happen, so it must not be reported as one — `saved` is the only thing
-    // that clears the dirty flag, and a cleared flag on an unsaved edit is how the edit gets
-    // closed and lost.
-    expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+    // The save did not happen, so it must not be reported as one — the success toast (and the
+    // "✓ Saved" indicator that rides the post-save re-render) confirm a write; showing either on
+    // a failed save tells the user their edit landed when it did not.
+    expect(mockShowInformationMessage).not.toHaveBeenCalled();
     // And the panel is NOT rebuilt. `render()` reads the STORE, which for a failed save still
     // holds the pre-edit macro, so re-rendering would throw away the very text the error is
     // telling the user was not saved — the exact outcome reporting the failure exists to
@@ -668,7 +671,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     expect(after).toHaveLength(1);
     expect(after[0].name).toBe("Fresh");
     expect(typeof after[0].id).toBe("string");
-    expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+    expect(mockShowInformationMessage).toHaveBeenCalledWith('Macro "Fresh" saved.');
   });
 
   /**
@@ -995,7 +998,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       const after = getMacros();
       expect(after).toHaveLength(1);
       expect(after[0].variables).toBeUndefined();
-      expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowInformationMessage).toHaveBeenCalledWith('Macro "Test" saved.');
     });
   });
 
@@ -1035,7 +1038,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         field: "trigger",
         message: expect.stringContaining("malformed variable declarations")
       });
-      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
 
       // Nothing was mutated — the save was rejected before saveMacros() ran.
       const after = getMacros();
@@ -1063,7 +1066,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         variables: []
       }));
 
-      expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowInformationMessage).toHaveBeenCalledWith('Macro "Cmd" saved.');
       const after = getMacros();
       expect(after[0].variables).toBeUndefined();
       expect(after[0].triggerPattern).toBeUndefined();
@@ -1114,7 +1117,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       await sendMessage(baseSaveMsg({ group: "Cisco/Routers" }));
 
       expect(getMacros()[0].group).toBe("Cisco/Routers");
-      expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowInformationMessage).toHaveBeenCalledWith('Macro "Test" saved.');
     });
 
     it("null/absent group persists as no group at all", async () => {
@@ -1178,7 +1181,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       const after = getMacros();
       expect(after[0].name).toBe("New");
       expect(after[0].group).toBe("Cisco\\Routers");
-      expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+      expect(mockShowInformationMessage).toHaveBeenCalledWith('Macro "New" saved.');
     });
 
     it("EDITING an unrenderable folder path is validated like any other input — untouched means preserved, touched means decide", async () => {

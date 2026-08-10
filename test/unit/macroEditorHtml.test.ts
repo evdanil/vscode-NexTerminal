@@ -392,6 +392,19 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("Unsaved changes");
   });
 
+  it("shows the '✓ Saved' indicator ONLY when a just-saved name is passed", () => {
+    const macros: TerminalMacro[] = [{ name: "Deploy", text: "npm run deploy" }];
+    // No justSavedName → indicator present in markup but NOT visible.
+    const idle = renderMacroEditorHtml(macros, 0, nonce, [], [], undefined, 1);
+    expect(idle).toContain('id="save-flag"');
+    expect(idle).not.toMatch(/class="save-indicator visible"/);
+    // justSavedName set → indicator rendered visible (baked in, not a post-render
+    // message that would race the webview reload), plus the auto-hide timer.
+    const saved = renderMacroEditorHtml(macros, 0, nonce, [], [], undefined, 1, "Deploy");
+    expect(saved).toMatch(/class="save-indicator visible"[^>]*id="save-flag"/);
+    expect(saved).toContain("setTimeout(hideSaveFlag");
+  });
+
   it("renders New Blank Macro button", () => {
     const html = render([], null);
     expect(html).toContain("new-btn");

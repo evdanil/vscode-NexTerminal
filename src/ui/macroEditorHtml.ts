@@ -102,7 +102,8 @@ export function renderMacroEditorHtml(
   profiles: MacroProfileOptionInput[] = [],
   folders: string[] = [],
   seedGroup?: string,
-  renderGeneration = 0
+  renderGeneration = 0,
+  justSavedName?: string
 ): string {
   const macro = selectedIndex !== null ? macros[selectedIndex] : undefined;
 
@@ -269,6 +270,16 @@ export function renderMacroEditorHtml(
       margin-left: 8px;
     }
     .dirty-indicator.visible {
+      display: inline;
+    }
+    .save-indicator {
+      display: none;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--vscode-testing-iconPassed, #2ea043);
+      margin-left: 4px;
+    }
+    .save-indicator.visible {
       display: inline;
     }
     .empty-state {
@@ -473,6 +484,7 @@ ${folderOptionsHtml}
   <div class="bottom-actions">
     <button type="button" class="btn-primary" id="save-btn">${escapeHtml(saveLabel)}</button>
     <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
+    <span class="save-indicator${justSavedName ? " visible" : ""}" id="save-flag" role="status" aria-live="polite">✓ Saved</span>
     <div class="spacer"></div>
     <button type="button" class="btn-secondary" id="new-btn">New Blank Macro</button>
   </div>
@@ -493,6 +505,20 @@ ${folderOptionsHtml}
       // it is a key into the host's records, never a claim about the id.
       var currentRenderGeneration = ${Number.isSafeInteger(renderGeneration) ? renderGeneration : 0};
       var KNOWN_PROFILE_IDS = ${profileIdsJson};
+      var saveFlag = document.getElementById("save-flag");
+
+      function hideSaveFlag() {
+        if (saveFlag) {
+          saveFlag.classList.remove("visible");
+        }
+      }
+
+      // A save just landed (baked into this render): show "✓ Saved" briefly, then
+      // fade it. Editing again clears it immediately so a stale "Saved" never sits
+      // next to unsaved changes.
+      if (saveFlag && saveFlag.classList.contains("visible")) {
+        setTimeout(hideSaveFlag, 3500);
+      }
 
       var VALID_PATTERN = /^(alt\\+[a-z0-9]|alt\\+shift\\+[a-z0-9]|ctrl\\+shift\\+[a-z0-9])$/;
       ${regexSafetyWebviewJs()}
@@ -599,15 +625,11 @@ ${folderOptionsHtml}
       }
 
       function markDirty() {
+        hideSaveFlag();
         if (!dirty) {
           dirty = true;
           document.getElementById("dirty-flag").classList.add("visible");
         }
-      }
-
-      function clearDirty() {
-        dirty = false;
-        document.getElementById("dirty-flag").classList.remove("visible");
       }
 
       // ---- Variables (docs/plans/2026-07-29-macro-variables.md §9.1-§9.5) ----
@@ -1070,8 +1092,9 @@ ${folderOptionsHtml}
       // Save
       document.getElementById("save-btn").addEventListener("click", function() {
         // A storage failure from the previous attempt must not sit there looking like the
-        // verdict on this one. Cleared here rather than on success, because success closes
-        // the loop via "saved" and a client-side validation abort below never reaches the host.
+        // verdict on this one. Cleared here rather than on success, because a successful save
+        // re-renders the whole page fresh (dirty cleared, "✓ Saved" shown) and a client-side
+        // validation abort below never reaches the host.
         document.getElementById("error-save").textContent = "";
         var name = document.getElementById("macro-name").value.trim();
         var text = document.getElementById("macro-text").value;
@@ -1209,9 +1232,6 @@ ${folderOptionsHtml}
       // Messages from host
       window.addEventListener("message", function(event) {
         var msg = event.data;
-        if (msg.type === "saved") {
-          clearDirty();
-        }
         if (msg.type === "saveError") {
           // §9.2 — per-row errors address a data-var-error="N" slot, never
           // an id (rows have no stable id; N is the row's DOM position).

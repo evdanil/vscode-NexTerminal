@@ -201,7 +201,7 @@ export class MacroEditorPanel {
     MacroEditorPanel.instance = new MacroEditorPanel(null, seed?.group);
   }
 
-  private render(): void {
+  private render(justSavedName?: string): void {
     if (this.disposed) return;
     const nonce = createWebviewNonce();
     const macros = getMacros();
@@ -227,7 +227,11 @@ export class MacroEditorPanel {
       if (oldest === undefined) break;
       this.renderedRefs.delete(oldest);
     }
-    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup, generation);
+    // `justSavedName` bakes the "✓ Saved" indicator into the fresh HTML. It is set
+    // ONLY by the save handler — the reload from `render()` would otherwise outrun a
+    // post-render `postMessage`, which is why the old `{type:"saved"}` signal was
+    // invisible. External re-renders (store change, macro switch, delete) pass nothing.
+    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup, generation, justSavedName);
   }
 
   /**
@@ -737,8 +741,14 @@ export class MacroEditorPanel {
           this.selectedIndex = newIndex;
         }
 
-        this.render();
-        void this.panel.webview.postMessage({ type: "saved" });
+        // Keep the panel open (a persistent multi-record editor) but signal the save
+        // clearly: an in-panel "✓ Saved" indicator baked into this render, plus a host
+        // toast naming the macro. Before this, save re-rendered to an identical clean
+        // form and posted a `{type:"saved"}` that raced the reload — indistinguishable
+        // from "nothing happened". This is the SUCCESS path only; every refusal branch
+        // above returns/breaks before reaching here and shows neither.
+        this.render(name);
+        void vscode.window.showInformationMessage(`Macro "${name}" saved.`);
         break;
       }
       case "delete": {
