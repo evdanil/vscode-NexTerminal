@@ -247,6 +247,45 @@ describe("PR-T3 IPMI slots — mode gate & hand edits", () => {
     }
   });
 
+  // FIX 5 #3 — row-2 opt-out coverage gap. `cur` unset + stamp present means the
+  // user CLEARED a template-applied BMC link; that field must stay unset under BOTH
+  // fill and override (the template is not allowed to re-fill an opt-out), and the
+  // stamp is carried forward so the opt-out survives. Kills a wrong `applyId` that
+  // re-fills a user-cleared link (e.g. `cur === undefined ? write : …`).
+  it("row 2 opt-out: cur unset + stamp present leaves ipmiGatewayServerId unwritten under fill AND override, stamp carried", () => {
+    const base = ownedServer({}, { syncedAt: 1000, templated: { ipmiGatewayServerId: GW1.id } });
+    for (const mode of ["fill", "override"] as const) {
+      const t = template({ ipmiGatewayServerId: { mode, value: GW2.id } });
+      const p = plan({
+        source: makeSource({ templateRules: [rule(t.id)] }),
+        devices: [makeDevice()],
+        servers: [cloneServerConfig(base), GW1, GW2],
+        templates: [t],
+        authProfiles: []
+      });
+      const record = afterFor(p, base.id) ?? base;
+      expect(record.ipmiGatewayServerId).toBeUndefined(); // row 2 leaves — never re-filled
+      expect(record.origin?.templated?.ipmiGatewayServerId).toBe(GW1.id); // opt-out stamp carried
+    }
+  });
+
+  it("row 2 opt-out: cur unset + stamp present leaves ipmiAuthProfileId unwritten under fill AND override, stamp carried", () => {
+    const base = ownedServer({}, { syncedAt: 1000, templated: { ipmiAuthProfileId: PA1.id } });
+    for (const mode of ["fill", "override"] as const) {
+      const t = template({ ipmiAuthProfileId: { mode, value: PA2.id } });
+      const p = plan({
+        source: makeSource({ templateRules: [rule(t.id)] }),
+        devices: [makeDevice()],
+        servers: [cloneServerConfig(base)],
+        templates: [t],
+        authProfiles: [PA1, PA2]
+      });
+      const record = afterFor(p, base.id) ?? base;
+      expect(record.ipmiAuthProfileId).toBeUndefined();
+      expect(record.origin?.templated?.ipmiAuthProfileId).toBe(PA1.id);
+    }
+  });
+
   it("row 5 release keeps value AND stamp when the template detaches", () => {
     const server = ownedServer(
       { ipmiAuthProfileId: PA1.id },
@@ -289,8 +328,14 @@ describe("PR-T3 IPMI slots — reference validation (skip-and-warn)", () => {
     expect(add.origin?.templated?.ipmiAuthProfileId).toBeUndefined();
     // The device's other fields proceed.
     expect(add.multiplexing).toBe(true);
-    // Kills "silent drop": one plan warning naming the template.
-    expect(p.warnings.some((w) => /IPMI Auth Profile|ipmi/i.test(w) && /T/.test(w))).toBe(true);
+    // Kills "silent drop": one plan warning naming the template AND the exact
+    // disposition (FIX 5 #6 — matcher tightened to the near-exact warning text so
+    // it cannot pass on an unrelated warning that merely says "ipmi").
+    expect(
+      p.warnings.some(
+        (w) => /Device template "T"/.test(w) && /IPMI auth profile that no longer exists/.test(w) && /skipped/.test(w)
+      )
+    ).toBe(true);
   });
 
   it("ipmiGatewayServerId resolving to no live server is skipped + warns; the OTHER field still applies", () => {
@@ -309,7 +354,12 @@ describe("PR-T3 IPMI slots — reference validation (skip-and-warn)", () => {
     expect(add.ipmiGatewayServerId).toBeUndefined();
     expect(add.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
     expect(add.legacyAlgorithms).toBe(true);
-    expect(p.warnings.some((w) => /IPMI Gateway|gateway/i.test(w))).toBe(true);
+    // FIX 5 #6 — tightened to the near-exact dangling-gateway warning text.
+    expect(
+      p.warnings.some(
+        (w) => /Device template "T"/.test(w) && /IPMI gateway server that no longer exists/.test(w) && /skipped/.test(w)
+      )
+    ).toBe(true);
   });
 });
 
@@ -333,6 +383,11 @@ describe("PR-T3 IPMI slots — model bookkeeping", () => {
     const c = cloneServerConfig(s);
     expect(c.origin?.templated?.ipmiAuthProfileId).toBe("a");
     expect(c.origin?.templated?.ipmiGatewayServerId).toBe("g");
+    // FIX 5 #4 — exercise the "does not alias" half: mutating the clone's stamp
+    // record must NOT reach back into the original (a shallow clone that aliased
+    // `origin.templated` would let this write corrupt `s`).
+    c.origin!.templated!.ipmiAuthProfileId = "z";
+    expect(s.origin?.templated?.ipmiAuthProfileId).toBe("a");
   });
 
   it("templateAppliedFields lists an ipmi field when cur === stamp, drops it when hand-edited", () => {
@@ -385,6 +440,18 @@ describe("PR-T3 IPMI slots — validation", () => {
       validateDeviceTemplate({ id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: 42 } } })
     ).toBe(false);
   });
+  // FIX 5 #7 — an empty-string value is not a valid id reference: `isNonEmptyString`
+  // rejects it, dropping the whole template (mirrors the `value:42` cases above).
+  it("rejects an empty-string value on ipmiAuthProfileId (drops whole template)", () => {
+    expect(
+      validateDeviceTemplate({ id: "t", name: "T", fields: { ipmiAuthProfileId: { mode: "fill", value: "" } } })
+    ).toBe(false);
+  });
+  it("rejects an empty-string value on ipmiGatewayServerId (drops whole template)", () => {
+    expect(
+      validateDeviceTemplate({ id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "fill", value: "" } } })
+    ).toBe(false);
+  });
 });
 
 // ============================================================================
@@ -434,7 +501,12 @@ describe("PR-T3 IPMI slots — manual folder apply", () => {
     const w = p.serverWrites.find((x) => x.serverId === s.id);
     expect(w?.ipmiAuthProfileId).toBeUndefined();
     expect(w?.ipmiGatewayServerId).toBe(GW1.id);
-    expect(p.warnings.some((warn) => /IPMI Auth Profile|profile.*no longer exists/i.test(warn))).toBe(true);
+    // FIX 5 #6 — tightened to the near-exact manual dangling-profile warning text.
+    expect(
+      p.warnings.some(
+        (warn) => /Device template "T"/.test(warn) && /IPMI auth profile that no longer exists/.test(warn) && /skipped/.test(warn)
+      )
+    ).toBe(true);
   });
 
   it("value semantics: fill writes where unset, skips where set", () => {
@@ -452,5 +524,114 @@ describe("PR-T3 IPMI slots — manual folder apply", () => {
     expect(p.serverWrites.find((x) => x.serverId === "sset")).toBeUndefined();
     expect(p.ipmiGatewayServerId?.willSet).toBe(1);
     expect(p.ipmiGatewayServerId?.skipped).toBe(1);
+  });
+});
+
+// ============================================================================
+// FALSIFICATION-CRITICAL: FIX 2 — self-gateway skip + warn (a server must not be
+// its own IPMI gateway). Mirrors the proxy self-reference skip on both paths.
+// ============================================================================
+describe("PR-T3 IPMI slots — FIX 2 self-gateway skip (sync path)", () => {
+  it("a catch-all gateway override that names the gateway host self-skips ONLY that host; siblings still get it written+stamped", () => {
+    // The gateway host is itself one of the synced devices; its (deterministic)
+    // server id is what a catch-all/override gateway rule would stamp onto every
+    // matched device — including the host itself.
+    const gwId = deterministicServerId("source-1", "device:gw");
+    const t = template({ ipmiGatewayServerId: { mode: "override", value: gwId } });
+    const p = plan({
+      source: makeSource({ templateRules: [rule(t.id)] }),
+      devices: [
+        makeDevice({ externalId: "device:gw", name: "gw-host" }),
+        makeDevice({ externalId: "device:1", name: "core-sw-1" })
+      ],
+      servers: [],
+      templates: [t],
+      authProfiles: []
+    });
+    const gwAdd = p.adds.find((a) => a.id === gwId);
+    const targetId = deterministicServerId("source-1", "device:1");
+    const targetAdd = p.adds.find((a) => a.id === targetId);
+    expect(gwAdd).toBeDefined();
+    expect(targetAdd).toBeDefined();
+    // Kills d512258 (writes the self-id): the host must NOT be its own gateway.
+    expect(gwAdd!.ipmiGatewayServerId).toBeUndefined();
+    expect(gwAdd!.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+    // The other matched server still gets the (valid, non-self) gateway.
+    expect(targetAdd!.ipmiGatewayServerId).toBe(gwId);
+    expect(targetAdd!.origin?.templated?.ipmiGatewayServerId).toBe(gwId);
+    // Kills "silent self-skip": one warning naming the template + the host.
+    expect(
+      p.warnings.some((w) => /Device template "T"/.test(w) && /"gw-host"/.test(w) && /its own IPMI gateway/.test(w))
+    ).toBe(true);
+  });
+});
+
+describe("PR-T3 IPMI slots — FIX 2 self-gateway skip (manual folder apply)", () => {
+  it("applying a gateway template to a folder containing the designated gateway host skips that host; siblings applied", () => {
+    const gwHost = bystanderServer("gw-host", "gateway-host");
+    const sibling = bystanderServer("srv-1", "sibling");
+    const t = template({ ipmiGatewayServerId: { mode: "override", value: gwHost.id } });
+    const p = planManualTemplateApply({
+      template: t,
+      servers: [gwHost, sibling],
+      sourceDefaultUsername: () => "admin",
+      authProfile: () => undefined,
+      hasServer: (id) => id === gwHost.id // the gateway ref itself resolves (not dangling)
+    });
+    // The host self-skips: no write for it.
+    expect(p.serverWrites.find((x) => x.serverId === gwHost.id)).toBeUndefined();
+    // The sibling is applied.
+    expect(p.serverWrites.find((x) => x.serverId === sibling.id)?.ipmiGatewayServerId).toBe(gwHost.id);
+    // Kills d512258 (no self-skip → willSet 2 / skipped 0, no warning): the self is
+    // counted in `skipped` (surfaced in the consent modal) + one warning.
+    expect(p.ipmiGatewayServerId?.willSet).toBe(1);
+    expect(p.ipmiGatewayServerId?.skipped).toBe(1);
+    expect(
+      p.warnings.some((w) => /Device template "T"/.test(w) && /"gateway-host"/.test(w) && /its own IPMI gateway/.test(w))
+    ).toBe(true);
+  });
+});
+
+// ============================================================================
+// FALSIFICATION-CRITICAL: FIX 3 — same-sync-pruned gateway survivor warning.
+// ============================================================================
+describe("PR-T3 IPMI slots — FIX 3 same-sync-pruned gateway", () => {
+  it("a gateway written this run whose gateway server is delete-pruned this same fetch warns (write kept)", () => {
+    // The gateway server is sync-owned by this source; its device is absent this
+    // fetch, so under prunePolicy:"delete" it is delete-pruned. The §5.3 dangling
+    // check passed (it was a live current server), so the plan writes its id onto
+    // the target AND deletes it in the same run.
+    const gw = ownedServer(
+      { id: "gw-id", name: "gw-host", group: "NetBox" },
+      { sourceId: "source-1", externalId: "device:gw", syncedAt: 1000 }
+    );
+    const t = template({ ipmiGatewayServerId: { mode: "override", value: "gw-id" } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule(t.id)] }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // gw device gone
+      servers: [gw],
+      templates: [t],
+      authProfiles: []
+    });
+    // gw is delete-pruned this run.
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "gw-id")).toBe(true);
+    const targetId = deterministicServerId("source-1", "device:1");
+    const targetAdd = p.adds.find((a) => a.id === targetId);
+    // Decision: WARN ONLY, keep the write — the gateway id is still written+stamped.
+    expect(targetAdd?.ipmiGatewayServerId).toBe("gw-id");
+    expect(targetAdd?.origin?.templated?.ipmiGatewayServerId).toBe("gw-id");
+    // Kills d512258 (no survivor pass → zero gateway warnings for this silent write).
+    // Mirroring the proxy survivor warning, the message names the RECORD carrying
+    // the gateway (the target, "core-sw-1"), the template, and the "will not survive"
+    // disposition.
+    expect(
+      p.warnings.some(
+        (w) =>
+          /Device template "T"/.test(w) &&
+          /IPMI gateway/i.test(w) &&
+          /will not survive this sync/.test(w) &&
+          /"core-sw-1"/.test(w)
+      )
+    ).toBe(true);
   });
 });

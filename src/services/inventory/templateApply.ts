@@ -753,6 +753,12 @@ export interface ProxySelfReferenceContext {
   targetServerId: string;
   targetServerName: string;
   proxyTemplateName: string | undefined;
+  // PR-T3 review FIX 2 — the SAME per-device self-reference judgement for the
+  // IPMI gateway id (a server id, like a jump host): a gateway winner equal to
+  // `targetServerId` would make the server its own gateway. Names the template
+  // for the skip warning, mirroring `proxyTemplateName`. `ipmiAuthProfileId` has
+  // NO self notion (an AuthProfile id, not a server id) — it is never checked.
+  ipmiGatewayTemplateName?: string;
 }
 
 /**
@@ -856,6 +862,22 @@ export function applyTemplateMatrix(
   const applyId = (key: "ipmiAuthProfileId" | "ipmiGatewayServerId"): void => {
     const d = desired[key];
     if (d === undefined) {
+      return;
+    }
+    // PR-T3 review FIX 2 — IPMI gateway SELF-REFERENCE (per-device), mirroring the
+    // proxy self-skip above: a gateway that IS the device being written would make
+    // the server its own gateway. The server edit form excludes self by
+    // construction, but a catch-all/override gateway rule stamps the host with its
+    // OWN id (it matches the rule), producing a persisted self-reference invisible
+    // in the editor. SKIP (drop to "desired none": do NOT write/stamp, so an
+    // existing sync-owned gateway carries forward, row 5) + ONE warning naming the
+    // template and server. Per-device — the same template legitimately sets a valid
+    // gateway on the OTHER devices it matches. `ipmiAuthProfileId` has no self
+    // notion, so this is gated on the gateway key alone.
+    if (key === "ipmiGatewayServerId" && proxyRef !== undefined && d.value === proxyRef.targetServerId) {
+      warnings.push(
+        `Device template "${proxyRef.ipmiGatewayTemplateName ?? "?"}" would make "${proxyRef.targetServerName}" its own IPMI gateway — the IPMI Gateway field was skipped.`
+      );
       return;
     }
     const cur = ownedServer?.[key];
@@ -1248,6 +1270,17 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
     }
     const stats: ValueFieldPlan = { mode: tf.mode, willSet: 0, skipped: 0 };
     for (const server of servers) {
+      // PR-T3 review FIX 2 (manual path) — per-server IPMI gateway self-reference,
+      // mirroring the manual proxy self-skip above: a folder that contains the very
+      // server this template names as the gateway would make that host its own
+      // gateway. Skip it (counted in `skipped`, surfaced in the consent modal) + one
+      // warning naming the template and server; siblings still apply. Gated on the
+      // gateway field — an IPMI auth profile id has no self notion.
+      if (field === "ipmiGatewayServerId" && server.id === tf.value) {
+        warnings.push(`Device template "${template.name}" would make "${server.name}" its own IPMI gateway — the IPMI Gateway field was skipped.`);
+        stats.skipped++;
+        continue;
+      }
       const write = tf.mode === "override" || server[field] === undefined;
       if (write) {
         const w = writeFor(server.id);

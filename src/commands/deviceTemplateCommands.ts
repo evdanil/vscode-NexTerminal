@@ -12,7 +12,7 @@ import {
   type ManualApplyPlan,
   type TemplatableField
 } from "../services/inventory/templateApply";
-import { buildRuleListItems, filterFeedback, saveOverlapWarnings } from "../services/inventory/templateRulesView";
+import { buildRuleListItems, filterFeedback, saveOverlapWarnings, templateSetsLabels } from "../services/inventory/templateRulesView";
 import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
 import type { InventorySourceConfig, TemplateRule } from "../models/inventory";
 import { configMutationLock } from "../services/configMutationLock";
@@ -390,22 +390,15 @@ async function manageDeviceTemplates(ctx: CommandContext): Promise<void> {
   openDeviceTemplateEditor(ctx, pick.template);
 }
 
-/** A one-line "Sets: Proxy, Auth Profile" summary via the shared short-label map. */
+/**
+ * A one-line "Sets: Proxy, Auth Profile" summary. PR-T3 review FIX 6 — delegates
+ * to the shared `templateSetsLabels` enumeration (the single source of field
+ * order, §7.2), so this hub / Apply-picker summary and the rules-view detail read
+ * the SAME spelling and ordering everywhere. Keeps this surface's own empty-state
+ * string ("Sets nothing yet").
+ */
 function describeTemplateFields(template: DeviceTemplateProfile): string {
-  const set: string[] = [];
-  for (const field of [
-    "proxy",
-    "authProfileId",
-    "multiplexing",
-    "legacyAlgorithms",
-    "logSession",
-    "ipmiAuthProfileId",
-    "ipmiGatewayServerId"
-  ] as TemplatableField[]) {
-    if (template.fields[field] !== undefined) {
-      set.push(TEMPLATE_FIELD_SHORT_LABELS[field]);
-    }
-  }
+  const set = templateSetsLabels(template);
   return set.length > 0 ? `Sets: ${set.join(", ")}` : "Sets nothing yet";
 }
 

@@ -285,7 +285,13 @@ function ipmiGatewaySelectField(
   seed?: Partial<ServerConfig>,
   servers?: ServerListEntry[],
   vw?: VisibleWhen,
-  advanced = true
+  advanced = true,
+  // Device templates (PR-T3 review FIX 1) — the template editor passes a
+  // template-VOICE hint: the server-form copy below ("this server"/"this machine",
+  // "Leave as (None)") has no referent in a template AND is actively wrong there
+  // (Fill/Override with (None) throws on submit). Defaults to the server-form copy
+  // so `serverCommands.ts` stays byte-identical.
+  hint?: string
 ): FormFieldDescriptor {
   return {
     type: "select",
@@ -300,8 +306,9 @@ function ipmiGatewaySelectField(
     ],
     value: seed?.ipmiGatewayServerId ?? "",
     hint:
+      hint ??
       "The server to run ipmitool on when a macro opts into gateway routing (Run on: the server's IPMI gateway) or Connect BMC Serial Console is used against this server. " +
-      "Leave as (None) when the BMC is reachable from this machine directly — routing only takes effect where a macro or command asks for it.",
+        "Leave as (None) when the BMC is reachable from this machine directly — routing only takes effect where a macro or command asks for it.",
     // Device templates (PR-T3) pass `advanced: false` — the whole template editor
     // is main content, nothing behind the Advanced chevron (m13).
     advanced,
@@ -831,7 +838,10 @@ export function deviceTemplateFormDefinition(
         advanced: false,
         autofill: false,
         suppressCreate: true,
-        hint: "The saved credentials this template links as each server's BMC (IPMI) login — separate from the SSH auth profile above."
+        // PR-T3 review FIX 7 — the empty-list pointer: with `suppressCreate: true`
+        // this select offers only "(None)" when no auth profiles exist, so Fill/
+        // Override then guarantees the submit error with no route to the fix.
+        hint: "The saved credentials this template links as each server's BMC (IPMI) login — separate from the SSH auth profile above. Create profiles with Manage Auth Profiles."
       }),
       templateOverridePreemption("ipmiAuthProfileId"),
 
@@ -839,7 +849,17 @@ export function deviceTemplateFormDefinition(
       // filterable server select (the same control the server form's IPMI Gateway
       // field uses), seeded from the template field, advanced off for this editor.
       templateModeSelect("ipmiGatewayServerId", modeOf("ipmiGatewayServerId")),
-      ipmiGatewaySelectField({ ipmiGatewayServerId: seed?.fields.ipmiGatewayServerId?.value }, servers, ipmiGatewayVw, false),
+      ipmiGatewaySelectField(
+        { ipmiGatewayServerId: seed?.fields.ipmiGatewayServerId?.value },
+        servers,
+        ipmiGatewayVw,
+        false,
+        // PR-T3 review FIX 1 — template-VOICE hint (the server-form copy is wrong
+        // in a template: no referent for "this server", and "Leave as (None)"
+        // misleads — Fill/Override with (None) throws on submit). FIX 7 appends the
+        // empty-list pointer, mirroring the IPMI-auth row.
+        "The server this template sets as each target's IPMI gateway — ipmitool runs there when a macro or Connect BMC Serial Console opts into gateway routing. To leave servers without a gateway, set the mode to \"Not set\". Add servers first if the list below is empty."
+      ),
       templateOverridePreemption("ipmiGatewayServerId")
     ]
   };

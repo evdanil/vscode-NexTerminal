@@ -758,6 +758,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // run's proxy, so the survivor pass's dangling warning names the template that
   // actually set THIS proxy (per-record), not the baseline catch-all's.
   const proxyTemplateNameByServerId = new Map<string, string>();
+  // PR-T3 review FIX 3 — per-record name of the template that WROTE this run's IPMI
+  // gateway, so the post-plan survivor pass can name it when the gateway server is
+  // delete-pruned in the SAME sync (the §5.3 dangling check ran against the
+  // OPTIMISTIC `liveServerIds`, which still admits a same-run delete-prune). Mirrors
+  // `proxyTemplateNameByServerId`.
+  const ipmiGatewayTemplateNameByServerId = new Map<string, string>();
 
   const adds: ServerConfig[] = [];
   const updates: Array<{ before: ServerConfig; after: ServerConfig }> = [];
@@ -1202,7 +1208,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const templateMatrix = applyTemplateMatrix(ownedServer, deviceDesiredNonAuth, {
         targetServerId: ownedServer.id,
         targetServerName: device.name,
-        proxyTemplateName: deviceProxyTemplateName
+        proxyTemplateName: deviceProxyTemplateName,
+        // PR-T3 review FIX 2 — names the template for the IPMI-gateway self-skip.
+        ipmiGatewayTemplateName: deviceCascade.provenance.ipmiGatewayServerId?.templateName
       });
       for (const w of templateMatrix.warnings) {
         warnings.push(w);
@@ -1213,6 +1221,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // survive.
       if (templateMatrix.values.proxy !== undefined && deviceProxyTemplateName !== undefined) {
         proxyTemplateNameByServerId.set(ownedServer.id, deviceProxyTemplateName);
+      }
+      // PR-T3 review FIX 3 — capture the template that WROTE this run's gateway, for
+      // the post-plan survivor pass (same-sync-pruned gateway warning).
+      if (templateMatrix.values.ipmiGatewayServerId !== undefined) {
+        const gwName = deviceCascade.provenance.ipmiGatewayServerId?.templateName;
+        if (gwName !== undefined) {
+          ipmiGatewayTemplateNameByServerId.set(ownedServer.id, gwName);
+        }
       }
       const afterOrigin: ServerOrigin = {
         sourceId: source.id,
@@ -1918,7 +1934,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const templateMatrix = applyTemplateMatrix(adopteeForMatrix, deviceDesiredNonAuth, {
           targetServerId: adoptee.id,
           targetServerName: device.name,
-          proxyTemplateName: deviceProxyTemplateName
+          proxyTemplateName: deviceProxyTemplateName,
+          // PR-T3 review FIX 2 — names the template for the IPMI-gateway self-skip.
+          ipmiGatewayTemplateName: deviceCascade.provenance.ipmiGatewayServerId?.templateName
         });
         for (const w of templateMatrix.warnings) {
           warnings.push(w);
@@ -1927,6 +1945,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // owned-update path, keyed by the adoptee's (preserved) id.
         if (templateMatrix.values.proxy !== undefined && deviceProxyTemplateName !== undefined) {
           proxyTemplateNameByServerId.set(adoptee.id, deviceProxyTemplateName);
+        }
+        // PR-T3 review FIX 3 — same gateway-template capture as the owned-update path.
+        if (templateMatrix.values.ipmiGatewayServerId !== undefined) {
+          const gwName = deviceCascade.provenance.ipmiGatewayServerId?.templateName;
+          if (gwName !== undefined) {
+            ipmiGatewayTemplateNameByServerId.set(adoptee.id, gwName);
+          }
         }
         const adoptionOrigin: ServerOrigin = {
           sourceId: source.id,
@@ -2309,7 +2334,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const addMatrix = applyTemplateMatrix(undefined, deviceDesiredNonAuth, {
       targetServerId: id,
       targetServerName: device.name,
-      proxyTemplateName: deviceProxyTemplateName
+      proxyTemplateName: deviceProxyTemplateName,
+      // PR-T3 review FIX 2 — names the template for the IPMI-gateway self-skip. A
+      // fresh add whose gateway rule matches its own id (a catch-all/override
+      // gateway) would otherwise stamp the host with its own id.
+      ipmiGatewayTemplateName: deviceCascade.provenance.ipmiGatewayServerId?.templateName
     });
     for (const w of addMatrix.warnings) {
       warnings.push(w);
@@ -2319,6 +2348,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // if its jump host does not survive (an add ships a dangling proxy otherwise).
     if (addMatrix.values.proxy !== undefined && deviceProxyTemplateName !== undefined) {
       proxyTemplateNameByServerId.set(id, deviceProxyTemplateName);
+    }
+    // PR-T3 review FIX 3 — capture the gateway-template name for the survivor pass.
+    if (addMatrix.values.ipmiGatewayServerId !== undefined) {
+      const gwName = deviceCascade.provenance.ipmiGatewayServerId?.templateName;
+      if (gwName !== undefined) {
+        ipmiGatewayTemplateNameByServerId.set(id, gwName);
+      }
     }
     adds.push({
       id,
@@ -2680,6 +2716,38 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   for (const a of adds) {
     survivorIds.add(a.id);
   }
+  // PR-T3 review FIX 3 — SAME-SYNC-PRUNED IPMI GATEWAY survivor warning, mirroring
+  // the proxy survivor pass's warn shape. The §5.3 dangling check that ran during
+  // composition used the OPTIMISTIC `liveServerIds`, which still admits a gateway
+  // server this plan DELETE-prunes in the same run (sync-owned, its device gone this
+  // fetch): the plan then writes+stamps that gateway's id onto a target AND deletes
+  // the gateway, with zero warnings — a silent write-and-prune the user consents to
+  // blind. Decision (per spec): WARN ONLY, keep the write+stamp — the runtime
+  // tolerates a dangling gateway (resolves to local + `noGatewayFallbackNote`) and an
+  // override template edit can later reclaim it; the defect is the SILENT consent,
+  // not the write. Scoped to gateways this run WROTE (`ipmiGatewayTemplateNameByServerId`),
+  // so a retained (row-5) gateway is out of scope, exactly as the proxy part-1 pass
+  // owns only written proxies. Deduped by message via `pushDedupTemplateWarning`.
+  const warnGatewayPruned = (record: ServerConfig): void => {
+    const gw = record.ipmiGatewayServerId;
+    if (gw === undefined || survivorIds.has(gw)) {
+      return; // gateway survives (or none written) — nothing to warn
+    }
+    const name = ipmiGatewayTemplateNameByServerId.get(record.id) ?? "?";
+    pushDedupTemplateWarning(
+      `Device template "${name}" on "${source.name}" set an IPMI gateway on "${record.name}" whose gateway server will not survive this sync (it is being pruned) — the gateway will not resolve until it is reclaimed.`
+    );
+  };
+  for (const a of adds) {
+    if (ipmiGatewayTemplateNameByServerId.has(a.id)) {
+      warnGatewayPruned(a);
+    }
+  }
+  for (const u of updates) {
+    if (ipmiGatewayTemplateNameByServerId.has(u.after.id)) {
+      warnGatewayPruned(u.after);
+    }
+  }
   // PR-T2 review (B2) — a proxy the survivor pass drops or restores did NOT flow
   // from this run's template onto the record, so its §3.4 provenance line must go
   // with it, or the consent report would claim a value flow the plan simultaneously
@@ -2797,6 +2865,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     before.multiplexing !== after.multiplexing ||
     before.legacyAlgorithms !== after.legacyAlgorithms ||
     before.logSession !== after.logSession ||
+    // PR-T3 review FIX 4 — symmetry with the mainline `changed` comparator (which
+    // lists both IPMI value fields). Unexploitable today (every matrix ipmi write
+    // also rewrites its stamp, and `serverOriginStampsEqual` below covers stamps),
+    // but the "value write ⇒ stamp write" invariant is implicit — a future path
+    // writing a value without a stamp would otherwise be silently collapsed here.
+    before.ipmiAuthProfileId !== after.ipmiAuthProfileId ||
+    before.ipmiGatewayServerId !== after.ipmiGatewayServerId ||
     !serverOriginStampsEqual(before.origin, after.origin) ||
     before.username !== after.username;
   const collapsedIds = new Set<string>();
