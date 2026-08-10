@@ -64,6 +64,18 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
   }
 }));
 
+// The management list panel is a thin presentation layer; here we only capture the
+// descriptor it is opened with, so tests can assert the projection (rows, empty
+// state, action→command mapping) without a real webview.
+const managementPanelOpens: Array<{ descriptor: import("../../src/ui/managementListPanel").ManagementListDescriptor }> = [];
+vi.mock("../../src/ui/managementListPanel", () => ({
+  ManagementListPanel: {
+    open: (_core: unknown, descriptor: import("../../src/ui/managementListPanel").ManagementListDescriptor) => {
+      managementPanelOpens.push({ descriptor });
+    }
+  }
+}));
+
 // Imported AFTER the mocks so the command module binds to them.
 const { registerDeviceTemplateCommands, parseDeviceTemplateFormValues, applyPlanWrites } = await import("../../src/commands/deviceTemplateCommands");
 const { FolderTreeItem } = await import("../../src/ui/nexusTreeProvider");
@@ -133,6 +145,7 @@ function registerWithVault(core: NexusCore, vault: unknown): void {
 beforeEach(() => {
   registeredCommands.clear();
   formPanelOpens.length = 0;
+  managementPanelOpens.length = 0;
   mockShowQuickPick.mockReset();
   mockShowInputBox.mockReset();
   mockShowWarningMessage.mockReset();
@@ -229,30 +242,57 @@ describe("device template CRUD commands", () => {
     expect(templates[0].fields.logSession).toEqual({ mode: "fill", value: false });
   });
 
-  it("nexus.deviceTemplate.manage shows the constructive empty-state (never a dead-end) when there are no templates", async () => {
+  it("nexus.deviceTemplate.manage opens the Device Templates list panel with the harmonized empty state when there are no templates", async () => {
     const core = makeCore();
     register(core);
-    mockShowInformationMessage.mockResolvedValue(undefined);
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
-    expect(mockShowInformationMessage).toHaveBeenCalledWith(
-      expect.stringContaining("No device templates yet. A device template applies shared settings"),
-      "New Device Template"
-    );
+    registeredCommands.get("nexus.deviceTemplate.manage")!();
+    expect(managementPanelOpens).toHaveLength(1);
+    const d = managementPanelOpens[0].descriptor;
+    expect(d.viewType).toBe("nexus.deviceTemplatesPanel");
+    expect(d.title).toBe("Device Templates");
+    expect(d.list()).toEqual([]);
+    // Harmonized em-dash fragment voice (matches the inventory panel).
+    expect(d.emptyState).toMatch(/^No device templates yet —/);
+    // No ellipsis: New opens the editor directly (no intermediate picker).
+    expect(d.primaryLabel).toBe("New Device Template");
   });
 
-  it("nexus.deviceTemplate.manage lists templates and opens the editor for the chosen one", async () => {
+  it("nexus.deviceTemplate.manage's descriptor lists templates (naturalCompare) with edit/delete actions and maps action→command", async () => {
     const core = makeCore();
-    const seed: DeviceTemplateProfile = { id: "t1", name: "Core", fields: { multiplexing: { mode: "override", value: true } } };
-    await core.addOrUpdateDeviceTemplate(seed);
+    await core.addOrUpdateDeviceTemplate({ id: "t2", name: "Beta", fields: {} });
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Alpha", fields: { multiplexing: { mode: "override", value: true } } });
     register(core);
-    mockShowQuickPick.mockResolvedValue({ label: "Core", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
-    expect(mockShowQuickPick).toHaveBeenCalled();
+    registeredCommands.get("nexus.deviceTemplate.manage")!();
+    const d = managementPanelOpens[0].descriptor;
+    const rows = d.list();
+    expect(rows.map((r) => r.name)).toEqual(["Alpha", "Beta"]); // sorted
+    expect(rows[0].actions).toEqual(["edit", "delete"]); // destructive last
+    // Closed action keys map to commands host-side — the webview never names them.
+    expect(d.commandFor("new")).toBe("nexus.deviceTemplate.add");
+    expect(d.commandFor("edit")).toBe("nexus.deviceTemplate.edit");
+    expect(d.commandFor("delete")).toBe("nexus.deviceTemplate.delete");
+  });
+
+  it("nexus.deviceTemplate.edit opens the seeded editor for THAT template (id-taking)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { multiplexing: { mode: "override", value: true } } });
+    await core.addOrUpdateDeviceTemplate({ id: "t2", name: "Edge", fields: {} });
+    register(core);
+    registeredCommands.get("nexus.deviceTemplate.edit")!("t2");
+    // Falsification: an Edit that ignored the id would open Add or the wrong record.
     const editOpen = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"));
     expect(editOpen).toBeDefined();
+    expect(editOpen!.formId).toBe("device-template-edit-t2");
   });
 
-  it("U3 — the manage hub can DELETE a template: confirm modal (values kept), then removeDeviceTemplate", async () => {
+  it("nexus.deviceTemplate.edit is a no-op for a missing id (deleted between render and click)", () => {
+    const core = makeCore();
+    register(core);
+    registeredCommands.get("nexus.deviceTemplate.edit")!("ghost");
+    expect(formPanelOpens).toHaveLength(0);
+  });
+
+  it("U3 — nexus.deviceTemplate.delete confirms THAT template WITHOUT a second picker, then removeDeviceTemplate", async () => {
     const core = makeCore();
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { multiplexing: { mode: "override", value: true } } });
     // A source that references the template — its rule must be cleared on delete.
@@ -268,14 +308,13 @@ describe("device template CRUD commands", () => {
       templateRules: [{ id: "r", templateId: "t1" }]
     });
     register(core);
-    // First pick: the delete entry. Second pick: the template to delete.
-    mockShowQuickPick
-      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
-      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
     mockShowWarningMessage.mockResolvedValue("Delete");
 
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
 
+    // No QuickPick — the id came from the panel row, so the "which template?" picker
+    // is skipped entirely.
+    expect(mockShowQuickPick).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
       'Delete device template "Core"?',
       expect.objectContaining({ modal: true, detail: expect.stringContaining("Values and stamps already applied to servers are kept") }),
@@ -291,12 +330,18 @@ describe("device template CRUD commands", () => {
     const core = makeCore();
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
     register(core);
-    mockShowQuickPick
-      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
-      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
     mockShowWarningMessage.mockResolvedValue(undefined); // dismissed
 
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
+  });
+
+  it("nexus.deviceTemplate.delete is a no-op for a missing id (no confirm, no removal)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("ghost");
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
     expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
   });
 });
@@ -317,9 +362,8 @@ describe("U1 — save toast + Sync Affected Sources (§6.1 UX-S8)", () => {
     });
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Switch defaults", fields: { logSession: { mode: "fill", value: true } } });
     register(core);
-    // Edit the referenced template.
-    mockShowQuickPick.mockResolvedValue({ label: "Switch defaults", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    // Edit the referenced template (id-taking edit command, as the panel row dispatches it).
+    registeredCommands.get("nexus.deviceTemplate.edit")!("t1");
     const editOpen = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!;
 
     mockShowInformationMessage.mockResolvedValue("Sync Affected Sources");
@@ -515,7 +559,7 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
     mockShowInformationMessage.mockResolvedValue(undefined);
     await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
     expect(mockShowInformationMessage).toHaveBeenCalledWith(
-      expect.stringContaining("No device templates yet."),
+      expect.stringContaining("No device templates yet —"),
       { modal: true },
       "New Device Template"
     );
@@ -822,8 +866,7 @@ describe("Fix A′ (PR #62 Codex round 3, SECURITY) — restore-on-apply-failure
 describe("Fix B (PR #62 Codex round 2) — edit save re-resolves the seeded template and refuses a deleted/stale record", () => {
   async function openEdit(core: NexusCore): Promise<{ onSubmit: (v: FormValues) => Promise<void> | void }> {
     register(core);
-    mockShowQuickPick.mockResolvedValue({ label: "Core", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    await registeredCommands.get("nexus.deviceTemplate.edit")!("t1");
     const editOpen = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!;
     return editOpen.options;
   }
@@ -898,7 +941,7 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     };
   }
 
-  it("a concurrent editor Save + delete of the SAME template aborts the delete (round-6 revision guard) and never tears disk state", async () => {
+  it("a concurrent editor Save of the SAME template (revision moves) while the delete confirm is open aborts the delete (round-6 revision guard) and never tears disk state", async () => {
     const repo = new InMemoryConfigRepository();
     const core = new NexusCore(repo);
     await core.initialize();
@@ -906,61 +949,36 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     await core.addOrUpdateInventorySource(referencingSource("src-1", "t1", "r1"));
     register(core);
 
-    // Open the EDIT editor for T (consumes one quickPick) and capture its onSubmit.
-    mockShowQuickPick.mockResolvedValueOnce({ label: "Core", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    // Open the EDIT editor for T (id-taking edit command, as the panel row dispatches
+    // it) and capture its onSubmit.
+    registeredCommands.get("nexus.deviceTemplate.edit")!("t1");
     const editOnSubmit = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!.options.onSubmit;
-
-    // Delete flow mocks: manage → delete entry → pick T → confirm "Delete".
-    mockShowQuickPick
-      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
-      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
-    mockShowWarningMessage.mockResolvedValue("Delete");
     mockShowInformationMessage.mockResolvedValue(undefined);
 
-    // Gate ONLY the first saveDeviceTemplates after install — the Save's whole-array
-    // persist. Held open, a lock-free delete can sweep T between install and release;
-    // when the Save's captured [incl T] snapshot then lands LAST it would resurrect T.
-    let releaseGate!: () => void;
-    const gate = new Promise<void>((res) => {
-      releaseGate = res;
-    });
-    const realSave = repo.saveDeviceTemplates.bind(repo);
-    let saveCalls = 0;
-    vi.spyOn(repo, "saveDeviceTemplates").mockImplementation(async (templates) => {
-      saveCalls++;
-      if (saveCalls === 1) {
-        await gate;
-      }
-      return realSave(templates);
+    // The delete command resolves T at its CURRENT (pre-Save) revision, then parks at
+    // the confirm modal. While the modal is open, the concurrent editor Save runs to
+    // completion under the serialized config lock, re-minting T's revision. The
+    // delete's in-lock revalidation then sees the moved revision and ABORTS — it must
+    // not remove an incarnation the confirmation never showed.
+    mockShowWarningMessage.mockImplementationOnce(async () => {
+      await editOnSubmit({ name: "Core", mode_logSession: "override", logSession: false });
+      return "Delete";
     });
 
-    // Kick off the Save; let it install T in memory and park at the gated persist.
-    const saveP = editOnSubmit({ name: "Core", mode_logSession: "fill", logSession: true });
-    await tick();
-    // Kick off the delete. Lock-free (fb07263): removeDeviceTemplate runs now,
-    // sweeping T and its rule and persisting [without T] immediately. Locked (fix):
-    // it queues behind the Save's held lock and does nothing until the Save completes.
-    const deleteP = registeredCommands.get("nexus.deviceTemplate.manage")!();
-    await tick();
-    // Release the Save's persist LAST.
-    releaseGate();
-    await Promise.all([saveP, deleteP]);
-    vi.restoreAllMocks();
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
 
     // DISK is the authority — reload a fresh core.
     const reloaded = new NexusCore(repo);
     await reloaded.initialize();
-    // Round-6 revision guard (PR #62 round 6) — the delete picked T at its pre-Save
-    // revision; the concurrent Save re-minted the revision under the serialized lock.
-    // The delete's in-lock revalidation now sees the moved revision and ABORTS rather
-    // than removing an incarnation the confirmation never showed. T therefore survives
-    // (as the Save's incarnation) and its referencing rule stays intact.
-    // Against fb07263 (lock-free, no revision guard) the delete swept T and its rule,
-    // then the Save's late [incl T] persist resurrected T while the rule stayed swept —
-    // a torn state (rule []). The rule assertion below is what discriminates the two.
+    // T survives (as the Save's incarnation) and its referencing rule stays intact.
+    // Falsification: an id-delete that ignored the revision guard would sweep T and its
+    // rule against a disclosure the Save invalidated.
     expect(reloaded.getDeviceTemplate("t1")).toBeDefined();
+    expect(reloaded.getDeviceTemplate("t1")!.fields.logSession).toEqual({ mode: "override", value: false });
     expect(reloaded.getInventorySource("src-1")!.templateRules).toEqual([{ id: "r1", templateId: "t1" }]);
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
+      expect.stringContaining("changed while the confirmation was open — nothing was deleted")
+    );
   });
 
   it("delete ABORTS when the referencing-source set changed under the open confirm modal (removeDeviceTemplate not called)", async () => {
@@ -969,9 +987,6 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     await core.addOrUpdateInventorySource(referencingSource("src-1", "t1", "r1"));
     register(core);
     const removeSpy = vi.spyOn(core, "removeDeviceTemplate");
-    mockShowQuickPick
-      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
-      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
     // While the confirm modal is open, a SECOND source starts referencing T — the
     // referencing set the disclosure was built from ([src-1]) diverges.
     mockShowWarningMessage.mockImplementationOnce(async () => {
@@ -979,7 +994,7 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
       return "Delete";
     });
 
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
 
     // Against fb07263 (no revalidation) removeDeviceTemplate runs and sweeps BOTH
     // sources against a stale disclosure. The guard aborts instead.
@@ -1005,10 +1020,6 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     await core.addOrUpdateInventorySource(referencingSource("src-1", "t1", "r1"));
     register(core);
     const removeSpy = vi.spyOn(core, "removeDeviceTemplate");
-    const picked = core.getSnapshot().deviceTemplates[0];
-    mockShowQuickPick
-      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
-      .mockResolvedValueOnce({ label: "Core", template: picked });
     // While the confirm modal is open, the SAME template is renamed elsewhere — a
     // fresh revision, but the referencing set ([src-1]) is untouched.
     mockShowWarningMessage.mockImplementationOnce(async () => {
@@ -1016,7 +1027,7 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
       return "Delete";
     });
 
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
 
     // Against 1190e5d (existence-only revalidation) removeDeviceTemplate runs and
     // deletes the renamed incarnation. The revision guard aborts instead.
@@ -1036,13 +1047,10 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
     await core.addOrUpdateInventorySource(referencingSource("src-1", "t1", "r1"));
     register(core);
-    mockShowQuickPick
-      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
-      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
     mockShowWarningMessage.mockResolvedValue("Delete"); // no concurrent change
     mockShowInformationMessage.mockResolvedValue(undefined);
 
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
 
     expect(core.getDeviceTemplate("t1")).toBeUndefined();
     expect(core.getInventorySource("src-1")!.templateRules).toEqual([]);
@@ -1053,15 +1061,12 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     const core = makeCore();
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
     register(core);
-    mockShowQuickPick
-      .mockResolvedValueOnce({ label: "$(trash) Delete a Device Template…", action: "delete", template: undefined })
-      .mockResolvedValueOnce({ label: "Core", template: core.getSnapshot().deviceTemplates[0] });
     mockShowWarningMessage.mockImplementationOnce(async () => {
       await core.removeDeviceTemplate("t1"); // vanished while the modal was open
       return "Delete";
     });
 
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    await registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
 
     expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
       expect.stringContaining("changed while the confirmation was open — nothing was deleted")
@@ -1073,8 +1078,7 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     const core = makeCore();
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { logSession: { mode: "fill", value: true } } });
     register(core);
-    mockShowQuickPick.mockResolvedValueOnce({ label: "Core", action: "edit", template: core.getSnapshot().deviceTemplates[0] });
-    await registeredCommands.get("nexus.deviceTemplate.manage")!();
+    registeredCommands.get("nexus.deviceTemplate.edit")!("t1");
     const editOnSubmit = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!.options.onSubmit;
     // Deleted while the editor sat open — the in-lock revalidation must reject and the
     // rejection must propagate out of runExclusive (a swallowed error would resolve).

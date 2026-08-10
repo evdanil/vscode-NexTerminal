@@ -75,7 +75,7 @@ export class AuthProfileEditorPanel {
     this.lastProfileSignature = profileSignature(core.getSnapshot().authProfiles);
     this.panel = vscode.window.createWebviewPanel(
       "nexus.authProfileEditor",
-      "Auth Profile Editor",
+      "Auth Profiles",
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );

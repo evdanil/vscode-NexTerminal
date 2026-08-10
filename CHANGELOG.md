@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.176] — 2026-08-10
+
+### Changed
+
+- **Device Templates and Inventory Sources now open as management tabs, matching Auth Profiles.** `Settings ▸ Device Templates` and `Settings ▸ Inventory Sources` previously dropped into a Quick Pick menu while `Settings ▸ Auth Profiles` opened a proper editor tab — an inconsistency. Both now open a list panel in a tab: every template (or source) is a row showing what it configures, with its actions right there on the row — Edit and Delete for a template; Sync Now, Edit, Template Rules, and Remove for a source. Click a row (or press Enter) to edit it; the destructive action sits apart from the rest to prevent a misclick. The list refreshes live as things change, and every underlying confirmation, busy-check, and sync-plan preview is exactly as before — the panel only presents them. Editing still opens the same form, which still closes and confirms on save. Rows are sorted by name, long names and descriptions are kept on one line with the full text on hover, and the panels are fully keyboard- and screen-reader-navigable.
+
+### Fixed
+
+- **The Auth Profiles editor tab now carries the same header anatomy as the other Settings tabs** — its tab is titled "Auth Profiles" (matching its Settings entry) with a heading at the top, and its **Delete** button is separated from **Save** so the two are not adjacent.
+
 ## [2.8.175] — 2026-08-10
 
 ### Fixed

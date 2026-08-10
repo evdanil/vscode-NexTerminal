@@ -4,6 +4,7 @@ import { renderHighlightRuleEditorHtml } from "../../src/ui/highlightRuleEditorH
 import { renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
 import { renderTerminalAppearanceHtml } from "../../src/ui/terminalAppearanceHtml";
 import { renderAuthProfileEditorHtml } from "../../src/ui/authProfileEditorHtml";
+import { renderManagementListHtml } from "../../src/ui/managementListHtml";
 import { renderSettingsHtml } from "../../src/ui/settingsHtml";
 import { renderFormHtml } from "../../src/ui/formHtml";
 import type { ColorScheme } from "../../src/models/colorScheme";
@@ -75,6 +76,36 @@ describe("webview document shell (byte-identity guard)", () => {
       renderAuthProfileEditorHtml(
         [{ id: "p1", name: "Prof", username: "root", authType: "password" }],
         "p1",
+        NONCE
+      )
+    ).toMatchSnapshot();
+  });
+
+  it("management list panel (device templates, populated)", () => {
+    expect(
+      renderManagementListHtml(
+        {
+          title: "Device Templates",
+          nounSingular: "device template",
+          primaryLabel: "New Device Template",
+          emptyState: "No device templates yet — apply shared settings.",
+          rows: [{ id: "t1", name: "Core", description: "Sets: Proxy", actions: ["edit", "delete"] }]
+        },
+        NONCE
+      )
+    ).toMatchSnapshot();
+  });
+
+  it("management list panel (inventory sources, empty state)", () => {
+    expect(
+      renderManagementListHtml(
+        {
+          title: "Inventory Sources",
+          nounSingular: "inventory source",
+          primaryLabel: "New Inventory Source…",
+          emptyState: "No inventory sources yet — add one to sync servers from your infrastructure.",
+          rows: []
+        },
         NONCE
       )
     ).toMatchSnapshot();

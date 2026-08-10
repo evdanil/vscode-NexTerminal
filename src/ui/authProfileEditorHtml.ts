@@ -96,7 +96,8 @@ export function renderAuthProfileEditorHtml(
     .conditional-field.visible {
       display: block;
     }`,
-    body: `  <div class="form-group">
+    body: `  <h2>Auth Profiles</h2>
+  <div class="form-group">
     <label>Auth Profile</label>
     <div class="custom-select" id="profile-selector">
       <input type="hidden" id="profile-select-value" value="${hiddenValue}" />
@@ -152,10 +153,10 @@ export function renderAuthProfileEditorHtml(
 
   <div class="bottom-actions">
     <button type="button" class="btn-primary" id="save-btn">${escapeHtml(saveLabel)}</button>
-    <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
     <span class="save-indicator${justSavedName ? " visible" : ""}" id="save-flag" role="status" aria-live="polite">✓ Saved</span>
     <div class="spacer"></div>
     <button type="button" class="btn-secondary" id="new-btn">New Profile</button>
+    <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
   </div>
 `,
     script: `    ${baseWebviewJs()}

@@ -91,6 +91,18 @@ vi.mock("../../src/ui/authProfileEditorPanel", () => ({
   }
 }));
 
+// The Inventory Sources management list panel is a thin presentation layer; here
+// we capture the descriptor it opens with so the hub's behavior (rows, empty
+// state, action→command mapping) can be asserted without a real webview.
+const managementPanelOpens: Array<{ descriptor: import("../../src/ui/managementListPanel").ManagementListDescriptor }> = [];
+vi.mock("../../src/ui/managementListPanel", () => ({
+  ManagementListPanel: {
+    open: (_core: unknown, descriptor: import("../../src/ui/managementListPanel").ManagementListDescriptor) => {
+      managementPanelOpens.push({ descriptor });
+    }
+  }
+}));
+
 interface FakePanel {
   dispose: ReturnType<typeof vi.fn>;
   onDidDispose: ReturnType<typeof vi.fn>;
@@ -254,6 +266,7 @@ describe("inventoryCommands", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+    managementPanelOpens.length = 0;
     mockWebviewOpen.mockImplementation(() => makeFakePanel());
   });
 
@@ -7986,23 +7999,7 @@ describe("inventoryCommands", () => {
   // T6 — the Settings-tree hub. Every level-2 row routes through
   // vscode.commands.executeCommand WITH the source id, so each of the four
   // existing race-guarded flows runs unchanged and no picker is shown twice.
-  describe("nexus.inventory.manage — Settings-tree hub", () => {
-    interface HubItem {
-      label: string;
-      description?: string;
-      kind?: number;
-    }
-    interface HubOptions {
-      title?: string;
-      placeHolder?: string;
-    }
-
-    function quickPickCall(index: number): { items: HubItem[]; options: HubOptions } {
-      const call = mockShowQuickPick.mock.calls[index] as [HubItem[], HubOptions];
-      expect(call).toBeDefined();
-      return { items: call[0], options: call[1] };
-    }
-
+  describe("nexus.inventory.manage — Settings-tree list panel", () => {
     async function setupHub(sources: InventorySourceConfig[]): Promise<NexusCore> {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -8015,94 +8012,58 @@ describe("inventoryCommands", () => {
       return core;
     }
 
-    it("level 1 lists every source with its sourceDescription() line, then a separator and the add row", async () => {
-      await setupHub([
-        makeSource({ id: "src-1", name: "Alpha" }),
-        makeSource({ id: "src-2", name: "Beta", lastSyncAt: Date.now() })
-      ]);
-      mockShowQuickPick.mockResolvedValueOnce(undefined); // dismissed
+    it("opens the Inventory Sources list panel (never a QuickPick) with the noun-title and ellipsized New label", async () => {
+      await setupHub([makeSource({ id: "src-1", name: "Alpha" })]);
 
-      await registeredCommands.get("nexus.inventory.manage")!();
+      registeredCommands.get("nexus.inventory.manage")!();
 
-      expect(mockShowQuickPick).toHaveBeenCalledTimes(1);
-      const { items, options } = quickPickCall(0);
-      expect(options).toEqual({ title: "Inventory Sources", placeHolder: "Choose a source to sync, edit, or remove" });
-      expect(items.map((item) => item.label)).toEqual(["Alpha", "Beta", "", "$(add) Add Inventory Source…"]);
-      // Reused verbatim from pickInventorySource's row description — provider
-      // label plus the relative last-sync phrasing.
-      expect(items[0].description).toBe("Fake Provider — never synced");
-      expect(items[1].description).toBe("Fake Provider — synced just now");
-      expect(items[2].kind).toBe(-1); // QuickPickItemKind.Separator
-      expect(items[3].kind).toBeUndefined();
-      // Dismissing level 1 is a cancel, not an implicit "add".
-      expect(mockExecuteCommand).not.toHaveBeenCalled();
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      expect(managementPanelOpens).toHaveLength(1);
+      const d = managementPanelOpens[0].descriptor;
+      expect(d.viewType).toBe("nexus.inventorySourcesPanel");
+      expect(d.title).toBe("Inventory Sources");
+      // Ellipsis: New runs the add-source wizard's provider pick (the only "New …"
+      // that earns the ellipsis).
+      expect(d.primaryLabel).toBe("New Inventory Source…");
     });
 
-    it("picking a source shows the action rows titled with the source name", async () => {
-      await setupHub([makeSource({ id: "src-1", name: "Alpha" }), makeSource({ id: "src-2", name: "Beta" })]);
-      mockShowQuickPick
-        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === "Beta"))
-        .mockResolvedValueOnce(undefined);
-
-      await registeredCommands.get("nexus.inventory.manage")!();
-
-      expect(mockShowQuickPick).toHaveBeenCalledTimes(2);
-      const { items, options } = quickPickCall(1);
-      expect(options.title).toBe("Beta");
-      expect(items.map((item) => [item.label, item.description])).toEqual([
-        ["$(sync) Sync Now", "Fetch devices and preview changes"],
-        ["$(edit) Edit…", "Change settings, credentials, or the auth profile"],
-        ["$(list-tree) Edit Template Rules…", "Attach device templates to filtered subsets of devices"],
-        ["$(trash) Remove…", "Choose what happens to its synced servers"]
+    it("descriptor lists every source (naturalCompare) with its sourceDescription line and the four sync/edit/rules/remove actions", async () => {
+      await setupHub([
+        makeSource({ id: "src-2", name: "Beta", lastSyncAt: Date.now() }),
+        makeSource({ id: "src-1", name: "Alpha" })
       ]);
+
+      registeredCommands.get("nexus.inventory.manage")!();
+      const d = managementPanelOpens[0].descriptor;
+      const rows = d.list();
+      expect(rows.map((r) => r.name)).toEqual(["Alpha", "Beta"]); // naturalCompare sorted
+      // Reused verbatim from pickInventorySource's row description — provider label
+      // plus the relative last-sync phrasing.
+      expect(rows[0].description).toBe("Fake Provider — never synced");
+      expect(rows[1].description).toBe("Fake Provider — synced just now");
+      // Destructive (remove) last.
+      expect(rows[0].actions).toEqual(["sync", "edit", "rules", "remove"]);
     });
 
     it.each([
-      ["$(sync) Sync Now", "nexus.inventory.syncNow"],
-      ["$(edit) Edit…", "nexus.inventory.editSource"],
-      ["$(list-tree) Edit Template Rules…", "nexus.deviceTemplate.editRules"],
-      ["$(trash) Remove…", "nexus.inventory.removeSource"]
-    ])("routing %s executes %s with the picked source id (kills a hub that drops the id and re-picks downstream)", async (rowLabel, commandId) => {
-      await setupHub([makeSource({ id: "src-1", name: "Alpha" }), makeSource({ id: "src-2", name: "Beta" })]);
-      mockShowQuickPick
-        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === "Beta"))
-        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === rowLabel));
-
-      await registeredCommands.get("nexus.inventory.manage")!();
-
-      expect(mockExecuteCommand).toHaveBeenCalledTimes(1);
-      expect(mockExecuteCommand).toHaveBeenCalledWith(commandId, "src-2");
-    });
-
-    it("empty state offers only the add row with the in-picker placeholder and never the pickInventorySource warning toast", async () => {
-      await setupHub([]);
-      mockShowQuickPick.mockImplementationOnce(async (items: HubItem[]) => items[0]);
-
-      await registeredCommands.get("nexus.inventory.manage")!();
-
-      expect(mockShowQuickPick).toHaveBeenCalledTimes(1);
-      const { items, options } = quickPickCall(0);
-      expect(items).toHaveLength(1);
-      expect(items[0].label).toBe("$(add) Add Inventory Source…");
-      // No trailing period: its sibling ("Choose a source to sync, edit, or
-      // remove") has none, and two placeholders on the same picker punctuating
-      // differently is the inconsistency this asserts against.
-      expect(options.placeHolder).toBe("No inventory sources yet — add one to sync servers from your infrastructure");
-      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.addSource");
-      // M2d's "No inventory sources configured. Add one first." belongs to the
-      // direct-command paths only — inside a picker the add row IS the affordance.
-      expect(mockShowWarningMessage).not.toHaveBeenCalled();
-    });
-
-    it("dismissing level 2 executes nothing", async () => {
+      ["sync", "nexus.inventory.syncNow"],
+      ["edit", "nexus.inventory.editSource"],
+      ["rules", "nexus.deviceTemplate.editRules"],
+      ["remove", "nexus.inventory.removeSource"],
+      ["new", "nexus.inventory.addSource"]
+    ])("maps the %s action key to %s (closed-action-key protocol — no commandId from the webview)", async (action, commandId) => {
       await setupHub([makeSource({ id: "src-1", name: "Alpha" })]);
-      mockShowQuickPick
-        .mockImplementationOnce(async (items: HubItem[]) => items.find((item) => item.label === "Alpha"))
-        .mockResolvedValueOnce(undefined);
+      registeredCommands.get("nexus.inventory.manage")!();
+      const d = managementPanelOpens[0].descriptor;
+      expect(d.commandFor(action as Parameters<typeof d.commandFor>[0])).toBe(commandId);
+    });
 
-      await registeredCommands.get("nexus.inventory.manage")!();
-
-      expect(mockExecuteCommand).not.toHaveBeenCalled();
+    it("empty state uses the harmonized em-dash fragment copy", async () => {
+      await setupHub([]);
+      registeredCommands.get("nexus.inventory.manage")!();
+      const d = managementPanelOpens[0].descriptor;
+      expect(d.list()).toEqual([]);
+      expect(d.emptyState).toMatch(/^No inventory sources yet —/);
     });
   });
 
