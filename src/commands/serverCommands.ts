@@ -647,6 +647,11 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     // blank select is no link at all, never an empty-string id.
     ipmiAuthProfileId: typeof values.ipmiAuthProfileId === "string" && values.ipmiAuthProfileId
       ? values.ipmiAuthProfileId : undefined,
+    // JUMP-HOST IPMI ROUTING (issue #48 PR-C) — an id into the server list, on
+    // the same terms as `ipmiAuthProfileId`/`authProfileId` above: a blank
+    // "(None)" select is no gateway at all, never an empty-string id.
+    ipmiGatewayServerId: typeof values.ipmiGatewayServerId === "string" && values.ipmiGatewayServerId
+      ? values.ipmiGatewayServerId : undefined,
     // Only `"http"` is stored — `"https"` is the default the absent field
     // already means, and writing it explicitly would put a member on every
     // server record no build before this one understands (the same rule

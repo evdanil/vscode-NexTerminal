@@ -237,6 +237,74 @@ describe("nexus.server.connectBmcSol", () => {
     expect(createdTerminals).toHaveLength(0);
     expect(String(setStatusBarMessage.mock.calls[0][0])).toContain("cancelled");
   });
+
+  /**
+   * Issue #48 PR-C (§3.6) — when the target names a reachable IPMI gateway, the
+   * command honors it exactly as a `route: "ipmiGateway"` macro does: the `-a`
+   * line is delivered into the GATEWAY's session terminal, no local terminal is
+   * spawned, no credential is read (env can't cross the hop — ipmitool prompts on
+   * the bastion), and no macro picker is shown.
+   */
+  function gatewayContext(opts: {
+    servers: ServerConfig[];
+    sessions?: Array<{ id: string; serverId: string }>;
+    terminals?: Map<string, unknown>;
+    secrets?: Record<string, string>;
+    profiles?: AuthProfile[];
+  }): CommandContext {
+    return {
+      core: {
+        getSnapshot: () => ({ activeSessions: opts.sessions ?? [], servers: opts.servers }),
+        getAuthProfile: (id: string) => (opts.profiles ?? [authProfile()]).find((p) => p.id === id),
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: opts.terminals ?? new Map(),
+      secretVault: {
+        get: async (key: string) => (opts.secrets ?? {})[key],
+        store: async () => {},
+        delete: async () => {}
+      }
+    } as unknown as CommandContext;
+  }
+
+  it("routes into the gateway's session with the -a form when ipmiGatewayServerId is set — no local terminal, no picker, no credential read", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
+
+    await connectBmcSol(ctx, { server: target });
+
+    // `-a`, resolved against the TARGET (10.0.0.9), delivered to the gateway.
+    expect(gwSent).toEqual([" ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -a sol activate\n"]);
+    // Never a local terminal (which is the `-E` local flow), never the picker.
+    expect(createdTerminals).toHaveLength(0);
+    expect(showQuickPick).not.toHaveBeenCalled();
+    // Env cannot cross the hop, so no credential is read or prompted for, and the
+    // §3.5 no-secret invariant holds — the `-a` line carries no password.
+    expect(showInputBox).not.toHaveBeenCalled();
+    expect(gwSent[0]).not.toContain("s3cr3t-bmc");
+    expect(gwSent[0]).not.toContain(" -E ");
+  });
+
+  it("keeps the local -E flow unchanged when the gateway id is dangling (names no server)", async () => {
+    // A dangling gateway resolves to "no gateway" — the command uses today's local
+    // `-E` terminal, exactly as an unset gateway does.
+    const ctx = gatewayContext({ servers: [], secrets: VAULTED });
+    await connectBmcSol(ctx, { server: server({ ipmiGatewayServerId: "ghost" }) });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].sent).toEqual([
+      " ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -E sol activate\n"
+    ]);
+    expect(createdTerminals[0].env).toEqual({ IPMITOOL_PASSWORD: "s3cr3t-bmc", IPMI_PASSWORD: "s3cr3t-bmc" });
+  });
 });
 
 describe("nexus.server.openBmcWebConsole", () => {

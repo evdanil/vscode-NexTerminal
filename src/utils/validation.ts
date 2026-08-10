@@ -288,6 +288,15 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.ipmiAuthProfileId !== undefined && (typeof obj.ipmiAuthProfileId !== "string" || obj.ipmiAuthProfileId === "")) {
     return false;
   }
+  // JUMP-HOST IPMI ROUTING (issue #48 PR-C) — the same shape check as
+  // `ipmiAuthProfileId`/`authProfileId` above: it is the same kind of value (an
+  // id reference into the server list), and an empty string is not a link to any
+  // server. Only a shape no writer of ours produces is rejected; a dangling id
+  // (one that names no current server) is tolerated here and resolves to "no
+  // gateway" at the run site, exactly like a jump host whose target was deleted.
+  if (obj.ipmiGatewayServerId !== undefined && (typeof obj.ipmiGatewayServerId !== "string" || obj.ipmiGatewayServerId === "")) {
+    return false;
+  }
   // TOLERANT, deliberately: anything outside the two literals is READ as absent
   // by `resolveBmcWebProtocol()` (⇒ https), so rejecting the row here would cost
   // a server its whole record — group, proxy, sync ownership — over a

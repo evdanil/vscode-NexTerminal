@@ -2,8 +2,15 @@ import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
 import { resolveBmcWebProtocol } from "../models/config";
 import { resolveProfileTokens } from "../services/profileTokens";
+import type { TerminalMacro } from "../models/terminalMacro";
 import { profileTokenServer, resolveIpmiTerminalEnv } from "./ipmiCredentials";
-import { openServerAdvancedEdit, reportProfileTokenError, resolveMacroBrowserUrl } from "./serverMacroCommands";
+import {
+  openServerAdvancedEdit,
+  reportProfileTokenError,
+  resolveIpmiGatewayServer,
+  resolveMacroBrowserUrl,
+  resolveServerSessionTarget
+} from "./serverMacroCommands";
 import { pickServer, toServerFromArg } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -47,6 +54,17 @@ export const BMC_SOL_COMMAND =
   " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E sol activate\n";
 
 /**
+ * The SOL command line for the GATEWAY path (issue #48 PR-C, §3.6). `-a` instead
+ * of `-E`: env injection cannot cross to a remote shell, so ipmitool prompts for
+ * the password itself on the bastion tty (no echo, nothing stored) — the same
+ * shape as the shipped "IPMI SOL (via jump host)" template. NO `-E`, NO `-P`, and
+ * nothing about the secret ever reaches this string, so the §3.5 no-secret-in-
+ * `sendText` invariant holds on this path by construction.
+ */
+export const BMC_SOL_COMMAND_GATEWAY =
+  " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -a sol activate\n";
+
+/**
  * The web-console URL template. The scheme is chosen by the server's
  * `bmcWebProtocol` through `resolveBmcWebProtocol()` and interpolated as one of
  * TWO known literals — never the stored string itself, which would let an
@@ -79,6 +97,33 @@ async function resolveTargetServer(ctx: CommandContext, arg?: unknown): Promise<
 export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise<void> {
   const server = await resolveTargetServer(ctx, arg);
   if (!server) {
+    return;
+  }
+
+  // JUMP-HOST IPMI ROUTING (issue #48 PR-C, §3.6). When the target names a
+  // reachable IPMI gateway, this command honors it exactly as a
+  // `route: "ipmiGateway"` macro does — no opt-in flag question arises, because
+  // the command has no independent identity to carry one on, and choosing it
+  // against a gateway-configured server IS the request to reach that BMC by its
+  // configured route. Env injection cannot cross to the gateway shell, so the
+  // `-a` form is used (ipmitool prompts on the bastion) and NO credential is read
+  // or prompted for here — the §3.5 no-secret invariant holds by construction.
+  const gateway = resolveIpmiGatewayServer(ctx, server);
+  if (gateway) {
+    const routed = resolveProfileTokens(BMC_SOL_COMMAND_GATEWAY, profileTokenServer(ctx, server), { form: "command" });
+    if (!routed.ok) {
+      await reportProfileTokenError(routed.error, server, { subject: "Connect BMC Serial Console", outcome: "run" });
+      return;
+    }
+    // The same routing step a macro takes — deliver into a session terminal of
+    // the gateway (connect-first confirm, connect-failed/timeout split, pinned
+    // target all carried over), no macro picker. `send` is the terminal's own
+    // `sendText(text, false)`; the command's trailing newline executes it.
+    const target = await resolveServerSessionTarget(ctx, gateway, { name: "BMC Serial Console" } as TerminalMacro);
+    if (!target) {
+      return;
+    }
+    await target.send(routed.text);
     return;
   }
 

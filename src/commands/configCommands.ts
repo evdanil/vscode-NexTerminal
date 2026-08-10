@@ -814,6 +814,14 @@ export function sanitizeForSharing(
     // SENDER's id verbatim, which on the receiving side either resolves to
     // nothing or (worse) to an unrelated local profile that happens to hold it.
     const newIpmiAuthProfileId = s.ipmiAuthProfileId ? idMap.get(s.ipmiAuthProfileId) : undefined;
+    // JUMP-HOST IPMI ROUTING (issue #48 PR-C) — an id reference INTO THE SERVER
+    // LIST, so it remaps through the SAME idMap as `proxy.jumpHostId` (every
+    // server's new id is already assigned in the second pass above), and takes
+    // `remapProxy`'s out-of-export disposition: when the gateway server is not in
+    // the bundle the field is dropped to `undefined`, never carried stale. An
+    // unset gateway means "the BMC is reachable locally" — a safe working default
+    // on the recipient — whereas a stale id can only fail confusingly at run time.
+    const newIpmiGatewayServerId = s.ipmiGatewayServerId ? idMap.get(s.ipmiGatewayServerId) : undefined;
     // §B6 — a share export travels to another person/machine; a synced-server marker
     // (sourceId/externalId) names an inventory source that only exists locally and
     // would be meaningless (and misleading) on the receiving end.
@@ -834,6 +842,7 @@ export function sanitizeForSharing(
       proxy: remapProxy(s.proxy, idMap),
       authProfileId: newAuthProfileId,
       ipmiAuthProfileId: newIpmiAuthProfileId,
+      ipmiGatewayServerId: newIpmiGatewayServerId,
       origin: undefined,
       formerlySynced: undefined
     };

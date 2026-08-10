@@ -197,6 +197,69 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain('document.getElementById("macro-provide-ipmi").checked = false;');
   });
 
+  /**
+   * Issue #48 PR-C — the "Run on" routing select. Shown only while Run in = Local
+   * terminal (bespoke conditional visibility, like the credential checkbox), and
+   * it round-trips `route` through the save payload.
+   */
+  it("renders the Run On select, defaulting to 'local' and hidden for a plain session macro", () => {
+    const html = render([{ name: "Plain", text: "show version\n" }], 0);
+    expect(html).toContain('id="macro-run-on-wrapper"');
+    expect(html).toContain('input type="hidden" id="macro-run-on" value="local"');
+    // Hidden for a session macro (only meaningful on a local terminal).
+    expect(html).toContain('id="run-on-group" style="display:none;"');
+    expect(html).toContain("This machine");
+    // The apostrophe in "server's" is HTML-escaped, so match the plain tail.
+    expect(html).toContain("IPMI gateway (falls back to this machine)");
+  });
+
+  it("shows Run On visible and preselected for a route:ipmiGateway local-terminal macro", () => {
+    const html = render(
+      [{ name: "SOL", text: "ipmitool\n", runIn: "localTerminal", route: "ipmiGateway" }],
+      0
+    );
+    expect(html).toContain('id="macro-run-on" value="ipmiGateway"');
+    expect(html).not.toContain('id="run-on-group" style="display:none;"');
+  });
+
+  it("reads a corrupt route as 'local' (the untrusted-field discipline made visible)", () => {
+    const html = render(
+      [{ name: "SOL", text: "x", runIn: "localTerminal", route: "IPMIGATEWAY" as never }],
+      0
+    );
+    expect(html).toContain('id="macro-run-on" value="local"');
+  });
+
+  it("carries route in the save payload and resets it to 'local' when Run in leaves Local terminal", () => {
+    const html = render([], null);
+    expect(html).toContain("route: runOnVal");
+    expect(html).toContain("function updateRunOnState()");
+    // Reset-to-local on hide, not just hiding: a stranded 'ipmiGateway' would
+    // submit a routing the user cannot see. The host also drops it, but the
+    // visible half must match.
+    expect(html).toContain('selectCustomOption(document.getElementById("macro-run-on-wrapper"), "local");');
+  });
+
+  it("shows the inert-combination hint only for route:ipmiGateway + provideIpmiCredentials, and carries the live toggle", () => {
+    // Both flags on → the hint is rendered VISIBLE.
+    const both = render(
+      [{ name: "SOL", text: "ipmitool\n", runIn: "localTerminal", route: "ipmiGateway", provideIpmiCredentials: true }],
+      0
+    );
+    expect(both).toContain('id="gateway-inert-credentials-hint"');
+    expect(both).toContain("ipmitool will prompt on the gateway instead");
+    // Rendered visible (no display:none) when both are on.
+    expect(both).not.toContain('id="gateway-inert-credentials-hint" style="display:none;"');
+    // Gateway route but credentials OFF → hint hidden.
+    const routeOnly = render(
+      [{ name: "SOL", text: "ipmitool\n", runIn: "localTerminal", route: "ipmiGateway" }],
+      0
+    );
+    expect(routeOnly).toContain('id="gateway-inert-credentials-hint" style="display:none;"');
+    // The live recompute is wired.
+    expect(both).toContain("function updateGatewayInertHint()");
+  });
+
   it("blocks the profile-token/trigger combination client-side, in its own warning slot", () => {
     const html = render([], null);
     // A dedicated slot: the variables/trigger conflict can apply to the same

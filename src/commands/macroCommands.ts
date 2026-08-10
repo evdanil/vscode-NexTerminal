@@ -139,6 +139,26 @@ export const MACRO_TEMPLATES: MacroTemplate[] = [
       provideIpmiCredentials: true
     }
   },
+  {
+    // JUMP-HOST SOL (issue #48 PR-C) — the `-a`/gateway sibling of the `-E`/local
+    // SOL template above. Two SOL templates now, each carrying exactly the flags
+    // its own command needs (§4.2 Path B item 4): this one runs on the target
+    // server's configured IPMI gateway (`route: "ipmiGateway"`), where ipmitool's
+    // own `-a` prompt supplies the password on the bastion tty — env injection
+    // cannot cross to a remote shell, so `provideIpmiCredentials` is OFF and there
+    // is no `-E`. A template insert is a LOCAL action, not an import, so the
+    // shipped `route` survives insertion (the capability strip list only touches
+    // import paths).
+    id: "ipmi-sol-gateway",
+    label: "IPMI SOL console (via jump host)",
+    description: "Open a serial-over-LAN console by running ipmitool on the target server's configured IPMI gateway. ipmitool prompts for the BMC password on the gateway (leading space keeps it out of shell history).",
+    macro: {
+      name: "IPMI SOL console (via jump host)",
+      text: " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -a sol activate\n",
+      runIn: "localTerminal",
+      route: "ipmiGateway"
+    }
+  },
   // Chassis power control — the other thing operators actually run against a
   // BMC, in the same shape as the SOL template above (localTerminal, `-E`,
   // flag set) so all four read and behave identically.

@@ -4889,6 +4889,37 @@ describe("sanitizeForSharing", () => {
     }
   });
 
+  /**
+   * Issue #48 PR-C — the share-export half of `ipmiGatewayServerId`. It is an id
+   * reference INTO THE SERVER LIST, so it must remap through the same idMap as
+   * `proxy.jumpHostId` (data assertion, no macro involved — the remap's actual
+   * claim is testable directly on the record).
+   */
+  it("remaps a server's ipmiGatewayServerId to the gateway's NEW id when both are exported", () => {
+    const gateway = makeServer({ id: "gw-1", name: "Bastion" });
+    const target = makeServer({ id: "srv-A", name: "Target", ipmiGatewayServerId: "gw-1" });
+
+    const result = sanitizeForSharing([target, gateway], [], [], [], {});
+
+    const newGateway = result.servers.find((s) => s.name === "Bastion")!;
+    const newTarget = result.servers.find((s) => s.name === "Target")!;
+    // The verbatim server spread would carry the SENDER's "gw-1" here.
+    expect(newTarget.ipmiGatewayServerId).toBe(newGateway.id);
+    expect(newTarget.ipmiGatewayServerId).not.toBe("gw-1");
+    // ...and it resolves to the exported gateway — not a dangling id.
+    expect(result.servers.some((s) => s.id === newTarget.ipmiGatewayServerId)).toBe(true);
+  });
+
+  it("drops an ipmiGatewayServerId whose gateway is NOT in the export, rather than carrying it stale", () => {
+    // "Unset gateway = reachable locally" is a safe working default on the
+    // recipient; a stale id can only fail confusingly at run time.
+    const target = makeServer({ id: "srv-A", name: "Target", ipmiGatewayServerId: "gw-absent" });
+
+    const result = sanitizeForSharing([target], [], [], [], {});
+
+    expect(result.servers[0].ipmiGatewayServerId).toBeUndefined();
+  });
+
   it("strips proxy username from SOCKS5 and HTTP configs", () => {
     const server = makeServer({
       proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "user1" }

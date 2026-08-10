@@ -1,7 +1,13 @@
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
 import type { TerminalMacro } from "../models/terminalMacro";
-import { macroProvidesIpmiCredentials, macroRunTargetBadge, resolveMacroRunTarget } from "../models/terminalMacro";
+import {
+  IPMI_GATEWAY_INERT_CREDENTIALS_HINT,
+  macroProvidesIpmiCredentials,
+  macroRunTargetBadge,
+  resolveMacroRoute,
+  resolveMacroRunTarget
+} from "../models/terminalMacro";
 import { getMacros } from "../macroSettings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import { bindingToDisplayLabel } from "../macroBindings";
@@ -294,6 +300,72 @@ export function sessionIpmiHintNote(macro: TerminalMacro): string | undefined {
 }
 
 /**
+ * The server a target server routes its IPMI to, or `undefined` when it names no
+ * gateway or names one that no longer exists in the snapshot. A dangling id
+ * resolves to "no gateway" — the same disposition `remapProxy` gives an
+ * out-of-export jump host — so the fall-back rule (run locally, plus a note)
+ * catches it exactly as it catches a server with no gateway at all.
+ *
+ * The ONE read site for `ipmiGatewayServerId` on the run path, so "does this
+ * server route to a gateway, and to which one" is decided once.
+ */
+export function resolveIpmiGatewayServer(ctx: CommandContext, server: ServerConfig): ServerConfig | undefined {
+  const id = server.ipmiGatewayServerId;
+  if (typeof id !== "string" || !id) {
+    return undefined;
+  }
+  return ctx.core.getSnapshot().servers.find((candidate) => candidate.id === id);
+}
+
+/**
+ * The fall-back note (§4.2 Path B item 0): a macro asked to run on the IPMI
+ * gateway, but the target names no reachable gateway, so it runs LOCALLY. Local
+ * is the intended destination for a no-gateway server ("unset gateway = the BMC
+ * is reachable locally"), not a degradation — the note only keeps the fall-back
+ * non-silent. Verbatim copy per the roadmap.
+ */
+export function noGatewayFallbackNote(
+  server: ServerConfig,
+  route: "local" | "ipmiGateway",
+  gateway: ServerConfig | undefined
+): string | undefined {
+  return route === "ipmiGateway" && !gateway
+    ? `No IPMI gateway is configured for ${server.name} — running locally.`
+    : undefined;
+}
+
+/**
+ * The route re-consent note (§4.2 Path B item 0, rev11): a LOCAL-routed
+ * local-terminal macro whose text reaches for a BMC (an IPMI token) runs against
+ * a server that HAS a gateway configured — so the command runs on this machine
+ * when the BMC may only be reachable from the gateway. Gated on IPMI-token usage
+ * exactly like the credentials hint, so it never nags on an unrelated local
+ * helper (`ping`, `scp`) that merely happens to sit on a gateway server. Verbatim
+ * copy per the roadmap.
+ */
+export function routeReconsentNote(
+  macro: TerminalMacro,
+  route: "local" | "ipmiGateway",
+  gateway: ServerConfig | undefined
+): string | undefined {
+  if (route !== "local" || !gateway || !usesIpmiTokens(macro.text)) {
+    return undefined;
+  }
+  return `This macro runs on this machine. If this BMC is only reachable from ${gateway.name}, set 'Run on: the server's IPMI gateway' in the macro editor.`;
+}
+
+/**
+ * The inert-credentials per-run note (§4.2 Path B item 4): a gateway-routed macro
+ * that also has `provideIpmiCredentials` on. Env injection cannot cross to the
+ * gateway shell, so the flag is inert and ipmitool's own `-a` prompt supplies the
+ * password there instead. Reads the SAME string the editor hint does
+ * (`IPMI_GATEWAY_INERT_CREDENTIALS_HINT`) so the two cannot drift.
+ */
+export function gatewayInertCredentialsNote(macro: TerminalMacro): string | undefined {
+  return (macro.provideIpmiCredentials as unknown) === true ? IPMI_GATEWAY_INERT_CREDENTIALS_HINT : undefined;
+}
+
+/**
  * The one delivery note built from however many caveats a run collected. Joined
  * with a semicolon rather than a second status message: `runMacroWithTarget`
  * appends ONE clause to the success line, and a second `setStatusBarMessage`
@@ -406,7 +478,7 @@ async function connectAndAwaitSessionTerminal(
  * Whatever this returns is pinned by reference before the prompt walk starts
  * (§8.1). Every await it performs happens BEFORE that pin, never after.
  */
-async function resolveServerSessionTarget(
+export async function resolveServerSessionTarget(
   ctx: CommandContext,
   server: ServerConfig,
   macro: TerminalMacro
@@ -552,12 +624,32 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     await reportProfileTokenError(resolution.error, server);
     return;
   }
+  // JUMP-HOST IPMI ROUTING (issue #48 PR-C). Resolved BEFORE the credential gate
+  // and before the dispatch, because it decides both: a gateway-routed macro
+  // never prompts for a password (env injection cannot cross to the gateway
+  // shell — ipmitool's own `-a` prompt supplies it there), and it is delivered
+  // into the GATEWAY's session terminal rather than a local one. The route is
+  // meaningful only for a `localTerminal` macro; every other target stays local
+  // to its own semantics.
+  const route = runTarget === "localTerminal" ? resolveMacroRoute(macro) : "local";
+  const gatewayServer = route === "ipmiGateway" ? resolveIpmiGatewayServer(ctx, server) : undefined;
+  // A gateway routing actually takes effect only when the target names a gateway
+  // that resolves; `route: "ipmiGateway"` with no reachable gateway FALLS BACK to
+  // a local terminal (plus the note below), so the credentials flag applies
+  // normally there because the terminal really is local.
+  const routedToGateway = route === "ipmiGateway" && gatewayServer !== undefined;
+
   // NOT REPORTED HERE — see `unknownTokenNote`. The caveats ride along with the
   // delivery report, because everything below can still abort.
   const deliveryNote = combineDeliveryNotes(
     unknownTokenNote(resolution.unknownTokens),
-    ipmiCredentialsOffNote(macro),
-    sessionIpmiHintNote(macro)
+    // On the gateway path the "tick Provide IPMI credentials" hint would be wrong
+    // (the flag is inert there), so it is replaced by the inert-credentials note;
+    // the local and fall-back paths keep the original hint.
+    routedToGateway ? gatewayInertCredentialsNote(macro) : ipmiCredentialsOffNote(macro),
+    sessionIpmiHintNote(macro),
+    noGatewayFallbackNote(server, route, gatewayServer),
+    routeReconsentNote(macro, route, resolveIpmiGatewayServer(ctx, server))
   );
 
   // THE CREDENTIAL GATE (issue #48 §3.3). Three conditions, all required, and
@@ -567,11 +659,16 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // and is never prompted, since prompting is the same disclosure decision moved
   // one dialog later.
   //
+  // SKIPPED ENTIRELY ON THE GATEWAY PATH (PR-C item 2): the secret must never be
+  // typed into a remote shell's history/scrollback, and env injection cannot
+  // reach it, so there is nothing to obtain and nothing to prompt for — ipmitool
+  // prompts on the bastion. Only a truly-local terminal reads this environment.
+  //
   // Resolved BEFORE the target is built and before the prompt walk, so a
   // cancelled credential prompt costs the user nothing: no terminal has been
   // spawned and no variable has been asked for.
   let ipmiEnv: Record<string, string> | undefined;
-  if (macroProvidesIpmiCredentials(macro)) {
+  if (!routedToGateway && macroProvidesIpmiCredentials(macro)) {
     const credential = await resolveIpmiTerminalEnv(ctx, server, { purpose: "IPMI" });
     if (credential.kind === "cancelled") {
       vscode.window.setStatusBarMessage(`Macro "${macro.name}" cancelled — nothing was sent.`, 4000);
@@ -583,7 +680,16 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   let target: MacroSendTarget | undefined;
   switch (runTarget) {
     case "localTerminal":
-      target = localTerminalTarget(macro, server, ipmiEnv);
+      // A gateway-routed macro rides a SESSION terminal of the gateway server —
+      // SOL is interactive and needs a real PTY, not a fresh local terminal.
+      // Tokens are already resolved against the TARGET server (the chokepoint is
+      // unchanged); only the destination terminal moves. The connect-first
+      // confirmation, the connect-failed-vs-timeout split and the pinned-target
+      // discipline all carry over by pointing `resolveServerSessionTarget` at the
+      // gateway's own `ServerConfig`.
+      target = routedToGateway
+        ? await resolveServerSessionTarget(ctx, gatewayServer!, macro)
+        : localTerminalTarget(macro, server, ipmiEnv);
       break;
     case "browser":
       target = browserTarget(macro, macros.indexOf(macro));

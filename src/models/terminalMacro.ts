@@ -104,7 +104,24 @@ export interface TerminalMacro {
    * person it binds is the person who ticked it.
    */
   provideIpmiCredentials?: boolean;
+  /** Where a `runIn: "localTerminal"` macro's terminal actually lives.
+   *  "local" (the default, and the meaning of ABSENT) = this machine, today's
+   *  behavior. "ipmiGateway" = the target server's IPMI gateway session, when
+   *  one is configured. Meaningless for other run targets. UNTRUSTED at every
+   *  read site like `runIn`: resolve through a helper that maps anything
+   *  outside the union to "local".
+   *
+   *  NEVER SURVIVES AN IMPORT (`IMPORTED_CAPABILITY_FIELDS`, below): it chooses
+   *  an EXECUTION HOST, so an imported macro carrying it would run its author's
+   *  command in an SSH session on the importer's bastion — usually the most
+   *  privileged box in the topology. Consent is re-given locally by re-ticking
+   *  "Run on" in the macro editor, or the routing is off. */
+  route?: "local" | "ipmiGateway";
 }
+
+export type MacroRoute = "local" | "ipmiGateway";
+
+export const MACRO_ROUTES: readonly MacroRoute[] = ["local", "ipmiGateway"];
 
 /**
  * The run target a macro ACTUALLY has, applied at every read site (§4.2's
@@ -138,6 +155,34 @@ export function macroProvidesIpmiCredentials(
 ): boolean {
   return resolveMacroRunTarget(macro) === "localTerminal" && (macro.provideIpmiCredentials as unknown) === true;
 }
+
+/**
+ * The route a macro ACTUALLY has, applied at every read site (§4.2 Path B's
+ * untrusted-field discipline, identical to `resolveMacroRunTarget`): absent, a
+ * non-string, or a string outside `MACRO_ROUTES` all resolve to `"local"` — the
+ * compatibility default and the meaning of ABSENT — so an imported record
+ * carrying `route: "IPMIGATEWAY"` / `route: 7` behaves like the ordinary local
+ * macro it was before, never like one that runs on a bastion. This is the ONE
+ * read site; every consumer goes through it (a direct `===`/truthiness read is
+ * exactly the bug the untrusted-route test exists to catch).
+ */
+export function resolveMacroRoute(macro: Pick<TerminalMacro, "route">): MacroRoute {
+  const raw = macro.route as unknown;
+  return typeof raw === "string" && (MACRO_ROUTES as readonly string[]).includes(raw)
+    ? (raw as MacroRoute)
+    : "local";
+}
+
+/**
+ * The non-blocking note shown when `route: "ipmiGateway"` and
+ * `provideIpmiCredentials` are BOTH on: env injection cannot cross to a remote
+ * shell, so the credentials flag is inert and ipmitool's own `-a` prompt supplies
+ * the password on the bastion tty instead. Deliberately not an error — a user may
+ * flip `route` back and forth on one macro. Defined here so the macro editor's
+ * live hint and the per-run delivery note read from ONE string and cannot drift.
+ */
+export const IPMI_GATEWAY_INERT_CREDENTIALS_HINT =
+  "IPMI credentials can't be sent to a gateway session — ipmitool will prompt on the gateway instead";
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */
 export function macroRunTargetLabel(target: MacroRunTarget): string {
