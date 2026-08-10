@@ -125,6 +125,53 @@ describe("NexusCore inventory sources", () => {
     expect(snapshot.focusedSessionId).toBeUndefined();
   });
 
+  it("prunes a gateway server via applyInventorySyncPlan and sweeps a SURVIVING referrer's dangling ipmiGatewayServerId (issue #48 PR-C, PR #65 Codex round 10)", async () => {
+    // Gateway B is inventory-owned and about to be pruned by the sync's delete
+    // policy. Server A (a hand-created survivor, NOT owned by this source) routes
+    // its IPMI through B; server C routes through a still-present gateway D.
+    const repository = new InMemoryConfigRepository([
+      { id: "B", name: "Gateway B", host: "b", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:B", syncedAt: 1 } },
+      { id: "D", name: "Gateway D", host: "d", port: 22, username: "u", authType: "agent", isHidden: false },
+      { id: "A", name: "Target A", host: "a", port: 22, username: "u", authType: "agent", isHidden: false, group: "rack/1", ipmiGatewayServerId: "B" },
+      { id: "C", name: "Target C", host: "c", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "D" }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    const saveServersSpy = vi.spyOn(repository, "saveServers");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["B"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    // B is pruned; A's now-dangling gateway ref is cleared while its other fields
+    // stand; C's live gateway D is untouched.
+    expect(core.getServer("B")).toBeUndefined();
+    const a = core.getServer("A");
+    expect(a?.ipmiGatewayServerId).toBeUndefined();
+    expect(a?.group).toBe("rack/1");
+    expect(a?.name).toBe("Target A");
+    expect(core.getServer("C")?.ipmiGatewayServerId).toBe("D");
+
+    // Folded into the method's existing single persist + single emit — no second
+    // write, no second emit.
+    expect(saveServersSpy).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    // The cleared ref persisted through that one write.
+    const core2 = new NexusCore(repository);
+    await core2.initialize();
+    expect(core2.getServer("A")?.ipmiGatewayServerId).toBeUndefined();
+    expect(core2.getServer("C")?.ipmiGatewayServerId).toBe("D");
+  });
+
   it("(F12) writes lastSyncAt on the applied source only — a second source's lastSyncAt is untouched", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

@@ -424,6 +424,99 @@ describe("openUnifiedForm SSH submit — the auth profile link is re-resolved un
   });
 });
 
+// The server-list twin of the auth-link guards above (`ipmiGatewayServerId`,
+// issue #48 PR-C, PR #65 Codex round 10): a gateway picked in the add form and
+// then deleted while the form sat open must not be born onto the new record.
+// Unlike the two auth guards this is a SILENT drop, not a reject — a dangling
+// gateway degrades to "run locally" at runtime, so the invariant is only that
+// the dangling id is never PERSISTED.
+describe("openUnifiedForm SSH submit — the IPMI gateway server link is guarded on CREATE (issue #48 PR-C, PR #65 Codex round 10)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({
+      get: vi.fn((_key: string, fallback: unknown) => fallback)
+    });
+    mockShowQuickPick.mockReset();
+    mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
+    mockSyncProxyPasswordSecret.mockImplementation(async () => {});
+  });
+
+  function ctxWithServers(servers: Map<string, { id: string; name: string }>) {
+    const addOrUpdateServer = vi.fn(async () => {});
+    return {
+      addOrUpdateServer,
+      ctx: {
+        core: {
+          getSnapshot: vi.fn(() => ({ servers: [...servers.values()], authProfiles: [] })),
+          getAuthProfile: vi.fn(),
+          getServer: vi.fn((id: string) => servers.get(id)),
+          addOrUpdateServer,
+          removeServer: vi.fn(),
+          addOrUpdateSerialProfile: vi.fn(),
+          addOrUpdateLocalShellProfile: vi.fn()
+        },
+        secretVault: { get: vi.fn(), store: vi.fn(), delete: vi.fn() }
+      } as any
+    };
+  }
+
+  it("drops an ipmiGatewayServerId that names no live server, and still creates the record (kills the gateway guard being absent on the add path — a dangling gateway link on a brand-new record)", async () => {
+    const servers = new Map<string, { id: string; name: string }>();
+    const { ctx, addOrUpdateServer } = ctxWithServers(servers);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", ipmiGatewayServerId: "gw-gone" });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+    await onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      ipmiGatewayServerId: "gw-gone"
+    });
+
+    // The kill: without the guard the record is created carrying the dangling
+    // "gw-gone". The server is still created (silent drop, not a reject), just
+    // without the gateway link.
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect(addOrUpdateServer.mock.calls.at(-1)![0].id).toBe("srv-new");
+    expect(addOrUpdateServer.mock.calls.at(-1)![0].ipmiGatewayServerId).toBeUndefined();
+  });
+
+  it("keeps an ipmiGatewayServerId that still names a live server (kills an over-broad drop that severs a legitimate gateway link)", async () => {
+    const servers = new Map<string, { id: string; name: string }>([["gw-1", { id: "gw-1", name: "Gateway" }]]);
+    const { ctx, addOrUpdateServer } = ctxWithServers(servers);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", ipmiGatewayServerId: "gw-1" });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+    await onSubmit({
+      profileType: "ssh",
+      name: "New Server",
+      host: "example.com",
+      username: "me",
+      ipmiGatewayServerId: "gw-1"
+    });
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "srv-new", ipmiGatewayServerId: "gw-1" })
+    );
+  });
+
+  it("creates the server when there is no gateway link at all (kills dropping/rejecting the unset case)", async () => {
+    const servers = new Map<string, { id: string; name: string }>();
+    const { ctx, addOrUpdateServer } = ctxWithServers(servers);
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server" });
+
+    openUnifiedForm(ctx);
+    const { onSubmit } = latestFormOptions();
+    await onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me" });
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(expect.objectContaining({ id: "srv-new" }));
+    expect(addOrUpdateServer.mock.calls.at(-1)![0].ipmiGatewayServerId).toBeUndefined();
+  });
+});
+
 describe("openUnifiedForm SSH submit — record+secret mutation locking (FINDING 2, P2 sibling)", () => {
   beforeEach(() => {
     vi.clearAllMocks();

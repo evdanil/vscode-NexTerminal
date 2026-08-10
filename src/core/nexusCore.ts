@@ -1143,6 +1143,36 @@ export class NexusCore {
       this.servers.set(server.id, server);
       batchWrittenServers.set(server.id, cloneServerConfig(server));
     }
+    // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 10) — a gateway
+    // server pruned by this sync leaves surviving servers with a dangling
+    // `ipmiGatewayServerId` that silently degrades gateway routing to local.
+    // Sweep it with the SAME shared helper removeServer uses, folded into this
+    // method's EXISTING persist/rollback envelope: run it AFTER the deletions and
+    // upserts are committed to `this.servers` and BEFORE the single saveServers
+    // below, so cleared survivors ride that one persist and one emit — no second
+    // write, no second emit. Each swept survivor is also enrolled in this batch's
+    // transactional bookkeeping so the conditional rollback restores it exactly
+    // like an upsert: capture its PRE-sweep record into `priorServers` (before
+    // the helper mutates it — `captureServerPrior` is idempotent, so a survivor
+    // already captured as a removed/upserted id keeps its earlier prior), then
+    // record the CLEARED record as this batch's write in `batchWrittenServers`.
+    // Only `ipmiGatewayServerId` on survivors is touched — every other field, and
+    // which servers remain, auth links, and origins, are left exactly as the
+    // deletions/upserts above left them.
+    const gatewayDeletedIds = new Set(removeServerIds);
+    if (gatewayDeletedIds.size > 0) {
+      for (const [id, server] of this.servers.entries()) {
+        if (server.ipmiGatewayServerId !== undefined && gatewayDeletedIds.has(server.ipmiGatewayServerId)) {
+          captureServerPrior(id);
+        }
+      }
+      for (const sweptId of this.clearGatewayReferencesTo(gatewayDeletedIds)) {
+        const cleared = this.servers.get(sweptId);
+        if (cleared) {
+          batchWrittenServers.set(sweptId, cloneServerConfig(cleared));
+        }
+      }
+    }
     // OWNERSHIP FIX (USE is not ownership) — a folder the user pre-created by
     // hand (e.g. "NetBox/RackA" made via the tree UI before this source ever
     // synced) that a sync merely PLACES a device into must never enter
@@ -1844,30 +1874,55 @@ export class NexusCore {
     this.emitChanged();
   }
 
-  public async removeServer(serverId: string): Promise<void> {
-    this.servers.delete(serverId);
-    // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 9) — clear every
-    // OTHER server's `ipmiGatewayServerId` that named the server just deleted,
-    // so a deletion never leaves a dangling gateway reference behind. Mirrors
-    // `removeAuthProfile`'s dependent-link sweep for the sibling server->server
-    // reference: same in-memory-first update, same shallow `{ ...server, <field>:
-    // undefined }` clear (ServerConfig carries no `revision`, so — like the auth
-    // sweep's server clear — none is regenerated), folded into the SINGLE
-    // saveServers persist below rather than one write per swept server, and told
-    // to observers by the same one-shot emit.
-    //
-    // ASYMMETRY WITH `proxy.jumpHostId`, the other server->server reference:
-    // removeServer intentionally does NOT sweep jumpHostId. A dangling jump host
-    // is tolerated and surfaced at connect time (proxySshFactory throws "Jump
-    // host server not found"), whereas a dangling gateway is otherwise SILENT —
-    // `resolveIpmiGatewayServer` degrades it to "no gateway / run locally" with
-    // only a fall-back note, never an error — which is why Codex calls for it to
-    // be swept here while jumpHostId is left as-is.
+  /**
+   * DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex rounds 9-10) — shared
+   * primitive behind EVERY server-deletion path. For each SURVIVING server whose
+   * `ipmiGatewayServerId` names a server in `deletedServerIds`, clear that link
+   * in place so a deletion never leaves a dangling gateway reference behind.
+   *
+   * Mirrors `removeAuthProfile`'s dependent-link sweep for the sibling
+   * server->server reference: same in-memory-first update, same shallow
+   * `{ ...server, ipmiGatewayServerId: undefined }` clear (ServerConfig carries
+   * no `revision`, so — like the auth sweep's server clear — none is
+   * regenerated). This method ONLY mutates `this.servers`; it does NOT persist
+   * or emit — every caller folds the swept survivors into its OWN existing
+   * single saveServers persist and one-shot emit (so there is never a second
+   * write or a second emit), and rollback-bearing callers
+   * (applyInventorySyncPlan) capture the returned ids into their transactional
+   * bookkeeping. The servers named by `deletedServerIds` are expected to already
+   * be gone from `this.servers` at call time, so they are never self-swept.
+   *
+   * ASYMMETRY WITH `proxy.jumpHostId`, the other server->server reference: the
+   * deletion paths intentionally do NOT sweep jumpHostId. A dangling jump host
+   * is tolerated and surfaced at connect time (proxySshFactory throws "Jump host
+   * server not found"), whereas a dangling gateway is otherwise SILENT —
+   * `resolveIpmiGatewayServer` degrades it to "no gateway / run locally" with
+   * only a fall-back note, never an error — which is why Codex calls for it to be
+   * swept while jumpHostId is left as-is.
+   *
+   * @returns the ids of the survivors whose gateway link was cleared.
+   */
+  private clearGatewayReferencesTo(deletedServerIds: Set<string>): string[] {
+    const cleared: string[] = [];
+    if (deletedServerIds.size === 0) {
+      return cleared;
+    }
     for (const [id, server] of this.servers.entries()) {
-      if (server.ipmiGatewayServerId === serverId) {
+      if (server.ipmiGatewayServerId !== undefined && deletedServerIds.has(server.ipmiGatewayServerId)) {
         this.servers.set(id, { ...server, ipmiGatewayServerId: undefined });
+        cleared.push(id);
       }
     }
+    return cleared;
+  }
+
+  public async removeServer(serverId: string): Promise<void> {
+    this.servers.delete(serverId);
+    // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 9, extracted to
+    // the shared `clearGatewayReferencesTo` helper in round 10) — clear every
+    // OTHER server's `ipmiGatewayServerId` that named the server just deleted,
+    // folded into the SINGLE saveServers persist below and the one-shot emit.
+    this.clearGatewayReferencesTo(new Set([serverId]));
     this.removeServerSessions(serverId);
     await this.repository.saveServers([...this.servers.values()]);
     this.emitChanged();
@@ -2077,11 +2132,21 @@ export class NexusCore {
 
   public async removeFolderCascade(path: string, deleteContents: boolean): Promise<void> {
     const parent = parentPath(path);
+    // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 10) — a gateway
+    // server deleted along with its folder leaves surviving servers OUTSIDE the
+    // folder with a dangling `ipmiGatewayServerId` that silently degrades gateway
+    // routing to local. Collect the ids this cascade deletes and sweep them with
+    // the shared helper before the single saveServers persist below, folded into
+    // that same one persist and one emit (no second write, no second emit). Only
+    // the `deleteContents` branch removes servers; the reparent branch only
+    // rewrites `.group`, so nothing is deleted and nothing to sweep there.
+    const cascadeDeletedServerIds = new Set<string>();
     if (deleteContents) {
       for (const [id, server] of this.servers.entries()) {
         if (server.group && isDescendantOrSelf(server.group, path)) {
           this.servers.delete(id);
           this.removeServerSessions(id);
+          cascadeDeletedServerIds.add(id);
         }
       }
       for (const [id, profile] of this.serialProfiles.entries()) {
@@ -2132,6 +2197,9 @@ export class NexusCore {
     for (const g of reparentedGroups) {
       this.explicitGroups.add(g);
     }
+    // Sweep dangling gateway refs left by the cascade's server deletions (see the
+    // note at the top of this method), folded into the persist just below.
+    this.clearGatewayReferencesTo(cascadeDeletedServerIds);
     await Promise.all([
       this.repository.saveServers([...this.servers.values()]),
       this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
