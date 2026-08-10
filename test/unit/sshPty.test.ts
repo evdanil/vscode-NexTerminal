@@ -1118,6 +1118,34 @@ describe("SshPty", () => {
 
       pty.dispose();
     });
+
+    // PR #67 Codex round 3 P2b — DNS names are case-insensitive, so an alternate
+    // that differs from the primary ONLY by hostname casing is the SAME endpoint;
+    // retrying it is futile and risks a second credential prompt / lockout. Against
+    // the pre-fix case-SENSITIVE gate (`altHost === host`) `EXAMPLE.COM` !==
+    // `example.com` so the fallback fired and `connect` was called twice.
+    it("does NOT retry when altHost differs from the primary host only by letter casing", async () => {
+      const connect = vi.fn(async () => {
+        throw econnrefused("example.com");
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "example.com", altHost: "EXAMPLE.COM" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
+
+      pty.dispose();
+    });
   });
 
   it("does not fire onConnectFailed for a failed RECONNECT — that path rethrows to reconnect()", async () => {

@@ -330,10 +330,18 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         const primaryMessage = primaryError instanceof Error ? primaryError.message.toLowerCase() : "";
         const isHandshakeTimeout = primaryMessage.includes("timed out while waiting for handshake");
         const isConnectionLevel = (stage === "tcp" || stage === "dns") && !isHandshakeTimeout;
+        // Hostname comparison is case-insensitive (PR #67 Codex round 3 P2b): DNS
+        // names are case-insensitive, so an alternate that differs from the primary
+        // only by casing (`example.com` vs `EXAMPLE.COM`) is the SAME endpoint and a
+        // retry would be futile — risking a second credential prompt / lockout. Both
+        // sides are trimmed + lower-cased before the equality check.
+        const primaryHostNormalized =
+          typeof this.serverConfig.host === "string" ? this.serverConfig.host.trim().toLowerCase() : "";
+        const altHostIsPrimary = altHost !== undefined && altHost.toLowerCase() === primaryHostNormalized;
         if (
           !isConnectionLevel ||
           altHost === undefined ||
-          altHost === this.serverConfig.host ||
+          altHostIsPrimary ||
           this.disposed ||
           this.shuttingDown ||
           generation !== this.connectionGeneration
