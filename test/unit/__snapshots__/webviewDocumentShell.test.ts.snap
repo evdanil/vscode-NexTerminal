@@ -7575,10 +7575,17 @@ exports[`webview document shell (byte-identity guard) > management list panel (d
     .mgmt-actions {
       display: flex;
       align-items: center;
+      justify-content: flex-end;
       gap: 6px;
-      flex: 0 0 auto;
-      /* Wrap the buttons among themselves too, so at the narrowest widths a
-         four-button inventory cluster stacks instead of clipping Remove. */
+      /* flex 0 1 auto + min-width 0 lets the cluster SHRINK below its max-content
+         width, so it is constrained to the available row width. A 0 0 auto cluster
+         keeps max-content and its own flex-wrap never gets a narrow width to wrap
+         at, so Remove still overflows on a narrow panel (PR #68 Codex round 1). Now
+         the cluster is bounded by the row, its buttons wrap among themselves, and
+         justify-content flex-end keeps them right-aligned whether inline or dropped
+         under the name. It never grows (flex-grow 0), so 700px is unchanged. */
+      flex: 0 1 auto;
+      min-width: 0;
       flex-wrap: wrap;
     }
     .mgmt-action {
@@ -8259,10 +8266,17 @@ exports[`webview document shell (byte-identity guard) > management list panel (i
     .mgmt-actions {
       display: flex;
       align-items: center;
+      justify-content: flex-end;
       gap: 6px;
-      flex: 0 0 auto;
-      /* Wrap the buttons among themselves too, so at the narrowest widths a
-         four-button inventory cluster stacks instead of clipping Remove. */
+      /* flex 0 1 auto + min-width 0 lets the cluster SHRINK below its max-content
+         width, so it is constrained to the available row width. A 0 0 auto cluster
+         keeps max-content and its own flex-wrap never gets a narrow width to wrap
+         at, so Remove still overflows on a narrow panel (PR #68 Codex round 1). Now
+         the cluster is bounded by the row, its buttons wrap among themselves, and
+         justify-content flex-end keeps them right-aligned whether inline or dropped
+         under the name. It never grows (flex-grow 0), so 700px is unchanged. */
+      flex: 0 1 auto;
+      min-width: 0;
       flex-wrap: wrap;
     }
     .mgmt-action {
