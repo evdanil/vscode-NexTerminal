@@ -694,18 +694,28 @@ describe("inventorySourceFormDefinition — saved-filter picker (PR-E)", () => {
     expect(pickerIndex).toBe(filterIndex - 1);
   });
 
-  it("the picker offers each saved filter plus the save-current sentinel, and is an autofill filterable select", () => {
+  it("the picker offers each saved filter plus the save-current sentinel, and is a filterable SYNCHRONOUS-fill select (kills the async-autofill wiring FIX B removed)", () => {
     const definition = inventorySourceFormDefinition(netboxLike, undefined, undefined, [], [], savedFilters);
     const picker = keyedField(definition, SAVED_FILTER_SELECT_KEY);
     expect(picker.type).toBe("select");
     const select = picker as Extract<FormFieldDescriptor, { type: "select" }>;
-    expect(select.autofill).toBe(true);
+    // FIX B (PR #64 Codex round 2) — the async round trip is gone: the picker no
+    // longer opts into `autofill` and instead names its synchronous fill target.
+    expect(select.autofill).toBeFalsy();
+    expect(select.fillTarget).toBe("cfg_filter");
     expect(select.filterable).toBe(true);
     const values = select.options.map((o) => o.value);
     expect(values).toContain("");
     expect(values).toContain("sf1");
     expect(values).toContain("sf2");
     expect(values).toContain(SAVED_FILTER_SAVE_CURRENT_SENTINEL);
+    // Only the real definition options carry a raw fillValue (the query string);
+    // the (None) and save-current sentinels carry none, so picking them never fills.
+    const byValue = new Map(select.options.map((o) => [o.value, o] as const));
+    expect(byValue.get("sf1")!.fillValue).toBe("role=core&site=syd");
+    expect(byValue.get("sf2")!.fillValue).toBe("role=edge");
+    expect(byValue.get("")!.fillValue).toBeUndefined();
+    expect(byValue.get(SAVED_FILTER_SAVE_CURRENT_SENTINEL)!.fillValue).toBeUndefined();
   });
 
   it("renders constructively with ZERO saved filters — still offers the save-current sentinel (kills a dead-end empty state)", () => {

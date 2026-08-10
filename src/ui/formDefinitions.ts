@@ -1185,12 +1185,23 @@ export const SAVED_FILTER_SAVE_CURRENT_SENTINEL = "__create__savedFilter";
 /**
  * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the "Saved Filter" picker rendered
  * directly above the Device Filter field. Reuses PR-F1's filterable select and
- * the generic autofill seam: picking a saved filter fills the Device Filter field
- * (`onAutofill` returns `{ [cfg_filter]: definition.filter }`), and the trailing
+ * fills the Device Filter field SYNCHRONOUSLY in the webview (`fillTarget` +
+ * per-option `fillValue`): picking a saved filter copies its raw query string
+ * straight into `cfg_filter` before Save can be clicked, and the trailing
  * "Save current filter as…" sentinel routes to `onCreateInline`, which saves the
  * current Device Filter text as a named definition. Rendered even with zero saved
  * filters — the empty state is constructive (the "Save current filter as…" row is
  * always offered), never a dead-end.
+ *
+ * FIX B (PR #64 Codex review round 2) — the fill is synchronous, NOT the async
+ * `autofill` round trip it used to be. The old round trip (`onAutofill` →
+ * `fillFields`) could be outrun by a Save clicked before the answer landed,
+ * silently dropping the pick; and a late answer would clobber a hand edit made
+ * after the pick. Carrying each real option's raw filter as `fillValue` and
+ * naming the target as `fillTarget` puts the value in the DOM at pick time, so a
+ * racing Save reads the right value and a later hand edit simply wins (nothing
+ * re-resolves the picker id at submit). (None) has no `fillValue` (no-op, never
+ * clears); the save-current sentinel has none (inline-create, never a fill).
  */
 function savedFilterSelectField(savedFilters: SavedFilterDefinition[] | undefined): FormFieldDescriptor {
   const list = savedFilters ?? [];
@@ -1201,10 +1212,13 @@ function savedFilterSelectField(savedFilters: SavedFilterDefinition[] | undefine
     // Grows with the library — filterable, with (None) pinned top and the save
     // affordance pinned bottom, same as the auth-profile / device-template selects.
     filterable: true,
-    autofill: true,
+    // Synchronous fill into the Device Filter field — no `autofill` round trip
+    // (FIX B). `fillTarget` is the prefixed form key the picker writes; each real
+    // option below carries its raw `fillValue` (the query string, `""` included).
+    fillTarget: inventoryConfigFieldPrefixedKey(SAVED_FILTER_TARGET_FIELD_ID),
     options: [
       { label: "(None)", value: "" },
-      ...list.map((f) => ({ label: f.name, value: f.id, description: f.filter || "(empty filter)" })),
+      ...list.map((f) => ({ label: f.name, value: f.id, description: f.filter || "(empty filter)", fillValue: f.filter })),
       { label: "Save current filter as…", value: SAVED_FILTER_SAVE_CURRENT_SENTINEL }
     ],
     // Always opens on (None): a source stores its own copy of a filter string, not

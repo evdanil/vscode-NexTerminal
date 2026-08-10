@@ -41,8 +41,19 @@ export type FormFieldDescriptor =
    * selects whose option list grows unbounded (server / auth-profile pickers),
    * never on small fixed-domain ones (auth type, proxy type) where a filter is
    * noise.
+   *
+   * `fillTarget` + option `fillValue` (issue #48 PR-E, PR #64 Codex round 2)
+   * are the SYNCHRONOUS, no-round-trip counterpart to `autofill`: a select
+   * whose `fillTarget` names another form key fills THAT key straight from the
+   * chosen option's raw `fillValue` in the webview, before Save can be clicked.
+   * The saved-filter picker uses this so a Save that races the old async fill
+   * can no longer carry a stale Device Filter. Only real options carry a
+   * `fillValue` (the raw query string, `""` included); the `(None)` sentinel
+   * has none, so picking it is a no-op that never clears the target, and the
+   * `__create__` sentinel routes to inline-create before any fill. Unlike
+   * `autofill`, this never touches the auth-profile mirror/ownership machinery.
    */
-  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string }[]; value?: string; filterable?: boolean; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string> } & FormFieldCommon)
+  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string; fillValue?: string }[]; value?: string; filterable?: boolean; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string>; fillTarget?: string } & FormFieldCommon)
   | ({ type: "combobox"; key: string; label: string; suggestions: string[]; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
   | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)
@@ -88,7 +99,7 @@ export type ExtensionMessage =
   | { type: "init"; definition: FormDefinition; values: FormValues }
   | { type: "browseResult"; key: string; path: string }
   | { type: "validationError"; errors: Record<string, string> }
-  | { type: "addSelectOption"; key: string; value: string; label: string; description?: string }
+  | { type: "addSelectOption"; key: string; value: string; label: string; description?: string; fillValue?: string }
   /**
    * `key` echoes the `autofill` message this answers, so the webview can
    * attribute the filled values to the select that asked for them.

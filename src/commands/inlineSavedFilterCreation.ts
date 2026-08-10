@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { NexusCore } from "../core/nexusCore";
 import type { WebviewFormPanel } from "../ui/webviewFormPanel";
 import type { FormValues } from "../ui/formTypes";
+import { configMutationLock } from "../services/configMutationLock";
 import {
   SAVED_FILTER_SELECT_KEY,
   inventoryConfigFieldPrefixedKey,
@@ -73,19 +74,40 @@ export function createInlineSavedFilterCreation(ctx: InlineSavedFilterContext): 
         }
         const definition = { id: randomUUID(), name: trimmedName, filter: currentFilter };
         try {
-          await ctx.core.addOrUpdateSavedFilter(definition);
+          // FIX A (issue #48 PR-E / PR #64 Codex review round 2) — serialize the
+          // persist under `configMutationLock`, the command-layer discipline the
+          // device-template commands established (`saveTemplateRules` /
+          // deviceTemplate delete). `addOrUpdateSavedFilter` is a lock-FREE core
+          // primitive; without the lock, this inline write (fired from an open
+          // inventory-source form) can interleave with a Complete Reset /
+          // replace-import that snapshots-then-mutates under the same lock, so a
+          // filter saved here could survive a reset that just reported all data
+          // deleted. A fresh UUID means there is nothing to revalidate — the add
+          // cannot collide with a concurrent edit — so the lock wraps the write
+          // alone; the name prompt above already resolved outside it (never hold
+          // the lock across interactive UI), and addSelectOption fires after it
+          // releases (a webview post, not a config mutation).
+          await configMutationLock.runExclusive(() => ctx.core.addOrUpdateSavedFilter(definition));
         } catch (error) {
           void vscode.window.showErrorMessage(
             `Could not save the filter: ${error instanceof Error ? error.message : String(error)}`
           );
           return;
         }
-        // Append + select it in the picker (its autofill re-fills the Device
-        // Filter with the same value it was saved from — a harmless no-op).
+        // Append + select it in the picker (its synchronous fill re-affirms the
+        // Device Filter with the same value it was saved from — a harmless no-op).
         // P1 — carry the definition's query as the option's description so the
         // just-saved row shows its query line immediately, like every other row,
         // rather than being the one row missing it until the form reopens.
-        capturedPanel.addSelectOption(SAVED_FILTER_SELECT_KEY, definition.id, definition.name, definition.filter);
+        // FIX B — also carry the raw filter as the option's fillValue so re-picking
+        // the just-saved row fills the Device Filter synchronously like any other.
+        capturedPanel.addSelectOption(
+          SAVED_FILTER_SELECT_KEY,
+          definition.id,
+          definition.name,
+          definition.filter,
+          definition.filter
+        );
       })();
     }
   };

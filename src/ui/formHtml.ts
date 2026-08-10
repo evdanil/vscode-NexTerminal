@@ -4,7 +4,7 @@ import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 
 /** A select option, mirrored from the `select` field descriptor's shape. */
-type SelectOption = { label: string; value: string; description?: string };
+type SelectOption = { label: string; value: string; description?: string; fillValue?: string };
 
 /**
  * Orders a FILTERABLE select's options into two pinned buckets around the
@@ -132,12 +132,20 @@ function renderField(field: FormFieldDescriptor): string {
       // A filterable select sorts+pins its options at render time; a plain one
       // emits them in declared order, byte-for-byte as before.
       const renderedOptions = field.filterable ? sortFilterableOptions(field.options) : field.options;
+      // FIX B (PR #64 Codex round 2) — a real option in a fillTarget select carries
+      // its raw `fillValue` as `data-fill-value`, so the change handler can fill the
+      // target field synchronously at pick time (no async round trip). Emitted iff
+      // the option declares one: the (None)/`__create__` sentinels carry none, so
+      // picking them never fills. `""` is a real value (empty-filter definition) and
+      // is emitted as `data-fill-value=""` — distinct from the attribute's absence.
       const optionsHtml = renderedOptions.map((opt) =>
-        `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}">` +
+        `<div class="custom-select-option${opt.value === selectedValue ? " selected" : ""}" data-value="${escapeHtml(opt.value)}"${opt.fillValue !== undefined ? ` data-fill-value="${escapeHtml(opt.fillValue)}"` : ""}>` +
         `<div class="custom-select-option-label">${escapeHtml(opt.label)}</div>` +
         (opt.description ? `<div class="custom-select-option-desc">${escapeHtml(opt.description)}</div>` : "") +
         `</div>`
       ).join("\n      ");
+      // The synchronous fill's target form key, carried on the wrapper (FIX B).
+      const fillTargetAttr = field.fillTarget ? ` data-fill-target="${escapeHtml(field.fillTarget)}"` : "";
       if (field.filterable) {
         // The filter input carries NO `name`, so the submit loop skips it and
         // the value the form posts stays the hidden input's — a filterable
@@ -148,7 +156,7 @@ function renderField(field: FormFieldDescriptor): string {
         const filterLabel = escapeHtml(`Filter ${field.label} options`);
         return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>
-  <div class="custom-select filterable" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}>
+  <div class="custom-select filterable" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
@@ -166,7 +174,7 @@ function renderField(field: FormFieldDescriptor): string {
       }
       return `<div class="form-group"${vw}>
   <label>${escapeHtml(field.label)}</label>
-  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}>
+  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
@@ -789,6 +797,19 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         }
         selectCustomOption(wrapper, value);
         wrapper.dataset.prev = value;
+        // FIX B (PR #64 Codex round 2) — a fillTarget select fills its target
+        // field SYNCHRONOUSLY from the chosen option's raw data-fill-value, before
+        // Save can be clicked (no async round trip to outrun). Only real options
+        // carry the attribute, so (None) is a no-op that never clears the target,
+        // and the __create__ sentinel already returned above. An empty-filter
+        // definition carries data-fill-value="" and fills "" (its own copy). A
+        // later hand edit to the target simply overwrites this — nothing re-resolves
+        // the picker at submit — so hand-edit-wins holds. Independent of the
+        // auth-profile mirror machinery: this touches neither profileFilledKeys nor
+        // profileDisplacedValues.
+        if (wrapper.dataset.fillTarget && opt.dataset.fillValue !== undefined) {
+          setFieldValue(wrapper.dataset.fillTarget, opt.dataset.fillValue);
+        }
         if (wrapper.dataset.autofill === 'true' && value) {
           vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value });
         }
@@ -817,6 +838,12 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             var newOpt = document.createElement("div");
             newOpt.className = "custom-select-option";
             newOpt.dataset.value = msg.value;
+            // FIX B (PR #64 Codex round 2) — an inline-created option (e.g. a just-
+            // saved filter) carries its raw fill value too, so re-picking it later
+            // fills the target synchronously like every render-time option.
+            if (msg.fillValue !== undefined) {
+              newOpt.dataset.fillValue = msg.fillValue;
+            }
             // P1 — mirror the initial render's label+desc structure so an
             // inline-created row carries its query line (msg.description) like
             // every other option, instead of a bare label-only node.
@@ -866,6 +893,12 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             }
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
+            // FIX B — mirror the user-click path's synchronous fill for a
+            // fillTarget select (the inline-created saved filter was saved FROM
+            // the current field, so this re-affirms that value in the DOM).
+            if (wrapper.dataset.fillTarget && msg.fillValue !== undefined) {
+              setFieldValue(wrapper.dataset.fillTarget, msg.fillValue);
+            }
             // An option injected after inline creation is a selection like any
             // other, so it must run the same two follow-ups the user-click
             // path runs (see initCustomSelects below). Without them an

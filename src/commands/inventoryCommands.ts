@@ -35,7 +35,7 @@ import {
   clearStaleProxyPasswordSecretsBeforeApply,
   restoreProxyPasswordSecrets
 } from "../services/inventory/proxySecretHygiene";
-import { inventoryConfigFieldPrefixedKey, inventorySourceFormDefinition, resolveSubmittedTemplateRules, SAVED_FILTER_SELECT_KEY, SAVED_FILTER_TARGET_FIELD_ID } from "../ui/formDefinitions";
+import { inventoryConfigFieldPrefixedKey, inventorySourceFormDefinition, resolveSubmittedTemplateRules } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import type { TemplateRule } from "../models/inventory";
@@ -934,24 +934,14 @@ function authProfileUsernameMirror(profile: AuthProfile | undefined): Record<str
   return username !== undefined ? { defaultUsername: username } : {};
 }
 
-/**
- * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the saved-filter picker's autofill
- * answer: fill the Device Filter field (`cfg_filter`) with the chosen
- * definition's query string. An INDEPENDENT copy — the source stores its own
- * `config.filter`, never a link — so deleting the definition later cannot touch
- * the source (see `NexusCore.removeSavedFilter`). A `(None)` selection (empty
- * value) or an unresolved id returns undefined, filling nothing.
- */
-function savedFilterAutofill(core: NexusCore, value: string): Record<string, string> | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const definition = core.getSavedFilter(value);
-  if (!definition) {
-    return undefined;
-  }
-  return { [inventoryConfigFieldPrefixedKey(SAVED_FILTER_TARGET_FIELD_ID)]: definition.filter };
-}
+// SAVED FILTER DEFINITIONS (issue #48 PR-E) — the saved-filter picker fills the
+// Device Filter field SYNCHRONOUSLY in the webview from each option's raw
+// `fillValue` (see `savedFilterSelectField` in formDefinitions.ts). FIX B (PR #64
+// Codex review round 2) dropped the async `onAutofill` → `fillFields` round trip
+// this picker used to rely on: it could be outrun by a Save clicked before the
+// answer landed (silently keeping the old filter), and a late answer would clobber
+// a hand edit. There is therefore no extension-side saved-filter autofill helper
+// anymore — the fill lives entirely client-side and never involves this file.
 
 export interface NewInventorySourceInput {
   name: string;
@@ -2347,14 +2337,11 @@ export function registerInventoryCommands(
         inlineDeviceTemplate.handleCreateInline(key);
         inlineSavedFilter.handleCreateInline(key, values);
       },
-      onAutofill: async (key, value) => {
-        // SAVED FILTER DEFINITIONS (PR-E) — the saved-filter picker fills the
-        // Device Filter field with an INDEPENDENT copy of the definition's query.
-        if (key === SAVED_FILTER_SELECT_KEY) {
-          return savedFilterAutofill(core, value);
-        }
-        // ONE lookup feeds both: what the form is about to show, and what Save
-        // checks that against.
+      onAutofill: async (_key, value) => {
+        // The saved-filter picker fills synchronously in the webview now (FIX B),
+        // so it never posts an `autofill` — only the auth-profile select reaches
+        // here. ONE lookup feeds both: what the form is about to show, and what
+        // Save checks that against.
         const profile = core.getAuthProfile(value);
         renderedAuthProfile = renderedSourceAuthProfile(profile);
         return authProfileUsernameMirror(profile);
@@ -2617,12 +2604,9 @@ export function registerInventoryCommands(
           inlineDeviceTemplate.handleCreateInline(key);
           inlineSavedFilter.handleCreateInline(key, values);
         },
-        onAutofill: async (key, value) => {
-          // SAVED FILTER DEFINITIONS (PR-E) — see addSource's copy.
-          if (key === SAVED_FILTER_SELECT_KEY) {
-            return savedFilterAutofill(core, value);
-          }
-          // ONE lookup feeds both — see addSource's copy.
+        onAutofill: async (_key, value) => {
+          // The saved-filter picker fills synchronously now (FIX B) — see
+          // addSource's copy. ONE lookup feeds both.
           const profile = core.getAuthProfile(value);
           renderedAuthProfile = renderedSourceAuthProfile(profile);
           return authProfileUsernameMirror(profile);

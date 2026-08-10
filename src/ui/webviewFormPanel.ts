@@ -159,9 +159,16 @@ export class WebviewFormPanel {
     return instance;
   }
 
-  public addSelectOption(key: string, value: string, label: string, description?: string): void {
+  /**
+   * `fillValue` (FIX B, PR #64 Codex round 2) — the injected option's raw
+   * synchronous-fill value for a `fillTarget` select (e.g. a just-saved filter's
+   * query string). Optional and additive: inline-create callers that fill nothing
+   * (auth profile, device template) omit it, and the webview only acts on it for a
+   * select declaring a `fillTarget`.
+   */
+  public addSelectOption(key: string, value: string, label: string, description?: string, fillValue?: string): void {
     if (!this.disposed) {
-      void this.panel.webview.postMessage({ type: "addSelectOption", key, value, label, description });
+      void this.panel.webview.postMessage({ type: "addSelectOption", key, value, label, description, fillValue });
     }
   }
 
