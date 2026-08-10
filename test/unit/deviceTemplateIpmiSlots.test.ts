@@ -629,18 +629,30 @@ describe("PR-T3 IPMI slots — FIX 2 self-gateway skip (manual folder apply)", (
 });
 
 // ============================================================================
-// FALSIFICATION-CRITICAL: FIX 3 — same-sync-pruned gateway survivor warning.
+// FALSIFICATION-CRITICAL: PR-T3 review round 3 (Codex) — the same-sync-pruned IPMI
+// gateway survivor pass is a REJECT (drop value+stamp+provenance,
+// survivor-guarded-restore, "not applied" warning), NOT the old FIX-3 "warn only,
+// keep the write". Rationale: `applyInventorySyncPlan` upserts then force-clears any
+// gateway ref (and its stamp) that names a delete-pruned server, so a kept-B plan
+// preview + §3.4 provenance line promise a mutation that never survives. The plan's
+// `after.ipmiGatewayServerId` must equal the post-apply state — a survivor or
+// undefined. These fixtures REPLACE the old FIX-3 warn-only test, which asserted the
+// now-wrong keep-the-write behavior (kept B + stamp + provenance, warned "remains
+// until reclaimed"). Each is built to FAIL against c8850df (CLAUDE.md non-vacuity).
 // ============================================================================
-describe("PR-T3 IPMI slots — FIX 3 same-sync-pruned gateway", () => {
-  it("a gateway written this run whose gateway server is delete-pruned this same fetch warns (write kept)", () => {
-    // The gateway server is sync-owned by this source; its device is absent this
-    // fetch, so under prunePolicy:"delete" it is delete-pruned. The §5.3 dangling
-    // check passed (it was a live current server), so the plan writes its id onto
-    // the target AND deletes it in the same run.
-    const gw = ownedServer(
-      { id: "gw-id", name: "gw-host", group: "NetBox" },
-      { sourceId: "source-1", externalId: "device:gw", syncedAt: 1000 }
+describe("PR-T3 IPMI slots — round 3 same-sync-pruned gateway REJECT", () => {
+  // A gateway server sync-owned by this source whose device is absent this fetch, so
+  // under prunePolicy:"delete" it delete-prunes. The §5.3 dangling check passed (it
+  // was a live current server), so composition wrote+stamped its id onto the target.
+  function prunedGateway(id: string, externalId: string): ServerConfig {
+    return ownedServer(
+      { id, name: id, group: "NetBox" },
+      { sourceId: "source-1", externalId, syncedAt: 1000 }
     );
+  }
+
+  it("ADD path — a fresh add whose template writes gateway B (delete-pruned same sync): B is REJECTED → after.ipmiGatewayServerId undefined, no stamp, NO §3.4 gateway provenance line, and a 'not applied' warning names the template (kills c8850df, which kept B + stamp + provenance and warned 'remains until reclaimed')", () => {
+    const gw = prunedGateway("gw-id", "device:gw");
     const t = template({ ipmiGatewayServerId: { mode: "override", value: "gw-id" } });
     const p = plan({
       source: makeSource({ prunePolicy: "delete", templateRules: [rule(t.id)] }),
@@ -652,22 +664,156 @@ describe("PR-T3 IPMI slots — FIX 3 same-sync-pruned gateway", () => {
     // gw is delete-pruned this run.
     expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "gw-id")).toBe(true);
     const targetId = deterministicServerId("source-1", "device:1");
-    const targetAdd = p.adds.find((a) => a.id === targetId);
-    // Decision: WARN ONLY, keep the write — the gateway id is still written+stamped.
-    expect(targetAdd?.ipmiGatewayServerId).toBe("gw-id");
-    expect(targetAdd?.origin?.templated?.ipmiGatewayServerId).toBe("gw-id");
-    // Kills d512258 (no survivor pass → zero gateway warnings for this silent write).
-    // Mirroring the proxy survivor warning, the message names the RECORD carrying
-    // the gateway (the target, "core-sw-1"), the template, and the "will not survive"
-    // disposition.
+    const targetAdd = p.adds.find((a) => a.id === targetId)!;
+    expect(targetAdd).toBeDefined();
+    // REJECT: value dropped, stamp cleared — byte-identical to post-apply state.
+    expect(targetAdd.ipmiGatewayServerId).toBeUndefined();
+    expect(targetAdd.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+    // Provenance dropped: no gateway §3.4 line for this record. The gateway short
+    // label is "IPMI Gateway"; the record's own name would front a provenance line.
+    expect(p.warnings.some((w) => /\bIPMI Gateway ←/.test(w))).toBe(false);
+    // "not applied" warning naming the template and this record.
     expect(
       p.warnings.some(
         (w) =>
           /Device template "T"/.test(w) &&
           /IPMI gateway/i.test(w) &&
           /will not survive this sync/.test(w) &&
+          /was not applied/.test(w) &&
           /"core-sw-1"/.test(w)
       )
     ).toBe(true);
+  });
+
+  it("UPDATE override MOVE, prior survives — before.gateway = A_live (survivor, template-owned), override writes B (pruned): after RESTORED to A_live + its stamp, gateway provenance dropped, warning present; gateway-only change COLLAPSES the update to unchanged (kills c8850df keep-B, and kills leaving a now-no-op update in the plan)", () => {
+    const gwLive = GW1; // a plain live server, never pruned — the still-valid prior gateway A_live
+    const gwPruned = prunedGateway("gw-b", "device:gwb"); // B, delete-pruned this run
+    // The target already carries A_live as a template-owned (stamped) gateway.
+    const s = ownedServer(
+      { ipmiGatewayServerId: gwLive.id },
+      { externalId: "device:1", templated: { ipmiGatewayServerId: gwLive.id } }
+    );
+    const t = template({ ipmiGatewayServerId: { mode: "override", value: "gw-b" } }); // gateway is the ONLY write
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule(t.id)] }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // device:gwb absent → B pruned
+      servers: [s, gwLive, gwPruned],
+      templates: [t],
+      authProfiles: []
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "gw-b")).toBe(true);
+    const sId = deterministicServerId("source-1", "device:1");
+    // Gateway was the only change → restoring A_live reverts it → update collapsed.
+    expect(afterFor(p, sId)).toBeUndefined();
+    expect(p.updates.some((u) => u.before.id === sId)).toBe(false);
+    expect(p.unchangedCount).toBe(1); // s is the only owned device; gw-b is pruned
+    expect(
+      p.warnings.some(
+        (w) => /Device template "T"/.test(w) && /will not survive this sync/.test(w) && /was not applied/.test(w)
+      )
+    ).toBe(true);
+  });
+
+  it("UPDATE override MOVE, prior survives, OTHER field also changed — before.gateway = A_live, override writes B (pruned) AND a rename lands: after RESTORED to A_live + stamp, the rename kept, update STAYS in `updates`, unchangedCount untouched (kills a collapse that fires when other fields genuinely changed, and confirms the restore path)", () => {
+    const gwLive = GW1;
+    const gwPruned = prunedGateway("gw-b", "device:gwb");
+    const s = ownedServer(
+      { name: "old-name", ipmiGatewayServerId: gwLive.id },
+      { externalId: "device:1", templated: { ipmiGatewayServerId: gwLive.id } }
+    );
+    const t = template({ ipmiGatewayServerId: { mode: "override", value: "gw-b" } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule(t.id)] }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // rename old-name → core-sw-1
+      servers: [s, gwLive, gwPruned],
+      templates: [t],
+      authProfiles: []
+    });
+    const sId = deterministicServerId("source-1", "device:1");
+    const after = afterFor(p, sId)!;
+    expect(after).toBeDefined(); // update kept — the rename genuinely changed
+    expect(after.ipmiGatewayServerId).toBe(gwLive.id); // restored to the still-valid prior gateway
+    expect(after.origin?.templated?.ipmiGatewayServerId).toBe(gwLive.id); // stamp follows the restored value
+    expect(after.name).toBe("core-sw-1"); // the genuine change intact
+    expect(p.unchangedCount).toBe(0);
+  });
+
+  it("SURVIVOR GUARD — before.gateway = A_pruned (ALSO delete-pruned this run), override writes B (pruned): after is UNDEFINED (NOT restored to A_pruned), stamp cleared. This is the case that fails if you blindly mirror proxy's unconditional restore (kills restoring a prior gateway that is itself being pruned — which would re-create the plan/apply mismatch)", () => {
+    const gwPriorPruned = prunedGateway("gw-a", "device:gwa"); // A_pruned — delete-pruned this run
+    const gwNewPruned = prunedGateway("gw-b", "device:gwb"); // B — delete-pruned this run
+    const s = ownedServer(
+      { ipmiGatewayServerId: "gw-a" },
+      { externalId: "device:1", templated: { ipmiGatewayServerId: "gw-a" } }
+    );
+    const t = template({ ipmiGatewayServerId: { mode: "override", value: "gw-b" } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule(t.id)] }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // both gwa + gwb devices absent
+      servers: [s, gwPriorPruned, gwNewPruned],
+      templates: [t],
+      authProfiles: []
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "gw-a")).toBe(true);
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "gw-b")).toBe(true);
+    const sId = deterministicServerId("source-1", "device:1");
+    const after = afterFor(p, sId);
+    // The prior A_pruned is NOT a survivor → the guard drops rather than restores.
+    // `after.ipmiGatewayServerId` is always survivor-or-undefined post-reject.
+    if (after !== undefined) {
+      expect(after.ipmiGatewayServerId).toBeUndefined();
+      expect(after.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+    } else {
+      // Update may collapse to unchanged if before also had no other diff and
+      // before.gateway (gw-a) matches the dropped undefined... but before carried
+      // gw-a, so after (undefined) differs and the update is kept. Guard the branch
+      // regardless — the observable invariant is "never gw-a, never gw-b".
+      expect(after).toBeDefined();
+    }
+    // Neither pruned gateway is written anywhere in the plan's surviving adds/updates.
+    for (const rec of [...p.adds, ...p.updates.map((u) => u.after)]) {
+      expect(rec.ipmiGatewayServerId).not.toBe("gw-a");
+      expect(rec.ipmiGatewayServerId).not.toBe("gw-b");
+    }
+  });
+
+  it("NEGATIVE — a written gateway that SURVIVES is kept + stamped + provenance intact, no warning (regression: the reject pass must not touch a valid write)", () => {
+    const s = ownedServer({}, { externalId: "device:1" });
+    const t = template({ ipmiGatewayServerId: { mode: "fill", value: GW1.id } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule(t.id)] }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })],
+      servers: [s, GW1], // GW1 is a live bystander → survivor
+      templates: [t],
+      authProfiles: []
+    });
+    const sId = deterministicServerId("source-1", "device:1");
+    const after = afterFor(p, sId)!;
+    expect(after.ipmiGatewayServerId).toBe(GW1.id);
+    expect(after.origin?.templated?.ipmiGatewayServerId).toBe(GW1.id);
+    // provenance line for the survivor gateway is present.
+    expect(p.warnings.some((w) => /\bIPMI Gateway ←/.test(w))).toBe(true);
+    expect(p.warnings.some((w) => /was not applied/.test(w))).toBe(false);
+  });
+
+  it("NEGATIVE — a HAND-set gateway (no matching stamp) pointing at a pruned server is left alone (§8.4 — not this pass's job)", () => {
+    const gwPruned = prunedGateway("gw-b", "device:gwb");
+    // s carries gw-b as a HAND value (no origin.templated stamp for the gateway).
+    const s = ownedServer({ name: "old-name", ipmiGatewayServerId: "gw-b" }, { externalId: "device:1" });
+    // A template that writes some OTHER field so this is an update, but does NOT
+    // write the gateway → gateway is not in `ipmiGatewayTemplateNameByServerId`.
+    const t = template({ multiplexing: { mode: "fill", value: true } });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete", templateRules: [rule(t.id)] }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })],
+      servers: [s, gwPruned],
+      templates: [t],
+      authProfiles: []
+    });
+    const sId = deterministicServerId("source-1", "device:1");
+    const after = afterFor(p, sId)!;
+    expect(after).toBeDefined();
+    // Hand gateway untouched — reject pass is stamp-gated and template-write-gated.
+    expect(after.ipmiGatewayServerId).toBe("gw-b");
+    expect(p.warnings.some((w) => /was not applied/.test(w))).toBe(false);
   });
 });

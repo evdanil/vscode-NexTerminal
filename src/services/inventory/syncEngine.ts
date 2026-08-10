@@ -2717,38 +2717,21 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   for (const a of adds) {
     survivorIds.add(a.id);
   }
-  // PR-T3 review FIX 3 — SAME-SYNC-PRUNED IPMI GATEWAY survivor warning, mirroring
-  // the proxy survivor pass's warn shape. The §5.3 dangling check that ran during
-  // composition used the OPTIMISTIC `liveServerIds`, which still admits a gateway
-  // server this plan DELETE-prunes in the same run (sync-owned, its device gone this
-  // fetch): the plan then writes+stamps that gateway's id onto a target AND deletes
-  // the gateway, with zero warnings — a silent write-and-prune the user consents to
-  // blind. Decision (per spec): WARN ONLY, keep the write+stamp — the runtime
-  // tolerates a dangling gateway (resolves to local + `noGatewayFallbackNote`) and an
-  // override template edit can later reclaim it; the defect is the SILENT consent,
-  // not the write. Scoped to gateways this run WROTE (`ipmiGatewayTemplateNameByServerId`),
-  // so a retained (row-5) gateway is out of scope, exactly as the proxy part-1 pass
-  // owns only written proxies. Deduped by message via `pushDedupTemplateWarning`.
-  const warnGatewayPruned = (record: ServerConfig): void => {
-    const gw = record.ipmiGatewayServerId;
-    if (gw === undefined || survivorIds.has(gw)) {
-      return; // gateway survives (or none written) — nothing to warn
-    }
-    const name = ipmiGatewayTemplateNameByServerId.get(record.id) ?? "?";
-    pushDedupTemplateWarning(
-      `Device template "${name}" on "${source.name}" set an IPMI gateway on "${record.name}" whose gateway server will not survive this sync (it is being pruned) — the gateway will not resolve until it is reclaimed.`
-    );
-  };
-  for (const a of adds) {
-    if (ipmiGatewayTemplateNameByServerId.has(a.id)) {
-      warnGatewayPruned(a);
-    }
-  }
-  for (const u of updates) {
-    if (ipmiGatewayTemplateNameByServerId.has(u.after.id)) {
-      warnGatewayPruned(u.after);
-    }
-  }
+  // PR-T3 review round 3 (Codex) — the FIX-3 warn-only gateway survivor pass that
+  // once sat HERE has been REPLACED by a REJECT pass and RELOCATED below, right
+  // after the proxy update loop and before the shared `collapsedIds` splice, so a
+  // gateway-only revert collapses to UNCHANGED through the same machinery the proxy
+  // reject feeds. See `rejectWrittenGateway` / `warnWrittenGateway` further down.
+  // Why the change: FIX-3 chose "warn only, keep the write" for a same-sync-pruned
+  // IPMI gateway — the plan kept `after.ipmiGatewayServerId = B` + its stamp + a §3.4
+  // provenance line and merely warned. But `NexusCore.applyInventorySyncPlan` upserts
+  // the record (with gateway B) and THEN calls `clearGatewayReferencesTo(deletedIds)`
+  // (which, since round-1 FIX B, also wipes the templated stamp) — so B and its stamp
+  // are erased the instant they land. The plan preview + provenance line therefore
+  // promised a mutation that never survives, and the warning's "remains until it is
+  // reclaimed" was false. Aligning the plan with application means the plan's `after`
+  // must equal the post-apply state: a non-survivor written gateway is REJECTED, its
+  // stamp collapsed, its provenance dropped — exactly like the proxy part-1 pass.
   // PR-T2 review (B2) — a proxy the survivor pass drops or restores did NOT flow
   // from this run's template onto the record, so its §3.4 provenance line must go
   // with it, or the consent report would claim a value flow the plan simultaneously
@@ -2759,10 +2742,27 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       delete entry.provenance.proxy;
     }
   };
+  // PR-T3 review round 3 — mirror of `dropProxyProvenance` for the gateway field. A
+  // gateway the reject pass drops (or restores) did NOT flow from this run's template
+  // onto the record, so its §3.4 provenance line must go with it — otherwise the
+  // consent report would render a gateway flow the plan simultaneously says was "not
+  // applied". (The round-2 fix made gateway provenance render, so dropping it here is
+  // what removes the line for a not-applied gateway.)
+  const dropGatewayProvenance = (serverId: string): void => {
+    const entry = provenanceByServer.get(serverId);
+    if (entry !== undefined) {
+      delete entry.provenance.ipmiGatewayServerId;
+    }
+  };
   // PR-T2 review (B1) — deduped by `server::jumpHost`, SHARED across part 1 (this
   // run's WRITTEN proxies) and part 2 (RETAINED proxies), so a single record is
   // never warned about twice for the same dangling jump host.
   const warnedRetainedProxyKeys = new Set<string>();
+  // PR-T3 review round 3 — a SEPARATE dedup set for gateway warnings, keyed by
+  // `${record.id}::${gatewayId}`. Proxy and gateway keys share the same shape but
+  // name different reference kinds; a separate set removes any chance of a
+  // cross-field key collision suppressing a legitimate second warning.
+  const warnedRetainedGatewayKeys = new Set<string>();
 
   // PART 1 (PR-T2 review, B1) — per-record survivor validation of the proxies THIS
   // RUN's matrix WROTE. GENERALIZES the round-6 baseline-catch-all pass: every add
@@ -2888,6 +2888,109 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
     }
   }
+
+  // PR-T3 review round 3 (Codex) — SAME-SYNC-PRUNED IPMI GATEWAY reject pass, the
+  // exact analogue of the proxy part-1 pass above for the single-id
+  // `ipmiGatewayServerId` field. It is RELOCATED here (from where FIX-3's warn-only
+  // pass used to sit, above `survivorIds`) so it feeds the SAME `collapsedIds` splice
+  // the proxy update loop feeds: a gateway-only revert that makes `after` byte-equal
+  // to `before` collapses to UNCHANGED, keeping the plan counts exact.
+  //
+  // WHY REJECT, NOT WARN-ONLY: `applyInventorySyncPlan` upserts the record and THEN
+  // `clearGatewayReferencesTo(deletedIds)` wipes any gateway ref (and, since round-1
+  // FIX B, its templated stamp) that names a delete-pruned server. A written gateway
+  // B that is delete-pruned this run is therefore erased the instant it lands, so the
+  // plan's `after.ipmiGatewayServerId` must equal that post-apply state — a survivor
+  // or `undefined`, never a doomed B. Keeping B (the old FIX-3 decision) made the plan
+  // preview and the §3.4 provenance line promise a mutation that never survives.
+  //
+  // THE ONE DELIBERATE DIVERGENCE FROM PROXY — SURVIVOR-GUARDED RESTORE: proxy
+  // restores the prior value A UNCONDITIONALLY on a rejected override MOVE. Gateway
+  // must NOT: `clearGatewayReferencesTo` force-clears ANY gateway ref in
+  // `deletedServerIds`, so restoring a prior gateway that is ITSELF being pruned would
+  // just re-create the very plan/apply mismatch this fix removes. The guard
+  // (`survivorIds.has(priorGateway)`) restores the prior gateway only when it will
+  // still exist after apply; otherwise it drops to `undefined`. This guarantees
+  // `after.ipmiGatewayServerId` is always a survivor-or-`undefined` — byte-identical
+  // to the post-apply state. Scoped to gateways this run WROTE
+  // (`ipmiGatewayTemplateNameByServerId`), so a retained (row-5, not-written-this-run)
+  // gateway and a HAND-set gateway (no matching stamp, §8.4) are left untouched.
+  const rejectWrittenGateway = (after: ServerConfig, before: ServerConfig | undefined): string | undefined => {
+    const gw = after.ipmiGatewayServerId;
+    const stampedGw = after.origin?.templated?.ipmiGatewayServerId;
+    if (
+      gw === undefined ||
+      stampedGw === undefined ||
+      stampedGw !== gw || // §8.4 — template-OWNED only; a hand-set gateway is left alone
+      gw === after.id || // self is always a survivor (FIX 2 skips self at composition; defensive)
+      survivorIds.has(gw)
+    ) {
+      return undefined; // not a written template gateway this pass must reject
+    }
+    const danglingGatewayId = gw;
+    const priorGateway = before?.ipmiGatewayServerId; // A_live on a row-3 override MOVE; undefined on a row-1 write
+    const priorStamp = before?.origin?.templated?.ipmiGatewayServerId;
+    if (priorGateway !== undefined && survivorIds.has(priorGateway)) {
+      // Row-5 carry of a STILL-VALID prior gateway on a row-3 override MOVE. The guard
+      // is what distinguishes this from proxy: a prior gateway that is itself pruned is
+      // NOT restored (see the divergence note above) — it falls through to the drop.
+      after.ipmiGatewayServerId = priorGateway;
+    } else {
+      delete after.ipmiGatewayServerId; // nothing valid prior → absent (never a written `undefined`)
+    }
+    const origin = after.origin;
+    if (origin?.templated !== undefined) {
+      const templated = { ...origin.templated };
+      if (priorGateway !== undefined && survivorIds.has(priorGateway) && priorStamp !== undefined) {
+        templated.ipmiGatewayServerId = priorStamp; // stamp follows the restored value
+      } else {
+        delete templated.ipmiGatewayServerId;
+      }
+      // Same `templatedHasAnyStamp` collapse the proxy reject uses: an emptied bag
+      // collapses to `undefined`, while a still-valid `ipmiAuthProfileId`/proxy/other
+      // stamp is preserved.
+      after.origin = { ...origin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+    }
+    // The template's NEW gateway B did not flow onto this record — strip its §3.4 line.
+    dropGatewayProvenance(after.id);
+    return danglingGatewayId;
+  };
+  const warnWrittenGateway = (record: ServerConfig, gatewayId: string): void => {
+    const warnKey = `${record.id}::${gatewayId}`;
+    if (warnedRetainedGatewayKeys.has(warnKey)) {
+      return;
+    }
+    warnedRetainedGatewayKeys.add(warnKey);
+    const name = ipmiGatewayTemplateNameByServerId.get(record.id) ?? "?";
+    warnings.push(
+      `Device template "${name}" on "${source.name}" set an IPMI gateway on "${record.name}" whose gateway server will not survive this sync (it is being pruned) — the template's new IPMI gateway was not applied.`
+    );
+  };
+  for (const a of adds) {
+    if (!ipmiGatewayTemplateNameByServerId.has(a.id)) {
+      continue; // this run wrote no gateway on this add
+    }
+    const rejectedGateway = rejectWrittenGateway(a, undefined);
+    if (rejectedGateway !== undefined) {
+      warnWrittenGateway(a, rejectedGateway);
+    }
+  }
+  for (const u of updates) {
+    if (!ipmiGatewayTemplateNameByServerId.has(u.after.id)) {
+      continue; // this run wrote no gateway on this update — a retained gateway is out of scope
+    }
+    const rejectedGateway = rejectWrittenGateway(u.after, u.before);
+    if (rejectedGateway !== undefined) {
+      warnWrittenGateway(u.after, rejectedGateway);
+      // Same no-op collapse the proxy update loop feeds: a gateway-only revert makes
+      // `after` byte-equal to `before` (`updateStillChanged` lists `ipmiGatewayServerId`
+      // via FIX 4) → the update collapses to UNCHANGED through the shared splice below.
+      if (!updateStillChanged(u.before, u.after)) {
+        collapsedIds.add(u.before.id);
+      }
+    }
+  }
+
   if (collapsedIds.size > 0) {
     for (let i = updates.length - 1; i >= 0; i--) {
       if (collapsedIds.has(updates[i].before.id)) {
