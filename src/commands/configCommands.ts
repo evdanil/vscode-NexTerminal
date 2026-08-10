@@ -1799,6 +1799,26 @@ export function registerConfigCommands(
       return { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
     };
 
+    /**
+     * The NEW ids of the servers that SURVIVE import — the server analogue of
+     * `importedProfileIds`, and the lens the IPMI gateway link passes through (see
+     * `linkToImportedServer` below). Built in FULL before any gateway link is
+     * finalized so a FORWARD reference (target A whose gateway B sits LATER in the
+     * `servers` array) still resolves: the gate is "B survived import", never "B was
+     * added before A was reached".
+     *
+     * Computing the set up front is sound because `validateServerConfig`'s verdict
+     * turns only on a server's OWN fields (id/name/host/port/username/authType and
+     * the shapes of a handful of optionals) — never on whether its references
+     * resolve, and in particular NOT on the VALUE of `ipmiGatewayServerId` (every
+     * non-empty string and `undefined` passes identically). So a server's survival
+     * is fixed before its gateway link is, and gating that link cannot change which
+     * servers survive. Each remapped server is built ONCE here (proxy, profile links
+     * and origin already remapped, gateway raw-remapped through `idMap`) and that
+     * exact shape validated; the finalize loop below only narrows the gateway field.
+     */
+    const remappedServers: ServerConfig[] = [];
+    const importedServerIds = new Set<string>();
     for (const server of servers) {
       let remappedProxy = server.proxy;
       if (remappedProxy?.type === "ssh") {
@@ -1859,14 +1879,44 @@ export function registerConfigCommands(
         ipmiAuthProfileId: linkToImportedProfile(server.ipmiAuthProfileId),
         // The IPMI gateway link is a SERVER-LIST reference, not a profile one, so
         // it remaps through the same `idMap` as `proxy.jumpHostId` (server half) —
-        // NOT `linkToImportedProfile`. Dropped to `undefined` when the gateway is
-        // not in the bundle, mirroring `proxy.jumpHostId`'s out-of-set disposition
-        // and the export side: the sender's id would otherwise ride in stale.
+        // NOT `linkToImportedProfile`. Raw-remapped here; FINALIZED below once the
+        // full surviving-server set is known (`linkToImportedServer`), because a
+        // raw remap alone keeps a fresh id even for a gateway that failed import.
         ipmiGatewayServerId: server.ipmiGatewayServerId ? (idMap.get(server.ipmiGatewayServerId) ?? undefined) : undefined,
         origin: remapOriginStamp(server.origin),
         formerlySynced: undefined
       };
-      tally(await addIfValid(remappedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
+      remappedServers.push(remappedServer);
+      if (validateServerConfig(remappedServer)) {
+        importedServerIds.add(remappedServer.id);
+      }
+    }
+
+    /**
+     * The gateway link's analogue of `linkToImportedProfile`, one bucket over: the
+     * IPMI gateway is a SERVER-LIST reference, so it remaps through `idMap` (the
+     * server half, like `proxy.jumpHostId`) — but the raw remap alone is not
+     * enough. `idMap` is filled for EVERY incoming server in the first pass, before
+     * a single one is validated, so `idMap.get(gatewayId)` returns a fresh id even
+     * when the referenced gateway FAILED `validateServerConfig` and was skipped —
+     * the target would then persist a fresh id no imported server holds (still
+     * dangling), and because the server and profile halves SHARE `idMap`, a
+     * malformed/hand-crafted payload whose gateway id equals a profile id could even
+     * resolve cross-namespace to a profile's new id. Keep it ONLY when the remapped
+     * id is in the surviving-server set; `undefined` for anything else — gateway
+     * absent from the bundle, rejected on import, or a cross-bucket id collision.
+     * `undefined` reads as "the BMC is reachable locally", exactly as
+     * `resolveIpmiGatewayServer` already treats a dangling id at the run site.
+     */
+    const linkToImportedServer = (remapped: string | undefined): string | undefined =>
+      remapped !== undefined && importedServerIds.has(remapped) ? remapped : undefined;
+
+    for (const remappedServer of remappedServers) {
+      const finalizedServer: ServerConfig = {
+        ...remappedServer,
+        ipmiGatewayServerId: linkToImportedServer(remappedServer.ipmiGatewayServerId)
+      };
+      tally(await addIfValid(finalizedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
     for (const tunnel of tunnels) {
       ensureId(tunnel as unknown as Record<string, unknown>);

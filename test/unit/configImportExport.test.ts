@@ -3348,6 +3348,91 @@ describe("share import", () => {
   });
 
   /**
+   * Issue #48 PR-C / PR #65 Codex review round 2 — the gateway analogue of the
+   * auth-profile "rejected record must leave no dangling reference" test. Round 1
+   * remapped `ipmiGatewayServerId` through `idMap`, but `idMap` is filled for EVERY
+   * incoming server before validation, so the remap "succeeds" (a fresh id) even
+   * when the referenced gateway FAILED `validateServerConfig` and was skipped — the
+   * imported target then persists a fresh id no imported server holds, still
+   * dangling, and `resolveIpmiGatewayServer` silently treats it as no-gateway. This
+   * drives the real import path with a valid target A whose gateway B is rejected
+   * (empty `host`, which `validateServerConfig` refuses) and asserts A's link is
+   * CLEARED — not left holding B's fresh, unpersisted id.
+   *
+   * Falsifier: under HEAD 0c185bc, A keeps `idMap.get("src-B")` (a fresh UUID),
+   * so `target.ipmiGatewayServerId` is a defined string that resolves to nothing.
+   */
+  it("share import clears a server's ipmiGatewayServerId when the gateway server was REJECTED on import (kills remapping through the id map alone, which hands the target a fresh id for a gateway that was never persisted)", async () => {
+    await core.addOrUpdateServer(makeServer({ id: "local-1", name: "Local A" }));
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({ id: "src-A", name: "Target", ipmiGatewayServerId: "src-B" }),
+        // Empty `host` — a shape `validateServerConfig` rejects (isNonEmptyString),
+        // reachable only from a hand-edited file, which is exactly why the target
+        // it is named by must not be stranded with a dead link.
+        makeServer({ id: "src-B", name: "Bastion", host: "" })
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/ipmi-gateway-rejected.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    // The premise, proven not assumed: the gateway really was rejected.
+    expect(snapshot.servers.some((s) => s.name === "Bastion")).toBe(false);
+    const target = snapshot.servers.find((s) => s.name === "Target")!;
+    // …and the target survived, but with no dangling link. Under HEAD 0c185bc this
+    // holds a fresh UUID for the gateway that was thrown away.
+    expect(target).toBeDefined();
+    expect(target.ipmiGatewayServerId).toBeUndefined();
+    // No imported server anywhere claims the (would-be) remapped id.
+    expect(snapshot.servers.some((s) => s.ipmiGatewayServerId !== undefined)).toBe(false);
+  });
+
+  /**
+   * Issue #48 PR-C / PR #65 Codex review round 2 — the guard against the fix
+   * OVER-dropping. The surviving-server set must be complete before any gateway
+   * link is finalized, so a FORWARD reference — target A whose gateway B sits LATER
+   * in the `servers` array, both valid — must still link to the imported B. A gate
+   * of "already imported at the point A is processed" would wrongly clear this.
+   * (The round-1 remap test already covers the gateway-BEFORE-target order.)
+   */
+  it("share import keeps a FORWARD ipmiGatewayServerId reference (gateway appears AFTER the target in the array, both valid) so the fix does not over-drop valid links", async () => {
+    await core.addOrUpdateServer(makeServer({ id: "local-1", name: "Local A" }));
+    await core.addOrUpdateServer(makeServer({ id: "local-2", name: "Local B" }));
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        // Target FIRST, gateway SECOND — the forward-reference order.
+        makeServer({ id: "src-A", name: "Target", ipmiGatewayServerId: "src-B" }),
+        makeServer({ id: "src-B", name: "Bastion" })
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/ipmi-gateway-forward.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.name === "Target")!;
+    const gateway = snapshot.servers.find((s) => s.name === "Bastion")!;
+
+    expect(target.ipmiGatewayServerId).toBe(gateway.id);
+    expect(target.ipmiGatewayServerId).not.toBe("src-B"); // the share path's fresh id
+    expect(snapshot.servers.some((s) => s.id === target.ipmiGatewayServerId)).toBe(true);
+  });
+
+  /**
    * REVIEW FINDING (P2) — the share path's half of "a rejected record must not
    * leave references pointing at nothing". `importShareData` assigns every auth
    * profile a fresh id in its FIRST pass, before anything is validated, then remaps
