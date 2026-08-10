@@ -5985,6 +5985,137 @@ describe("backup export round-trip", () => {
     expect(s1?.origin?.syncedAuthProfileId).toBe("ap-ok");
   });
 
+  /**
+   * Issue #48 PR-C / PR #65 Codex review round 3 — the BACKUP-import analogue of
+   * the round-2 share test "rejected gateway leaves no dangling link". The backup
+   * path preserves ids (no remap), so a target keeps its `ipmiGatewayServerId`
+   * verbatim; when the referenced gateway server FAILS `validateServerConfig` it
+   * is never persisted, and the round-2 share fix does not cover this path. The
+   * post-import server sweep must clear the dangling gateway link exactly as it
+   * clears dangling auth-profile links.
+   *
+   * Falsifier: under HEAD a9c3d5b the backup sweep has no gateway clause, so A
+   * keeps "B" — a defined id that resolves to nothing.
+   */
+  it("import clears a dangling ipmiGatewayServerId when the gateway server FAILS validation on backup import (kills the verbatim id-preserving spread that strands the target with a dead jump-host link)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const importData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({ id: "A", name: "Target", ipmiGatewayServerId: "B" }),
+        // Empty `host` — a shape `validateServerConfig` rejects (isNonEmptyString),
+        // so the gateway is never persisted and A's verbatim link dangles.
+        makeServer({ id: "B", name: "Bastion", host: "" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import-gw-rejected.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" });
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    // The premise, proven not assumed: the gateway really was rejected.
+    expect(snapshot.servers.some((s) => s.id === "B")).toBe(false);
+    const target = snapshot.servers.find((s) => s.id === "A")!;
+    // …and the target survived, but with no dangling link.
+    expect(target).toBeDefined();
+    expect(target.ipmiGatewayServerId).toBeUndefined();
+    expect(snapshot.servers.some((s) => s.ipmiGatewayServerId !== undefined)).toBe(false);
+  });
+
+  it("import KEEPS a valid ipmiGatewayServerId on backup import — the gateway server imports too, so the link resolves (guards against over-sweeping)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    const importData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [
+        makeServer({ id: "A", name: "Target", ipmiGatewayServerId: "B" }),
+        makeServer({ id: "B", name: "Bastion" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import-gw-valid.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" });
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.id === "A")!;
+    // Both imported, id-preserving, so the link is live.
+    expect(target.ipmiGatewayServerId).toBe("B");
+    expect(snapshot.servers.some((s) => s.id === "B")).toBe(true);
+  });
+
+  it("import KEEPS an ipmiGatewayServerId that names a PRE-EXISTING local server on merge — its id is in the post-import server set, so it must not be swept", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+
+    // A gateway that already lives on this machine — NOT in the payload.
+    await core.addOrUpdateServer(makeServer({ id: "local-gw", name: "Local Bastion" }));
+
+    const importData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer({ id: "A", name: "Target", ipmiGatewayServerId: "local-gw" })],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    };
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/import-gw-local.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Merge", value: "merge" });
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.id === "A")!;
+    // The gateway resolves against a pre-existing local server, so the link stays.
+    expect(target.ipmiGatewayServerId).toBe("local-gw");
+    expect(snapshot.servers.some((s) => s.id === "local-gw")).toBe(true);
+  });
+
   it("import clears a dangling authProfileId on an inventory source when the profile is not imported", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();

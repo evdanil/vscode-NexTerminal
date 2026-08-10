@@ -2143,6 +2143,7 @@ export function registerConfigCommands(
     // Clear dangling authProfileId references
     const postImportSnapshot = core.getSnapshot();
     const knownProfileIds = new Set(postImportSnapshot.authProfiles.map((p) => p.id));
+    const knownServerIds = new Set(postImportSnapshot.servers.map((s) => s.id));
     for (const server of postImportSnapshot.servers) {
       // Captured as a local so the stamp comparisons below keep narrowing
       // `origin`/`formerlySynced`: `x?.stamp === <string>` proves the container
@@ -2155,10 +2156,18 @@ export function registerConfigCommands(
       // can carry either, both, or two different profiles — so it is swept on
       // its own terms rather than as a rider on the SSH clear.
       const ipmiDangles = Boolean(server.ipmiAuthProfileId) && !knownProfileIds.has(server.ipmiAuthProfileId!);
-      if (sshDangles || ipmiDangles) {
+      // The BMC jump-host link dangles independently of the auth links — it is a
+      // server-list reference (checked against `knownServerIds`, NOT
+      // `knownProfileIds`) that has no auth stamp, so it never touches the
+      // origin/formerlySynced clears below. A self-referencing gateway keeps its
+      // own id in `knownServerIds`, so it is not swept here; the runtime self-ref
+      // guard in `resolveIpmiGatewayServer` handles that case.
+      const gatewayDangles = Boolean(server.ipmiGatewayServerId) && !knownServerIds.has(server.ipmiGatewayServerId!);
+      if (sshDangles || ipmiDangles || gatewayDangles) {
         const cleared: ServerConfig = { ...server };
         if (sshDangles) cleared.authProfileId = undefined;
         if (ipmiDangles) cleared.ipmiAuthProfileId = undefined;
+        if (gatewayDangles) cleared.ipmiGatewayServerId = undefined;
         // Same rule as NexusCore.removeAuthProfile: the inventory sync's record
         // that IT applied this profile (origin.syncedAuthProfileId) dies with the
         // link it describes. Left behind, it would read as a per-server opt-out —
