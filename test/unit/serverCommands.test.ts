@@ -1023,6 +1023,20 @@ describe("formValuesToServer — BMC fields (issue #48 PR-B)", () => {
   });
 });
 
+describe("formValuesToServer — altHost (issue #48)", () => {
+  const base = { name: "Test", host: "example.com", port: 22, username: "root", authType: "password" };
+
+  it("stores a trimmed altHost and treats blank/whitespace as none", () => {
+    expect(formValuesToServer({ ...base, altHost: "2001:db8::1" })!.altHost).toBe("2001:db8::1");
+    expect(formValuesToServer({ ...base, altHost: "  2001:db8::1  " })!.altHost).toBe("2001:db8::1");
+    // Blank / all-whitespace must canonicalize to undefined, or it would read as
+    // "set" here and as "not set" in the connect-fallback (which trims first).
+    expect(formValuesToServer({ ...base, altHost: "" })!.altHost).toBeUndefined();
+    expect(formValuesToServer({ ...base, altHost: "   " })!.altHost).toBeUndefined();
+    expect(formValuesToServer(base)!.altHost).toBeUndefined();
+  });
+});
+
 describe("formValuesToServer with proxy", () => {
   it("includes proxy config in server when present", () => {
     const server = formValuesToServer({

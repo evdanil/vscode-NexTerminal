@@ -595,9 +595,13 @@ describe("createNetboxProvider", () => {
           { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv4" },
           { apiToken: "tok" }
         );
-        expect(tree.devices[0].endpoints).toContainEqual({ kind: "ssh", host: "10.0.0.5", port: 22 });
-        // Must NOT have taken the IPv6 primary_ip.
-        expect(tree.devices[0].endpoints).not.toContainEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
+        // ALTERNATE HOST (issue #48, Phase 2) — the v6 is no longer DROPPED; it
+        // becomes the ALTERNATE (second) ssh endpoint. What "prefer-ipv4" still
+        // guarantees is that the PRIMARY (first) ssh endpoint is the v4, so the
+        // ordering is the assertion rather than the mere presence/absence of v6.
+        const ssh = tree.devices[0].endpoints.filter((e) => e.kind === "ssh");
+        expect(ssh[0]).toEqual({ kind: "ssh", host: "10.0.0.5", port: 22 });
+        expect(ssh[1]).toEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
       });
 
       it("prefer-ipv6 takes primary_ip6 (kills a fixed primary_ip read)", async () => {
@@ -662,6 +666,120 @@ describe("createNetboxProvider", () => {
           { apiToken: "tok" }
         );
         expect(tree.devices[0].endpoints).toContainEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
+      });
+    });
+
+    /**
+     * ALTERNATE HOST (issue #48, Phase 2) — the NON-PREFERRED IP family address
+     * is emitted as a SECOND ssh endpoint AFTER the primary. THE ENDPOINT
+     * CONVENTION: the first ssh endpoint is the primary host; the second ssh
+     * endpoint is the alternate. The sync engine's `selectAltEndpoint` maps the
+     * second onto `ServerConfig.altHost`. Only present, CIDR-stripped-non-empty
+     * addresses DISTINCT from the primary become an alternate — a single-IP
+     * device gets none. Every fixture is built so the WRONG family (or a
+     * missing/duplicate alternate) produces a visibly different endpoint list.
+     */
+    describe("alternate host — second ssh endpoint (Phase 2)", () => {
+      const bothFamilies = {
+        id: 1,
+        name: "dual-stack",
+        primary_ip: { address: "2001:db8::5/64" }, // NetBox's primary_ip yields IPv6 when both exist
+        primary_ip4: { address: "10.0.0.5/24" },
+        primary_ip6: { address: "2001:db8::5/64" }
+      };
+      const fetchOne = (row: unknown) => vi.fn(async () => makeResponse(200, { count: 1, results: [row] }));
+      const sshEndpoints = (tree: { devices: { endpoints: { kind: string }[] }[] }) =>
+        tree.devices[0].endpoints.filter((e) => e.kind === "ssh");
+
+      it("prefer-ipv4 emits [ssh v4, ssh v6] — primary v4, alternate the non-preferred v6 (kills no-alternate, and kills emitting the alt in the wrong order)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv4" },
+          { apiToken: "tok" }
+        );
+        expect(sshEndpoints(tree)).toEqual([
+          { kind: "ssh", host: "10.0.0.5", port: 22 },
+          { kind: "ssh", host: "2001:db8::5", port: 22 }
+        ]);
+      });
+
+      it("prefer-ipv6 emits [ssh v6, ssh v4] — primary v6, alternate the non-preferred v4 (kills reading the SAME family for both, which would emit no alternate)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv6" },
+          { apiToken: "tok" }
+        );
+        expect(sshEndpoints(tree)).toEqual([
+          { kind: "ssh", host: "2001:db8::5", port: 22 },
+          { kind: "ssh", host: "10.0.0.5", port: 22 }
+        ]);
+      });
+
+      it("auto emits [ssh primary_ip, ssh other-family] — the alternate is the family field that DIFFERS from primary_ip (kills an auto path that emits primary_ip twice or picks the same-family field)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+        // primary_ip is the v6 here, so the alternate is the v4 (the concrete
+        // opposite family), never a second copy of the v6 primary.
+        expect(sshEndpoints(tree)).toEqual([
+          { kind: "ssh", host: "2001:db8::5", port: 22 },
+          { kind: "ssh", host: "10.0.0.5", port: 22 }
+        ]);
+      });
+
+      it("auto with primary_ip == the v4 puts the v6 as the alternate (kills an auto rule hard-wired to one family instead of 'the one that differs from host')", async () => {
+        const v4Primary = {
+          id: 2,
+          name: "v4-primary",
+          primary_ip: { address: "10.0.0.5/24" }, // primary_ip IS the v4 this time
+          primary_ip4: { address: "10.0.0.5/24" },
+          primary_ip6: { address: "2001:db8::5/64" }
+        };
+        const provider = createNetboxProvider(fetchOne(v4Primary) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+        expect(sshEndpoints(tree)).toEqual([
+          { kind: "ssh", host: "10.0.0.5", port: 22 },
+          { kind: "ssh", host: "2001:db8::5", port: 22 }
+        ]);
+      });
+
+      it("a single-IP device gets NO second ssh endpoint (kills always-emitting an alternate, which would put an empty or duplicate host on the tree)", async () => {
+        const single = { id: 3, name: "single", primary_ip: { address: "10.0.0.7/24" } };
+        for (const family of ["auto", "prefer-ipv4", "prefer-ipv6"]) {
+          const provider = createNetboxProvider(fetchOne(single) as unknown as typeof fetch);
+          const tree = await provider.fetchInventory(
+            { baseUrl: "https://netbox.local", primaryIpFamily: family },
+            { apiToken: "tok" }
+          );
+          expect(sshEndpoints(tree)).toEqual([{ kind: "ssh", host: "10.0.0.7", port: 22 }]);
+        }
+      });
+
+      it("an alternate address EQUAL to the primary emits no second endpoint (kills dropping the `!== host` guard, which would emit a redundant duplicate ssh endpoint)", async () => {
+        // primary_ip4 and primary_ip6 carry the same address (after CIDR strip),
+        // so under prefer-ipv4 the alternate (v6) equals the primary (v4).
+        const sameBothFamilies = {
+          id: 4,
+          name: "same-addr",
+          primary_ip: { address: "10.0.0.9/24" },
+          primary_ip4: { address: "10.0.0.9/24" },
+          primary_ip6: { address: "10.0.0.9/32" }
+        };
+        const provider = createNetboxProvider(fetchOne(sameBothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv4" },
+          { apiToken: "tok" }
+        );
+        expect(sshEndpoints(tree)).toEqual([{ kind: "ssh", host: "10.0.0.9", port: 22 }]);
+      });
+
+      it("the alternate is CIDR-stripped, same as the primary (kills emitting the raw `address` with its prefix)", async () => {
+        const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
+        const tree = await provider.fetchInventory(
+          { baseUrl: "https://netbox.local", primaryIpFamily: "prefer-ipv4" },
+          { apiToken: "tok" }
+        );
+        // 2001:db8::5/64 -> 2001:db8::5, never the raw slashed form.
+        expect(sshEndpoints(tree)[1]).toEqual({ kind: "ssh", host: "2001:db8::5", port: 22 });
       });
     });
 

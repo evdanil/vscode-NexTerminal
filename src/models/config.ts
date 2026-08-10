@@ -183,6 +183,43 @@ export interface ServerOrigin {
    */
   syncedIpmiHost?: string;
   /**
+   * ALTERNATE HOST (issue #48, Phase 2) — the alternate SSH address the sync
+   * itself last WROTE into `altHost` — the non-preferred-IP-family address the
+   * provider supplied as of that write (for NetBox, the OTHER family's
+   * `primary_ip*` — see `readAlternateAddress`), and `undefined` when the sync
+   * wrote none.
+   *
+   * A FAITHFUL TWIN OF `syncedIpmiHost` above, and it exists for the identical
+   * reason: `altHost` shipped as a HAND-EDITED field in Phase 1, before any sync
+   * could write it, so "device always wins" would clobber every early adopter's
+   * manual second address on the first post-upgrade sync — and a device with no
+   * second family address at all would read as "this field should be empty". The
+   * stamp records what the SYNC put there, so the sync only ever fills an
+   * untouched field or overwrites one still carrying exactly its own last value;
+   * a hand-typed value (no stamp, or a stamp the value no longer equals) is left
+   * alone, and so is a value whose device merely stopped reporting a second
+   * address this fetch.
+   *
+   * Written ONLY where the sync writes `altHost` — the add path always
+   * (`undefined` included, so a source whose devices gain a second family
+   * address later finds the stamps already there), the update path only when the
+   * write rule fires — plus the ONE stamp-only case (matrix row 5a) and never
+   * inferred from the record's current value alone. The write rule and the whole
+   * 6-row + 5a matrix are `syncOwnsAltHost` in the sync engine, which references
+   * `syncOwnsIpmiHost`'s matrix VERBATIM (cur = `altHost`, stamp =
+   * `syncedAltHost`, alt = this fetch's alternate host) — every clause, the
+   * stamp-only row 5a residual and the cleared-value row 2 opt-out included,
+   * applies unchanged.
+   *
+   * Optional for backward compat, exactly like `syncedIpmiHost`: servers synced
+   * by a build before this field existed have none, and — for the same asymmetry
+   * against `syncedUsername` — absent means HANDS-OFF rather than "eligible":
+   * there is no source-level default alternate host to fall back to, so a record
+   * carrying an `altHost` with NO stamp is a hand entry and is never overwritten,
+   * unless that value is the device's own current alternate address (row 5a).
+   */
+  syncedAltHost?: string;
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — per-field record of what the sync's
    * TEMPLATE APPLICATION last wrote onto this server, one member per
    * non-auth templatable field. Same `syncedUsername`/`syncedAuthProfileId`
@@ -377,6 +414,29 @@ export interface DetachedServerOrigin {
    */
   syncedIpmiHost?: string;
   /**
+   * ALTERNATE HOST (issue #48, Phase 2) — the alternate address the REMOVED
+   * SOURCE'S SYNC had last written into `altHost` on this server, copied
+   * verbatim from the server's own `ServerOrigin.syncedAltHost` at detach time,
+   * and `undefined` when that sync had written none.
+   *
+   * A FAITHFUL TWIN of `syncedIpmiHost` beside it, preserved for the identical
+   * reason and against the identical failure: it is the only record of whether
+   * the `altHost` the server still carries was the SYNC'S doing or the USER'S,
+   * and the write rule (`syncOwnsAltHost`) is decided on precisely that
+   * distinction. Dropped here, Remove Source → Keep Servers → re-add → Adopt
+   * would strip the origin and restore no alternate-host stamp, so an adopted
+   * server's sync-written second address would arrive looking hand-typed (matrix
+   * row 5) and the sync could never update it again — permanently, and silently,
+   * for a value the sync itself had put there.
+   *
+   * Optional and restored, never invented: adoption copies it back into the new
+   * `origin`, and a marker that carries none restores none — bit-identical to a
+   * server the sync never wrote a second address on. Nothing clears it, exactly
+   * like `syncedIpmiHost`: an address names no other record, so it cannot dangle
+   * when something else is deleted.
+   */
+  syncedAltHost?: string;
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — the per-field record of what the
    * REMOVED SOURCE'S TEMPLATE APPLICATION last wrote onto this server's
    * template-managed fields (proxy / booleans / the two IPMI id references,
@@ -439,6 +499,28 @@ export interface ServerConfig {
   group?: string;
   host: string;
   port: number;
+  /**
+   * ALTERNATE HOST (issue #48) — an OPTIONAL, ADDITIVE second SSH address tried
+   * as a fallback when the primary `host` is unreachable at the TCP/DNS level
+   * (unreachable / refused / timed out / name-resolution failure). Family-agnostic:
+   * it is any address — typically the IPv6 to the primary's IPv4 or vice-versa —
+   * and "preferred" is simply whichever address the user (or a later sync) put in
+   * `host`. The connect-fallback lives in `SshPty.start` (services/ssh/sshPty.ts):
+   * it retries against this address exactly once, and ONLY on a connection-level
+   * failure — never on auth / host-key / key / proxy failures, which would just
+   * re-fail on the other address and risk extra credential prompts.
+   *
+   * SCOPE IN v1 is the SSH TERMINAL target host ONLY. It is NOT read by the
+   * IPMI/BMC path (that is `ipmiHost`, a different address for a different
+   * purpose), and NOT by tunnels or jump-hosts, which stay on the primary `host`.
+   * A future phase may auto-populate it from an inventory sync's secondary
+   * primary-IP; nothing here reads or writes it from sync yet.
+   *
+   * Optional and additive, like every other field added after 1.0 — records
+   * written by older builds have none, and older builds round-trip it untouched
+   * (servers are stored as whole objects under `nexus.servers`).
+   */
+  altHost?: string;
   username: string;
   authType: AuthType;
   keyPath?: string;
@@ -656,7 +738,7 @@ export function templatedHasAnyStamp(templated: ServerOrigin["templated"]): bool
 /**
  * Every member of ServerOrigin EXCEPT `syncedAt` — i.e. the ownership key plus
  * the stamps the sync writes as decision INPUTS for its own next run
- * (`syncedUsername`, `syncedAuthProfileId`, `syncedIpmiHost`).
+ * (`syncedUsername`, `syncedAuthProfileId`, `syncedIpmiHost`, `syncedAltHost`).
  *
  * Exists for computeSyncPlan's `changed` check, which must be able to ask "did
  * this sync compute a stamp the record does not already carry?" without asking
@@ -693,6 +775,15 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // that server permanently stampless, i.e. read as a hand entry by every
     // later sync and never updated when the BMC is re-addressed.
     a.syncedIpmiHost === b.syncedIpmiHost &&
+    // ALTERNATE HOST (issue #48, Phase 2) — the `altHost` stamp joins for the
+    // same reason the `ipmiHost` one above it does, and AUTH 3a's shape reaches
+    // it identically: a server whose device supplies an alternate address EQUAL
+    // to the value the record already carries computes this stamp for the first
+    // time (matrix row 5a) and changes nothing else, and an `after` discarded as
+    // "unchanged" there would throw the new stamp away — leaving that server
+    // permanently stampless, read as a hand entry by every later sync and never
+    // updated when the second address changes.
+    a.syncedAltHost === b.syncedAltHost &&
     // DEVICE TEMPLATES (PR-T1) — the per-field template stamps join for the
     // same reason: a template application whose value already equals the
     // record must still land in `updates` to persist the stamp (AUTH 3a's
@@ -707,7 +798,7 @@ function serverOriginsEqual(a: ServerOrigin | undefined, b: ServerOrigin | undef
   if (a === b) return true;
   if (!a || !b) return false;
   // Every member of ServerOrigin is compared, the `syncedUsername` /
-  // `syncedAuthProfileId` / `syncedIpmiHost` stamps included: they are what the
+  // `syncedAuthProfileId` / `syncedIpmiHost` / `syncedAltHost` stamps included: they are what the
   // retro-apply and OOB write rules read, so an origin that differs only there
   // is a materially different record. Leaving any of them out would let the
   // rollback merge in mergeServerConfigFields call two origins "equal" and drop
@@ -765,6 +856,13 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // restore the forgetful one, and the adopted server's BMC address would be
     // back to looking hand-typed, which no later sync can repair.
     a.syncedIpmiHost === b.syncedIpmiHost &&
+    // ALTERNATE HOST (issue #48, Phase 2) — compared one field down for the
+    // identical reason `syncedIpmiHost` above it is: a rollback that called two
+    // markers equal while one remembers the alternate address the removed source
+    // wrote and the other does not would restore the forgetful one, and the
+    // adopted server's second address would be back to looking hand-typed, which
+    // no later sync can repair.
+    a.syncedAltHost === b.syncedAltHost &&
     // DEVICE TEMPLATES (issue #48 PR-T1) — the template receipt joins for the
     // identical reason `syncedAuthProfileId` and `syncedIpmiHost` above it did:
     // a rollback that called two markers equal while one remembers the non-auth
@@ -796,6 +894,7 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.group === b.group &&
     a.host === b.host &&
     a.port === b.port &&
+    a.altHost === b.altHost &&
     a.username === b.username &&
     a.authType === b.authType &&
     a.keyPath === b.keyPath &&
@@ -844,6 +943,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.group !== batchSnapshot.group) merged.group = current.group;
   if (current.host !== batchSnapshot.host) merged.host = current.host;
   if (current.port !== batchSnapshot.port) merged.port = current.port;
+  if (current.altHost !== batchSnapshot.altHost) merged.altHost = current.altHost;
   if (current.username !== batchSnapshot.username) merged.username = current.username;
   if (current.authType !== batchSnapshot.authType) merged.authType = current.authType;
   if (current.keyPath !== batchSnapshot.keyPath) merged.keyPath = current.keyPath;

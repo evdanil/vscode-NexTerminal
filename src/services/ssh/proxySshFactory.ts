@@ -126,7 +126,23 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     }
 
     this.assertNoCircularProxyChain(jumpServer, nextVisited);
-    const jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage);
+    // ALTERNATE HOST (issue #48, PR #67 Codex round 2) — tag a jump-host CONNECTION
+    // failure with jump-host provenance so `classifySshConnectionError` labels it
+    // `proxy` instead of the raw `tcp`/`dns` of the underlying socket error. The SSH
+    // terminal's alternate-host fallback (`SshPty`) excludes the `proxy` stage, so it
+    // will NOT retry the target's `altHost` through a jump host that is itself
+    // unreachable — both attempts would traverse the same failed hop, wasting a retry
+    // and, for unsaved credentials, repeating the pre-connect prompt. A failure that
+    // reaches the TARGET transport (below, through an established tunnel) keeps its own
+    // `tcp`/`dns` stage and still triggers the fallback, which correctly re-dials the
+    // target's alternate address VIA the (working) jump host.
+    let jumpConnection: SshConnection;
+    try {
+      jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Jump host connection failed (${jumpServer.name}): ${detail}`);
+    }
 
     // Each auth attempt gets its own TCP tunnel through the jump host.
     const sockFactory = async (): Promise<Duplex> => {
@@ -169,23 +185,40 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     let lastSock: net.Socket | undefined;
 
     const sockFactory = async (): Promise<net.Socket> => {
-      const { socket } = await SocksClient.createConnection({
-        proxy: {
-          host: proxy.host,
-          port: proxy.port,
-          type: 5,
-          ...(proxy.username && {
-            userId: proxy.username,
-            password: proxyPassword ?? ""
-          })
-        },
-        command: "connect",
-        destination: {
-          host: target.host,
-          port: target.port
-        },
-        timeout: this.proxyTimeoutMs
-      });
+      let socket: net.Socket;
+      try {
+        ({ socket } = await SocksClient.createConnection({
+          proxy: {
+            host: proxy.host,
+            port: proxy.port,
+            type: 5,
+            ...(proxy.username && {
+              userId: proxy.username,
+              password: proxyPassword ?? ""
+            })
+          },
+          command: "connect",
+          destination: {
+            host: target.host,
+            port: target.port
+          },
+          timeout: this.proxyTimeoutMs
+        }));
+      } catch (error) {
+        // ALTERNATE HOST (issue #48, PR #67 Codex round 4) — a failure ESTABLISHING the
+        // SOCKS proxy tunnel (proxy unreachable/refused, or the proxy cannot reach the
+        // target) is a PROXY-stage failure, not a target `tcp`/`dns` one. SocksClient
+        // surfaces raw `ECONNREFUSED`/`ETIMEDOUT` with no "proxy"/"socks" text, which the
+        // reordered `classifySshConnectionError` (concrete errno BEFORE the broad proxy
+        // keyword — round 3 P2a) would otherwise label `tcp`, causing `SshPty` to retry
+        // the target's `altHost` through the SAME failed proxy (futile, and repeats the
+        // proxy/password prompt). Tag it with the structured "Proxy connection failed"
+        // marker so it classifies `proxy` (fallback excluded), mirroring the jump-host
+        // wrap in connectViaSshJump. Target SSH-handshake failures happen AFTER this
+        // sockFactory resolves and keep their own true stage.
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Proxy connection failed (socks5 ${proxy.host}:${proxy.port}): ${detail}`);
+      }
 
       // The socks library schedules setImmediate(() => socket.resume()) after the
       // SOCKS5 handshake completes. If there's any async gap before ssh2 takes the
@@ -229,14 +262,29 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     let lastSock: net.Socket | undefined;
 
     const sockFactory = async (): Promise<net.Socket> => {
-      const socket = await this.httpConnectHandshake(
-        proxy.host,
-        proxy.port,
-        target.host,
-        target.port,
-        proxy.username,
-        proxyPassword
-      );
+      let socket: net.Socket;
+      try {
+        socket = await this.httpConnectHandshake(
+          proxy.host,
+          proxy.port,
+          target.host,
+          target.port,
+          proxy.username,
+          proxyPassword
+        );
+      } catch (error) {
+        // ALTERNATE HOST (issue #48, PR #67 Codex round 4) — see the SOCKS wrap in
+        // connectViaSocks5. `httpConnectHandshake` rejects with "HTTP CONNECT proxy
+        // error: connect ECONNREFUSED …" when the proxy socket is unreachable; the
+        // reordered classifier matches that concrete `econnrefused` BEFORE the broad
+        // proxy keyword and would label it `tcp`, wrongly triggering the target
+        // `altHost` retry through the same dead proxy. Tag proxy-tunnel-establishment
+        // failures with the structured "Proxy connection failed" marker so they
+        // classify `proxy` (fallback excluded). Target SSH-handshake failures happen
+        // after this resolves and are unaffected.
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Proxy connection failed (http ${proxy.host}:${proxy.port}): ${detail}`);
+      }
       lastSock = socket;
       return socket;
     };

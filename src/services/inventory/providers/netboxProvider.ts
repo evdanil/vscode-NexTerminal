@@ -123,6 +123,52 @@ function readPrimaryAddress(obj: Record<string, unknown>, family: PrimaryIpFamil
   return primary;
 }
 
+/**
+ * ALTERNATE HOST (issue #48, Phase 2) — reads the NON-PREFERRED IP-family
+ * address off a device row, the counterpart of `readPrimaryAddress` above, from
+ * the SAME `primary_ip4` / `primary_ip6` fields (no new API call). Returned
+ * CIDR-stripped, or `undefined` when the device offers no usable second address.
+ *
+ * The rule (user-confirmed, issue #48):
+ *  - `prefer-ipv4` → primary is `primary_ip4`, so the alternate is `primary_ip6`.
+ *  - `prefer-ipv6` → primary is `primary_ip6`, so the alternate is `primary_ip4`.
+ *  - `auto` → primary is NetBox's own `primary_ip`, so the alternate is the OTHER
+ *    family field — whichever of `primary_ip4`/`primary_ip6` differs from the
+ *    primary host. Both are considered in order and the first that differs wins,
+ *    which lands on `primary_ip4` when `primary_ip` is the v6 and on
+ *    `primary_ip6` when it is the v4 — the concrete opposite family in each case.
+ *
+ * Only a present, `stripCidr`-non-empty address that is DISTINCT from
+ * `primaryHost` is an alternate: a single-IP device (or one whose family fields
+ * collapse to the same address the primary already carries) gets none, so no
+ * spurious second SSH endpoint is emitted. `oob_ip` is a single field with no
+ * family siblings and is UNAFFECTED — the family preference governs only the SSH
+ * primary/alternate pair, exactly as the `oob_ip` block in `mapEntry` documents.
+ */
+function readAlternateAddress(obj: Record<string, unknown>, family: PrimaryIpFamily, primaryHost: string): string | undefined {
+  const addressOf = (key: string): unknown => {
+    const field = obj[key] as { address?: unknown } | null | undefined;
+    return field && typeof field === "object" ? field.address : undefined;
+  };
+  const usableAddress = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
+  const v4 = addressOf("primary_ip4");
+  const v6 = addressOf("primary_ip6");
+  // The candidate family field(s), in priority order. A `prefer-*` source has an
+  // explicit non-preferred family; `auto` has none, so it considers both and
+  // takes the first that differs from the primary host (see the rule above).
+  const candidates: unknown[] = family === "prefer-ipv4" ? [v6] : family === "prefer-ipv6" ? [v4] : [v4, v6];
+  for (const candidate of candidates) {
+    if (!usableAddress(candidate)) {
+      continue;
+    }
+    const host = stripCidr(candidate);
+    if (host.length > 0 && host !== primaryHost) {
+      return host;
+    }
+  }
+  return undefined;
+}
+
 /** "10.0.0.5/24" -> "10.0.0.5"; "2001:db8::5/64" -> "2001:db8::5". */
 export function stripCidr(address: string): string {
   const slash = address.lastIndexOf("/");
@@ -641,9 +687,23 @@ function mapEntry(
   const usable = Boolean(name) && typeof address === "string" && address.length > 0;
   const vars = kind === "device" ? deviceVars(obj) : vmVars(obj);
   const folderPath = renderFolderTemplate(template, vars);
-  const endpoints: InventoryDevice["endpoints"] = usable
-    ? [{ kind: "ssh", host: stripCidr(address as string), port: 22 }]
-    : [];
+  const primaryHost = usable ? stripCidr(address as string) : undefined;
+  const endpoints: InventoryDevice["endpoints"] = primaryHost !== undefined ? [{ kind: "ssh", host: primaryHost, port: 22 }] : [];
+  // ALTERNATE HOST (issue #48, Phase 2) — the NON-PREFERRED IP-family address is
+  // emitted as a SECOND `kind: "ssh"` endpoint AFTER the primary one. THE ENDPOINT
+  // CONVENTION (see models/inventory.ts): the FIRST ssh endpoint is the primary
+  // host; the SECOND ssh endpoint is the alternate host. The sync engine's
+  // `selectSshEndpoint` maps the first onto `ServerConfig.host` and
+  // `selectAltEndpoint` maps the second onto `ServerConfig.altHost`. Only emitted
+  // when a primary exists (an alternate with no primary would be meaningless) and
+  // when `readAlternateAddress` finds one that is present, CIDR-stripped-non-empty
+  // and DISTINCT from the primary. The `oob_ip` → redfish block below is untouched.
+  if (primaryHost !== undefined) {
+    const altHost = readAlternateAddress(obj, primaryIpFamily, primaryHost);
+    if (altHost !== undefined) {
+      endpoints.push({ kind: "ssh", host: altHost, port: 22 });
+    }
+  }
   // Out-of-band management address, read with the same defensive shape as
   // `primary_ip` and from the same rows the pagination already fetches (no new
   // API call, no new config field). DEVICES ONLY — NetBox VMs have no `oob_ip`,

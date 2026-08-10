@@ -9,9 +9,14 @@ export type InventoryEndpointKind = "ssh" | "redfish" | "url" | "ipmi-sol";
  * kind === "ssh" onto `ServerConfig.host`/`port`, and the FIRST with kind
  * "redfish" or "ipmi-sol" onto `ServerConfig.ipmiHost` (see
  * `selectManagementEndpoint` in services/inventory/syncEngine.ts, and the stamp
- * rules on `ServerOrigin.syncedIpmiHost`). All other kinds — and extra
- * endpoints of either group — are accepted, preserved on the tree, and
- * otherwise unused.
+ * rules on `ServerOrigin.syncedIpmiHost`).
+ *
+ * ALTERNATE HOST (issue #48, Phase 2) — the SECOND endpoint with kind === "ssh"
+ * carries the ALTERNATE host, mapped onto `ServerConfig.altHost` by
+ * `selectAltEndpoint` (with the `ServerOrigin.syncedAltHost` stamp rule twinning
+ * `syncedIpmiHost`'s). THE CONVENTION: first ssh = primary host, second ssh =
+ * alternate host. All other kinds — and any THIRD-or-later ssh endpoint — are
+ * accepted, preserved on the tree, and otherwise unused.
  */
 export interface InventoryEndpoint {
   kind: InventoryEndpointKind;

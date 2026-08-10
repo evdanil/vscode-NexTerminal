@@ -296,6 +296,33 @@ describe("ProxySshFactory", () => {
     expect(connection).toBeDefined();
   });
 
+  it("wraps a jump-host CONNECTION failure with jump-host provenance so it classifies as `proxy`, not `tcp` (PR #67 round 2)", async () => {
+    const jumpServer = makeServer({ id: "srv-jump", name: "Jump Host", host: "jump.example.com" });
+    const targetServer = makeServer({ proxy: { type: "ssh", jumpHostId: "srv-jump" } });
+    servers.set("srv-jump", jumpServer);
+
+    // The jump host itself is unreachable — the connect to it rejects with a RAW
+    // socket error carrying no proxy/jump context.
+    authFactory.connect = vi.fn(async (server: ServerConfig) => {
+      if (server.id === "srv-jump") {
+        throw Object.assign(new Error("connect ECONNREFUSED 10.9.9.9:22"), { code: "ECONNREFUSED" });
+      }
+      return makeFakeConnection();
+    });
+    const factory = await createFactory();
+
+    // Against the pre-fix code the raw ECONNREFUSED propagated verbatim (→ classifies
+    // `tcp` → the SshPty altHost fallback would retry through the same dead jump host).
+    await expect(factory.connect(targetServer)).rejects.toThrow(/Jump host connection failed/);
+
+    const { classifySshConnectionError } = await import("../../src/services/ssh/connectionDiagnostics");
+    expect(
+      classifySshConnectionError(
+        new Error("Jump host connection failed (Jump Host): connect ECONNREFUSED 10.9.9.9:22")
+      ).stage
+    ).toBe("proxy");
+  });
+
   it("threads context.onAuthMessage into authFactory.connect when server has no proxy", async () => {
     const factory = await createFactory();
     const server = makeServer();
@@ -381,6 +408,53 @@ describe("ProxySshFactory", () => {
       sockFactory: expect.any(Function),
       onAuthMessage
     });
+  });
+
+  it("wraps a SOCKS5 proxy-tunnel failure with proxy provenance so it classifies `proxy`, not `tcp` (PR #67 round 4)", async () => {
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080 } });
+    const socksMod = await import("socks");
+    // The proxy socket itself is refused — SocksClient surfaces a RAW errno with no
+    // "proxy"/"socks" text. Against the pre-fix code this propagated verbatim, so the
+    // reordered classifier (concrete errno before the broad proxy keyword) labelled it
+    // `tcp` and the SshPty altHost fallback would retry through the same dead proxy.
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
+      Object.assign(new Error("connect ECONNREFUSED 203.0.113.5:1080"), { code: "ECONNREFUSED" })
+    );
+
+    const factory = await createFactory();
+    await expect(factory.connect(server)).rejects.toThrow(/Proxy connection failed/);
+
+    const { classifySshConnectionError } = await import("../../src/services/ssh/connectionDiagnostics");
+    expect(
+      classifySshConnectionError(
+        new Error("Proxy connection failed (socks5 proxy.local:1080): connect ECONNREFUSED 203.0.113.5:1080")
+      ).stage
+    ).toBe("proxy");
+  });
+
+  it("wraps an HTTP CONNECT proxy-tunnel failure with proxy provenance so it classifies `proxy`, not `tcp` (PR #67 round 4)", async () => {
+    const server = makeServer({ proxy: { type: "http", host: "proxy.local", port: 8080 } });
+    // The proxy socket errors: httpConnectHandshake rejects with
+    // "HTTP CONNECT proxy error: connect ECONNREFUSED …". The reordered classifier
+    // matches the concrete `econnrefused` before the broad proxy keyword, so without
+    // the round-4 wrap this classifies `tcp` and the fallback would fire.
+    const socket = createMockHttpSocket();
+    await mockNetCreateConnectionWithSocket(socket);
+
+    const factory = await createFactory();
+    const pending = factory.connect(server);
+    // Once the CONNECT request is written, emit a socket error to fail the tunnel.
+    await waitForSocketWrite(socket as any);
+    socket.emitError(Object.assign(new Error("connect ECONNREFUSED 203.0.113.5:8080"), { code: "ECONNREFUSED" }));
+
+    await expect(pending).rejects.toThrow(/Proxy connection failed/);
+
+    const { classifySshConnectionError } = await import("../../src/services/ssh/connectionDiagnostics");
+    expect(
+      classifySshConnectionError(
+        new Error("Proxy connection failed (http proxy.local:8080): HTTP CONNECT proxy error: connect ECONNREFUSED 203.0.113.5:8080")
+      ).stage
+    ).toBe("proxy");
   });
 
   it("connects through SSH jump host", async () => {

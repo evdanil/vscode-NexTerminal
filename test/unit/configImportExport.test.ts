@@ -820,6 +820,26 @@ describe("config import command (legacy)", () => {
     expect(snapshot.servers[0].origin).toBeUndefined();
   });
 
+  it("ALTERNATE HOST (issue #48, Phase 2) — a synced server with `altHost` + `origin.syncedAltHost` survives an export→import round-trip, stamp and value intact (kills an `isValidServerOrigin` that rejects the new stamp, which would strip the WHOLE origin and lose sync ownership of the field)", () => {
+    // A well-formed synced server carrying both the value and the sync's stamp.
+    const synced = {
+      ...makeServer(),
+      altHost: "2001:db8::1",
+      origin: { sourceId: "src1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    };
+    const exportData = makeExportData({ servers: [synced], tunnels: [], serialProfiles: [] });
+    return runImport(exportData, "merge").then(() => {
+      const snapshot = core.getSnapshot();
+      expect(snapshot.servers).toHaveLength(1);
+      const s = snapshot.servers[0];
+      // The value rides through untouched (a bare address, no id to remap)...
+      expect(s.altHost).toBe("2001:db8::1");
+      // ...and the origin is NOT stripped — the stamp survives so the next sync
+      // still owns the field (matrix row 3, not a misread row 5 hand entry).
+      expect(s.origin?.syncedAltHost).toBe("2001:db8::1");
+    });
+  });
+
   /**
    * ADOPT 1 — the same import-boundary disposition for `formerlySynced`, the
    * "Keep Servers" receipt the sync engine's adoption rule matches on. A backup

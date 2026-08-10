@@ -98,8 +98,8 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
   if (obj.templated !== undefined && !isValidTemplatedStamps(obj.templated)) {
     return false;
   }
-  // `syncedInstanceKey`, `syncedUsername`, `syncedAuthProfileId` and
-  // `syncedIpmiHost` are optional
+  // `syncedInstanceKey`, `syncedUsername`, `syncedAuthProfileId`,
+  // `syncedIpmiHost` and `syncedAltHost` are optional
   // (absent on every server synced before each field existed) but shape-checked
   // like the rest:
   // this guard is the ONLY thing standing between a hand-edited backup /
@@ -127,7 +127,14 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     // with an empty host is not selected at all), and the server form stores a
     // cleared address as `undefined`, so an empty string could not have come
     // from either — it can only be a hand-edited backup or a version-skewed row.
-    isOptionalNonEmptyString(obj.syncedIpmiHost)
+    isOptionalNonEmptyString(obj.syncedIpmiHost) &&
+    // ALTERNATE HOST (issue #48, Phase 2) — the same tolerant optional-string
+    // check as `syncedIpmiHost` above, for the same reason: the sync writes this
+    // stamp only in the same breath as a non-empty `altHost` (an ssh endpoint
+    // with an empty host is never selected), and the server form stores a cleared
+    // alternate host as `undefined`, so an empty string could not have come from
+    // either — only a hand-edited backup or a version-skewed row.
+    isOptionalNonEmptyString(obj.syncedAltHost)
   );
 }
 
@@ -185,7 +192,13 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
  * restored into a real origin at adoption, where the write rule compares it
  * against the record's own field.
  *
- * DEVICE TEMPLATES (issue #48 PR-T1) — `templated` is the fourth optional
+ * ALTERNATE HOST (issue #48, Phase 2) — `syncedAltHost` is the fourth optional
+ * member, on exactly the terms of `syncedIpmiHost` above: the detach copies it
+ * from the origin and a source that had written no second address leaves nothing
+ * to copy, so absent is the ordinary case. PRESENT it must be a non-empty string,
+ * exactly as `isValidServerOrigin` checks the origin stamp it mirrors.
+ *
+ * DEVICE TEMPLATES (issue #48 PR-T1) — `templated` is the fifth optional
  * member, on the same terms and with the same disposition as its sibling on the
  * live origin: the detach copies it from `origin.templated` and a source that
  * applied no proxy/boolean template leaves nothing to copy, so absent is the
@@ -206,6 +219,15 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
     return false;
   }
   if (obj.syncedIpmiHost !== undefined && !isNonEmptyString(obj.syncedIpmiHost)) {
+    return false;
+  }
+  // ALTERNATE HOST (issue #48, Phase 2) — the third scalar receipt, on the same
+  // terms and with the same disposition as `syncedIpmiHost` above: the detach
+  // copies it from the origin, a source that had written no second address leaves
+  // nothing to copy (so absent is the ordinary case), and PRESENT it must be a
+  // non-empty string — restored into a real origin at adoption where the write
+  // rule compares it against the record's own field.
+  if (obj.syncedAltHost !== undefined && !isNonEmptyString(obj.syncedAltHost)) {
     return false;
   }
   if (obj.templated !== undefined && !isValidTemplatedStamps(obj.templated)) {
@@ -286,6 +308,16 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   // can arrive from a backup import written by anything, so the substitution
   // site is the chokepoint that actually holds.
   if (obj.ipmiHost !== undefined && typeof obj.ipmiHost !== "string") {
+    return false;
+  }
+  // ALTERNATE HOST (issue #48) — the same tolerant TYPE check as `ipmiHost`
+  // above, for the same reasons: reject a shape no writer of ours produces, but
+  // never a merely untidy value. An empty or whitespace `altHost` reads
+  // identically to absent at the connect-fallback site (`SshPty.start` trims and
+  // treats blank as "no alternate host"), so it is tolerated here exactly as the
+  // form normalizes empty → undefined on save. Not required — a server without a
+  // second address must still validate.
+  if (obj.altHost !== undefined && typeof obj.altHost !== "string") {
     return false;
   }
   // Same shape check as `authProfileId` above — it is the same kind of value (a

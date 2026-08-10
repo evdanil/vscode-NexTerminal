@@ -250,6 +250,34 @@ function selectSshEndpoint(device: InventoryDevice) {
 }
 
 /**
+ * ALTERNATE HOST (issue #48, Phase 2) — selects the endpoint the sync maps to
+ * `ServerConfig.altHost`: the first non-empty ssh endpoint whose host DIFFERS
+ * from the primary ssh endpoint's host.
+ *
+ * THE CONVENTION (models/inventory.ts): the FIRST ssh endpoint is the primary
+ * host — `selectSshEndpoint` above — and the alternate is the next one carrying
+ * a genuinely different address. The provider (netboxProvider.ts) emits the
+ * second ssh endpoint only when the alternate address is present,
+ * CIDR-stripped-non-empty and DISTINCT from the primary, so a single-IP device
+ * has no second ssh endpoint and this returns `undefined`.
+ *
+ * REVIEW FIX (issue #48, M3a) — the distinctness check is enforced HERE rather
+ * than merely "the SECOND ssh endpoint". `computeSyncPlan` (~1110) RELIES on
+ * this selector never handing it an `altHost` equal to the primary `host`; the
+ * old `[1]`-after-filter would hand back a self-duplicate whenever a third-party
+ * provider emitted two IDENTICAL ssh endpoints (`[A, A, …]` → `A`), persisting a
+ * dangling `altHost === host` the connect-fallback would have to guard away. The
+ * natural meaning of "alternate" is "an address that is not the primary", so we
+ * take the first ssh host that actually differs from `selectSshEndpoint`'s. A
+ * THIRD-or-later distinct ssh endpoint is still accepted on the tree and left
+ * unused (this returns the first differing one), per the model doc.
+ */
+function selectAltEndpoint(device: InventoryDevice) {
+  const primary = selectSshEndpoint(device);
+  return device.endpoints.find((e) => e.kind === "ssh" && e.host.length > 0 && e.host !== primary?.host);
+}
+
+/**
  * Selects the endpoint the sync maps to `ServerConfig.ipmiHost`: the FIRST
  * endpoint with kind "redfish" or "ipmi-sol" and a non-empty host.
  *
@@ -377,6 +405,45 @@ function syncOwnsIpmiHost(current: string | undefined, stamp: string | undefined
   // 2's cleared-forever opt-out survives a user who empties the field to `""`.
   const cur = current !== undefined && current.trim() === "" ? undefined : current;
   return cur === stamp || cur === oob;
+}
+
+/**
+ * ALTERNATE HOST (issue #48, Phase 2) — may this sync WRITE `ServerConfig.altHost`
+ * on an existing owned server? A FAITHFUL TWIN of `syncOwnsIpmiHost` above:
+ * byte-identical logic, and governed by THE SAME 6-row + 5a matrix documented
+ * there — read it VERBATIM with `cur` = `ownedServer.altHost`, `stamp` =
+ * `origin.syncedAltHost`, `alt` = this fetch's alternate host. Every clause
+ * transfers unchanged:
+ *  1. cur ABSENT (undefined OR blank), stamp unset, alt present → WRITE + stamp.
+ *  2. cur unset, stamp set (user CLEARED a synced value), alt present → LEAVE
+ *     (the per-server opt-out).
+ *  3. cur === stamp, alt different → WRITE + re-stamp.
+ *  4. cur ≠ stamp (a hand edit), alt present → LEAVE, carry the stamp; never
+ *     laundered into the stamp.
+ *  5. cur set, stamp unset (a Phase-1 hand entry) → LEAVE; absent stamp is NOT
+ *     "the sync owns this".
+ *  5a. cur === alt (whatever the stamp) → the value already IS the device's
+ *     alternate, so nothing is written but the STAMP is recorded (a stamp-only
+ *     change). Row 2 stays unreachable from here — `alt` is non-empty by
+ *     selection, so a cleared `cur` can never equal it.
+ *  6. alt ABSENT this fetch → NEVER touch; carry the stamp (the caller's
+ *     `altHost !== undefined` guard).
+ *
+ * WHY THIS DISCIPLINE AND NOT `host`/`port`'s: `altHost`, exactly like
+ * `ipmiHost`, shipped as a HAND-EDITED field before any sync could write it
+ * (Phase 1), so "device always wins" would clobber a manual second address and
+ * an absent alternate would read as "the field should be empty". The stamp
+ * records what the SYNC wrote; the sync writes only where the record still
+ * carries exactly that (or the device's current alternate — row 5a).
+ */
+function syncOwnsAltHost(current: string | undefined, stamp: string | undefined, alt: string): boolean {
+  // Blank/whitespace-only reads as absent, and the comparison is otherwise
+  // VERBATIM — the whole rationale (why `cur` is normalized on one side only and
+  // only for blankness, why the stamp needs no normalization, why a blank `cur`
+  // WITH a stamp survives row 2's opt-out) is `syncOwnsIpmiHost`'s, one function
+  // up. This is the same logic on the alternate-host triple.
+  const cur = current !== undefined && current.trim() === "" ? undefined : current;
+  return cur === stamp || cur === alt;
 }
 
 /**
@@ -1048,6 +1115,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
     }
 
+    // ALTERNATE HOST (issue #48, Phase 2) — the alternate SSH address this fetch
+    // offers for `ServerConfig.altHost`, or `undefined` when the device supplies
+    // none (matrix row 6 in `syncOwnsAltHost`). The SECOND ssh endpoint by the
+    // convention `selectAltEndpoint` documents. UNLIKE the out-of-band address
+    // above it needs NO address-shape validation here: it is an SSH host, and the
+    // provider has already CIDR-stripped it and guaranteed it differs from the
+    // primary — so it is handled exactly as the primary `endpoint.host` is (which
+    // this path never validates either).
+    const altEndpoint = selectAltEndpoint(device);
+    const altHost = altEndpoint?.host;
+
     // Folder resolution: device.folderPath is relative to source.targetFolder.
     let rel: string | undefined;
     if (device.folderPath) {
@@ -1190,6 +1268,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // `syncOwnsIpmiHost` for the write rule and the whole matrix.
       const takesIpmiHost =
         mgmtHost !== undefined && syncOwnsIpmiHost(ownedServer.ipmiHost, ownedServer.origin?.syncedIpmiHost, mgmtHost);
+      // ALTERNATE HOST (issue #48, Phase 2) — the twin decision for `altHost`,
+      // decided HERE for the same reason `takesIpmiHost` is: its stamp goes INTO
+      // the origin literal below, which the retro-apply / rollback branches
+      // rebuild. See `syncOwnsAltHost` for the write rule and the whole matrix.
+      const takesAltHost =
+        altHost !== undefined && syncOwnsAltHost(ownedServer.altHost, ownedServer.origin?.syncedAltHost, altHost);
       // DEVICE TEMPLATES (PR-T1) — the §4.3 matrix for the four non-auth fields.
       // `templateMatrix.templated` is the carried-forward stamp record with the
       // written fields updated (the one-line `templated:` carry-forward
@@ -1295,6 +1379,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // next sync refill the field they emptied. Carried forward as
         // `undefined` too, which is what keeps a Phase-1 hand entry hands-off.
         syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedServer.origin?.syncedIpmiHost,
+        // ALTERNATE HOST (issue #48, Phase 2) — the same "records what the sync
+        // wrote" discipline one field down: refreshed exactly where this sync
+        // writes `altHost` (the `takesAltHost` line below), and otherwise carried
+        // forward VERBATIM — including as `undefined`, which keeps a Phase-1 hand
+        // entry hands-off and a cleared-value opt-out (matrix row 2) cleared. The
+        // carry-forward is load-bearing for the reason `syncedIpmiHost`'s is: an
+        // update fired for an unrelated reason rebuilds this literal from scratch.
+        syncedAltHost: takesAltHost ? altHost : ownedServer.origin?.syncedAltHost,
         // DEVICE TEMPLATES (PR-T1) — the per-field template stamps, carried
         // forward with this run's writes already folded in by the matrix above.
         // The one-line carry-forward the whole feature turns on (§5.2 / fixture
@@ -1325,6 +1417,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
       if (takesIpmiHost) {
         after.ipmiHost = mgmtHost;
+      }
+      // ALTERNATE HOST (issue #48, Phase 2) — the value half of the decision
+      // stamped above, on exactly the rows `syncOwnsAltHost` answers yes for, so
+      // the record and its stamp can never disagree about who owns the field.
+      // A conditional assignment (not a member of the literal) so the `...ownedServer`
+      // spread preserves the value on the rows this must not touch.
+      if (takesAltHost) {
+        after.altHost = altHost;
       }
 
       // AUTH 2 — retro-apply. The single exception to the field-ownership rule
@@ -1570,6 +1670,36 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         bump(retainedByProfile, rolledBackProfileId);
       }
 
+      // ALTERNATE HOST (issue #48, M3b) — enforce the `altHost !== host` invariant
+      // `computeSyncPlan` claims (~1110). `selectAltEndpoint` (M3a) guarantees any
+      // value THIS sync WRITES already differs from the primary, so the only way
+      // `after` can leave here with `altHost === host` is the pure-carry route (b):
+      // a device that lost its second address family so the primary `host` flips to
+      // the value the CARRIED `altHost` was still holding (matrix row 6 carried the
+      // old alternate forward, and `endpoint.host` is now that same address). A
+      // dangling self-duplicate is not a value the sync should persist — drop it and
+      // clear its stamp so the record and its provenance agree the field is unset.
+      // Run AFTER the origin rebuilds above so the stamp clear survives them; the
+      // `ipmiHost` paths are deliberately untouched (they carry no such invariant).
+      // Self-healing: the run that regains a second family re-fills `altHost` as an
+      // ordinary row-1 write.
+      // PROVENANCE-GATED (PR #67 Codex round 1, P2) — drop ONLY a value the sync
+      // OWNS (`syncedAltHost === altHost`). A HAND-entered `altHost` that a device
+      // later reports as its new primary is NOT the sync's to delete: hand edits are
+      // untouched (the whole point of `syncOwnsAltHost`), and clearing it would
+      // permanently lose the user's fallback if the primary later flips back with no
+      // provider-supplied alternate. A hand value that happens to equal `host` stays;
+      // `SshPty` simply skips the redundant retry while it does.
+      if (
+        after.altHost !== undefined &&
+        after.altHost === after.host &&
+        after.origin !== undefined &&
+        after.origin.syncedAltHost === after.altHost
+      ) {
+        after.altHost = undefined;
+        after.origin = { ...after.origin, syncedAltHost: undefined };
+      }
+
       // AUTH 3 — authProfileId joins the comparison because a retro-apply stamp
       // can be the ONLY difference between `before` and `after` (the device
       // itself is usually identical on the sync that first carries a profile).
@@ -1619,6 +1749,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.group !== after.group ||
         ownedServer.authProfileId !== after.authProfileId ||
         ownedServer.ipmiHost !== after.ipmiHost ||
+        // ALTERNATE HOST (issue #48, Phase 2) — joins the value half for the same
+        // reason `ipmiHost` does (rows 1 and 3, the plainly-visible change); the
+        // stamp-only row 5a rides in on the `serverOriginStampsEqual` line below.
+        ownedServer.altHost !== after.altHost ||
         !proxyConfigsEqual(ownedServer.proxy, after.proxy) ||
         ownedServer.multiplexing !== after.multiplexing ||
         ownedServer.legacyAlgorithms !== after.legacyAlgorithms ||
@@ -1894,6 +2028,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesIpmiHost =
           mgmtHost !== undefined &&
           syncOwnsIpmiHost(adoptee.ipmiHost, adoptee.formerlySynced?.syncedIpmiHost, mgmtHost);
+        // ALTERNATE HOST (issue #48, Phase 2) — the twin decision on an adoptee,
+        // the same substitution the OOB one makes: the marker's receipt
+        // (`DetachedServerOrigin.syncedAltHost`) stands in for the origin stamp on
+        // a record this sync did not create. See `syncOwnsAltHost` for the matrix.
+        const takesAltHost =
+          altHost !== undefined &&
+          syncOwnsAltHost(adoptee.altHost, adoptee.formerlySynced?.syncedAltHost, altHost);
         // FIX 1 (PR #61 Codex review) — APPLY THE TEMPLATE MATRIX ON ADOPTION,
         // mirroring the update path (~1071). An adopted server is OWNED from this
         // point (the same principle the `endpoint.username` and OOB writes below
@@ -2042,6 +2183,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // and a device offering no OOB endpoint at all touches neither (row 6,
           // the `mgmtHost !== undefined` guard) — the receipt simply carries.
           syncedIpmiHost: takesIpmiHost ? mgmtHost : adoptee.formerlySynced?.syncedIpmiHost,
+          // ALTERNATE HOST (issue #48, Phase 2) — the same "records what the sync
+          // wrote" discipline as `syncedIpmiHost` above, applied to the adoptee:
+          // written from `altHost` exactly where THIS sync writes `altHost` (the
+          // conditional below the literal), and otherwise the marker's receipt
+          // RESTORED VERBATIM — including as `undefined`, which keeps a hand-typed
+          // alternate hands-off (matrix row 5). A marker carrying none is
+          // bit-identical to a server the sync never wrote a second address on.
+          syncedAltHost: takesAltHost ? altHost : adoptee.formerlySynced?.syncedAltHost,
           // FIX 1 — the per-field template stamps for the non-auth fields the
           // matrix above wrote onto this adoptee, folded into the origin literal
           // so the auth-branch rebuild (`{ ...adoptionOrigin, syncedAuthProfileId }`)
@@ -2110,6 +2259,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // what preserves the value on the rows this must not touch.
         if (takesIpmiHost) {
           after.ipmiHost = mgmtHost;
+        }
+        // ALTERNATE HOST (issue #48, Phase 2) — the value half of the alternate-host
+        // decision stamped above, written on exactly the rows `syncOwnsAltHost`
+        // answers yes for. Conditional (not in the literal) so the `...adoptee`
+        // spread preserves the value on the rows this must not touch.
+        if (takesAltHost) {
+          after.altHost = altHost;
         }
         // AUTH 2 on an adoptee, deliberately allowed. Blocking it for one sync
         // would only move the same disclosed switch to the next run — the server
@@ -2189,6 +2345,25 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           const names = overrideRefusedByProfile.get(authDecision.profileId) ?? [];
           names.push(device.name);
           overrideRefusedByProfile.set(authDecision.profileId, names);
+        }
+        // ALTERNATE HOST (issue #48, M3b) — the same `altHost !== host` invariant
+        // enforcement as the update path (~1660), applied to the adoptee. Adoption
+        // writes `host = endpoint.host` while carrying the adoptee's own `altHost`
+        // through the `...adoptee` spread, so the pure-carry route (b) can land an
+        // `altHost === host` here exactly as it can on an owned update. Drop the
+        // dangling self-duplicate and clear its stamp, AFTER the origin rebuilds
+        // above so the clear survives them; the `ipmiHost` path is untouched.
+        // PROVENANCE-GATED (PR #67 Codex round 1, P2) — same as the owned-update
+        // path: drop ONLY a sync-owned duplicate (`syncedAltHost === altHost`), never
+        // a hand-entered `altHost` the adoptee brought that now equals the primary.
+        if (
+          after.altHost !== undefined &&
+          after.altHost === after.host &&
+          after.origin !== undefined &&
+          after.origin.syncedAltHost === after.altHost
+        ) {
+          after.altHost = undefined;
+          after.origin = { ...after.origin, syncedAltHost: undefined };
         }
         // No `changed` comparison, unlike the owned-update path above: gaining
         // `origin` guarantees before !== after, so an adoption is ALWAYS an
@@ -2385,6 +2560,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // below records it so every LATER sync has the ownership question already
       // answered.
       ipmiHost: mgmtHost,
+      // ALTERNATE HOST (issue #48, Phase 2) — the device's alternate SSH address,
+      // or `undefined` when it supplies none. Same "a fresh record has nothing to
+      // protect, so no matrix" reasoning as `ipmiHost` above: whatever this fetch
+      // offers is the starting value, and the `syncedAltHost` stamp below records
+      // it so every LATER sync has the ownership question already answered.
+      altHost,
       // `syncedUsername` mirrors the `username` two lines above, and
       // `syncedAuthProfileId` mirrors the `authProfileId` above it — the values
       // this sync is writing onto the record, which is what makes a later
@@ -2421,6 +2602,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // which is the right state for a server the user has never typed into:
         // an add that supplies no address must not be mistaken for a hand entry.
         syncedIpmiHost: mgmtHost,
+        // ALTERNATE HOST (issue #48, Phase 2) — mirrors the `altHost` written
+        // above, recorded UNCONDITIONALLY (`undefined` included) on the same "a
+        // source whose devices gain a second address later must find the stamps
+        // already there" argument. A record born with neither value nor stamp is
+        // matrix row 1 (fill it in), which is the right state for a server the
+        // user has never typed a second address into.
+        syncedAltHost: altHost,
         // DEVICE TEMPLATES (PR-T1) — the template stamps for the non-auth fields
         // written above (row 1), so every LATER sync has the ownership question
         // already answered. Absent when the template set none of them.
@@ -2862,6 +3050,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     before.group !== after.group ||
     before.authProfileId !== after.authProfileId ||
     before.ipmiHost !== after.ipmiHost ||
+    // ALTERNATE HOST (issue #48, Phase 2) — symmetry with the mainline `changed`
+    // comparator, which lists `altHost` too; a value write without a stamp write
+    // would otherwise be silently collapsed here.
+    before.altHost !== after.altHost ||
     !proxyConfigsEqual(before.proxy, after.proxy) ||
     before.multiplexing !== after.multiplexing ||
     before.legacyAlgorithms !== after.legacyAlgorithms ||
