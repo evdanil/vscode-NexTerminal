@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { bindingToDisplayLabel } from "../macroBindings";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { TerminalMacro } from "../models/terminalMacro";
-import { macroRunTargetLabel, resolveMacroRunTarget } from "../models/terminalMacro";
+import { macroRunPlacementLabel, macroRunsOnGateway, resolveMacroRunTarget } from "../models/terminalMacro";
 import { getMacroFolders, getMacros, saveMacros } from "../macroSettings";
 import {
   findAmbiguousMacroStateKeys,
@@ -106,10 +106,15 @@ export class MacroTreeItem extends vscode.TreeItem {
 
     // Issue #48 — where it runs, when that is not the session. A macro that
     // opens a browser window or a local shell from a sidebar click is not the
-    // thing the rest of this row describes.
+    // thing the rest of this row describes. Route-aware (PR-C): a gateway-routed
+    // localTerminal macro runs on the target server's IPMI gateway, not this
+    // machine, so it reads "Runs on: the server's IPMI gateway …" rather than
+    // "Runs in: Local terminal" — the preposition follows the editor "Run on"
+    // select, and the placement label is shared with the pickers' badge.
     const runTarget = resolveMacroRunTarget(macro);
     if (runTarget !== "session") {
-      this.tooltip += `\nRuns in: ${macroRunTargetLabel(runTarget)}`;
+      const preposition = macroRunsOnGateway(macro) ? "Runs on" : "Runs in";
+      this.tooltip += `\n${preposition}: ${macroRunPlacementLabel(macro)}`;
     }
 
     // \u00a79.6 \u2014 names only; values do not exist at this point. Only names whose

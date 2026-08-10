@@ -483,6 +483,35 @@ export interface ServerConfig {
    * it; it is a fact about the hardware the user states once.
    */
   bmcWebProtocol?: BmcWebProtocol;
+  /**
+   * JUMP-HOST IPMI ROUTING (issue #48 PR-C) — "reach this server's BMC by
+   * running ipmitool on THAT server". An id reference into the same server list,
+   * exactly like `SshJumpProxy.jumpHostId`: it names another `ServerConfig` whose
+   * SSH session is where a gateway-routed macro's command actually runs, so
+   * ipmitool can reach a BMC management network that is not reachable from this
+   * machine.
+   *
+   * A TOPOLOGY FACT, NEVER A MODE. Setting it changes nothing on its own — unset
+   * means "the BMC is reachable locally" (today's behavior, unchanged), and every
+   * ordinary local macro on a gateway-configured server still runs locally. It
+   * only declares WHICH box to use when something opts into gateway routing: a
+   * macro with `route: "ipmiGateway"` (models/terminalMacro.ts) or
+   * `connectBmcSol` invoked against this server (commands/bmcCommands.ts). A
+   * server-level field must never redefine a macro-level contract, which is why
+   * routing is a per-macro opt-in rather than an automatic consequence of this
+   * field being present.
+   *
+   * SHARE-EXPORT MATERIAL. Because it is an id into the server list it must be
+   * remapped on `sanitizeForSharing` through the SAME `idMap` as
+   * `proxy.jumpHostId`, and dropped to `undefined` when the gateway server is not
+   * part of the bundle — an unset gateway ("reachable locally") is a safe working
+   * default on the recipient, while a stale id can only fail confusingly at run
+   * time.
+   *
+   * Optional and additive, like every other post-1.0 field — records written by
+   * older builds have none, and older builds round-trip it untouched.
+   */
+  ipmiGatewayServerId?: string;
   openFileExplorerOnFirstConnect?: boolean;
   proxy?: ProxyConfig;
   authProfileId?: string;  // references AuthProfile.id; credentials resolved at connection time
@@ -737,6 +766,7 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.ipmiHost === b.ipmiHost &&
     a.ipmiAuthProfileId === b.ipmiAuthProfileId &&
     a.bmcWebProtocol === b.bmcWebProtocol &&
+    a.ipmiGatewayServerId === b.ipmiGatewayServerId &&
     a.openFileExplorerOnFirstConnect === b.openFileExplorerOnFirstConnect &&
     a.authProfileId === b.authProfileId &&
     proxyConfigsEqual(a.proxy, b.proxy) &&
@@ -784,6 +814,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.ipmiHost !== batchSnapshot.ipmiHost) merged.ipmiHost = current.ipmiHost;
   if (current.ipmiAuthProfileId !== batchSnapshot.ipmiAuthProfileId) merged.ipmiAuthProfileId = current.ipmiAuthProfileId;
   if (current.bmcWebProtocol !== batchSnapshot.bmcWebProtocol) merged.bmcWebProtocol = current.bmcWebProtocol;
+  if (current.ipmiGatewayServerId !== batchSnapshot.ipmiGatewayServerId) merged.ipmiGatewayServerId = current.ipmiGatewayServerId;
   if (current.openFileExplorerOnFirstConnect !== batchSnapshot.openFileExplorerOnFirstConnect) {
     merged.openFileExplorerOnFirstConnect = current.openFileExplorerOnFirstConnect;
   }

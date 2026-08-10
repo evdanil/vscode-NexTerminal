@@ -3,7 +3,13 @@ import type { ServerConfig } from "../models/config";
 import { resolveBmcWebProtocol } from "../models/config";
 import { resolveProfileTokens } from "../services/profileTokens";
 import { profileTokenServer, resolveIpmiTerminalEnv } from "./ipmiCredentials";
-import { openServerAdvancedEdit, reportProfileTokenError, resolveMacroBrowserUrl } from "./serverMacroCommands";
+import {
+  openServerAdvancedEdit,
+  reportProfileTokenError,
+  resolveIpmiGatewayServer,
+  resolveMacroBrowserUrl,
+  resolveServerSessionTarget
+} from "./serverMacroCommands";
 import { pickServer, toServerFromArg } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -47,6 +53,17 @@ export const BMC_SOL_COMMAND =
   " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E sol activate\n";
 
 /**
+ * The SOL command line for the GATEWAY path (issue #48 PR-C, §3.6). `-a` instead
+ * of `-E`: env injection cannot cross to a remote shell, so ipmitool prompts for
+ * the password itself on the bastion tty (no echo, nothing stored) — the same
+ * shape as the shipped "IPMI SOL (via jump host)" template. NO `-E`, NO `-P`, and
+ * nothing about the secret ever reaches this string, so the §3.5 no-secret-in-
+ * `sendText` invariant holds on this path by construction.
+ */
+export const BMC_SOL_COMMAND_GATEWAY =
+  " ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -a sol activate\n";
+
+/**
  * The web-console URL template. The scheme is chosen by the server's
  * `bmcWebProtocol` through `resolveBmcWebProtocol()` and interpolated as one of
  * TWO known literals — never the stored string itself, which would let an
@@ -80,6 +97,69 @@ export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise
   const server = await resolveTargetServer(ctx, arg);
   if (!server) {
     return;
+  }
+
+  // JUMP-HOST IPMI ROUTING (issue #48 PR-C, §3.6). When the target names a
+  // reachable IPMI gateway, this command honors it exactly as a
+  // `route: "ipmiGateway"` macro does — no opt-in flag question arises, because
+  // the command has no independent identity to carry one on, and choosing it
+  // against a gateway-configured server IS the request to reach that BMC by its
+  // configured route. Env injection cannot cross to the gateway shell, so the
+  // `-a` form is used (ipmitool prompts on the bastion) and NO credential is read
+  // or prompted for here — the §3.5 no-secret invariant holds by construction.
+  const gateway = resolveIpmiGatewayServer(ctx, server);
+  if (gateway) {
+    const routed = resolveProfileTokens(BMC_SOL_COMMAND_GATEWAY, profileTokenServer(ctx, server), { form: "command" });
+    if (!routed.ok) {
+      await reportProfileTokenError(routed.error, server, { subject: "Connect BMC Serial Console", outcome: "run" });
+      return;
+    }
+    // The same routing step a macro takes — deliver into a session terminal of
+    // the gateway (connect-first confirm, connect-failed/timeout split, pinned
+    // target all carried over), no macro picker. `reveal` surfaces the gateway
+    // session so the interactive `-a` prompt is visible immediately (B2), and
+    // `gatewayForName` names the routing context in the connect-first modal (S2).
+    // The name-only object is accepted directly now (`Pick<TerminalMacro,"name">`
+    // — P6), no cast.
+    const target = await resolveServerSessionTarget(
+      ctx,
+      gateway,
+      { name: "BMC Serial Console" },
+      { reveal: true, gatewayForName: server.name }
+    );
+    if (!target) {
+      return;
+    }
+    // P5 — re-check validity before the send, mirroring the macro path's
+    // `runMacroWithTarget`: a terminal closed while the connect-first QuickPick
+    // was up must not swallow the send silently.
+    if (!target.isStillValid()) {
+      vscode.window.setStatusBarMessage(`BMC console for "${server.name}" — the gateway session closed, nothing was sent.`, 4000);
+      return;
+    }
+    // `send` reveals the gateway terminal and runs its `sendText(text, false)`;
+    // the command's trailing newline executes it.
+    await target.send(routed.text);
+    // B2 — the gateway path is otherwise silent (the `-a` prompt sits on the
+    // bastion tty), so name where the console command went and why a password
+    // prompt appears there.
+    vscode.window.setStatusBarMessage(
+      `SOL console command sent to "${gateway.name}" — ipmitool will prompt for the BMC password there.`,
+      4000
+    );
+    return;
+  }
+
+  // The target NAMES an IPMI gateway that no longer resolves (deleted, or an
+  // invalid self-reference) — distinct from a server that never had one, where
+  // local IS the configured route. The macro path surfaces this via
+  // noGatewayFallbackNote; the direct command must too, or a BMC only reachable
+  // from the now-missing gateway is silently dialed from a machine that can't
+  // reach it. Non-blocking (local delivery still proceeds below).
+  if (server.ipmiGatewayServerId) {
+    void vscode.window.showWarningMessage(
+      `The IPMI gateway configured for "${server.name}" is no longer available — connecting to the BMC from this machine instead.`
+    );
   }
 
   const resolution = resolveProfileTokens(BMC_SOL_COMMAND, profileTokenServer(ctx, server), { form: "command" });

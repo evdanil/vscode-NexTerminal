@@ -901,6 +901,63 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       expect("provideIpmiCredentials" in getMacros()[0]).toBe(false);
     });
 
+    it("persists route:ipmiGateway only for a local-terminal macro, and drops it on switch back to local (issue #48 PR-C)", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({
+        text: " ipmitool -H ${profile.ipmiHost} -a sol activate\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway"
+      }));
+      expect(getMacros()[0].route).toBe("ipmiGateway");
+
+      const macroId = getMacros()[0].id!;
+      const { sendMessage: sendAgain } = await openPanel(0);
+      await sendAgain(baseSaveMsg({
+        index: 0,
+        id: macroId,
+        text: " ipmitool -H ${profile.ipmiHost} -a sol activate\n",
+        runIn: "localTerminal",
+        route: "local"
+      }));
+      // ABSENT, not "local": without the unconditional delete, the old
+      // "ipmiGateway" survives the spread and the macro keeps executing on the
+      // bastion after the user routed it back to this machine.
+      expect("route" in getMacros()[0]).toBe(false);
+    });
+
+    it("refuses to store route on a session or browser macro, whatever the message says", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+      await sendMessage(baseSaveMsg({ text: "show version\n", runIn: "session", route: "ipmiGateway" }));
+      expect("route" in getMacros()[0]).toBe(false);
+
+      const { sendMessage: sendBrowser } = await openPanel();
+      await sendBrowser(baseSaveMsg({
+        name: "Web",
+        text: "https://${profile.ipmiHost}/",
+        runIn: "browser",
+        route: "ipmiGateway"
+      }));
+      expect("route" in getMacros()[1]).toBe(false);
+    });
+
+    it.each([["IPMIGATEWAY"], [7], [{}]])("treats an untrusted route (%o) in the save message as local", async (raw) => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({
+        text: " ipmitool\n",
+        runIn: "localTerminal",
+        route: raw as unknown as string
+      }));
+
+      // A direct `=== "ipmiGateway"` on the message would still be off here, but a
+      // truthiness read would store `{}`/`7` — the resolver reads them as local.
+      expect("route" in getMacros()[0]).toBe(false);
+    });
+
     it("persists a valid variables array, dropping empty label/default fields", async () => {
       await harness([]);
       const { sendMessage } = await openPanel();

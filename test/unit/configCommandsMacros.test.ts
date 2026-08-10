@@ -438,6 +438,17 @@ describe("imported macros — capability flags are stripped (issue #48 §3.3)", 
     expect("provideIpmiCredentials" in result!.macros[0]).toBe(false);
   });
 
+  it("S3 — reports capabilityStripped=true when an incoming macro carried a capability field", () => {
+    const result = collectIncomingMacros({ version: 2 as const, exportedAt: "", macros: [HOSTILE] });
+    expect(result!.capabilityStripped).toBe(true);
+  });
+
+  it("S3 — reports capabilityStripped=false when no incoming macro carried a capability field", () => {
+    const clean: TerminalMacro = { id: "c", name: "Show", text: "show version\n", runIn: "localTerminal" };
+    const result = collectIncomingMacros({ version: 2 as const, exportedAt: "", macros: [clean] });
+    expect(result!.capabilityStripped).toBe(false);
+  });
+
   it("the content key ignores the flags, so re-importing a stripped macro does not duplicate the local one", () => {
     // The flags are deliberately NOT part of `keyOf`: they are stripped on
     // import, so counting them would make an imported (stripped) macro fail to

@@ -5,7 +5,7 @@ import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { authProfileCredentialMirror, formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
-import { serverConfigsEqual } from "../models/config";
+import { serverConfigsEqual, type ServerConfig } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
@@ -91,10 +91,11 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         }
         await ctx.core.addOrUpdateLocalShellProfile(profile);
       } else {
-        const server = formValuesToServer(values);
-        if (!server) {
+        const builtServer = formValuesToServer(values);
+        if (!builtServer) {
           return;
         }
+        let server: ServerConfig = builtServer;
         // FINDING 2 (P2, edit-race review, sibling) — same record+secret
         // pairing as nexus.server.edit (serverCommands.ts), for the
         // add/create path: addOrUpdateServer and syncProxyPasswordSecret
@@ -161,6 +162,25 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           // an id that resolves to nothing is the one and only thing to catch.
           if (server.ipmiAuthProfileId !== undefined && ctx.core.getAuthProfile(server.ipmiAuthProfileId) === undefined) {
             throw new Error(MISSING_IPMI_AUTH_PROFILE_MESSAGE);
+          }
+          // JUMP-HOST IPMI ROUTING (issue #48 PR-C, PR #65 Codex round 10) — the
+          // server-list twin of the two auth-link guards above, and for the same
+          // reason: the add form can sit open while the chosen IPMI gateway
+          // server is deleted, and the deletion sweep (removeServer /
+          // applyInventorySyncPlan / removeFolderCascade) cannot reach a server
+          // that does not exist yet. Drop a gateway id that names no live server
+          // so the new record can't be born with a dangling link. Because
+          // `ipmiGatewayServerId` is a SERVER reference it checks
+          // `ctx.core.getServer` (not `getAuthProfile`). Unlike the two auth
+          // guards this does NOT throw: a dangling gateway degrades silently to
+          // "run locally" at runtime, so the round-9/10 invariant is simply to
+          // never PERSIST the dangling link — existence-check only, silent drop,
+          // still under the same lock every server write takes. A live id and an
+          // unset "(None)" are kept. The new server's own freshly-minted id can't
+          // collide with the gateway pick (chosen from existing servers), so
+          // there is no self-reference concern here.
+          if (server.ipmiGatewayServerId !== undefined && ctx.core.getServer(server.ipmiGatewayServerId) === undefined) {
+            server = { ...server, ipmiGatewayServerId: undefined };
           }
           // FINDINGS 2+3 (P2, create-rollback review, sibling) — same
           // single-owner displacement as the nexus.server.edit rollback

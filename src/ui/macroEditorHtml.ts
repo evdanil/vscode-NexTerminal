@@ -5,7 +5,7 @@ import { serializeForInlineScript } from "./shared/inlineScriptData";
 import { renderWebviewDocument } from "./shared/webviewDocument";
 import { getAssignedBinding } from "../macroBindingHelpers";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
-import { MACRO_RUN_TARGETS, MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE, macroProvidesIpmiCredentials, resolveMacroRunTarget } from "../models/terminalMacro";
+import { IPMI_GATEWAY_INERT_CREDENTIALS_HINT, MACRO_RUN_TARGETS, MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE, macroProvidesIpmiCredentials, resolveMacroRoute, resolveMacroRunTarget } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
@@ -160,6 +160,22 @@ export function renderMacroEditorHtml(
   const runInOptionsHtml = runInOptions.map((option) =>
     `<div class="custom-select-option${option.value === runIn ? " selected" : ""}" data-value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</div>`
   ).join("\n        ");
+  // Issue #48 PR-C — the "Run on" routing opt-in, read through the model's own
+  // resolver so a corrupt stored value renders as the compatibility default
+  // ("local") instead of an empty select. Shown only while Run in = Local
+  // terminal, where it is the only thing it can mean.
+  const route = macro ? resolveMacroRoute(macro) : "local";
+  const runOnVisible = runIn === "localTerminal";
+  const runOnOptions = [
+    { value: "local", label: "This machine" },
+    { value: "ipmiGateway", label: "The server's IPMI gateway (falls back to this machine)" }
+  ];
+  const selectedRunOnLabel = runOnOptions.find((option) => option.value === route)?.label ?? runOnOptions[0].label;
+  const runOnOptionsHtml = runOnOptions.map((option) =>
+    `<div class="custom-select-option${option.value === route ? " selected" : ""}" data-value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</div>`
+  ).join("\n        ");
+  // The inert-combination hint (item 4): route ipmiGateway + credentials on.
+  const gatewayInertHintVisible = runIn === "localTerminal" && route === "ipmiGateway" && provideIpmi;
 
   const nameValue = macro?.name ?? "";
   const textValue = macro?.text ?? "";
@@ -340,6 +356,24 @@ export function renderMacroEditorHtml(
     <div class="hint" id="session-ipmitool-hint" style="display:none;">This looks like an ipmitool command. "Session terminal" types it into the connected SSH session, so it runs on the remote host. Choose "Local terminal" to run it from this machine, then tick "Provide IPMI credentials" to supply the BMC password.</div>
   </div>
 
+  <!-- Issue #48 PR-C — "Run on": where a Local terminal macro's terminal actually
+       lives. Bespoke conditional visibility (mirrors the provide-ipmi group), NOT
+       a form-framework surface; shown only while Run in = Local terminal, and the
+       save handler drops the route for every other target regardless. -->
+  <div class="form-group" id="run-on-group"${runOnVisible ? "" : ' style="display:none;"'}>
+    <label for="macro-run-on-wrapper">Run on</label>
+    <div class="custom-select" id="macro-run-on-wrapper">
+      <input type="hidden" id="macro-run-on" value="${escapeHtml(route)}" />
+      <div class="custom-select-trigger" tabindex="0">
+        <span class="custom-select-text">${escapeHtml(selectedRunOnLabel)}</span>
+      </div>
+      <div class="custom-select-dropdown">
+        ${runOnOptionsHtml}
+      </div>
+    </div>
+    <div class="hint">IPMI gateway routing runs the command in an SSH session on the gateway server configured for the target server, so tools like ipmitool can reach a BMC network that isn't reachable from here. Tokens are still resolved against the target server. The gateway is set per server in the server form's advanced "IPMI Gateway" field.</div>
+  </div>
+
   <!-- Issue #48 §3.3 — the IPMI credential opt-in. Shown only while Run in =
        Local terminal, where it is the only thing it can mean; the save handler
        drops the flag for every other target regardless of what is checked. -->
@@ -349,6 +383,11 @@ export function renderMacroEditorHtml(
       Provide IPMI credentials to this macro's terminal
     </label>
     <div class="hint">Puts the server's IPMI password (from the IPMI Auth Profile linked in its server form) into the local terminal's environment as IPMITOOL_PASSWORD/IPMI_PASSWORD, so <code>ipmitool -E</code> can read it without the password ever appearing in the command line, the scrollback, or Copy All. Every command run in that terminal — by this macro or typed later — can read it. Leave this off unless the macro is an ipmitool command. If no password is stored, you are asked for one at run time and it is used for that run only.</div>
+    <!-- P3 — the inert-combination hint lives HERE, beside the checkbox that
+         triggers it (route = gateway AND this box ticked), not in the run-on group
+         where ticking the box surfaced a hint in a different, possibly off-screen
+         group. Same id / same live-update (updateGatewayInertHint), same constant. -->
+    <div class="hint" id="gateway-inert-credentials-hint"${gatewayInertHintVisible ? "" : ' style="display:none;"'}>${escapeHtml(IPMI_GATEWAY_INERT_CREDENTIALS_HINT)}</div>
   </div>
 
   <div class="form-group">
@@ -508,6 +547,55 @@ ${folderOptionsHtml}
         if (!isLocal) {
           document.getElementById("macro-provide-ipmi").checked = false;
         }
+      }
+
+      // Sets the "Run on" custom-select value WITHOUT dispatching a change event.
+      // selectCustomOption() dispatches a change event, which is what markDirty()
+      // listens for — so using it from an init/reset path marks the editor dirty
+      // with zero user edits (B3: the dirty dot on open, and a spurious
+      // discard-changes confirm when switching macros). This mirrors
+      // updateProvideIpmiState(), which sets checked directly for the same reason;
+      // the reset is not a user edit.
+      function setRunOnValueSilently(value) {
+        var wrapper = document.getElementById("macro-run-on-wrapper");
+        var hiddenInput = wrapper.querySelector('input[type="hidden"]');
+        var textEl = wrapper.querySelector('.custom-select-text');
+        var options = wrapper.querySelectorAll('.custom-select-option');
+        for (var i = 0; i < options.length; i++) {
+          var match = options[i].dataset.value === value;
+          options[i].classList.toggle('selected', match);
+          options[i].setAttribute('aria-selected', match ? 'true' : 'false');
+          if (match) {
+            var labelEl = options[i].querySelector('.custom-select-option-label');
+            textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
+          }
+        }
+        hiddenInput.value = value;
+      }
+
+      // Issue #48 PR-C — "Run on" is meaningful only on a Local terminal macro, so
+      // it is hidden AND reset to "local" for any other target: leaving a hidden
+      // "ipmiGateway" would submit a routing the user cannot see. (The host drops
+      // the route for a non-local target anyway; this is the visible half.) The
+      // reset goes through the SILENT setter — see setRunOnValueSilently (B3).
+      function updateRunOnState() {
+        var isLocal = document.getElementById("macro-run-in").value === "localTerminal";
+        document.getElementById("run-on-group").style.display = isLocal ? "" : "none";
+        if (!isLocal) {
+          setRunOnValueSilently("local");
+        }
+      }
+
+      // Issue #48 PR-C item 4 — the inert-combination hint: route = the server's
+      // IPMI gateway AND "Provide IPMI credentials" ticked. Non-blocking (never
+      // disables Save); env injection can't cross to a gateway session, so
+      // ipmitool prompts on the gateway instead.
+      function updateGatewayInertHint() {
+        var isLocal = document.getElementById("macro-run-in").value === "localTerminal";
+        var isGateway = document.getElementById("macro-run-on").value === "ipmiGateway";
+        var provideIpmi = document.getElementById("macro-provide-ipmi").checked;
+        var show = isLocal && isGateway && provideIpmi;
+        document.getElementById("gateway-inert-credentials-hint").style.display = show ? "" : "none";
       }
 
       function markDirty() {
@@ -918,9 +1006,18 @@ ${folderOptionsHtml}
         markDirty();
         updateRunInConflictWarning();
         updateProvideIpmiState();
+        updateRunOnState();
+        updateGatewayInertHint();
         updateSessionIpmitoolHint();
       });
-      document.getElementById("macro-provide-ipmi").addEventListener("change", markDirty);
+      document.getElementById("macro-run-on").addEventListener("change", function() {
+        markDirty();
+        updateGatewayInertHint();
+      });
+      document.getElementById("macro-provide-ipmi").addEventListener("change", function() {
+        markDirty();
+        updateGatewayInertHint();
+      });
       document.getElementById("macro-trigger-scope").addEventListener("change", function() {
         markDirty();
         updateTriggerProfileState();
@@ -988,6 +1085,7 @@ ${folderOptionsHtml}
         var triggerProfileId = document.getElementById("macro-trigger-profile").value.trim();
         var runInVal = document.getElementById("macro-run-in").value;
         var provideIpmiVal = document.getElementById("macro-provide-ipmi").checked;
+        var runOnVal = document.getElementById("macro-run-on").value;
         var folderVal = document.getElementById("macro-folder").value.trim();
 
         // Validate
@@ -1090,6 +1188,7 @@ ${folderOptionsHtml}
           triggerProfileId: triggerProfileId || null,
           runIn: runInVal,
           provideIpmiCredentials: provideIpmiVal,
+          route: runOnVal,
           variables: variablesForSave,
           group: folderVal || null
         });
@@ -1134,6 +1233,8 @@ ${folderOptionsHtml}
       });
       updateTriggerProfileState();
       updateProvideIpmiState();
+      updateRunOnState();
+      updateGatewayInertHint();
       computeDiagnostics();
       updateTriggerConflictWarning();
       updateRunInConflictWarning();

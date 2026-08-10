@@ -267,7 +267,40 @@ function ipmiAuthProfileSelectField(
   };
 }
 
-function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?: AuthProfile[]): FormFieldDescriptor[] {
+/**
+ * JUMP-HOST IPMI ROUTING (issue #48 PR-C) — "reach this server's BMC by running
+ * ipmitool on THAT server". An id reference into the server list, like the Jump
+ * Host select and for the same growth reason it is filterable (PR-F1), with
+ * "(None)" (value "") pinned on top and self excluded (a server cannot be its own
+ * gateway). Advanced, next to the other IPMI fields; unset = the BMC is reachable
+ * locally (today's behavior).
+ */
+function ipmiGatewaySelectField(
+  seed?: Partial<ServerConfig>,
+  servers?: ServerListEntry[],
+  vw?: VisibleWhen
+): FormFieldDescriptor {
+  return {
+    type: "select",
+    key: "ipmiGatewayServerId",
+    label: "IPMI Gateway",
+    filterable: true,
+    options: [
+      { label: "(None)", value: "" },
+      ...(servers ?? [])
+        .filter((s) => s.id !== seed?.id)
+        .map((s) => ({ label: s.name, value: s.id }))
+    ],
+    value: seed?.ipmiGatewayServerId ?? "",
+    hint:
+      "The server to run ipmitool on when a macro opts into gateway routing (Run on: the server's IPMI gateway) or Connect BMC Serial Console is used against this server. " +
+      "Leave as (None) when the BMC is reachable from this machine directly — routing only takes effect where a macro or command asks for it.",
+    advanced: true,
+    visibleWhen: vw
+  };
+}
+
+function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?: AuthProfile[], servers?: ServerListEntry[]): FormFieldDescriptor[] {
   return [
     { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the SSH server.", visibleWhen: vw },
     { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: seed?.port ?? 22, visibleWhen: vw },
@@ -292,6 +325,7 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
     // no BMC should not be asked about one.
     { type: "text", key: "ipmiHost", label: "IPMI / BMC Host", placeholder: "10.0.0.1 or bmc.example.com", value: seed?.ipmiHost, hint: "Optional out-of-band management address — the address only, no https:// or path (e.g. 10.0.0.1, not https://10.0.0.1/). Used by macros through ${profile.ipmiHost}; never used to connect over SSH.", advanced: true, visibleWhen: vw },
     ipmiAuthProfileSelectField(authProfiles, seed?.ipmiAuthProfileId, vw),
+    ipmiGatewaySelectField(seed, servers, vw),
     // Two literals, never a free-text scheme: `ipmiHost` is an address (no `/`,
     // no scheme concept — see profileTokens.ts's ADDRESS_CHARSET), so the scheme
     // has to live in its own typed field or not at all.
@@ -817,7 +851,7 @@ export function serverFormDefinition(
   const linkedProfile = seed?.authProfileId
     ? (authProfiles ?? []).find((profile) => profile.id === seed.authProfileId)
     : undefined;
-  const ssh = applyLinkedAuthProfileValues(sshFields(seed, undefined, authProfiles), linkedProfile);
+  const ssh = applyLinkedAuthProfileValues(sshFields(seed, undefined, authProfiles, servers), linkedProfile);
 
   return {
     title: isEdit ? "Edit SSH Server Profile" : "Add SSH Server Profile",
@@ -1047,7 +1081,7 @@ export function unifiedProfileFormDefinition(
       unifiedProfileTypeField(seed),
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server, Console, or Project Shell" },
       authProfileSelectField(authProfiles, sshVw),
-      ...sshFields(undefined, sshVw, authProfiles),
+      ...sshFields(undefined, sshVw, authProfiles, servers),
       ...proxyFields(undefined, servers, sshVw),
       openFileExplorerOnFirstConnectField(undefined, sshVw),
       ...serialFields(undefined, serialVw),

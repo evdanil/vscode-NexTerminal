@@ -12,7 +12,7 @@ import {
   saveMacros
 } from "../macroSettings";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
-import { resolveMacroRunTarget, validateMacroRunTarget } from "../models/terminalMacro";
+import { resolveMacroRoute, resolveMacroRunTarget, validateMacroRunTarget } from "../models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
@@ -606,6 +606,14 @@ export class MacroEditorPanel {
         // so a macro the user had just de-privileged would keep receiving the
         // BMC password. Absent means false; a `false` is never written.
         delete macro.provideIpmiCredentials;
+        // Issue #48 PR-C — same delete-then-conditionally-re-add shape as `runIn`
+        // / `provideIpmiCredentials`: without the unconditional delete, moving a
+        // macro off "Local terminal" (or back to "This machine") would leave a
+        // stored `"ipmiGateway"` alive through the `{ ...existingMacro }` spread,
+        // so a macro the user just de-routed would keep executing on the bastion.
+        // Read through the tolerant resolver, and only a resolved "ipmiGateway" on
+        // a local-terminal macro is ever written — absent means "local".
+        delete macro.route;
         // §4.1 — "" canonicalizes to `undefined`; only a non-empty normalized
         // path is ever persisted. The untouched case re-attaches the stored
         // string byte-for-byte instead (see the Folder-field comment above);
@@ -624,6 +632,14 @@ export class MacroEditorPanel {
         // capability armed on a record where no UI renders it.
         if (runIn === "localTerminal" && (msg.provideIpmiCredentials as unknown) === true) {
           macro.provideIpmiCredentials = true;
+        }
+        // Issue #48 PR-C — gated on the RESOLVED run target (a route means
+        // nothing off a local terminal) and read through the same tolerant
+        // resolver every other read site uses, so an unknown value stores nothing
+        // rather than failing the save. Only a non-default "ipmiGateway" is
+        // persisted — absent means "local".
+        if (runIn === "localTerminal" && resolveMacroRoute({ route: msg.route as TerminalMacro["route"] }) === "ipmiGateway") {
+          macro.route = "ipmiGateway";
         }
         if (secret) macro.secret = true;
         else delete macro.secret;

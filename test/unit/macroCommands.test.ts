@@ -233,6 +233,7 @@ describe("macroCommands template actions", () => {
       "Wait and send confirmation",
       "Scoped auto-trigger example",
       "IPMI SOL console",
+      "IPMI SOL console (via jump host)",
       "IPMI Power Status",
       "IPMI Power On",
       "IPMI Power Off (hard, no OS shutdown)",
@@ -268,6 +269,30 @@ describe("macroCommands template actions", () => {
     // TerminalCaptureBuffer (which `nexus.terminal.copyAll` exports).
     expect(created.text).not.toContain("-P ");
     expect(mockSaveMacros).toHaveBeenCalledWith(macros);
+  });
+
+  it("ships the jump-host SOL template with route:ipmiGateway, the -a form, and NO credential flag (issue #48 PR-C)", async () => {
+    const macros: unknown[] = [];
+    mockGetMacros.mockReturnValue(macros);
+    mockShowQuickPick.mockResolvedValue({ templateId: "ipmi-sol-gateway" });
+
+    await registeredCommands.get("nexus.macro.addFromTemplate")!();
+
+    const created = macros[0] as { text: string; runIn?: string; route?: string; provideIpmiCredentials?: boolean };
+    expect(created.runIn).toBe("localTerminal");
+    // The route is what makes this the gateway sibling — a template insert is a
+    // LOCAL action, so the shipped route survives insertion (fails against a
+    // template shipped without the route, which would run locally like PR-B's).
+    expect(created.route).toBe("ipmiGateway");
+    // `-a`, never `-E`: env injection can't cross to the gateway shell, so
+    // ipmitool prompts on the bastion. The credential flag would be inert here,
+    // so the template ships with it OFF.
+    expect(created.text).toContain(" -a ");
+    expect(created.text).not.toContain(" -E ");
+    expect(created.text).not.toContain("-P ");
+    expect(created.provideIpmiCredentials).toBeUndefined();
+    expect(created.text).toContain("-H ${profile.ipmiHost}");
+    expect(created.text).toContain("-U ${profile.ipmiUsername}");
   });
 
   it.each([

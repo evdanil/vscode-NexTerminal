@@ -10,7 +10,7 @@ import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
-import { stripImportedCapabilityFields } from "../models/terminalMacro";
+import { hasImportedCapabilityField, IMPORTED_CAPABILITY_RESET_NOTICE, stripImportedCapabilityFields } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
 import type { SecretVault } from "../services/ssh/contracts";
@@ -814,6 +814,14 @@ export function sanitizeForSharing(
     // SENDER's id verbatim, which on the receiving side either resolves to
     // nothing or (worse) to an unrelated local profile that happens to hold it.
     const newIpmiAuthProfileId = s.ipmiAuthProfileId ? idMap.get(s.ipmiAuthProfileId) : undefined;
+    // JUMP-HOST IPMI ROUTING (issue #48 PR-C) — an id reference INTO THE SERVER
+    // LIST, so it remaps through the SAME idMap as `proxy.jumpHostId` (every
+    // server's new id is already assigned in the second pass above), and takes
+    // `remapProxy`'s out-of-export disposition: when the gateway server is not in
+    // the bundle the field is dropped to `undefined`, never carried stale. An
+    // unset gateway means "the BMC is reachable locally" — a safe working default
+    // on the recipient — whereas a stale id can only fail confusingly at run time.
+    const newIpmiGatewayServerId = s.ipmiGatewayServerId ? idMap.get(s.ipmiGatewayServerId) : undefined;
     // §B6 — a share export travels to another person/machine; a synced-server marker
     // (sourceId/externalId) names an inventory source that only exists locally and
     // would be meaningless (and misleading) on the receiving end.
@@ -834,6 +842,7 @@ export function sanitizeForSharing(
       proxy: remapProxy(s.proxy, idMap),
       authProfileId: newAuthProfileId,
       ipmiAuthProfileId: newIpmiAuthProfileId,
+      ipmiGatewayServerId: newIpmiGatewayServerId,
       origin: undefined,
       formerlySynced: undefined
     };
@@ -1178,7 +1187,7 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
 export function collectIncomingMacros(
   data: NexusConfigExport,
   decryptedSecrets?: Record<string, unknown>
-): { macros: TerminalMacro[]; unresolvedCount: number } | undefined {
+): { macros: TerminalMacro[]; unresolvedCount: number; capabilityStripped: boolean } | undefined {
   // New format (version 2): top-level `macros` + id-keyed secret blobs
   if (Array.isArray(data.macros)) {
     const secretBlobs = (decryptedSecrets?.secretMacros as Array<{ id?: string; name?: string; text?: string }> | undefined) ?? [];
@@ -1188,6 +1197,10 @@ export function collectIncomingMacros(
       if (blob.id && typeof blob.text === "string") byId.set(blob.id, blob.text);
       if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
+    // S3 — recorded off the RAW records, before sanitizeImportedMacro strips them,
+    // so an imported gateway-routed/credentialed macro is reset-with-notice rather
+    // than reset-silently. Presence, not per-macro count: the notice fires once.
+    const capabilityStripped = data.macros.some((m) => hasImportedCapabilityField(m));
     let unresolvedCount = 0;
     const macros = data.macros.map<TerminalMacro>((m) => {
       if (m.secret) {
@@ -1197,7 +1210,7 @@ export function collectIncomingMacros(
       }
       return sanitizeImportedMacro({ ...m });
     });
-    return { macros, unresolvedCount };
+    return { macros, unresolvedCount, capabilityStripped };
   }
 
   // Legacy format (version 1): macros under `settings.nexus.terminal.macros`;
@@ -1209,6 +1222,7 @@ export function collectIncomingMacros(
     for (const blob of secretBlobs) {
       if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
+    const capabilityStripped = legacy.some((m) => hasImportedCapabilityField(m));
     let unresolvedCount = 0;
     const macros = legacy.map<TerminalMacro>((m) => {
       if (m.secret) {
@@ -1218,7 +1232,7 @@ export function collectIncomingMacros(
       }
       return sanitizeImportedMacro({ ...m });
     });
-    return { macros, unresolvedCount };
+    return { macros, unresolvedCount, capabilityStripped };
   }
 
   return undefined;
@@ -1785,6 +1799,26 @@ export function registerConfigCommands(
       return { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
     };
 
+    /**
+     * The NEW ids of the servers that SURVIVE import — the server analogue of
+     * `importedProfileIds`, and the lens the IPMI gateway link passes through (see
+     * `linkToImportedServer` below). Built in FULL before any gateway link is
+     * finalized so a FORWARD reference (target A whose gateway B sits LATER in the
+     * `servers` array) still resolves: the gate is "B survived import", never "B was
+     * added before A was reached".
+     *
+     * Computing the set up front is sound because `validateServerConfig`'s verdict
+     * turns only on a server's OWN fields (id/name/host/port/username/authType and
+     * the shapes of a handful of optionals) — never on whether its references
+     * resolve, and in particular NOT on the VALUE of `ipmiGatewayServerId` (every
+     * non-empty string and `undefined` passes identically). So a server's survival
+     * is fixed before its gateway link is, and gating that link cannot change which
+     * servers survive. Each remapped server is built ONCE here (proxy, profile links
+     * and origin already remapped, gateway raw-remapped through `idMap`) and that
+     * exact shape validated; the finalize loop below only narrows the gateway field.
+     */
+    const remappedServers: ServerConfig[] = [];
+    const importedServerIds = new Set<string>();
     for (const server of servers) {
       let remappedProxy = server.proxy;
       if (remappedProxy?.type === "ssh") {
@@ -1843,10 +1877,46 @@ export function registerConfigCommands(
         // The BMC credential link goes through the same lens: it is a profile
         // reference like any other, and a share bundle's ids are the sender's.
         ipmiAuthProfileId: linkToImportedProfile(server.ipmiAuthProfileId),
+        // The IPMI gateway link is a SERVER-LIST reference, not a profile one, so
+        // it remaps through the same `idMap` as `proxy.jumpHostId` (server half) —
+        // NOT `linkToImportedProfile`. Raw-remapped here; FINALIZED below once the
+        // full surviving-server set is known (`linkToImportedServer`), because a
+        // raw remap alone keeps a fresh id even for a gateway that failed import.
+        ipmiGatewayServerId: server.ipmiGatewayServerId ? (idMap.get(server.ipmiGatewayServerId) ?? undefined) : undefined,
         origin: remapOriginStamp(server.origin),
         formerlySynced: undefined
       };
-      tally(await addIfValid(remappedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
+      remappedServers.push(remappedServer);
+      if (validateServerConfig(remappedServer)) {
+        importedServerIds.add(remappedServer.id);
+      }
+    }
+
+    /**
+     * The gateway link's analogue of `linkToImportedProfile`, one bucket over: the
+     * IPMI gateway is a SERVER-LIST reference, so it remaps through `idMap` (the
+     * server half, like `proxy.jumpHostId`) — but the raw remap alone is not
+     * enough. `idMap` is filled for EVERY incoming server in the first pass, before
+     * a single one is validated, so `idMap.get(gatewayId)` returns a fresh id even
+     * when the referenced gateway FAILED `validateServerConfig` and was skipped —
+     * the target would then persist a fresh id no imported server holds (still
+     * dangling), and because the server and profile halves SHARE `idMap`, a
+     * malformed/hand-crafted payload whose gateway id equals a profile id could even
+     * resolve cross-namespace to a profile's new id. Keep it ONLY when the remapped
+     * id is in the surviving-server set; `undefined` for anything else — gateway
+     * absent from the bundle, rejected on import, or a cross-bucket id collision.
+     * `undefined` reads as "the BMC is reachable locally", exactly as
+     * `resolveIpmiGatewayServer` already treats a dangling id at the run site.
+     */
+    const linkToImportedServer = (remapped: string | undefined): string | undefined =>
+      remapped !== undefined && importedServerIds.has(remapped) ? remapped : undefined;
+
+    for (const remappedServer of remappedServers) {
+      const finalizedServer: ServerConfig = {
+        ...remappedServer,
+        ipmiGatewayServerId: linkToImportedServer(remappedServer.ipmiGatewayServerId)
+      };
+      tally(await addIfValid(finalizedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
     for (const tunnel of tunnels) {
       ensureId(tunnel as unknown as Record<string, unknown>);
@@ -1906,6 +1976,10 @@ export function registerConfigCommands(
         : [];
     if (rawMacros.length > 0) {
       const incoming = rawMacros.filter((m) => !m.secret);
+      // S3 — recorded off the RAW non-secret records (the ones actually imported)
+      // before sanitizeImportedMacro strips them, so a shared gateway-routed /
+      // credentialed macro is reset-with-notice, not silently. Fired once below.
+      const capabilityStripped = incoming.some((m) => hasImportedCapabilityField(m));
       const existing = getMacros();
       const existingByKey = new Set(existing.map(keyOf));
       const merged = [...existing];
@@ -1926,6 +2000,11 @@ export function registerConfigCommands(
         }
       }
       await saveMacros(merged);
+      // S3 — one-time, non-blocking, once per share import that reset ≥1 macro's
+      // capability field.
+      if (capabilityStripped) {
+        void vscode.window.showInformationMessage(IMPORTED_CAPABILITY_RESET_NOTICE);
+      }
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
@@ -2064,6 +2143,7 @@ export function registerConfigCommands(
     // Clear dangling authProfileId references
     const postImportSnapshot = core.getSnapshot();
     const knownProfileIds = new Set(postImportSnapshot.authProfiles.map((p) => p.id));
+    const knownServerIds = new Set(postImportSnapshot.servers.map((s) => s.id));
     for (const server of postImportSnapshot.servers) {
       // Captured as a local so the stamp comparisons below keep narrowing
       // `origin`/`formerlySynced`: `x?.stamp === <string>` proves the container
@@ -2076,10 +2156,18 @@ export function registerConfigCommands(
       // can carry either, both, or two different profiles — so it is swept on
       // its own terms rather than as a rider on the SSH clear.
       const ipmiDangles = Boolean(server.ipmiAuthProfileId) && !knownProfileIds.has(server.ipmiAuthProfileId!);
-      if (sshDangles || ipmiDangles) {
+      // The BMC jump-host link dangles independently of the auth links — it is a
+      // server-list reference (checked against `knownServerIds`, NOT
+      // `knownProfileIds`) that has no auth stamp, so it never touches the
+      // origin/formerlySynced clears below. A self-referencing gateway keeps its
+      // own id in `knownServerIds`, so it is not swept here; the runtime self-ref
+      // guard in `resolveIpmiGatewayServer` handles that case.
+      const gatewayDangles = Boolean(server.ipmiGatewayServerId) && !knownServerIds.has(server.ipmiGatewayServerId!);
+      if (sshDangles || ipmiDangles || gatewayDangles) {
         const cleared: ServerConfig = { ...server };
         if (sshDangles) cleared.authProfileId = undefined;
         if (ipmiDangles) cleared.ipmiAuthProfileId = undefined;
+        if (gatewayDangles) cleared.ipmiGatewayServerId = undefined;
         // Same rule as NexusCore.removeAuthProfile: the inventory sync's record
         // that IT applied this profile (origin.syncedAuthProfileId) dies with the
         // link it describes. Left behind, it would read as a per-server opt-out —
@@ -2203,7 +2291,7 @@ export function registerConfigCommands(
 
     // Apply macros from import payload
     if (incomingResult !== undefined) {
-      const { macros: incomingMacros, unresolvedCount } = incomingResult;
+      const { macros: incomingMacros, unresolvedCount, capabilityStripped } = incomingResult;
       if (mode === "replace") {
         // `replaceMacros`, not `saveMacros`: this is the one macro write in the extension whose
         // input is a wholesale external list, and the store's two entry points exist for
@@ -2266,6 +2354,13 @@ export function registerConfigCommands(
         void vscode.window.showWarningMessage(
           `${unresolvedCount} secret macro${unresolvedCount === 1 ? "" : "s"} could not be decrypted from this backup. Their entries were imported but the secret text is missing — edit them to restore the value.`
         );
+      }
+      // S3 — one-time, non-blocking, once per import op: a backup/share bundle
+      // carried ≥1 macro with a capability field (gateway routing / IPMI
+      // credentials) that the strip reset. This is the explicit user-initiated
+      // import path only; legacy Settings absorption never shows it.
+      if (capabilityStripped) {
+        void vscode.window.showInformationMessage(IMPORTED_CAPABILITY_RESET_NOTICE);
       }
     }
 

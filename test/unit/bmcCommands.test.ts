@@ -21,6 +21,10 @@ const showInputBox = vi.fn();
 const executeCommand = vi.fn();
 const openExternal = vi.fn(async () => true);
 const createdTerminals: Array<{ name: string; sent: string[]; env?: Record<string, string>; options: Record<string, unknown> }> = [];
+// The open-terminal set backing `vscode.window.terminals`, so a pinned session
+// target's isStillValid() re-check (P5) can be exercised — a terminal absent here
+// reads as closed. Populated by gatewayContext from its seeded session terminals.
+let openTerminals: unknown[] = [];
 
 vi.mock("vscode", () => ({
   commands: {
@@ -48,7 +52,7 @@ vi.mock("vscode", () => ({
       };
     }),
     get terminals() {
-      return [] as unknown[];
+      return openTerminals;
     },
     activeTerminal: undefined as unknown
   },
@@ -124,6 +128,7 @@ beforeEach(() => {
   openExternal.mockResolvedValue(true as unknown as never);
   pickServer.mockReset();
   createdTerminals.length = 0;
+  openTerminals = [];
 });
 
 describe("nexus.server.connectBmcSol", () => {
@@ -236,6 +241,160 @@ describe("nexus.server.connectBmcSol", () => {
 
     expect(createdTerminals).toHaveLength(0);
     expect(String(setStatusBarMessage.mock.calls[0][0])).toContain("cancelled");
+  });
+
+  /**
+   * Issue #48 PR-C (§3.6) — when the target names a reachable IPMI gateway, the
+   * command honors it exactly as a `route: "ipmiGateway"` macro does: the `-a`
+   * line is delivered into the GATEWAY's session terminal, no local terminal is
+   * spawned, no credential is read (env can't cross the hop — ipmitool prompts on
+   * the bastion), and no macro picker is shown.
+   */
+  function gatewayContext(opts: {
+    servers: ServerConfig[];
+    sessions?: Array<{ id: string; serverId: string }>;
+    terminals?: Map<string, unknown>;
+    secrets?: Record<string, string>;
+    profiles?: AuthProfile[];
+  }): CommandContext {
+    // A pinned session target is re-checked against window.terminals before send
+    // (isStillValid); seed the open set so the normal path is not read as closed.
+    if (opts.terminals) {
+      openTerminals = [...opts.terminals.values()];
+    }
+    return {
+      core: {
+        getSnapshot: () => ({ activeSessions: opts.sessions ?? [], servers: opts.servers }),
+        getAuthProfile: (id: string) => (opts.profiles ?? [authProfile()]).find((p) => p.id === id),
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: opts.terminals ?? new Map(),
+      secretVault: {
+        get: async (key: string) => (opts.secrets ?? {})[key],
+        store: async () => {},
+        delete: async () => {}
+      }
+    } as unknown as CommandContext;
+  }
+
+  it("routes into the gateway's session with the -a form when ipmiGatewayServerId is set — no local terminal, no picker, no credential read", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const gwSent: string[] = [];
+    const show = vi.fn();
+    const gwTerminal = { name: "Nexus SSH: Bastion", show, sendText: (text: string) => gwSent.push(text) };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
+
+    await connectBmcSol(ctx, { server: target });
+
+    // `-a`, resolved against the TARGET (10.0.0.9), delivered to the gateway.
+    expect(gwSent).toEqual([" ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -a sol activate\n"]);
+    // Never a local terminal (which is the `-E` local flow), never the picker.
+    expect(createdTerminals).toHaveLength(0);
+    expect(showQuickPick).not.toHaveBeenCalled();
+    // Env cannot cross the hop, so no credential is read or prompted for, and the
+    // §3.5 no-secret invariant holds — the `-a` line carries no password.
+    expect(showInputBox).not.toHaveBeenCalled();
+    expect(gwSent[0]).not.toContain("s3cr3t-bmc");
+    expect(gwSent[0]).not.toContain(" -E ");
+    // B2 — the gateway session is revealed on delivery (the `-a` prompt is hidden
+    // until focused) and a status line names where the command went.
+    expect(show).toHaveBeenCalled();
+    const status = setStatusBarMessage.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(status).toContain('SOL console command sent to "Bastion"');
+    expect(status).toContain("ipmitool will prompt for the BMC password there");
+  });
+
+  it("P5 — does not send silently when the gateway session was closed during the QuickPick", async () => {
+    // The pinned target's isStillValid() re-check: a terminal absent from
+    // window.terminals is treated as closed, so the send is skipped and reported
+    // rather than swallowed.
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const gwSent: string[] = [];
+    // Open at resolve time (exitStatus undefined, so it is picked as the target)...
+    const gwTerminal = { name: "Nexus SSH: Bastion", show: vi.fn(), sendText: (text: string) => gwSent.push(text) };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
+    // ...then gone from window.terminals by send time — isStillValid() reads it as closed.
+    openTerminals = [];
+
+    await connectBmcSol(ctx, { server: target });
+
+    // Nothing sent; the closed-session outcome is reported, not silent.
+    expect(gwSent).toEqual([]);
+    const status = setStatusBarMessage.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(status).toContain("the gateway session closed");
+  });
+
+  it("keeps the local -E flow unchanged when the gateway id is dangling (names no server)", async () => {
+    // A dangling gateway resolves to "no gateway" — the command uses today's local
+    // `-E` terminal, exactly as an unset gateway does.
+    const ctx = gatewayContext({ servers: [], secrets: VAULTED });
+    await connectBmcSol(ctx, { server: server({ ipmiGatewayServerId: "ghost" }) });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].sent).toEqual([
+      " ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -E sol activate\n"
+    ]);
+    expect(createdTerminals[0].env).toEqual({ IPMITOOL_PASSWORD: "s3cr3t-bmc", IPMI_PASSWORD: "s3cr3t-bmc" });
+  });
+
+  it("Codex round 7 P2 — warns when a CONFIGURED gateway no longer resolves (deleted), then still runs the local -E flow", async () => {
+    // The gateway server was deleted (its id dangles); the target still NAMES it.
+    // The command must surface this — a BMC only reachable from the now-missing
+    // gateway would otherwise be silently dialed from here — while still delivering
+    // the local `-E` flow (non-blocking).
+    const ctx = gatewayContext({ servers: [], secrets: VAULTED });
+    await connectBmcSol(ctx, { server: server({ ipmiGatewayServerId: "ghost" }) });
+
+    // The warning fired (c1a00a1 was silent here — this is the falsifying assertion).
+    expect(showWarningMessage).toHaveBeenCalledTimes(1);
+    const warn = String(showWarningMessage.mock.calls[0][0]);
+    expect(warn).toContain("Core Switch");
+    expect(warn).toContain("no longer available");
+    // ...and the local `-E` flow still ran.
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].sent).toEqual([
+      " ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -E sol activate\n"
+    ]);
+    expect(createdTerminals[0].env).toEqual({ IPMITOOL_PASSWORD: "s3cr3t-bmc", IPMI_PASSWORD: "s3cr3t-bmc" });
+  });
+
+  it("Codex round 7 P2 — does NOT warn when NO gateway is configured (local is the configured route)", async () => {
+    // ipmiGatewayServerId unset: local delivery is correct, not a broken-config
+    // fallback — no warning must appear.
+    await connectBmcSol(context(VAULTED), { server: server() });
+
+    expect(showWarningMessage).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(1);
+  });
+
+  it("Codex round 7 P2 — does NOT warn when the configured gateway RESOLVES (gateway path)", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const gwTerminal = { name: "Nexus SSH: Bastion", show: vi.fn(), sendText: vi.fn() };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
+
+    await connectBmcSol(ctx, { server: target });
+
+    // Gateway path taken — no broken-config warning, no local terminal.
+    expect(showWarningMessage).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(0);
   });
 });
 

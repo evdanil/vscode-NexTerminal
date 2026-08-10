@@ -2572,6 +2572,91 @@ describe("nexus.server.edit — a dangling IPMI auth profile link (P2)", () => {
   });
 });
 
+/**
+ * REVIEW FINDING (P2, issue #48 PR-C, PR #65 Codex round 9) — the gateway link's
+ * copy of the dangling-reference guard: an `ipmiGatewayServerId` that names a
+ * server deleted while the edit form sat open must be DROPPED to undefined at
+ * Save (a silent drop, not a reject), never persisted as a dangling id. The
+ * measure is the record handed to addOrUpdateServer.
+ */
+describe("nexus.server.edit — a dangling IPMI gateway reference (P2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  interface EditPanel {
+    onSubmit: (v: Record<string, unknown>) => Promise<void>;
+  }
+
+  async function openEdit(ctx: CommandContext): Promise<EditPanel> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as EditPanel;
+  }
+
+  /** A rename that also carries an IPMI gateway selection. */
+  function renameWithGateway(ipmiGatewayServerId?: string): Record<string, unknown> {
+    return {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      ...(ipmiGatewayServerId !== undefined ? { ipmiGatewayServerId } : {})
+    };
+  }
+
+  it("drops a submitted ipmiGatewayServerId that names no live server (kills copying the stale select value onto the record — a dangling id resolveIpmiGatewayServer silently degrades to run-locally)", async () => {
+    // Only srv-1 is live; the gateway the form still names ("gone") was deleted
+    // while the form sat open, so the submission carries a dangling id.
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(renameWithGateway("gone"));
+
+    // The kill: c46abc8 persists "gone" verbatim. The guard drops it to undefined.
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect((addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig).ipmiGatewayServerId).toBeUndefined();
+  });
+
+  it("preserves a submitted ipmiGatewayServerId that names a live server (kills an over-broad drop that clears a legitimate gateway)", async () => {
+    const gateway = makeServer({ id: "gw-1", name: "Gateway" });
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer(), gateway]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(renameWithGateway("gw-1"));
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect((addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig).ipmiGatewayServerId).toBe("gw-1");
+  });
+
+  it("leaves an unset gateway undefined — (None) (kills a guard that invents a value for the empty case)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer()]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(renameWithGateway());
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
+    expect((addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig).ipmiGatewayServerId).toBeUndefined();
+  });
+});
+
 describe("nexus.server.edit — origin preservation (P1)", () => {
   beforeEach(() => {
     vi.clearAllMocks();

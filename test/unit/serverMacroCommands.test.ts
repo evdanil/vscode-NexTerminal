@@ -68,11 +68,13 @@ vi.mock("../../src/commands/serverCommands", () => ({
     arg && typeof arg === "object" && "server" in arg ? (arg as { server: ServerConfig }).server : undefined
 }));
 
-import { collectIncomingMacros } from "../../src/commands/configCommands";
+import { collectIncomingMacros, sanitizeForSharing } from "../../src/commands/configCommands";
+import { stripImportedCapabilityFields } from "../../src/models/terminalMacro";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import {
   buildServerMacroPicks,
+  commandReadsIpmiEnv,
   resolveMacroBrowserUrl,
   runMacroOnServer,
   sessionIpmiHintNote
@@ -198,6 +200,18 @@ describe("buildServerMacroPicks", () => {
   it("badges a macro that does not run in the session", () => {
     const macros: TerminalMacro[] = [{ id: "a", name: "BMC", text: "https://x/", runIn: "browser" }];
     expect(buildServerMacroPicks(macros, server())[0].description).toContain("[Browser]");
+  });
+
+  it("badges a gateway-routed local-terminal macro as [IPMI gateway], not [Local terminal] (issue #48 PR-C)", () => {
+    // The picker passes the whole macro, so the route-aware badge surfaces the
+    // execution host. Against 3c38972 this read `[Local terminal] `, hiding the
+    // gateway run at selection time.
+    const macros: TerminalMacro[] = [
+      { id: "a", name: "SOL", text: "ipmitool -E sol activate\n", runIn: "localTerminal", route: "ipmiGateway" }
+    ];
+    const description = buildServerMacroPicks(macros, server())[0].description;
+    expect(description).toContain("[IPMI gateway]");
+    expect(description).not.toContain("[Local terminal]");
   });
 });
 
@@ -1249,5 +1263,772 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
 
   it("returns nothing for a browser macro", () => {
     expect(sessionIpmiHintNote({ id: "a", name: "Web", text: "https://10.0.0.9/\n", runIn: "browser" })).toBeUndefined();
+  });
+});
+
+/**
+ * Issue #48 PR-C — jump-host IPMI routing (Path B). Every fixture here is built
+ * to fail against a specific wrong implementation: the withdrawn "gateway set ⇒
+ * route everything" design, tokens resolved on the wrong server, a routing that
+ * refuses the run instead of falling back, and a hint keyed on the server's
+ * gateway rather than on IPMI-token usage.
+ */
+describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", () => {
+  const GW_SOL = " ipmitool -H ${profile.ipmiHost} -a sol activate\n";
+
+  async function pickFirst(): Promise<void> {
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+  }
+
+  /**
+   * A context whose snapshot carries both `servers` and `activeSessions`, plus a
+   * `sessionTerminals` map — everything the gateway routing reads. `onDidChange`
+   * is live so a connect-first path (used by the fall-back-with-no-session cases)
+   * can register a session, though these fixtures pre-seed the gateway session.
+   */
+  function routingContext(opts: {
+    servers: ServerConfig[];
+    sessions?: Array<{ id: string; serverId: string }>;
+    terminals?: Map<string, unknown>;
+  }): CommandContext {
+    const listeners = new Set<() => void>();
+    const activeSessions = [...(opts.sessions ?? [])];
+    // Pinned session targets are re-checked against `window.terminals` before a
+    // send (isTerminalStillValid), so a seeded gateway terminal must be listed as
+    // open or the send is treated as "terminal closed".
+    if (opts.terminals) {
+      openTerminals = [...opts.terminals.values()] as typeof openTerminals;
+    }
+    return context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [...activeSessions], servers: opts.servers }),
+        getAuthProfile: () => undefined,
+        onDidChange: (listener: () => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        }
+      },
+      sessionTerminals: opts.terminals ?? new Map()
+    } as unknown as Partial<CommandContext>);
+  }
+
+  it("delivers a route:ipmiGateway macro into the GATEWAY's session terminal, tokens resolved against the TARGET", async () => {
+    // Target and gateway carry DIFFERENT ipmiHosts, so a bug that resolves tokens
+    // against the gateway would send `10.9.9.9` — this asserts the target's
+    // `10.0.0.9`. And a bug that delivers locally would create a terminal.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // The gateway session got the TARGET's address, verbatim — never the gateway's.
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -a sol activate\n"]);
+    // Never a local terminal, and never a fresh connect (the gateway was already up).
+    expect(createdTerminals).toHaveLength(0);
+    expect(connectServer).not.toHaveBeenCalled();
+  });
+
+  it("keeps an UNRELATED local macro on a gateway server LOCAL — no gateway session touched", async () => {
+    // The finding-2 regression: a plain `ping` helper with NO route and NO IPMI
+    // token, on a server that HAS a gateway. The gateway is given a live session
+    // so a "gateway set ⇒ route everything" impl would visibly deliver there
+    // (gwSent length 1, createdTerminals 0) — this asserts the opposite.
+    const target = server({ id: "srv-1", name: "Target", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([{ id: "a", name: "Ping", text: "ping ${profile.host}\n", runIn: "localTerminal" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].sent).toEqual(["ping 10.1.2.3\n"]);
+    expect(gwSent).toEqual([]);
+    expect(connectServer).not.toHaveBeenCalled();
+  });
+
+  it("keeps an EXPLICITLY route:local macro on a gateway server local too (the field is not advisory)", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "local" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(gwSent).toEqual([]);
+  });
+
+  it("FALLS BACK to a local terminal — plus the note — when route:ipmiGateway but the target has no gateway", async () => {
+    // Fails BOTH against an impl that refuses the run (createdTerminals would be
+    // 0) AND against one that drops the note.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9" });
+    const ctx = routingContext({ servers: [target] });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].sent).toEqual([" ipmitool -H 10.0.0.9 -a sol activate\n"]);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
+  });
+
+  it("FALLS BACK to local when the gateway id is dangling (names no server in the snapshot)", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "ghost" });
+    const ctx = routingContext({ servers: [target] });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
+  });
+
+  it("treats an untrusted route ('IPMIGATEWAY') as local, on a gateway server", async () => {
+    // The dispatch half of the untrusted-route unit test: a direct `===` read
+    // would route this onto the bastion; the resolver reads it as local.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      { id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "IPMIGATEWAY" as TerminalMacro["route"] }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(gwSent).toEqual([]);
+  });
+
+  it("emits the route re-consent note for a LOCAL-routed IPMI macro on a gateway server, and still runs locally", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const ctx = routingContext({ servers: [target, gateway] });
+    // Local-routed (no route), text uses ${profile.ipmiHost}.
+    await setMacros([{ id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} sol activate\n", runIn: "localTerminal" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("set 'Run on: the server's IPMI gateway'");
+    expect(status).toContain("Bastion");
+  });
+
+  it("does NOT emit the re-consent note for a local macro with NO IPMI token on the same gateway server", async () => {
+    // The scoping sibling: keyed on IPMI-token usage, not on the server's gateway
+    // alone — otherwise it would nag on every unrelated local helper.
+    const target = server({ id: "srv-1", name: "Target", host: "10.1.2.3", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const ctx = routingContext({ servers: [target, gateway] });
+    await setMacros([{ id: "a", name: "Ping", text: "ping ${profile.host}\n", runIn: "localTerminal" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).not.toContain("Run on:");
+  });
+
+  it("B1 — does NOT emit the re-consent note for a SESSION macro with an IPMI token on a gateway server (keeps the session hint)", async () => {
+    // The re-consent note is scoped to localTerminal macros; a session macro
+    // with `${profile.ipmiHost}` on a gateway server used to get BOTH it (false +
+    // self-contradictory) and the session hint. Only the session hint is correct.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const sent: string[] = [];
+    const sessTerminal = { name: "Nexus SSH: Target", sendText: (t: string) => sent.push(t) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-t", serverId: "srv-1" }],
+      terminals: new Map<string, unknown>([["sess-t", sessTerminal]])
+    });
+    await setMacros([{ id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} sol activate\n", runIn: "session" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    // The false, contradictory re-consent copy is gone...
+    expect(status).not.toContain("This macro runs on this machine");
+    expect(status).not.toContain("set 'Run on:");
+    // ...but the existing (correct) session hint is unchanged.
+    expect(status).toContain("ran in the SSH session on the remote host");
+  });
+
+  it("B1 — does NOT emit the re-consent note for a BROWSER macro with an IPMI token on a gateway server", async () => {
+    // A browser macro has no "Run on" field for the note to point at, so pointing
+    // there is a dead end; the note must not fire on this target either.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const ctx = routingContext({ servers: [target, gateway] });
+    await setMacros([{ id: "a", name: "Web", text: "https://${profile.ipmiHost}/", runIn: "browser" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(openExternal).toHaveBeenCalled();
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).not.toContain("This macro runs on this machine");
+    expect(status).not.toContain("set 'Run on:");
+  });
+
+  it("B2 — reveals the gateway session terminal on delivery of a route:ipmiGateway macro", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const show = vi.fn();
+    const gwTerminal = { name: "Nexus SSH: Bastion", show, sendText: () => {} };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // The interactive `-a` prompt sits hidden until the terminal is focused.
+    expect(show).toHaveBeenCalled();
+  });
+
+  it("S2 — names the routing context in the connect-first modal on the gateway path", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    // No gateway session yet → the connect-first modal is shown.
+    const ctx = routingContext({ servers: [target, gateway] });
+    showWarningMessage.mockResolvedValue(undefined); // decline — the message is what we assert
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const msg = String(showWarningMessage.mock.calls[0][0]);
+    expect(msg).toContain('"Bastion" (IPMI gateway for "Core Switch")');
+  });
+
+  it("P4 — a server naming ITSELF as its IPMI gateway is treated as no gateway (local fall-back + note)", async () => {
+    // A hand-edited/exported self-reference must not deliver into the target's own
+    // session; it resolves to no gateway, so the run falls back to a local terminal.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "srv-1" });
+    const ctx = routingContext({ servers: [target] });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
+  });
+
+  /**
+   * Issue #48 PR-C — the behavioral half of the share-export gateway remap
+   * (roadmap §4.3, rev11), the two-field interaction end to end:
+   *
+   *  1. A share bundle is produced with `sanitizeForSharing`, which remaps A's
+   *     `ipmiGatewayServerId` to B's NEW id (the data assertion lives in
+   *     configImportExport.test.ts). The exported ids are the ones this test then
+   *     routes against, so a remap that dangled would surface here as a fall-back.
+   *  2. The macro imports LOCAL-ROUTED — `stripImportedCapabilityFields` deletes
+   *     `route` on every ingest path — so before the user re-consents it runs on
+   *     THIS machine, never on the imported bastion.
+   *  3. The user re-ticks "Run on: the server's IPMI gateway" (modelled by setting
+   *     `route` back locally), and only THEN does gateway delivery happen, against
+   *     the imported A/B pair.
+   *
+   * THE RE-CONSENT STEP IS THE PROPERTY UNDER TEST — do not optimise it away. A
+   * reviewer who deletes it (or exempts `route` from the strip to "make it work")
+   * has re-created the unconsented-bastion-execution hole the strip exists to
+   * close. Steps 2 and 3 are asserted as opposites so neither can pass vacuously.
+   */
+  it("imports local-routed (runs locally), then delivers to the imported gateway ONLY after the user re-consents to routing", async () => {
+    const originalTarget = server({ id: "A", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "B" });
+    const originalGateway = server({ id: "B", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const originalMacro: TerminalMacro = {
+      id: "m", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway"
+    };
+
+    // Export → the bundle carries A' and B' with remapped ids, A'.gateway === B'.id.
+    const bundle = sanitizeForSharing([originalTarget, originalGateway], [], [], [], {}, [], [originalMacro]);
+    const importedTarget = bundle.servers.find((s) => s.name === "Target")!;
+    const importedGateway = bundle.servers.find((s) => s.name === "Bastion")!;
+    expect(importedTarget.ipmiGatewayServerId).toBe(importedGateway.id);
+    // Import strips the route — the imported macro is local by construction.
+    const importedMacro = stripImportedCapabilityFields(bundle.macros[0]);
+    expect("route" in importedMacro).toBe(false);
+
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [importedTarget, importedGateway],
+      sessions: [{ id: "sess-gw", serverId: importedGateway.id }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+
+    // BEFORE re-consent: local-routed → a local terminal, gateway untouched.
+    await setMacros([importedMacro]);
+    await pickFirst();
+    await runMacroOnServer(ctx, { server: importedTarget });
+    expect(createdTerminals).toHaveLength(1);
+    expect(gwSent).toEqual([]);
+
+    // AFTER re-consent: the user re-ticks "Run on", and NOW it rides the imported
+    // gateway's session — proving A'.ipmiGatewayServerId resolves to imported B'.
+    createdTerminals.length = 0;
+    await setMacros([{ ...importedMacro, route: "ipmiGateway" }]);
+    await pickFirst();
+    await runMacroOnServer(ctx, { server: importedTarget });
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -a sol activate\n"]);
+    expect(createdTerminals).toHaveLength(0);
+  });
+
+  it("does not read the terminal environment for a gateway-routed macro even when provideIpmiCredentials is on (the flag is inert)", async () => {
+    // The credential must never be typed into a remote shell: the gateway path
+    // skips the vault/prompt entirely, and the inert-combination note is surfaced.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiAuthProfileId: "ap-1", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    openTerminals = [gwTerminal] as typeof openTerminals;
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [{ id: "sess-gw", serverId: "gw-1" }], servers: [target, gateway] }),
+        getAuthProfile: (id: string) => (id === "ap-1" ? authProfile() : undefined),
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secretVault: { get: async () => "s3cr3t", store: async () => {}, delete: async () => {} }
+    } as unknown as Partial<CommandContext>);
+    await setMacros([
+      { id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway", provideIpmiCredentials: true }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // Delivered to the gateway, no local terminal, and no credential prompt.
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -a sol activate\n"]);
+    expect(createdTerminals).toHaveLength(0);
+    expect(showInputBox).not.toHaveBeenCalled();
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    // Reworded (PR-C round 4): the inert note points at the `-a` form instead of
+    // unconditionally promising a bare prompt — and this GW_SOL command is `-a`,
+    // so the inert note (not the `-E` warning) is the correct one here.
+    expect(status).toContain("ipmitool prompts on the gateway via its `-a` form instead");
+    expect(status).not.toContain("reads the IPMI password from the environment");
+  });
+
+  it("WARNS that a `-E` gateway command will fail (it reads the password from env, which the gateway can't provide) and does NOT promise a prompt", async () => {
+    // The P2 (Codex round 4): every shipped LOCAL IPMI template uses `-E`. Flip
+    // its "Run on" to the gateway and the command is delivered UNCHANGED — with no
+    // env on the bastion, ipmitool exits "password not available" INSTEAD of
+    // prompting. Against 576b39c this path emits the prompt-promising inert note
+    // and NO warning, so this test is red there and green after.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiAuthProfileId: "ap-1", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    openTerminals = [gwTerminal] as typeof openTerminals;
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [{ id: "sess-gw", serverId: "gw-1" }], servers: [target, gateway] }),
+        getAuthProfile: (id: string) => (id === "ap-1" ? authProfile() : undefined),
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secretVault: { get: async () => "s3cr3t", store: async () => {}, delete: async () => {} }
+    } as unknown as Partial<CommandContext>);
+    // The shipped LOCAL template form: reads the password from the environment via `-E`.
+    await setMacros([
+      { id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} -E sol activate\n", runIn: "localTerminal", route: "ipmiGateway", provideIpmiCredentials: true }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    // The accurate warning fires, naming the gateway and pointing at `-a`.
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    expect(status).toContain("use ipmitool's -a form");
+    // The over-promising inert copy is REPLACED, not doubled — no bare prompt promise.
+    expect(status).not.toContain("prompts on the gateway via its `-a` form instead");
+    expect(status).not.toContain("will prompt on the gateway");
+    // The security invariant is unchanged: delivered to the GATEWAY, verbatim, with
+    // no local terminal, no vault prompt, and no env/secret injected anywhere.
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -E sol activate\n"]);
+    expect(createdTerminals).toHaveLength(0);
+    expect(showInputBox).not.toHaveBeenCalled();
+    expect(gwSent.join("")).not.toContain("s3cr3t");
+  });
+
+  it("WARNS on a `-E` that sits on a backslash-CONTINUED line of a gateway ipmitool command (Codex round 6 P2)", async () => {
+    // A shell backslash-newline is a line continuation: the lines join into ONE
+    // ipmitool invocation, so a `-E` on a continued line is still its argument and
+    // still fails on the bastion. Round 5's `[^;&|\n]*` stopped at the newline and
+    // returned false → no warning → red against 751810a, green after normalizing
+    // continuations.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiAuthProfileId: "ap-1", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    openTerminals = [gwTerminal] as typeof openTerminals;
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [{ id: "sess-gw", serverId: "gw-1" }], servers: [target, gateway] }),
+        getAuthProfile: (id: string) => (id === "ap-1" ? authProfile() : undefined),
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secretVault: { get: async () => "s3cr3t", store: async () => {}, delete: async () => {} }
+    } as unknown as Partial<CommandContext>);
+    await setMacros([
+      {
+        id: "a",
+        name: "SOL",
+        text: "ipmitool -I lanplus \\\n  -H ${profile.ipmiHost} -U admin \\\n  -E sol activate\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway",
+        provideIpmiCredentials: true
+      }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    // The over-promising inert copy is REPLACED, not doubled.
+    expect(status).not.toContain("prompts on the gateway via its `-a` form instead");
+  });
+
+  it("WARNS on a `-E` gateway command even with provideIpmiCredentials OFF — the warning is keyed on the command, not the flag", async () => {
+    // Falsifies a flag-only implementation: with the credentials flag off, a
+    // flag-gated note would stay silent, but the `-E` command still fails on the
+    // gateway, so the warning must still fire.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      { id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} -E sol activate\n", runIn: "localTerminal", route: "ipmiGateway", provideIpmiCredentials: false }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -E sol activate\n"]);
+  });
+
+  it("WARNS on a gateway command whose `-E` is QUOTED — the shell strips the quotes, ipmitool still reads the env (Codex round 7 P2)", async () => {
+    // `ipmitool '-E' sol activate`: the shell hands ipmitool a standalone `-E`, so
+    // it still fails on the bastion. Round 6 required horizontal whitespace before
+    // the dash and returned false → no warning → red against c1a00a1, green after
+    // widening the delimiter to accept quotes.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      { id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} '-E' sol activate\n", runIn: "localTerminal", route: "ipmiGateway", provideIpmiCredentials: true }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 '-E' sol activate\n"]);
+  });
+
+  it("WARNS on a gateway command whose `-E` is glued to a redirection (`-E>/tmp/log`), Codex round 8 P2", async () => {
+    // `ipmitool -E>/tmp/ipmi.log …`: the shell reads `-E` as a standalone flag and
+    // `>` as redirection, so ipmitool still gets a bare `-E` and still fails on the
+    // bastion with no env. Round 7's `(?=[\s'"]|$)` lookahead returned false for
+    // `-E>` → no warning → red against 3c38972, green after closing the class.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      {
+        id: "a",
+        name: "SOL",
+        text: " ipmitool -H ${profile.ipmiHost} -E>/tmp/ipmi.log chassis power status\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway",
+        provideIpmiCredentials: true
+      }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    // The over-promising inert copy is REPLACED, not doubled.
+    expect(status).not.toContain("prompts on the gateway via its `-a` form instead");
+    // Delivered to the gateway verbatim — the redirection is preserved in the text.
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -E>/tmp/ipmi.log chassis power status\n"]);
+  });
+
+  it("does NOT emit the `-E` warning for an `-a` gateway command — that gets the (accurate) inert note", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      { id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway", provideIpmiCredentials: true }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    // The `-a` command prompts correctly on the bastion — inert note, no warning.
+    expect(status).toContain("ipmitool prompts on the gateway via its `-a` form instead");
+    expect(status).not.toContain("reads the IPMI password from the environment");
+  });
+
+  it("does NOT emit the `-E` warning when the `-E` belongs to a WRAPPER and ipmitool uses `-a` (round-5 false positive)", async () => {
+    // `sudo -E ipmitool … -a`: the `-E` is sudo's preserve-environment, and ipmitool
+    // itself uses `-a` and prompts fine on the bastion. Round 4's predicate matched
+    // the wrapper's `-E` and wrongly emitted the "will fail on the gateway" warning;
+    // this asserts the scoped predicate gives the accurate `-a` inert note instead.
+    // Red against bdcd6c0 (which emits the false `-E` warning), green after.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      {
+        id: "a",
+        name: "SOL",
+        text: " sudo -E ipmitool -I lanplus -H ${profile.ipmiHost} -a sol activate\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway",
+        provideIpmiCredentials: true
+      }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // Delivered to the gateway verbatim — the wrapper `-E` is preserved in the text.
+    expect(gwSent).toEqual([" sudo -E ipmitool -I lanplus -H 10.0.0.9 -a sol activate\n"]);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    // The `-a` command prompts on the bastion — accurate inert note, NO `-E` warning.
+    expect(status).toContain("ipmitool prompts on the gateway via its `-a` form instead");
+    expect(status).not.toContain("reads the IPMI password from the environment");
+    expect(status).not.toContain("it will fail on Bastion");
+  });
+
+  it("leaves a LOCAL (non-routed) `-E` macro unchanged — env injected as today, no gateway note, no `-E` warning", async () => {
+    // Regression: the `-E` predicate must not leak into the local path, where the
+    // credential IS legitimately injected into the environment of a local terminal.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiAuthProfileId: "ap-1" });
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [], servers: [target] }),
+        getAuthProfile: (id: string) => (id === "ap-1" ? authProfile() : undefined),
+        onDidChange: () => () => {}
+      },
+      secretVault: { get: async () => "s3cr3t-bmc", store: async () => {}, delete: async () => {} }
+    } as unknown as Partial<CommandContext>);
+    await setMacros([
+      { id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} -E sol activate\n", runIn: "localTerminal", provideIpmiCredentials: true }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // A local terminal is created WITH the injected IPMI env (unchanged behaviour).
+    expect(createdTerminals).toHaveLength(1);
+    expect("env" in createdTerminals[0].options).toBe(true);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).not.toContain("reads the IPMI password from the environment");
+    expect(status).not.toContain("prompts on the gateway");
+  });
+});
+
+describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", () => {
+  it("matches a standalone `-E` that is an argument of an ipmitool invocation", () => {
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus -H x -U y -E sol activate")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -H 10.0.0.9 -E sol activate")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -E chassis power status")).toBe(true);
+    // A wrapper before ipmitool is fine — the `-E` still follows ipmitool.
+    expect(commandReadsIpmiEnv("sudo ipmitool -E sol activate")).toBe(true);
+    // `\bipmitool\b` matches inside a path prefix.
+    expect(commandReadsIpmiEnv("/usr/bin/ipmitool -H 10.0.0.9 -E sol activate")).toBe(true);
+  });
+
+  it("matches a QUOTED standalone `-E` the shell strips to `-E` (Codex round 7 P2)", () => {
+    // `ipmitool '-E' sol activate` / `ipmitool "-E" sol activate`: the shell strips
+    // the quotes and ipmitool receives a standalone `-E`. Round 6 required
+    // horizontal whitespace immediately before the dash and returned false here —
+    // this asserts a quote delimiter around `-E` is accepted too.
+    expect(commandReadsIpmiEnv("ipmitool '-E' sol activate")).toBe(true);
+    expect(commandReadsIpmiEnv('ipmitool "-E" sol activate')).toBe(true);
+  });
+
+  it("matches `-E` at end of line and before a trailing newline (same segment)", () => {
+    expect(commandReadsIpmiEnv("ipmitool sol activate -E")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool sol activate -E\n")).toBe(true);
+  });
+
+  it("matches a compact `-E` bounded by a shell metacharacter, not just whitespace/quote (Codex round 8 P2)", () => {
+    // The shell treats `-E` as a standalone flag and the following metacharacter
+    // as its own token, so ipmitool still receives a bare `-E`. Round 7's
+    // `(?=[\s'"]|$)` accepted only whitespace/quote/end and returned false for
+    // `-E>` etc. — red against 3c38972, green after closing the terminator class.
+    expect(commandReadsIpmiEnv("ipmitool -E>/tmp/ipmi.log chassis power status")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -E</dev/null sol")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -E;echo done")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -E|tee log")).toBe(true);
+    expect(commandReadsIpmiEnv("(ipmitool -E)")).toBe(true);
+  });
+
+  it("matches a `-E` on a backslash-CONTINUED line of the ipmitool command (Codex round 6 P2)", () => {
+    // A backslash-newline joins the lines into one command; the continued `-E` is
+    // still an ipmitool argument. Round 5's `[^;&|\n]*` stopped at the newline and
+    // returned false here — this asserts the normalized predicate returns true.
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\n  -E sol activate")).toBe(true);
+    // Multi-line continuation.
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\n  -H x -U y \\\n  -E sol activate")).toBe(true);
+    // CRLF continuation.
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\r\n  -E sol activate")).toBe(true);
+  });
+
+  it("does NOT match a `-E` that starts the line after an ipmitool command at a BARE (unescaped) newline (round-6 residual false positive)", () => {
+    // An unescaped newline is a real command boundary; the next-line `-E` is not an
+    // argument of the ipmitool call above it. Round 5's `\s`-before-`-E` spanned the
+    // bare newline and returned TRUE here — this asserts the horizontal-whitespace
+    // predicate returns false.
+    expect(commandReadsIpmiEnv("ipmitool -a sol activate\n-E foo")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -a sol activate\r\n-E foo")).toBe(false);
+  });
+
+  it("does NOT match a `-E` owned by a WRAPPER before ipmitool (the round-5 false positive)", () => {
+    // `sudo -E ipmitool … -a`: the `-E` is sudo's preserve-environment and comes
+    // BEFORE ipmitool; ipmitool itself uses `-a` and prompts. Round 4's predicate
+    // returned true here — this asserts the scoped predicate returns false.
+    expect(commandReadsIpmiEnv("sudo -E ipmitool -I lanplus -H x -U y -a sol activate")).toBe(false);
+    // Leading `-E` with no ipmitool argument of its own.
+    expect(commandReadsIpmiEnv("-E ipmitool -a")).toBe(false);
+  });
+
+  it("does NOT match a `-E` in a PIPED non-ipmitool segment", () => {
+    // `[^;&|\n]*` stops at the `|`, so the `grep -E` on the far side is out of scope.
+    expect(commandReadsIpmiEnv("ipmitool -a sol activate | grep -E foo")).toBe(false);
+  });
+
+  it("does NOT match a `-E` behind a `;`/`&` command separator from the ipmitool call", () => {
+    // `[^;&|\n]*` cannot cross a `;`, `&` or `|`, so a `-E` in a following command
+    // is out of the ipmitool segment's scope.
+    expect(commandReadsIpmiEnv("ipmitool -a sol; -E chassis")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -a sol && -E chassis")).toBe(false);
+    // No ipmitool token at all.
+    expect(commandReadsIpmiEnv("first line\n-E chassis")).toBe(false);
+  });
+
+  it("does NOT match when the command word is not ipmitool (`ipmitoolx`)", () => {
+    expect(commandReadsIpmiEnv("ipmitoolx -E")).toBe(false);
+  });
+
+  it("does NOT match `-E` embedded in another word", () => {
+    expect(commandReadsIpmiEnv("ipmitool -Example sol")).toBe(false);
+    expect(commandReadsIpmiEnv("foo-E bar")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -Env")).toBe(false);
+    // A quoted `-Example` must not match either — the char after -E is `x`, a
+    // word-continuation char, so the trailing negative lookahead rejects it
+    // (Codex round 7/8 P2).
+    expect(commandReadsIpmiEnv("ipmitool '-Example'")).toBe(false);
+  });
+
+  it("does NOT match a `-E` immediately glued to a word-continuation char (`=`/`/`), Codex round 8 P2", () => {
+    // `-E=foo` and `-E/path` are single ipmitool tokens, NOT a standalone `-E`
+    // followed by a redirection — the char after -E (`=`/`/`) is a
+    // word-continuation char, so the closed terminator class rejects them. This
+    // is the pair the round-8 lookahead must NOT over-accept while it starts
+    // accepting `-E>`.
+    expect(commandReadsIpmiEnv("ipmitool -E=foo sol")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -E/path sol")).toBe(false);
+  });
+
+  it("does NOT match a QUOTED `-E` owned by a wrapper before ipmitool (round 7 P2)", () => {
+    // `sudo '-E' ipmitool … -a`: the quoted `-E` is still BEFORE ipmitool; ipmitool
+    // itself uses `-a`. The `\bipmitool\b` prefix keeps this out of scope.
+    expect(commandReadsIpmiEnv("sudo '-E' ipmitool -I lanplus -H x -U y -a sol activate")).toBe(false);
+  });
+
+  it("does NOT match a command with no `-E` flag", () => {
+    expect(commandReadsIpmiEnv("ipmitool -H 10.0.0.9 -a sol activate")).toBe(false);
+    expect(commandReadsIpmiEnv("show version")).toBe(false);
   });
 });

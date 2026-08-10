@@ -711,6 +711,91 @@ describe("NexusCore", () => {
     expect(core.getSnapshot().authProfiles).toHaveLength(0);
   });
 
+  it("removeServer sweeps ipmiGatewayServerId from other servers referencing the deleted server (issue #48 PR-C, PR #65 Codex round 9)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // A gateway server B, a server A routing its IPMI through B, and an
+    // unrelated server C routing through a DIFFERENT still-present gateway D.
+    await core.addOrUpdateServer({
+      id: "B", name: "Gateway B", host: "b", port: 22, username: "u",
+      authType: "password", isHidden: false
+    });
+    await core.addOrUpdateServer({
+      id: "D", name: "Gateway D", host: "d", port: 22, username: "u",
+      authType: "password", isHidden: false
+    });
+    await core.addOrUpdateServer({
+      id: "A", name: "Target A", host: "a", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "rack/1", ipmiGatewayServerId: "B"
+    });
+    await core.addOrUpdateServer({
+      id: "C", name: "Target C", host: "c", port: 22, username: "u",
+      authType: "password", isHidden: false, ipmiGatewayServerId: "D"
+    });
+
+    await core.removeServer("B");
+
+    // A's dangling gateway is cleared; its unrelated fields are intact.
+    const a = core.getServer("A");
+    expect(a?.ipmiGatewayServerId).toBeUndefined();
+    expect(a?.group).toBe("rack/1");
+    expect(a?.name).toBe("Target A");
+    // C references a still-present gateway (D) and is untouched by B's deletion.
+    expect(core.getServer("C")?.ipmiGatewayServerId).toBe("D");
+    expect(core.getServer("B")).toBeUndefined();
+
+    // The sweep persists: a fresh core reads the cleared reference from disk.
+    const core2 = new NexusCore(repository);
+    await core2.initialize();
+    expect(core2.getServer("A")?.ipmiGatewayServerId).toBeUndefined();
+    expect(core2.getServer("C")?.ipmiGatewayServerId).toBe("D");
+  });
+
+  it("removeFolderCascade with deleteContents sweeps ipmiGatewayServerId from OUTSIDE servers referencing a deleted-in-folder gateway (issue #48 PR-C, PR #65 Codex round 10)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // Gateway B lives inside the folder to be deleted; A (outside) and C
+    // (outside) both route their IPMI through a gateway. A -> B (about to be
+    // deleted with the folder), C -> D (a still-present gateway, also outside).
+    await core.addOrUpdateServer({
+      id: "D", name: "Gateway D", host: "d", port: 22, username: "u",
+      authType: "password", isHidden: false
+    });
+    await core.addOrUpdateServer({
+      id: "B", name: "Gateway B", host: "b", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Rack"
+    });
+    await core.addOrUpdateServer({
+      id: "A", name: "Target A", host: "a", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Safe", ipmiGatewayServerId: "B"
+    });
+    await core.addOrUpdateServer({
+      id: "C", name: "Target C", host: "c", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "Safe", ipmiGatewayServerId: "D"
+    });
+
+    await core.removeFolderCascade("Rack", true);
+
+    // B is gone with the folder; A's dangling gateway is cleared, its other
+    // fields intact; C still points at the surviving gateway D.
+    expect(core.getServer("B")).toBeUndefined();
+    const a = core.getServer("A");
+    expect(a?.ipmiGatewayServerId).toBeUndefined();
+    expect(a?.group).toBe("Safe");
+    expect(a?.name).toBe("Target A");
+    expect(core.getServer("C")?.ipmiGatewayServerId).toBe("D");
+
+    // The sweep persists through the same folded saveServers write.
+    const core2 = new NexusCore(repository);
+    await core2.initialize();
+    expect(core2.getServer("A")?.ipmiGatewayServerId).toBeUndefined();
+    expect(core2.getServer("C")?.ipmiGatewayServerId).toBe("D");
+  });
+
   it("removeAuthProfile saves servers when references cleared", async () => {
     const repository = new InMemoryConfigRepository(
       [],

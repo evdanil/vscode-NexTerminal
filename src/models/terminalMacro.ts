@@ -104,7 +104,24 @@ export interface TerminalMacro {
    * person it binds is the person who ticked it.
    */
   provideIpmiCredentials?: boolean;
+  /** Where a `runIn: "localTerminal"` macro's terminal actually lives.
+   *  "local" (the default, and the meaning of ABSENT) = this machine, today's
+   *  behavior. "ipmiGateway" = the target server's IPMI gateway session, when
+   *  one is configured. Meaningless for other run targets. UNTRUSTED at every
+   *  read site like `runIn`: resolve through a helper that maps anything
+   *  outside the union to "local".
+   *
+   *  NEVER SURVIVES AN IMPORT (`IMPORTED_CAPABILITY_FIELDS`, below): it chooses
+   *  an EXECUTION HOST, so an imported macro carrying it would run its author's
+   *  command in an SSH session on the importer's bastion — usually the most
+   *  privileged box in the topology. Consent is re-given locally by re-ticking
+   *  "Run on" in the macro editor, or the routing is off. */
+  route?: "local" | "ipmiGateway";
 }
+
+export type MacroRoute = "local" | "ipmiGateway";
+
+export const MACRO_ROUTES: readonly MacroRoute[] = ["local", "ipmiGateway"];
 
 /**
  * The run target a macro ACTUALLY has, applied at every read site (§4.2's
@@ -139,6 +156,41 @@ export function macroProvidesIpmiCredentials(
   return resolveMacroRunTarget(macro) === "localTerminal" && (macro.provideIpmiCredentials as unknown) === true;
 }
 
+/**
+ * The route a macro ACTUALLY has, applied at every read site (§4.2 Path B's
+ * untrusted-field discipline, identical to `resolveMacroRunTarget`): absent, a
+ * non-string, or a string outside `MACRO_ROUTES` all resolve to `"local"` — the
+ * compatibility default and the meaning of ABSENT — so an imported record
+ * carrying `route: "IPMIGATEWAY"` / `route: 7` behaves like the ordinary local
+ * macro it was before, never like one that runs on a bastion. This is the ONE
+ * read site; every consumer goes through it (a direct `===`/truthiness read is
+ * exactly the bug the untrusted-route test exists to catch).
+ */
+export function resolveMacroRoute(macro: Pick<TerminalMacro, "route">): MacroRoute {
+  const raw = macro.route as unknown;
+  return typeof raw === "string" && (MACRO_ROUTES as readonly string[]).includes(raw)
+    ? (raw as MacroRoute)
+    : "local";
+}
+
+/**
+ * The non-blocking note shown when `route: "ipmiGateway"` and
+ * `provideIpmiCredentials` are BOTH on: env injection cannot cross to a remote
+ * shell, so the credentials flag is inert and ipmitool's own `-a` prompt supplies
+ * the password on the bastion tty instead. Deliberately not an error — a user may
+ * flip `route` back and forth on one macro. Defined here so the macro editor's
+ * live hint and the per-run delivery note read from ONE string and cannot drift.
+ *
+ * POINTS AT `-a`, DOES NOT PROMISE A BARE PROMPT (PR-C round 4, P2). ipmitool only
+ * prompts on the gateway when the command uses its `-a` form; a command that reads
+ * the password from the environment (`-E`) gets no env on the gateway and simply
+ * FAILS there. So this shared copy names the `-a` form rather than promising an
+ * unconditional prompt — the run-time `-E`-on-gateway warning
+ * (`gatewayEnvPasswordNote`) covers the failing case that this editor hint can't.
+ */
+export const IPMI_GATEWAY_INERT_CREDENTIALS_HINT =
+  "IPMI credentials can't be sent to a gateway session — ipmitool prompts on the gateway via its `-a` form instead";
+
 /** Human-readable label for a run target, shared by the editor and the pickers. */
 export function macroRunTargetLabel(target: MacroRunTarget): string {
   switch (target) {
@@ -152,15 +204,50 @@ export function macroRunTargetLabel(target: MacroRunTarget): string {
 }
 
 /**
- * The `[Local terminal] ` / `[Browser] ` prefix pickers put in front of a
- * macro's description, and `""` for an ordinary session macro. One definition
- * so every picker that lists macros badges them identically — a macro that will
- * open a browser window instead of typing into the terminal is exactly the
- * thing a list of macros must not hide.
+ * Where a macro RUNS, route-aware, for launch-surface display (issue #48 PR-C).
+ * A `localTerminal` macro with `route: "ipmiGateway"` does not run on this
+ * machine — it runs in the target server's IPMI-gateway SSH session — so the
+ * badge and the sidebar tooltip must not say "Local terminal" and hide that
+ * execution-host change at selection time. The DECLARED route is what shows: a
+ * routed macro that falls back to local at run time (no gateway configured) is
+ * still gateway-INTENDED, which is what a launch surface should reflect (the
+ * fall-back note covers the runtime reality). Every other target is unaffected —
+ * `route` is meaningless off a local terminal.
+ *
+ * Wording follows the editor's "Run on" select (`src/ui/macroEditorHtml.ts`) so
+ * the editor, the badge, and the tooltip cannot drift.
  */
-export function macroRunTargetBadge(macro: Pick<TerminalMacro, "runIn">): string {
+export function macroRunPlacementLabel(macro: Pick<TerminalMacro, "runIn" | "route">): string {
   const target = resolveMacroRunTarget(macro);
-  return target === "session" ? "" : `[${macroRunTargetLabel(target)}] `;
+  if (target === "localTerminal" && resolveMacroRoute(macro) === "ipmiGateway") {
+    return "the server's IPMI gateway (falls back to this machine)";
+  }
+  return macroRunTargetLabel(target);
+}
+
+/** Whether a macro's placement is the gateway-routed case, so a caller can pick
+ * the "Runs on:" preposition (a gateway is a place a run runs ON) over the
+ * "Runs in:" the other targets read with. Route is meaningful only on a local
+ * terminal, so every other target answers false. */
+export function macroRunsOnGateway(macro: Pick<TerminalMacro, "runIn" | "route">): boolean {
+  return resolveMacroRunTarget(macro) === "localTerminal" && resolveMacroRoute(macro) === "ipmiGateway";
+}
+
+/**
+ * The `[Local terminal] ` / `[Browser] ` / `[IPMI gateway] ` prefix pickers put
+ * in front of a macro's description, and `""` for an ordinary session macro. One
+ * definition so every picker that lists macros badges them identically — a macro
+ * that will open a browser window, or run on a bastion instead of this machine,
+ * is exactly the thing a list of macros must not hide. Route-aware
+ * (`Pick<…, "runIn" | "route">`): a gateway-routed `localTerminal` macro badges
+ * as the SHORT `[IPMI gateway] ` rather than `[Local terminal] `.
+ */
+export function macroRunTargetBadge(macro: Pick<TerminalMacro, "runIn" | "route">): string {
+  const target = resolveMacroRunTarget(macro);
+  if (target === "session") {
+    return "";
+  }
+  return macroRunsOnGateway(macro) ? "[IPMI gateway] " : `[${macroRunTargetLabel(target)}] `;
 }
 
 /**
@@ -219,6 +306,31 @@ export function stripImportedCapabilityFields<T extends TerminalMacro>(macro: T)
   }
   return copy;
 }
+
+/**
+ * Whether an incoming macro carries a capability field that
+ * `stripImportedCapabilityFields` will actually remove — i.e. the strip is not a
+ * no-op for this record. Presence of the key (not its value) is the test: the
+ * editor only ever WRITES a capability field when it is meaningfully on
+ * (`provideIpmiCredentials: true`, `route: "ipmiGateway"`) and deletes it
+ * otherwise, so a present key is a capability the importing user is about to have
+ * reset. Drives the one-time import notice (S3) so an explicit backup/share import
+ * that silently strips routing/credentials tells the user it happened.
+ */
+export function hasImportedCapabilityField(macro: TerminalMacro): boolean {
+  return IMPORTED_CAPABILITY_FIELDS.some(
+    (field) => (macro as unknown as Record<string, unknown>)[field] !== undefined
+  );
+}
+
+/**
+ * The one-time notice shown after an explicit backup/share import strips a
+ * capability field from ≥1 incoming macro (S3). Verbatim per the roadmap
+ * (§3.3/§4.2). NOT fired on legacy Settings absorption — a modal there (Settings
+ * Sync replay) would be out of place.
+ */
+export const IMPORTED_CAPABILITY_RESET_NOTICE =
+  "Capability settings on imported macros (IPMI credentials, gateway routing) were reset; re-enable them on the macros you trust.";
 
 export const MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE =
   'A macro can auto-trigger or run outside its session, not both. Set "Run in" back to Session terminal, or clear the auto-trigger pattern.';
