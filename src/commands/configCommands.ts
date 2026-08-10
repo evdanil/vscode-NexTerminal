@@ -1857,6 +1857,12 @@ export function registerConfigCommands(
         // The BMC credential link goes through the same lens: it is a profile
         // reference like any other, and a share bundle's ids are the sender's.
         ipmiAuthProfileId: linkToImportedProfile(server.ipmiAuthProfileId),
+        // The IPMI gateway link is a SERVER-LIST reference, not a profile one, so
+        // it remaps through the same `idMap` as `proxy.jumpHostId` (server half) —
+        // NOT `linkToImportedProfile`. Dropped to `undefined` when the gateway is
+        // not in the bundle, mirroring `proxy.jumpHostId`'s out-of-set disposition
+        // and the export side: the sender's id would otherwise ride in stale.
+        ipmiGatewayServerId: server.ipmiGatewayServerId ? (idMap.get(server.ipmiGatewayServerId) ?? undefined) : undefined,
         origin: remapOriginStamp(server.origin),
         formerlySynced: undefined
       };

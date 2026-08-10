@@ -3281,6 +3281,73 @@ describe("share import", () => {
   });
 
   /**
+   * Issue #48 PR-C / PR #65 Codex review round 1 — the IMPORT half of the
+   * `ipmiGatewayServerId` round trip. The export-side remap (sanitizeForSharing)
+   * was already correct; `importShareData` never remapped this field, so the
+   * verbatim `...server` spread carried the sender's EXPORT-time gateway id into
+   * the imported record. On the recipient that id matches nothing —
+   * `resolveIpmiGatewayServer` fails and gateway-routed macros silently fall back
+   * to local. This test drives the ACTUAL import path (the share branch of
+   * applyNexusExportText → importShareData) with pre-existing servers so the
+   * import-time idMap reassigns ids, then asserts the imported target resolves to
+   * the imported gateway — not the dangling export-time id.
+   */
+  it("share import remaps ipmiGatewayServerId to the imported gateway's fresh id (kills the verbatim spread that carries the sender's export-time id, which resolves to nothing on the recipient)", async () => {
+    // Pre-existing servers so the import-time idMap must reassign ids (a no-op
+    // remap would otherwise be indistinguishable from carrying the id verbatim).
+    await core.addOrUpdateServer(makeServer({ id: "local-1", name: "Local A" }));
+    await core.addOrUpdateServer(makeServer({ id: "local-2", name: "Local B" }));
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({ id: "src-A", name: "Target", ipmiGatewayServerId: "src-B" }),
+        makeServer({ id: "src-B", name: "Bastion" })
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/ipmi-gateway.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.name === "Target")!;
+    const gateway = snapshot.servers.find((s) => s.name === "Bastion")!;
+
+    // THE CLAIM — the imported target can find its imported gateway. Under HEAD
+    // 8faf6d7 this holds the export-time "src-B", which resolves to nothing.
+    expect(target.ipmiGatewayServerId).toBe(gateway.id);
+    expect(target.ipmiGatewayServerId).not.toBe("src-B"); // not the export-time id
+    // …and it really resolves against the imported server list, not a dangle.
+    expect(snapshot.servers.some((s) => s.id === target.ipmiGatewayServerId)).toBe(true);
+  });
+
+  it("share import drops an ipmiGatewayServerId whose gateway is NOT in the bundle, rather than carrying it stale", async () => {
+    await core.addOrUpdateServer(makeServer({ id: "local-1", name: "Local A" }));
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [makeServer({ id: "src-A", name: "Target", ipmiGatewayServerId: "src-absent" })],
+      tunnels: [],
+      serialProfiles: []
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/ipmi-gateway-absent.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.name === "Target")!;
+    // Unset gateway = "the BMC is reachable locally", a safe recipient default;
+    // a stale id can only fail confusingly at run time.
+    expect(target.ipmiGatewayServerId).toBeUndefined();
+  });
+
+  /**
    * REVIEW FINDING (P2) — the share path's half of "a rejected record must not
    * leave references pointing at nothing". `importShareData` assigns every auth
    * profile a fresh id in its FIRST pass, before anything is validated, then remaps
