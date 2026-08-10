@@ -1402,7 +1402,9 @@ describe("applyPlanWrites — reference revalidation (PR-T3, PR #66 Codex round 
     await core.removeServer("GW");
 
     const applied = await applyPlanWrites(ctxFor(core), plan);
-    expect(applied).toBe(1);
+    // R's ONLY field was the gateway; it was revalidated away, so R is not counted
+    // as applied (round 11 — the count/toast must not claim an untouched server).
+    expect(applied).toBe(0);
     // The now-dangling gateway must NOT be persisted. Against the pre-fix writer
     // (unconditional `next.ipmiGatewayServerId = write.ipmiGatewayServerId`) R would
     // carry the dangling "GW" and this assertion fails.
@@ -1518,5 +1520,32 @@ describe("applyPlanWrites — detached receipt stamp clear (PR-T3, PR #66 Codex 
     const next = core.getServer("K")!;
     expect(next.formerlySynced?.templated?.ipmiGatewayServerId).toBeUndefined(); // cleared
     expect(next.formerlySynced?.templated?.ipmiAuthProfileId).toBe("PA"); // untouched — not written
+  });
+});
+
+describe("applyPlanWrites — skip a target whose only field was revalidated away (PR-T3, PR #66 Codex round 11)", () => {
+  it("does NOT count/save a server whose sole written field (a gateway) is deleted before apply", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "GW", name: "Gateway", host: "g", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    await core.addOrUpdateServer({ id: "R", name: "Target R", host: "r", port: 22, username: "u", authType: "agent", isHidden: false, group: "DC", origin: { sourceId: "src", externalId: "R", syncedAt: 1 } });
+
+    // Plan whose ONLY write for R is the IPMI gateway (GW live at plan time).
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "GW" } } },
+      servers: [core.getServer("R")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "GW" || id === "R"
+    });
+    expect(plan.serverWrites.find((w) => w.serverId === "R")?.writtenFields).toEqual(["ipmiGatewayServerId"]);
+
+    // GW pruned before apply → R's only field is skipped → R must NOT be counted.
+    await core.removeServer("GW");
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    // Against the pre-fix writer this returns 1 (saved + counted an unchanged R).
+    expect(applied).toBe(0);
+    // R is untouched: no dangling gateway persisted, origin intact.
+    expect(core.getServer("R")?.ipmiGatewayServerId).toBeUndefined();
+    expect(core.getServer("R")?.origin?.templated).toBeUndefined();
   });
 });

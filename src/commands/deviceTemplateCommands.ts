@@ -603,6 +603,16 @@ export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan
         dropWritten("ipmiGatewayServerId"); // gateway server pruned since the plan was computed
       }
     }
+    // PR-T3 review round 11 (Codex) — if reference revalidation above dropped the
+    // target's ONLY planned field (its sole write was a now-dangling reference),
+    // `writtenFields` is empty and `next` is byte-equal to `live`: nothing was
+    // applied. Skip the redundant save AND the `applied` count so the final toast
+    // does not claim the template was applied to a server whose one field was
+    // skipped. A target that still has any written field (a surviving reference, or
+    // a non-reference field like proxy/a boolean) falls through and is applied.
+    if (writtenFields.length === 0) {
+      continue;
+    }
     // §7.4 — clear the stamps of exactly the fields written, so every one reads
     // as a hand edit (row 7) to later syncs. `clearTemplatedStamps` also clears
     // `syncedAuthProfileId` when the auth link is among the written fields.
