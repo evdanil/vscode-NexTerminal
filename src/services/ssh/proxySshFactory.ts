@@ -126,7 +126,23 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     }
 
     this.assertNoCircularProxyChain(jumpServer, nextVisited);
-    const jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage);
+    // ALTERNATE HOST (issue #48, PR #67 Codex round 2) — tag a jump-host CONNECTION
+    // failure with jump-host provenance so `classifySshConnectionError` labels it
+    // `proxy` instead of the raw `tcp`/`dns` of the underlying socket error. The SSH
+    // terminal's alternate-host fallback (`SshPty`) excludes the `proxy` stage, so it
+    // will NOT retry the target's `altHost` through a jump host that is itself
+    // unreachable — both attempts would traverse the same failed hop, wasting a retry
+    // and, for unsaved credentials, repeating the pre-connect prompt. A failure that
+    // reaches the TARGET transport (below, through an established tunnel) keeps its own
+    // `tcp`/`dns` stage and still triggers the fallback, which correctly re-dials the
+    // target's alternate address VIA the (working) jump host.
+    let jumpConnection: SshConnection;
+    try {
+      jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Jump host connection failed (${jumpServer.name}): ${detail}`);
+    }
 
     // Each auth attempt gets its own TCP tunnel through the jump host.
     const sockFactory = async (): Promise<Duplex> => {

@@ -296,6 +296,33 @@ describe("ProxySshFactory", () => {
     expect(connection).toBeDefined();
   });
 
+  it("wraps a jump-host CONNECTION failure with jump-host provenance so it classifies as `proxy`, not `tcp` (PR #67 round 2)", async () => {
+    const jumpServer = makeServer({ id: "srv-jump", name: "Jump Host", host: "jump.example.com" });
+    const targetServer = makeServer({ proxy: { type: "ssh", jumpHostId: "srv-jump" } });
+    servers.set("srv-jump", jumpServer);
+
+    // The jump host itself is unreachable — the connect to it rejects with a RAW
+    // socket error carrying no proxy/jump context.
+    authFactory.connect = vi.fn(async (server: ServerConfig) => {
+      if (server.id === "srv-jump") {
+        throw Object.assign(new Error("connect ECONNREFUSED 10.9.9.9:22"), { code: "ECONNREFUSED" });
+      }
+      return makeFakeConnection();
+    });
+    const factory = await createFactory();
+
+    // Against the pre-fix code the raw ECONNREFUSED propagated verbatim (→ classifies
+    // `tcp` → the SshPty altHost fallback would retry through the same dead jump host).
+    await expect(factory.connect(targetServer)).rejects.toThrow(/Jump host connection failed/);
+
+    const { classifySshConnectionError } = await import("../../src/services/ssh/connectionDiagnostics");
+    expect(
+      classifySshConnectionError(
+        new Error("Jump host connection failed (Jump Host): connect ECONNREFUSED 10.9.9.9:22")
+      ).stage
+    ).toBe("proxy");
+  });
+
   it("threads context.onAuthMessage into authFactory.connect when server has no proxy", async () => {
     const factory = await createFactory();
     const server = makeServer();

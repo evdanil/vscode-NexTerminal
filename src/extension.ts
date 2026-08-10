@@ -28,6 +28,7 @@ import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { ProxySshFactory } from "./services/ssh/proxySshFactory";
 import { SshConnectionPool } from "./services/ssh/sshConnectionPool";
+import { pooledConnectionParamsChanged } from "./services/ssh/pooledConnectionParams";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
@@ -1047,17 +1048,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     syncViews();
     for (const server of snapshot.servers) {
       const prev = previousServers.get(server.id);
-      if (prev && (
-        prev.host !== server.host ||
-        prev.port !== server.port ||
-        prev.username !== server.username ||
-        prev.authType !== server.authType ||
-        prev.keyPath !== server.keyPath ||
-        prev.authProfileId !== server.authProfileId ||
-        prev.multiplexing !== server.multiplexing ||
-        prev.legacyAlgorithms !== server.legacyAlgorithms ||
-        JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)
-      )) {
+      if (prev && pooledConnectionParamsChanged(prev, server)) {
         pool.invalidate(server.id);
         // Clear stale proxy password when proxy endpoint changes to prevent
         // sending one proxy's credentials to a different proxy server.
