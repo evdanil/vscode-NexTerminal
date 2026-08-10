@@ -172,6 +172,224 @@ describe("NexusCore inventory sources", () => {
     expect(core2.getServer("C")?.ipmiGatewayServerId).toBe("D");
   });
 
+  it("(PR-T3) the applyInventorySyncPlan gateway prune also clears a surviving referrer's origin.templated.ipmiGatewayServerId stamp (kills leaving the new gateway value stamp behind after a bulk prune)", async () => {
+    // Gateway B is pruned; survivor A routes IPMI through B and carries the
+    // template-write stamp naming B; survivor C routes through still-present D.
+    const repository = new InMemoryConfigRepository([
+      { id: "B", name: "Gateway B", host: "b", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:B", syncedAt: 1 } },
+      { id: "D", name: "Gateway D", host: "d", port: 22, username: "u", authType: "agent", isHidden: false },
+      { id: "A", name: "Target A", host: "a", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "B", origin: { sourceId: "source-1", externalId: "device:A", syncedAt: 1, templated: { ipmiGatewayServerId: "B" } } },
+      { id: "C", name: "Target C", host: "c", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "D", origin: { sourceId: "source-1", externalId: "device:C", syncedAt: 1, templated: { ipmiGatewayServerId: "D" } } }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["B"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    const a = core.getServer("A");
+    expect(a?.ipmiGatewayServerId).toBeUndefined();
+    // Its only stamp named B → the bag collapses to undefined (single-member clear).
+    expect(a?.origin?.templated).toBeUndefined();
+    // C's live gateway stamp is untouched.
+    expect(core.getServer("C")?.origin?.templated?.ipmiGatewayServerId).toBe("D");
+  });
+
+  it("(PR-T3, PR #66 round 5) a BATCH prune of BOTH a diverged gateway stamp's target AND the current value preserves the user's divergence stamp (kills the membership test that erased stamp A)", async () => {
+    // Referrer R was template-stamped with gateway A, then the user hand-changed
+    // its current gateway to B (cur B ≠ stamp A — a row-6 divergence). A sync prune
+    // removes BOTH A and B in the same batch. R's current value B is deleted, so R
+    // enters the sweep — but its stamp names A, NOT the value being cleared, so the
+    // divergence stamp must SURVIVE. Under the old `deletedServerIds.has(stamp)`
+    // membership test, stamp A (also in the batch) was wrongly erased, leaving R
+    // value-less AND stamp-less → the next sync would template-write a new gateway
+    // over the user's edit. The equality gate (stamp === current value cleared)
+    // preserves it.
+    const repository = new InMemoryConfigRepository([
+      { id: "A", name: "Gateway A", host: "a", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:A", syncedAt: 1 } },
+      { id: "B", name: "Gateway B", host: "b", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:B", syncedAt: 1 } },
+      // R: current gateway B (hand-diverged), stamp names A (the template's write).
+      { id: "R", name: "Referrer R", host: "r", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "B", origin: { sourceId: "source-1", externalId: "device:R", syncedAt: 1, templated: { ipmiGatewayServerId: "A" } } }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["A", "B"], // batch removes BOTH the stamp target and the current value
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    const r = core.getServer("R");
+    // Current value B is deleted → cleared.
+    expect(r?.ipmiGatewayServerId).toBeUndefined();
+    // Divergence stamp A (≠ the cleared value B) must SURVIVE — this is the assertion
+    // that fails under the membership test (which deletes A because it's in the batch).
+    expect(r?.origin?.templated?.ipmiGatewayServerId).toBe("A");
+  });
+
+  it("(PR-T3, PR #66 round 5) a batch prune still clears an OWNED gateway stamp (cur === stamp) — regression", async () => {
+    // The owned case (cur === stamp === the deleted gateway) must still clear both,
+    // so the equality gate did not over-narrow.
+    const repository = new InMemoryConfigRepository([
+      { id: "B", name: "Gateway B", host: "b", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:B", syncedAt: 1 } },
+      { id: "X", name: "Other X", host: "x", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:X", syncedAt: 1 } },
+      { id: "R", name: "Referrer R", host: "r", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "B", origin: { sourceId: "source-1", externalId: "device:R", syncedAt: 1, templated: { ipmiGatewayServerId: "B" } } }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["B", "X"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    const r = core.getServer("R");
+    expect(r?.ipmiGatewayServerId).toBeUndefined();
+    // cur === stamp === B → both cleared, bag collapses.
+    expect(r?.origin?.templated).toBeUndefined();
+  });
+
+  it("(PR-T3, PR #66 round 7) applyInventorySyncPlan revalidates an UPSERTED server's ipmiGatewayServerId against the FINAL live set and clears a dangling one + its owned stamp (kills persisting a gateway deleted after plan time)", async () => {
+    // A survivor gateway that pre-exists this apply (a valid resolve target).
+    const repository = new InMemoryConfigRepository([
+      { id: "SURV", name: "Survivor GW", host: "s", port: 22, username: "u", authType: "agent", isHidden: false }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    const saveServersSpy = vi.spyOn(repository, "saveServers");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    // computeSyncPlan validated each gateway against a plan-time snapshot; a folder
+    // delete in another window (no configMutationLock) then pruned "GHOST" AFTER the
+    // snapshot, so the pre-apply guards still pass and the upsert lands here naming a
+    // gateway that no longer exists — and "GHOST" is NOT in removeServerIds, so the
+    // existing sweep misses it. U1 is template-owned on the dangling gateway
+    // (cur === stamp === GHOST). U2 routes through U3 (another upsert in THIS batch);
+    // U4 routes through the pre-existing survivor SURV — both must be preserved.
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [
+        { id: "U1", name: "Target U1", host: "u1", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "GHOST", origin: { sourceId: "source-1", externalId: "device:U1", syncedAt: 1, templated: { ipmiGatewayServerId: "GHOST" } } },
+        { id: "U2", name: "Target U2", host: "u2", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "U3", origin: { sourceId: "source-1", externalId: "device:U2", syncedAt: 1, templated: { ipmiGatewayServerId: "U3" } } },
+        { id: "U3", name: "Gateway U3", host: "u3", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:U3", syncedAt: 1 } },
+        { id: "U4", name: "Target U4", host: "u4", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "SURV", origin: { sourceId: "source-1", externalId: "device:U4", syncedAt: 1, templated: { ipmiGatewayServerId: "SURV" } } }
+      ],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    // U1's dangling gateway is cleared; its only stamp named GHOST (the value being
+    // cleared) → the bag collapses. Under HEAD 99207c5 U1 persists "GHOST".
+    const u1 = core.getServer("U1");
+    expect(u1?.ipmiGatewayServerId).toBeUndefined();
+    expect(u1?.origin?.templated).toBeUndefined();
+    // U2's gateway resolves to a same-batch upsert; U4's to a pre-existing survivor —
+    // both preserved with their stamps.
+    const u2 = core.getServer("U2");
+    expect(u2?.ipmiGatewayServerId).toBe("U3");
+    expect(u2?.origin?.templated?.ipmiGatewayServerId).toBe("U3");
+    const u4 = core.getServer("U4");
+    expect(u4?.ipmiGatewayServerId).toBe("SURV");
+    expect(u4?.origin?.templated?.ipmiGatewayServerId).toBe("SURV");
+
+    // Folded into the method's existing single persist + single emit — no second
+    // write, no second emit.
+    expect(saveServersSpy).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    // The cleared ref persisted through that one write.
+    const core2 = new NexusCore(repository);
+    await core2.initialize();
+    expect(core2.getServer("U1")?.ipmiGatewayServerId).toBeUndefined();
+    expect(core2.getServer("U2")?.ipmiGatewayServerId).toBe("U3");
+  });
+
+  it("(PR-T3, PR #66 round 7) the upserted-gateway revalidation honors the round-5 equality gate — a live value is untouched, and a diverged stamp survives a dangling-value clear", async () => {
+    const repository = new InMemoryConfigRepository([
+      { id: "SURV", name: "Survivor GW", host: "s", port: 22, username: "u", authType: "agent", isHidden: false }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [
+        // U5: value SURV is LIVE (resolves), stamp names a now-absent DIFFERENT id
+        // (a row-6 divergence). The value is live, so nothing is cleared and the
+        // equality gate never fires — value AND stamp both stand.
+        { id: "U5", name: "Target U5", host: "u5", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "SURV", origin: { sourceId: "source-1", externalId: "device:U5", syncedAt: 1, templated: { ipmiGatewayServerId: "GHOST-A" } } },
+        // U6: value GHOST-B is dangling, and the stamp names GHOST-C, NOT the value —
+        // so GHOST-B is a HAND value the user diverged to (cur !== stamp). Round 8:
+        // a hand/diverged gateway is §8.4 leave-alone, so BOTH the dangling value and
+        // the diverged stamp are preserved (the sync never overwrites a hand field).
+        { id: "U6", name: "Target U6", host: "u6", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "GHOST-B", origin: { sourceId: "source-1", externalId: "device:U6", syncedAt: 1, templated: { ipmiGatewayServerId: "GHOST-C" } } }
+      ],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    const u5 = core.getServer("U5");
+    expect(u5?.ipmiGatewayServerId).toBe("SURV");
+    expect(u5?.origin?.templated?.ipmiGatewayServerId).toBe("GHOST-A");
+    const u6 = core.getServer("U6");
+    // A dangling but HAND-diverged value (cur GHOST-B ≠ stamp GHOST-C) is preserved
+    // — the sync only cleans a gateway it OWNS (cur === stamp) that went stale.
+    expect(u6?.ipmiGatewayServerId).toBe("GHOST-B");
+    expect(u6?.origin?.templated?.ipmiGatewayServerId).toBe("GHOST-C");
+  });
+
+  it("(PR-T3, PR #66 round 8) the upserted-gateway revalidation LEAVES a hand-configured dangling gateway alone (kills clearing a hand field the planner deliberately carried through)", async () => {
+    // U7 carries a dangling gateway "PHANTOM" that was ALREADY dangling at plan time
+    // and is purely HAND-configured (no origin.templated stamp names it). The planner
+    // carries such a gateway through unchanged (§8.4 — it degrades to local at
+    // runtime); clearing it at application would overwrite a hand field and diverge
+    // from the preview even though nothing was deleted after planning. MUST fail
+    // against 1f16bdb, whose unconditional value clear wipes "PHANTOM".
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [
+        // No templated stamp at all → a hand-owned gateway. It is dangling (PHANTOM
+        // resolves to no server), but that is the user's field, not the sync's.
+        { id: "U7", name: "Target U7", host: "u7", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "PHANTOM", origin: { sourceId: "source-1", externalId: "device:U7", syncedAt: 1 } }
+      ],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    expect(core.getServer("U7")?.ipmiGatewayServerId).toBe("PHANTOM");
+  });
+
   it("(F12) writes lastSyncAt on the applied source only — a second source's lastSyncAt is untouched", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

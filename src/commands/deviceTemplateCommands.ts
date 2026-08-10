@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ProxyConfig, ServerConfig } from "../models/config";
 import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "../models/deviceTemplate";
 import {
+  clearDetachedTemplatedStamps,
   clearTemplatedStamps,
   filterLabel,
   parseTemplateFilter,
@@ -12,7 +13,7 @@ import {
   type ManualApplyPlan,
   type TemplatableField
 } from "../services/inventory/templateApply";
-import { buildRuleListItems, filterFeedback, saveOverlapWarnings } from "../services/inventory/templateRulesView";
+import { buildRuleListItems, filterFeedback, saveOverlapWarnings, templateSetsLabels } from "../services/inventory/templateRulesView";
 import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
 import type { InventorySourceConfig, TemplateRule } from "../models/inventory";
 import { configMutationLock } from "../services/configMutationLock";
@@ -102,6 +103,23 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
   const log = readTemplateField<boolean>(values, "logSession", () => values.logSession === true);
   if (log) {
     fields.logSession = log;
+  }
+  // PR-T3 — the two IPMI id references. Both submit under their own key from a
+  // filterable select; a "(None)"/empty pick or the `__create__` sentinel reads
+  // as "no value" (throws if a mode was chosen — same as the SSH auth row).
+  const ipmiAuth = readTemplateField<string>(values, "ipmiAuthProfileId", () => {
+    const raw = values.ipmiAuthProfileId;
+    return typeof raw === "string" && raw !== "" && !raw.startsWith("__create__") ? raw : undefined;
+  });
+  if (ipmiAuth) {
+    fields.ipmiAuthProfileId = ipmiAuth;
+  }
+  const ipmiGateway = readTemplateField<string>(values, "ipmiGatewayServerId", () => {
+    const raw = values.ipmiGatewayServerId;
+    return typeof raw === "string" && raw !== "" ? raw : undefined;
+  });
+  if (ipmiGateway) {
+    fields.ipmiGatewayServerId = ipmiGateway;
   }
   return { id: existingId ?? randomUUID(), name, fields };
 }
@@ -212,6 +230,22 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
           throw new Error(
             "The selected auth profile no longer exists — it was deleted while this editor was open. " +
               'Choose another auth profile, or set the Auth Profile field\'s mode to "Not set".'
+          );
+        }
+        // The BMC `ipmiAuthProfileId` (issue #48 PR-T3) is the second templatable
+        // field carrying a cross-record reference into the AuthProfile store, so
+        // it gets the SAME live-core revalidation as the SSH link above, in the
+        // same locked section: a profile deleted while this editor sat open would
+        // otherwise persist as a dangling `fields.ipmiAuthProfileId` that §5.3
+        // silently drops at apply time. No parallel gateway guard —
+        // `ipmiGatewayServerId` is a server-list reference validated at apply time
+        // (§5.3 skip-and-warn), exactly like `proxy.jumpHostId`, per the comment
+        // above; only auth-profile refs are revalidated in the form.
+        const linkedIpmiAuthProfileId = template.fields.ipmiAuthProfileId?.value;
+        if (linkedIpmiAuthProfileId !== undefined && ctx.core.getAuthProfile(linkedIpmiAuthProfileId) === undefined) {
+          throw new Error(
+            "The selected IPMI auth profile no longer exists — it was deleted while this editor was open. " +
+              'Choose another IPMI auth profile, or set the IPMI Auth Profile field\'s mode to "Not set".'
           );
         }
         await ctx.core.addOrUpdateDeviceTemplate(template);
@@ -373,14 +407,15 @@ async function manageDeviceTemplates(ctx: CommandContext): Promise<void> {
   openDeviceTemplateEditor(ctx, pick.template);
 }
 
-/** A one-line "Sets: Proxy, Auth Profile" summary via the shared short-label map. */
+/**
+ * A one-line "Sets: Proxy, Auth Profile" summary. PR-T3 review FIX 6 — delegates
+ * to the shared `templateSetsLabels` enumeration (the single source of field
+ * order, §7.2), so this hub / Apply-picker summary and the rules-view detail read
+ * the SAME spelling and ordering everywhere. Keeps this surface's own empty-state
+ * string ("Sets nothing yet").
+ */
 function describeTemplateFields(template: DeviceTemplateProfile): string {
-  const set: string[] = [];
-  for (const field of ["proxy", "authProfileId", "multiplexing", "legacyAlgorithms", "logSession"] as TemplatableField[]) {
-    if (template.fields[field] !== undefined) {
-      set.push(TEMPLATE_FIELD_SHORT_LABELS[field]);
-    }
-  }
+  const set = templateSetsLabels(template);
   return set.length > 0 ? `Sets: ${set.join(", ")}` : "Sets nothing yet";
 }
 
@@ -453,6 +488,8 @@ function buildConsentModalDetail(plan: ManualApplyPlan): string {
   valueLine("multiplexing", plan.multiplexing);
   valueLine("legacyAlgorithms", plan.legacyAlgorithms);
   valueLine("logSession", plan.logSession);
+  valueLine("ipmiAuthProfileId", plan.ipmiAuthProfileId);
+  valueLine("ipmiGatewayServerId", plan.ipmiGatewayServerId);
   if (plan.auth) {
     const a = plan.auth;
     if (a.mode === "fill") {
@@ -497,8 +534,25 @@ function planFor(ctx: CommandContext, template: DeviceTemplateProfile, servers: 
  * each write (the `authProfileCommands.ts` single-writer discipline), and clears
  * the stamps of the fields each write touched (§7.4 ownership rule). Non-synced
  * servers have no `origin`, so the clear is a no-op there.
+ *
+ * REFERENCE FIELDS ARE RE-RESOLVED PER WRITE (issue #48 PR-T3, PR #66 Codex round
+ * 6). The three cross-record references — `ipmiGatewayServerId` (a `ServerConfig.id`)
+ * and the two auth links (`authProfileId` / `ipmiAuthProfileId`, `AuthProfile.id`s) —
+ * are validated at PLAN time, but this loop yields at every `addOrUpdateServer`, so
+ * a concurrent deletion can land between writes. The flagged path: `nexus.group.remove`
+ * (folder delete) prunes servers WITHOUT taking `configMutationLock`, so it can delete
+ * the selected IPMI gateway from another folder mid-apply even though this apply runs
+ * under the lock. Its deletion sweep (`clearGatewayReferencesTo`) only reaches servers
+ * ALREADY written; a server written AFTER it would re-introduce the dangling link, which
+ * then silently routes IPMI locally. So each reference is RE-RESOLVED against live core
+ * immediately before the write and, if it no longer resolves, SKIPPED and dropped from
+ * the stamp-clear set (neither written nor recorded as hand-owned). Robust without a
+ * second lock: every deletion path mutates `this.servers` / the auth store in memory
+ * synchronously before its own persist await, so this synchronous re-read always observes
+ * a committed deletion. The gateway is the demonstrated race; the two auth checks are the
+ * same-class guard (never persist a dangling reference) and cost one lookup each.
  */
-async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Promise<number> {
+export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Promise<number> {
   let applied = 0;
   for (const write of plan.serverWrites) {
     const live = ctx.core.getServer(write.serverId);
@@ -506,6 +560,16 @@ async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Prom
       continue;
     }
     const next: ServerConfig = { ...live };
+    // A field skipped below (its reference no longer resolves) must NOT be treated
+    // as written by the §7.4 stamp clear — so work off a mutable copy of the plan's
+    // written-field list and drop any reference we decline to persist.
+    const writtenFields = [...write.writtenFields];
+    const dropWritten = (field: TemplatableField): void => {
+      const i = writtenFields.indexOf(field);
+      if (i >= 0) {
+        writtenFields.splice(i, 1);
+      }
+    };
     if (write.proxy !== undefined) {
       next.proxy = write.proxy;
     }
@@ -519,16 +583,56 @@ async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Prom
       next.logSession = write.logSession;
     }
     if (write.authProfileId !== undefined) {
-      next.authProfileId = write.authProfileId;
+      if (ctx.core.getAuthProfile(write.authProfileId) !== undefined) {
+        next.authProfileId = write.authProfileId;
+      } else {
+        dropWritten("authProfileId"); // profile deleted since the plan was computed
+      }
+    }
+    if (write.ipmiAuthProfileId !== undefined) {
+      if (ctx.core.getAuthProfile(write.ipmiAuthProfileId) !== undefined) {
+        next.ipmiAuthProfileId = write.ipmiAuthProfileId;
+      } else {
+        dropWritten("ipmiAuthProfileId");
+      }
+    }
+    if (write.ipmiGatewayServerId !== undefined) {
+      if (ctx.core.getServer(write.ipmiGatewayServerId) !== undefined) {
+        next.ipmiGatewayServerId = write.ipmiGatewayServerId;
+      } else {
+        dropWritten("ipmiGatewayServerId"); // gateway server pruned since the plan was computed
+      }
+    }
+    // PR-T3 review round 11 (Codex) — if reference revalidation above dropped the
+    // target's ONLY planned field (its sole write was a now-dangling reference),
+    // `writtenFields` is empty and `next` is byte-equal to `live`: nothing was
+    // applied. Skip the redundant save AND the `applied` count so the final toast
+    // does not claim the template was applied to a server whose one field was
+    // skipped. A target that still has any written field (a surviving reference, or
+    // a non-reference field like proxy/a boolean) falls through and is applied.
+    if (writtenFields.length === 0) {
+      continue;
     }
     // §7.4 — clear the stamps of exactly the fields written, so every one reads
     // as a hand edit (row 7) to later syncs. `clearTemplatedStamps` also clears
     // `syncedAuthProfileId` when the auth link is among the written fields.
-    const clearedOrigin = clearTemplatedStamps(live.origin, write.writtenFields);
+    const clearedOrigin = clearTemplatedStamps(live.origin, writtenFields);
     if (clearedOrigin === undefined) {
       delete next.origin;
     } else {
       next.origin = clearedOrigin;
+    }
+    // PR-T3 review round 9 (Codex) — a server KEPT from a removed source carries its
+    // ownership receipt in `formerlySynced` (a DetachedServerOrigin), not `origin`. Clear
+    // the same written members from THAT detached receipt too: without it, a manual Override
+    // claiming the existing value as a hand edit leaves the detached stamp intact, and a
+    // later ADOPTION restores it into a live `origin` as template-owned — silently breaking
+    // the modal's "this becomes hand-owned" promise. A DetachedServerOrigin never collapses
+    // to `undefined` (only its `templated`/`syncedAuthProfileId` members clear), so this is a
+    // straight reassign when `formerlySynced` is present and a no-op when it is absent.
+    const clearedFormerly = clearDetachedTemplatedStamps(live.formerlySynced, writtenFields);
+    if (clearedFormerly !== undefined) {
+      next.formerlySynced = clearedFormerly;
     }
     await ctx.core.addOrUpdateServer(next);
     applied++;

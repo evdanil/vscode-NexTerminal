@@ -108,6 +108,45 @@ describe("Fixture 25 — removeAuthProfile template clause (§8.4)", () => {
     expect(swept.fields.multiplexing).toEqual({ mode: "override", value: true }); // other fields intact
     expect(swept.revision).not.toBe(revBefore); // re-revisioned
   });
+
+  it("(PR-T3) clears a template's fields.ipmiAuthProfileId when the named profile is deleted (kills a sweep that forgets the new BMC template field)", async () => {
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const profile: AuthProfile = { id: "P", name: "P", username: "svc", authType: "agent" };
+    await core.addOrUpdateAuthProfile(profile);
+    await core.addOrUpdateDeviceTemplate(tmpl("T", { ipmiAuthProfileId: { mode: "fill", value: "P" }, multiplexing: { mode: "override", value: true } }));
+    const revBefore = core.getDeviceTemplate("T")!.revision;
+
+    await core.removeAuthProfile("P");
+
+    const swept = core.getDeviceTemplate("T")!;
+    expect(swept.fields.ipmiAuthProfileId).toBeUndefined();
+    expect(swept.fields.multiplexing).toEqual({ mode: "override", value: true }); // other fields intact
+    expect(swept.revision).not.toBe(revBefore); // re-revisioned
+  });
+
+  it("(PR-T3) a template naming the deleted profile in BOTH authProfileId and ipmiAuthProfileId loses BOTH fields (kills a sweep that clears only one link)", async () => {
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const profile: AuthProfile = { id: "P", name: "P", username: "svc", authType: "agent" };
+    await core.addOrUpdateAuthProfile(profile);
+    await core.addOrUpdateDeviceTemplate(
+      tmpl("T", {
+        authProfileId: { mode: "fill", value: "P" },
+        ipmiAuthProfileId: { mode: "fill", value: "P" },
+        logSession: { mode: "override", value: true }
+      })
+    );
+
+    await core.removeAuthProfile("P");
+
+    const swept = core.getDeviceTemplate("T")!;
+    expect(swept.fields.authProfileId).toBeUndefined();
+    expect(swept.fields.ipmiAuthProfileId).toBeUndefined();
+    expect(swept.fields.logSession).toEqual({ mode: "override", value: true }); // unrelated field intact
+  });
 });
 
 describe("Fixture 26 — storage round-trip + share exclusion", () => {
@@ -140,5 +179,45 @@ describe("Fixture 26 — storage round-trip + share exclusion", () => {
     const sanitized = sanitizeForSharing([], [], [], [], {}, [], []);
     expect("deviceTemplates" in sanitized).toBe(false);
     expect("inventorySources" in sanitized).toBe(false);
+  });
+
+  it("PR-T3 — a template carrying both IPMI id fields + a server's IPMI stamps survive a repository reload (fixture 26 / F)", async () => {
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateDeviceTemplate(
+      tmpl("Tipmi", {
+        ipmiAuthProfileId: { mode: "fill", value: "bmc-prof" },
+        ipmiGatewayServerId: { mode: "override", value: "mgmt-host" }
+      })
+    );
+    await core.addOrUpdateServer({
+      id: "srv-ipmi",
+      name: "sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      ipmiAuthProfileId: "bmc-prof",
+      ipmiGatewayServerId: "mgmt-host",
+      origin: {
+        sourceId: "s1",
+        externalId: "device:1",
+        syncedAt: 1,
+        templated: { ipmiAuthProfileId: "bmc-prof", ipmiGatewayServerId: "mgmt-host" }
+      }
+    });
+
+    const core2 = new NexusCore(repo);
+    await core2.initialize();
+    const t = core2.getDeviceTemplate("Tipmi");
+    expect(t?.fields.ipmiAuthProfileId).toEqual({ mode: "fill", value: "bmc-prof" });
+    expect(t?.fields.ipmiGatewayServerId).toEqual({ mode: "override", value: "mgmt-host" });
+    const s = core2.getServer("srv-ipmi");
+    expect(s?.ipmiAuthProfileId).toBe("bmc-prof");
+    expect(s?.ipmiGatewayServerId).toBe("mgmt-host");
+    expect(s?.origin?.templated?.ipmiAuthProfileId).toBe("bmc-prof");
+    expect(s?.origin?.templated?.ipmiGatewayServerId).toBe("mgmt-host");
   });
 });

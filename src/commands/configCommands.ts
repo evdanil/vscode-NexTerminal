@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
-import { cloneTemplatedStamps } from "../models/config";
+import { cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
@@ -1793,10 +1793,44 @@ export function registerConfigCommands(
      * work with no reader anyway.
      */
     const remapOriginStamp = (origin: ServerOrigin | undefined): ServerOrigin | undefined => {
-      if (!isValidServerOrigin(origin) || origin.syncedAuthProfileId === undefined) {
+      // REVIEW FINDING (P2, PR #66 Codex round 7) — the guard used to early-return
+      // whenever `syncedAuthProfileId === undefined`, which left BOTH
+      // `origin.templated` IPMI stamps in the EXPORTER's id namespace on any origin
+      // that carried only templated stamps. Proceed when EITHER the SSH auth stamp
+      // is set OR the origin carries any templated stamp — an origin whose ONLY
+      // stamps are the templated IPMI ones must still be remapped, or its stamps
+      // survive import as foreign ids and the template matrix reads a PERMANENT
+      // hand divergence (row 6), locking a field that was actually template-owned.
+      if (
+        !isValidServerOrigin(origin) ||
+        (origin.syncedAuthProfileId === undefined && !templatedHasAnyStamp(origin.templated))
+      ) {
         return origin;
       }
-      return { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
+      // `syncedAuthProfileId` through the SAME lens the SSH auth VALUE uses
+      // (`linkToImportedProfile`); `linkToImportedProfile(undefined)` is `undefined`,
+      // so an origin carrying only templated stamps keeps `syncedAuthProfileId`
+      // absent, exactly as before.
+      const next: ServerOrigin = { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
+      // Each templated stamp is remapped through the SAME lens its VALUE passes
+      // through on the remapped server below: the auth stamp through
+      // `linkToImportedProfile` (FINAL — profiles are fully resolved here), the
+      // gateway stamp RAW through `idMap` (mirroring the value's raw remap at the
+      // `ipmiGatewayServerId:` line below; the final `linkToImportedServer`
+      // narrowing happens in the finalize loop, since the surviving-server set is
+      // not known at this point). Collapse the rebuilt bag via `templatedHasAnyStamp`
+      // so a template-owned field survives as `cur === stamp` in LOCAL ids and a
+      // real divergence is preserved. `formerlySynced` is dropped whole on share
+      // import below, so no twin remap is needed here.
+      if (origin.templated !== undefined) {
+        const templated = cloneTemplatedStamps(origin.templated);
+        templated.ipmiAuthProfileId = linkToImportedProfile(origin.templated.ipmiAuthProfileId);
+        templated.ipmiGatewayServerId = origin.templated.ipmiGatewayServerId
+          ? (idMap.get(origin.templated.ipmiGatewayServerId) ?? undefined)
+          : undefined;
+        next.templated = templatedHasAnyStamp(templated) ? templated : undefined;
+      }
+      return next;
     };
 
     /**
@@ -1912,9 +1946,25 @@ export function registerConfigCommands(
       remapped !== undefined && importedServerIds.has(remapped) ? remapped : undefined;
 
     for (const remappedServer of remappedServers) {
+      // Narrow the gateway VALUE and, the SAME way, its STAMP (PR #66 Codex round
+      // 7). `remapOriginStamp` above raw-remapped `origin.templated.ipmiGatewayServerId`
+      // through `idMap`, mirroring the value's raw remap; both are FINALIZED here
+      // through `linkToImportedServer`, so a gateway whose target did not survive
+      // import collapses BOTH value and stamp to `undefined` (no false divergence),
+      // and an owned gateway (`cur === stamp` at the source) keeps identical
+      // value+stamp — both raw-remapped, both narrowed → equal → still
+      // template-owned in LOCAL ids. Collapse the rebuilt bag via
+      // `templatedHasAnyStamp`.
+      let finalizedOrigin = remappedServer.origin;
+      if (finalizedOrigin?.templated?.ipmiGatewayServerId !== undefined) {
+        const templated = cloneTemplatedStamps(finalizedOrigin.templated);
+        templated.ipmiGatewayServerId = linkToImportedServer(finalizedOrigin.templated.ipmiGatewayServerId);
+        finalizedOrigin = { ...finalizedOrigin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+      }
       const finalizedServer: ServerConfig = {
         ...remappedServer,
-        ipmiGatewayServerId: linkToImportedServer(remappedServer.ipmiGatewayServerId)
+        ipmiGatewayServerId: linkToImportedServer(remappedServer.ipmiGatewayServerId),
+        origin: finalizedOrigin
       };
       tally(await addIfValid(finalizedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
@@ -2155,14 +2205,18 @@ export function registerConfigCommands(
       // The BMC credential link dangles independently of the SSH one — a server
       // can carry either, both, or two different profiles — so it is swept on
       // its own terms rather than as a rider on the SSH clear.
-      const ipmiDangles = Boolean(server.ipmiAuthProfileId) && !knownProfileIds.has(server.ipmiAuthProfileId!);
+      const danglingIpmiProfileId =
+        server.ipmiAuthProfileId && !knownProfileIds.has(server.ipmiAuthProfileId) ? server.ipmiAuthProfileId : undefined;
+      const ipmiDangles = danglingIpmiProfileId !== undefined;
       // The BMC jump-host link dangles independently of the auth links — it is a
       // server-list reference (checked against `knownServerIds`, NOT
       // `knownProfileIds`) that has no auth stamp, so it never touches the
       // origin/formerlySynced clears below. A self-referencing gateway keeps its
       // own id in `knownServerIds`, so it is not swept here; the runtime self-ref
       // guard in `resolveIpmiGatewayServer` handles that case.
-      const gatewayDangles = Boolean(server.ipmiGatewayServerId) && !knownServerIds.has(server.ipmiGatewayServerId!);
+      const danglingGatewayServerId =
+        server.ipmiGatewayServerId && !knownServerIds.has(server.ipmiGatewayServerId) ? server.ipmiGatewayServerId : undefined;
+      const gatewayDangles = danglingGatewayServerId !== undefined;
       if (sshDangles || ipmiDangles || gatewayDangles) {
         const cleared: ServerConfig = { ...server };
         if (sshDangles) cleared.authProfileId = undefined;
@@ -2191,6 +2245,51 @@ export function registerConfigCommands(
         // out of retro-apply the moment it is reclaimed.
         if (danglingSshProfileId !== undefined && server.formerlySynced?.syncedAuthProfileId === danglingSshProfileId) {
           cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
+        }
+        // BMC VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiAuthProfileId`)
+        // — mirrors NexusCore.removeAuthProfile's BMC stamp clear: the sync's
+        // receipt that IT wrote the BMC credential link dies with the link, or it
+        // reads as a per-server opt-out (value undefined, stamp naming a profile)
+        // and `matrixWrites` locks the field out of even a later override
+        // template. Gated on `ipmiDangles` (the BMC id that no longer resolves),
+        // INDEPENDENT of the SSH clear above: a server reached here only by a
+        // dangling BMC link keeps a live, resolving SSH stamp, and vice versa.
+        // Only the stamp naming the very dangling id is dropped. Single-member
+        // clear mirrors `dropTemplateProxy` / `clearTemplatedStamps`: rebuild the
+        // bag without the member, collapse to `undefined` when empty. Each rebuild
+        // chains off `cleared.origin` (not the original `server.origin`) so a
+        // server dangling in BOTH the BMC-auth and the gateway stamp loses both —
+        // the gateway pass must not resurrect the just-cleared auth member.
+        if (danglingIpmiProfileId !== undefined && server.origin?.templated?.ipmiAuthProfileId === danglingIpmiProfileId) {
+          const base = cleared.origin ?? server.origin;
+          const templated = { ...base.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.origin = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        if (danglingIpmiProfileId !== undefined && server.formerlySynced?.templated?.ipmiAuthProfileId === danglingIpmiProfileId) {
+          const base = cleared.formerlySynced ?? server.formerlySynced;
+          const templated = { ...base.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.formerlySynced = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        // GATEWAY VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiGatewayServerId`)
+        // — mirrors NexusCore.clearGatewayReferencesTo's stamp clear. Gated on
+        // `gatewayDangles` (the gateway server id absent from this import), and
+        // cleared only when the stamp names that same dangling server id. STAMP
+        // ONLY — no `fields.ipmiGatewayServerId` template sweep below, for the
+        // same skip-and-warn reason the deletion path gives (template->server refs
+        // are validated at sync time, not eagerly rewritten).
+        if (danglingGatewayServerId !== undefined && server.origin?.templated?.ipmiGatewayServerId === danglingGatewayServerId) {
+          const base = cleared.origin ?? server.origin;
+          const templated = { ...base.templated };
+          delete templated.ipmiGatewayServerId;
+          cleared.origin = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        if (danglingGatewayServerId !== undefined && server.formerlySynced?.templated?.ipmiGatewayServerId === danglingGatewayServerId) {
+          const base = cleared.formerlySynced ?? server.formerlySynced;
+          const templated = { ...base.templated };
+          delete templated.ipmiGatewayServerId;
+          cleared.formerlySynced = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
         }
         await core.addOrUpdateServer(cleared);
       }
@@ -2224,9 +2323,26 @@ export function registerConfigCommands(
     const sweepSnapshot = core.getSnapshot();
     const knownTemplateIds = new Set(sweepSnapshot.deviceTemplates.map((t) => t.id));
     for (const template of sweepSnapshot.deviceTemplates) {
+      // A template's SSH `authProfileId` and BMC `ipmiAuthProfileId` (issue #48
+      // PR-T3) are independent links into the AuthProfile store — each is swept
+      // on its own terms against the same `knownProfileIds` set, and a template
+      // dangling in both loses both. No `fields.ipmiGatewayServerId` sweep: that
+      // template->server reference is skip-and-warn at sync time, not a dangling
+      // import to rewrite here (same rationale as the deletion-path omission).
       const linkedProfileId = template.fields.authProfileId?.value;
-      if (linkedProfileId !== undefined && !knownProfileIds.has(linkedProfileId)) {
-        const { authProfileId: _authProfileId, ...restFields } = template.fields;
+      const sshDangles = linkedProfileId !== undefined && !knownProfileIds.has(linkedProfileId);
+      const linkedIpmiProfileId = template.fields.ipmiAuthProfileId?.value;
+      const ipmiDangles = linkedIpmiProfileId !== undefined && !knownProfileIds.has(linkedIpmiProfileId);
+      if (sshDangles || ipmiDangles) {
+        let restFields = template.fields;
+        if (sshDangles) {
+          const { authProfileId: _authProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
+        if (ipmiDangles) {
+          const { ipmiAuthProfileId: _ipmiAuthProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
         await core.addOrUpdateDeviceTemplate({ ...template, fields: restFields });
       }
     }

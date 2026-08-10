@@ -3,6 +3,7 @@ import {
   cloneServerConfig,
   mergeServerConfigFields,
   serverConfigsEqual,
+  templatedHasAnyStamp,
   type ActiveLocalShellSession,
   type ActiveSerialSession,
   type ActiveSession,
@@ -380,6 +381,56 @@ export class NexusCore {
         if (server.authProfileId === profileId && server.formerlySynced?.syncedAuthProfileId === profileId) {
           cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
         }
+        // BMC VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiAuthProfileId`)
+        // — the sync's receipt that IT wrote the BMC credential link on this
+        // server, cleared for the SAME reason as the SSH `syncedAuthProfileId`
+        // stamp above: left standing after its link is gone it reads as a
+        // per-server opt-out (value undefined, stamp still naming a profile), and
+        // `matrixWrites` would lock the field out of even a later override
+        // template — the carry-forward trap the PR-T3 value stamps otherwise
+        // spring on deletion.
+        //
+        // GATE ASYMMETRY vs the SSH stamp clears above: those gate on
+        // `authProfileId === profileId` because `syncedAuthProfileId` records the
+        // SSH link. THIS stamp records the BMC link, so it gates on
+        // `ipmiAuthProfileId === profileId`. A server reached here only through
+        // its SSH link has had no BMC link cleared and must keep its BMC stamp;
+        // and a server whose BMC value the USER already hand-cleared (value
+        // undefined, stamp still naming this profile, reached here only via its
+        // SSH link) keeps it too — that opt-out is deliberate.
+        //
+        // SINGLE-MEMBER CLEAR — mirrors the sync engine's `dropTemplateProxy` /
+        // `clearTemplatedStamps`: rebuild the `templated` bag without the member
+        // and collapse it to `undefined` when nothing else is stamped
+        // (`templatedHasAnyStamp`). Chained off `cleared.origin` so a server that
+        // named this profile on BOTH links loses the SSH stamp AND the BMC stamp.
+        if (
+          server.ipmiAuthProfileId === profileId &&
+          (cleared.origin ?? server.origin)?.templated?.ipmiAuthProfileId === profileId
+        ) {
+          const baseOrigin = cleared.origin ?? server.origin!;
+          const templated = { ...baseOrigin.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.origin = { ...baseOrigin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        // The detached twin (`formerlySynced.templated.ipmiAuthProfileId`) — swept
+        // for the reason the SSH `formerlySynced.syncedAuthProfileId` above is:
+        // adoption restores the marker into a live origin, so a stamp left naming
+        // a deleted profile would be the permanent opt-out this clear prevents,
+        // merely deferred until the record is reclaimed. Same BMC-link gate, same
+        // single-member mechanics.
+        if (
+          server.ipmiAuthProfileId === profileId &&
+          (cleared.formerlySynced ?? server.formerlySynced)?.templated?.ipmiAuthProfileId === profileId
+        ) {
+          const baseFormerly = cleared.formerlySynced ?? server.formerlySynced!;
+          const templated = { ...baseFormerly.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.formerlySynced = {
+            ...baseFormerly,
+            templated: templatedHasAnyStamp(templated) ? templated : undefined
+          };
+        }
         this.servers.set(id, cleared);
         serversChanged = true;
       }
@@ -417,9 +468,25 @@ export class NexusCore {
     // the shared stamp; this is the SOURCE of the link, not the record of it.
     const previousTemplates = new Map<string, DeviceTemplateProfile>();
     for (const [id, template] of this.deviceTemplates.entries()) {
-      if (template.fields.authProfileId?.value === profileId) {
+      // A template can name this profile as its SSH `authProfileId`, as its BMC
+      // `ipmiAuthProfileId` (issue #48 PR-T3), or as BOTH — each is an
+      // independent link into this same AuthProfile store, so each is swept on
+      // its own terms and a template naming the profile in both fields loses
+      // both. Destructured out (never written `undefined`) exactly like the SSH
+      // field, with the same single rollback capture/restore and re-revision.
+      const sshLinkMatch = template.fields.authProfileId?.value === profileId;
+      const bmcLinkMatch = template.fields.ipmiAuthProfileId?.value === profileId;
+      if (sshLinkMatch || bmcLinkMatch) {
         previousTemplates.set(id, template);
-        const { authProfileId: _authProfileId, ...restFields } = template.fields;
+        let restFields = template.fields;
+        if (sshLinkMatch) {
+          const { authProfileId: _authProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
+        if (bmcLinkMatch) {
+          const { ipmiAuthProfileId: _ipmiAuthProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
         this.deviceTemplates.set(id, { ...template, fields: restFields, revision: randomUUID() });
       }
     }
@@ -1173,6 +1240,106 @@ export class NexusCore {
         }
       }
     }
+    // APPLICATION-TIME UPSERTED-GATEWAY REVALIDATION (issue #48 PR-T3, PR #66
+    // Codex round 7) — the sync-apply SIBLING of round 6's manual-apply per-write
+    // revalidation (deviceTemplateCommands.ts `applyPlanWrites`), same class, same
+    // graceful-degradation symptom. `computeSyncPlan` validated each upserted
+    // server's `ipmiGatewayServerId` against a `liveServerIds` SNAPSHOT taken at
+    // PLAN time (syncEngine.ts). A folder delete (`nexus.group.remove`) does NOT
+    // take `configMutationLock` and does not revise the source/template, so it can
+    // prune the selected gateway AFTER that snapshot — e.g. from another window
+    // while this apply's confirmation modal is open — and the pre-apply guards
+    // (`sourceConfigUnchanged` / the "absent" structural checks) still pass. The
+    // upsert then lands in `this.servers` above carrying a gateway id that no
+    // longer names any server. The `gatewayDeletedIds` sweep just above only
+    // covers servers THIS plan removes (`removeServerIds`), so it misses that
+    // externally-deleted gateway, the dangling link persists, and IPMI silently
+    // falls back to local (`resolveIpmiGatewayServer` treats a dangling id as
+    // "reachable locally"). Close it on this path too: after the deletions,
+    // upserts, and the removeServerIds-sweep have all landed, revalidate each
+    // UPSERTED server against the FINAL `this.servers` and clear a gateway that no
+    // longer resolves — folded into this method's EXISTING persist/rollback
+    // envelope exactly like the sweep above (capture the PRE-clear record into
+    // `priorServers` before mutating — `captureServerPrior` is idempotent, so an
+    // upsert already captured at its original value keeps that prior — then record
+    // the CLEARED record as this batch's write in `batchWrittenServers`, riding
+    // the one `saveServers` + one emit below: NO second write, NO second emit).
+    // Only `ipmiGatewayServerId` (+ its stamp under the round-5 gate) on the
+    // affected upserts is touched; every other field, which servers remain, auth
+    // links, and origins stay exactly as the deletions/upserts left them.
+    //
+    // `ipmiAuthProfileId` is deliberately NOT revalidated here — auth profiles are
+    // validated against the never-pruned profile store; a server-ref (gateway) is
+    // the one that races with folder deletion. And folder deletion is NOT
+    // serialized (the lower-blast-radius revalidation is the chosen fix, mirroring
+    // round 6).
+    for (const upserted of upsertServers) {
+      const live = this.servers.get(upserted.id);
+      // Only a server THIS batch still owns in the live map, whose gateway is set
+      // but resolves to no surviving server. A gateway whose target was removed by
+      // THIS plan's own `removeServerIds` was already cleared by the sweep above,
+      // so `live.ipmiGatewayServerId` reads `undefined` here and it is skipped —
+      // no double processing. A gateway still present (`this.servers.has(gw)`) is
+      // live and left alone, which is also what keeps a DIVERGED stamp (value
+      // present-and-live, stamp naming some other now-absent id) untouched: the
+      // value is live, there is nothing to clear, and the round-5 equality gate
+      // below never fires on it anyway.
+      if (!live || live.ipmiGatewayServerId === undefined || this.servers.has(live.ipmiGatewayServerId)) {
+        continue;
+      }
+      // REVIEW FINDING (PR #66 Codex round 8) — restrict this cleanup to a
+      // TEMPLATE-OWNED gateway (the sync's own write: stamp === value, on the live
+      // origin OR its detached `formerlySynced` twin). A HAND-configured gateway —
+      // unstamped, or a value the user diverged to (`cur !== stamp`) — is §8.4
+      // leave-alone: `computeSyncPlan` deliberately carries even an ALREADY-DANGLING
+      // hand gateway through unchanged (it degrades to "reachable locally" at
+      // runtime), so clearing it during application would silently overwrite a
+      // hand-owned field AND make the persisted result diverge from the approved
+      // preview, even though nothing was deleted after planning. Round 7's value
+      // clear was unconditional here; the stamp clear below was already gated this
+      // way, so this lifts the same ownership gate to cover the value — only a
+      // gateway the sync wrote and that WENT stale after plan time is cleaned.
+      const templateOwnsGateway =
+        live.origin?.templated?.ipmiGatewayServerId === live.ipmiGatewayServerId ||
+        live.formerlySynced?.templated?.ipmiGatewayServerId === live.ipmiGatewayServerId;
+      if (!templateOwnsGateway) {
+        continue;
+      }
+      captureServerPrior(upserted.id);
+      // Clear the dangling value and, UNDER THE ROUND-5 EQUALITY GATE, its stamp
+      // twin(s). Same mechanics `clearGatewayReferencesTo` uses (stamp === the
+      // gateway value being cleared; the `formerlySynced` twin likewise; collapse
+      // the bag via `templatedHasAnyStamp`), inlined here rather than shared
+      // because that helper gates on membership in a DELETED set while this pass
+      // gates on "no longer resolves in the FINAL set" — see round 5's
+      // `clearGatewayReferencesTo` doc for why the equality gate (not a membership
+      // test) is what preserves a user's real divergence.
+      let cleared: ServerConfig = { ...live, ipmiGatewayServerId: undefined };
+      if (
+        live.origin?.templated?.ipmiGatewayServerId !== undefined &&
+        live.origin.templated.ipmiGatewayServerId === live.ipmiGatewayServerId
+      ) {
+        const templated = { ...live.origin.templated };
+        delete templated.ipmiGatewayServerId;
+        cleared = {
+          ...cleared,
+          origin: { ...live.origin, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+        };
+      }
+      if (
+        live.formerlySynced?.templated?.ipmiGatewayServerId !== undefined &&
+        live.formerlySynced.templated.ipmiGatewayServerId === live.ipmiGatewayServerId
+      ) {
+        const templated = { ...live.formerlySynced.templated };
+        delete templated.ipmiGatewayServerId;
+        cleared = {
+          ...cleared,
+          formerlySynced: { ...live.formerlySynced, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+        };
+      }
+      this.servers.set(upserted.id, cleared);
+      batchWrittenServers.set(upserted.id, cloneServerConfig(cleared));
+    }
     // OWNERSHIP FIX (USE is not ownership) — a folder the user pre-created by
     // hand (e.g. "NetBox/RackA" made via the tree UI before this source ever
     // synced) that a sync merely PLACES a device into must never enter
@@ -1909,7 +2076,65 @@ export class NexusCore {
     }
     for (const [id, server] of this.servers.entries()) {
       if (server.ipmiGatewayServerId !== undefined && deletedServerIds.has(server.ipmiGatewayServerId)) {
-        this.servers.set(id, { ...server, ipmiGatewayServerId: undefined });
+        let next: ServerConfig = { ...server, ipmiGatewayServerId: undefined };
+        // GATEWAY VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiGatewayServerId`)
+        // — the sync's receipt that IT wrote the BMC gateway link, cleared with
+        // the link for the reason the auth stamp is cleared in `removeAuthProfile`:
+        // a stamp outliving its value reads as a per-server opt-out and
+        // `matrixWrites` locks the field out of even a later override template.
+        // Scoping falls out for free — the helper is only entered for a server
+        // whose gateway VALUE names a deleted server, so a server whose gateway
+        // the user already hand-cleared is never reached and its stamp (opt-out)
+        // survives, consistent with FIX A. Cleared only when the stamp equals the
+        // CURRENT gateway value being cleared (`stamp === server.ipmiGatewayServerId`),
+        // i.e. the sync still OWNS the link (cur === stamp) — NOT merely when the
+        // stamp names some deleted server. This is what the single-record deletion
+        // and the auth-profile paths require, and it matters in a BATCH deletion
+        // (folder cascade / inventory prune): a referrer template-stamped with
+        // gateway A whose user later hand-changed the value to B, when BOTH A and B
+        // are deleted in one batch, would — under a membership test — lose its
+        // divergence stamp A along with the value, so the next sync would read it as
+        // never-configured and template-write a new gateway over the user's edit.
+        // The equality gate preserves the diverged stamp (cur B ≠ stamp A) exactly
+        // as row 6 intends. Same single-member mechanics as `removeAuthProfile`
+        // (mirror of `dropTemplateProxy` / `clearTemplatedStamps`): rebuild the
+        // bag without the member, collapse to `undefined` when nothing else is
+        // stamped.
+        //
+        // STAMP ONLY — NO device-template `fields.ipmiGatewayServerId` sweep here,
+        // intentionally: a template->server reference is the design's
+        // skip-and-warn-at-sync-time class (servers churn constantly via sync
+        // prune; eagerly rewriting user templates on every server deletion would
+        // be wrong). This is the SAME rationale as the `jumpHostId`-vs-gateway
+        // value asymmetry documented in this method's doc comment — skip-and-warn
+        // owns the template field.
+        if (
+          server.origin?.templated?.ipmiGatewayServerId !== undefined &&
+          server.origin.templated.ipmiGatewayServerId === server.ipmiGatewayServerId
+        ) {
+          const templated = { ...server.origin.templated };
+          delete templated.ipmiGatewayServerId;
+          next = {
+            ...next,
+            origin: { ...server.origin, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+          };
+        }
+        // The detached twin, swept the same way and for the same adoption reason
+        // as the auth stamp's `formerlySynced` clear — and under the same equality
+        // gate (stamp === the current gateway value being cleared), so a user's
+        // divergence on a detached record survives a batch deletion too.
+        if (
+          server.formerlySynced?.templated?.ipmiGatewayServerId !== undefined &&
+          server.formerlySynced.templated.ipmiGatewayServerId === server.ipmiGatewayServerId
+        ) {
+          const templated = { ...server.formerlySynced.templated };
+          delete templated.ipmiGatewayServerId;
+          next = {
+            ...next,
+            formerlySynced: { ...server.formerlySynced, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+          };
+        }
+        this.servers.set(id, next);
         cleared.push(id);
       }
     }

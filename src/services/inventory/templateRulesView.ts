@@ -20,8 +20,16 @@ import {
  * `commands/` is the thin orchestrator over these.
  */
 
-/** The five templatable fields, alphabetically by short label — the order §7.2's `Sets:` detail shows. */
-const FIELDS_BY_LABEL: TemplatableField[] = (["proxy", "authProfileId", "multiplexing", "legacyAlgorithms", "logSession"] as TemplatableField[]).sort(
+/** The templatable fields, alphabetically by short label — the order §7.2's `Sets:` detail shows. */
+const FIELDS_BY_LABEL: TemplatableField[] = ([
+  "proxy",
+  "authProfileId",
+  "multiplexing",
+  "legacyAlgorithms",
+  "logSession",
+  "ipmiAuthProfileId",
+  "ipmiGatewayServerId"
+] as TemplatableField[]).sort(
   (a, b) => TEMPLATE_FIELD_SHORT_LABELS[a].localeCompare(TEMPLATE_FIELD_SHORT_LABELS[b])
 );
 

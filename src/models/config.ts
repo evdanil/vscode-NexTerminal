@@ -214,7 +214,18 @@ export interface ServerOrigin {
     multiplexing?: boolean;
     legacyAlgorithms?: boolean;
     logSession?: boolean;
-    // future: ipmiAuthProfileId?: string; ipmiGatewayServerId?: string;
+    // DEVICE TEMPLATES (issue #48 PR-T3, §14) — VALUE stamps for the two IPMI id
+    // references, following the `proxy` value-stamp pattern (present-when-set;
+    // presence checks are `!== undefined`, never truthiness). A present member is
+    // the exact id the sync's template application last wrote; absent means it
+    // never wrote the field. Reference-validated at composition (§5.3), so a
+    // dangling id is never a written value here. They carry through every point
+    // this member's bookkeeping bill enumerates — the detach receipt
+    // (DetachedServerOrigin.templated, same type), isValidServerOrigin
+    // (isValidTemplatedStamps), templatedStampsEqual, cloneTemplatedStamps — for
+    // free, because each keys off this one shape.
+    ipmiAuthProfileId?: string;
+    ipmiGatewayServerId?: string;
   };
 }
 
@@ -367,11 +378,12 @@ export interface DetachedServerOrigin {
   syncedIpmiHost?: string;
   /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — the per-field record of what the
-   * REMOVED SOURCE'S TEMPLATE APPLICATION last wrote onto this server's non-auth
-   * fields (proxy / booleans), copied verbatim from the server's own
-   * `ServerOrigin.templated` at detach time, and absent when that sync wrote
-   * none. Same shape as `ServerOrigin.templated` (four non-auth fields; nested
-   * `ProxyConfig`).
+   * REMOVED SOURCE'S TEMPLATE APPLICATION last wrote onto this server's
+   * template-managed fields (proxy / booleans / the two IPMI id references,
+   * PR-T3), copied verbatim from the server's own `ServerOrigin.templated` at
+   * detach time, and absent when that sync wrote none. Same shape as
+   * `ServerOrigin.templated` (six stamp members; nested `ProxyConfig`), so the
+   * two IPMI value stamps ride the receipt for free.
    *
    * NOT a matching input — like `syncedAuthProfileId` and `syncedIpmiHost` beside
    * it, it decides nothing about adoption. It is the third part of the origin
@@ -609,7 +621,35 @@ export function templatedStampsEqual(a: ServerOrigin["templated"], b: ServerOrig
     proxyConfigsEqual(ap.proxy, bp.proxy) &&
     ap.multiplexing === bp.multiplexing &&
     ap.legacyAlgorithms === bp.legacyAlgorithms &&
-    ap.logSession === bp.logSession
+    ap.logSession === bp.logSession &&
+    // DEVICE TEMPLATES (PR-T3) — the two IPMI id-reference stamps join the same
+    // `===` comparison the booleans use: present-vs-absent is a DIFFERENCE (a
+    // stamp cleared to absent must read as changed so the rollback merge sees it).
+    ap.ipmiAuthProfileId === bp.ipmiAuthProfileId &&
+    ap.ipmiGatewayServerId === bp.ipmiGatewayServerId
+  );
+}
+
+/**
+ * DEVICE TEMPLATES (PR-T1/PR-T3) — is any templatable field stamped on this
+ * `origin.templated` record? The single presence predicate every "does this
+ * record still carry a stamp?" site shares (the matrix's `hasStamp`, the manual
+ * clear's residue check, both survivor passes), so a member added to `templated`
+ * is taught to all of them in ONE place — the grouped-member bookkeeping
+ * discipline §1.3 turns on. PRESENT-when-false for booleans, present-when-set for
+ * the value stamps: every check is `!== undefined`, never truthiness.
+ */
+export function templatedHasAnyStamp(templated: ServerOrigin["templated"]): boolean {
+  if (templated === undefined) {
+    return false;
+  }
+  return (
+    templated.proxy !== undefined ||
+    templated.multiplexing !== undefined ||
+    templated.legacyAlgorithms !== undefined ||
+    templated.logSession !== undefined ||
+    templated.ipmiAuthProfileId !== undefined ||
+    templated.ipmiGatewayServerId !== undefined
   );
 }
 

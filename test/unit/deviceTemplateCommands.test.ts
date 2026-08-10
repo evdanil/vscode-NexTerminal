@@ -65,9 +65,10 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 }));
 
 // Imported AFTER the mocks so the command module binds to them.
-const { registerDeviceTemplateCommands, parseDeviceTemplateFormValues } = await import("../../src/commands/deviceTemplateCommands");
+const { registerDeviceTemplateCommands, parseDeviceTemplateFormValues, applyPlanWrites } = await import("../../src/commands/deviceTemplateCommands");
 const { FolderTreeItem } = await import("../../src/ui/nexusTreeProvider");
 const { proxyPasswordSecretKey } = await import("../../src/services/ssh/silentAuth");
+const { planManualTemplateApply } = await import("../../src/services/inventory/templateApply");
 
 const P: ProxyConfig = { type: "socks5", host: "10.0.0.9", port: 1080 };
 
@@ -168,6 +169,32 @@ describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
 
   it("rejects an empty name", () => {
     expect(() => parseDeviceTemplateFormValues({ name: "  " })).toThrow(/Name is required/);
+  });
+
+  it("PR-T3 — the two IPMI id references round-trip fill / override / unset", () => {
+    const t = parseDeviceTemplateFormValues({
+      name: "T",
+      mode_ipmiAuthProfileId: "fill",
+      ipmiAuthProfileId: "pa-1",
+      mode_ipmiGatewayServerId: "override",
+      ipmiGatewayServerId: "gw-1"
+    });
+    expect(t.fields.ipmiAuthProfileId).toEqual({ mode: "fill", value: "pa-1" });
+    expect(t.fields.ipmiGatewayServerId).toEqual({ mode: "override", value: "gw-1" });
+
+    const unset = parseDeviceTemplateFormValues({
+      name: "T",
+      mode_ipmiAuthProfileId: "none", // value present but mode none → dropped
+      ipmiAuthProfileId: "pa-1",
+      mode_ipmiGatewayServerId: "none"
+    });
+    expect(unset.fields.ipmiAuthProfileId).toBeUndefined();
+    expect(unset.fields.ipmiGatewayServerId).toBeUndefined();
+
+    // The __create__ sentinel / (None) reads as "no value" → rejects when a mode is chosen.
+    expect(() =>
+      parseDeviceTemplateFormValues({ name: "T", mode_ipmiAuthProfileId: "fill", ipmiAuthProfileId: "__create__authProfile" })
+    ).toThrow(/IPMI Auth Profile mode is set to Fill but no value is configured/);
   });
 
   it("P3 — a field whose mode is fill/override but has no usable value is REJECTED, not silently dropped", () => {
@@ -534,6 +561,32 @@ describe("2b — template save rejects a vanished auth-profile reference (PR #62
     const templates = core.getSnapshot().deviceTemplates;
     expect(templates).toHaveLength(1);
     expect(templates[0].fields.authProfileId).toEqual({ mode: "fill", value: "prof-1" });
+  });
+
+  it("(PR-T3) REJECTS (form kept open) when fields.ipmiAuthProfileId names a profile deleted while the editor was open — nothing persisted", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "prof-1", name: "BMC", username: "adm", authType: "agent" });
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    // The IPMI auth profile is deleted while the editor sits open — the second
+    // cross-record reference the save must revalidate against live core.
+    await core.removeAuthProfile("prof-1");
+    await expect(
+      formPanelOpens[0].options.onSubmit({ name: "Linked", mode_ipmiAuthProfileId: "fill", ipmiAuthProfileId: "prof-1" })
+    ).rejects.toThrow(/IPMI auth profile no longer exists/i);
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(0);
+  });
+
+  it("(PR-T3) sibling — a LIVE ipmiAuthProfileId persists normally (guard not over-firing)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "prof-1", name: "BMC", username: "adm", authType: "agent" });
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await formPanelOpens[0].options.onSubmit({ name: "Linked", mode_ipmiAuthProfileId: "fill", ipmiAuthProfileId: "prof-1" });
+    const templates = core.getSnapshot().deviceTemplates;
+    expect(templates).toHaveLength(1);
+    expect(templates[0].fields.ipmiAuthProfileId).toEqual({ mode: "fill", value: "prof-1" });
   });
 });
 
@@ -1312,5 +1365,187 @@ describe("Edit Template Rules… flow (§7.2)", () => {
     const rules = core.getInventorySource("src-1")!.templateRules!;
     expect(rules).toHaveLength(1);
     expect(rules[0]).toMatchObject({ templateId: "t1", filter: "role=switch" });
+  });
+});
+
+describe("applyPlanWrites — reference revalidation (PR-T3, PR #66 Codex round 6)", () => {
+  function targetServer(): ServerConfig {
+    return {
+      id: "R",
+      name: "Target R",
+      host: "r",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "DC",
+      origin: { sourceId: "src", externalId: "R", syncedAt: 1 }
+    };
+  }
+
+  it("SKIPS an IPMI gateway pruned since plan time (kills persisting a dangling gateway from a concurrent folder delete)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "GW", name: "Gateway", host: "g", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    await core.addOrUpdateServer(targetServer());
+
+    // Plan (computed while GW is live) sets R's IPMI gateway to GW.
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "GW" } } },
+      servers: [core.getServer("R")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "GW" || id === "R"
+    });
+    expect(plan.serverWrites.find((w) => w.serverId === "R")?.ipmiGatewayServerId).toBe("GW");
+
+    // CONCURRENT DELETION between plan and apply: GW is pruned (e.g. its folder removed).
+    await core.removeServer("GW");
+
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    // R's ONLY field was the gateway; it was revalidated away, so R is not counted
+    // as applied (round 11 — the count/toast must not claim an untouched server).
+    expect(applied).toBe(0);
+    // The now-dangling gateway must NOT be persisted. Against the pre-fix writer
+    // (unconditional `next.ipmiGatewayServerId = write.ipmiGatewayServerId`) R would
+    // carry the dangling "GW" and this assertion fails.
+    expect(core.getServer("R")?.ipmiGatewayServerId).toBeUndefined();
+    // Skipped ⇒ not recorded as hand-owned: no gateway stamp was minted.
+    expect(core.getServer("R")?.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+  });
+
+  it("WRITES a gateway that still resolves at apply time (regression — the guard did not over-skip)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "GW", name: "Gateway", host: "g", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    await core.addOrUpdateServer(targetServer());
+
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "GW" } } },
+      servers: [core.getServer("R")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "GW" || id === "R"
+    });
+
+    // GW remains live — the reference resolves at apply time.
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    expect(applied).toBe(1);
+    expect(core.getServer("R")?.ipmiGatewayServerId).toBe("GW");
+  });
+});
+
+// ============================================================================
+// FALSIFICATION-CRITICAL: PR-T3 review round 9 (Codex) — FIX B. The §7.4 manual-apply
+// stamp clear must also strip the written members from the DETACHED `formerlySynced`
+// receipt, not only from `live.origin`. A server KEPT from a removed source carries its
+// ownership receipt in `formerlySynced` (no `origin`); when a manual Override claims the
+// existing value as a hand edit, the detached stamp must be cleared too — otherwise a later
+// ADOPTION restores it into a live `origin` as template-owned, silently breaking the consent
+// modal's "this becomes hand-owned" promise. Built to FAIL against 229730e, which clears
+// only `live.origin` and leaves the detached stamp intact.
+// ============================================================================
+describe("applyPlanWrites — detached receipt stamp clear (PR-T3, PR #66 Codex round 9)", () => {
+  /** A server KEPT from a removed source: no `origin`, a `formerlySynced` receipt whose `templated` stamps the two IPMI ids the sync last wrote. */
+  function keptServer(templated: { ipmiGatewayServerId?: string; ipmiAuthProfileId?: string }, live: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "K",
+      name: "Kept",
+      host: "k",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "DC",
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: "https://netbox.example.com",
+        externalId: "K",
+        templated,
+        detachedAt: 1
+      },
+      ...live
+    };
+  }
+
+  it("CLEARS the detached gateway stamp when an Override claims the SAME gateway as a hand edit (kills clearing only live.origin — the detached stamp survives and a later adoption resurrects it as template-owned)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "X", name: "Gateway X", host: "x", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    // Kept server currently points at gateway X, and its DETACHED receipt stamps X as the
+    // removed source's template-owned value. No `origin` — the stamp lives only on the receipt.
+    await core.addOrUpdateServer(keptServer({ ipmiGatewayServerId: "X" }, { ipmiGatewayServerId: "X" }));
+
+    // An Override rule writes the SAME value X, deliberately claiming it as a hand edit —
+    // an override always writes (even a no-op value), so `ipmiGatewayServerId` is written.
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "X" } } },
+      servers: [core.getServer("K")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "X" || id === "K"
+    });
+    expect(plan.serverWrites.find((w) => w.serverId === "K")?.writtenFields).toContain("ipmiGatewayServerId");
+
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    expect(applied).toBe(1);
+    const next = core.getServer("K")!;
+    // The value the Override wrote is present…
+    expect(next.ipmiGatewayServerId).toBe("X");
+    // …and the DETACHED stamp is CLEARED — the whole point of FIX B. Against 229730e only
+    // `live.origin` is cleared, so the detached stamp survives and this assertion fails.
+    // The bag held only the gateway stamp, so it collapses to `undefined`.
+    expect(next.formerlySynced?.templated?.ipmiGatewayServerId).toBeUndefined();
+    // The receipt's REQUIRED fields are never touched — a DetachedServerOrigin never
+    // collapses to `undefined`.
+    expect(next.formerlySynced?.sourceId).toBe("removed-source");
+    expect(next.formerlySynced?.externalId).toBe("K");
+  });
+
+  it("clears ONLY the written member — a co-stamped ipmiAuthProfileId survives when only the gateway is written (proves the clear keys off writtenFields, not a blanket wipe)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "X", name: "Gateway X", host: "x", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    // Receipt stamps BOTH IPMI ids; the Override writes only the gateway.
+    await core.addOrUpdateServer(keptServer({ ipmiGatewayServerId: "X", ipmiAuthProfileId: "PA" }, { ipmiGatewayServerId: "X", ipmiAuthProfileId: "PA" }));
+
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "X" } } },
+      servers: [core.getServer("K")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "X" || id === "K"
+    });
+
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    expect(applied).toBe(1);
+    const next = core.getServer("K")!;
+    expect(next.formerlySynced?.templated?.ipmiGatewayServerId).toBeUndefined(); // cleared
+    expect(next.formerlySynced?.templated?.ipmiAuthProfileId).toBe("PA"); // untouched — not written
+  });
+});
+
+describe("applyPlanWrites — skip a target whose only field was revalidated away (PR-T3, PR #66 Codex round 11)", () => {
+  it("does NOT count/save a server whose sole written field (a gateway) is deleted before apply", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "GW", name: "Gateway", host: "g", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    await core.addOrUpdateServer({ id: "R", name: "Target R", host: "r", port: 22, username: "u", authType: "agent", isHidden: false, group: "DC", origin: { sourceId: "src", externalId: "R", syncedAt: 1 } });
+
+    // Plan whose ONLY write for R is the IPMI gateway (GW live at plan time).
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "GW" } } },
+      servers: [core.getServer("R")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "GW" || id === "R"
+    });
+    expect(plan.serverWrites.find((w) => w.serverId === "R")?.writtenFields).toEqual(["ipmiGatewayServerId"]);
+
+    // GW pruned before apply → R's only field is skipped → R must NOT be counted.
+    await core.removeServer("GW");
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    // Against the pre-fix writer this returns 1 (saved + counted an unchanged R).
+    expect(applied).toBe(0);
+    // R is untouched: no dangling gateway persisted, origin intact.
+    expect(core.getServer("R")?.ipmiGatewayServerId).toBeUndefined();
+    expect(core.getServer("R")?.origin?.templated).toBeUndefined();
   });
 });
