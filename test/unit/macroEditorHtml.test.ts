@@ -273,7 +273,7 @@ describe("renderMacroEditorHtml", () => {
       0
     );
     expect(both).toContain('id="gateway-inert-credentials-hint"');
-    expect(both).toContain("ipmitool will prompt on the gateway instead");
+    expect(both).toContain("ipmitool prompts on the gateway via its `-a` form instead");
     // Rendered visible (no display:none) when both are on.
     expect(both).not.toContain('id="gateway-inert-credentials-hint" style="display:none;"');
     // Gateway route but credentials OFF → hint hidden.

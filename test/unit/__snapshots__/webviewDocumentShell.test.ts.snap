@@ -5796,7 +5796,7 @@ echo hi</textarea>
          triggers it (route = gateway AND this box ticked), not in the run-on group
          where ticking the box surfaced a hint in a different, possibly off-screen
          group. Same id / same live-update (updateGatewayInertHint), same constant. -->
-    <div class="hint" id="gateway-inert-credentials-hint" style="display:none;">IPMI credentials can&#39;t be sent to a gateway session — ipmitool will prompt on the gateway instead</div>
+    <div class="hint" id="gateway-inert-credentials-hint" style="display:none;">IPMI credentials can&#39;t be sent to a gateway session — ipmitool prompts on the gateway via its \`-a\` form instead</div>
   </div>
 
   <div class="form-group">

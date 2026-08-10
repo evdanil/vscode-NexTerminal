@@ -180,9 +180,16 @@ export function resolveMacroRoute(macro: Pick<TerminalMacro, "route">): MacroRou
  * the password on the bastion tty instead. Deliberately not an error — a user may
  * flip `route` back and forth on one macro. Defined here so the macro editor's
  * live hint and the per-run delivery note read from ONE string and cannot drift.
+ *
+ * POINTS AT `-a`, DOES NOT PROMISE A BARE PROMPT (PR-C round 4, P2). ipmitool only
+ * prompts on the gateway when the command uses its `-a` form; a command that reads
+ * the password from the environment (`-E`) gets no env on the gateway and simply
+ * FAILS there. So this shared copy names the `-a` form rather than promising an
+ * unconditional prompt — the run-time `-E`-on-gateway warning
+ * (`gatewayEnvPasswordNote`) covers the failing case that this editor hint can't.
  */
 export const IPMI_GATEWAY_INERT_CREDENTIALS_HINT =
-  "IPMI credentials can't be sent to a gateway session — ipmitool will prompt on the gateway instead";
+  "IPMI credentials can't be sent to a gateway session — ipmitool prompts on the gateway via its `-a` form instead";
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */
 export function macroRunTargetLabel(target: MacroRunTarget): string {

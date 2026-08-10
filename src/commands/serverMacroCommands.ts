@@ -383,6 +383,45 @@ export function gatewayInertCredentialsNote(macro: TerminalMacro): string | unde
 }
 
 /**
+ * ipmitool's `-E` flag as a STANDALONE token — its "read the password from the
+ * environment" flag (`IPMITOOL_PASSWORD` / `IPMI_PASSWORD`). Boundaries on both
+ * sides so `-Example`, `foo-E` and `-Env` do NOT match, only a real `-E` argument
+ * (line start or after whitespace; end of line or before whitespace).
+ */
+const IPMITOOL_ENV_PASSWORD_FLAG_RE = /(?:^|\s)-E(?=\s|$)/;
+
+/**
+ * Whether a command reads the IPMI password from the environment via ipmitool's
+ * `-E` flag. This is the real predicate for "this will FAIL on a gateway": the
+ * gateway session gets no injected env (the secret never crosses to the remote
+ * hop), so a `-E` command exits "password not available" there instead of
+ * prompting. A text-derived HINT only (§3.3) — never used for authorization, and
+ * the command is neither blocked nor rewritten on its account.
+ */
+export function commandReadsIpmiEnv(text: string): boolean {
+  return IPMITOOL_ENV_PASSWORD_FLAG_RE.test(text);
+}
+
+/**
+ * The `-E`-on-gateway per-run WARNING (PR-C round 4, P2). A gateway-routed command
+ * that reads the password from the environment (`-E`) can't get that env on the
+ * gateway session, so it FAILS on the bastion rather than prompting — the exact
+ * case the inert-credentials note's old "will prompt" copy over-promised. Keyed on
+ * the COMMAND, not the credentials flag: `-E` fails whether or not
+ * `provideIpmiCredentials` is set, so this fires regardless of the flag and
+ * REPLACES the flag-gated inert note when it applies (the two never double-fire).
+ *
+ * Names the gateway and points at ipmitool's `-a` form (which prompts on the
+ * bastion tty) as the fix. Lowercase-leaning, no trailing period: appended as a
+ * clause like the sibling notes; the status line adds its own punctuation.
+ */
+export function gatewayEnvPasswordNote(command: string, gateway: ServerConfig): string | undefined {
+  return commandReadsIpmiEnv(command)
+    ? `this command reads the IPMI password from the environment (-E), which a gateway session can't provide — it will fail on ${gateway.name}; use ipmitool's -a form so it prompts there instead`
+    : undefined;
+}
+
+/**
  * The one delivery note built from however many caveats a run collected. Joined
  * with a semicolon rather than a second status message: `runMacroWithTarget`
  * appends ONE clause to the success line, and a second `setStatusBarMessage`
@@ -716,9 +755,17 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     // intelligible (they were not provided to a LOCAL run it fell back to).
     noGatewayFallbackNote(server, route, gatewayServer),
     // On the gateway path the "tick Provide IPMI credentials" hint would be wrong
-    // (the flag is inert there), so it is replaced by the inert-credentials note;
-    // the local and fall-back paths keep the original hint.
-    routedToGateway ? gatewayInertCredentialsNote(macro) : ipmiCredentialsOffNote(macro),
+    // (the flag is inert there), so it is replaced by a gateway-specific note; the
+    // local and fall-back paths keep the original hint. When the command reads its
+    // password from the environment (`-E`), the gateway session can't provide it,
+    // so it FAILS there rather than prompting — that case gets an active warning
+    // (keyed on the command, not the flag) that REPLACES the inert note, which
+    // would otherwise over-promise a prompt that never comes.
+    routedToGateway
+      ? commandReadsIpmiEnv(resolution.text)
+        ? gatewayEnvPasswordNote(resolution.text, gatewayServer!)
+        : gatewayInertCredentialsNote(macro)
+      : ipmiCredentialsOffNote(macro),
     sessionIpmiHintNote(macro),
     routeReconsentNote(macro, route, resolveIpmiGatewayServer(ctx, server))
   );
