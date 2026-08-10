@@ -2690,6 +2690,16 @@ export function registerConfigCommands(
         await core.removeInventorySource(source.id);
       }
 
+      // Remove all device templates (PR-T1) and saved filters (PR-E) — the reset
+      // promises to delete ALL Nexus data. Sources are already gone above, so
+      // removeDeviceTemplate's rule-sweep touches nothing.
+      for (const template of snapshot.deviceTemplates) {
+        await core.removeDeviceTemplate(template.id);
+      }
+      for (const filter of snapshot.savedFilters) {
+        await core.removeSavedFilter(filter.id);
+      }
+
       // Clear macros (globalState + vault entries)
       await getActiveMacroStore().clearAll();
       if (context) {

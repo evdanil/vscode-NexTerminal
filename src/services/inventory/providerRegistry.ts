@@ -42,6 +42,18 @@ export function validateProviderShape(provider: unknown): asserts provider is In
     if (typeof f.type !== "string" || !VALID_FIELD_TYPES.has(f.type as InventoryConfigFieldType)) {
       throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid type "${String(f.type)}".`);
     }
+    if (f.type === "select") {
+      if (!Array.isArray(f.options) || f.options.length === 0) {
+        throw new Error(`Inventory provider configFields entry "${f.id}" of type "select" must declare a non-empty options array.`);
+      }
+      for (const opt of f.options) {
+        if (typeof opt !== "object" || opt === null
+            || typeof (opt as { label?: unknown }).label !== "string" || (opt as { label: string }).label.length === 0
+            || typeof (opt as { value?: unknown }).value !== "string") {
+          throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid select option (each option needs a non-empty string label and a string value).`);
+        }
+      }
+    }
     if (seenFieldIds.has(f.id)) {
       throw new Error(`Inventory provider configFields has a duplicate field id "${f.id}".`);
     }

@@ -4951,11 +4951,22 @@ describe("complete reset", () => {
     await core.addOrUpdateSerialProfile(makeSerialProfile());
     await core.addOrUpdateAuthProfile(makeAuthProfile());
     await core.addGroup("Production");
+    // PR #64 Codex round 1 (P2 #1) — device templates (PR-T1) and saved filters
+    // (PR-E) are Nexus data too, and Complete Reset promises to delete ALL of it.
+    // Against HEAD 589efab both survive the reset, so these two assertions go red
+    // there and green with the AFTER-inventory-loop clear.
+    await core.addOrUpdateDeviceTemplate({ id: "dt1", name: "Edge defaults", fields: {} });
+    await core.addOrUpdateSavedFilter({ id: "sf1", name: "Syd core", filter: "role=core&site=syd" });
     await vault.store("password-s1", "pw");
     await vault.store("passphrase-s1", "pp");
     await vault.store("auth-profile-password-ap1", "auth-pw");
     await vault.store("auth-profile-passphrase-ap1", "auth-pp");
     configStore.set("nexus.terminal.macros", [{ name: "M", text: "echo" }]);
+
+    // Confirm the fixture actually seeded both buckets, so the emptiness
+    // assertions below can only pass because the reset cleared them.
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
+    expect(core.getSnapshot().savedFilters).toHaveLength(1);
 
     mockShowWarningMessage.mockResolvedValue("Delete Everything");
     mockShowInputBox.mockResolvedValue("DELETE");
@@ -4968,6 +4979,8 @@ describe("complete reset", () => {
     expect(snapshot.tunnels).toHaveLength(0);
     expect(snapshot.serialProfiles).toHaveLength(0);
     expect(snapshot.explicitGroups).toHaveLength(0);
+    expect(snapshot.deviceTemplates).toHaveLength(0);
+    expect(snapshot.savedFilters).toHaveLength(0);
     expect(await vault.get("password-s1")).toBeUndefined();
     expect(await vault.get("passphrase-s1")).toBeUndefined();
     expect(await vault.get("auth-profile-password-ap1")).toBeUndefined();

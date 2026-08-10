@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { InventoryProviderRegistry, validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, resolveProviderInstanceKey } from "../../src/models/inventory";
 import type { InventoryProvider } from "../../src/models/inventory";
+import { createNetboxProvider } from "../../src/services/inventory/providers/netboxProvider";
 
 function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
   return {
@@ -120,6 +121,56 @@ describe("validateProviderShape", () => {
   it("rejects a non-function instanceKey loudly (kills a silent degrade for a typo'd `instanceKey: \"...\"`, which is indistinguishable at runtime from a provider that never declared one — and the symptom, adoption quietly never firing, only shows up after a user has already removed a source with Keep Servers)", () => {
     expect(() => validateProviderShape(makeProvider({ instanceKey: "https://netbox.example.com" as never }))).toThrow(/instanceKey/);
     expect(() => validateProviderShape(makeProvider({ instanceKey: 42 as never }))).toThrow(/instanceKey/);
+  });
+
+  // SELECT OPTIONS VALIDATION (PR #64 Codex review round 1, P2 — issue #48 PR-E).
+  // `type:"select"` reached VALID_FIELD_TYPES without any check on `options`, so a
+  // third-party provider could register a select with no/empty/malformed options —
+  // yielding an empty, unsavable required control, or malformed members that throw
+  // inside renderFormHtml's escaping. Each case below registers SILENTLY against the
+  // pre-fix boundary (the assertion that it throws is red there), and throws with the
+  // fix. `value:""` is a legitimate sentinel and must stay accepted.
+  it("rejects a select field that OMITS options (kills accepting an empty, unsavable dropdown at the registration boundary)", () => {
+    const bad = makeProvider({ configFields: [{ id: "family", label: "Family", type: "select" }] });
+    expect(() => validateProviderShape(bad)).toThrow(/"family".*select.*non-empty options array/i);
+  });
+
+  it("rejects a select field with an EMPTY options array", () => {
+    const bad = makeProvider({ configFields: [{ id: "family", label: "Family", type: "select", options: [] }] });
+    expect(() => validateProviderShape(bad)).toThrow(/"family".*select.*non-empty options array/i);
+  });
+
+  it("rejects a select option whose label is an empty string (only label must be non-empty)", () => {
+    const bad = makeProvider({ configFields: [{ id: "family", label: "Family", type: "select", options: [{ label: "", value: "auto" }] }] });
+    expect(() => validateProviderShape(bad)).toThrow(/"family".*invalid select option/i);
+  });
+
+  it("rejects a select option whose value is not a string — a number or undefined (kills a malformed member reaching renderFormHtml's escaping)", () => {
+    const numeric = makeProvider({ configFields: [{ id: "family", label: "Family", type: "select", options: [{ label: "Auto", value: 1 as never }] }] });
+    expect(() => validateProviderShape(numeric)).toThrow(/"family".*invalid select option/i);
+    const missing = makeProvider({ configFields: [{ id: "family", label: "Family", type: "select", options: [{ label: "Auto" } as never] }] });
+    expect(() => validateProviderShape(missing)).toThrow(/"family".*invalid select option/i);
+  });
+
+  it("accepts a well-formed select, INCLUDING an option with value:\"\" (a legitimate none/default sentinel)", () => {
+    const ok = makeProvider({
+      configFields: [{
+        id: "family",
+        label: "Family",
+        type: "select",
+        options: [
+          { label: "None", value: "" },
+          { label: "IPv4", value: "prefer-ipv4" }
+        ]
+      }]
+    });
+    expect(() => validateProviderShape(ok)).not.toThrow();
+  });
+
+  it("accepts the built-in NetBox provider, whose primaryIpFamily select declares proper options (kills a rule that would reject a legitimate shipped select)", () => {
+    const netbox = createNetboxProvider();
+    expect(() => validateProviderShape(netbox)).not.toThrow();
+    expect(() => new InventoryProviderRegistry().register(netbox)).not.toThrow();
   });
 });
 
