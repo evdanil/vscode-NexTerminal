@@ -3175,6 +3175,107 @@ describe("computeSyncPlan — adopt-on-add", () => {
       expect(adopted.ipmiHost).toBe("10.1.1.1");
       expect(adopted.origin?.syncedIpmiHost).toBe("10.1.1.1");
     });
+
+    /** The kept device with an ALTERNATE (second) ssh endpoint beside its primary one. */
+    function keptDeviceWithAlt(alt: string, overrides: Partial<InventoryDevice> = {}): InventoryDevice {
+      return keptDevice({ endpoints: [{ kind: "ssh", host: "lab-sw-01" }, { kind: "ssh", host: alt }], ...overrides });
+    }
+
+    it("ALTERNATE HOST (Phase 2) — an adoption RESTORES `syncedAltHost` from the marker, and a marker carrying none restores none (kills a receipt-less adoption, under which Remove Source → Keep Servers → re-add → Adopt leaves a SYNC-WRITTEN alternate host looking hand-typed forever)", () => {
+      const source = makeSource();
+
+      const withReceipt = makeKeptServer({ altHost: "2001:db8::9", formerlySynced: keptMarker({ syncedAltHost: "2001:db8::9" }) });
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithAlt("2001:db8::9")]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.altHost).toBe("2001:db8::9");
+      expect(adopted.origin?.syncedAltHost).toBe("2001:db8::9");
+
+      // THE NEAR-MISS: an identical record whose marker carries NO receipt holds
+      // a hand-typed alternate, so the adoption must restore nothing and leave it
+      // hands-off. Kills an implementation that simply stamps `adoptee.altHost`.
+      const handTyped = makeKeptServer({
+        id: "kept-2",
+        altHost: "192.168.50.5",
+        formerlySynced: keptMarker({ externalId: "device:2" })
+      });
+      const handAdopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithAlt("2001:db8::9", { externalId: "device:2" })]),
+        currentServers: [handTyped],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+      expect(handAdopted.altHost).toBe("192.168.50.5");
+      expect(handAdopted.origin?.syncedAltHost).toBeUndefined();
+    });
+
+    it("ALTERNATE HOST (Phase 2) — a re-addressed alternate WHILE THE SOURCE WAS DETACHED is applied BY the adoption, not one sync later (matrix row 3; kills a restore-only adoption that leaves the record on the dead alternate for the run the user approved)", () => {
+      const source = makeSource();
+      const withReceipt = makeKeptServer({
+        altHost: "2001:db8::1",
+        formerlySynced: keptMarker({ syncedAltHost: "2001:db8::1" })
+      });
+
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithAlt("2001:db8::2")]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.altHost).toBe("2001:db8::2");
+      expect(adopted.origin?.syncedAltHost).toBe("2001:db8::2");
+    });
+
+    it("ALTERNATE HOST (Phase 2) — a hand-typed alternate with NO receipt survives adoption untouched and unstamped (kills the over-broad `takesAltHost = altHost !== undefined`, which would clobber the one value the matrix exists to protect)", () => {
+      const source = makeSource();
+      const handTyped = makeKeptServer({
+        altHost: "192.168.0.9",
+        formerlySynced: keptMarker()
+      });
+
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDeviceWithAlt("2001:db8::2")]),
+        currentServers: [handTyped],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.altHost).toBe("192.168.0.9");
+      expect(adopted.origin?.syncedAltHost).toBeUndefined();
+    });
+
+    it("ALTERNATE HOST (Phase 2) — a device offering NO alternate leaves the field alone AND still carries the receipt (matrix row 6; kills the half-fix `syncedAltHost: takesAltHost ? altHost : undefined`, which drops the restore on every no-write row)", () => {
+      const source = makeSource();
+      const withReceipt = makeKeptServer({
+        altHost: "2001:db8::1",
+        formerlySynced: keptMarker({ syncedAltHost: "2001:db8::1" })
+      });
+
+      // `keptDevice()` — a single ssh endpoint, no second one beside it.
+      const adopted = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [withReceipt],
+        now: 5000,
+        adoptionChoice: "adopt"
+      }).updates[0].after;
+
+      expect(adopted.id).toBe("kept-1");
+      expect(adopted.altHost).toBe("2001:db8::1");
+      expect(adopted.origin?.syncedAltHost).toBe("2001:db8::1");
+    });
   });
 
   /**
@@ -3993,5 +4094,331 @@ describe("computeSyncPlan — oob_ip -> ipmiHost (OOB)", () => {
     expect(after.ipmiHost).toBe("10.9.9.9");
     expect(after.origin?.syncedIpmiHost).toBe("10.9.9.9");
     expect(plan.warnings.some((w) => w.includes("out-of-band address that cannot be used"))).toBe(true);
+  });
+});
+
+/**
+ * ALTERNATE HOST (issue #48, Phase 2) — the provider's SECOND ssh endpoint
+ * reaching `ServerConfig.altHost`, and the `ServerOrigin.syncedAltHost` stamp
+ * that decides when the sync may write it.
+ *
+ * `altHost` is a FAITHFUL PARALLEL of `ipmiHost`: it too shipped as a
+ * hand-edited field before any sync could write it (Phase 1), so it is on the
+ * `syncedAuthProfileId`/`syncedIpmiHost` discipline — the stamp records what the
+ * SYNC wrote, and the sync writes only where the record still carries exactly
+ * that. There is one fixture per row of `syncOwnsAltHost`'s matrix below (which
+ * references `syncOwnsIpmiHost`'s verbatim), each built so the WRONG rule
+ * produces a visibly different plan. Unlike `ipmiHost`, `altHost` is a plain SSH
+ * host and is NOT run through `isAddressValue`, so the OOB block's two
+ * sync-time-validation fixtures have no `altHost` twin.
+ */
+describe("computeSyncPlan — altHost (alternate host, Phase 2)", () => {
+  const PRIMARY = { kind: "ssh" as const, host: "10.0.0.1" };
+  const ALT = { kind: "ssh" as const, host: "2001:db8::1" };
+
+  /** A device with the primary ssh endpoint and an alternate (second) ssh endpoint. */
+  function deviceWithAlt(alt = "2001:db8::1", overrides: Partial<InventoryDevice> = {}): InventoryDevice {
+    return makeDevice({ endpoints: [PRIMARY, { kind: "ssh", host: alt }], ...overrides });
+  }
+
+  /** The one update this plan is expected to contain. */
+  function onlyUpdate(plan: InventorySyncPlan) {
+    expect(plan.updates).toHaveLength(1);
+    return plan.updates[0].after;
+  }
+
+  it("ADD PATH: writes the alternate endpoint into altHost and stamps it, and stamps `undefined` when the device offers none (kills a stampless add, which reads as a hand entry on the very next sync and is never updated again)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([deviceWithAlt(), makeDevice({ externalId: "device:2", name: "single-ip" })]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds).toHaveLength(2);
+    const [withAlt, withoutAlt] = plan.adds;
+    expect(withAlt.altHost).toBe("2001:db8::1");
+    expect(withAlt.origin?.syncedAltHost).toBe("2001:db8::1");
+    // The primary SSH mapping is untouched by any of this.
+    expect(withAlt.host).toBe("10.0.0.1");
+    expect(withoutAlt.altHost).toBeUndefined();
+    expect(withoutAlt.origin?.syncedAltHost).toBeUndefined();
+  });
+
+  it("selects the SECOND ssh endpoint, never the first (kills a selector that maps the primary onto altHost, and kills one that takes a third-or-later endpoint)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({
+          endpoints: [PRIMARY, { kind: "ssh", host: "2001:db8::1" }, { kind: "ssh", host: "2001:db8::ffff" }]
+        })
+      ]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds[0].host).toBe("10.0.0.1");
+    expect(plan.adds[0].altHost).toBe("2001:db8::1");
+  });
+
+  it("MATRIX ROW 1 — unset value, unset stamp, alternate present: writes and stamps (kills 'never write', which leaves the whole feature inert)", () => {
+    const owned = makeOwnedServer();
+    expect(owned.altHost).toBeUndefined();
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithAlt()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.altHost).toBe("2001:db8::1");
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
+  });
+
+  it("MATRIX ROW 2 — unset value, stamp SET (the user cleared a synced alternate): leaves it cleared and carries the stamp forward (kills a missing opt-out clause, which refills the field on every sync forever)", () => {
+    const owned = makeOwnedServer({
+      // The stamp is what makes this "the user emptied a value the sync wrote"
+      // rather than "never configured" — the only difference from row 1's fixture.
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([deviceWithAlt()]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("MATRIX ROW 1, BLANK VALUE — an empty-string altHost with no stamp is ABSENT, not hand-configured: filled and stamped (kills a strict `cur === stamp` comparison that misfiles `\"\"` as a hand edit forever)", () => {
+    const owned = makeOwnedServer({ altHost: "" });
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithAlt()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.altHost).toBe("2001:db8::1");
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
+  });
+
+  it("MATRIX ROW 1, WHITESPACE-ONLY VALUE — same as the blank one: filled and stamped (kills a fix that only special-cases the exact empty string)", () => {
+    const owned = makeOwnedServer({ altHost: "   " });
+
+    const after = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithAlt()]), currentServers: [owned], now: 2000 })
+    );
+
+    expect(after.altHost).toBe("2001:db8::1");
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
+  });
+
+  it("MATRIX ROW 2, BLANK VALUE — a blank value WITH a stamp is still the opt-out: left blank, stamp carried forward (kills the over-fix `blank cur → the sync owns it`)", () => {
+    const owned = makeOwnedServer({
+      altHost: "",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::9" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // Renamed, so an update is pushed whatever the rule does and the assertion
+      // observes the FIELD rather than the mere presence of a plan entry.
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [PRIMARY, ALT] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.name).toBe("core-sw-1-renamed");
+    expect(after.altHost).toBe("");
+    expect(after.altHost).not.toBe("2001:db8::1");
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::9");
+  });
+
+  it("MATRIX ROW 3 — value still equals the stamp, alternate moved: overwrites and re-stamps (kills 'never overwrite', which strands a changed alternate on its old address)", () => {
+    const owned = makeOwnedServer({
+      altHost: "2001:db8::1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    });
+
+    const after = onlyUpdate(
+      computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([deviceWithAlt("2001:db8::50")]),
+        currentServers: [owned],
+        now: 2000
+      })
+    );
+
+    expect(after.altHost).toBe("2001:db8::50");
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::50");
+  });
+
+  it("MATRIX ROW 4 — value HAND-EDITED away from the stamp: the hand edit survives and is never laundered into the stamp (kills 'the device always wins', the host/port rule)", () => {
+    const owned = makeOwnedServer({
+      // The sync wrote 2001:db8::1; the user retyped it; the device now reports a
+      // third value, so all three are distinct and every wrong rule lands elsewhere.
+      altHost: "192.168.50.5",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [PRIMARY, { kind: "ssh", host: "2001:db8::50" }] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.name).toBe("core-sw-1-renamed");
+    expect(after.altHost).toBe("192.168.50.5");
+    // Carried forward VERBATIM — recording the hand-edited value would make the
+    // next sync read it as "still exactly what I stamped" and overwrite it.
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
+  });
+
+  it("MATRIX ROW 5 — legacy hand-set value with NO stamp: untouched, and it does not acquire a stamp (kills 'absent stamp means the sync owns it', which clobbers every Phase-1 manual entry on the first post-upgrade sync)", () => {
+    const owned = makeOwnedServer({
+      altHost: "192.168.50.5",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [PRIMARY, ALT] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.altHost).toBe("192.168.50.5");
+    expect(after.origin?.syncedAltHost).toBeUndefined();
+  });
+
+  it("MATRIX ROW 5a — a hand-typed value that ALREADY EQUALS the device's alternate gains the stamp while the value stays put: a GENUINE stamp-only update (kills the `cur === stamp`-only gate, under which a copied-out-of-NetBox alternate can never be stamped and goes silently stale)", () => {
+    const owned = makeOwnedServer({
+      altHost: "2001:db8::1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // Nothing else moved: same name/host/port/folder/alternate. The STAMP is the
+      // entire difference between `before` and `after` (AUTH 3a's shape).
+      tree: makeTree([deviceWithAlt()]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.unchangedCount).toBe(0);
+    const { before, after } = plan.updates[0];
+    expect(before.altHost).toBe("2001:db8::1");
+    expect(after.altHost).toBe("2001:db8::1");
+    expect(before.origin?.syncedAltHost).toBeUndefined();
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
+  });
+
+  it("MATRIX ROW 5a, WHAT THE STAMP THEN BUYS — once stamped, the same record follows the alternate to its new address on the next sync (row 3); without the stamp it is stuck forever", () => {
+    const owned = makeOwnedServer({
+      altHost: "2001:db8::1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+    });
+
+    const stamped = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithAlt()]), currentServers: [owned], now: 2000 })
+    );
+    expect(stamped.origin?.syncedAltHost).toBe("2001:db8::1");
+
+    // Feeding sync one's OUTPUT back in is the point: the repair must survive.
+    const followed = onlyUpdate(
+      computeSyncPlan({ source: makeSource(), tree: makeTree([deviceWithAlt("2001:db8::50")]), currentServers: [stamped], now: 3000 })
+    );
+    expect(followed.altHost).toBe("2001:db8::50");
+    expect(followed.origin?.syncedAltHost).toBe("2001:db8::50");
+  });
+
+  it("MATRIX ROW 5a NEVER REACHES THE OPT-OUT — a CLEARED value stays cleared whether or not the device still reports the address the stamp names (kills an equal-value rule written against the STAMP instead of the record's own value)", () => {
+    const stampMatchesDevice = makeOwnedServer({
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    });
+    const stampIsStale = makeOwnedServer({
+      id: deterministicServerId("source-1", "device:2"),
+      name: "core-sw-2",
+      origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    });
+    expect(stampMatchesDevice.altHost).toBeUndefined();
+    expect(stampIsStale.altHost).toBeUndefined();
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        deviceWithAlt("2001:db8::1"),
+        makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [PRIMARY, { kind: "ssh", host: "2001:db8::50" }] })
+      ]),
+      currentServers: [stampMatchesDevice, stampIsStale],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(2);
+  });
+
+  it("MATRIX ROW 6 — alternate ABSENT this fetch: the sync-owned value is carried forward with its stamp intact (kills 'an absent alternate clears the field')", () => {
+    const owned = makeOwnedServer({
+      altHost: "2001:db8::1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      // Renamed, single ssh endpoint (no alternate), so the plan carries an update
+      // whatever the rule does — the fixture observes the FIELD.
+      tree: makeTree([makeDevice({ name: "core-sw-1-renamed", endpoints: [PRIMARY] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = onlyUpdate(plan);
+    expect(after.altHost).toBe("2001:db8::1");
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
+  });
+
+  it("an altHost write is enough to make an otherwise-identical server an UPDATE rather than unchanged (kills forgetting `altHost` in the `changed` comparison)", () => {
+    const owned = makeOwnedServer();
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([deviceWithAlt()]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.unchangedCount).toBe(0);
+    expect(plan.updates[0].before.altHost).toBeUndefined();
+    expect(plan.updates[0].after.altHost).toBe("2001:db8::1");
+  });
+
+  it("the alternate write survives a retro-apply in the same plan (kills writing the stamp onto `after.origin` after the literal, which the retro-apply branch's `{ ...afterOrigin }` rebuild silently drops)", () => {
+    const authProfile: AuthProfile = { id: "p1", name: "Fleet", username: "admin", authType: "password" };
+    const owned = makeOwnedServer({ origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" } });
+
+    const after = onlyUpdate(
+      computeSyncPlan({
+        source: makeSource({ authProfileId: "p1" }),
+        tree: makeTree([deviceWithAlt()]),
+        currentServers: [owned],
+        now: 2000,
+        authProfile
+      })
+    );
+
+    // Retro-apply fired...
+    expect(after.authProfileId).toBe("p1");
+    expect(after.origin?.syncedAuthProfileId).toBe("p1");
+    // ...and did not take the alternate-host stamp with it.
+    expect(after.altHost).toBe("2001:db8::1");
+    expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
   });
 });

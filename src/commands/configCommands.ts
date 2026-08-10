@@ -2708,6 +2708,14 @@ export function registerConfigCommands(
                       ...(rolledBackOrigin.syncedIpmiHost !== undefined
                         ? { syncedIpmiHost: rolledBackOrigin.syncedIpmiHost }
                         : {}),
+                      // ALTERNATE HOST (issue #48, Phase 2) — copied from the
+                      // origin being stripped for the same reason the auth/OOB
+                      // provenance above is, and omitted rather than written as
+                      // `undefined` for the same reason: this object is persisted
+                      // verbatim.
+                      ...(rolledBackOrigin.syncedAltHost !== undefined
+                        ? { syncedAltHost: rolledBackOrigin.syncedAltHost }
+                        : {}),
                       // DEVICE TEMPLATES (issue #48 PR-T1, Codex review round 3) —
                       // the template stamps, the fourth part of the origin that
                       // must OUTLIVE the strip, on exactly the terms of the auth/

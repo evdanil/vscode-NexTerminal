@@ -3039,6 +3039,16 @@ export function registerInventoryCommands(
                     // rather than written as `undefined` for the reason
                     // `instanceKey` is.
                     ...(origin.syncedIpmiHost !== undefined ? { syncedIpmiHost: origin.syncedIpmiHost } : {}),
+                    // ALTERNATE HOST (issue #48, Phase 2) — the alternate-host
+                    // provenance, preserved across the strip on exactly the terms
+                    // of the auth/OOB provenance above. It says whether the
+                    // `altHost` this server keeps was the SYNC'S doing or the
+                    // USER'S, which is the whole of the `syncOwnsAltHost` write
+                    // rule. Dropped here, an adopted server's sync-written second
+                    // address arrived looking hand-typed and no later sync could
+                    // update it. Omitted rather than written as `undefined` for the
+                    // reason `instanceKey` is.
+                    ...(origin.syncedAltHost !== undefined ? { syncedAltHost: origin.syncedAltHost } : {}),
                     // DEVICE TEMPLATES (issue #48 PR-T1) — the third part of the
                     // origin that has to SURVIVE the strip, on exactly the terms
                     // of the auth/OOB provenance above. It says whether the
