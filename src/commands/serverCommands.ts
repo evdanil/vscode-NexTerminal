@@ -1404,6 +1404,32 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             if (candidate.ipmiAuthProfileId !== undefined && ctx.core.getAuthProfile(candidate.ipmiAuthProfileId) === undefined) {
               throw new Error(MISSING_IPMI_AUTH_PROFILE_MESSAGE);
             }
+            // REVIEW FINDING (P2, issue #48 PR-C, PR #65 Codex round 9) — the
+            // gateway link's copy of the same after-the-fact-reference hazard the
+            // `ipmiAuthProfileId` guard just above closes. `ipmiGatewayServerId`
+            // names another server in the live set (see resolveIpmiGatewayServer);
+            // if the user picked a gateway and then deleted THAT server while this
+            // form sat open, formValuesToServer copies the stale select value
+            // straight onto the record and it persists as a dangling id. The
+            // deletion sweep in NexusCore.removeServer clears the reference on
+            // every OTHER live server, but it cannot reach a value still sitting
+            // in an already-open form — this is that path.
+            //
+            // Re-resolve against LIVE core state under the same lock every server
+            // write takes, and DROP a submitted id that names no live server. This
+            // is an EXISTENCE check only, exactly like the ipmiAuthProfileId guard:
+            // a blank/unset stays undefined (formValuesToServer already produced
+            // undefined), a live id is preserved, and a SELF-reference (id === this
+            // server's own id) is already neutralized at the run site by
+            // resolveIpmiGatewayServer, so only a NON-EXISTENT id is dropped here.
+            //
+            // A SILENT drop, not a Save rejection like the auth-profile guards:
+            // Codex's two acceptable fixes ("re-resolve and drop" / "sweep on
+            // delete") are both non-throwing, and the gateway link — unlike an SSH
+            // profile — mirrors nothing into this form for the user to have lost.
+            if (candidate.ipmiGatewayServerId !== undefined && ctx.core.getServer(candidate.ipmiGatewayServerId) === undefined) {
+              candidate.ipmiGatewayServerId = undefined;
+            }
             // Which submitted credentials are this user's own, and which the
             // stored record keeps — see preserveLinkedServerCredentials.
             const linked = preserveLinkedServerCredentials(existing, candidate, linkedProfile);

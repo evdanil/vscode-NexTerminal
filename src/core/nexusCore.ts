@@ -1846,6 +1846,28 @@ export class NexusCore {
 
   public async removeServer(serverId: string): Promise<void> {
     this.servers.delete(serverId);
+    // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 9) — clear every
+    // OTHER server's `ipmiGatewayServerId` that named the server just deleted,
+    // so a deletion never leaves a dangling gateway reference behind. Mirrors
+    // `removeAuthProfile`'s dependent-link sweep for the sibling server->server
+    // reference: same in-memory-first update, same shallow `{ ...server, <field>:
+    // undefined }` clear (ServerConfig carries no `revision`, so — like the auth
+    // sweep's server clear — none is regenerated), folded into the SINGLE
+    // saveServers persist below rather than one write per swept server, and told
+    // to observers by the same one-shot emit.
+    //
+    // ASYMMETRY WITH `proxy.jumpHostId`, the other server->server reference:
+    // removeServer intentionally does NOT sweep jumpHostId. A dangling jump host
+    // is tolerated and surfaced at connect time (proxySshFactory throws "Jump
+    // host server not found"), whereas a dangling gateway is otherwise SILENT —
+    // `resolveIpmiGatewayServer` degrades it to "no gateway / run locally" with
+    // only a fall-back note, never an error — which is why Codex calls for it to
+    // be swept here while jumpHostId is left as-is.
+    for (const [id, server] of this.servers.entries()) {
+      if (server.ipmiGatewayServerId === serverId) {
+        this.servers.set(id, { ...server, ipmiGatewayServerId: undefined });
+      }
+    }
     this.removeServerSessions(serverId);
     await this.repository.saveServers([...this.servers.values()]);
     this.emitChanged();
