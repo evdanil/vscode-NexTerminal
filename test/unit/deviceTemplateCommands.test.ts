@@ -561,6 +561,32 @@ describe("2b — template save rejects a vanished auth-profile reference (PR #62
     expect(templates).toHaveLength(1);
     expect(templates[0].fields.authProfileId).toEqual({ mode: "fill", value: "prof-1" });
   });
+
+  it("(PR-T3) REJECTS (form kept open) when fields.ipmiAuthProfileId names a profile deleted while the editor was open — nothing persisted", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "prof-1", name: "BMC", username: "adm", authType: "agent" });
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    // The IPMI auth profile is deleted while the editor sits open — the second
+    // cross-record reference the save must revalidate against live core.
+    await core.removeAuthProfile("prof-1");
+    await expect(
+      formPanelOpens[0].options.onSubmit({ name: "Linked", mode_ipmiAuthProfileId: "fill", ipmiAuthProfileId: "prof-1" })
+    ).rejects.toThrow(/IPMI auth profile no longer exists/i);
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(0);
+  });
+
+  it("(PR-T3) sibling — a LIVE ipmiAuthProfileId persists normally (guard not over-firing)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "prof-1", name: "BMC", username: "adm", authType: "agent" });
+    register(core);
+    await registeredCommands.get("nexus.deviceTemplate.add")!();
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await formPanelOpens[0].options.onSubmit({ name: "Linked", mode_ipmiAuthProfileId: "fill", ipmiAuthProfileId: "prof-1" });
+    const templates = core.getSnapshot().deviceTemplates;
+    expect(templates).toHaveLength(1);
+    expect(templates[0].fields.ipmiAuthProfileId).toEqual({ mode: "fill", value: "prof-1" });
+  });
 });
 
 describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the stale proxy-password before publishing the new proxy", () => {

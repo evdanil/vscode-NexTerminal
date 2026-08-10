@@ -172,6 +172,36 @@ describe("NexusCore inventory sources", () => {
     expect(core2.getServer("C")?.ipmiGatewayServerId).toBe("D");
   });
 
+  it("(PR-T3) the applyInventorySyncPlan gateway prune also clears a surviving referrer's origin.templated.ipmiGatewayServerId stamp (kills leaving the new gateway value stamp behind after a bulk prune)", async () => {
+    // Gateway B is pruned; survivor A routes IPMI through B and carries the
+    // template-write stamp naming B; survivor C routes through still-present D.
+    const repository = new InMemoryConfigRepository([
+      { id: "B", name: "Gateway B", host: "b", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:B", syncedAt: 1 } },
+      { id: "D", name: "Gateway D", host: "d", port: 22, username: "u", authType: "agent", isHidden: false },
+      { id: "A", name: "Target A", host: "a", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "B", origin: { sourceId: "source-1", externalId: "device:A", syncedAt: 1, templated: { ipmiGatewayServerId: "B" } } },
+      { id: "C", name: "Target C", host: "c", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "D", origin: { sourceId: "source-1", externalId: "device:C", syncedAt: 1, templated: { ipmiGatewayServerId: "D" } } }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["B"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    const a = core.getServer("A");
+    expect(a?.ipmiGatewayServerId).toBeUndefined();
+    // Its only stamp named B → the bag collapses to undefined (single-member clear).
+    expect(a?.origin?.templated).toBeUndefined();
+    // C's live gateway stamp is untouched.
+    expect(core.getServer("C")?.origin?.templated?.ipmiGatewayServerId).toBe("D");
+  });
+
   it("(F12) writes lastSyncAt on the applied source only — a second source's lastSyncAt is untouched", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);

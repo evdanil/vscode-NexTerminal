@@ -3,6 +3,7 @@ import {
   cloneServerConfig,
   mergeServerConfigFields,
   serverConfigsEqual,
+  templatedHasAnyStamp,
   type ActiveLocalShellSession,
   type ActiveSerialSession,
   type ActiveSession,
@@ -380,6 +381,56 @@ export class NexusCore {
         if (server.authProfileId === profileId && server.formerlySynced?.syncedAuthProfileId === profileId) {
           cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
         }
+        // BMC VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiAuthProfileId`)
+        // — the sync's receipt that IT wrote the BMC credential link on this
+        // server, cleared for the SAME reason as the SSH `syncedAuthProfileId`
+        // stamp above: left standing after its link is gone it reads as a
+        // per-server opt-out (value undefined, stamp still naming a profile), and
+        // `matrixWrites` would lock the field out of even a later override
+        // template — the carry-forward trap the PR-T3 value stamps otherwise
+        // spring on deletion.
+        //
+        // GATE ASYMMETRY vs the SSH stamp clears above: those gate on
+        // `authProfileId === profileId` because `syncedAuthProfileId` records the
+        // SSH link. THIS stamp records the BMC link, so it gates on
+        // `ipmiAuthProfileId === profileId`. A server reached here only through
+        // its SSH link has had no BMC link cleared and must keep its BMC stamp;
+        // and a server whose BMC value the USER already hand-cleared (value
+        // undefined, stamp still naming this profile, reached here only via its
+        // SSH link) keeps it too — that opt-out is deliberate.
+        //
+        // SINGLE-MEMBER CLEAR — mirrors the sync engine's `dropTemplateProxy` /
+        // `clearTemplatedStamps`: rebuild the `templated` bag without the member
+        // and collapse it to `undefined` when nothing else is stamped
+        // (`templatedHasAnyStamp`). Chained off `cleared.origin` so a server that
+        // named this profile on BOTH links loses the SSH stamp AND the BMC stamp.
+        if (
+          server.ipmiAuthProfileId === profileId &&
+          (cleared.origin ?? server.origin)?.templated?.ipmiAuthProfileId === profileId
+        ) {
+          const baseOrigin = cleared.origin ?? server.origin!;
+          const templated = { ...baseOrigin.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.origin = { ...baseOrigin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        // The detached twin (`formerlySynced.templated.ipmiAuthProfileId`) — swept
+        // for the reason the SSH `formerlySynced.syncedAuthProfileId` above is:
+        // adoption restores the marker into a live origin, so a stamp left naming
+        // a deleted profile would be the permanent opt-out this clear prevents,
+        // merely deferred until the record is reclaimed. Same BMC-link gate, same
+        // single-member mechanics.
+        if (
+          server.ipmiAuthProfileId === profileId &&
+          (cleared.formerlySynced ?? server.formerlySynced)?.templated?.ipmiAuthProfileId === profileId
+        ) {
+          const baseFormerly = cleared.formerlySynced ?? server.formerlySynced!;
+          const templated = { ...baseFormerly.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.formerlySynced = {
+            ...baseFormerly,
+            templated: templatedHasAnyStamp(templated) ? templated : undefined
+          };
+        }
         this.servers.set(id, cleared);
         serversChanged = true;
       }
@@ -417,9 +468,25 @@ export class NexusCore {
     // the shared stamp; this is the SOURCE of the link, not the record of it.
     const previousTemplates = new Map<string, DeviceTemplateProfile>();
     for (const [id, template] of this.deviceTemplates.entries()) {
-      if (template.fields.authProfileId?.value === profileId) {
+      // A template can name this profile as its SSH `authProfileId`, as its BMC
+      // `ipmiAuthProfileId` (issue #48 PR-T3), or as BOTH — each is an
+      // independent link into this same AuthProfile store, so each is swept on
+      // its own terms and a template naming the profile in both fields loses
+      // both. Destructured out (never written `undefined`) exactly like the SSH
+      // field, with the same single rollback capture/restore and re-revision.
+      const sshLinkMatch = template.fields.authProfileId?.value === profileId;
+      const bmcLinkMatch = template.fields.ipmiAuthProfileId?.value === profileId;
+      if (sshLinkMatch || bmcLinkMatch) {
         previousTemplates.set(id, template);
-        const { authProfileId: _authProfileId, ...restFields } = template.fields;
+        let restFields = template.fields;
+        if (sshLinkMatch) {
+          const { authProfileId: _authProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
+        if (bmcLinkMatch) {
+          const { ipmiAuthProfileId: _ipmiAuthProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
         this.deviceTemplates.set(id, { ...template, fields: restFields, revision: randomUUID() });
       }
     }
@@ -1909,7 +1976,53 @@ export class NexusCore {
     }
     for (const [id, server] of this.servers.entries()) {
       if (server.ipmiGatewayServerId !== undefined && deletedServerIds.has(server.ipmiGatewayServerId)) {
-        this.servers.set(id, { ...server, ipmiGatewayServerId: undefined });
+        let next: ServerConfig = { ...server, ipmiGatewayServerId: undefined };
+        // GATEWAY VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiGatewayServerId`)
+        // — the sync's receipt that IT wrote the BMC gateway link, cleared with
+        // the link for the reason the auth stamp is cleared in `removeAuthProfile`:
+        // a stamp outliving its value reads as a per-server opt-out and
+        // `matrixWrites` locks the field out of even a later override template.
+        // Scoping falls out for free — the helper is only entered for a server
+        // whose gateway VALUE names a deleted server, so a server whose gateway
+        // the user already hand-cleared is never reached and its stamp (opt-out)
+        // survives, consistent with FIX A. Cleared only when the stamp itself
+        // names a deleted server. Same single-member mechanics as `removeAuthProfile`
+        // (mirror of `dropTemplateProxy` / `clearTemplatedStamps`): rebuild the
+        // bag without the member, collapse to `undefined` when nothing else is
+        // stamped.
+        //
+        // STAMP ONLY — NO device-template `fields.ipmiGatewayServerId` sweep here,
+        // intentionally: a template->server reference is the design's
+        // skip-and-warn-at-sync-time class (servers churn constantly via sync
+        // prune; eagerly rewriting user templates on every server deletion would
+        // be wrong). This is the SAME rationale as the `jumpHostId`-vs-gateway
+        // value asymmetry documented in this method's doc comment — skip-and-warn
+        // owns the template field.
+        if (
+          server.origin?.templated?.ipmiGatewayServerId !== undefined &&
+          deletedServerIds.has(server.origin.templated.ipmiGatewayServerId)
+        ) {
+          const templated = { ...server.origin.templated };
+          delete templated.ipmiGatewayServerId;
+          next = {
+            ...next,
+            origin: { ...server.origin, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+          };
+        }
+        // The detached twin, swept the same way and for the same adoption reason
+        // as the auth stamp's `formerlySynced` clear.
+        if (
+          server.formerlySynced?.templated?.ipmiGatewayServerId !== undefined &&
+          deletedServerIds.has(server.formerlySynced.templated.ipmiGatewayServerId)
+        ) {
+          const templated = { ...server.formerlySynced.templated };
+          delete templated.ipmiGatewayServerId;
+          next = {
+            ...next,
+            formerlySynced: { ...server.formerlySynced, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+          };
+        }
+        this.servers.set(id, next);
         cleared.push(id);
       }
     }

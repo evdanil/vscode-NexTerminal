@@ -231,6 +231,22 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
               'Choose another auth profile, or set the Auth Profile field\'s mode to "Not set".'
           );
         }
+        // The BMC `ipmiAuthProfileId` (issue #48 PR-T3) is the second templatable
+        // field carrying a cross-record reference into the AuthProfile store, so
+        // it gets the SAME live-core revalidation as the SSH link above, in the
+        // same locked section: a profile deleted while this editor sat open would
+        // otherwise persist as a dangling `fields.ipmiAuthProfileId` that §5.3
+        // silently drops at apply time. No parallel gateway guard —
+        // `ipmiGatewayServerId` is a server-list reference validated at apply time
+        // (§5.3 skip-and-warn), exactly like `proxy.jumpHostId`, per the comment
+        // above; only auth-profile refs are revalidated in the form.
+        const linkedIpmiAuthProfileId = template.fields.ipmiAuthProfileId?.value;
+        if (linkedIpmiAuthProfileId !== undefined && ctx.core.getAuthProfile(linkedIpmiAuthProfileId) === undefined) {
+          throw new Error(
+            "The selected IPMI auth profile no longer exists — it was deleted while this editor was open. " +
+              'Choose another IPMI auth profile, or set the IPMI Auth Profile field\'s mode to "Not set".'
+          );
+        }
         await ctx.core.addOrUpdateDeviceTemplate(template);
       });
       // U1 (§6.1 UX-S8) — the VERBATIM save toast (single "saved." wording, not a

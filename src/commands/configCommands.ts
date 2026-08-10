@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
-import { cloneTemplatedStamps } from "../models/config";
+import { cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
@@ -2155,14 +2155,18 @@ export function registerConfigCommands(
       // The BMC credential link dangles independently of the SSH one — a server
       // can carry either, both, or two different profiles — so it is swept on
       // its own terms rather than as a rider on the SSH clear.
-      const ipmiDangles = Boolean(server.ipmiAuthProfileId) && !knownProfileIds.has(server.ipmiAuthProfileId!);
+      const danglingIpmiProfileId =
+        server.ipmiAuthProfileId && !knownProfileIds.has(server.ipmiAuthProfileId) ? server.ipmiAuthProfileId : undefined;
+      const ipmiDangles = danglingIpmiProfileId !== undefined;
       // The BMC jump-host link dangles independently of the auth links — it is a
       // server-list reference (checked against `knownServerIds`, NOT
       // `knownProfileIds`) that has no auth stamp, so it never touches the
       // origin/formerlySynced clears below. A self-referencing gateway keeps its
       // own id in `knownServerIds`, so it is not swept here; the runtime self-ref
       // guard in `resolveIpmiGatewayServer` handles that case.
-      const gatewayDangles = Boolean(server.ipmiGatewayServerId) && !knownServerIds.has(server.ipmiGatewayServerId!);
+      const danglingGatewayServerId =
+        server.ipmiGatewayServerId && !knownServerIds.has(server.ipmiGatewayServerId) ? server.ipmiGatewayServerId : undefined;
+      const gatewayDangles = danglingGatewayServerId !== undefined;
       if (sshDangles || ipmiDangles || gatewayDangles) {
         const cleared: ServerConfig = { ...server };
         if (sshDangles) cleared.authProfileId = undefined;
@@ -2191,6 +2195,51 @@ export function registerConfigCommands(
         // out of retro-apply the moment it is reclaimed.
         if (danglingSshProfileId !== undefined && server.formerlySynced?.syncedAuthProfileId === danglingSshProfileId) {
           cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
+        }
+        // BMC VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiAuthProfileId`)
+        // — mirrors NexusCore.removeAuthProfile's BMC stamp clear: the sync's
+        // receipt that IT wrote the BMC credential link dies with the link, or it
+        // reads as a per-server opt-out (value undefined, stamp naming a profile)
+        // and `matrixWrites` locks the field out of even a later override
+        // template. Gated on `ipmiDangles` (the BMC id that no longer resolves),
+        // INDEPENDENT of the SSH clear above: a server reached here only by a
+        // dangling BMC link keeps a live, resolving SSH stamp, and vice versa.
+        // Only the stamp naming the very dangling id is dropped. Single-member
+        // clear mirrors `dropTemplateProxy` / `clearTemplatedStamps`: rebuild the
+        // bag without the member, collapse to `undefined` when empty. Each rebuild
+        // chains off `cleared.origin` (not the original `server.origin`) so a
+        // server dangling in BOTH the BMC-auth and the gateway stamp loses both —
+        // the gateway pass must not resurrect the just-cleared auth member.
+        if (danglingIpmiProfileId !== undefined && server.origin?.templated?.ipmiAuthProfileId === danglingIpmiProfileId) {
+          const base = cleared.origin ?? server.origin;
+          const templated = { ...base.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.origin = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        if (danglingIpmiProfileId !== undefined && server.formerlySynced?.templated?.ipmiAuthProfileId === danglingIpmiProfileId) {
+          const base = cleared.formerlySynced ?? server.formerlySynced;
+          const templated = { ...base.templated };
+          delete templated.ipmiAuthProfileId;
+          cleared.formerlySynced = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        // GATEWAY VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiGatewayServerId`)
+        // — mirrors NexusCore.clearGatewayReferencesTo's stamp clear. Gated on
+        // `gatewayDangles` (the gateway server id absent from this import), and
+        // cleared only when the stamp names that same dangling server id. STAMP
+        // ONLY — no `fields.ipmiGatewayServerId` template sweep below, for the
+        // same skip-and-warn reason the deletion path gives (template->server refs
+        // are validated at sync time, not eagerly rewritten).
+        if (danglingGatewayServerId !== undefined && server.origin?.templated?.ipmiGatewayServerId === danglingGatewayServerId) {
+          const base = cleared.origin ?? server.origin;
+          const templated = { ...base.templated };
+          delete templated.ipmiGatewayServerId;
+          cleared.origin = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+        }
+        if (danglingGatewayServerId !== undefined && server.formerlySynced?.templated?.ipmiGatewayServerId === danglingGatewayServerId) {
+          const base = cleared.formerlySynced ?? server.formerlySynced;
+          const templated = { ...base.templated };
+          delete templated.ipmiGatewayServerId;
+          cleared.formerlySynced = { ...base, templated: templatedHasAnyStamp(templated) ? templated : undefined };
         }
         await core.addOrUpdateServer(cleared);
       }
@@ -2224,9 +2273,26 @@ export function registerConfigCommands(
     const sweepSnapshot = core.getSnapshot();
     const knownTemplateIds = new Set(sweepSnapshot.deviceTemplates.map((t) => t.id));
     for (const template of sweepSnapshot.deviceTemplates) {
+      // A template's SSH `authProfileId` and BMC `ipmiAuthProfileId` (issue #48
+      // PR-T3) are independent links into the AuthProfile store — each is swept
+      // on its own terms against the same `knownProfileIds` set, and a template
+      // dangling in both loses both. No `fields.ipmiGatewayServerId` sweep: that
+      // template->server reference is skip-and-warn at sync time, not a dangling
+      // import to rewrite here (same rationale as the deletion-path omission).
       const linkedProfileId = template.fields.authProfileId?.value;
-      if (linkedProfileId !== undefined && !knownProfileIds.has(linkedProfileId)) {
-        const { authProfileId: _authProfileId, ...restFields } = template.fields;
+      const sshDangles = linkedProfileId !== undefined && !knownProfileIds.has(linkedProfileId);
+      const linkedIpmiProfileId = template.fields.ipmiAuthProfileId?.value;
+      const ipmiDangles = linkedIpmiProfileId !== undefined && !knownProfileIds.has(linkedIpmiProfileId);
+      if (sshDangles || ipmiDangles) {
+        let restFields = template.fields;
+        if (sshDangles) {
+          const { authProfileId: _authProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
+        if (ipmiDangles) {
+          const { ipmiAuthProfileId: _ipmiAuthProfileId, ...rest } = restFields;
+          restFields = rest;
+        }
         await core.addOrUpdateDeviceTemplate({ ...template, fields: restFields });
       }
     }

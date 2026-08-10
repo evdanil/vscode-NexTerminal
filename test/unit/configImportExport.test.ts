@@ -2952,6 +2952,53 @@ describe("backup import", () => {
     expect(snapshot.serialProfiles).toHaveLength(0);
   });
 
+  it("(PR-T3) clears dangling ipmiAuthProfileId + ipmiGatewayServerId VALUES and their origin.templated stamps, and sweeps a dangling fields.ipmiAuthProfileId template field, on backup import (kills leaving the new IPMI stamps/field behind as a matrixWrites opt-out trap)", async () => {
+    // A server carrying BMC-auth + gateway links (and their template-write stamps)
+    // that this backup does NOT bring a target for: the profile "ghostP" and the
+    // gateway server "ghostGW" are in no imported bucket, so both dangle. The bag
+    // also carries a live-resolving proxy stamp so the clears are provably per-member.
+    const danglingServer = makeServer({
+      id: "srv-dangle",
+      name: "Dangler",
+      ipmiAuthProfileId: "ghostP",
+      ipmiGatewayServerId: "ghostGW",
+      origin: {
+        sourceId: "src-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        templated: { ipmiAuthProfileId: "ghostP", ipmiGatewayServerId: "ghostGW", multiplexing: true }
+      }
+    });
+    const exportData = {
+      version: 1,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [danglingServer],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [], // ghostP is brought along by nothing
+      deviceTemplates: [
+        { id: "T", name: "Edge", fields: { ipmiAuthProfileId: { mode: "fill", value: "ghostP" }, logSession: { mode: "override", value: true } } }
+      ]
+    };
+
+    await runBackupImport(exportData, "merge");
+
+    const imported = core.getSnapshot().servers.find((s) => s.name === "Dangler")!;
+    expect(imported).toBeDefined();
+    // Values cleared.
+    expect(imported.ipmiAuthProfileId).toBeUndefined();
+    expect(imported.ipmiGatewayServerId).toBeUndefined();
+    // Both dangling stamps cleared; the live proxy-era stamp (multiplexing) survives.
+    expect(imported.origin?.templated?.ipmiAuthProfileId).toBeUndefined();
+    expect(imported.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+    expect(imported.origin?.templated?.multiplexing).toBe(true);
+    // The template's dangling BMC-auth field is swept; its unrelated field stands.
+    const template = core.getSnapshot().deviceTemplates.find((t) => t.id === "T")!;
+    expect(template.fields.ipmiAuthProfileId).toBeUndefined();
+    expect(template.fields.logSession).toEqual({ mode: "override", value: true });
+  });
+
   it("merge import restores backed-up folder files only when missing", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
     const sshDir = path.join(os.homedir(), ".ssh");

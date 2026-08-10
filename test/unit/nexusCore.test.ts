@@ -115,6 +115,37 @@ describe("NexusCore", () => {
     expect(core.getSnapshot().servers).toHaveLength(0);
   });
 
+  it("removeServer (PR-T3) clears a surviving referrer's ipmiGatewayServerId AND the origin.templated.ipmiGatewayServerId stamp naming the deleted server (kills leaving the new gateway stamp behind, a matrixWrites opt-out trap)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // Gateway B, plus referrer A whose gateway value AND template-write stamp both
+    // name B; the bag carries a second stamp so the clear is provably single-member.
+    await core.addOrUpdateServer({ id: "B", name: "GW", host: "b", port: 22, username: "u", authType: "agent", isHidden: false });
+    await core.addOrUpdateServer({
+      id: "A", name: "A", host: "a", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "B",
+      origin: { sourceId: "src-1", externalId: "device:A", syncedAt: 1000, templated: { ipmiGatewayServerId: "B", multiplexing: true } }
+    });
+    // Referrer C names a still-present gateway D — untouched.
+    await core.addOrUpdateServer({ id: "D", name: "GW2", host: "d", port: 22, username: "u", authType: "agent", isHidden: false });
+    await core.addOrUpdateServer({
+      id: "C", name: "C", host: "c", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "D",
+      origin: { sourceId: "src-1", externalId: "device:C", syncedAt: 1000, templated: { ipmiGatewayServerId: "D" } }
+    });
+
+    await core.removeServer("B");
+
+    const a = core.getServer("A");
+    expect(a?.ipmiGatewayServerId).toBeUndefined();
+    expect(a?.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+    expect(a?.origin?.templated?.multiplexing).toBe(true); // unrelated stamp survives
+    // C's live gateway D and its stamp are untouched.
+    const c = core.getServer("C");
+    expect(c?.ipmiGatewayServerId).toBe("D");
+    expect(c?.origin?.templated?.ipmiGatewayServerId).toBe("D");
+  });
+
   it("updates existing server and tunnel in place by id", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);
@@ -879,6 +910,120 @@ describe("NexusCore", () => {
     // must survive it, or the next sync (against whatever profile the source is
     // re-pointed at) reattaches a link the user deliberately removed.
     expect(core.getServer("s1")?.origin?.syncedAuthProfileId).toBe("ap1");
+  });
+
+  it("removeAuthProfile (PR-T3) also drops the BMC value stamp origin.templated.ipmiAuthProfileId when its link is cleared (kills leaving the new IPMI-auth stamp behind, a matrixWrites opt-out trap)", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [{ id: "ap1", name: "Prod", username: "root", authType: "password" }]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // A server the sync linked as its BMC credentials, with the template-write
+    // receipt agreeing with the value. The bag carries a second, unrelated stamp
+    // so the emptied-bag collapse can't be what "clears" the member.
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "agent", isHidden: false, ipmiAuthProfileId: "ap1",
+      origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "u", templated: { ipmiAuthProfileId: "ap1", multiplexing: true } }
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    const cleared = core.getServer("s1");
+    expect(cleared?.ipmiAuthProfileId).toBeUndefined();
+    // The stamp naming the deleted profile is gone; the unrelated stamp stays, so
+    // the bag survives rather than collapsing (single-member clear, not a wipe).
+    expect(cleared?.origin?.templated?.ipmiAuthProfileId).toBeUndefined();
+    expect(cleared?.origin?.templated?.multiplexing).toBe(true);
+  });
+
+  it("removeAuthProfile (PR-T3) collapses origin.templated to undefined when the IPMI-auth stamp was its only member (mirrors the sync engine's templatedHasAnyStamp convention)", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [{ id: "ap1", name: "Prod", username: "root", authType: "password" }]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "agent", isHidden: false, ipmiAuthProfileId: "ap1",
+      origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "u", templated: { ipmiAuthProfileId: "ap1" } }
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    // An all-absent bag collapses to undefined, exactly as clearTemplatedStamps /
+    // dropTemplateProxy produce it.
+    expect(core.getServer("s1")?.origin?.templated).toBeUndefined();
+  });
+
+  it("removeAuthProfile (PR-T3) leaves a BMC stamp naming a DIFFERENT live profile untouched on a server reached only via its SSH link (kills a BMC sweep that ignores the ipmiAuthProfileId link gate)", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [
+        { id: "ap1", name: "Prod", username: "root", authType: "password" },
+        { id: "ap2", name: "BMC", username: "adm", authType: "password" }
+      ]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // Reached by the loop ONLY through its SSH link (authProfileId: ap1). Its BMC
+    // value was hand-cleared, but the BMC stamp still names a DIFFERENT, still-live
+    // profile ap2 — a deliberate opt-out that deleting ap1 must not disturb.
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "agent", isHidden: false, authProfileId: "ap1",
+      origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "u", syncedAuthProfileId: "ap1", templated: { ipmiAuthProfileId: "ap2" } }
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    const cleared = core.getServer("s1");
+    expect(cleared?.authProfileId).toBeUndefined();
+    expect(cleared?.origin?.syncedAuthProfileId).toBeUndefined();
+    // The BMC stamp gates on the BMC link (ipmiAuthProfileId === profileId), which
+    // this server never had for ap1 — so its ap2 opt-out survives.
+    expect(cleared?.origin?.templated?.ipmiAuthProfileId).toBe("ap2");
+  });
+
+  it("removeAuthProfile (PR-T3) sweeps the detached formerlySynced.templated.ipmiAuthProfileId twin when the BMC link is cleared (kills leaving the adoption-restored stamp naming a deleted profile)", async () => {
+    const repository = new InMemoryConfigRepository(
+      [],
+      [],
+      [],
+      [],
+      [{ id: "ap1", name: "Prod", username: "root", authType: "password" }]
+    );
+    const core = new NexusCore(repository);
+    await core.initialize();
+
+    // A kept ("Keep Servers") record: no live origin, but a detach receipt whose
+    // templated twin records the removed source's BMC template write.
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "agent", isHidden: false, ipmiAuthProfileId: "ap1",
+      formerlySynced: { sourceId: "src-1", sourceName: "NB", providerId: "netbox", externalId: "device:1", templated: { ipmiAuthProfileId: "ap1" } }
+    });
+
+    await core.removeAuthProfile("ap1");
+
+    const cleared = core.getServer("s1");
+    expect(cleared?.ipmiAuthProfileId).toBeUndefined();
+    // Adoption would restore this receipt into a live origin; left naming a deleted
+    // profile it would be the opt-out trap merely deferred until reclaim.
+    expect(cleared?.formerlySynced?.templated).toBeUndefined();
   });
 
   it("markSessionActivity adds session to activitySessionIds and emits change", async () => {
