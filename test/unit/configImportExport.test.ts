@@ -1988,6 +1988,37 @@ describe("backup import", () => {
     ]);
   });
 
+  it("(Codex round 5, P2) SAVED FILTER DEFINITIONS (PR-E) — a backup savedFilter whose id uses the reserved `__create__` prefix is DROPPED on import while a valid sibling survives (kills importing an un-selectable inline-create-sentinel filter)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    // importPreservingIds filters the backup's savedFilters through
+    // `validateSavedFilter`; a `__create__`-prefixed id collides with the
+    // webview inline-create sentinel namespace and must be rejected at this
+    // boundary so it is never persisted, exactly as the getSavedFilters load
+    // drops it. Its valid sibling must still import.
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      savedFilters: [
+        { id: "__create__hijack", name: "Reserved prefix", filter: "role=core" },
+        { id: "sf-valid", name: "Valid", filter: "role=edge" }
+      ],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "merge");
+
+    const filters = core.getSnapshot().savedFilters;
+    expect(filters.find((f) => f.id === "__create__hijack")).toBeUndefined();
+    expect(filters).toEqual([{ id: "sf-valid", name: "Valid", filter: "role=edge" }]);
+  });
+
   it("(T-M4) SAVED FILTER DEFINITIONS (PR-E) — replace mode removes a pre-existing local saved filter that the backup does NOT contain (kills deleting the replace-mode removal loop)", async () => {
     const store = new InMemoryMacroStore();
     await store.initialize();
