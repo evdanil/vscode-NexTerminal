@@ -406,8 +406,9 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
 /**
  * ITEM A (provider trust fingerprint) — pure hash over exactly the provider
  * shape a user can actually SEE and reason about when they configured a
- * source: its label and its configFields' (id, label, type, required),
- * in the provider's own declared order. Deliberately excludes
+ * source: its label and its configFields' (id, label, type, required, and —
+ * for select fields — their options), in the provider's own declared order.
+ * Deliberately excludes
  * testConnection/fetchInventory (functions — not hashable, and not what the
  * user "configured against") and `id` itself (the fingerprint's whole
  * purpose is to detect a DIFFERENT provider answering to the SAME id; hashing
@@ -426,7 +427,17 @@ export function computeProviderFingerprint(provider: Pick<InventoryProvider, "la
       id: field.id,
       label: field.label,
       type: field.type,
-      required: field.required === true
+      required: field.required === true,
+      // SELECT OPTIONS (PR #64 Codex review round 3, P2 — issue #48 PR-E).
+      // Include a select field's options so a change to their label/value/ORDER
+      // (with id/label/type/required unchanged) yields a DIFFERENT fingerprint and
+      // triggers the provider-change re-confirmation. Normalized to just
+      // {label, value} in declared order — only those and their order matter, and
+      // any future extra option member cannot perturb the hash. Non-select fields
+      // have no `options`, so this is `undefined`; JSON.stringify drops undefined
+      // members, keeping optionless fields BYTE-IDENTICAL to the pre-patch shape —
+      // no spurious re-confirmation for existing non-select providers.
+      options: field.options ? field.options.map((o) => ({ label: o.label, value: o.value })) : undefined
     }))
   };
   return createHash("sha256").update(JSON.stringify(shape)).digest("hex").slice(0, 16);

@@ -52,6 +52,18 @@ export function validateProviderShape(provider: unknown): asserts provider is In
             || typeof (opt as { value?: unknown }).value !== "string") {
           throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid select option (each option needs a non-empty string label and a string value).`);
         }
+        // RESERVED SENTINEL NAMESPACE (PR #64 Codex review round 3, P2 — issue #48
+        // PR-E). The webview treats ANY select option whose value starts with
+        // `__create__` as an inline-create sentinel (isCreateOption in
+        // ui/shared/webviewScripts.ts / filterableSelectLogic.ts) — the click
+        // handler returns without selecting it. Provider `type:"select"` fields
+        // have no inline-create handler, so such an option is impossible to choose
+        // or persist (silently inert). Reject it at the registration boundary.
+        // Empty-string value (the "(None)" sentinel) is still allowed — only the
+        // reserved prefix is off-limits.
+        if ((opt as { value: string }).value.startsWith("__create__")) {
+          throw new Error(`Inventory provider configFields entry "${f.id}" has a select option whose value uses the reserved "__create__" prefix.`);
+        }
       }
     }
     if (seenFieldIds.has(f.id)) {

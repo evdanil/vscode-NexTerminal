@@ -172,6 +172,41 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(netbox)).not.toThrow();
     expect(() => new InventoryProviderRegistry().register(netbox)).not.toThrow();
   });
+
+  // RESERVED `__create__` SENTINEL PREFIX (PR #64 Codex review round 3, P2 — issue
+  // #48 PR-E). The webview treats ANY select option whose value starts with
+  // `__create__` as an inline-create sentinel (isCreateOption) — the click handler
+  // returns WITHOUT selecting it. Provider selects have no inline-create handler,
+  // so such an option is impossible to choose or persist (silently inert). Both
+  // cases below register SILENTLY against 36c24eb (the assertion that they throw is
+  // red there) and throw with the fix.
+  it("rejects a select option whose value starts with the reserved __create__ prefix (kills accepting a silently un-selectable sentinel-shadowed option)", () => {
+    const bad = makeProvider({ configFields: [{ id: "family", label: "Family", type: "select", options: [{ label: "Create…", value: "__create__foo" }] }] });
+    expect(() => validateProviderShape(bad)).toThrow(/"family".*reserved.*__create__.*prefix/i);
+  });
+
+  it("rejects a select option whose value is exactly \"__create__\" (the bare reserved prefix)", () => {
+    const bad = makeProvider({ configFields: [{ id: "family", label: "Family", type: "select", options: [{ label: "Create", value: "__create__" }] }] });
+    expect(() => validateProviderShape(bad)).toThrow(/"family".*reserved.*__create__.*prefix/i);
+    expect(() => new InventoryProviderRegistry().register(bad)).toThrow(/reserved.*__create__/i);
+  });
+
+  it("still accepts ordinary select option values, including value:\"\" (only the __create__ prefix is reserved)", () => {
+    const ok = makeProvider({
+      configFields: [{
+        id: "family",
+        label: "Family",
+        type: "select",
+        options: [
+          { label: "None", value: "" },
+          { label: "Auto", value: "auto" },
+          { label: "Create-ish", value: "create__notReserved" }
+        ]
+      }]
+    });
+    expect(() => validateProviderShape(ok)).not.toThrow();
+    expect(() => new InventoryProviderRegistry().register(ok)).not.toThrow();
+  });
 });
 
 /**
