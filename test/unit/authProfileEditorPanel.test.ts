@@ -9,6 +9,7 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 const mockPostMessage = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowErrorMessage = vi.fn();
+const mockShowInformationMessage = vi.fn();
 const mockShowOpenDialog = vi.fn();
 let onDidReceiveMessageHandler: ((msg: Record<string, unknown>) => void) | undefined;
 let onDidDisposeHandler: (() => void) | undefined;
@@ -33,6 +34,7 @@ vi.mock("vscode", () => ({
     })),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
+    showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
     showOpenDialog: (...args: unknown[]) => mockShowOpenDialog(...args)
   },
   ViewColumn: { Active: 1 },
@@ -146,7 +148,10 @@ describe("AuthProfileEditorPanel", () => {
       authProfilePasswordSecretKey(profiles[0].id),
       "secret123"
     );
-    expect(mockPostMessage).toHaveBeenCalledWith({ type: "saved" });
+    // Save now signals success visibly (panel stays open): a host toast naming the
+    // profile. Guards against the prior silent save (a re-render to an identical
+    // clean form) that read as "nothing happened".
+    expect(mockShowInformationMessage).toHaveBeenCalledWith('Auth profile "New Profile" saved.');
   });
 
   it("save existing profile keeps password when blank", async () => {
@@ -576,7 +581,8 @@ describe("AuthProfileEditorPanel", () => {
       // in place of the one just deleted.
       expect(core.getSnapshot().authProfiles).toEqual([]);
       expect(vault.store).not.toHaveBeenCalled();
-      expect(mockPostMessage).not.toHaveBeenCalledWith({ type: "saved" });
+      // The refusal path must NOT report success: no "saved" toast, only the error.
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
       expect(mockShowErrorMessage).toHaveBeenCalledWith(
         'Auth profile "Renamed" was deleted while you were editing it — nothing was saved. Create it again if you still need it.'
       );

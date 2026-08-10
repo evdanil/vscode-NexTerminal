@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.174] — 2026-08-10
+
+### Fixed
+
+- **Saving an auth profile now visibly confirms the save.** The Auth Profile editor kept the panel open after **Save** — the right choice for editing several profiles in a row — but gave no sign the save had happened: it re-rendered to an identical clean form, which read as "nothing happened, maybe it's broken." (Under the hood the one success signal it did send was posted *after* a full webview reload, so it raced the reload and never showed.) Save now confirms clearly and still leaves the panel open: a green **"✓ Saved"** indicator appears beside the Save button — baked into the render so it can't be lost to the reload — and fades after a few seconds or the moment you start editing again, alongside a notification naming the profile that was saved.
+
 ## [2.8.173] — 2026-08-10
 
 ### Added
