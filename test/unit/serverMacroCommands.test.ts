@@ -1685,6 +1685,47 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(gwSent.join("")).not.toContain("s3cr3t");
   });
 
+  it("WARNS on a `-E` that sits on a backslash-CONTINUED line of a gateway ipmitool command (Codex round 6 P2)", async () => {
+    // A shell backslash-newline is a line continuation: the lines join into ONE
+    // ipmitool invocation, so a `-E` on a continued line is still its argument and
+    // still fails on the bastion. Round 5's `[^;&|\n]*` stopped at the newline and
+    // returned false → no warning → red against 751810a, green after normalizing
+    // continuations.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiAuthProfileId: "ap-1", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    openTerminals = [gwTerminal] as typeof openTerminals;
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [{ id: "sess-gw", serverId: "gw-1" }], servers: [target, gateway] }),
+        getAuthProfile: (id: string) => (id === "ap-1" ? authProfile() : undefined),
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secretVault: { get: async () => "s3cr3t", store: async () => {}, delete: async () => {} }
+    } as unknown as Partial<CommandContext>);
+    await setMacros([
+      {
+        id: "a",
+        name: "SOL",
+        text: "ipmitool -I lanplus \\\n  -H ${profile.ipmiHost} -U admin \\\n  -E sol activate\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway",
+        provideIpmiCredentials: true
+      }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    // The over-promising inert copy is REPLACED, not doubled.
+    expect(status).not.toContain("prompts on the gateway via its `-a` form instead");
+  });
+
   it("WARNS on a `-E` gateway command even with provideIpmiCredentials OFF — the warning is keyed on the command, not the flag", async () => {
     // Falsifies a flag-only implementation: with the credentials flag off, a
     // flag-gated note would stay silent, but the `-E` command still fails on the
@@ -1814,6 +1855,26 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
   it("matches `-E` at end of line and before a trailing newline (same segment)", () => {
     expect(commandReadsIpmiEnv("ipmitool sol activate -E")).toBe(true);
     expect(commandReadsIpmiEnv("ipmitool sol activate -E\n")).toBe(true);
+  });
+
+  it("matches a `-E` on a backslash-CONTINUED line of the ipmitool command (Codex round 6 P2)", () => {
+    // A backslash-newline joins the lines into one command; the continued `-E` is
+    // still an ipmitool argument. Round 5's `[^;&|\n]*` stopped at the newline and
+    // returned false here — this asserts the normalized predicate returns true.
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\n  -E sol activate")).toBe(true);
+    // Multi-line continuation.
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\n  -H x -U y \\\n  -E sol activate")).toBe(true);
+    // CRLF continuation.
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\r\n  -E sol activate")).toBe(true);
+  });
+
+  it("does NOT match a `-E` that starts the line after an ipmitool command at a BARE (unescaped) newline (round-6 residual false positive)", () => {
+    // An unescaped newline is a real command boundary; the next-line `-E` is not an
+    // argument of the ipmitool call above it. Round 5's `\s`-before-`-E` spanned the
+    // bare newline and returned TRUE here — this asserts the horizontal-whitespace
+    // predicate returns false.
+    expect(commandReadsIpmiEnv("ipmitool -a sol activate\n-E foo")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -a sol activate\r\n-E foo")).toBe(false);
   });
 
   it("does NOT match a `-E` owned by a WRAPPER before ipmitool (the round-5 false positive)", () => {

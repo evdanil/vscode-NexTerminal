@@ -398,7 +398,11 @@ export function gatewayInertCredentialsNote(macro: TerminalMacro): string | unde
  * (`ipmitool -a … | grep -E …`). Requiring the `-E` to follow `ipmitool` inside
  * the same segment ties it to the invocation that actually reads the env.
  */
-const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*\s-E(?=\s|$)/;
+// \bipmitool\b, then within the same segment ([^;&|\n]* — cannot cross ; & | or
+// an unescaped newline), a -E preceded by HORIZONTAL whitespace ([^\S\n], so a
+// bare newline does NOT put a next-line -E on this command) and followed by
+// whitespace (incl. the newline that ends the command) or end of string.
+const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*[^\S\n]-E(?=\s|$)/;
 
 /**
  * Whether a command reads the IPMI password from the environment via ipmitool's
@@ -409,7 +413,13 @@ const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*\s-E(?=\s|$)/;
  * the command is neither blocked nor rewritten on its account.
  */
 export function commandReadsIpmiEnv(text: string): boolean {
-  return IPMITOOL_ENV_PASSWORD_FLAG_RE.test(text);
+  // Shell line continuation: a backslash immediately before a newline joins the
+  // two lines into ONE command, so a -E on a continued line is still an argument
+  // of the ipmitool invocation above it. Collapse continuations first (to a
+  // space, a safe token separator) so the segment scan sees one line; an
+  // UNESCAPED newline stays a real command boundary in the regex above.
+  const withoutContinuations = text.replace(/\\\r?\n/g, " ");
+  return IPMITOOL_ENV_PASSWORD_FLAG_RE.test(withoutContinuations);
 }
 
 /**
