@@ -428,16 +428,20 @@ export function computeProviderFingerprint(provider: Pick<InventoryProvider, "la
       label: field.label,
       type: field.type,
       required: field.required === true,
-      // SELECT OPTIONS (PR #64 Codex review round 3, P2 — issue #48 PR-E).
-      // Include a select field's options so a change to their label/value/ORDER
-      // (with id/label/type/required unchanged) yields a DIFFERENT fingerprint and
-      // triggers the provider-change re-confirmation. Normalized to just
-      // {label, value} in declared order — only those and their order matter, and
-      // any future extra option member cannot perturb the hash. Non-select fields
-      // have no `options`, so this is `undefined`; JSON.stringify drops undefined
-      // members, keeping optionless fields BYTE-IDENTICAL to the pre-patch shape —
-      // no spurious re-confirmation for existing non-select providers.
-      options: field.options ? field.options.map((o) => ({ label: o.label, value: o.value })) : undefined
+      // SELECT OPTIONS (PR #64 Codex review round 3, P2 — issue #48 PR-E; round
+      // 4 P2 corner). Include a SELECT field's options so a change to their
+      // label/value/ORDER (with id/label/type/required unchanged) yields a
+      // DIFFERENT fingerprint and triggers the provider-change re-confirmation.
+      // Normalized to just {label, value} in declared order — only those and
+      // their order matter, and any future extra option member cannot perturb the
+      // hash. Gated on `type === "select"` because `options` is documented-IGNORED
+      // (and never rendered) on non-select fields, yet `validateProviderShape`
+      // ACCEPTS a stray `options` member there — so a non-select field always
+      // projects `options: undefined` regardless of whether it carries one.
+      // JSON.stringify drops undefined members, keeping every non-select field
+      // BYTE-IDENTICAL to the pre-round-3 shape — no spurious re-confirmation for
+      // existing sources.
+      options: field.type === "select" && field.options ? field.options.map((o) => ({ label: o.label, value: o.value })) : undefined
     }))
   };
   return createHash("sha256").update(JSON.stringify(shape)).digest("hex").slice(0, 16);

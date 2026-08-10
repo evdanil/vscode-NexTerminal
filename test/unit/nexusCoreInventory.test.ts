@@ -3860,6 +3860,40 @@ describe("computeProviderFingerprint (ITEM A — provider trust fingerprint)", (
     // property is guarded rather than vacuous.
     expect(computeProviderFingerprint(makeProvider())).toBe("ae99d9cc15c65e72");
   });
+
+  // NON-SELECT `options` IGNORED (PR #64 Codex review round 4, P2 — issue #48
+  // PR-E; corner of round-3's Fix B). round-3 projected `options` for EVERY
+  // field, but `options` is documented-ignored (and never rendered) on
+  // non-select fields, and `validateProviderShape` accepts a stray `options`
+  // member on a string/number/boolean/password field. An existing provider
+  // carrying such an ignored member must NOT get a different fingerprint than
+  // one without it — otherwise its sources hit a spurious provider-change
+  // confirmation + credential gate on upgrade, and any later edit to that
+  // ignored metadata re-prompts. The projection is now gated on
+  // `type === "select"`, so these three fingerprint IDENTICALLY. Against 81b3c2d
+  // (options projected for all fields) the with-options cases perturb the hash →
+  // RED; after the fix → GREEN.
+  function makeNonSelectWithOptions(options?: { label: string; value: string }[]): InventoryProvider {
+    return makeProvider({
+      configFields: [
+        // A STRING field carrying an ignored `options` member.
+        { id: "baseUrl", label: "Base URL", type: "string", required: true, options } as InventoryProvider["configFields"][number],
+        { id: "apiToken", label: "API Token", type: "password", required: true }
+      ]
+    });
+  }
+
+  it("ignores an `options` member on a NON-select field — its fingerprint equals the same provider without it (documented-ignored metadata must not perturb the hash)", () => {
+    const withOptions = computeProviderFingerprint(makeNonSelectWithOptions([{ label: "Auto", value: "auto" }]));
+    const withoutOptions = computeProviderFingerprint(makeNonSelectWithOptions(undefined));
+    expect(withOptions).toBe(withoutOptions);
+  });
+
+  it("ignores the VALUE of an `options` member on a NON-select field — two different ignored option values fingerprint the same", () => {
+    const a = computeProviderFingerprint(makeNonSelectWithOptions([{ label: "Auto", value: "auto" }]));
+    const b = computeProviderFingerprint(makeNonSelectWithOptions([{ label: "Manual", value: "manual" }]));
+    expect(a).toBe(b);
+  });
 });
 
 describe("validateServerConfig — origin handling (F13/FIX 5)", () => {
