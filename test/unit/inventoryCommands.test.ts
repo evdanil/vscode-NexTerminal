@@ -297,6 +297,46 @@ describe("inventoryCommands", () => {
       expect(await vault.get(inventorySecretKey(source.id, "apiToken"))).toBe("secret-token");
     });
 
+    it("(T-M2) the saved-filter picker's own selection is NEVER persisted into provider config — only cfg_filter's own copy is stored (kills a parse path that copies the unprefixed `savedFilter` key into config)", async () => {
+      // SAVED FILTER DEFINITIONS (PR-E) — the picker key (`savedFilter`, unprefixed)
+      // is a pure fill control, not a stored source field. A submit that carries it
+      // (as the webview always does — it is a real form control) must leave no
+      // `savedFilter` in the persisted config, and must not contaminate the stored
+      // Device Filter with anything other than cfg_filter's own value.
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "filter", label: "Device Filter", type: "string", required: false }
+        ]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      const cmd = registeredCommands.get("nexus.inventory.addSource")!;
+      await cmd();
+      const { onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My NetBox",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_filter: "role=core",
+        savedFilter: "sf1" // the picker's own selection — must never be persisted
+      });
+
+      const source = core.getSnapshot().inventorySources[0];
+      // The source stores only its own copy of the Device Filter...
+      expect(source.config.filter).toBe("role=core");
+      // ...and NO trace of the picker key, at any level.
+      expect((source.config as Record<string, unknown>).savedFilter).toBeUndefined();
+      expect((source as unknown as Record<string, unknown>).savedFilter).toBeUndefined();
+    });
+
     it("(ITEM A) stamps providerFingerprint from the chosen provider at creation (kills a source created with no fingerprint at all)", async () => {
       const { core, provider } = await runAddSourceHappyPath();
 

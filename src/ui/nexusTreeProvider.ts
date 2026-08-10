@@ -239,7 +239,8 @@ export class NexusTreeProvider
     activitySessionIds: new Set(),
     focusedSessionId: undefined,
     inventorySources: [],
-    deviceTemplates: []
+    deviceTemplates: [],
+    savedFilters: []
   };
 
   public readonly dragMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME];

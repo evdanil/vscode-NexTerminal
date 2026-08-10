@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ConfigRepository } from "../core/contracts";
 import {
   validateServerConfig,
@@ -11,6 +12,7 @@ import {
   validateLocalShellProfile,
   validateInventorySource,
   validateDeviceTemplate,
+  validateSavedFilter,
   isValidServerOrigin,
   isValidDetachedServerOrigin
 } from "../utils/validation";
@@ -23,6 +25,7 @@ const GROUPS_KEY = "nexus.groups";
 const AUTH_PROFILES_KEY = "nexus.authProfiles";
 const INVENTORY_SOURCES_KEY = "nexus.inventorySources";
 const DEVICE_TEMPLATES_KEY = "nexus.deviceTemplates";
+const SAVED_FILTERS_KEY = "nexus.savedFilters";
 
 /**
  * `globalState.get(key, [])` only substitutes the default when the key is ABSENT.
@@ -218,5 +221,24 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveDeviceTemplates(templates: DeviceTemplateProfile[]): Promise<void> {
     await this.context.globalState.update(DEVICE_TEMPLATES_KEY, templates);
+  }
+
+  public async getSavedFilters(): Promise<SavedFilterDefinition[]> {
+    // SAVED FILTER DEFINITIONS (PR-E) — same corrupt-shape-tolerant load as every
+    // other store: a whole entry is skipped if its shape guard fails, never a
+    // partial one. No `revision` machinery (a saved filter is a copy-from template
+    // with no in-flight-sync semantics), so no load-time backfill.
+    const raw = asArray<SavedFilterDefinition>(this.context.globalState.get(SAVED_FILTERS_KEY, []));
+    return raw.filter((item) => {
+      if (validateSavedFilter(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid saved filter entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveSavedFilters(filters: SavedFilterDefinition[]): Promise<void> {
+    await this.context.globalState.update(SAVED_FILTERS_KEY, filters);
   }
 }

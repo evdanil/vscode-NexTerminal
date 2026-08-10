@@ -43,6 +43,7 @@ import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../uti
 import { mostCommonUsername } from "./configCommands";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { createInlineDeviceTemplateCreation } from "./inlineDeviceTemplateCreation";
+import { createInlineSavedFilterCreation } from "./inlineSavedFilterCreation";
 
 /**
  * F1 — server runtime teardown, injected from extension.ts (mirrors the
@@ -438,6 +439,20 @@ function formValuesToProviderConfig(
 
     if (field.type === "boolean") {
       config[field.id] = raw === true;
+      continue;
+    }
+
+    if (field.type === "select") {
+      // PRIMARY-IP FAMILY PREFERENCE (issue #48 PR-E) — a select posts a plain
+      // string (the chosen option's value). Store a value that is one of the
+      // declared options; anything else (a stale/hand-posted value) is dropped so
+      // the provider falls back to its own default rather than persisting a value
+      // the dropdown could never show. Never "required" in practice — a select
+      // always has a current option — so an unmatched value simply stores nothing.
+      const options = field.options ?? [];
+      if (typeof raw === "string" && options.some((o) => o.value === raw)) {
+        config[field.id] = raw;
+      }
       continue;
     }
 
@@ -918,6 +933,15 @@ function authProfileUsernameMirror(profile: AuthProfile | undefined): Record<str
   const username = authProfileOwnedCredentials(profile).username;
   return username !== undefined ? { defaultUsername: username } : {};
 }
+
+// SAVED FILTER DEFINITIONS (issue #48 PR-E) — the saved-filter picker fills the
+// Device Filter field SYNCHRONOUSLY in the webview from each option's raw
+// `fillValue` (see `savedFilterSelectField` in formDefinitions.ts). FIX B (PR #64
+// Codex review round 2) dropped the async `onAutofill` → `fillFields` round trip
+// this picker used to rely on: it could be outrun by a Save clicked before the
+// answer landed (silently keeping the old filter), and a late answer would clobber
+// a hand edit. There is therefore no extension-side saved-filter autofill helper
+// anymore — the fill lives entirely client-side and never involves this file.
 
 export interface NewInventorySourceInput {
   name: string;
@@ -2251,7 +2275,8 @@ export function registerInventoryCommands(
       undefined,
       mostCommonUsername(snapshot.servers),
       snapshot.authProfiles,
-      snapshot.deviceTemplates
+      snapshot.deviceTemplates,
+      snapshot.savedFilters
     );
     // Same controller/handler triple the server edit form uses
     // (serverCommands.ts) — the only difference is onAutofill's payload: this
@@ -2261,6 +2286,9 @@ export function registerInventoryCommands(
     // DEVICE TEMPLATES (PR-T1b) — the source form's "Create new device template…"
     // affordance, routed to whichever `onCreateInline` key fired.
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
+    // SAVED FILTER DEFINITIONS (PR-E) — the "Save current filter as…" affordance
+    // on the saved-filter picker.
+    const inlineSavedFilter = createInlineSavedFilterCreation({ core });
     // REVIEW FINDING (P2) — the profile whose username this form is currently
     // showing, checked against live state at Save by
     // `inventoryAuthProfileRejection`. Seeded as `undefined` and NOT from any
@@ -2304,13 +2332,16 @@ export function registerInventoryCommands(
         })();
       },
       onTest: (values) => handleFormTest(values, provider, provider.label),
-      onCreateInline: (key) => {
+      onCreateInline: (key, values) => {
         inlineAuthProfile.handleCreateInline(key);
         inlineDeviceTemplate.handleCreateInline(key);
+        inlineSavedFilter.handleCreateInline(key, values);
       },
       onAutofill: async (_key, value) => {
-        // ONE lookup feeds both: what the form is about to show, and what Save
-        // checks that against.
+        // The saved-filter picker fills synchronously in the webview now (FIX B),
+        // so it never posts an `autofill` — only the auth-profile select reaches
+        // here. ONE lookup feeds both: what the form is about to show, and what
+        // Save checks that against.
         const profile = core.getAuthProfile(value);
         renderedAuthProfile = renderedSourceAuthProfile(profile);
         return authProfileUsernameMirror(profile);
@@ -2318,6 +2349,7 @@ export function registerInventoryCommands(
     });
     inlineAuthProfile.attachPanel(panel);
     inlineDeviceTemplate.attachPanel(panel);
+    inlineSavedFilter.attachPanel(panel);
   }
 
   // `sourceIdArg` mirrors syncNow's: the manage hub (and any future caller
@@ -2449,7 +2481,8 @@ export function registerInventoryCommands(
     // would render a real link as `(None)` and quietly drop it on Save.
     const authProfiles = core.getSnapshot().authProfiles;
     const deviceTemplates = core.getSnapshot().deviceTemplates;
-    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles, deviceTemplates);
+    const savedFilters = core.getSnapshot().savedFilters;
+    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles, deviceTemplates, savedFilters);
     // REVIEW FINDING (P2) — as addSource's, but seeded: this form opens already
     // showing the LINKED profile's username in Default SSH Username, locked
     // (`inventorySourceFormDefinition`'s render rule), so on Edit "rendered"
@@ -2468,6 +2501,7 @@ export function registerInventoryCommands(
     // in. The marker machinery below is untouched by this wiring.
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
+    const inlineSavedFilter = createInlineSavedFilterCreation({ core });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
     try {
       // F6 — WebviewFormPanel.open can throw synchronously (or reject — see
@@ -2565,12 +2599,14 @@ export function registerInventoryCommands(
           return submitPromise;
         },
         onTest: (values) => handleFormTest(values, provider, source.name, source),
-        onCreateInline: (key) => {
+        onCreateInline: (key, values) => {
           inlineAuthProfile.handleCreateInline(key);
           inlineDeviceTemplate.handleCreateInline(key);
+          inlineSavedFilter.handleCreateInline(key, values);
         },
         onAutofill: async (_key, value) => {
-          // ONE lookup feeds both — see addSource's copy.
+          // The saved-filter picker fills synchronously now (FIX B) — see
+          // addSource's copy. ONE lookup feeds both.
           const profile = core.getAuthProfile(value);
           renderedAuthProfile = renderedSourceAuthProfile(profile);
           return authProfileUsernameMirror(profile);
@@ -2583,6 +2619,7 @@ export function registerInventoryCommands(
     panel.onDidDispose(releaseInFlight);
     inlineAuthProfile.attachPanel(panel);
     inlineDeviceTemplate.attachPanel(panel);
+    inlineSavedFilter.attachPanel(panel);
   }
 
   /** `sourceIdArg` as in editSource/syncNow — see editSource's note. */

@@ -319,6 +319,11 @@ describe("isValidExport", () => {
     expect(isValidExport(makeExportData({ inventorySources: [makeInventorySource()] }))).toBe(true);
     expect(isValidExport(makeExportData({ inventorySources: "not-an-array" }))).toBe(false);
   });
+
+  it("accepts a valid savedFilters array and rejects a non-array savedFilters (PR-E)", () => {
+    expect(isValidExport(makeExportData({ savedFilters: [{ id: "f1", name: "n", filter: "x=1" }] }))).toBe(true);
+    expect(isValidExport(makeExportData({ savedFilters: "not-an-array" }))).toBe(false);
+  });
 });
 
 describe("SETTINGS_KEYS", () => {
@@ -1955,6 +1960,97 @@ describe("backup import", () => {
     expect(afterSecondMerge.map((m) => m.name)).toEqual(["Enable", "Poll", "Reload"]);
     expect(afterSecondMerge[2].id).toBe("file-c");
   });
+
+  it("SAVED FILTER DEFINITIONS (PR-E) — round-trips through backup import preserving ids and values (kills a bucket that is exported but never imported)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      savedFilters: [
+        { id: "sf1", name: "Syd core", filter: "role=core&site=syd" },
+        { id: "sf2", name: "Edge", filter: "role=edge" }
+      ],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "merge");
+
+    expect(core.getSnapshot().savedFilters).toEqual([
+      { id: "sf1", name: "Syd core", filter: "role=core&site=syd" },
+      { id: "sf2", name: "Edge", filter: "role=edge" }
+    ]);
+  });
+
+  it("(Codex round 5, P2) SAVED FILTER DEFINITIONS (PR-E) — a backup savedFilter whose id uses the reserved `__create__` prefix is DROPPED on import while a valid sibling survives (kills importing an un-selectable inline-create-sentinel filter)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    // importPreservingIds filters the backup's savedFilters through
+    // `validateSavedFilter`; a `__create__`-prefixed id collides with the
+    // webview inline-create sentinel namespace and must be rejected at this
+    // boundary so it is never persisted, exactly as the getSavedFilters load
+    // drops it. Its valid sibling must still import.
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      savedFilters: [
+        { id: "__create__hijack", name: "Reserved prefix", filter: "role=core" },
+        { id: "sf-valid", name: "Valid", filter: "role=edge" }
+      ],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "merge");
+
+    const filters = core.getSnapshot().savedFilters;
+    expect(filters.find((f) => f.id === "__create__hijack")).toBeUndefined();
+    expect(filters).toEqual([{ id: "sf-valid", name: "Valid", filter: "role=edge" }]);
+  });
+
+  it("(T-M4) SAVED FILTER DEFINITIONS (PR-E) — replace mode removes a pre-existing local saved filter that the backup does NOT contain (kills deleting the replace-mode removal loop)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    // A local saved filter whose id the incoming backup does NOT carry — replace
+    // mode must wipe it. If the removal loop (configCommands `for (const filter of
+    // snapshot.savedFilters) removeSavedFilter`) were deleted, this stale local
+    // filter would survive: existingIds is empty in replace mode, so
+    // importPreservingIds never touches it, and nothing else clears it.
+    await core.addOrUpdateSavedFilter({ id: "local-A", name: "Local only", filter: "site=local" });
+
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      savedFilters: [{ id: "sf-B", name: "From backup", filter: "role=edge" }],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "replace");
+
+    const filters = core.getSnapshot().savedFilters;
+    // The stale local filter is GONE...
+    expect(filters.find((f) => f.id === "local-A")).toBeUndefined();
+    // ...and only the backup's filter remains.
+    expect(filters).toEqual([{ id: "sf-B", name: "From backup", filter: "role=edge" }]);
+  });
+
 
   it("merge still skips by ID, so a macro edited locally is not re-added from the backup as a second copy", async () => {
     // The two dedupe keys are independent and this is the half the content key cannot do:
@@ -4886,11 +4982,22 @@ describe("complete reset", () => {
     await core.addOrUpdateSerialProfile(makeSerialProfile());
     await core.addOrUpdateAuthProfile(makeAuthProfile());
     await core.addGroup("Production");
+    // PR #64 Codex round 1 (P2 #1) — device templates (PR-T1) and saved filters
+    // (PR-E) are Nexus data too, and Complete Reset promises to delete ALL of it.
+    // Against HEAD 589efab both survive the reset, so these two assertions go red
+    // there and green with the AFTER-inventory-loop clear.
+    await core.addOrUpdateDeviceTemplate({ id: "dt1", name: "Edge defaults", fields: {} });
+    await core.addOrUpdateSavedFilter({ id: "sf1", name: "Syd core", filter: "role=core&site=syd" });
     await vault.store("password-s1", "pw");
     await vault.store("passphrase-s1", "pp");
     await vault.store("auth-profile-password-ap1", "auth-pw");
     await vault.store("auth-profile-passphrase-ap1", "auth-pp");
     configStore.set("nexus.terminal.macros", [{ name: "M", text: "echo" }]);
+
+    // Confirm the fixture actually seeded both buckets, so the emptiness
+    // assertions below can only pass because the reset cleared them.
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
+    expect(core.getSnapshot().savedFilters).toHaveLength(1);
 
     mockShowWarningMessage.mockResolvedValue("Delete Everything");
     mockShowInputBox.mockResolvedValue("DELETE");
@@ -4903,6 +5010,8 @@ describe("complete reset", () => {
     expect(snapshot.tunnels).toHaveLength(0);
     expect(snapshot.serialProfiles).toHaveLength(0);
     expect(snapshot.explicitGroups).toHaveLength(0);
+    expect(snapshot.deviceTemplates).toHaveLength(0);
+    expect(snapshot.savedFilters).toHaveLength(0);
     expect(await vault.get("password-s1")).toBeUndefined();
     expect(await vault.get("passphrase-s1")).toBeUndefined();
     expect(await vault.get("auth-profile-password-ap1")).toBeUndefined();
@@ -5162,6 +5271,46 @@ describe("share export round-trip", () => {
     expect(exported.inventorySources).toBeUndefined();
     expect(exported.servers).toHaveLength(1);
     expect(exported.servers[0].origin).toBeUndefined();
+  });
+
+  /**
+   * T-M1 (PR-E) — share export EXCLUDES saved filters. Mirrors §B6: a real saved
+   * filter is populated on the exporting core, the ACTUAL share command path
+   * (`nexus.config.export`) produces the bundle, and the serialized payload is
+   * asserted to carry no `savedFilters` key.
+   *
+   * Non-vacuous: the premise is asserted (the store DID hold a saved filter on the
+   * way in, so the exclusion cannot pass merely because there was nothing to
+   * exclude), and the assertion is on the serialized JSON that actually travels.
+   * Under the realistic break — adding `savedFilters: snapshot.savedFilters` to
+   * `exportShare`'s `exportData` literal — the key is present and this fails.
+   */
+  it("(T-M1) share export carries NO savedFilters key even when the store holds one (kills leaking saved filters into a shared bundle)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    // The premise: a real saved filter exists on the exporting core.
+    await sourceCore.addOrUpdateSavedFilter({ id: "sf1", name: "Syd core", filter: "role=core&site=syd" });
+    expect(sourceCore.getSnapshot().savedFilters).toHaveLength(1);
+
+    registerConfigCommands(sourceCore, vault);
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/share.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    await registeredCommands.get("nexus.config.export")!();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.savedFilters).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(exported, "savedFilters")).toBe(false);
   });
 
   /**

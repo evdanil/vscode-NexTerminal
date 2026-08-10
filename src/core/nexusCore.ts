@@ -16,6 +16,7 @@ import {
 } from "../models/config";
 import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -109,6 +110,7 @@ export class NexusCore {
   private readonly authProfiles = new Map<string, AuthProfile>();
   private readonly inventorySources = new Map<string, InventorySourceConfig>();
   private readonly deviceTemplates = new Map<string, DeviceTemplateProfile>();
+  private readonly savedFilters = new Map<string, SavedFilterDefinition>();
   // TOMBSTONE (rollback-vs-live-close race) — set while applyInventorySyncPlan
   // has captured pre-batch session state and is awaiting its persist. Session
   // lifecycle callbacks (onSessionClosed -> unregisterSession) are NOT
@@ -127,7 +129,7 @@ export class NexusCore {
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources, deviceTemplates] =
+    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources, deviceTemplates, savedFilters] =
       await Promise.all([
         this.repository.getServers(),
         this.repository.getTunnels(),
@@ -136,7 +138,8 @@ export class NexusCore {
         this.repository.getGroups(),
         this.repository.getAuthProfiles(),
         this.repository.getInventorySources(),
-        this.repository.getDeviceTemplates()
+        this.repository.getDeviceTemplates(),
+        this.repository.getSavedFilters()
       ]);
     this.servers.clear();
     this.tunnels.clear();
@@ -146,6 +149,7 @@ export class NexusCore {
     this.authProfiles.clear();
     this.inventorySources.clear();
     this.deviceTemplates.clear();
+    this.savedFilters.clear();
     const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
     for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
@@ -171,6 +175,9 @@ export class NexusCore {
     for (const template of deviceTemplates) {
       this.deviceTemplates.set(template.id, template);
     }
+    for (const filter of savedFilters) {
+      this.savedFilters.set(filter.id, filter);
+    }
     if (normalizedServers.changed) {
       await this.repository.saveServers(normalizedServers.servers);
     }
@@ -193,7 +200,8 @@ export class NexusCore {
       activitySessionIds: new Set(this.activitySessionIds),
       focusedSessionId: this.focusedSessionId,
       inventorySources: [...this.inventorySources.values()],
-      deviceTemplates: [...this.deviceTemplates.values()]
+      deviceTemplates: [...this.deviceTemplates.values()],
+      savedFilters: [...this.savedFilters.values()]
     };
   }
 
@@ -655,6 +663,69 @@ export class NexusCore {
     } finally {
       this.emitChanged();
     }
+  }
+
+  public getSavedFilter(id: string): SavedFilterDefinition | undefined {
+    return this.savedFilters.get(id);
+  }
+
+  /**
+   * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the repo-wide in-memory-first +
+   * persist + rollback discipline (`addOrUpdateAuthProfile`/
+   * `addOrUpdateDeviceTemplate`): the map mutates first, and a rejected persist
+   * leaves NO trace (the previous record is restored, or the new one removed) so
+   * the next unrelated `saveSavedFilters` from some other command can never
+   * silently commit a half-applied change.
+   *
+   * No `revision` is minted here (unlike device templates / inventory sources): a
+   * saved filter is a copy-from template with no in-flight-sync incarnation
+   * semantics to fast-fail against — the value is copied into a source's own
+   * `config.filter` at pick time and never referenced live.
+   */
+  public async addOrUpdateSavedFilter(filter: SavedFilterDefinition): Promise<void> {
+    const hadPrevious = this.savedFilters.has(filter.id);
+    const previous = this.savedFilters.get(filter.id);
+    this.savedFilters.set(filter.id, filter);
+    try {
+      await this.repository.saveSavedFilters([...this.savedFilters.values()]);
+    } catch (error) {
+      if (hadPrevious) {
+        this.savedFilters.set(filter.id, previous!);
+      } else {
+        this.savedFilters.delete(filter.id);
+      }
+      throw error;
+    }
+    this.emitChanged();
+  }
+
+  /**
+   * SAVED FILTER DEFINITIONS (issue #48 PR-E) — delete a saved filter definition.
+   *
+   * DELIBERATELY DOES NO SOURCE SWEEP. A saved definition is a template to COPY
+   * FROM, not a live reference: picking one fills a source's own `config.filter`
+   * with an INDEPENDENT copy of the query string, so a source keeps whatever
+   * filter it was last configured with regardless of what happens to the
+   * definition it was copied from. Sweeping sources' stored `config.filter` here
+   * would silently wipe working filters off unrelated sources — the exact
+   * opposite of what a template-library delete should do. So this is a plain
+   * record drop with the same in-memory-first + persist + rollback discipline as
+   * `addOrUpdateSavedFilter`; a rejected persist restores the deleted record.
+   */
+  public async removeSavedFilter(id: string): Promise<void> {
+    const hadPrevious = this.savedFilters.has(id);
+    const previous = this.savedFilters.get(id);
+    if (!hadPrevious) {
+      return;
+    }
+    this.savedFilters.delete(id);
+    try {
+      await this.repository.saveSavedFilters([...this.savedFilters.values()]);
+    } catch (error) {
+      this.savedFilters.set(id, previous!);
+      throw error;
+    }
+    this.emitChanged();
   }
 
   /**

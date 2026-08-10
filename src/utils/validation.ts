@@ -10,6 +10,7 @@ import type {
 } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 import { normalizeFolderPath } from "./folderPaths";
 
 function isNonEmptyString(value: unknown): value is string {
@@ -459,6 +460,40 @@ export function validateDeviceTemplate(item: unknown): item is DeviceTemplatePro
     validField(fields.multiplexing, (v) => typeof v === "boolean") &&
     validField(fields.legacyAlgorithms, (v) => typeof v === "boolean") &&
     validField(fields.logSession, (v) => typeof v === "boolean")
+  );
+}
+
+/**
+ * SAVED FILTER DEFINITIONS (issue #48 PR-E) — shape guard for a persisted
+ * `SavedFilterDefinition`. Same trust boundary and tolerant disposition as the
+ * other config-store guards: `id`/`name` non-empty strings, `filter` a string
+ * (empty allowed — a saved definition MAY be a catch-all, and the source's own
+ * Device Filter field admits ""). A whole definition is skipped by the storage
+ * getter if this fails — never a partial one.
+ *
+ * RESERVED SENTINEL NAMESPACE (PR #64 Codex review round 5, P2 — issue #48
+ * PR-E). The saved-filter picker uses each definition's `id` as the option
+ * VALUE, and the webview treats ANY option value starting with `__create__` as
+ * the inline-create sentinel (isCreateOption in ui/shared/webviewScripts.ts /
+ * filterableSelectLogic.ts) — the click handler returns before applying its
+ * fillValue, so such an entry is DISPLAYED but un-selectable (clicking it opens
+ * "Save current filter as…" instead). `randomUUID()` never produces this
+ * prefix, so only an imported backup or a hand-edited persisted row can collide.
+ * Reject it at this persistence/import boundary — the same reservation the
+ * round-3 fix makes of provider select option values (see providerRegistry.ts)
+ * — so the getter drops the whole entry rather than load an inert one. `obj.id`
+ * is narrowed to `string` by `isNonEmptyString` before `.startsWith`.
+ */
+export function validateSavedFilter(item: unknown): item is SavedFilterDefinition {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  return (
+    isNonEmptyString(obj.id) &&
+    !obj.id.startsWith("__create__") &&
+    isNonEmptyString(obj.name) &&
+    typeof obj.filter === "string"
   );
 }
 

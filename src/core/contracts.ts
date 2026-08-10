@@ -12,6 +12,7 @@ import type {
 } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 
 export interface ConfigRepository {
   getServers(): Promise<ServerConfig[]>;
@@ -30,6 +31,8 @@ export interface ConfigRepository {
   saveInventorySources(sources: InventorySourceConfig[]): Promise<void>;
   getDeviceTemplates(): Promise<DeviceTemplateProfile[]>;
   saveDeviceTemplates(templates: DeviceTemplateProfile[]): Promise<void>;
+  getSavedFilters(): Promise<SavedFilterDefinition[]>;
+  saveSavedFilters(filters: SavedFilterDefinition[]): Promise<void>;
 }
 
 export interface SessionSnapshot {
@@ -48,6 +51,7 @@ export interface SessionSnapshot {
   focusedSessionId: string | undefined;
   inventorySources: InventorySourceConfig[];
   deviceTemplates: DeviceTemplateProfile[];
+  savedFilters: SavedFilterDefinition[];
 }
 
 export interface TunnelRegistryStore {

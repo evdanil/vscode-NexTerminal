@@ -2,6 +2,7 @@ import type { ConfigRepository } from "../core/contracts";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { SavedFilterDefinition } from "../models/savedFilter";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
@@ -12,7 +13,8 @@ export class InMemoryConfigRepository implements ConfigRepository {
     private authProfiles: AuthProfile[] = [],
     private localShellProfiles: LocalShellProfile[] = [],
     private inventorySources: InventorySourceConfig[] = [],
-    private deviceTemplates: DeviceTemplateProfile[] = []
+    private deviceTemplates: DeviceTemplateProfile[] = [],
+    private savedFilters: SavedFilterDefinition[] = []
   ) {}
 
   public async getServers(): Promise<ServerConfig[]> {
@@ -81,5 +83,13 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveDeviceTemplates(templates: DeviceTemplateProfile[]): Promise<void> {
     this.deviceTemplates = [...templates];
+  }
+
+  public async getSavedFilters(): Promise<SavedFilterDefinition[]> {
+    return [...this.savedFilters];
+  }
+
+  public async saveSavedFilters(filters: SavedFilterDefinition[]): Promise<void> {
+    this.savedFilters = [...filters];
   }
 }

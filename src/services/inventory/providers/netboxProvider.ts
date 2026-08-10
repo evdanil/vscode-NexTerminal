@@ -56,8 +56,72 @@ const NETBOX_CONFIG_FIELDS: InventoryConfigField[] = [
     type: "boolean",
     required: false,
     description: "Also fetch NetBox virtual machines (no rack/location — site/role/tenant only)."
+  },
+  {
+    // PRIMARY-IP FAMILY PREFERENCE (issue #48 PR-E, backlog #3) — which address
+    // family to import when a device carries both an IPv4 and an IPv6 primary IP.
+    // `auto` (the default, and the first option so legacy sources render/store it)
+    // reads NetBox's own `primary_ip`, byte-identical to pre-PR-E behaviour —
+    // which yields IPv6 when both exist. `prefer-ipv4`/`prefer-ipv6` read
+    // `primary_ip4`/`primary_ip6` from the SAME device rows (no extra API call),
+    // each falling back to `primary_ip` when its family-specific field is absent.
+    id: "primaryIpFamily",
+    label: "Primary IP Family",
+    type: "select",
+    required: false,
+    options: [
+      { label: "Automatic (NetBox primary IP)", value: "auto" },
+      { label: "Prefer IPv4", value: "prefer-ipv4" },
+      { label: "Prefer IPv6", value: "prefer-ipv6" }
+    ],
+    description:
+      "Which address to import when a device has both IPv4 and IPv6 primary IPs. Automatic uses NetBox's own primary IP (IPv6 when both exist). Prefer options fall back to the primary IP when the device has no address in that family. The out-of-band (BMC) address is never affected."
   }
 ];
+
+/** PRIMARY-IP FAMILY PREFERENCE (PR-E) — the address family a source prefers. */
+type PrimaryIpFamily = "auto" | "prefer-ipv4" | "prefer-ipv6";
+
+/** Coerce a stored config value to a known preference; anything else is `auto`,
+ *  so an absent field (legacy source) or a hand-mangled value is zero behaviour
+ *  change bit-for-bit. */
+function parsePrimaryIpFamily(raw: unknown): PrimaryIpFamily {
+  return raw === "prefer-ipv4" || raw === "prefer-ipv6" ? raw : "auto";
+}
+
+/**
+ * PRIMARY-IP FAMILY PREFERENCE (PR-E) — reads the preferred address off a device
+ * row, from the SAME `{ address?: unknown }`-shaped fields NetBox already returns
+ * (`primary_ip`, `primary_ip4`, `primary_ip6`) — no new API call. Each family
+ * preference falls back to `primary_ip` when its family-specific field carries no
+ * usable string address, so a device that has only `primary_ip` never loses its
+ * endpoint under a `prefer-*` preference. `auto` reads `primary_ip` directly, so
+ * the returned value is byte-identical to pre-PR-E behaviour. Keeps the defensive
+ * shape the previous single-field read used; CIDR stripping stays with the caller.
+ */
+function readPrimaryAddress(obj: Record<string, unknown>, family: PrimaryIpFamily): unknown {
+  const addressOf = (key: string): unknown => {
+    const field = obj[key] as { address?: unknown } | null | undefined;
+    return field && typeof field === "object" ? field.address : undefined;
+  };
+  // H1 (N2) — the family field counts as PRESENT only when it carries a
+  // non-empty (trimmed) string. A present-but-empty `primary_ip4: { address: "" }`
+  // is not a usable endpoint, so it must fall back to `primary_ip` rather than
+  // returning "" and dropping the SSH endpoint. NetBox does not emit that shape
+  // today; this hardens the theoretical case without changing any real read.
+  const usableAddress = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
+  const primary = addressOf("primary_ip");
+  if (family === "prefer-ipv4") {
+    const v4 = addressOf("primary_ip4");
+    return usableAddress(v4) ? v4 : primary;
+  }
+  if (family === "prefer-ipv6") {
+    const v6 = addressOf("primary_ip6");
+    return usableAddress(v6) ? v6 : primary;
+  }
+  // `auto` reads `primary_ip` directly — byte-identical to pre-PR-E behaviour.
+  return primary;
+}
 
 /** "10.0.0.5/24" -> "10.0.0.5"; "2001:db8::5/64" -> "2001:db8::5". */
 export function stripCidr(address: string): string {
@@ -547,7 +611,14 @@ function deviceAttributes(obj: Record<string, unknown>, kind: "device" | "vm"): 
  * throws a protocol error naming the endpoint and row index instead of
  * returning `undefined`.
  */
-function mapEntry(raw: unknown, endpointPath: string, index: number, template: string, kind: "device" | "vm"): InventoryDevice {
+function mapEntry(
+  raw: unknown,
+  endpointPath: string,
+  index: number,
+  template: string,
+  kind: "device" | "vm",
+  primaryIpFamily: PrimaryIpFamily
+): InventoryDevice {
   if (typeof raw !== "object" || raw === null) {
     throw new InventoryProviderError(
       "protocol",
@@ -561,8 +632,12 @@ function mapEntry(raw: unknown, endpointPath: string, index: number, template: s
     throw new InventoryProviderError("protocol", `row ${index} of ${endpointPath} has no id — refusing to sync.`);
   }
   const name = typeof obj.name === "string" ? obj.name : "";
-  const primaryIp = obj.primary_ip as { address?: unknown } | null | undefined;
-  const address = primaryIp && typeof primaryIp === "object" ? primaryIp.address : undefined;
+  // PRIMARY-IP FAMILY PREFERENCE (PR-E) — the SSH endpoint's address is chosen by
+  // the source's family preference off the same row (primary_ip / primary_ip4 /
+  // primary_ip6). `auto` is byte-identical to the previous single `primary_ip`
+  // read. The `oob_ip` block below is UNAFFECTED: `oob_ip` is a single NetBox
+  // field with no v4/v6 siblings, so no family preference can (or does) govern it.
+  const address = readPrimaryAddress(obj, primaryIpFamily);
   const usable = Boolean(name) && typeof address === "string" && address.length > 0;
   const vars = kind === "device" ? deviceVars(obj) : vmVars(obj);
   const folderPath = renderFolderTemplate(template, vars);
@@ -644,6 +719,7 @@ async function fetchInventoryImpl(
   const template =
     typeof config.folderTemplate === "string" && config.folderTemplate.trim() ? config.folderTemplate : DEFAULT_FOLDER_TEMPLATE;
   const includeVms = config.includeVms === true;
+  const primaryIpFamily = parsePrimaryIpFamily(config.primaryIpFamily);
 
   const warnings: string[] = [];
   const filterParams = parseFilter(typeof config.filter === "string" ? config.filter : "", warnings);
@@ -688,12 +764,12 @@ async function fetchInventoryImpl(
   const hasNoSshEndpoint = (mapped: InventoryDevice): boolean => !mapped.endpoints.some((e) => e.kind === "ssh");
   let skippedCount = 0;
   rawDevices.forEach((raw, index) => {
-    const mapped = mapEntry(raw, "/api/dcim/devices/", index, template, "device");
+    const mapped = mapEntry(raw, "/api/dcim/devices/", index, template, "device", primaryIpFamily);
     devices.push(mapped);
     if (hasNoSshEndpoint(mapped)) skippedCount++;
   });
   rawVms.forEach((raw, index) => {
-    const mapped = mapEntry(raw, "/api/virtualization/virtual-machines/", index, template, "vm");
+    const mapped = mapEntry(raw, "/api/virtualization/virtual-machines/", index, template, "vm", primaryIpFamily);
     devices.push(mapped);
     if (hasNoSshEndpoint(mapped)) skippedCount++;
   });

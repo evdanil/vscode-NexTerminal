@@ -3804,6 +3804,96 @@ describe("computeProviderFingerprint (ITEM A — provider trust fingerprint)", (
     const b = computeProviderFingerprint(makeProvider({ testConnection: async () => {}, fetchInventory: async () => ({ contractVersion: 1, devices: [] }) }));
     expect(a).toBe(b);
   });
+
+  // SELECT OPTIONS IN THE FINGERPRINT (PR #64 Codex review round 3, P2 — issue #48
+  // PR-E). Before the fix the projection was {id,label,type,required} and OMITTED
+  // `options`, so a select field whose option labels/values/ORDER changed (with
+  // id/label/type/required unchanged) hashed the SAME — checkProviderFingerprint
+  // then treated the materially-changed provider as "unchanged" and could hand it
+  // the source's stored credentials WITHOUT the provider-change re-confirmation.
+  // Each label-/value-/order-differ case below is RED against 36c24eb (same hash)
+  // and green with the fix.
+  function makeSelectProvider(options: { label: string; value: string }[]): InventoryProvider {
+    return makeProvider({
+      configFields: [
+        { id: "baseUrl", label: "Base URL", type: "string", required: true },
+        { id: "family", label: "Family", type: "select", required: false, options }
+      ]
+    });
+  }
+
+  it("changes when a select field's option LABELS change (kills a fingerprint that omits options)", () => {
+    const a = computeProviderFingerprint(makeSelectProvider([{ label: "Auto", value: "auto" }, { label: "IPv4", value: "prefer-ipv4" }]));
+    const b = computeProviderFingerprint(makeSelectProvider([{ label: "Automatic", value: "auto" }, { label: "IPv4", value: "prefer-ipv4" }]));
+    expect(a).not.toBe(b);
+  });
+
+  it("changes when a select field's option VALUES change (kills a fingerprint that omits options)", () => {
+    const a = computeProviderFingerprint(makeSelectProvider([{ label: "Auto", value: "auto" }, { label: "IPv4", value: "prefer-ipv4" }]));
+    const b = computeProviderFingerprint(makeSelectProvider([{ label: "Auto", value: "auto" }, { label: "IPv4", value: "ipv4-first" }]));
+    expect(a).not.toBe(b);
+  });
+
+  it("changes when a select field's option ORDER is reversed (kills a fingerprint that sorts/ignores option order)", () => {
+    const a = computeProviderFingerprint(makeSelectProvider([{ label: "Auto", value: "auto" }, { label: "IPv4", value: "prefer-ipv4" }]));
+    const reversed = computeProviderFingerprint(makeSelectProvider([{ label: "IPv4", value: "prefer-ipv4" }, { label: "Auto", value: "auto" }]));
+    expect(a).not.toBe(reversed);
+  });
+
+  it("is stable for byte-identical select options in identical order (the fix must not destabilize an unchanged select)", () => {
+    const opts = () => [{ label: "Auto", value: "auto" }, { label: "IPv4", value: "prefer-ipv4" }];
+    expect(computeProviderFingerprint(makeSelectProvider(opts()))).toBe(computeProviderFingerprint(makeSelectProvider(opts())));
+  });
+
+  it("normalizes options to {label,value} only — an extra per-option member does not perturb the hash (future-proofing against option shape growth)", () => {
+    const plain = computeProviderFingerprint(makeSelectProvider([{ label: "Auto", value: "auto" }]));
+    const withExtra = computeProviderFingerprint(makeSelectProvider([{ label: "Auto", value: "auto", description: "pick automatically" } as never]));
+    expect(plain).toBe(withExtra);
+  });
+
+  it("leaves an optionless (all non-select) provider's fingerprint BYTE-IDENTICAL to the pre-patch shape — no spurious re-confirmation for existing sources", () => {
+    // This exact value was computed against the pre-patch projection
+    // {id,label,type,required} (no `options` key). Because JSON.stringify drops
+    // `undefined` members, the patched map — which emits `options: undefined` for
+    // these non-select fields — must serialize to the same bytes and reproduce it.
+    // A hardcoded expectation, not a self-referential a===a, so the "no churn"
+    // property is guarded rather than vacuous.
+    expect(computeProviderFingerprint(makeProvider())).toBe("ae99d9cc15c65e72");
+  });
+
+  // NON-SELECT `options` IGNORED (PR #64 Codex review round 4, P2 — issue #48
+  // PR-E; corner of round-3's Fix B). round-3 projected `options` for EVERY
+  // field, but `options` is documented-ignored (and never rendered) on
+  // non-select fields, and `validateProviderShape` accepts a stray `options`
+  // member on a string/number/boolean/password field. An existing provider
+  // carrying such an ignored member must NOT get a different fingerprint than
+  // one without it — otherwise its sources hit a spurious provider-change
+  // confirmation + credential gate on upgrade, and any later edit to that
+  // ignored metadata re-prompts. The projection is now gated on
+  // `type === "select"`, so these three fingerprint IDENTICALLY. Against 81b3c2d
+  // (options projected for all fields) the with-options cases perturb the hash →
+  // RED; after the fix → GREEN.
+  function makeNonSelectWithOptions(options?: { label: string; value: string }[]): InventoryProvider {
+    return makeProvider({
+      configFields: [
+        // A STRING field carrying an ignored `options` member.
+        { id: "baseUrl", label: "Base URL", type: "string", required: true, options } as InventoryProvider["configFields"][number],
+        { id: "apiToken", label: "API Token", type: "password", required: true }
+      ]
+    });
+  }
+
+  it("ignores an `options` member on a NON-select field — its fingerprint equals the same provider without it (documented-ignored metadata must not perturb the hash)", () => {
+    const withOptions = computeProviderFingerprint(makeNonSelectWithOptions([{ label: "Auto", value: "auto" }]));
+    const withoutOptions = computeProviderFingerprint(makeNonSelectWithOptions(undefined));
+    expect(withOptions).toBe(withoutOptions);
+  });
+
+  it("ignores the VALUE of an `options` member on a NON-select field — two different ignored option values fingerprint the same", () => {
+    const a = computeProviderFingerprint(makeNonSelectWithOptions([{ label: "Auto", value: "auto" }]));
+    const b = computeProviderFingerprint(makeNonSelectWithOptions([{ label: "Manual", value: "manual" }]));
+    expect(a).toBe(b);
+  });
 });
 
 describe("validateServerConfig — origin handling (F13/FIX 5)", () => {

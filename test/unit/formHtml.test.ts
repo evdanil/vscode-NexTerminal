@@ -1314,15 +1314,18 @@ describe("renderFormHtml — filterable client wiring is present in the emitted 
     // `wrapper.classList.remove('open')` with no trigger focus — stranding
     // focus on the hidden filter input and leaving aria-expanded="true" stale
     // when the inline-create editor was cancelled.
+    // The load-bearing invariant: the __create__ branch closes the dropdown
+    // through setCustomSelectOpen(false) + restores trigger focus before posting.
     expect(html).toContain(
       "if (value && value.indexOf('__create__') === 0) {\n" +
         "          setCustomSelectOpen(wrapper, false);\n" +
         "          var trigger = wrapper.querySelector('.custom-select-trigger');\n" +
-        "          if (trigger) trigger.focus();\n" +
-        "          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name });\n" +
-        "          return;\n" +
-        "        }",
+        "          if (trigger) trigger.focus();\n",
     );
+    // SAVED FILTER DEFINITIONS (issue #48 PR-E) — the create message now carries a
+    // snapshot of the current form values, so "Save current filter as…" can act on
+    // the typed Device Filter text.
+    expect(html).toContain("vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: createValues });");
     // And the discarded bare-remove idiom must be gone entirely (it existed
     // nowhere else in the emitted script).
     expect(html).not.toContain("wrapper.classList.remove('open')");
@@ -1345,5 +1348,203 @@ describe("renderFormHtml — filterable client wiring is present in the emitted 
 
   it("shows the No matches row only when no real option matches and no create affordance exists", () => {
     expect(html).toContain("noMatches.style.display = (realVisible === 0 && !hasCreateOption) ? '' : 'none';");
+  });
+});
+
+/**
+ * FIX B (issue #48 PR-E / PR #64 Codex review round 2) — the saved-filter picker
+ * fills the Device Filter SYNCHRONOUSLY in the webview from each option's raw
+ * `data-fill-value`, replacing the async `onAutofill` → `fillFields` round trip a
+ * Save could outrun. Two halves proved here: the RENDER emits the fill wiring, and
+ * the pick CALLBACK fills the target field with no round trip so a submit landing
+ * before any (now-absent) async answer carries the definition's filter.
+ */
+describe("FIX B — saved-filter picker synchronous fill (no round-trip race)", () => {
+  /** A NetBox-shaped provider that declares the `filter` (Device Filter) config
+   *  field, so `inventorySourceFormDefinition` renders the saved-filter picker. */
+  const providerWithFilter = {
+    id: "netbox",
+    label: "NetBox",
+    configFields: [
+      { id: "host", label: "Host", type: "string" as const, required: true },
+      { id: "filter", label: "Device Filter", type: "string" as const, required: false }
+    ],
+    testConnection: async () => undefined,
+    fetchInventory: async () => ({ nodes: [] }) as never
+  };
+
+  function renderSourceForm() {
+    const definition = inventorySourceFormDefinition(
+      providerWithFilter,
+      undefined,
+      undefined,
+      [],
+      [],
+      [{ id: "sf1", name: "Syd core", filter: "role=core&site=syd" }]
+    );
+    return renderFormHtml(definition);
+  }
+
+  it("RENDER: the picker wrapper carries data-fill-target=cfg_filter and the real option its raw data-fill-value; (None)/create carry none (kills the async-autofill wiring)", () => {
+    const html = renderSourceForm();
+    // The wrapper names its synchronous fill target.
+    expect(html).toContain('data-fill-target="cfg_filter"');
+    // The real definition option carries the RAW filter string (not the
+    // "(empty filter)" description fallback) as its fill value.
+    expect(html).toContain('data-value="sf1" data-fill-value="role=core&amp;site=syd"');
+    // The round trip is gone: this picker no longer opts into data-autofill.
+    const wrapperStart = html.indexOf('data-name="savedFilter"');
+    const wrapperEnd = html.indexOf("</div>", html.indexOf('data-name="savedFilter"'));
+    expect(wrapperStart).toBeGreaterThan(-1);
+    expect(html.slice(wrapperStart, wrapperEnd)).not.toContain('data-autofill="true"');
+    // (None) (value "") and the "Save current filter as…" __create__ sentinel are
+    // fill-less — picking them must never fill, so they carry no data-fill-value.
+    const noneOpt = /class="custom-select-option[^"]*" data-value=""[^>]*>/.exec(html);
+    expect(noneOpt).not.toBeNull();
+    expect(noneOpt![0]).not.toContain("data-fill-value");
+    const createOpt = /class="custom-select-option[^"]*" data-value="__create__savedFilter"[^>]*>/.exec(html);
+    expect(createOpt).not.toBeNull();
+    expect(createOpt![0]).not.toContain("data-fill-value");
+  });
+
+  // ── Behavioral extraction: run the pick callback against a fake DOM ──────────
+  /** Slice one brace-balanced function out of the rendered script. */
+  function extractFn(html: string, signature: string): string {
+    const start = html.indexOf(signature);
+    expect(start).toBeGreaterThan(-1);
+    let depth = 0;
+    let end = -1;
+    for (let i = html.indexOf("{", start); i < html.length; i++) {
+      if (html[i] === "{") depth++;
+      else if (html[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    expect(end).toBeGreaterThan(start);
+    return html.slice(start, end + 1);
+  }
+
+  interface FakeEl {
+    name?: string;
+    value: string;
+    type: string;
+    disabled?: boolean;
+  }
+
+  /** A form.elements that supports BOTH named (`form.elements["cfg_filter"]`) and
+   *  indexed (`form.elements[0]` + `.length`) access, like the real collection. */
+  function makeForm(): { form: { elements: Record<string | number, FakeEl> & { length: number } }; cfg: FakeEl; sf: FakeEl } {
+    const cfg: FakeEl = { name: "cfg_filter", value: "OLD-source-filter", type: "text" };
+    const sf: FakeEl = { name: "savedFilter", value: "", type: "hidden" };
+    const elements = { cfg_filter: cfg, savedFilter: sf, 0: cfg, 1: sf, length: 2 } as Record<string | number, FakeEl> & {
+      length: number;
+    };
+    return { form: { elements }, cfg, sf };
+  }
+
+  /** Build the real `setFieldValue` from the rendered script (writes into
+   *  form.elements; the custom-select branch is inert for a plain text target). */
+  function buildSetFieldValue(html: string, form: unknown): (key: string, value: string) => void {
+    const src = extractFn(html, "function setFieldValue(key, value)");
+    const documentStub = { getElementById: () => null };
+    const selectStub = (): void => {};
+    return new Function("form", "document", "selectCustomOption", `${src}\nreturn setFieldValue;`)(
+      form,
+      documentStub,
+      selectStub
+    ) as (key: string, value: string) => void;
+  }
+
+  /** Build the initCustomSelects option-click callback from the rendered script. */
+  function buildPickCallback(
+    html: string,
+    form: unknown,
+    setFieldValue: (key: string, value: string) => void,
+    postMessage: (m: unknown) => void
+  ): (wrapper: unknown, opt: unknown) => void {
+    const src = extractFn(html, "function(wrapper, opt) {");
+    const noop = (): void => {};
+    return new Function(
+      "vscode",
+      "form",
+      "setFieldValue",
+      "selectCustomOption",
+      "setCustomSelectOpen",
+      "releaseProfileOwnedFields",
+      `return (${src});`
+    )({ postMessage }, form, setFieldValue, noop, noop, noop) as (wrapper: unknown, opt: unknown) => void;
+  }
+
+  /** Run the rendered submit handler and return the collected values it posts. */
+  function collectSubmitValues(html: string, form: unknown): Record<string, unknown> {
+    const src = extractFn(html, 'form.addEventListener("submit", function(e) {');
+    // The extracted slice is `form.addEventListener("submit", function(e) { ... }`
+    // — pull the inner handler out and invoke it.
+    const inner = src.slice(src.indexOf("function(e)"));
+    let posted: Record<string, unknown> = {};
+    const vscodeStub = {
+      postMessage: (m: { type: string; values: Record<string, unknown> }) => {
+        if (m.type === "submit") posted = m.values;
+      }
+    };
+    const handler = new Function("form", "vscode", `return (${inner});`)(form, vscodeStub) as (e: unknown) => void;
+    handler({ preventDefault: () => {} });
+    return posted;
+  }
+
+  const wrapper = { dataset: { name: "savedFilter", fillTarget: "cfg_filter" }, querySelector: () => null };
+
+  it("submitting a picked filter BEFORE any async answer persists the DEFINITION's filter, not the stale field value (the core race — RED at 695d6af)", () => {
+    const html = renderSourceForm();
+    const { form, cfg } = makeForm();
+    const setFieldValue = buildSetFieldValue(html, form);
+    const posted: unknown[] = [];
+    const pick = buildPickCallback(html, form, setFieldValue, (m) => posted.push(m));
+
+    // The user picks the saved filter. On 695d6af this only POSTS an autofill and
+    // waits for a fillFields answer; with the fix it fills cfg_filter synchronously.
+    pick(wrapper, { dataset: { value: "sf1", fillValue: "role=core&site=syd" } });
+
+    // Save is clicked NOW — no fillFields answer is ever delivered. The submit
+    // collection must carry the definition's filter. On 695d6af cfg_filter is
+    // still "OLD-source-filter" (the fill never landed) → this goes red.
+    expect(cfg.value).toBe("role=core&site=syd");
+    const values = collectSubmitValues(html, form);
+    expect(values.cfg_filter).toBe("role=core&site=syd");
+    // And it is an INDEPENDENT string copy — mutating the field never reaches any
+    // definition (there is none here to reach); the value simply lives on the field.
+    expect(typeof values.cfg_filter).toBe("string");
+  });
+
+  it("(None) after a pick does NOT clear the field (no clobber)", () => {
+    const html = renderSourceForm();
+    const { form, cfg } = makeForm();
+    const setFieldValue = buildSetFieldValue(html, form);
+    const pick = buildPickCallback(html, form, setFieldValue, () => {});
+
+    pick(wrapper, { dataset: { value: "sf1", fillValue: "role=core&site=syd" } });
+    expect(cfg.value).toBe("role=core&site=syd");
+    // (None) carries no fill value — picking it is a no-op, never a clear.
+    pick(wrapper, { dataset: { value: "" } });
+    expect(cfg.value).toBe("role=core&site=syd");
+  });
+
+  it("a hand edit AFTER a pick is what gets persisted — the picker id is NOT re-resolved at submit (hand-edit-wins)", () => {
+    const html = renderSourceForm();
+    const { form, cfg } = makeForm();
+    const setFieldValue = buildSetFieldValue(html, form);
+    const pick = buildPickCallback(html, form, setFieldValue, () => {});
+
+    pick(wrapper, { dataset: { value: "sf1", fillValue: "role=core&site=syd" } });
+    // The user then hand-edits the Device Filter.
+    cfg.value = "role=edge&site=mel";
+    // The picker's hidden value still names sf1, but the submit must carry the
+    // hand edit — nothing re-resolves the id, so the manual value wins.
+    const values = collectSubmitValues(html, form);
+    expect(values.cfg_filter).toBe("role=edge&site=mel");
   });
 });

@@ -5,7 +5,7 @@ export interface ProviderRegistration {
   dispose(): void;
 }
 
-const VALID_FIELD_TYPES: ReadonlySet<InventoryConfigFieldType> = new Set(["string", "password", "number", "boolean"]);
+const VALID_FIELD_TYPES: ReadonlySet<InventoryConfigFieldType> = new Set(["string", "password", "number", "boolean", "select"]);
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]*$/i;
 
 /**
@@ -41,6 +41,30 @@ export function validateProviderShape(provider: unknown): asserts provider is In
     }
     if (typeof f.type !== "string" || !VALID_FIELD_TYPES.has(f.type as InventoryConfigFieldType)) {
       throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid type "${String(f.type)}".`);
+    }
+    if (f.type === "select") {
+      if (!Array.isArray(f.options) || f.options.length === 0) {
+        throw new Error(`Inventory provider configFields entry "${f.id}" of type "select" must declare a non-empty options array.`);
+      }
+      for (const opt of f.options) {
+        if (typeof opt !== "object" || opt === null
+            || typeof (opt as { label?: unknown }).label !== "string" || (opt as { label: string }).label.length === 0
+            || typeof (opt as { value?: unknown }).value !== "string") {
+          throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid select option (each option needs a non-empty string label and a string value).`);
+        }
+        // RESERVED SENTINEL NAMESPACE (PR #64 Codex review round 3, P2 — issue #48
+        // PR-E). The webview treats ANY select option whose value starts with
+        // `__create__` as an inline-create sentinel (isCreateOption in
+        // ui/shared/webviewScripts.ts / filterableSelectLogic.ts) — the click
+        // handler returns without selecting it. Provider `type:"select"` fields
+        // have no inline-create handler, so such an option is impossible to choose
+        // or persist (silently inert). Reject it at the registration boundary.
+        // Empty-string value (the "(None)" sentinel) is still allowed — only the
+        // reserved prefix is off-limits.
+        if ((opt as { value: string }).value.startsWith("__create__")) {
+          throw new Error(`Inventory provider configFields entry "${f.id}" has a select option whose value uses the reserved "__create__" prefix.`);
+        }
+      }
     }
     if (seenFieldIds.has(f.id)) {
       throw new Error(`Inventory provider configFields has a duplicate field id "${f.id}".`);

@@ -75,6 +75,60 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     await expect(repo.getGroups()).resolves.toEqual(["a", "b"]);
   });
 
+  it("(T-M3) SAVED FILTER DEFINITIONS (PR-E) getSavedFilters DROPS a malformed entry WHOLE while a valid sibling in the same array survives (kills a validator loosened to accept a non-string filter or an empty name)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Five malformed shapes `validateSavedFilter` must reject, plus one valid
+    // sibling in the SAME array — so the assertion cannot pass merely because the
+    // array was empty. Each malformed entry must be dropped WHOLE, never partially
+    // loaded. This is the store-getter read boundary (no `ensureId` synthesis), so
+    // a missing-id and a non-object entry are exercised faithfully here.
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.savedFilters": [
+          { id: "bad-filter-type", name: "Bad filter type", filter: 42 }, // filter not a string
+          { id: "bad-empty-name", name: "", filter: "x=1" }, // empty name
+          { name: "no-id", filter: "x=1" }, // missing id
+          "not-an-object", // non-object entry
+          null, // null entry
+          { id: "good", name: "Good", filter: "role=core" } // the valid sibling
+        ]
+      })
+    );
+
+    const filters = await repo.getSavedFilters();
+
+    // Only the valid sibling survives; every malformed entry was dropped whole.
+    expect(filters).toEqual([{ id: "good", name: "Good", filter: "role=core" }]);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("(Codex round 5, P2) SAVED FILTER DEFINITIONS (PR-E) getSavedFilters DROPS a `__create__`-prefixed id WHOLE while a valid uuid sibling survives (kills a validator that lets the reserved inline-create sentinel prefix through and load an un-selectable filter)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // A `__create__`-prefixed id is the webview inline-create sentinel namespace
+    // (isCreateOption): loaded, such a filter is DISPLAYED but un-selectable —
+    // clicking it opens "Save current filter as…" instead of applying it. It can
+    // only arrive via an imported backup or a hand-edited row (randomUUID never
+    // produces it). Two flavours: an arbitrary prefixed id, and one that exactly
+    // collides with the real save-current sentinel value. Both must be dropped
+    // WHOLE; the valid uuid sibling in the SAME array must survive.
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.savedFilters": [
+          { id: "__create__foo", name: "Foo", filter: "role=core" },
+          { id: "__create__savedFilter", name: "Collides with sentinel", filter: "site=syd" },
+          { id: "9f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f", name: "Real", filter: "role=edge" }
+        ]
+      })
+    );
+
+    const filters = await repo.getSavedFilters();
+
+    expect(filters).toEqual([{ id: "9f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f", name: "Real", filter: "role=edge" }]);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
   it("(F13/FIX 5) getServers strips a malformed origin and keeps the rest of the server, warning once — the row is NOT dropped (kills both 'rejects whole server' and 'never strips at all')", async () => {
     const serverWithBadOrigin: ServerConfig = {
       ...validServer,

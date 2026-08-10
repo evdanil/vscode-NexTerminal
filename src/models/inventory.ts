@@ -56,7 +56,7 @@ export interface InventoryTree {
   truncated?: boolean;
 }
 
-export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean";
+export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
 
 export interface InventoryConfigField {
   id: string;
@@ -65,6 +65,17 @@ export interface InventoryConfigField {
   required?: boolean;
   placeholder?: string;
   description?: string;
+  /**
+   * PRIMARY-IP FAMILY PREFERENCE (issue #48 PR-E, backlog #3) — the closed set of
+   * choices for a `type: "select"` field, in the order the dropdown lists them.
+   * The stored value is the chosen `value`; the provider is responsible for
+   * defaulting an absent/unknown value (a select added to a provider whose older
+   * sources predate the field has no stored value on those sources). Ignored for
+   * every other field type. The value strings are the same non-secret vocabulary
+   * as a string field, so `formValuesToProviderConfig` stores a select exactly as
+   * it stores a string.
+   */
+  options?: { label: string; value: string }[];
 }
 
 export type InventorySourceValues = Record<string, string | number | boolean>; // secrets NEVER here
@@ -395,8 +406,9 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
 /**
  * ITEM A (provider trust fingerprint) — pure hash over exactly the provider
  * shape a user can actually SEE and reason about when they configured a
- * source: its label and its configFields' (id, label, type, required),
- * in the provider's own declared order. Deliberately excludes
+ * source: its label and its configFields' (id, label, type, required, and —
+ * for select fields — their options), in the provider's own declared order.
+ * Deliberately excludes
  * testConnection/fetchInventory (functions — not hashable, and not what the
  * user "configured against") and `id` itself (the fingerprint's whole
  * purpose is to detect a DIFFERENT provider answering to the SAME id; hashing
@@ -415,7 +427,21 @@ export function computeProviderFingerprint(provider: Pick<InventoryProvider, "la
       id: field.id,
       label: field.label,
       type: field.type,
-      required: field.required === true
+      required: field.required === true,
+      // SELECT OPTIONS (PR #64 Codex review round 3, P2 — issue #48 PR-E; round
+      // 4 P2 corner). Include a SELECT field's options so a change to their
+      // label/value/ORDER (with id/label/type/required unchanged) yields a
+      // DIFFERENT fingerprint and triggers the provider-change re-confirmation.
+      // Normalized to just {label, value} in declared order — only those and
+      // their order matter, and any future extra option member cannot perturb the
+      // hash. Gated on `type === "select"` because `options` is documented-IGNORED
+      // (and never rendered) on non-select fields, yet `validateProviderShape`
+      // ACCEPTS a stray `options` member there — so a non-select field always
+      // projects `options: undefined` regardless of whether it carries one.
+      // JSON.stringify drops undefined members, keeping every non-select field
+      // BYTE-IDENTICAL to the pre-round-3 shape — no spurious re-confirmation for
+      // existing sources.
+      options: field.type === "select" && field.options ? field.options.map((o) => ({ label: o.label, value: o.value })) : undefined
     }))
   };
   return createHash("sha256").update(JSON.stringify(shape)).digest("hex").slice(0, 16);
