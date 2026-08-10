@@ -126,6 +126,7 @@ vi.mock("../../src/utils/securecrtParser", async () => {
 });
 
 import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharing } from "../../src/commands/configCommands";
+import { IMPORTED_CAPABILITY_RESET_NOTICE } from "../../src/models/terminalMacro";
 import { SETTINGS_META } from "../../src/ui/settingsMetadata";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
@@ -518,6 +519,38 @@ describe("config import command (legacy)", () => {
 
     expect(core.getSnapshot().servers).toHaveLength(0);
     expect(mockShowInformationMessage).toHaveBeenCalledWith("Imported 0 profiles (1 skipped).");
+  });
+
+  it("S3 — shows the capability-reset notice ONCE when an imported macro carried a stripped capability field", async () => {
+    // A gateway-routed macro is stripped to local on import; without the notice the
+    // strip is silent and the user never learns their routing was reset.
+    const exportData = makeExportData({
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [
+        { id: "m1", name: "SOL", text: "ipmitool -H 10.0.0.9 sol activate\n", runIn: "localTerminal", route: "ipmiGateway" },
+        { id: "m2", name: "Show", text: "show version\n" }
+      ]
+    });
+    await runImport(exportData, "merge");
+
+    const noticeCalls = mockShowInformationMessage.mock.calls.filter(
+      (c) => c[0] === IMPORTED_CAPABILITY_RESET_NOTICE
+    );
+    expect(noticeCalls).toHaveLength(1);
+  });
+
+  it("S3 — does NOT show the capability-reset notice when no imported macro carried a capability field", async () => {
+    const exportData = makeExportData({
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      macros: [{ id: "m1", name: "Show", text: "show version\n", runIn: "localTerminal" }]
+    });
+    await runImport(exportData, "merge");
+
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith(IMPORTED_CAPABILITY_RESET_NOTICE);
   });
 
   it("rejects invalid JSON that sniffs as a host list and offers a one-click reroute", async () => {

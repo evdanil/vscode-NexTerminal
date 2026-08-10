@@ -10,7 +10,7 @@ import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
-import { stripImportedCapabilityFields } from "../models/terminalMacro";
+import { hasImportedCapabilityField, IMPORTED_CAPABILITY_RESET_NOTICE, stripImportedCapabilityFields } from "../models/terminalMacro";
 import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from "../services/macroVariables";
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
 import type { SecretVault } from "../services/ssh/contracts";
@@ -1187,7 +1187,7 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
 export function collectIncomingMacros(
   data: NexusConfigExport,
   decryptedSecrets?: Record<string, unknown>
-): { macros: TerminalMacro[]; unresolvedCount: number } | undefined {
+): { macros: TerminalMacro[]; unresolvedCount: number; capabilityStripped: boolean } | undefined {
   // New format (version 2): top-level `macros` + id-keyed secret blobs
   if (Array.isArray(data.macros)) {
     const secretBlobs = (decryptedSecrets?.secretMacros as Array<{ id?: string; name?: string; text?: string }> | undefined) ?? [];
@@ -1197,6 +1197,10 @@ export function collectIncomingMacros(
       if (blob.id && typeof blob.text === "string") byId.set(blob.id, blob.text);
       if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
+    // S3 — recorded off the RAW records, before sanitizeImportedMacro strips them,
+    // so an imported gateway-routed/credentialed macro is reset-with-notice rather
+    // than reset-silently. Presence, not per-macro count: the notice fires once.
+    const capabilityStripped = data.macros.some((m) => hasImportedCapabilityField(m));
     let unresolvedCount = 0;
     const macros = data.macros.map<TerminalMacro>((m) => {
       if (m.secret) {
@@ -1206,7 +1210,7 @@ export function collectIncomingMacros(
       }
       return sanitizeImportedMacro({ ...m });
     });
-    return { macros, unresolvedCount };
+    return { macros, unresolvedCount, capabilityStripped };
   }
 
   // Legacy format (version 1): macros under `settings.nexus.terminal.macros`;
@@ -1218,6 +1222,7 @@ export function collectIncomingMacros(
     for (const blob of secretBlobs) {
       if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
+    const capabilityStripped = legacy.some((m) => hasImportedCapabilityField(m));
     let unresolvedCount = 0;
     const macros = legacy.map<TerminalMacro>((m) => {
       if (m.secret) {
@@ -1227,7 +1232,7 @@ export function collectIncomingMacros(
       }
       return sanitizeImportedMacro({ ...m });
     });
-    return { macros, unresolvedCount };
+    return { macros, unresolvedCount, capabilityStripped };
   }
 
   return undefined;
@@ -1915,6 +1920,10 @@ export function registerConfigCommands(
         : [];
     if (rawMacros.length > 0) {
       const incoming = rawMacros.filter((m) => !m.secret);
+      // S3 — recorded off the RAW non-secret records (the ones actually imported)
+      // before sanitizeImportedMacro strips them, so a shared gateway-routed /
+      // credentialed macro is reset-with-notice, not silently. Fired once below.
+      const capabilityStripped = incoming.some((m) => hasImportedCapabilityField(m));
       const existing = getMacros();
       const existingByKey = new Set(existing.map(keyOf));
       const merged = [...existing];
@@ -1935,6 +1944,11 @@ export function registerConfigCommands(
         }
       }
       await saveMacros(merged);
+      // S3 — one-time, non-blocking, once per share import that reset ≥1 macro's
+      // capability field.
+      if (capabilityStripped) {
+        void vscode.window.showInformationMessage(IMPORTED_CAPABILITY_RESET_NOTICE);
+      }
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
@@ -2212,7 +2226,7 @@ export function registerConfigCommands(
 
     // Apply macros from import payload
     if (incomingResult !== undefined) {
-      const { macros: incomingMacros, unresolvedCount } = incomingResult;
+      const { macros: incomingMacros, unresolvedCount, capabilityStripped } = incomingResult;
       if (mode === "replace") {
         // `replaceMacros`, not `saveMacros`: this is the one macro write in the extension whose
         // input is a wholesale external list, and the store's two entry points exist for
@@ -2275,6 +2289,13 @@ export function registerConfigCommands(
         void vscode.window.showWarningMessage(
           `${unresolvedCount} secret macro${unresolvedCount === 1 ? "" : "s"} could not be decrypted from this backup. Their entries were imported but the secret text is missing — edit them to restore the value.`
         );
+      }
+      // S3 — one-time, non-blocking, once per import op: a backup/share bundle
+      // carried ≥1 macro with a capability field (gateway routing / IPMI
+      // credentials) that the strip reset. This is the explicit user-initiated
+      // import path only; legacy Settings absorption never shows it.
+      if (capabilityStripped) {
+        void vscode.window.showInformationMessage(IMPORTED_CAPABILITY_RESET_NOTICE);
       }
     }
 

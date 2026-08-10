@@ -1381,7 +1381,7 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(createdTerminals).toHaveLength(1);
     expect(createdTerminals[0].sent).toEqual([" ipmitool -H 10.0.0.9 -a sol activate\n"]);
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
-    expect(status).toContain("No IPMI gateway is configured for Target — running locally.");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
   });
 
   it("FALLS BACK to local when the gateway id is dangling (names no server in the snapshot)", async () => {
@@ -1394,7 +1394,7 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
 
     expect(createdTerminals).toHaveLength(1);
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
-    expect(status).toContain("No IPMI gateway is configured for Target — running locally.");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
   });
 
   it("treats an untrusted route ('IPMIGATEWAY') as local, on a gateway server", async () => {
@@ -1449,6 +1449,98 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
 
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
     expect(status).not.toContain("Run on:");
+  });
+
+  it("B1 — does NOT emit the re-consent note for a SESSION macro with an IPMI token on a gateway server (keeps the session hint)", async () => {
+    // The re-consent note is scoped to localTerminal macros; a session macro
+    // with `${profile.ipmiHost}` on a gateway server used to get BOTH it (false +
+    // self-contradictory) and the session hint. Only the session hint is correct.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const sent: string[] = [];
+    const sessTerminal = { name: "Nexus SSH: Target", sendText: (t: string) => sent.push(t) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-t", serverId: "srv-1" }],
+      terminals: new Map<string, unknown>([["sess-t", sessTerminal]])
+    });
+    await setMacros([{ id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} sol activate\n", runIn: "session" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    // The false, contradictory re-consent copy is gone...
+    expect(status).not.toContain("This macro runs on this machine");
+    expect(status).not.toContain("set 'Run on:");
+    // ...but the existing (correct) session hint is unchanged.
+    expect(status).toContain("ran in the SSH session on the remote host");
+  });
+
+  it("B1 — does NOT emit the re-consent note for a BROWSER macro with an IPMI token on a gateway server", async () => {
+    // A browser macro has no "Run on" field for the note to point at, so pointing
+    // there is a dead end; the note must not fire on this target either.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const ctx = routingContext({ servers: [target, gateway] });
+    await setMacros([{ id: "a", name: "Web", text: "https://${profile.ipmiHost}/", runIn: "browser" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(openExternal).toHaveBeenCalled();
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).not.toContain("This macro runs on this machine");
+    expect(status).not.toContain("set 'Run on:");
+  });
+
+  it("B2 — reveals the gateway session terminal on delivery of a route:ipmiGateway macro", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const show = vi.fn();
+    const gwTerminal = { name: "Nexus SSH: Bastion", show, sendText: () => {} };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // The interactive `-a` prompt sits hidden until the terminal is focused.
+    expect(show).toHaveBeenCalled();
+  });
+
+  it("S2 — names the routing context in the connect-first modal on the gateway path", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    // No gateway session yet → the connect-first modal is shown.
+    const ctx = routingContext({ servers: [target, gateway] });
+    showWarningMessage.mockResolvedValue(undefined); // decline — the message is what we assert
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const msg = String(showWarningMessage.mock.calls[0][0]);
+    expect(msg).toContain('"Bastion" (IPMI gateway for "Core Switch")');
+  });
+
+  it("P4 — a server naming ITSELF as its IPMI gateway is treated as no gateway (local fall-back + note)", async () => {
+    // A hand-edited/exported self-reference must not deliver into the target's own
+    // session; it resolves to no gateway, so the run falls back to a local terminal.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "srv-1" });
+    const ctx = routingContext({ servers: [target] });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
   });
 
   /**

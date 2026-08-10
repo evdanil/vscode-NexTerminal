@@ -311,7 +311,11 @@ export function sessionIpmiHintNote(macro: TerminalMacro): string | undefined {
  */
 export function resolveIpmiGatewayServer(ctx: CommandContext, server: ServerConfig): ServerConfig | undefined {
   const id = server.ipmiGatewayServerId;
-  if (typeof id !== "string" || !id) {
+  // P4/NIT-4 — a server naming ITSELF as its IPMI gateway is treated as no
+  // gateway (local delivery). A hand-edited or exported self-reference would
+  // otherwise deliver the routed command into the target's OWN session terminal,
+  // which is not what "route to the gateway" means and defeats the fall-back rule.
+  if (typeof id !== "string" || !id || id === server.id) {
     return undefined;
   }
   return ctx.core.getSnapshot().servers.find((candidate) => candidate.id === id);
@@ -329,8 +333,10 @@ export function noGatewayFallbackNote(
   route: "local" | "ipmiGateway",
   gateway: ServerConfig | undefined
 ): string | undefined {
+  // No trailing period: the status line (macroVariablePrompt.ts) adds its own, and
+  // the sibling notes are appended as unpunctuated clauses.
   return route === "ipmiGateway" && !gateway
-    ? `No IPMI gateway is configured for ${server.name} — running locally.`
+    ? `No IPMI gateway is configured for ${server.name} — running locally`
     : undefined;
 }
 
@@ -348,10 +354,21 @@ export function routeReconsentNote(
   route: "local" | "ipmiGateway",
   gateway: ServerConfig | undefined
 ): string | undefined {
+  // SCOPED TO LOCAL-TERMINAL MACROS (B1). The route is only ever meaningful on a
+  // `localTerminal` macro; every other target has `route` forced to `"local"` by
+  // the caller, which would otherwise satisfy the guard below and hand a
+  // `session`/`browser` macro this note — false and self-contradictory copy (a
+  // session macro already gets `sessionIpmiHintNote`, and a browser macro has no
+  // "Run on" field to point at). Gated on the resolved run target like the sibling
+  // note helpers so it stays exclusively on the local run path.
+  if (resolveMacroRunTarget(macro) !== "localTerminal") {
+    return undefined;
+  }
   if (route !== "local" || !gateway || !usesIpmiTokens(macro.text)) {
     return undefined;
   }
-  return `This macro runs on this machine. If this BMC is only reachable from ${gateway.name}, set 'Run on: the server's IPMI gateway' in the macro editor.`;
+  // No trailing period: the status line (macroVariablePrompt.ts) adds its own.
+  return `This macro runs on this machine. If this BMC is only reachable from ${gateway.name}, set 'Run on: the server's IPMI gateway' in the macro editor`;
 }
 
 /**
@@ -471,32 +488,82 @@ async function connectAndAwaitSessionTerminal(
   }
 }
 
+/** Options that only apply when `resolveServerSessionTarget` aims at a GATEWAY. */
+export interface ServerSessionTargetOptions {
+  /**
+   * Reveal the session terminal on delivery (B2). The gateway path is an
+   * interactive console whose `-a` password prompt sits hidden until the terminal
+   * is focused, so unlike an ordinary session send it must surface it. Left off
+   * for ordinary `session` macros, which keep today's non-revealing behavior.
+   */
+  reveal?: boolean;
+  /**
+   * The name of the server whose IPMI gateway `server` is, threaded so the
+   * connect-first modal can name the routing context (S2): the user acted on
+   * "Core Switch", so a bare `"Bastion" is not connected` reads as an unrelated
+   * server. Absent for ordinary session callers, which keep today's copy.
+   */
+  gatewayForName?: string;
+}
+
+/**
+ * Wraps a session terminal's send so it reveals the terminal first (B2). Reveal
+ * is best-effort — a just-closed terminal or a test double may not expose
+ * `show()` — and never touches the transport, so the remote shell is untouched.
+ */
+function revealingSessionTarget(terminal: vscode.Terminal): MacroSendTarget {
+  const base = terminalSendTarget(terminal);
+  return {
+    description: base.description,
+    isStillValid: () => base.isStillValid(),
+    send(text: string): boolean | Promise<boolean> {
+      if (typeof terminal.show === "function") {
+        terminal.show();
+      }
+      return base.send(text);
+    }
+  };
+}
+
 /**
  * The send target for a `session` macro: a terminal of THIS SERVER's session —
  * never `window.activeTerminal`, which may belong to a different host entirely.
  *
  * Whatever this returns is pinned by reference before the prompt walk starts
  * (§8.1). Every await it performs happens BEFORE that pin, never after.
+ *
+ * `macro` is `Pick<…, "name">` (P6): only the name is read here — for the picker
+ * title and the connect-first modal — so a real `TerminalMacro` is not required
+ * and the direct BMC command need not cast a name-only object to one.
  */
 export async function resolveServerSessionTarget(
   ctx: CommandContext,
   server: ServerConfig,
-  macro: TerminalMacro
+  macro: Pick<TerminalMacro, "name">,
+  options: ServerSessionTargetOptions = {}
 ): Promise<MacroSendTarget | undefined> {
+  const buildTarget = (terminal: vscode.Terminal): MacroSendTarget =>
+    options.reveal ? revealingSessionTarget(terminal) : terminalSendTarget(terminal);
+
   const terminals = sessionTerminalsFor(ctx, server.id);
   if (terminals.length === 1) {
-    return terminalSendTarget(terminals[0]);
+    return buildTarget(terminals[0]);
   }
   if (terminals.length > 1) {
     const picked = await vscode.window.showQuickPick(
       terminals.map((terminal, index) => ({ label: terminal.name, description: `Session ${index + 1}`, terminal })),
       { title: `Run "${macro.name}" on which session?` }
     );
-    return picked ? terminalSendTarget(picked.terminal) : undefined;
+    return picked ? buildTarget(picked.terminal) : undefined;
   }
 
+  // S2 — name the routing context on the gateway path so the modal does not read
+  // as a stray, apparently-unrelated server.
+  const subject = options.gatewayForName
+    ? `"${server.name}" (IPMI gateway for "${options.gatewayForName}")`
+    : `"${server.name}"`;
   const choice = await vscode.window.showWarningMessage(
-    `"${server.name}" is not connected. Connect now and run "${macro.name}"?`,
+    `${subject} is not connected. Connect now and run "${macro.name}"?`,
     { modal: true },
     "Connect and Run"
   );
@@ -504,7 +571,7 @@ export async function resolveServerSessionTarget(
     return undefined;
   }
   const terminal = await connectAndAwaitSessionTerminal(ctx, server);
-  return terminal ? terminalSendTarget(terminal) : undefined;
+  return terminal ? buildTarget(terminal) : undefined;
 }
 
 /**
@@ -643,12 +710,16 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // delivery report, because everything below can still abort.
   const deliveryNote = combineDeliveryNotes(
     unknownTokenNote(resolution.unknownTokens),
+    // P1 — the fall-back note comes BEFORE the credentials note: on the
+    // route:ipmiGateway-with-no-gateway path both fire, and "running locally"
+    // is what makes the following "IPMI credentials were not provided" clause
+    // intelligible (they were not provided to a LOCAL run it fell back to).
+    noGatewayFallbackNote(server, route, gatewayServer),
     // On the gateway path the "tick Provide IPMI credentials" hint would be wrong
     // (the flag is inert there), so it is replaced by the inert-credentials note;
     // the local and fall-back paths keep the original hint.
     routedToGateway ? gatewayInertCredentialsNote(macro) : ipmiCredentialsOffNote(macro),
     sessionIpmiHintNote(macro),
-    noGatewayFallbackNote(server, route, gatewayServer),
     routeReconsentNote(macro, route, resolveIpmiGatewayServer(ctx, server))
   );
 
@@ -688,7 +759,13 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
       // discipline all carry over by pointing `resolveServerSessionTarget` at the
       // gateway's own `ServerConfig`.
       target = routedToGateway
-        ? await resolveServerSessionTarget(ctx, gatewayServer!, macro)
+        ? await resolveServerSessionTarget(ctx, gatewayServer!, macro, {
+            // Reveal the gateway session so the interactive `-a` prompt is
+            // visible immediately (B2), and name the routing context in the
+            // connect-first modal (S2).
+            reveal: true,
+            gatewayForName: server.name
+          })
         : localTerminalTarget(macro, server, ipmiEnv);
       break;
     case "browser":

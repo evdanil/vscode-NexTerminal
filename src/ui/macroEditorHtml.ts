@@ -371,8 +371,7 @@ export function renderMacroEditorHtml(
         ${runOnOptionsHtml}
       </div>
     </div>
-    <div class="hint">IPMI gateway routing runs the command in an SSH session on the gateway server configured for the target server, so tools like ipmitool can reach a BMC network that isn't reachable from here. Tokens are still resolved against the target server.</div>
-    <div class="hint" id="gateway-inert-credentials-hint"${gatewayInertHintVisible ? "" : ' style="display:none;"'}>${escapeHtml(IPMI_GATEWAY_INERT_CREDENTIALS_HINT)}</div>
+    <div class="hint">IPMI gateway routing runs the command in an SSH session on the gateway server configured for the target server, so tools like ipmitool can reach a BMC network that isn't reachable from here. Tokens are still resolved against the target server. The gateway is set per server in the server form's advanced "IPMI Gateway" field.</div>
   </div>
 
   <!-- Issue #48 §3.3 — the IPMI credential opt-in. Shown only while Run in =
@@ -384,6 +383,11 @@ export function renderMacroEditorHtml(
       Provide IPMI credentials to this macro's terminal
     </label>
     <div class="hint">Puts the server's IPMI password (from the IPMI Auth Profile linked in its server form) into the local terminal's environment as IPMITOOL_PASSWORD/IPMI_PASSWORD, so <code>ipmitool -E</code> can read it without the password ever appearing in the command line, the scrollback, or Copy All. Every command run in that terminal — by this macro or typed later — can read it. Leave this off unless the macro is an ipmitool command. If no password is stored, you are asked for one at run time and it is used for that run only.</div>
+    <!-- P3 — the inert-combination hint lives HERE, beside the checkbox that
+         triggers it (route = gateway AND this box ticked), not in the run-on group
+         where ticking the box surfaced a hint in a different, possibly off-screen
+         group. Same id / same live-update (updateGatewayInertHint), same constant. -->
+    <div class="hint" id="gateway-inert-credentials-hint"${gatewayInertHintVisible ? "" : ' style="display:none;"'}>${escapeHtml(IPMI_GATEWAY_INERT_CREDENTIALS_HINT)}</div>
   </div>
 
   <div class="form-group">
@@ -545,15 +549,40 @@ ${folderOptionsHtml}
         }
       }
 
+      // Sets the "Run on" custom-select value WITHOUT dispatching a change event.
+      // selectCustomOption() dispatches a change event, which is what markDirty()
+      // listens for — so using it from an init/reset path marks the editor dirty
+      // with zero user edits (B3: the dirty dot on open, and a spurious
+      // discard-changes confirm when switching macros). This mirrors
+      // updateProvideIpmiState(), which sets checked directly for the same reason;
+      // the reset is not a user edit.
+      function setRunOnValueSilently(value) {
+        var wrapper = document.getElementById("macro-run-on-wrapper");
+        var hiddenInput = wrapper.querySelector('input[type="hidden"]');
+        var textEl = wrapper.querySelector('.custom-select-text');
+        var options = wrapper.querySelectorAll('.custom-select-option');
+        for (var i = 0; i < options.length; i++) {
+          var match = options[i].dataset.value === value;
+          options[i].classList.toggle('selected', match);
+          options[i].setAttribute('aria-selected', match ? 'true' : 'false');
+          if (match) {
+            var labelEl = options[i].querySelector('.custom-select-option-label');
+            textEl.textContent = labelEl ? labelEl.textContent : options[i].textContent;
+          }
+        }
+        hiddenInput.value = value;
+      }
+
       // Issue #48 PR-C — "Run on" is meaningful only on a Local terminal macro, so
       // it is hidden AND reset to "local" for any other target: leaving a hidden
       // "ipmiGateway" would submit a routing the user cannot see. (The host drops
-      // the route for a non-local target anyway; this is the visible half.)
+      // the route for a non-local target anyway; this is the visible half.) The
+      // reset goes through the SILENT setter — see setRunOnValueSilently (B3).
       function updateRunOnState() {
         var isLocal = document.getElementById("macro-run-in").value === "localTerminal";
         document.getElementById("run-on-group").style.display = isLocal ? "" : "none";
         if (!isLocal) {
-          selectCustomOption(document.getElementById("macro-run-on-wrapper"), "local");
+          setRunOnValueSilently("local");
         }
       }
 

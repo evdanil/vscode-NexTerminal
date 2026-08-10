@@ -237,7 +237,33 @@ describe("renderMacroEditorHtml", () => {
     // Reset-to-local on hide, not just hiding: a stranded 'ipmiGateway' would
     // submit a routing the user cannot see. The host also drops it, but the
     // visible half must match.
-    expect(html).toContain('selectCustomOption(document.getElementById("macro-run-on-wrapper"), "local");');
+    expect(html).toContain('setRunOnValueSilently("local")');
+  });
+
+  it("B3 — the Run-on init/reset path sets the value SILENTLY, never through the dispatching selectCustomOption", () => {
+    // selectCustomOption() dispatches a change event, which markDirty() listens for
+    // — so an init call through it marks the editor dirty on open (and provokes a
+    // spurious discard-changes confirm on switch). updateRunOnState must instead go
+    // through setRunOnValueSilently, mirroring updateProvideIpmiState's direct set.
+    // NOTE: this asserts the generated inline script's SHAPE — the runtime webview
+    // JS (dispatch → markDirty wiring) is not itself unit-testable in this harness.
+    const html = render([], null);
+    // The silent setter exists and sets the hidden input WITHOUT dispatching.
+    expect(html).toContain("function setRunOnValueSilently(value)");
+    expect(html).toContain("hiddenInput.value = value;");
+    // updateRunOnState resets via the silent setter, not the dispatching helper.
+    const updateRunOnBody = html.slice(
+      html.indexOf("function updateRunOnState()"),
+      html.indexOf("function updateGatewayInertHint()")
+    );
+    expect(updateRunOnBody).toContain('setRunOnValueSilently("local")');
+    expect(updateRunOnBody).not.toContain("selectCustomOption");
+    // The silent setter itself must not dispatch a change/input event.
+    const silentBody = html.slice(
+      html.indexOf("function setRunOnValueSilently(value)"),
+      html.indexOf("function updateRunOnState()")
+    );
+    expect(silentBody).not.toContain("dispatchEvent");
   });
 
   it("shows the inert-combination hint only for route:ipmiGateway + provideIpmiCredentials, and carries the live toggle", () => {

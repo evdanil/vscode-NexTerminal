@@ -21,6 +21,10 @@ const showInputBox = vi.fn();
 const executeCommand = vi.fn();
 const openExternal = vi.fn(async () => true);
 const createdTerminals: Array<{ name: string; sent: string[]; env?: Record<string, string>; options: Record<string, unknown> }> = [];
+// The open-terminal set backing `vscode.window.terminals`, so a pinned session
+// target's isStillValid() re-check (P5) can be exercised — a terminal absent here
+// reads as closed. Populated by gatewayContext from its seeded session terminals.
+let openTerminals: unknown[] = [];
 
 vi.mock("vscode", () => ({
   commands: {
@@ -48,7 +52,7 @@ vi.mock("vscode", () => ({
       };
     }),
     get terminals() {
-      return [] as unknown[];
+      return openTerminals;
     },
     activeTerminal: undefined as unknown
   },
@@ -124,6 +128,7 @@ beforeEach(() => {
   openExternal.mockResolvedValue(true as unknown as never);
   pickServer.mockReset();
   createdTerminals.length = 0;
+  openTerminals = [];
 });
 
 describe("nexus.server.connectBmcSol", () => {
@@ -252,6 +257,11 @@ describe("nexus.server.connectBmcSol", () => {
     secrets?: Record<string, string>;
     profiles?: AuthProfile[];
   }): CommandContext {
+    // A pinned session target is re-checked against window.terminals before send
+    // (isStillValid); seed the open set so the normal path is not read as closed.
+    if (opts.terminals) {
+      openTerminals = [...opts.terminals.values()];
+    }
     return {
       core: {
         getSnapshot: () => ({ activeSessions: opts.sessions ?? [], servers: opts.servers }),
@@ -271,7 +281,8 @@ describe("nexus.server.connectBmcSol", () => {
     const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
     const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
     const gwSent: string[] = [];
-    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const show = vi.fn();
+    const gwTerminal = { name: "Nexus SSH: Bastion", show, sendText: (text: string) => gwSent.push(text) };
     const ctx = gatewayContext({
       servers: [target, gateway],
       sessions: [{ id: "sess-gw", serverId: "gw-1" }],
@@ -291,6 +302,38 @@ describe("nexus.server.connectBmcSol", () => {
     expect(showInputBox).not.toHaveBeenCalled();
     expect(gwSent[0]).not.toContain("s3cr3t-bmc");
     expect(gwSent[0]).not.toContain(" -E ");
+    // B2 — the gateway session is revealed on delivery (the `-a` prompt is hidden
+    // until focused) and a status line names where the command went.
+    expect(show).toHaveBeenCalled();
+    const status = setStatusBarMessage.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(status).toContain('SOL console command sent to "Bastion"');
+    expect(status).toContain("ipmitool will prompt for the BMC password there");
+  });
+
+  it("P5 — does not send silently when the gateway session was closed during the QuickPick", async () => {
+    // The pinned target's isStillValid() re-check: a terminal absent from
+    // window.terminals is treated as closed, so the send is skipped and reported
+    // rather than swallowed.
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const gwSent: string[] = [];
+    // Open at resolve time (exitStatus undefined, so it is picked as the target)...
+    const gwTerminal = { name: "Nexus SSH: Bastion", show: vi.fn(), sendText: (text: string) => gwSent.push(text) };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
+    // ...then gone from window.terminals by send time — isStillValid() reads it as closed.
+    openTerminals = [];
+
+    await connectBmcSol(ctx, { server: target });
+
+    // Nothing sent; the closed-session outcome is reported, not silent.
+    expect(gwSent).toEqual([]);
+    const status = setStatusBarMessage.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(status).toContain("the gateway session closed");
   });
 
   it("keeps the local -E flow unchanged when the gateway id is dangling (names no server)", async () => {

@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
 import { resolveBmcWebProtocol } from "../models/config";
 import { resolveProfileTokens } from "../services/profileTokens";
-import type { TerminalMacro } from "../models/terminalMacro";
 import { profileTokenServer, resolveIpmiTerminalEnv } from "./ipmiCredentials";
 import {
   openServerAdvancedEdit,
@@ -117,13 +116,37 @@ export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise
     }
     // The same routing step a macro takes — deliver into a session terminal of
     // the gateway (connect-first confirm, connect-failed/timeout split, pinned
-    // target all carried over), no macro picker. `send` is the terminal's own
-    // `sendText(text, false)`; the command's trailing newline executes it.
-    const target = await resolveServerSessionTarget(ctx, gateway, { name: "BMC Serial Console" } as TerminalMacro);
+    // target all carried over), no macro picker. `reveal` surfaces the gateway
+    // session so the interactive `-a` prompt is visible immediately (B2), and
+    // `gatewayForName` names the routing context in the connect-first modal (S2).
+    // The name-only object is accepted directly now (`Pick<TerminalMacro,"name">`
+    // — P6), no cast.
+    const target = await resolveServerSessionTarget(
+      ctx,
+      gateway,
+      { name: "BMC Serial Console" },
+      { reveal: true, gatewayForName: server.name }
+    );
     if (!target) {
       return;
     }
+    // P5 — re-check validity before the send, mirroring the macro path's
+    // `runMacroWithTarget`: a terminal closed while the connect-first QuickPick
+    // was up must not swallow the send silently.
+    if (!target.isStillValid()) {
+      vscode.window.setStatusBarMessage(`BMC console for "${server.name}" — the gateway session closed, nothing was sent.`, 4000);
+      return;
+    }
+    // `send` reveals the gateway terminal and runs its `sendText(text, false)`;
+    // the command's trailing newline executes it.
     await target.send(routed.text);
+    // B2 — the gateway path is otherwise silent (the `-a` prompt sits on the
+    // bastion tty), so name where the console command went and why a password
+    // prompt appears there.
+    vscode.window.setStatusBarMessage(
+      `SOL console command sent to "${gateway.name}" — ipmitool will prompt for the BMC password there.`,
+      4000
+    );
     return;
   }
 

@@ -265,6 +265,31 @@ export function stripImportedCapabilityFields<T extends TerminalMacro>(macro: T)
   return copy;
 }
 
+/**
+ * Whether an incoming macro carries a capability field that
+ * `stripImportedCapabilityFields` will actually remove — i.e. the strip is not a
+ * no-op for this record. Presence of the key (not its value) is the test: the
+ * editor only ever WRITES a capability field when it is meaningfully on
+ * (`provideIpmiCredentials: true`, `route: "ipmiGateway"`) and deletes it
+ * otherwise, so a present key is a capability the importing user is about to have
+ * reset. Drives the one-time import notice (S3) so an explicit backup/share import
+ * that silently strips routing/credentials tells the user it happened.
+ */
+export function hasImportedCapabilityField(macro: TerminalMacro): boolean {
+  return IMPORTED_CAPABILITY_FIELDS.some(
+    (field) => (macro as unknown as Record<string, unknown>)[field] !== undefined
+  );
+}
+
+/**
+ * The one-time notice shown after an explicit backup/share import strips a
+ * capability field from ≥1 incoming macro (S3). Verbatim per the roadmap
+ * (§3.3/§4.2). NOT fired on legacy Settings absorption — a modal there (Settings
+ * Sync replay) would be out of place.
+ */
+export const IMPORTED_CAPABILITY_RESET_NOTICE =
+  "Capability settings on imported macros (IPMI credentials, gateway routing) were reset; re-enable them on the macros you trust.";
+
 export const MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE =
   'A macro can auto-trigger or run outside its session, not both. Set "Run in" back to Session terminal, or clear the auto-trigger pattern.';
 
