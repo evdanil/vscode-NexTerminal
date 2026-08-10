@@ -817,3 +817,161 @@ describe("PR-T3 IPMI slots — round 3 same-sync-pruned gateway REJECT", () => {
     expect(p.warnings.some((w) => /was not applied/.test(w))).toBe(false);
   });
 });
+
+// ============================================================================
+// FALSIFICATION-CRITICAL: PR-T3 review round 4 (Codex) — the RETAINED-gateway
+// sibling of round 3's written-gateway reject. A server carrying a TEMPLATE-OWNED
+// gateway from an EARLIER sync that THIS run does NOT re-write (row-4 unchanged
+// winner / row-5 after the rule disappears) is absent from
+// `ipmiGatewayTemplateNameByServerId`, so round 3's written pass skips it. If that
+// retained gateway names a server delete-pruned this same sync, the plan preview
+// keeps value+stamp with no warning, but `applyInventorySyncPlan`'s
+// `clearGatewayReferencesTo` wipes both → preview lies. This gateway PART 2 pass
+// (mirroring proxy PART 2a/2b) drops the retained dangling gateway in the preview
+// so it matches the post-apply state. Each fixture is built to FAIL against
+// 60812e8 (which has no retained-gateway pass). Deliberate divergence from proxy:
+// NO self-gateway drop (a self-gateway is a survivor + harmless local — negative
+// test below proves it).
+// ============================================================================
+describe("PR-T3 IPMI slots — round 4 retained same-sync-pruned gateway cleanup", () => {
+  // A gateway server sync-owned by this source whose device is absent this fetch,
+  // so under prunePolicy:"delete" it delete-prunes — a non-survivor.
+  function prunedGateway(id: string, externalId: string): ServerConfig {
+    return ownedServer({ id, name: id, group: "NetBox" }, { sourceId: "source-1", externalId, syncedAt: 1000 });
+  }
+
+  it("RETAINED update-in-place — S RETAINS a template-owned gateway → GW (row-5 carry, no rule writes it), GW delete-pruned this sync, AND S is RENAMED (unrelated update) → after.ipmiGatewayServerId ABSENT, stamp cleared, rename preserved, one 'was removed' warning (kills 60812e8, which retains the dangling gateway on the already-planned update)", () => {
+    const gw = prunedGateway("gw-ret", "device:gwret");
+    // S: retained template-owned gateway → gw (value === stamp). NO template rule
+    // writes the gateway this run, so it is a row-5 receipt round 3's written pass
+    // never inspects. A rename is the unrelated change that puts S in `updates`.
+    const s = ownedServer(
+      { name: "old-name", ipmiGatewayServerId: "gw-ret" },
+      { externalId: "device:1", templated: { ipmiGatewayServerId: "gw-ret" } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }), // no template rules — the gateway is a retained receipt
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // rename old-name → core-sw-1; device:gwret absent → gw pruned
+      servers: [s, gw]
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "gw-ret")).toBe(true);
+    const sId = deterministicServerId("source-1", "device:1");
+    const after = afterFor(p, sId);
+    expect(after).toBeDefined(); // the rename kept S in updates
+    expect(after!.name).toBe("core-sw-1"); // the unrelated change preserved
+    expect(after!.ipmiGatewayServerId).toBeUndefined(); // THE FIX: retained dangling gateway dropped IN PLACE
+    expect("ipmiGatewayServerId" in after!).toBe(false); // absent, never a written undefined
+    expect(after!.origin?.templated?.ipmiGatewayServerId).toBeUndefined(); // the ownership stamp cleared with it
+    expect(
+      p.warnings.some((w) => /IPMI gateway/i.test(w) && /will not survive this sync/.test(w) && /was removed/.test(w))
+    ).toBe(true);
+  });
+
+  it("RETAINED unplanned promotion — an otherwise-UNCHANGED S retaining a template-owned dangling gateway is PROMOTED to a new update dropping it (value absent, stamp cleared), warning present, unchangedCount decremented by exactly 1 (kills 60812e8, which leaves S unchanged with a dangling gateway)", () => {
+    const gw = prunedGateway("gw-ret", "device:gwret");
+    const s = ownedServer(
+      { ipmiGatewayServerId: "gw-ret" },
+      { externalId: "device:1", templated: { ipmiGatewayServerId: "gw-ret" } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // S name/endpoint unchanged → counted unchanged
+      servers: [s, gw]
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "gw-ret")).toBe(true);
+    const sId = deterministicServerId("source-1", "device:1");
+    const after = afterFor(p, sId);
+    expect(after).toBeDefined(); // promoted to a new update
+    expect(after!.ipmiGatewayServerId).toBeUndefined();
+    expect("ipmiGatewayServerId" in after!).toBe(false);
+    expect(after!.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+    expect(p.unchangedCount).toBe(0); // counted unchanged (tally 1), then decremented by exactly 1 on promotion
+    expect(
+      p.warnings.some((w) => /IPMI gateway/i.test(w) && /will not survive this sync/.test(w) && /was removed/.test(w))
+    ).toBe(true);
+  });
+
+  it("BOTH proxy+gateway dangling on ONE unplanned server — exactly ONE update entry, BOTH dropped, unchangedCount decremented by exactly 1 (NOT 2): proves no double-promotion (kills 60812e8, where the gateway is never dropped)", () => {
+    // One pruned server that is BOTH S's jump-host proxy AND its IPMI gateway.
+    const dangler = prunedGateway("dangler", "device:dangler");
+    const s = ownedServer(
+      { proxy: { type: "ssh", jumpHostId: "dangler" }, ipmiGatewayServerId: "dangler" },
+      {
+        externalId: "device:1",
+        templated: { proxy: { type: "ssh", jumpHostId: "dangler" }, ipmiGatewayServerId: "dangler" }
+      }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // S unchanged; device:dangler absent → pruned
+      servers: [s, dangler]
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === "dangler")).toBe(true);
+    const sId = deterministicServerId("source-1", "device:1");
+    // Exactly ONE update entry for S — proxy PART 2b promoted it, gateway PART 2a
+    // cleaned the gateway on that SAME entry (fresh planned-set skip prevents a
+    // second promotion).
+    const sUpdates = p.updates.filter((u) => u.before.id === sId);
+    expect(sUpdates.length).toBe(1);
+    const after = sUpdates[0].after;
+    expect(after.proxy).toBeUndefined(); // proxy dropped by proxy PART 2b
+    expect(after.ipmiGatewayServerId).toBeUndefined(); // gateway dropped by gateway PART 2a
+    expect(after.origin?.templated?.proxy).toBeUndefined();
+    expect(after.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+    expect(p.unchangedCount).toBe(0); // counted unchanged (tally 1), decremented ONCE — not twice
+  });
+
+  it("NEGATIVE — a retained gateway pointing at a SURVIVOR is untouched, NOT promoted, not warned (regression: an unchanged server stays unchanged)", () => {
+    const s = ownedServer(
+      { ipmiGatewayServerId: GW1.id }, // GW1 is a live bystander → survivor
+      { externalId: "device:1", templated: { ipmiGatewayServerId: GW1.id } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })],
+      servers: [s, GW1]
+    });
+    const sId = deterministicServerId("source-1", "device:1");
+    expect(afterFor(p, sId)).toBeUndefined(); // no update — nothing to clean
+    expect(p.unchangedCount).toBe(1);
+    expect(p.warnings.some((w) => /was removed/.test(w))).toBe(false);
+  });
+
+  it("NEGATIVE — a HAND-set gateway (no matching stamp) pointing at a pruned server is left alone (§8.4)", () => {
+    const gw = prunedGateway("gw-ret", "device:gwret");
+    // S carries gw-ret as a HAND value — NO origin.templated stamp for the gateway.
+    const s = ownedServer({ ipmiGatewayServerId: "gw-ret" }, { externalId: "device:1", templated: undefined });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })],
+      servers: [s, gw]
+    });
+    const sId = deterministicServerId("source-1", "device:1");
+    const record = afterFor(p, sId) ?? s;
+    expect(record.ipmiGatewayServerId).toBe("gw-ret"); // hand gateway kept — §8.4
+    expect(p.warnings.some((w) => /was removed/.test(w))).toBe(false);
+  });
+
+  it("NEGATIVE (no-self-drop divergence) — a retained SELF-gateway (ipmiGatewayServerId === own id, stamped) is LEFT ALONE and NOT promoted (a self-gateway is a survivor + harmless local; proves the deliberate divergence from the proxy self-drop)", () => {
+    const sId = deterministicServerId("source-1", "device:1");
+    // S's retained template-owned gateway points at ITSELF. Unlike a self-proxy
+    // (which proxy PART 2 drops as a §5.3 circular ref), a self-gateway is a
+    // survivor and resolves harmlessly to local — so it must be retained.
+    const s = ownedServer(
+      { id: sId, ipmiGatewayServerId: sId },
+      { externalId: "device:1", templated: { ipmiGatewayServerId: sId } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ externalId: "device:1", name: "core-sw-1" })], // S unchanged
+      servers: [s]
+    });
+    // NOT promoted — no update, self-gateway retained.
+    expect(afterFor(p, sId)).toBeUndefined();
+    expect(p.unchangedCount).toBe(1);
+    expect(p.warnings.some((w) => /was removed/.test(w))).toBe(false);
+    // The retained self-gateway value + stamp survive untouched.
+    expect(s.ipmiGatewayServerId).toBe(sId);
+    expect(s.origin?.templated?.ipmiGatewayServerId).toBe(sId);
+  });
+});

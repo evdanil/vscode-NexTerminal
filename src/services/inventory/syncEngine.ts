@@ -3238,6 +3238,152 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
   }
 
+  // ==========================================================================
+  // GATEWAY PART 2 (Codex round 4, P2) — the RETAINED-gateway sibling of the
+  // proxy PART 2 pass above, and the round-4 analog of round 3's WRITTEN-gateway
+  // reject (`rejectWrittenGateway` / part 1). This ADDS a parallel gateway pass
+  // beside the proxy passes; it does NOT touch any of them (proxy is one of the
+  // five protected engine fields).
+  //
+  // THE GAP round 3 left. Round 3's written pass only inspects gateways THIS
+  // RUN's matrix WROTE (`ipmiGatewayTemplateNameByServerId`) — a row-1 write or a
+  // row-3 override MOVE. A server that carries a template-OWNED gateway from an
+  // EARLIER sync which THIS run does NOT re-write (row-4 unchanged winner, or
+  // row-5 after its rule disappears) is absent from that map, so the written
+  // pass's `continue` at the top of its `updates` loop (the
+  // `!ipmiGatewayTemplateNameByServerId.has(u.after.id)` guard) skips it. If that
+  // retained gateway names a server delete-pruned in the SAME sync, the plan
+  // preview keeps value + stamp with NO warning — but `applyInventorySyncPlan`
+  // then calls `clearGatewayReferencesTo(deletedServerIds)`, which wipes both.
+  // Preview lies. This pass closes that gap for retained gateways, exactly as
+  // proxy PART 2 closes it for retained proxies.
+  //
+  // WHY A DROP, NOT A ROUND-3 RESTORE. Round 3 (part 1) RESTORES the pre-matrix
+  // gateway A on a rejected override MOVE (survivor-guarded), because A is the
+  // still-working value to fall back to. A RETAINED gateway has no such fallback:
+  // its rule is gone (or unchanged this run), the stamped value IS the dangling
+  // gateway, and there is nothing prior beneath it — so absent is the repair,
+  // identical to the unplanned-server promotion.
+  //
+  // THE ONE DELIBERATE DIVERGENCE FROM PROXY — NO SELF-DROP. `invalidTemplateProxy`
+  // additionally flags a retained SELF-proxy (`jumpHost === record.id`), because a
+  // circular proxy is the §5.3 reference the connect-time guard refuses. Gateways
+  // have NO such rule: a self-gateway (`ipmiGatewayServerId === record.id`) IS a
+  // survivor, so `survivorIds.has(cur)` is true and `invalidTemplateGateway`
+  // leaves it alone — and that is RIGHT, because a self-gateway resolves
+  // harmlessly to "local" at runtime AND `clearGatewayReferencesTo` never clears
+  // it (self is not in `deletedServerIds` unless the server itself is pruned, in
+  // which case its whole record is gone). Retaining a self-gateway in the preview
+  // is therefore already consistent with application — there is no lie to fix.
+  // Do NOT invent a circular-reference drop for gateways.
+  //
+  // ORDERING — this pass is inserted AFTER proxy PART 2 completes. Proxy PART 2b
+  // may have PROMOTED unplanned servers into `updates`; this pass must SEE those
+  // promotions, so a server dangling on BOTH proxy and gateway is cleaned in the
+  // SAME update by GATEWAY PART 2a below, never promoted twice (GATEWAY PART 2b's
+  // freshly-recomputed planned set skips it).
+
+  // Drops the template-owned gateway off a record: the `ipmiGatewayServerId` field
+  // goes ABSENT (destructured out, never a written `undefined`) and the
+  // `templated.ipmiGatewayServerId` stamp is cleared, so the record and its
+  // ownership receipt stay consistent. The `templatedHasAnyStamp` collapse keeps a
+  // still-valid `ipmiAuthProfileId` / proxy stamp — mirror of `dropTemplateProxy`.
+  const dropTemplateGateway = (record: ServerConfig): ServerConfig => {
+    const origin = record.origin!;
+    const templated = origin.templated !== undefined ? { ...origin.templated } : {};
+    delete templated.ipmiGatewayServerId;
+    const { ipmiGatewayServerId: _droppedGateway, ...withoutGateway } = record;
+    return { ...withoutGateway, origin: { ...origin, templated: templatedHasAnyStamp(templated) ? templated : undefined } };
+  };
+  // Is a record's EFFECTIVE gateway an INVALID template-OWNED reference this pass
+  // must clean? Returns the dangling gateway id, or undefined when there is
+  // nothing to clean. INVALID = the gateway is template-OWNED
+  // (`record.origin.templated.ipmiGatewayServerId === cur`, §8.4 — a hand-set
+  // gateway is left alone) AND names a NON-survivor. NO self-reference handling
+  // (the deliberate divergence from `invalidTemplateProxy` — see the header): a
+  // self-gateway `cur === record.id` is a survivor, so `survivorIds.has(cur)` is
+  // true and it is correctly NOT flagged.
+  const invalidTemplateGateway = (record: ServerConfig): string | undefined => {
+    const cur = record.ipmiGatewayServerId;
+    const stampedGateway = record.origin?.templated?.ipmiGatewayServerId;
+    if (
+      cur === undefined ||
+      stampedGateway === undefined ||
+      stampedGateway !== cur || // §8.4 — template-OWNED only; a hand-set gateway is left alone
+      survivorIds.has(cur) // a self-gateway is a survivor → NOT flagged (no self-drop; see header)
+    ) {
+      return undefined;
+    }
+    return cur;
+  };
+  const warnRetainedGateway = (record: ServerConfig, gatewayId: string): void => {
+    // Dedupe by `server::gateway` in the SAME `warnedRetainedGatewayKeys` set the
+    // round-3 WRITTEN pass uses. Written vs retained are disjoint (a gateway is
+    // either written this run or retained, never both), so sharing the set is safe
+    // and prevents any cross-pass double-warn on the same reference.
+    const warnKey = `${record.id}::${gatewayId}`;
+    if (warnedRetainedGatewayKeys.has(warnKey)) {
+      return;
+    }
+    warnedRetainedGatewayKeys.add(warnKey);
+    warnings.push(
+      `Server "${record.name}" on "${source.name}" carries a device-template IPMI gateway whose gateway server will not survive this sync (it is being pruned) — the IPMI gateway field was removed.`
+    );
+  };
+
+  // GATEWAY PART 2a — every planned update's `after`, cleaned IN PLACE. Because
+  // proxy PART 2b already ran, this `updates` array INCLUDES any proxy-promoted
+  // server, so a server dangling on BOTH proxy and gateway is cleaned HERE in its
+  // existing update — never re-promoted by GATEWAY PART 2b below. No promotion and
+  // no `unchangedCount` change: the server was already an update.
+  for (const u of updates) {
+    const invalidGateway = invalidTemplateGateway(u.after);
+    if (invalidGateway === undefined) {
+      continue;
+    }
+    warnRetainedGateway(u.after, invalidGateway);
+    u.after = dropTemplateGateway(u.after); // a DROP (retained value IS the dangling gateway — nothing beneath to restore)
+    dropGatewayProvenance(u.after.id); // no §3.4 line for a removed gateway (retained ⇒ usually none; belt-and-suspenders, mirror proxy)
+  }
+
+  // GATEWAY PART 2b — the UNPLANNED set. RECOMPUTE `plannedServerIds` FRESH here
+  // (adds ∪ CURRENT updates-before ∪ prunes): do NOT reuse proxy PART 2b's
+  // snapshot, because proxy PART 2b may have PUSHED new updates after taking it. A
+  // server proxy-PART-2b promoted is now in THIS fresh set → skipped here → its
+  // gateway was already cleaned by GATEWAY PART 2a → no duplicate update, no
+  // double-decrement. Iterate the SAME `unplannedCandidates` (owned ∪ kept) built
+  // for the proxy pass — a kept server carries no `origin`, so
+  // `invalidTemplateGateway`'s stamp guard makes it a no-op.
+  const gatewayPlannedServerIds = new Set<string>();
+  for (const id of addedServerIds) {
+    gatewayPlannedServerIds.add(id);
+  }
+  for (const u of updates) {
+    gatewayPlannedServerIds.add(u.before.id);
+  }
+  for (const id of prunedServerIds) {
+    gatewayPlannedServerIds.add(id);
+  }
+  for (const candidate of unplannedCandidates) {
+    if (gatewayPlannedServerIds.has(candidate.id)) {
+      continue; // already an add / update (incl. a proxy-promoted one) / prune — handled by PART 2a or its own branch
+    }
+    const invalidGateway = invalidTemplateGateway(candidate);
+    if (invalidGateway === undefined) {
+      continue;
+    }
+    warnRetainedGateway(candidate, invalidGateway);
+    // NOT PLANNED — promote to a new gateway-dropping update.
+    updates.push({ before: candidate, after: dropTemplateGateway(candidate) });
+    dropGatewayProvenance(candidate.id);
+    // Same decrement gate as proxy PART 2b (Codex round 4): a server whose device
+    // was SKIPPED this fetch reaches here without ever hitting `unchangedCount++`,
+    // so an unconditional decrement would understate the count or drive it negative.
+    if (unchangedServerIds.has(candidate.id)) {
+      unchangedCount--; // this device was counted unchanged in the loop; it is now an update
+    }
+  }
+
   // M2 (PR-T2 review) — SOURCE-LEVEL dangling-reference warnings, emitted ONCE
   // after the loop and deduped against the per-device path (`pushDedupTemplateWarning`).
   // The per-device dangling warnings only fire for devices the loop reached, so a
