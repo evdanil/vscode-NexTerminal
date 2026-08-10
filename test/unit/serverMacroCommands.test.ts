@@ -1734,6 +1734,44 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(status).not.toContain("reads the IPMI password from the environment");
   });
 
+  it("does NOT emit the `-E` warning when the `-E` belongs to a WRAPPER and ipmitool uses `-a` (round-5 false positive)", async () => {
+    // `sudo -E ipmitool … -a`: the `-E` is sudo's preserve-environment, and ipmitool
+    // itself uses `-a` and prompts fine on the bastion. Round 4's predicate matched
+    // the wrapper's `-E` and wrongly emitted the "will fail on the gateway" warning;
+    // this asserts the scoped predicate gives the accurate `-a` inert note instead.
+    // Red against bdcd6c0 (which emits the false `-E` warning), green after.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      {
+        id: "a",
+        name: "SOL",
+        text: " sudo -E ipmitool -I lanplus -H ${profile.ipmiHost} -a sol activate\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway",
+        provideIpmiCredentials: true
+      }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // Delivered to the gateway verbatim — the wrapper `-E` is preserved in the text.
+    expect(gwSent).toEqual([" sudo -E ipmitool -I lanplus -H 10.0.0.9 -a sol activate\n"]);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    // The `-a` command prompts on the bastion — accurate inert note, NO `-E` warning.
+    expect(status).toContain("ipmitool prompts on the gateway via its `-a` form instead");
+    expect(status).not.toContain("reads the IPMI password from the environment");
+    expect(status).not.toContain("it will fail on Bastion");
+  });
+
   it("leaves a LOCAL (non-routed) `-E` macro unchanged — env injected as today, no gateway note, no `-E` warning", async () => {
     // Regression: the `-E` predicate must not leak into the local path, where the
     // credential IS legitimately injected into the environment of a local terminal.
@@ -1763,15 +1801,46 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
 });
 
 describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", () => {
-  it("matches `-E` as a standalone token", () => {
+  it("matches a standalone `-E` that is an argument of an ipmitool invocation", () => {
+    expect(commandReadsIpmiEnv("ipmitool -I lanplus -H x -U y -E sol activate")).toBe(true);
     expect(commandReadsIpmiEnv("ipmitool -H 10.0.0.9 -E sol activate")).toBe(true);
     expect(commandReadsIpmiEnv("ipmitool -E chassis power status")).toBe(true);
+    // A wrapper before ipmitool is fine — the `-E` still follows ipmitool.
+    expect(commandReadsIpmiEnv("sudo ipmitool -E sol activate")).toBe(true);
+    // `\bipmitool\b` matches inside a path prefix.
+    expect(commandReadsIpmiEnv("/usr/bin/ipmitool -H 10.0.0.9 -E sol activate")).toBe(true);
   });
 
-  it("matches `-E` at end of line and after a newline", () => {
+  it("matches `-E` at end of line and before a trailing newline (same segment)", () => {
     expect(commandReadsIpmiEnv("ipmitool sol activate -E")).toBe(true);
     expect(commandReadsIpmiEnv("ipmitool sol activate -E\n")).toBe(true);
-    expect(commandReadsIpmiEnv("first line\n-E chassis")).toBe(true);
+  });
+
+  it("does NOT match a `-E` owned by a WRAPPER before ipmitool (the round-5 false positive)", () => {
+    // `sudo -E ipmitool … -a`: the `-E` is sudo's preserve-environment and comes
+    // BEFORE ipmitool; ipmitool itself uses `-a` and prompts. Round 4's predicate
+    // returned true here — this asserts the scoped predicate returns false.
+    expect(commandReadsIpmiEnv("sudo -E ipmitool -I lanplus -H x -U y -a sol activate")).toBe(false);
+    // Leading `-E` with no ipmitool argument of its own.
+    expect(commandReadsIpmiEnv("-E ipmitool -a")).toBe(false);
+  });
+
+  it("does NOT match a `-E` in a PIPED non-ipmitool segment", () => {
+    // `[^;&|\n]*` stops at the `|`, so the `grep -E` on the far side is out of scope.
+    expect(commandReadsIpmiEnv("ipmitool -a sol activate | grep -E foo")).toBe(false);
+  });
+
+  it("does NOT match a `-E` behind a `;`/`&` command separator from the ipmitool call", () => {
+    // `[^;&|\n]*` cannot cross a `;`, `&` or `|`, so a `-E` in a following command
+    // is out of the ipmitool segment's scope.
+    expect(commandReadsIpmiEnv("ipmitool -a sol; -E chassis")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -a sol && -E chassis")).toBe(false);
+    // No ipmitool token at all.
+    expect(commandReadsIpmiEnv("first line\n-E chassis")).toBe(false);
+  });
+
+  it("does NOT match when the command word is not ipmitool (`ipmitoolx`)", () => {
+    expect(commandReadsIpmiEnv("ipmitoolx -E")).toBe(false);
   });
 
   it("does NOT match `-E` embedded in another word", () => {

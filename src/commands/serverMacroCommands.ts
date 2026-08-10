@@ -383,12 +383,22 @@ export function gatewayInertCredentialsNote(macro: TerminalMacro): string | unde
 }
 
 /**
- * ipmitool's `-E` flag as a STANDALONE token — its "read the password from the
- * environment" flag (`IPMITOOL_PASSWORD` / `IPMI_PASSWORD`). Boundaries on both
- * sides so `-Example`, `foo-E` and `-Env` do NOT match, only a real `-E` argument
- * (line start or after whitespace; end of line or before whitespace).
+ * ipmitool's `-E` flag as a STANDALONE token, SCOPED to an actual ipmitool
+ * invocation — its "read the password from the environment" flag
+ * (`IPMITOOL_PASSWORD` / `IPMI_PASSWORD`). `\bipmitool\b` matches the command
+ * (word-boundary, so a path prefix `/usr/bin/ipmitool` counts and `ipmitoolx`
+ * does not) then, WITHIN THE SAME command segment (`[^;&|\n]*` stops at a `;`,
+ * `&`, `|` or newline), a whitespace-delimited standalone `-E` (before whitespace
+ * or end of string, so `-Example`/`-Env` do not match).
+ *
+ * The scoping is what round 4 lacked: a bare `/(?:^|\s)-E(?=\s|$)/` matched any
+ * `-E` anywhere in the text, false-positiving on a `-E` owned by a WRAPPER
+ * (`sudo -E ipmitool … -a`, where the `-E` is sudo's preserve-environment and
+ * ipmitool itself uses `-a` and prompts) or by a PIPED non-ipmitool command
+ * (`ipmitool -a … | grep -E …`). Requiring the `-E` to follow `ipmitool` inside
+ * the same segment ties it to the invocation that actually reads the env.
  */
-const IPMITOOL_ENV_PASSWORD_FLAG_RE = /(?:^|\s)-E(?=\s|$)/;
+const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*\s-E(?=\s|$)/;
 
 /**
  * Whether a command reads the IPMI password from the environment via ipmitool's
