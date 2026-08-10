@@ -65,9 +65,10 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 }));
 
 // Imported AFTER the mocks so the command module binds to them.
-const { registerDeviceTemplateCommands, parseDeviceTemplateFormValues } = await import("../../src/commands/deviceTemplateCommands");
+const { registerDeviceTemplateCommands, parseDeviceTemplateFormValues, applyPlanWrites } = await import("../../src/commands/deviceTemplateCommands");
 const { FolderTreeItem } = await import("../../src/ui/nexusTreeProvider");
 const { proxyPasswordSecretKey } = await import("../../src/services/ssh/silentAuth");
+const { planManualTemplateApply } = await import("../../src/services/inventory/templateApply");
 
 const P: ProxyConfig = { type: "socks5", host: "10.0.0.9", port: 1080 };
 
@@ -1364,5 +1365,68 @@ describe("Edit Template Rules… flow (§7.2)", () => {
     const rules = core.getInventorySource("src-1")!.templateRules!;
     expect(rules).toHaveLength(1);
     expect(rules[0]).toMatchObject({ templateId: "t1", filter: "role=switch" });
+  });
+});
+
+describe("applyPlanWrites — reference revalidation (PR-T3, PR #66 Codex round 6)", () => {
+  function targetServer(): ServerConfig {
+    return {
+      id: "R",
+      name: "Target R",
+      host: "r",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "DC",
+      origin: { sourceId: "src", externalId: "R", syncedAt: 1 }
+    };
+  }
+
+  it("SKIPS an IPMI gateway pruned since plan time (kills persisting a dangling gateway from a concurrent folder delete)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "GW", name: "Gateway", host: "g", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    await core.addOrUpdateServer(targetServer());
+
+    // Plan (computed while GW is live) sets R's IPMI gateway to GW.
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "GW" } } },
+      servers: [core.getServer("R")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "GW" || id === "R"
+    });
+    expect(plan.serverWrites.find((w) => w.serverId === "R")?.ipmiGatewayServerId).toBe("GW");
+
+    // CONCURRENT DELETION between plan and apply: GW is pruned (e.g. its folder removed).
+    await core.removeServer("GW");
+
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    expect(applied).toBe(1);
+    // The now-dangling gateway must NOT be persisted. Against the pre-fix writer
+    // (unconditional `next.ipmiGatewayServerId = write.ipmiGatewayServerId`) R would
+    // carry the dangling "GW" and this assertion fails.
+    expect(core.getServer("R")?.ipmiGatewayServerId).toBeUndefined();
+    // Skipped ⇒ not recorded as hand-owned: no gateway stamp was minted.
+    expect(core.getServer("R")?.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+  });
+
+  it("WRITES a gateway that still resolves at apply time (regression — the guard did not over-skip)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "GW", name: "Gateway", host: "g", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    await core.addOrUpdateServer(targetServer());
+
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "GW" } } },
+      servers: [core.getServer("R")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "GW" || id === "R"
+    });
+
+    // GW remains live — the reference resolves at apply time.
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    expect(applied).toBe(1);
+    expect(core.getServer("R")?.ipmiGatewayServerId).toBe("GW");
   });
 });

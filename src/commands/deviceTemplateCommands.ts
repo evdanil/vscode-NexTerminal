@@ -533,8 +533,25 @@ function planFor(ctx: CommandContext, template: DeviceTemplateProfile, servers: 
  * each write (the `authProfileCommands.ts` single-writer discipline), and clears
  * the stamps of the fields each write touched (§7.4 ownership rule). Non-synced
  * servers have no `origin`, so the clear is a no-op there.
+ *
+ * REFERENCE FIELDS ARE RE-RESOLVED PER WRITE (issue #48 PR-T3, PR #66 Codex round
+ * 6). The three cross-record references — `ipmiGatewayServerId` (a `ServerConfig.id`)
+ * and the two auth links (`authProfileId` / `ipmiAuthProfileId`, `AuthProfile.id`s) —
+ * are validated at PLAN time, but this loop yields at every `addOrUpdateServer`, so
+ * a concurrent deletion can land between writes. The flagged path: `nexus.group.remove`
+ * (folder delete) prunes servers WITHOUT taking `configMutationLock`, so it can delete
+ * the selected IPMI gateway from another folder mid-apply even though this apply runs
+ * under the lock. Its deletion sweep (`clearGatewayReferencesTo`) only reaches servers
+ * ALREADY written; a server written AFTER it would re-introduce the dangling link, which
+ * then silently routes IPMI locally. So each reference is RE-RESOLVED against live core
+ * immediately before the write and, if it no longer resolves, SKIPPED and dropped from
+ * the stamp-clear set (neither written nor recorded as hand-owned). Robust without a
+ * second lock: every deletion path mutates `this.servers` / the auth store in memory
+ * synchronously before its own persist await, so this synchronous re-read always observes
+ * a committed deletion. The gateway is the demonstrated race; the two auth checks are the
+ * same-class guard (never persist a dangling reference) and cost one lookup each.
  */
-async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Promise<number> {
+export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Promise<number> {
   let applied = 0;
   for (const write of plan.serverWrites) {
     const live = ctx.core.getServer(write.serverId);
@@ -542,6 +559,16 @@ async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Prom
       continue;
     }
     const next: ServerConfig = { ...live };
+    // A field skipped below (its reference no longer resolves) must NOT be treated
+    // as written by the §7.4 stamp clear — so work off a mutable copy of the plan's
+    // written-field list and drop any reference we decline to persist.
+    const writtenFields = [...write.writtenFields];
+    const dropWritten = (field: TemplatableField): void => {
+      const i = writtenFields.indexOf(field);
+      if (i >= 0) {
+        writtenFields.splice(i, 1);
+      }
+    };
     if (write.proxy !== undefined) {
       next.proxy = write.proxy;
     }
@@ -555,18 +582,30 @@ async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Prom
       next.logSession = write.logSession;
     }
     if (write.authProfileId !== undefined) {
-      next.authProfileId = write.authProfileId;
+      if (ctx.core.getAuthProfile(write.authProfileId) !== undefined) {
+        next.authProfileId = write.authProfileId;
+      } else {
+        dropWritten("authProfileId"); // profile deleted since the plan was computed
+      }
     }
     if (write.ipmiAuthProfileId !== undefined) {
-      next.ipmiAuthProfileId = write.ipmiAuthProfileId;
+      if (ctx.core.getAuthProfile(write.ipmiAuthProfileId) !== undefined) {
+        next.ipmiAuthProfileId = write.ipmiAuthProfileId;
+      } else {
+        dropWritten("ipmiAuthProfileId");
+      }
     }
     if (write.ipmiGatewayServerId !== undefined) {
-      next.ipmiGatewayServerId = write.ipmiGatewayServerId;
+      if (ctx.core.getServer(write.ipmiGatewayServerId) !== undefined) {
+        next.ipmiGatewayServerId = write.ipmiGatewayServerId;
+      } else {
+        dropWritten("ipmiGatewayServerId"); // gateway server pruned since the plan was computed
+      }
     }
     // §7.4 — clear the stamps of exactly the fields written, so every one reads
     // as a hand edit (row 7) to later syncs. `clearTemplatedStamps` also clears
     // `syncedAuthProfileId` when the auth link is among the written fields.
-    const clearedOrigin = clearTemplatedStamps(live.origin, write.writtenFields);
+    const clearedOrigin = clearTemplatedStamps(live.origin, writtenFields);
     if (clearedOrigin === undefined) {
       delete next.origin;
     } else {
