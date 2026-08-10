@@ -1,5 +1,5 @@
 import type { AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../models/config";
-import { authProfileNeedsServerKeyPath } from "../../models/config";
+import { authProfileNeedsServerKeyPath, templatedHasAnyStamp } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, TemplateRule } from "../../models/inventory";
 import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "../../models/deviceTemplate";
 
@@ -38,8 +38,20 @@ import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "..
  * recreates the over-strict refusal a prior review round caught.
  */
 
-/** The five v1 templatable fields; the four non-auth ones stamp `origin.templated`. */
-export type TemplatableField = "proxy" | "authProfileId" | "multiplexing" | "legacyAlgorithms" | "logSession";
+/**
+ * The v1 templatable fields. All EXCEPT `authProfileId` stamp `origin.templated`
+ * (the auth link reuses the shared `syncedAuthProfileId`). The two IPMI id
+ * references (PR-T3, §14) are `origin.templated`-value-stamped like proxy/booleans
+ * and additionally reference-validated skip-and-warn (§5.3).
+ */
+export type TemplatableField =
+  | "proxy"
+  | "authProfileId"
+  | "multiplexing"
+  | "legacyAlgorithms"
+  | "logSession"
+  | "ipmiAuthProfileId"
+  | "ipmiGatewayServerId";
 
 /**
  * §7.3 / §7.4 — the ONE short-label map for templatable field display names,
@@ -53,11 +65,26 @@ export const TEMPLATE_FIELD_SHORT_LABELS: Record<TemplatableField, string> = {
   authProfileId: "Auth Profile",
   multiplexing: "Multiplexing",
   legacyAlgorithms: "Legacy Algorithms",
-  logSession: "Session Logging"
+  logSession: "Session Logging",
+  ipmiAuthProfileId: "IPMI Auth Profile",
+  ipmiGatewayServerId: "IPMI Gateway"
 };
 
-/** The four non-auth stamp fields, in the order the tooltip lists them. */
-const NON_AUTH_TEMPLATABLE_FIELDS = ["proxy", "multiplexing", "legacyAlgorithms", "logSession"] as const;
+/**
+ * The `origin.templated`-stamped fields, in the order the tooltip lists them —
+ * every templatable field EXCEPT `authProfileId` (which stamps the shared
+ * `syncedAuthProfileId`). The two IPMI id references (PR-T3) belong here: they
+ * carry their own `origin.templated` value stamp, so `cur === stamp` is the same
+ * ownership question the booleans answer.
+ */
+const NON_AUTH_TEMPLATABLE_FIELDS = [
+  "proxy",
+  "multiplexing",
+  "legacyAlgorithms",
+  "logSession",
+  "ipmiAuthProfileId",
+  "ipmiGatewayServerId"
+] as const;
 
 /**
  * §7.3 (UX-S12) — the non-auth templatable fields a server is CURRENTLY carrying
@@ -71,7 +98,9 @@ const NON_AUTH_TEMPLATABLE_FIELDS = ["proxy", "multiplexing", "legacyAlgorithms"
  * proxy by structural equality. `authProfileId` is deliberately NOT included — the
  * SSH auth link already surfaces on its own `[auth: …]` tooltip suffix.
  */
-export function templateAppliedFields(server: Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "origin">): TemplatableField[] {
+export function templateAppliedFields(
+  server: Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId" | "origin">
+): TemplatableField[] {
   const stamps = server.origin?.templated;
   if (stamps === undefined) {
     return [];
@@ -83,6 +112,7 @@ export function templateAppliedFields(server: Pick<ServerConfig, "proxy" | "mult
         applied.push("proxy");
       }
     } else if (stamps[field] !== undefined && server[field] === stamps[field]) {
+      // Booleans and the two IPMI id strings alike: PRESENT stamp AND cur === stamp.
       applied.push(field);
     }
   }
@@ -314,6 +344,8 @@ export interface CascadeWinners {
   multiplexing?: TemplateField<boolean>;
   legacyAlgorithms?: TemplateField<boolean>;
   logSession?: TemplateField<boolean>;
+  ipmiAuthProfileId?: TemplateField<string>;
+  ipmiGatewayServerId?: TemplateField<string>;
 }
 
 /** §3.4 — where one field's applied value came from, for the plan-report provenance lines. */
@@ -483,6 +515,17 @@ export function selectFieldWinners(
   if (logWin !== undefined) {
     winners.logSession = logWin.field;
   }
+  // PR-T3 (§14) — the two IPMI id references resolve through the identical
+  // per-field cascade (string equality); tie-break, specificity, mode-gate and
+  // provenance are all inherited from the generic path, no special-casing.
+  const ipmiAuthWin = resolveField<string>("ipmiAuthProfileId", (t) => t.fields.ipmiAuthProfileId, (a, b) => a === b);
+  if (ipmiAuthWin !== undefined) {
+    winners.ipmiAuthProfileId = ipmiAuthWin.field;
+  }
+  const ipmiGatewayWin = resolveField<string>("ipmiGatewayServerId", (t) => t.fields.ipmiGatewayServerId, (a, b) => a === b);
+  if (ipmiGatewayWin !== undefined) {
+    winners.ipmiGatewayServerId = ipmiGatewayWin.field;
+  }
 
   const authWin = resolveField<string>("authProfileId", (t) => t.fields.authProfileId, (a, b) => a === b);
   let authFromImplicit = false;
@@ -515,6 +558,25 @@ export interface DesiredNonAuthFields {
   multiplexing?: DesiredField<boolean>;
   legacyAlgorithms?: DesiredField<boolean>;
   logSession?: DesiredField<boolean>;
+  ipmiAuthProfileId?: DesiredField<string>;
+  ipmiGatewayServerId?: DesiredField<string>;
+}
+
+/**
+ * §5.3 / §14 (PR-T3) reference-validation context for the two IPMI id fields,
+ * the SAME skip-and-warn posture as the jump-host / auth-profile references.
+ * `hasAuthProfile` resolves `ipmiAuthProfileId` against the live profile store
+ * (dangling → dropped); `hasServer` resolves `ipmiGatewayServerId` against the
+ * set of servers live after this sync (reusing the proxy jump-host predicate).
+ * The template names name the disposition in the house style. Absent ⇒ no IPMI
+ * reference validation (legacy/test callers), matching `proxyRef`'s optionality.
+ */
+export interface IpmiReferenceContext {
+  hasAuthProfile: (profileId: string) => boolean;
+  hasServer: (serverId: string) => boolean;
+  ipmiAuthProfileTemplateName: string | undefined;
+  ipmiGatewayServerTemplateName: string | undefined;
+  sourceName: string;
 }
 
 /**
@@ -558,7 +620,11 @@ export interface ComposedDesiredFields {
  * A resolvable, non-self reference — and any `socks5`/`http` proxy, which carry
  * no server reference — passes through unchanged.
  */
-export function composeDesiredFields(winners: CascadeWinners, proxyRef?: ProxyReferenceContext): ComposedDesiredFields {
+export function composeDesiredFields(
+  winners: CascadeWinners,
+  proxyRef?: ProxyReferenceContext,
+  ipmiRef?: IpmiReferenceContext
+): ComposedDesiredFields {
   const desired: DesiredNonAuthFields = {};
   const warnings: string[] = [];
   if (winners.proxy !== undefined) {
@@ -580,6 +646,31 @@ export function composeDesiredFields(winners: CascadeWinners, proxyRef?: ProxyRe
   }
   if (winners.logSession !== undefined) {
     desired.logSession = { value: winners.logSession.value, mode: winners.logSession.mode };
+  }
+  // PR-T3 (§5.3 / §14) — reference-validation skip-and-warn for the two IPMI id
+  // fields. A dangling reference drops the field to "desired none" (left UNSET so
+  // the matrix carries an existing sync-owned value forward, row 5 — never a
+  // written `undefined`) plus one plan warning naming the template. Reuses the
+  // jump-host / auth-profile skip-and-warn verbatim in spirit.
+  if (winners.ipmiAuthProfileId !== undefined) {
+    const value = winners.ipmiAuthProfileId.value;
+    if (ipmiRef !== undefined && !ipmiRef.hasAuthProfile(value)) {
+      warnings.push(
+        `Device template "${ipmiRef.ipmiAuthProfileTemplateName ?? "?"}" on "${ipmiRef.sourceName}" links an IPMI auth profile that no longer exists — the IPMI Auth Profile field was skipped.`
+      );
+    } else {
+      desired.ipmiAuthProfileId = { value, mode: winners.ipmiAuthProfileId.mode };
+    }
+  }
+  if (winners.ipmiGatewayServerId !== undefined) {
+    const value = winners.ipmiGatewayServerId.value;
+    if (ipmiRef !== undefined && !ipmiRef.hasServer(value)) {
+      warnings.push(
+        `Device template "${ipmiRef.ipmiGatewayServerTemplateName ?? "?"}" on "${ipmiRef.sourceName}" sets an IPMI gateway server that no longer exists — the IPMI Gateway field was skipped.`
+      );
+    } else {
+      desired.ipmiGatewayServerId = { value, mode: winners.ipmiGatewayServerId.mode };
+    }
   }
   return { desired, warnings };
 }
@@ -632,7 +723,7 @@ function matrixWrites<T>(
 
 export interface TemplateMatrixResult {
   /** Field values to assign onto the record. */
-  values: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession">>;
+  values: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId">>;
   /** The full new `origin.templated` record — carried-forward stamps with the written fields updated. */
   templated: ServerOrigin["templated"];
   /** §5.3 per-device self-reference skip warnings (a proxy routing the target through itself). */
@@ -757,8 +848,28 @@ export function applyTemplateMatrix(
   applyBool("legacyAlgorithms");
   applyBool("logSession");
 
-  const hasStamp = templated.proxy !== undefined || templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
-  return { values, templated: hasStamp ? templated : undefined, warnings, clearProxy };
+  // PR-T3 (§14) — the two IPMI id references ride the SAME §4.3 matrix as the
+  // booleans, with string equality. No provider/device supply (srcX empty), so
+  // desired reduces to the template value; the mode gate (row 3 fires only for an
+  // override winner) is inherited from `matrixWrites`.
+  const idEqual = (a: string | undefined, b: string | undefined): boolean => a === b;
+  const applyId = (key: "ipmiAuthProfileId" | "ipmiGatewayServerId"): void => {
+    const d = desired[key];
+    if (d === undefined) {
+      return;
+    }
+    const cur = ownedServer?.[key];
+    const stamp = carried?.[key];
+    const write = ownedServer === undefined ? true : matrixWrites(cur !== undefined, cur, stamp !== undefined, stamp, d, idEqual);
+    if (write) {
+      values[key] = d.value;
+      templated[key] = d.value;
+    }
+  };
+  applyId("ipmiAuthProfileId");
+  applyId("ipmiGatewayServerId");
+
+  return { values, templated: templatedHasAnyStamp(templated) ? templated : undefined, warnings, clearProxy };
 }
 
 /**
@@ -971,6 +1082,8 @@ export interface ManualApplyServerWrite {
   legacyAlgorithms?: boolean;
   logSession?: boolean;
   authProfileId?: string;
+  ipmiAuthProfileId?: string;
+  ipmiGatewayServerId?: string;
   /** The fields written above, in `TemplatableField` terms — fed verbatim to `clearTemplatedStamps`. */
   writtenFields: TemplatableField[];
 }
@@ -1002,6 +1115,8 @@ export interface ManualApplyPlan {
   multiplexing?: ValueFieldPlan;
   legacyAlgorithms?: ValueFieldPlan;
   logSession?: ValueFieldPlan;
+  ipmiAuthProfileId?: ValueFieldPlan;
+  ipmiGatewayServerId?: ValueFieldPlan;
   auth?: AuthFieldPlan;
   /** §5.3 reference-validation warnings — dangling auth profile / jump host / per-target self-proxy. */
   warnings: string[];
@@ -1113,6 +1228,49 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
   plan.legacyAlgorithms = applyBool("legacyAlgorithms");
   plan.logSession = applyBool("logSession");
 
+  // ---- IPMI id-reference value fields (PR-T3) -------------------------------
+  // Plain value-field semantics (fill = write where unset, override = write over)
+  // like the four above, PLUS §5.3 reference validation: a dangling reference
+  // drops the WHOLE field (device-independent, checked once) + a modal warning —
+  // exactly the proxy dangling-jump-host handling.
+  const applyIdField = (
+    field: "ipmiAuthProfileId" | "ipmiGatewayServerId",
+    refValid: (id: string) => boolean,
+    danglingWarning: string
+  ): ValueFieldPlan | undefined => {
+    const tf = template.fields[field];
+    if (tf === undefined) {
+      return undefined;
+    }
+    if (!refValid(tf.value)) {
+      warnings.push(danglingWarning);
+      return undefined; // dropped — no consent line, mirroring proxy dangling
+    }
+    const stats: ValueFieldPlan = { mode: tf.mode, willSet: 0, skipped: 0 };
+    for (const server of servers) {
+      const write = tf.mode === "override" || server[field] === undefined;
+      if (write) {
+        const w = writeFor(server.id);
+        w[field] = tf.value;
+        w.writtenFields.push(field);
+        stats.willSet++;
+      } else {
+        stats.skipped++;
+      }
+    }
+    return stats;
+  };
+  plan.ipmiAuthProfileId = applyIdField(
+    "ipmiAuthProfileId",
+    (id) => authProfile(id) !== undefined,
+    `Device template "${template.name}" links an IPMI auth profile that no longer exists — the IPMI Auth Profile field was skipped.`
+  );
+  plan.ipmiGatewayServerId = applyIdField(
+    "ipmiGatewayServerId",
+    (id) => hasServer(id),
+    `Device template "${template.name}" sets an IPMI gateway server that no longer exists — the IPMI Gateway field was skipped.`
+  );
+
   // ---- Auth link ------------------------------------------------------------
   const authField = template.fields.authProfileId;
   if (authField !== undefined) {
@@ -1199,16 +1357,18 @@ export function clearTemplatedStamps(origin: ServerOrigin | undefined, writtenFi
   const templated = origin.templated ? { ...origin.templated } : undefined;
   if (templated !== undefined) {
     for (const field of writtenFields) {
-      if (field === "proxy" || field === "multiplexing" || field === "legacyAlgorithms" || field === "logSession") {
+      if (
+        field === "proxy" ||
+        field === "multiplexing" ||
+        field === "legacyAlgorithms" ||
+        field === "logSession" ||
+        field === "ipmiAuthProfileId" ||
+        field === "ipmiGatewayServerId"
+      ) {
         delete templated[field];
       }
     }
-    const stillHasStamp =
-      templated.proxy !== undefined ||
-      templated.multiplexing !== undefined ||
-      templated.legacyAlgorithms !== undefined ||
-      templated.logSession !== undefined;
-    next.templated = stillHasStamp ? templated : undefined;
+    next.templated = templatedHasAnyStamp(templated) ? templated : undefined;
   }
   return next;
 }

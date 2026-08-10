@@ -141,4 +141,44 @@ describe("Fixture 26 — storage round-trip + share exclusion", () => {
     expect("deviceTemplates" in sanitized).toBe(false);
     expect("inventorySources" in sanitized).toBe(false);
   });
+
+  it("PR-T3 — a template carrying both IPMI id fields + a server's IPMI stamps survive a repository reload (fixture 26 / F)", async () => {
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateDeviceTemplate(
+      tmpl("Tipmi", {
+        ipmiAuthProfileId: { mode: "fill", value: "bmc-prof" },
+        ipmiGatewayServerId: { mode: "override", value: "mgmt-host" }
+      })
+    );
+    await core.addOrUpdateServer({
+      id: "srv-ipmi",
+      name: "sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      ipmiAuthProfileId: "bmc-prof",
+      ipmiGatewayServerId: "mgmt-host",
+      origin: {
+        sourceId: "s1",
+        externalId: "device:1",
+        syncedAt: 1,
+        templated: { ipmiAuthProfileId: "bmc-prof", ipmiGatewayServerId: "mgmt-host" }
+      }
+    });
+
+    const core2 = new NexusCore(repo);
+    await core2.initialize();
+    const t = core2.getDeviceTemplate("Tipmi");
+    expect(t?.fields.ipmiAuthProfileId).toEqual({ mode: "fill", value: "bmc-prof" });
+    expect(t?.fields.ipmiGatewayServerId).toEqual({ mode: "override", value: "mgmt-host" });
+    const s = core2.getServer("srv-ipmi");
+    expect(s?.ipmiAuthProfileId).toBe("bmc-prof");
+    expect(s?.ipmiGatewayServerId).toBe("mgmt-host");
+    expect(s?.origin?.templated?.ipmiAuthProfileId).toBe("bmc-prof");
+    expect(s?.origin?.templated?.ipmiGatewayServerId).toBe("mgmt-host");
+  });
 });

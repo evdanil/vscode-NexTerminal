@@ -170,6 +170,32 @@ describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
     expect(() => parseDeviceTemplateFormValues({ name: "  " })).toThrow(/Name is required/);
   });
 
+  it("PR-T3 — the two IPMI id references round-trip fill / override / unset", () => {
+    const t = parseDeviceTemplateFormValues({
+      name: "T",
+      mode_ipmiAuthProfileId: "fill",
+      ipmiAuthProfileId: "pa-1",
+      mode_ipmiGatewayServerId: "override",
+      ipmiGatewayServerId: "gw-1"
+    });
+    expect(t.fields.ipmiAuthProfileId).toEqual({ mode: "fill", value: "pa-1" });
+    expect(t.fields.ipmiGatewayServerId).toEqual({ mode: "override", value: "gw-1" });
+
+    const unset = parseDeviceTemplateFormValues({
+      name: "T",
+      mode_ipmiAuthProfileId: "none", // value present but mode none → dropped
+      ipmiAuthProfileId: "pa-1",
+      mode_ipmiGatewayServerId: "none"
+    });
+    expect(unset.fields.ipmiAuthProfileId).toBeUndefined();
+    expect(unset.fields.ipmiGatewayServerId).toBeUndefined();
+
+    // The __create__ sentinel / (None) reads as "no value" → rejects when a mode is chosen.
+    expect(() =>
+      parseDeviceTemplateFormValues({ name: "T", mode_ipmiAuthProfileId: "fill", ipmiAuthProfileId: "__create__authProfile" })
+    ).toThrow(/IPMI Auth Profile mode is set to Fill but no value is configured/);
+  });
+
   it("P3 — a field whose mode is fill/override but has no usable value is REJECTED, not silently dropped", () => {
     // Auth mode set but left on (None)/create sentinel → reject (the pre-fix code
     // returned a template with the auth field silently dropped).

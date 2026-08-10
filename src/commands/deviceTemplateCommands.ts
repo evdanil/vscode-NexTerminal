@@ -103,6 +103,23 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
   if (log) {
     fields.logSession = log;
   }
+  // PR-T3 — the two IPMI id references. Both submit under their own key from a
+  // filterable select; a "(None)"/empty pick or the `__create__` sentinel reads
+  // as "no value" (throws if a mode was chosen — same as the SSH auth row).
+  const ipmiAuth = readTemplateField<string>(values, "ipmiAuthProfileId", () => {
+    const raw = values.ipmiAuthProfileId;
+    return typeof raw === "string" && raw !== "" && !raw.startsWith("__create__") ? raw : undefined;
+  });
+  if (ipmiAuth) {
+    fields.ipmiAuthProfileId = ipmiAuth;
+  }
+  const ipmiGateway = readTemplateField<string>(values, "ipmiGatewayServerId", () => {
+    const raw = values.ipmiGatewayServerId;
+    return typeof raw === "string" && raw !== "" ? raw : undefined;
+  });
+  if (ipmiGateway) {
+    fields.ipmiGatewayServerId = ipmiGateway;
+  }
   return { id: existingId ?? randomUUID(), name, fields };
 }
 
@@ -376,7 +393,15 @@ async function manageDeviceTemplates(ctx: CommandContext): Promise<void> {
 /** A one-line "Sets: Proxy, Auth Profile" summary via the shared short-label map. */
 function describeTemplateFields(template: DeviceTemplateProfile): string {
   const set: string[] = [];
-  for (const field of ["proxy", "authProfileId", "multiplexing", "legacyAlgorithms", "logSession"] as TemplatableField[]) {
+  for (const field of [
+    "proxy",
+    "authProfileId",
+    "multiplexing",
+    "legacyAlgorithms",
+    "logSession",
+    "ipmiAuthProfileId",
+    "ipmiGatewayServerId"
+  ] as TemplatableField[]) {
     if (template.fields[field] !== undefined) {
       set.push(TEMPLATE_FIELD_SHORT_LABELS[field]);
     }
@@ -453,6 +478,8 @@ function buildConsentModalDetail(plan: ManualApplyPlan): string {
   valueLine("multiplexing", plan.multiplexing);
   valueLine("legacyAlgorithms", plan.legacyAlgorithms);
   valueLine("logSession", plan.logSession);
+  valueLine("ipmiAuthProfileId", plan.ipmiAuthProfileId);
+  valueLine("ipmiGatewayServerId", plan.ipmiGatewayServerId);
   if (plan.auth) {
     const a = plan.auth;
     if (a.mode === "fill") {
@@ -520,6 +547,12 @@ async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan): Prom
     }
     if (write.authProfileId !== undefined) {
       next.authProfileId = write.authProfileId;
+    }
+    if (write.ipmiAuthProfileId !== undefined) {
+      next.ipmiAuthProfileId = write.ipmiAuthProfileId;
+    }
+    if (write.ipmiGatewayServerId !== undefined) {
+      next.ipmiGatewayServerId = write.ipmiGatewayServerId;
     }
     // §7.4 — clear the stamps of exactly the fields written, so every one reads
     // as a hand edit (row 7) to later syncs. `clearTemplatedStamps` also clears

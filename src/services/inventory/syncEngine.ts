@@ -1,5 +1,5 @@
 import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin } from "../../models/config";
-import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual } from "../../models/config";
+import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual, templatedHasAnyStamp } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../models/inventory";
 import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
@@ -711,11 +711,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // is now per-record (PART 1 below) and needs no baseline desired proxy.
   const baselineDevice: Pick<InventoryDevice, "name" | "attributes"> = { name: "", attributes: undefined };
   const baselineCascade = selectFieldWinners(baselineDevice, prepared, source.authProfileId);
-  const baselineComposed = composeDesiredFields(baselineCascade.winners, {
-    hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
-    proxyTemplateName: baselineCascade.proxyTemplateName,
-    sourceName: source.name
-  });
+  const baselineComposed = composeDesiredFields(
+    baselineCascade.winners,
+    {
+      hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
+      proxyTemplateName: baselineCascade.proxyTemplateName,
+      sourceName: source.name
+    },
+    // PR-T3 — the IPMI reference-validation context; its dangling warnings dedupe
+    // against the per-device path and are the sole surface when zero devices sync.
+    {
+      hasAuthProfile: (pid) => resolveAuthProfileById(pid) !== undefined,
+      hasServer: (sid) => liveServerIds.has(sid),
+      ipmiAuthProfileTemplateName: baselineCascade.provenance.ipmiAuthProfileId?.templateName,
+      ipmiGatewayServerTemplateName: baselineCascade.provenance.ipmiGatewayServerId?.templateName,
+      sourceName: source.name
+    }
+  );
 
   // DEVICE TEMPLATES (PR-T2) — per-device warning dedupe. The dangling-jump-host
   // and dangling-auth-profile warnings name the TEMPLATE/source, not the device,
@@ -1070,11 +1082,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     for (const rid of deviceCascade.matchedRuleIds) {
       matchedRuleIds.add(rid);
     }
-    const deviceComposed = composeDesiredFields(deviceCascade.winners, {
-      hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
-      proxyTemplateName: deviceCascade.proxyTemplateName,
-      sourceName: source.name
-    });
+    const deviceComposed = composeDesiredFields(
+      deviceCascade.winners,
+      {
+        hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
+        proxyTemplateName: deviceCascade.proxyTemplateName,
+        sourceName: source.name
+      },
+      // PR-T3 — IPMI reference validation for this device's winners; a dangling
+      // id drops the field to none + a deduped warning naming the template.
+      {
+        hasAuthProfile: (pid) => resolveAuthProfileById(pid) !== undefined,
+        hasServer: (sid) => liveServerIds.has(sid),
+        ipmiAuthProfileTemplateName: deviceCascade.provenance.ipmiAuthProfileId?.templateName,
+        ipmiGatewayServerTemplateName: deviceCascade.provenance.ipmiGatewayServerId?.templateName,
+        sourceName: source.name
+      }
+    );
     const deviceDesiredNonAuth = deviceComposed.desired;
     for (const w of deviceComposed.warnings) {
       pushDedupTemplateWarning(w); // dangling jump host — names the template, identical across devices
@@ -1108,15 +1132,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const recordWrittenProvenance = (
       serverId: string,
       serverName: string,
-      matrixValues: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession">>,
+      matrixValues: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId">>,
       authWritten: boolean
     ): void => {
       const provenance: Partial<Record<TemplatableField, FieldProvenance>> = {};
-      const nonAuthFields: Array<"proxy" | "multiplexing" | "legacyAlgorithms" | "logSession"> = [
+      const nonAuthFields: Array<"proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId"> = [
         "proxy",
         "multiplexing",
         "legacyAlgorithms",
-        "logSession"
+        "logSession",
+        "ipmiAuthProfileId",
+        "ipmiGatewayServerId"
       ];
       for (const f of nonAuthFields) {
         if (matrixValues[f] !== undefined) {
@@ -1580,6 +1606,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.multiplexing !== after.multiplexing ||
         ownedServer.legacyAlgorithms !== after.legacyAlgorithms ||
         ownedServer.logSession !== after.logSession ||
+        // PR-T3 — the two IPMI id-reference value fields join the value half; the
+        // origin half (their `templated` stamps) rides in on serverOriginStampsEqual.
+        ownedServer.ipmiAuthProfileId !== after.ipmiAuthProfileId ||
+        ownedServer.ipmiGatewayServerId !== after.ipmiGatewayServerId ||
         !serverOriginStampsEqual(ownedServer.origin, after.origin) ||
         (endpoint.username !== undefined && ownedServer.username !== after.username);
       if (changed) {
@@ -2720,12 +2750,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       } else {
         delete templated.proxy;
       }
-      const stillStamped =
-        templated.proxy !== undefined ||
-        templated.multiplexing !== undefined ||
-        templated.legacyAlgorithms !== undefined ||
-        templated.logSession !== undefined;
-      after.origin = { ...origin, templated: stillStamped ? templated : undefined };
+      // PR-T3 — the presence check must see the two IPMI value stamps too, or
+      // dropping the proxy would erase a still-valid IPMI stamp with it.
+      after.origin = { ...origin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
     }
     // The template's NEW proxy did not flow onto this record — strip its §3.4 line.
     dropProxyProvenance(after.id);
@@ -2898,10 +2925,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const origin = record.origin!;
     const templated = origin.templated !== undefined ? { ...origin.templated } : {};
     delete templated.proxy;
-    const stillStamped =
-      templated.multiplexing !== undefined || templated.legacyAlgorithms !== undefined || templated.logSession !== undefined;
+    // PR-T3 — the two IPMI value stamps count toward "still stamped" so the proxy
+    // drop never silently erases them.
     const { proxy: _droppedProxy, ...withoutProxy } = record;
-    return { ...withoutProxy, origin: { ...origin, templated: stillStamped ? templated : undefined } };
+    return { ...withoutProxy, origin: { ...origin, templated: templatedHasAnyStamp(templated) ? templated : undefined } };
   };
   // ROUND 9 (UNIFICATION) — the single predicate every record source now shares:
   // is a record's EFFECTIVE proxy an INVALID template-OWNED ssh proxy this pass

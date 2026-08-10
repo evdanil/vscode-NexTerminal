@@ -77,7 +77,13 @@ function isValidTemplatedStamps(value: unknown): boolean {
   return (
     (obj.multiplexing === undefined || typeof obj.multiplexing === "boolean") &&
     (obj.legacyAlgorithms === undefined || typeof obj.legacyAlgorithms === "boolean") &&
-    (obj.logSession === undefined || typeof obj.logSession === "boolean")
+    (obj.logSession === undefined || typeof obj.logSession === "boolean") &&
+    // DEVICE TEMPLATES (PR-T3) — the two IPMI value stamps are id references:
+    // non-empty strings when present (an empty string is a link to nothing and
+    // could not have come from a sync write). Malformed ⇒ the whole origin is
+    // stripped, same loud disposition as the rest.
+    isOptionalNonEmptyString(obj.ipmiAuthProfileId) &&
+    isOptionalNonEmptyString(obj.ipmiGatewayServerId)
   );
 }
 
@@ -468,7 +474,12 @@ export function validateDeviceTemplate(item: unknown): item is DeviceTemplatePro
     validField(fields.authProfileId, (v) => isNonEmptyString(v)) &&
     validField(fields.multiplexing, (v) => typeof v === "boolean") &&
     validField(fields.legacyAlgorithms, (v) => typeof v === "boolean") &&
-    validField(fields.logSession, (v) => typeof v === "boolean")
+    validField(fields.logSession, (v) => typeof v === "boolean") &&
+    // DEVICE TEMPLATES (PR-T3) — the two IPMI id-reference fields carry a
+    // non-empty string value, mirroring the `authProfileId` clause above; a
+    // malformed `{mode, value: 42}` drops the whole template at the load boundary.
+    validField(fields.ipmiAuthProfileId, (v) => isNonEmptyString(v)) &&
+    validField(fields.ipmiGatewayServerId, (v) => isNonEmptyString(v))
   );
 }
 

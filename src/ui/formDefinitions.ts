@@ -29,6 +29,12 @@ interface AuthProfileSelectOptions {
    */
   key?: string;
   /**
+   * Device templates (PR-T3) — the field label. Defaults to `"Auth Profile"`;
+   * the template editor's IPMI-auth row overrides it to `"IPMI Auth Profile"` so
+   * the reused SSH-auth select reads correctly beside the IPMI mode select.
+   */
+  label?: string;
+  /**
    * Device templates (PR-T1b) — defaults to `true` (mirror the chosen profile's
    * username/authType/keyPath into the form's own controls and lock them). The
    * template editor sets it `false`: there is NO server SSH form on that editor
@@ -202,7 +208,7 @@ function authProfileSelectField(
   return {
     type: "select",
     key: opts?.key ?? "authProfileId",
-    label: "Auth Profile",
+    label: opts?.label ?? "Auth Profile",
     options,
     // Grows with the auth-profile list; type-to-filter with (None)/create
     // pinned (PR-F1). The inline-create round trip survives — the filter input
@@ -278,7 +284,8 @@ function ipmiAuthProfileSelectField(
 function ipmiGatewaySelectField(
   seed?: Partial<ServerConfig>,
   servers?: ServerListEntry[],
-  vw?: VisibleWhen
+  vw?: VisibleWhen,
+  advanced = true
 ): FormFieldDescriptor {
   return {
     type: "select",
@@ -295,7 +302,9 @@ function ipmiGatewaySelectField(
     hint:
       "The server to run ipmitool on when a macro opts into gateway routing (Run on: the server's IPMI gateway) or Connect BMC Serial Console is used against this server. " +
       "Leave as (None) when the BMC is reachable from this machine directly — routing only takes effect where a macro or command asks for it.",
-    advanced: true,
+    // Device templates (PR-T3) pass `advanced: false` — the whole template editor
+    // is main content, nothing behind the Advanced chevron (m13).
+    advanced,
     visibleWhen: vw
   };
 }
@@ -674,8 +683,15 @@ function proxyFields(
 // adopted verbatim from §7.1. No new webview machinery.
 // ---------------------------------------------------------------------------
 
-/** The five v1 templatable fields, in editor order. */
-export type TemplatableFormField = "proxy" | "authProfileId" | "multiplexing" | "legacyAlgorithms" | "logSession";
+/** The v1 templatable fields, in editor order. */
+export type TemplatableFormField =
+  | "proxy"
+  | "authProfileId"
+  | "multiplexing"
+  | "legacyAlgorithms"
+  | "logSession"
+  | "ipmiAuthProfileId"
+  | "ipmiGatewayServerId";
 
 /** The form key of a field's companion mode select (`mode_proxy`, …). */
 export function deviceTemplateModeKey(field: TemplatableFormField): string {
@@ -703,13 +719,27 @@ const TEMPLATE_EDITOR_INTRO_HTML = [
 
 /** The companion mode select for one templatable field. Always visible; its
  *  value gates the field's controls below through `visibleWhen`. */
+const TEMPLATE_MODE_FIELD_LABELS: Record<TemplatableFormField, string> = {
+  proxy: "Proxy",
+  authProfileId: "Auth Profile",
+  multiplexing: "Connection multiplexing",
+  legacyAlgorithms: "Legacy SSH algorithms",
+  logSession: "Session Logging",
+  ipmiAuthProfileId: "IPMI Auth Profile",
+  ipmiGatewayServerId: "IPMI Gateway"
+};
+
 function templateModeSelect(field: TemplatableFormField, seededMode: string): FormFieldDescriptor {
   return {
     type: "select",
     key: deviceTemplateModeKey(field),
-    label: `${field === "authProfileId" ? "Auth Profile" : field === "proxy" ? "Proxy" : field === "multiplexing" ? "Connection multiplexing" : field === "legacyAlgorithms" ? "Legacy SSH algorithms" : "Session Logging"} — Template mode`,
+    label: `${TEMPLATE_MODE_FIELD_LABELS[field]} — Template mode`,
     options: TEMPLATE_MODE_OPTIONS,
     value: seededMode,
+    // Only the SSH auth LINK is gated by the six AUTH-2 eligibility clauses, so
+    // only it carries the auth-mode hint. The two IPMI id references ride the
+    // generic value matrix (fill write-once / override replaces sync-owned), so
+    // the shared hint is the accurate one for them.
     hint: field === "authProfileId" ? TEMPLATE_AUTH_MODE_HINT : TEMPLATE_MODE_SHARED_HINT
   };
 }
@@ -742,6 +772,8 @@ export function deviceTemplateFormDefinition(
   const mpxVw = templateValueVisibleWhen("multiplexing");
   const legacyVw = templateValueVisibleWhen("legacyAlgorithms");
   const logVw = templateValueVisibleWhen("logSession");
+  const ipmiAuthVw = templateValueVisibleWhen("ipmiAuthProfileId");
+  const ipmiGatewayVw = templateValueVisibleWhen("ipmiGatewayServerId");
 
   return {
     title: isEdit ? "Edit Device Template" : "New Device Template",
@@ -787,7 +819,28 @@ export function deviceTemplateFormDefinition(
       // Session transcript logging
       templateModeSelect("logSession", modeOf("logSession")),
       { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.fields.logSession?.value ?? true, visibleWhen: logVw },
-      templateOverridePreemption("logSession")
+      templateOverridePreemption("logSession"),
+
+      // IPMI Auth Profile (PR-T3) — the BMC's own login link. Reuses the SSH
+      // filterable auth-profile select (autofill off, no inline-create), keyed to
+      // the template's ipmi field and labelled for the IPMI row.
+      templateModeSelect("ipmiAuthProfileId", modeOf("ipmiAuthProfileId")),
+      authProfileSelectField(authProfiles, ipmiAuthVw, seed?.fields.ipmiAuthProfileId?.value, {
+        key: "ipmiAuthProfileId",
+        label: "IPMI Auth Profile",
+        advanced: false,
+        autofill: false,
+        suppressCreate: true,
+        hint: "The saved credentials this template links as each server's BMC (IPMI) login — separate from the SSH auth profile above."
+      }),
+      templateOverridePreemption("ipmiAuthProfileId"),
+
+      // IPMI Gateway (PR-T3) — an id reference into the server list. Reuses PR-C's
+      // filterable server select (the same control the server form's IPMI Gateway
+      // field uses), seeded from the template field, advanced off for this editor.
+      templateModeSelect("ipmiGatewayServerId", modeOf("ipmiGatewayServerId")),
+      ipmiGatewaySelectField({ ipmiGatewayServerId: seed?.fields.ipmiGatewayServerId?.value }, servers, ipmiGatewayVw, false),
+      templateOverridePreemption("ipmiGatewayServerId")
     ]
   };
 }
@@ -802,7 +855,12 @@ const TEMPLATE_FIELD_FORM_KEY: Record<Exclude<TemplatableField, "authProfileId">
   proxy: "proxyType",
   multiplexing: "multiplexing",
   legacyAlgorithms: "legacyAlgorithms",
-  logSession: "logSession"
+  logSession: "logSession",
+  // PR-T3 — the Edit Server form controls these two IPMI id references submit
+  // under, so §7.3's template-applied hint lands on them when the server carries
+  // a template-owned IPMI value.
+  ipmiAuthProfileId: "ipmiAuthProfileId",
+  ipmiGatewayServerId: "ipmiGatewayServerId"
 };
 
 /**

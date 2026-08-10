@@ -45,12 +45,24 @@ export interface DeviceTemplateProfile {
    * cascade falls through it to the next-most-specific rule. There is no
    * "clear" mode in v1 (see §11 open question 3), so absence is unambiguous.
    *
-   * Only these five v1 fields are templatable. `host`/`name`/`ipmiHost`
+   * These seven v1 fields are templatable. `host`/`name`/`ipmiHost`
    * (identity), `group` (folder placement), `username`/`authType`/`keyPath`
    * (auth-profile machinery), and `port` (deferred, §4.6) are deliberately
    * excluded. `authProfileId` is a LINK only — never copied credentials — and
    * reuses the existing `ServerOrigin.syncedAuthProfileId` stamp rather than a
    * twin in `origin.templated`.
+   *
+   * `ipmiAuthProfileId` / `ipmiGatewayServerId` (issue #48 PR-T3, §14 reserved
+   * slots): both are ID REFERENCES applied TEMPLATE-ONLY — the sync writes
+   * neither from provider data (NetBox supplies `ipmiHost`, not the BMC's auth
+   * profile or its gateway). `ipmiAuthProfileId` names an `AuthProfile.id`;
+   * `ipmiGatewayServerId` names a `ServerConfig.id`. Both are reference-validated
+   * skip-and-warn (§5.3: a dangling id drops the field to "desired none" + one
+   * plan warning). UNLIKE `authProfileId`, neither is sync-written, so each gets
+   * its OWN value stamp in `origin.templated` (a string id, present-when-set —
+   * the `templated.proxy` value-stamp pattern, not the shared
+   * `syncedAuthProfileId`); they otherwise ride the generic §4.3 matrix exactly
+   * like the booleans (string equality).
    */
   fields: {
     proxy?: TemplateField<ProxyConfig>;
@@ -58,9 +70,8 @@ export interface DeviceTemplateProfile {
     multiplexing?: TemplateField<boolean>;
     legacyAlgorithms?: TemplateField<boolean>;
     logSession?: TemplateField<boolean>;
-    // Reserved — added by PR-T3 once PR-B / PR-C land the ServerConfig fields:
-    // ipmiAuthProfileId?: TemplateField<string>;
-    // ipmiGatewayServerId?: TemplateField<string>;
+    ipmiAuthProfileId?: TemplateField<string>; // AuthProfile.id — the BMC's own login (PR-T3)
+    ipmiGatewayServerId?: TemplateField<string>; // ServerConfig.id — the IPMI gateway (PR-T3)
   };
 }
 

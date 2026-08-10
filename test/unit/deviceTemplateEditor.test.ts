@@ -27,6 +27,44 @@ describe("deviceTemplateFormDefinition — tri-state wiring (§7.1)", () => {
     expect(field(def, "multiplexing")?.visibleWhen).toEqual({ field: "mode_multiplexing", value: ["fill", "override"] });
     expect(field(def, "legacyAlgorithms")?.visibleWhen).toEqual({ field: "mode_legacyAlgorithms", value: ["fill", "override"] });
     expect(field(def, "logSession")?.visibleWhen).toEqual({ field: "mode_logSession", value: ["fill", "override"] });
+    // PR-T3 — the two IPMI id-reference rows, reusing the filterable auth-profile
+    // and server selects, gated on their own companion mode selects.
+    expect(field(def, "ipmiAuthProfileId")?.visibleWhen).toEqual({ field: "mode_ipmiAuthProfileId", value: ["fill", "override"] });
+    expect(field(def, "ipmiGatewayServerId")?.visibleWhen).toEqual({ field: "mode_ipmiGatewayServerId", value: ["fill", "override"] });
+  });
+
+  it("PR-T3 — the IPMI rows reuse the filterable selects and seed from the template fields", () => {
+    const seed = {
+      id: "t1",
+      name: "T",
+      fields: {
+        ipmiAuthProfileId: { mode: "fill" as const, value: "pa-1" },
+        ipmiGatewayServerId: { mode: "override" as const, value: "gw-1" }
+      }
+    };
+    const def = deviceTemplateFormDefinition(
+      seed,
+      [{ id: "gw-1", name: "Gateway 1" }],
+      [{ id: "pa-1", name: "P1", username: "u", authType: "agent" } as AuthProfile]
+    );
+    const ipmiAuth = field(def, "ipmiAuthProfileId") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(ipmiAuth.label).toBe("IPMI Auth Profile");
+    expect(ipmiAuth.filterable).toBe(true);
+    expect(ipmiAuth.advanced).toBe(false); // whole editor is main content (m13)
+    expect(ipmiAuth.value).toBe("pa-1");
+    // suppressCreate: no inline-create handler is wired for this editor's selects.
+    expect(ipmiAuth.options.some((o) => o.value.startsWith("__create__"))).toBe(false);
+
+    const ipmiGw = field(def, "ipmiGatewayServerId") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(ipmiGw.label).toBe("IPMI Gateway");
+    expect(ipmiGw.filterable).toBe(true);
+    expect(ipmiGw.advanced).toBe(false);
+    expect(ipmiGw.value).toBe("gw-1");
+    expect(ipmiGw.options).toContainEqual({ label: "Gateway 1", value: "gw-1" });
+
+    // Both mode selects seeded from the template.
+    expect((field(def, "mode_ipmiAuthProfileId") as Extract<FormFieldDescriptor, { type: "select" }>).value).toBe("fill");
+    expect((field(def, "mode_ipmiGatewayServerId") as Extract<FormFieldDescriptor, { type: "select" }>).value).toBe("override");
   });
 
   it("each mode select offers the three verbatim options and defaults to Not set", () => {
@@ -160,7 +198,9 @@ describe("shared short-label map (§7.3/§7.4)", () => {
       authProfileId: "Auth Profile",
       multiplexing: "Multiplexing",
       legacyAlgorithms: "Legacy Algorithms",
-      logSession: "Session Logging"
+      logSession: "Session Logging",
+      ipmiAuthProfileId: "IPMI Auth Profile",
+      ipmiGatewayServerId: "IPMI Gateway"
     });
     // templateAppliedFields returns the fields still carrying a template value,
     // and the tooltip renders them through the SAME map (proved by the labels).
