@@ -15,6 +15,7 @@ import {
   filterLabel,
   prepareTemplateRules,
   selectFieldWinners,
+  TEMPLATABLE_FIELD_ORDER,
   TEMPLATE_FIELD_SHORT_LABELS,
   type FieldProvenance,
   type PreparedRule,
@@ -3179,7 +3180,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // dead and are removed.
   if (provenanceByServer.size > 0) {
     const groups = new Map<string, { count: number; provenance: Partial<Record<TemplatableField, FieldProvenance>> }>();
-    const fieldOrder: TemplatableField[] = ["proxy", "authProfileId", "multiplexing", "legacyAlgorithms", "logSession"];
+    // The canonical field order, shared so a new templatable field (here the two
+    // PR-T3 IPMI id references) is never silently omitted from this report again —
+    // the former hand-maintained five-field literal collected IPMI provenance but
+    // never rendered it, and an IPMI-only write produced no provenance line at all.
+    const fieldOrder = TEMPLATABLE_FIELD_ORDER;
     for (const entry of provenanceByServer.values()) {
       const parts: string[] = [];
       for (const field of fieldOrder) {

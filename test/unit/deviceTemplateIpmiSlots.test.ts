@@ -4,6 +4,7 @@ import {
   clearTemplatedStamps,
   planManualTemplateApply,
   templateAppliedFields,
+  TEMPLATABLE_FIELD_ORDER,
   TEMPLATE_FIELD_SHORT_LABELS,
   type TemplatableField
 } from "../../src/services/inventory/templateApply";
@@ -411,6 +412,41 @@ describe("PR-T3 IPMI slots — model bookkeeping", () => {
   it("short labels exist", () => {
     expect(TEMPLATE_FIELD_SHORT_LABELS.ipmiAuthProfileId).toBe("IPMI Auth Profile");
     expect(TEMPLATE_FIELD_SHORT_LABELS.ipmiGatewayServerId).toBe("IPMI Gateway");
+  });
+});
+
+// ============================================================================
+// §3.4 sync-plan PROVENANCE report (PR #66 Codex round 2) — the two IPMI fields
+// must appear in the report's ordered enumeration, or an IPMI-only template write
+// is approved with no provenance line at all.
+// ============================================================================
+describe("PR-T3 IPMI slots — sync-plan provenance report", () => {
+  it("renders a provenance line for an IPMI-only template write (kills a report fieldOrder that omits the IPMI fields)", () => {
+    const t = template({
+      ipmiAuthProfileId: { mode: "fill", value: PA1.id },
+      ipmiGatewayServerId: { mode: "fill", value: GW1.id }
+    });
+    const p = plan({
+      source: makeSource({ templateRules: [rule(t.id)] }),
+      devices: [makeDevice()],
+      servers: [GW1],
+      templates: [t],
+      authProfiles: [PA1]
+    });
+    // A fresh add whose ONLY template writes are the two IPMI fields. Against the
+    // pre-fix five-field report order these produced NO provenance line at all
+    // (`parts` stayed empty → the server was skipped), hiding from the approver
+    // which template supplied the BMC links they are consenting to.
+    expect(p.warnings.some((w) => w.includes(`${TEMPLATE_FIELD_SHORT_LABELS.ipmiGatewayServerId} ← "T"`))).toBe(true);
+    expect(p.warnings.some((w) => w.includes(`${TEMPLATE_FIELD_SHORT_LABELS.ipmiAuthProfileId} ← "T"`))).toBe(true);
+  });
+
+  it("TEMPLATABLE_FIELD_ORDER covers every templatable field (kills a drifted ordered enumeration)", () => {
+    // The shared enumeration and the label map must name the same set; a field
+    // added to one but not the other is exactly the drift this fix removed.
+    expect([...TEMPLATABLE_FIELD_ORDER].sort()).toEqual(
+      (Object.keys(TEMPLATE_FIELD_SHORT_LABELS) as TemplatableField[]).sort()
+    );
   });
 });
 

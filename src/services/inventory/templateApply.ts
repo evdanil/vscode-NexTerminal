@@ -71,6 +71,27 @@ export const TEMPLATE_FIELD_SHORT_LABELS: Record<TemplatableField, string> = {
 };
 
 /**
+ * The canonical display ORDER of the templatable fields, shared by every surface
+ * that enumerates all of them in a fixed sequence — currently the §3.4 sync-plan
+ * provenance report. A single source of truth so a NEW templatable field can
+ * never be silently dropped from an ordered renderer again (PR-T3 / PR #66 Codex
+ * round 2: the report's hand-maintained `fieldOrder` still listed only the
+ * original five, so IPMI provenance was collected but never rendered — and an
+ * IPMI-only write produced no provenance line at all). Typed as the full
+ * `TemplatableField[]` so adding a member to the union without adding it here is
+ * a compile error via the exhaustiveness test.
+ */
+export const TEMPLATABLE_FIELD_ORDER: readonly TemplatableField[] = [
+  "proxy",
+  "authProfileId",
+  "multiplexing",
+  "legacyAlgorithms",
+  "logSession",
+  "ipmiAuthProfileId",
+  "ipmiGatewayServerId"
+];
+
+/**
  * The `origin.templated`-stamped fields, in the order the tooltip lists them —
  * every templatable field EXCEPT `authProfileId` (which stamps the shared
  * `syncedAuthProfileId`). The two IPMI id references (PR-T3) belong here: they
