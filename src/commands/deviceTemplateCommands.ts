@@ -27,6 +27,7 @@ import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { deviceTemplateFormDefinition, type ServerListEntry } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { ManagementListPanel, type ManagementListDescriptor } from "../ui/managementListPanel";
 import { FolderTreeItem } from "../ui/nexusTreeProvider";
 import { formValuesToProxy } from "./serverCommands";
 import { isDescendantOrSelf } from "../utils/folderPaths";
@@ -273,39 +274,37 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
   });
 }
 
-/** UX-M5 empty-state placeholder for the manage hub (never the legacy dead-end). */
+/**
+ * UX-M5 empty-state placeholder for the manage panel + the apply-picker's
+ * zero-template modal (never the legacy dead-end). Harmonized to the em-dash
+ * fragment voice the inventory panel's empty state uses ("No X yet — <do this>").
+ */
 const EMPTY_STATE_PLACEHOLDER =
-  "No device templates yet. A device template applies shared settings — proxy, auth profile, and more — to servers synced from inventory.";
+  "No device templates yet — apply shared settings like proxy and auth profile to servers synced from inventory.";
 
 /**
  * U3 (§7.1 CRUD, §6.2) — the confirm modal + `removeDeviceTemplate` wiring, using
  * the auth-profile delete idiom (a modal naming the template). Per §6.2 the record
  * is removed and every referencing `templateRules` entry cleared, but applied
  * VALUES and STAMPS already on servers are KEPT (reclaimable) — the modal says so.
+ *
+ * P0-2 — the caller (the `nexus.deviceTemplate.delete` command, dispatched by the
+ * Device Templates list panel's `delete` row) resolves the id to the live template
+ * and hands it in, so this flow is always given a concrete `target`: there is no
+ * "which template?" picker. The command is `when: false` (never in the palette) and
+ * its only caller no-ops on an unresolved id, so a no-arg entry is unreachable. All
+ * the revision + referencing-set refusal guards below still run — the panel is a
+ * presentation layer and weakens none of them.
  */
-async function deleteDeviceTemplateFlow(ctx: CommandContext): Promise<void> {
-  const templates = ctx.core.getSnapshot().deviceTemplates;
-  if (templates.length === 0) {
-    return;
-  }
-  const pick = await vscode.window.showQuickPick(
-    templates
-      .slice()
-      .sort((a, b) => naturalCompare(a.name, b.name))
-      .map((t) => ({ label: t.name, description: describeTemplateFields(t), template: t })),
-    { title: "Delete Device Template", placeHolder: "Select a device template to delete" }
-  );
-  if (!pick) {
-    return;
-  }
-  const referencing = sourcesReferencingTemplate(ctx, pick.template.id);
+async function deleteDeviceTemplateFlow(ctx: CommandContext, target: DeviceTemplateProfile): Promise<void> {
+  const referencing = sourcesReferencingTemplate(ctx, target.id);
   const sourceNote =
     referencing.length > 0
       ? ` It is cleared from ${referencing.length === 1 ? "1 inventory source's rules" : `${referencing.length} inventory sources' rules`}.`
       : "";
   const detail = `Values and stamps already applied to servers are kept — deleting removes only the template and its rules.${sourceNote}`;
   const confirm = await vscode.window.showWarningMessage(
-    `Delete device template "${pick.template.name}"?`,
+    `Delete device template "${target.name}"?`,
     { modal: true, detail },
     "Delete"
   );
@@ -330,10 +329,10 @@ async function deleteDeviceTemplateFlow(ctx: CommandContext): Promise<void> {
     // The picked template must still exist — a concurrent delete/reset could have
     // removed it while the confirm sat open. Name the change rather than silently
     // reporting a deletion of nothing.
-    const live = ctx.core.getDeviceTemplate(pick.template.id);
+    const live = ctx.core.getDeviceTemplate(target.id);
     if (live === undefined) {
       refusal =
-        `The device template "${pick.template.name}" was changed while the confirmation was open — nothing was deleted. ` +
+        `The device template "${target.name}" was changed while the confirmation was open — nothing was deleted. ` +
         "Reopen Manage Device Templates to review the current templates.";
       return;
     }
@@ -345,9 +344,9 @@ async function deleteDeviceTemplateFlow(ctx: CommandContext): Promise<void> {
     // minted fresh on every `addOrUpdateDeviceTemplate`, so it is the signal that the
     // record diverged from the one the modal named. This is the delete-side twin of
     // the round-2 edit-save revision guard (and the round-1 apply revision guard).
-    if (live.revision !== pick.template.revision) {
+    if (live.revision !== target.revision) {
       refusal =
-        `The device template "${pick.template.name}" was changed while the confirmation was open — nothing was deleted. ` +
+        `The device template "${target.name}" was changed while the confirmation was open — nothing was deleted. ` +
         "Run Delete again to review the current version.";
       return;
     }
@@ -356,55 +355,67 @@ async function deleteDeviceTemplateFlow(ctx: CommandContext): Promise<void> {
     // N sources' rules" disclosure untruthful — refuse and ask the user to re-run so
     // the disclosure is accurate (same divergence-refusal shape as the manual-apply
     // and auth-profile-delete guards).
-    if (!sameSourceIdSet(sourcesReferencingTemplate(ctx, pick.template.id), referencing)) {
+    if (!sameSourceIdSet(sourcesReferencingTemplate(ctx, target.id), referencing)) {
       refusal =
-        `What deleting "${pick.template.name}" would clear changed while the confirmation was open — nothing was deleted. ` +
+        `What deleting "${target.name}" would clear changed while the confirmation was open — nothing was deleted. ` +
         "Delete it again to review what it is referenced by now.";
       return;
     }
-    await ctx.core.removeDeviceTemplate(pick.template.id);
+    await ctx.core.removeDeviceTemplate(target.id);
   });
   if (refusal !== undefined) {
     void vscode.window.showWarningMessage(refusal);
     return;
   }
-  void vscode.window.showInformationMessage(`Device template "${pick.template.name}" deleted.`);
+  void vscode.window.showInformationMessage(`Device template "${target.name}" deleted.`);
 }
 
-async function manageDeviceTemplates(ctx: CommandContext): Promise<void> {
-  const templates = ctx.core.getSnapshot().deviceTemplates;
-  if (templates.length === 0) {
-    // Constructive placeholder + New button (UX-M5) — never "No X configured".
-    const choice = await vscode.window.showInformationMessage(EMPTY_STATE_PLACEHOLDER, "New Device Template");
-    if (choice === "New Device Template") {
-      openDeviceTemplateEditor(ctx);
-    }
-    return;
-  }
-  const NEW = "$(add) New Device Template";
-  const DELETE = "$(trash) Delete a Device Template…";
-  type ManageAction = "new" | "delete" | "edit";
-  const pick = await vscode.window.showQuickPick(
-    [
-      { label: NEW, action: "new" as ManageAction, template: undefined as DeviceTemplateProfile | undefined },
-      ...templates
-        .slice()
+/**
+ * The Device Templates list-panel descriptor (P0-3). Rows open the EXISTING
+ * seeded editor (`nexus.deviceTemplate.edit`) and delete through the parameterized
+ * flow (`nexus.deviceTemplate.delete`); the panel posts only closed action keys
+ * and this maps each to a command — no command name ever crosses the webview
+ * boundary. `signature()` folds in each template's `revision` (minted fresh on
+ * every save), so an in-place value edit re-renders the list live.
+ */
+function deviceTemplatesDescriptor(ctx: CommandContext): ManagementListDescriptor {
+  return {
+    viewType: "nexus.deviceTemplatesPanel",
+    title: "Device Templates",
+    nounSingular: "device template",
+    // No ellipsis: New opens the editor directly (no intermediate picker).
+    primaryLabel: "New Device Template",
+    emptyState: EMPTY_STATE_PLACEHOLDER,
+    list: () =>
+      ctx.core
+        .getSnapshot()
+        .deviceTemplates.slice()
         .sort((a, b) => naturalCompare(a.name, b.name))
-        .map((t) => ({ label: t.name, description: describeTemplateFields(t), action: "edit" as ManageAction, template: t as DeviceTemplateProfile | undefined })),
-      // U3 — a dedicated delete entry, so selecting a template row keeps its
-      // meaning (edit) and delete is an explicit, separately-confirmed choice.
-      { label: DELETE, action: "delete" as ManageAction, template: undefined as DeviceTemplateProfile | undefined }
-    ],
-    { title: "Manage Device Templates", placeHolder: "Select a device template to edit, create a new one, or delete one" }
-  );
-  if (!pick) {
-    return;
-  }
-  if (pick.action === "delete") {
-    await deleteDeviceTemplateFlow(ctx);
-    return;
-  }
-  openDeviceTemplateEditor(ctx, pick.template);
+        .map((t) => ({ id: t.id, name: t.name, description: describeTemplateFields(t), actions: ["edit", "delete"] })),
+    signature: () =>
+      ctx.core
+        .getSnapshot()
+        .deviceTemplates.map((t) => `${t.id}:${t.name}:${t.revision ?? ""}`)
+        .join("|"),
+    commandFor: (action) => {
+      switch (action) {
+        case "new":
+          return "nexus.deviceTemplate.add";
+        case "delete":
+          return "nexus.deviceTemplate.delete";
+        default:
+          // "edit" (row-click / name-button default). Other keys never reach here
+          // for this kind (the rows never render them).
+          return "nexus.deviceTemplate.edit";
+      }
+    }
+  };
+}
+
+function manageDeviceTemplates(ctx: CommandContext): void {
+  // UX-M5 — the panel's own empty state carries the constructive New affordance,
+  // so there is no separate zero-template branch here anymore.
+  ManagementListPanel.open(ctx.core, deviceTemplatesDescriptor(ctx));
 }
 
 /**
@@ -954,6 +965,38 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
   return [
     vscode.commands.registerCommand("nexus.deviceTemplate.add", () => {
       openDeviceTemplateEditor(ctx);
+    }),
+
+    // P0-1 — id-taking edit for the list panel's `edit` row. Resolves the id to
+    // the LIVE template and opens the seeded editor; a missing id (deleted between
+    // render and click) is a no-op — the panel re-renders on the next change.
+    vscode.commands.registerCommand("nexus.deviceTemplate.edit", (arg?: unknown) => {
+      const id = typeof arg === "string" ? arg : undefined;
+      const template = id ? ctx.core.getSnapshot().deviceTemplates.find((t) => t.id === id) : undefined;
+      if (template) {
+        openDeviceTemplateEditor(ctx, template);
+      } else if (id) {
+        // P3-8 — a vanished id (deleted between render and click) tells the user
+        // rather than silently doing nothing, matching the inventory siblings'
+        // "That inventory source no longer exists." acknowledgement.
+        void vscode.window.showInformationMessage("That device template no longer exists.");
+      }
+    }),
+
+    // P0-2 — id-taking delete for the list panel's `delete` row. Resolves the id
+    // to the LIVE template and routes to the parameterized flow (no second picker),
+    // preserving every revision + referencing-set guard.
+    vscode.commands.registerCommand("nexus.deviceTemplate.delete", (arg?: unknown) => {
+      const id = typeof arg === "string" ? arg : undefined;
+      const template = id ? ctx.core.getSnapshot().deviceTemplates.find((t) => t.id === id) : undefined;
+      if (template) {
+        return deleteDeviceTemplateFlow(ctx, template);
+      }
+      if (id) {
+        // P3-8 — same vanished-id acknowledgement as the edit command above.
+        void vscode.window.showInformationMessage("That device template no longer exists.");
+      }
+      return undefined;
     }),
 
     vscode.commands.registerCommand("nexus.deviceTemplate.manage", () => manageDeviceTemplates(ctx)),

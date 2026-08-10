@@ -75,7 +75,7 @@ export class AuthProfileEditorPanel {
     this.lastProfileSignature = profileSignature(core.getSnapshot().authProfiles);
     this.panel = vscode.window.createWebviewPanel(
       "nexus.authProfileEditor",
-      "Auth Profile Editor",
+      "Auth Profiles",
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
@@ -118,7 +118,7 @@ export class AuthProfileEditorPanel {
     AuthProfileEditorPanel.instance = new AuthProfileEditorPanel(core, secretVault, null);
   }
 
-  private render(): void {
+  private render(justSavedName?: string): void {
     if (this.disposed) return;
     const nonce = createWebviewNonce();
     const profiles = this.core.getSnapshot().authProfiles;
@@ -127,7 +127,11 @@ export class AuthProfileEditorPanel {
       this.selectedId = profiles.length > 0 ? profiles[0].id : null;
     }
     this.lastProfileSignature = profileSignature(profiles);
-    this.panel.webview.html = renderAuthProfileEditorHtml(profiles, this.selectedId, nonce);
+    // `justSavedName` bakes the "✓ Saved" indicator into the fresh HTML. It is set
+    // ONLY by the save handler — the reload from `render()` would otherwise outrun
+    // a post-render `postMessage`, which is why the old `{type:"saved"}` signal was
+    // invisible. External re-renders (onDidChange, profile switch) pass nothing.
+    this.panel.webview.html = renderAuthProfileEditorHtml(profiles, this.selectedId, nonce, justSavedName);
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -262,8 +266,12 @@ export class AuthProfileEditorPanel {
           }
 
           this.selectedId = savedId ?? this.selectedId;
-          this.render();
-          void this.panel.webview.postMessage({ type: "saved" });
+          // Keep the panel open (a persistent multi-record editor) but signal the
+          // save clearly: an in-panel "✓ Saved" indicator baked into this render,
+          // plus a host toast. Before this, save re-rendered to an identical clean
+          // form with no confirmation — indistinguishable from "nothing happened".
+          this.render(name);
+          void vscode.window.showInformationMessage(`Auth profile "${name}" saved.`);
           break;
         }
         case "delete": {

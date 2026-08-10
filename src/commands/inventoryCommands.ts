@@ -38,6 +38,8 @@ import {
 import { inventoryConfigFieldPrefixedKey, inventorySourceFormDefinition, resolveSubmittedTemplateRules } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { ManagementListPanel, type ManagementListDescriptor } from "../ui/managementListPanel";
+import { naturalCompare } from "../utils/naturalCompare";
 import type { TemplateRule } from "../models/inventory";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { mostCommonUsername } from "./configCommands";
@@ -4294,68 +4296,70 @@ export function registerInventoryCommands(
   }
 
   /**
-   * nexus.inventory.manage — the Settings-tree hub (Settings ▸ Inventory
-   * Sources). Two-level plain showQuickPick that ROUTES into the four
-   * existing, race-guarded commands rather than reimplementing any of them:
-   * no new persistence, no new webview, no new critical section. Level 2
-   * dispatches through vscode.commands.executeCommand (never the local
-   * function) so hub, palette and keybinding invocations share one path — and
-   * always with the source id, so the target command never re-opens a picker
-   * the user has already answered.
+   * The Inventory Sources list-panel descriptor. Each row's actions dispatch the
+   * SAME four existing, race-guarded commands the QuickPick hub dispatched — no
+   * new persistence, no new critical section; the panel adds no busy-marker of its
+   * own and relies entirely on `inFlightSourceIds` in the target commands. The
+   * webview posts only closed action keys, and this maps each to a command per
+   * kind (P0-3), always with the source id, so the target command never re-opens a
+   * picker the user has already answered.
+   *
+   * `signature()` folds in each source's last-sync timestamp so a completed sync
+   * re-renders the "synced Nm ago" line; `onDidChangeViewState` additionally
+   * freshens the relative phrasing whenever the tab becomes visible.
    *
    * Deliberately NOT here: a "Reapply auth to synced servers" row. Retro-apply
    * belongs to the sync plan preview and its confirm modal; a second bulk
    * mutation path bypassing that preview is exactly the rejected option C.
    */
-  async function manageSources(): Promise<void> {
-    const sources = core.getSnapshot().inventorySources;
-
-    interface SourceHubItem extends vscode.QuickPickItem {
-      source?: InventorySourceConfig;
-      addSource?: boolean;
-    }
-    const rows: SourceHubItem[] = sources.map((source) => ({
-      label: source.name,
-      description: sourceDescription(source, registry),
-      source
-    }));
-    if (rows.length > 0) {
-      rows.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
-    }
-    rows.push({ label: "$(add) Add Inventory Source…", addSource: true });
-
-    const picked = await vscode.window.showQuickPick(rows, {
+  function inventorySourcesDescriptor(): ManagementListDescriptor {
+    return {
+      viewType: "nexus.inventorySourcesPanel",
       title: "Inventory Sources",
-      // Empty state stays INSIDE the picker: the user is already mid-gesture,
-      // so the add row is the affordance and pickInventorySource's M2d warning
-      // toast ("No inventory sources configured. Add one first.") would be a
-      // dead-end interruption here. That toast still serves the direct
-      // command paths.
-      placeHolder:
-        sources.length === 0
-          ? "No inventory sources yet — add one to sync servers from your infrastructure"
-          : "Choose a source to sync, edit, or remove"
-    });
-    if (!picked) return;
-    if (picked.addSource) {
-      await vscode.commands.executeCommand("nexus.inventory.addSource");
-      return;
-    }
-    const source = picked.source;
-    if (!source) return;
+      nounSingular: "inventory source",
+      // Ellipsis: New runs the add-source wizard, whose provider pick is an
+      // intermediate picker (the only "New …" that earns the ellipsis).
+      primaryLabel: "New Inventory Source…",
+      emptyState: "No inventory sources yet — add one to sync servers from your infrastructure.",
+      list: () =>
+        core
+          .getSnapshot()
+          .inventorySources.slice()
+          .sort((a, b) => naturalCompare(a.name, b.name))
+          .map((source) => ({
+            id: source.id,
+            name: source.name,
+            description: sourceDescription(source, registry),
+            actions: ["sync", "edit", "rules", "remove"]
+          })),
+      signature: () =>
+        core
+          .getSnapshot()
+          .inventorySources.map((s) => `${s.id}:${s.name}:${s.providerId}:${s.lastSyncAt ?? ""}`)
+          .join("|"),
+      commandFor: (action) => {
+        switch (action) {
+          case "new":
+            return "nexus.inventory.addSource";
+          case "sync":
+            return "nexus.inventory.syncNow";
+          case "edit":
+            return "nexus.inventory.editSource";
+          case "rules":
+            return "nexus.deviceTemplate.editRules";
+          default:
+            // "remove"
+            return "nexus.inventory.removeSource";
+        }
+      },
+      // sourceDescription embeds a relative "synced N ago" phrase that ages with
+      // wall-clock time, so keep it fresh while the tab sits visible (Codex R2).
+      refreshWhileVisible: true
+    };
+  }
 
-    interface SourceActionItem extends vscode.QuickPickItem {
-      commandId: string;
-    }
-    const actions: SourceActionItem[] = [
-      { label: "$(sync) Sync Now", description: "Fetch devices and preview changes", commandId: "nexus.inventory.syncNow" },
-      { label: "$(edit) Edit…", description: "Change settings, credentials, or the auth profile", commandId: "nexus.inventory.editSource" },
-      { label: "$(list-tree) Edit Template Rules…", description: "Attach device templates to filtered subsets of devices", commandId: "nexus.deviceTemplate.editRules" },
-      { label: "$(trash) Remove…", description: "Choose what happens to its synced servers", commandId: "nexus.inventory.removeSource" }
-    ];
-    const action = await vscode.window.showQuickPick(actions, { title: source.name });
-    if (!action) return;
-    await vscode.commands.executeCommand(action.commandId, source.id);
+  function manageSources(): void {
+    ManagementListPanel.open(core, inventorySourcesDescriptor());
   }
 
   return [

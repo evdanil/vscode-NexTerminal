@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.8.177] — 2026-08-10
+
+### Fixed
+
+- **Management-panel polish (Device Templates / Inventory Sources tabs).** A narrow panel no longer clips a source's right-most action — the row's action buttons wrap under the name instead. Re-opening a panel that is already the active tab now refreshes it (so a source's "synced N ago" line is current, not stale). Keyboard focus restores to the exact button you were on after the list refreshes, and clicking a row action whose record was deleted a moment earlier now says so rather than doing nothing silently.
+
+## [2.8.176] — 2026-08-10
+
+### Changed
+
+- **Device Templates and Inventory Sources now open as management tabs, matching Auth Profiles.** `Settings ▸ Device Templates` and `Settings ▸ Inventory Sources` previously dropped into a Quick Pick menu while `Settings ▸ Auth Profiles` opened a proper editor tab — an inconsistency. Both now open a list panel in a tab: every template (or source) is a row showing what it configures, with its actions right there on the row — Edit and Delete for a template; Sync Now, Edit, Template Rules, and Remove for a source. Click a row (or press Enter) to edit it; the destructive action sits apart from the rest to prevent a misclick. The list refreshes live as things change, and every underlying confirmation, busy-check, and sync-plan preview is exactly as before — the panel only presents them. Editing still opens the same form, which still closes and confirms on save. Rows are sorted by name, long names and descriptions are kept on one line with the full text on hover, and the panels are fully keyboard- and screen-reader-navigable.
+
+### Fixed
+
+- **The Auth Profiles editor tab now carries the same header anatomy as the other Settings tabs** — its tab is titled "Auth Profiles" (matching its Settings entry) with a heading at the top, and its **Delete** button is separated from **Save** so the two are not adjacent.
+
+## [2.8.175] — 2026-08-10
+
+### Fixed
+
+- **Saving a macro now visibly confirms the save, matching the auth-profile editor.** The Macro editor keeps its panel open after **Save** (so you can edit several in a row) but, like the auth-profile editor before it, gave no sign the save landed — the same silent re-render that read as "nothing happened," for the same reason (its one success signal was posted after the webview reload and lost the race). Save now shows a green **"✓ Saved"** indicator beside the Save button — baked into the render so it can't be lost — fading after a few seconds or the moment you edit again, plus a notification naming the macro. Save-success feedback is now consistent across every editor reached from Settings: the ones that stay open (auth profiles, macros) show the indicator, and the ones that close on save (device templates, inventory sources) confirm with their existing toast.
+
+## [2.8.174] — 2026-08-10
+
+### Fixed
+
+- **Saving an auth profile now visibly confirms the save.** The Auth Profile editor kept the panel open after **Save** — the right choice for editing several profiles in a row — but gave no sign the save had happened: it re-rendered to an identical clean form, which read as "nothing happened, maybe it's broken." (Under the hood the one success signal it did send was posted *after* a full webview reload, so it raced the reload and never showed.) Save now confirms clearly and still leaves the panel open: a green **"✓ Saved"** indicator appears beside the Save button — baked into the render so it can't be lost to the reload — and fades after a few seconds or the moment you start editing again, alongside a notification naming the profile that was saved.
+
+## [2.8.173] — 2026-08-10
+
+### Added
+
+- **Device templates apply a shared bundle of connection settings to the servers a sync creates.** Until now an inventory sync brought in a device's identity — its address, name, folder, and a single source-wide SSH auth profile — and nothing else, so a proxy, session logging, a multiplexing choice, a legacy-algorithm toggle, or a BMC login had to be set on every synced server by hand. A **device template** is a named, reusable bundle of exactly those settings — **Proxy**, **Auth Profile** (the SSH one), **Multiplexing**, **Legacy Algorithms**, **Session Logging**, **IPMI Auth Profile**, and **IPMI Gateway** (the server ipmitool runs on) — that the sync applies to matched devices and keeps current. Create and edit them with **New Device Template** / **Manage Device Templates** from the Command Palette or the settings hub; each field is tri-state — **Not set**, **Fill** (write only where nothing is set), or **Override** (replace source data and earlier-synced values) — and a template never holds secrets, so a proxy still prompts for its password on first connect. Bind a template to a source's devices with **Edit Template Rules**: a rule is a filter like `role=switch&site=syd` (keys `role, site, location, rack, tenant, status, platform, tag, name`; a repeated key is OR, distinct keys are AND, an empty filter matches every device) pointing at a template, and a source's own form also offers a single **Device Template** select that applies one template to everything it syncs. Where several rules match one device the settings **cascade per field** — the most specific rule wins each setting *it* sets, while broader rules still supply the rest, and the order you added the rules in never decides it. The three ownership rules the out-of-band IP sync already follows hold here too: **your own edits win** (a template never changes a value you set by hand), **clearing a template-applied value opts that server out** so it is not re-applied, and **changes apply on each source's next sync, not immediately**. Deleting a template leaves the values it already applied in place. **Apply Device Template** on a folder's right-click menu applies one to the servers under it straight away, outside a sync — and, because you asked for it there, the values it writes count as your own edits that later syncs will not touch, which is also how you replace a pre-template hand value that Override deliberately leaves alone.
+- **A server can carry a second SSH address, and Nexus tries the other one when the first can't be reached.** A new **Alternate host** field (Advanced section of the server form) holds a second address — typically the IPv6 to the primary Host's IPv4, or the reverse, though it is any address at all. When a terminal can't reach the primary Host at the connection level — no route to it, connection refused, timed out, or a name that won't resolve — Nexus retries once against the alternate, and the terminal banner names the address that won. It falls back **only** on those transport-level failures: an authentication, host-key, key, or proxy failure is never retried on the other address, because it would fail there the same way and could cost a second credential prompt or trip a lockout. The scope is the **SSH terminal target only** — tunnels, jump hosts, and the connection pool stay on the primary Host in this release.
+- **NetBox sync can choose which IP family is primary, and imports the other as the alternate.** A source's new **Primary IP Family** setting — **Automatic (NetBox primary IP)** (IPv6 when a device has both, matching the previous behaviour), **Prefer IPv4**, or **Prefer IPv6** — decides which address fills a synced server's Host. When a device carries both families, the *other* family's primary IP is written into **Alternate host** automatically, so a synced server arrives ready to fall back from one stack to the other with nothing typed by hand. The alternate is sync-owned exactly like every other synced field: an address you type into Alternate host yourself is never overwritten, clearing it is a per-server opt-out later syncs respect, and a device that stops reporting a second family keeps its last known alternate rather than having it erased. The out-of-band (BMC) address is unaffected by the family choice.
+
 ## [2.8.100] — 2026-08-09
 
 ### Added

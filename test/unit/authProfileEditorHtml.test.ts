@@ -14,6 +14,19 @@ describe("renderAuthProfileEditorHtml", () => {
     expect(html).toContain(`nonce-${nonce}`);
   });
 
+  it("shows the '✓ Saved' indicator ONLY when a just-saved name is passed", () => {
+    const profiles: AuthProfile[] = [{ id: "ap1", name: "Prod", username: "root", authType: "password" }];
+    // No justSavedName → indicator present in markup but NOT visible.
+    const idle = renderAuthProfileEditorHtml(profiles, "ap1", nonce);
+    expect(idle).toContain('id="save-flag"');
+    expect(idle).not.toMatch(/class="save-indicator visible"/);
+    // justSavedName set → indicator rendered visible (baked in, not a post-render
+    // message that would race the webview reload), plus the auto-hide timer.
+    const saved = renderAuthProfileEditorHtml(profiles, "ap1", nonce, "Prod");
+    expect(saved).toMatch(/class="save-indicator visible"[^>]*id="save-flag"/);
+    expect(saved).toContain("setTimeout(hideSaveFlag");
+  });
+
   it("renders auth type options", () => {
     const html = render();
     expect(html).toContain('data-value="password"');

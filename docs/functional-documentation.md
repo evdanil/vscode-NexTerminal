@@ -382,6 +382,15 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexus.authProfile.add`, `nexus.authProfile.manage`
 - `nexus.authProfile.applyToFolder`, `nexus.authProfile.applyToServer`
 
+**Inventory (NetBox):**
+- `nexus.inventory.addSource`, `nexus.inventory.editSource`, `nexus.inventory.removeSource`
+- `nexus.inventory.syncNow`, `nexus.inventory.manage`
+
+**Device Template:**
+- `nexus.deviceTemplate.add` (New Device Template), `nexus.deviceTemplate.manage` (Manage Device Templates)
+- `nexus.deviceTemplate.editRules` (Edit Template Rules — filter→template bindings on a source)
+- `nexus.deviceTemplate.applyToFolder` (Apply Device Template — immediate folder apply; written values become hand-owned)
+
 **Macros:**
 - `nexus.macro.editor`
 - `nexus.macro.add`, `nexus.macro.addFromTemplate`, `nexus.macro.openDocs`, `nexus.macro.edit`, `nexus.macro.remove`

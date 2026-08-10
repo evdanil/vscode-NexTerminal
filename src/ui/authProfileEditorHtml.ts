@@ -7,7 +7,8 @@ import { renderWebviewDocument } from "./shared/webviewDocument";
 export function renderAuthProfileEditorHtml(
   profiles: AuthProfile[],
   selectedId: string | null,
-  nonce: string
+  nonce: string,
+  justSavedName?: string
 ): string {
   const profile = selectedId !== null ? profiles.find((p) => p.id === selectedId) : undefined;
 
@@ -71,6 +72,16 @@ export function renderAuthProfileEditorHtml(
     .dirty-indicator.visible {
       display: inline;
     }
+    .save-indicator {
+      display: none;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--vscode-testing-iconPassed, #2ea043);
+      margin-left: 4px;
+    }
+    .save-indicator.visible {
+      display: inline;
+    }
     .browse-row {
       display: flex;
       gap: 6px;
@@ -85,7 +96,8 @@ export function renderAuthProfileEditorHtml(
     .conditional-field.visible {
       display: block;
     }`,
-    body: `  <div class="form-group">
+    body: `  <h2>Auth Profiles</h2>
+  <div class="form-group">
     <label>Auth Profile</label>
     <div class="custom-select" id="profile-selector">
       <input type="hidden" id="profile-select-value" value="${hiddenValue}" />
@@ -141,9 +153,10 @@ export function renderAuthProfileEditorHtml(
 
   <div class="bottom-actions">
     <button type="button" class="btn-primary" id="save-btn">${escapeHtml(saveLabel)}</button>
-    <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
+    <span class="save-indicator${justSavedName ? " visible" : ""}" id="save-flag" role="status" aria-live="polite">✓ Saved</span>
     <div class="spacer"></div>
     <button type="button" class="btn-secondary" id="new-btn">New Profile</button>
+    <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
   </div>
 `,
     script: `    ${baseWebviewJs()}
@@ -151,8 +164,23 @@ export function renderAuthProfileEditorHtml(
       var vscode = acquireVsCodeApi();
       var dirty = false;
       var currentId = ${selectedId !== null ? JSON.stringify(selectedId) : "null"};
+      var saveFlag = document.getElementById("save-flag");
+
+      function hideSaveFlag() {
+        if (saveFlag) {
+          saveFlag.classList.remove("visible");
+        }
+      }
+
+      // A save just landed (baked into this render): show "✓ Saved" briefly, then
+      // fade it. Editing again clears it immediately so a stale "Saved" never sits
+      // next to unsaved changes.
+      if (saveFlag && saveFlag.classList.contains("visible")) {
+        setTimeout(hideSaveFlag, 3500);
+      }
 
       function markDirty() {
+        hideSaveFlag();
         if (!dirty) {
           dirty = true;
           document.getElementById("dirty-flag").classList.add("visible");

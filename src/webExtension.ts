@@ -133,6 +133,8 @@ const unsupportedCommands = [
   "nexus.authProfile.applyToServer",
   "nexus.deviceTemplate.add",
   "nexus.deviceTemplate.manage",
+  "nexus.deviceTemplate.edit",
+  "nexus.deviceTemplate.delete",
   "nexus.deviceTemplate.applyToFolder",
   "nexus.deviceTemplate.editRules",
   "nexus.savedFilter.manage",
