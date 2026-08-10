@@ -204,15 +204,50 @@ export function macroRunTargetLabel(target: MacroRunTarget): string {
 }
 
 /**
- * The `[Local terminal] ` / `[Browser] ` prefix pickers put in front of a
- * macro's description, and `""` for an ordinary session macro. One definition
- * so every picker that lists macros badges them identically — a macro that will
- * open a browser window instead of typing into the terminal is exactly the
- * thing a list of macros must not hide.
+ * Where a macro RUNS, route-aware, for launch-surface display (issue #48 PR-C).
+ * A `localTerminal` macro with `route: "ipmiGateway"` does not run on this
+ * machine — it runs in the target server's IPMI-gateway SSH session — so the
+ * badge and the sidebar tooltip must not say "Local terminal" and hide that
+ * execution-host change at selection time. The DECLARED route is what shows: a
+ * routed macro that falls back to local at run time (no gateway configured) is
+ * still gateway-INTENDED, which is what a launch surface should reflect (the
+ * fall-back note covers the runtime reality). Every other target is unaffected —
+ * `route` is meaningless off a local terminal.
+ *
+ * Wording follows the editor's "Run on" select (`src/ui/macroEditorHtml.ts`) so
+ * the editor, the badge, and the tooltip cannot drift.
  */
-export function macroRunTargetBadge(macro: Pick<TerminalMacro, "runIn">): string {
+export function macroRunPlacementLabel(macro: Pick<TerminalMacro, "runIn" | "route">): string {
   const target = resolveMacroRunTarget(macro);
-  return target === "session" ? "" : `[${macroRunTargetLabel(target)}] `;
+  if (target === "localTerminal" && resolveMacroRoute(macro) === "ipmiGateway") {
+    return "the server's IPMI gateway (falls back to this machine)";
+  }
+  return macroRunTargetLabel(target);
+}
+
+/** Whether a macro's placement is the gateway-routed case, so a caller can pick
+ * the "Runs on:" preposition (a gateway is a place a run runs ON) over the
+ * "Runs in:" the other targets read with. Route is meaningful only on a local
+ * terminal, so every other target answers false. */
+export function macroRunsOnGateway(macro: Pick<TerminalMacro, "runIn" | "route">): boolean {
+  return resolveMacroRunTarget(macro) === "localTerminal" && resolveMacroRoute(macro) === "ipmiGateway";
+}
+
+/**
+ * The `[Local terminal] ` / `[Browser] ` / `[IPMI gateway] ` prefix pickers put
+ * in front of a macro's description, and `""` for an ordinary session macro. One
+ * definition so every picker that lists macros badges them identically — a macro
+ * that will open a browser window, or run on a bastion instead of this machine,
+ * is exactly the thing a list of macros must not hide. Route-aware
+ * (`Pick<…, "runIn" | "route">`): a gateway-routed `localTerminal` macro badges
+ * as the SHORT `[IPMI gateway] ` rather than `[Local terminal] `.
+ */
+export function macroRunTargetBadge(macro: Pick<TerminalMacro, "runIn" | "route">): string {
+  const target = resolveMacroRunTarget(macro);
+  if (target === "session") {
+    return "";
+  }
+  return macroRunsOnGateway(macro) ? "[IPMI gateway] " : `[${macroRunTargetLabel(target)}] `;
 }
 
 /**

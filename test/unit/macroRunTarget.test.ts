@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   MACRO_ROUTES,
   MACRO_RUN_TARGETS,
+  macroRunPlacementLabel,
+  macroRunTargetBadge,
   macroRunTargetLabel,
   resolveMacroRoute,
   resolveMacroRunTarget,
@@ -71,5 +73,58 @@ describe("macroRunTargetLabel", () => {
   it("names every target distinctly", () => {
     const labels = MACRO_RUN_TARGETS.map(macroRunTargetLabel);
     expect(new Set(labels).size).toBe(MACRO_RUN_TARGETS.length);
+  });
+});
+
+describe("macroRunTargetBadge (route-aware, issue #48 PR-C)", () => {
+  it("badges a gateway-routed local-terminal macro as [IPMI gateway], not [Local terminal]", () => {
+    // The round-8 P2: a localTerminal macro with route:ipmiGateway runs on the
+    // target server's IPMI gateway session, but the launch pickers used to badge
+    // it `[Local terminal] ` (derived from runIn only), hiding the execution host.
+    // Red against 3c38972 (which returns `[Local terminal] `), green after.
+    expect(macroRunTargetBadge({ runIn: "localTerminal", route: "ipmiGateway" })).toBe("[IPMI gateway] ");
+  });
+
+  it("keeps [Local terminal] for a local-terminal macro with no route or route:local", () => {
+    expect(macroRunTargetBadge({ runIn: "localTerminal" })).toBe("[Local terminal] ");
+    expect(macroRunTargetBadge({ runIn: "localTerminal", route: "local" })).toBe("[Local terminal] ");
+  });
+
+  it("reads an untrusted route as local, so a corrupt record still badges [Local terminal]", () => {
+    // Route flows through resolveMacroRoute, so "IPMIGATEWAY"/7 can never promote
+    // a badge to the gateway form — the same untrusted-field discipline the run
+    // path uses (a direct `===` read is the bug this guards).
+    expect(macroRunTargetBadge({ runIn: "localTerminal", route: "IPMIGATEWAY" as never })).toBe("[Local terminal] ");
+  });
+
+  it("leaves session (empty), browser, and route on a non-local target unchanged", () => {
+    expect(macroRunTargetBadge({ runIn: "session" })).toBe("");
+    expect(macroRunTargetBadge({})).toBe("");
+    expect(macroRunTargetBadge({ runIn: "browser" })).toBe("[Browser] ");
+    // route is meaningless off a local terminal — a browser macro carrying it is
+    // still badged [Browser], never the gateway form.
+    expect(macroRunTargetBadge({ runIn: "browser", route: "ipmiGateway" })).toBe("[Browser] ");
+    expect(macroRunTargetBadge({ runIn: "session", route: "ipmiGateway" })).toBe("");
+  });
+});
+
+describe("macroRunPlacementLabel (route-aware tooltip label, issue #48 PR-C)", () => {
+  it("names the gateway placement for a routed local-terminal macro", () => {
+    // The sidebar tooltip must not say "Local terminal" for a gateway-routed
+    // macro. Red against 3c38972 (no such helper / plain "Local terminal"), green
+    // after. Wording matches the editor "Run on" select.
+    expect(macroRunPlacementLabel({ runIn: "localTerminal", route: "ipmiGateway" })).toBe(
+      "the server's IPMI gateway (falls back to this machine)"
+    );
+  });
+
+  it("keeps the plain run-target labels for every other placement", () => {
+    expect(macroRunPlacementLabel({ runIn: "localTerminal" })).toBe("Local terminal");
+    expect(macroRunPlacementLabel({ runIn: "localTerminal", route: "local" })).toBe("Local terminal");
+    expect(macroRunPlacementLabel({ runIn: "browser" })).toBe("Browser");
+    expect(macroRunPlacementLabel({})).toBe("Session terminal");
+    // Declared route is what shows — a routed macro whose gateway is missing at
+    // run time is still gateway-INTENDED here; the fall-back note covers runtime.
+    expect(macroRunPlacementLabel({ runIn: "browser", route: "ipmiGateway" })).toBe("Browser");
   });
 });

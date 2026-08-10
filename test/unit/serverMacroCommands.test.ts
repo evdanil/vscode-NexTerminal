@@ -201,6 +201,18 @@ describe("buildServerMacroPicks", () => {
     const macros: TerminalMacro[] = [{ id: "a", name: "BMC", text: "https://x/", runIn: "browser" }];
     expect(buildServerMacroPicks(macros, server())[0].description).toContain("[Browser]");
   });
+
+  it("badges a gateway-routed local-terminal macro as [IPMI gateway], not [Local terminal] (issue #48 PR-C)", () => {
+    // The picker passes the whole macro, so the route-aware badge surfaces the
+    // execution host. Against 3c38972 this read `[Local terminal] `, hiding the
+    // gateway run at selection time.
+    const macros: TerminalMacro[] = [
+      { id: "a", name: "SOL", text: "ipmitool -E sol activate\n", runIn: "localTerminal", route: "ipmiGateway" }
+    ];
+    const description = buildServerMacroPicks(macros, server())[0].description;
+    expect(description).toContain("[IPMI gateway]");
+    expect(description).not.toContain("[Local terminal]");
+  });
 });
 
 describe("nexus.server.runMacro — dispatch", () => {
@@ -1779,6 +1791,43 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 '-E' sol activate\n"]);
   });
 
+  it("WARNS on a gateway command whose `-E` is glued to a redirection (`-E>/tmp/log`), Codex round 8 P2", async () => {
+    // `ipmitool -E>/tmp/ipmi.log …`: the shell reads `-E` as a standalone flag and
+    // `>` as redirection, so ipmitool still gets a bare `-E` and still fails on the
+    // bastion with no env. Round 7's `(?=[\s'"]|$)` lookahead returned false for
+    // `-E>` → no warning → red against 3c38972, green after closing the class.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      {
+        id: "a",
+        name: "SOL",
+        text: " ipmitool -H ${profile.ipmiHost} -E>/tmp/ipmi.log chassis power status\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway",
+        provideIpmiCredentials: true
+      }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    // The over-promising inert copy is REPLACED, not doubled.
+    expect(status).not.toContain("prompts on the gateway via its `-a` form instead");
+    // Delivered to the gateway verbatim — the redirection is preserved in the text.
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -E>/tmp/ipmi.log chassis power status\n"]);
+  });
+
   it("does NOT emit the `-E` warning for an `-a` gateway command — that gets the (accurate) inert note", async () => {
     const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
     const gateway = server({ id: "gw-1", name: "Bastion" });
@@ -1893,6 +1942,18 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
     expect(commandReadsIpmiEnv("ipmitool sol activate -E\n")).toBe(true);
   });
 
+  it("matches a compact `-E` bounded by a shell metacharacter, not just whitespace/quote (Codex round 8 P2)", () => {
+    // The shell treats `-E` as a standalone flag and the following metacharacter
+    // as its own token, so ipmitool still receives a bare `-E`. Round 7's
+    // `(?=[\s'"]|$)` accepted only whitespace/quote/end and returned false for
+    // `-E>` etc. — red against 3c38972, green after closing the terminator class.
+    expect(commandReadsIpmiEnv("ipmitool -E>/tmp/ipmi.log chassis power status")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -E</dev/null sol")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -E;echo done")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -E|tee log")).toBe(true);
+    expect(commandReadsIpmiEnv("(ipmitool -E)")).toBe(true);
+  });
+
   it("matches a `-E` on a backslash-CONTINUED line of the ipmitool command (Codex round 6 P2)", () => {
     // A backslash-newline joins the lines into one command; the continued `-E` is
     // still an ipmitool argument. Round 5's `[^;&|\n]*` stopped at the newline and
@@ -1944,9 +2005,20 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
     expect(commandReadsIpmiEnv("ipmitool -Example sol")).toBe(false);
     expect(commandReadsIpmiEnv("foo-E bar")).toBe(false);
     expect(commandReadsIpmiEnv("ipmitool -Env")).toBe(false);
-    // A quoted `-Example` must not match either — the char after -E is `x`, so the
-    // trailing `[\s'"]|$` lookahead rejects it (Codex round 7 P2).
+    // A quoted `-Example` must not match either — the char after -E is `x`, a
+    // word-continuation char, so the trailing negative lookahead rejects it
+    // (Codex round 7/8 P2).
     expect(commandReadsIpmiEnv("ipmitool '-Example'")).toBe(false);
+  });
+
+  it("does NOT match a `-E` immediately glued to a word-continuation char (`=`/`/`), Codex round 8 P2", () => {
+    // `-E=foo` and `-E/path` are single ipmitool tokens, NOT a standalone `-E`
+    // followed by a redirection — the char after -E (`=`/`/`) is a
+    // word-continuation char, so the closed terminator class rejects them. This
+    // is the pair the round-8 lookahead must NOT over-accept while it starts
+    // accepting `-E>`.
+    expect(commandReadsIpmiEnv("ipmitool -E=foo sol")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -E/path sol")).toBe(false);
   });
 
   it("does NOT match a QUOTED `-E` owned by a wrapper before ipmitool (round 7 P2)", () => {

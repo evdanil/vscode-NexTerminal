@@ -140,6 +140,18 @@ describe("MacroTreeItem", () => {
     expect(session.tooltip).not.toContain("Runs in:");
   });
 
+  it("names the IPMI gateway placement in the tooltip for a routed local-terminal macro (issue #48 PR-C)", () => {
+    // A localTerminal macro with route:ipmiGateway runs on the target server's
+    // IPMI gateway session, not this machine. Against 3c38972 the tooltip read
+    // "Runs in: Local terminal", hiding the execution host — red there, green now.
+    const routed = new MacroTreeItem(
+      { name: "SOL", text: "ipmitool\n", runIn: "localTerminal", route: "ipmiGateway" },
+      0
+    );
+    expect(routed.tooltip).toContain("Runs on: the server's IPMI gateway (falls back to this machine)");
+    expect(routed.tooltip).not.toContain("Runs in: Local terminal");
+  });
+
   it("truncates description at ~40 chars and replaces newlines with ↵", () => {
     const shortMacro = { name: "Short", text: "echo hi" };
     const shortItem = new MacroTreeItem(shortMacro, 0);

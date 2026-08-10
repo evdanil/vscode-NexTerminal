@@ -401,10 +401,16 @@ export function gatewayInertCredentialsNote(macro: TerminalMacro): string | unde
 // \bipmitool\b, then within the same segment ([^;&|\n]* — cannot cross ; & | or
 // an unescaped newline), a -E preceded by HORIZONTAL whitespace OR a quote
 // ((?:[^\S\n]|['"]), so a shell-stripped `'-E'`/`"-E"` counts but a bare newline
-// does NOT put a next-line -E on this command) and followed by whitespace (incl.
-// the newline that ends the command), a closing quote, or end of string (so
-// `-Example`/`'-Example'`/`-Env` still do not match — the char after -E is `x`/`n`).
-const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*(?:[^\S\n]|['"])-E(?=[\s'"]|$)/;
+// does NOT put a next-line -E on this command) and NOT followed by a
+// word-continuation character. `-E(?![^\s'"<>;|&()])` closes the WHOLE
+// shell-token-terminator class rather than whitelisting a few chars: a -E is a
+// complete ipmitool token when what follows it is a token terminator —
+// whitespace (incl. the newline that ends the command), a quote, a redirection
+// `<`/`>` (so the compact `ipmitool -E>/tmp/log` counts, round 8), a separator
+// `;`/`|`/`&`, a subshell paren `(`/`)`, or end of string — but NOT a
+// word-continuation char, so `-Example`/`'-Example'`/`-Env`/`-E=foo`/`-E/path`
+// still do not match (the char after -E is `x`/`n`/`=`/`/`).
+const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*(?:[^\S\n]|['"])-E(?![^\s'"<>;|&()])/;
 
 /**
  * Whether a command reads the IPMI password from the environment via ipmitool's
