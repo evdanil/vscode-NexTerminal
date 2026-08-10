@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.177] — 2026-08-10
+
+### Fixed
+
+- **Management-panel polish (Device Templates / Inventory Sources tabs).** A narrow panel no longer clips a source's right-most action — the row's action buttons wrap under the name instead. Re-opening a panel that is already the active tab now refreshes it (so a source's "synced N ago" line is current, not stale). Keyboard focus restores to the exact button you were on after the list refreshes, and clicking a row action whose record was deleted a moment earlier now says so rather than doing nothing silently.
+
 ## [2.8.176] — 2026-08-10
 
 ### Changed

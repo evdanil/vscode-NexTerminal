@@ -288,34 +288,15 @@ const EMPTY_STATE_PLACEHOLDER =
  * is removed and every referencing `templateRules` entry cleared, but applied
  * VALUES and STAMPS already on servers are KEPT (reclaimable) — the modal says so.
  *
- * P0-2 — parameterized: when `template` is passed (the Device Templates list panel's
- * `delete` row resolves the id to the live template and hands it in), the "which
- * template?" picker is SKIPPED and that template is confirmed/deleted directly. The
- * no-arg path keeps the picker for palette/other callers. All the revision +
- * referencing-set refusal guards below run identically in both cases — the panel is
- * a presentation layer and weakens none of them.
+ * P0-2 — the caller (the `nexus.deviceTemplate.delete` command, dispatched by the
+ * Device Templates list panel's `delete` row) resolves the id to the live template
+ * and hands it in, so this flow is always given a concrete `target`: there is no
+ * "which template?" picker. The command is `when: false` (never in the palette) and
+ * its only caller no-ops on an unresolved id, so a no-arg entry is unreachable. All
+ * the revision + referencing-set refusal guards below still run — the panel is a
+ * presentation layer and weakens none of them.
  */
-async function deleteDeviceTemplateFlow(ctx: CommandContext, template?: DeviceTemplateProfile): Promise<void> {
-  let target: DeviceTemplateProfile;
-  if (template !== undefined) {
-    target = template;
-  } else {
-    const templates = ctx.core.getSnapshot().deviceTemplates;
-    if (templates.length === 0) {
-      return;
-    }
-    const pick = await vscode.window.showQuickPick(
-      templates
-        .slice()
-        .sort((a, b) => naturalCompare(a.name, b.name))
-        .map((t) => ({ label: t.name, description: describeTemplateFields(t), template: t })),
-      { title: "Delete Device Template", placeHolder: "Select a device template to delete" }
-    );
-    if (!pick) {
-      return;
-    }
-    target = pick.template;
-  }
+async function deleteDeviceTemplateFlow(ctx: CommandContext, target: DeviceTemplateProfile): Promise<void> {
   const referencing = sourcesReferencingTemplate(ctx, target.id);
   const sourceNote =
     referencing.length > 0
@@ -994,6 +975,11 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
       const template = id ? ctx.core.getSnapshot().deviceTemplates.find((t) => t.id === id) : undefined;
       if (template) {
         openDeviceTemplateEditor(ctx, template);
+      } else if (id) {
+        // P3-8 — a vanished id (deleted between render and click) tells the user
+        // rather than silently doing nothing, matching the inventory siblings'
+        // "That inventory source no longer exists." acknowledgement.
+        void vscode.window.showInformationMessage("That device template no longer exists.");
       }
     }),
 
@@ -1005,6 +991,10 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
       const template = id ? ctx.core.getSnapshot().deviceTemplates.find((t) => t.id === id) : undefined;
       if (template) {
         return deleteDeviceTemplateFlow(ctx, template);
+      }
+      if (id) {
+        // P3-8 — same vanished-id acknowledgement as the edit command above.
+        void vscode.window.showInformationMessage("That device template no longer exists.");
       }
       return undefined;
     }),

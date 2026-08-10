@@ -132,6 +132,11 @@ export class ManagementListPanel {
   public static open(core: NexusCore, descriptor: ManagementListDescriptor): void {
     const existing = ManagementListPanel.instances.get(descriptor.viewType);
     if (existing) {
+      // Freshen before revealing: `onDidChangeViewState` fires only on a
+      // visibility TRANSITION, so an explicit re-invoke while the panel is
+      // already the active tab would otherwise leave relative phrasing
+      // ("synced 3h ago") stale. A render is cheap and idempotent.
+      existing.render();
       existing.panel.reveal();
       return;
     }

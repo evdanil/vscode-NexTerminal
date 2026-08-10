@@ -72,7 +72,7 @@ function renderRow(row: ManagementRow, noun: string): string {
   // name. `title` carries the full text for the ellipsized single line.
   return `<li class="mgmt-row" data-id="${escapeHtml(row.id)}">
         <div class="mgmt-row-main">
-          <button type="button" class="mgmt-name" data-action="edit" data-id="${escapeHtml(row.id)}" title="${escapeHtml(row.name)}">${escapeHtml(row.name)}</button>
+          <button type="button" class="mgmt-name" data-action="edit" data-id="${escapeHtml(row.id)}" data-slot="name" title="${escapeHtml(row.name)}">${escapeHtml(row.name)}</button>
           <div class="mgmt-actions">
             ${actionsHtml}
           </div>
@@ -141,6 +141,11 @@ export function renderManagementListHtml(view: ManagementListView, nonce: string
       display: flex;
       align-items: center;
       gap: 8px;
+      /* At a narrow panel (≈350px) the fixed-size action cluster and the
+         ellipsizing name compete for one row, squeezing the name to ~0 and
+         clipping the destructive button. Allowing the row to wrap lets the
+         cluster drop under the name; at 700px there is room, so nothing wraps. */
+      flex-wrap: wrap;
     }
     .mgmt-name {
       flex: 1 1 auto;
@@ -163,6 +168,9 @@ export function renderManagementListHtml(view: ManagementListView, nonce: string
       align-items: center;
       gap: 6px;
       flex: 0 0 auto;
+      /* Wrap the buttons among themselves too, so at the narrowest widths a
+         four-button inventory cluster stacks instead of clipping Remove. */
+      flex-wrap: wrap;
     }
     .mgmt-action {
       padding: 4px 10px;
@@ -226,10 +234,16 @@ ${listOrEmpty}
 
       // ── Scroll + focus preservation across re-renders ───────────────────
       // Child-editor saves re-render this list; keep the user's place.
-      function findButton(id, action) {
+      // The row NAME button and the cluster EDIT button share data-action="edit"
+      // and data-id, so focus restore must also key off data-slot ("name" for the
+      // name button, absent → "" for cluster buttons) or it would land on the
+      // first (name) match instead of the exact control the user was on.
+      function findButton(id, action, slot) {
         var btns = document.querySelectorAll("[data-action]");
         for (var i = 0; i < btns.length; i++) {
-          if (btns[i].getAttribute("data-id") === id && btns[i].getAttribute("data-action") === action) return btns[i];
+          if (btns[i].getAttribute("data-id") === id &&
+              btns[i].getAttribute("data-action") === action &&
+              (btns[i].getAttribute("data-slot") || "") === slot) return btns[i];
         }
         return null;
       }
@@ -251,14 +265,24 @@ ${listOrEmpty}
         var action = t.getAttribute && t.getAttribute("data-action");
         var id = t.getAttribute && t.getAttribute("data-id");
         if (action && id) {
-          state.focusKey = id + "\\n" + action;
+          var slot = (t.getAttribute("data-slot")) || "";
+          state.focusKey = id + "\\n" + action + "\\n" + slot;
           state.focusIndex = rowIndexOf(t);
           vscode.setState(state);
         }
       });
+      // Coalesce the per-scroll persist: scrollY is tracked synchronously on the
+      // shared state object, but vscode.setState fires at most once per frame-ish
+      // window so a fast scroll does not post a message per pixel. The restore
+      // below still reads the latest persisted scrollY.
+      var scrollTimer = null;
       window.addEventListener("scroll", function() {
         state.scrollY = window.scrollY;
-        vscode.setState(state);
+        if (scrollTimer) return;
+        scrollTimer = setTimeout(function() {
+          scrollTimer = null;
+          vscode.setState(state);
+        }, 100);
       });
 
       if (typeof state.scrollY === "number") { window.scrollTo(0, state.scrollY); }
@@ -270,11 +294,12 @@ ${listOrEmpty}
           if (nb) nb.focus();
           return;
         }
-        var sep = key.indexOf("\\n");
-        if (sep < 0) return;
-        var id = key.slice(0, sep);
-        var action = key.slice(sep + 1);
-        var target = findButton(id, action);
+        var parts = key.split("\\n");
+        if (parts.length < 2) return;
+        var id = parts[0];
+        var action = parts[1];
+        var slot = parts.length > 2 ? parts[2] : "";
+        var target = findButton(id, action, slot);
         if (target) { target.focus(); return; }
         // Focused record was deleted → the row now at that index, else the New button.
         var rows = document.querySelectorAll(".mgmt-row");

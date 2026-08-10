@@ -285,11 +285,13 @@ describe("device template CRUD commands", () => {
     expect(editOpen!.formId).toBe("device-template-edit-t2");
   });
 
-  it("nexus.deviceTemplate.edit is a no-op for a missing id (deleted between render and click)", () => {
+  it("nexus.deviceTemplate.edit is a no-op for a missing id but acknowledges the vanished record (P3-8)", () => {
     const core = makeCore();
     register(core);
     registeredCommands.get("nexus.deviceTemplate.edit")!("ghost");
     expect(formPanelOpens).toHaveLength(0);
+    // P3-8 — matches the inventory siblings' vanished-id acknowledgement.
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("That device template no longer exists.");
   });
 
   it("U3 — nexus.deviceTemplate.delete confirms THAT template WITHOUT a second picker, then removeDeviceTemplate", async () => {
@@ -336,13 +338,15 @@ describe("device template CRUD commands", () => {
     expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
   });
 
-  it("nexus.deviceTemplate.delete is a no-op for a missing id (no confirm, no removal)", async () => {
+  it("nexus.deviceTemplate.delete is a no-op for a missing id (no confirm, no removal) but acknowledges the vanished record (P3-8)", async () => {
     const core = makeCore();
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
     register(core);
     await registeredCommands.get("nexus.deviceTemplate.delete")!("ghost");
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
     expect(core.getSnapshot().deviceTemplates).toHaveLength(1);
+    // P3-8 — same acknowledgement as the edit command and the inventory siblings.
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("That device template no longer exists.");
   });
 });
 
@@ -941,7 +945,7 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     };
   }
 
-  it("a concurrent editor Save of the SAME template (revision moves) while the delete confirm is open aborts the delete (round-6 revision guard) and never tears disk state", async () => {
+  it("SEQUENTIAL revision guard (disk authority) — an editor Save that COMPLETED (revision moved) before the delete confirm returned aborts the delete via the round-6 revision guard", async () => {
     const repo = new InMemoryConfigRepository();
     const core = new NexusCore(repo);
     await core.initialize();
@@ -955,11 +959,11 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     const editOnSubmit = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!.options.onSubmit;
     mockShowInformationMessage.mockResolvedValue(undefined);
 
-    // The delete command resolves T at its CURRENT (pre-Save) revision, then parks at
-    // the confirm modal. While the modal is open, the concurrent editor Save runs to
-    // completion under the serialized config lock, re-minting T's revision. The
-    // delete's in-lock revalidation then sees the moved revision and ABORTS — it must
-    // not remove an incarnation the confirmation never showed.
+    // This is a SEQUENTIAL check (not a concurrency one): the Save runs to completion
+    // and is awaited INSIDE the modal mock, re-minting T's revision, before "Delete"
+    // is returned. The delete then revalidates against the moved revision and ABORTS.
+    // It exercises the round-6 revision guard through a disk reload — the lock
+    // SERIALIZATION itself is proven by the next test, which interleaves the two.
     mockShowWarningMessage.mockImplementationOnce(async () => {
       await editOnSubmit({ name: "Core", mode_logSession: "override", logSession: false });
       return "Delete";
@@ -979,6 +983,77 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
     expect(mockShowWarningMessage).toHaveBeenLastCalledWith(
       expect.stringContaining("changed while the confirmation was open — nothing was deleted")
     );
+  });
+
+  it("CONCURRENT lock serialization (disk authority) — a delete whose sweep interleaves with an in-flight editor Save persist does NOT tear disk state (kills removing configMutationLock from the Save/delete flows)", async () => {
+    // GENUINE concurrency, unlike the sequential test above. Both the editor Save
+    // (openDeviceTemplateEditor's onSubmit) and the delete flow wrap their
+    // revalidate-then-whole-array-persist in configMutationLock.runExclusive. With
+    // the lock REMOVED, a delete that sweeps the record + its source rules while the
+    // Save's `saveDeviceTemplates` is still in flight, then lets the Save's late
+    // whole-array persist commit LAST, RESURRECTS the swept template on disk while
+    // its referencing rule is already gone — the torn state. The lock forces the two
+    // flows to serialize, so disk stays coherent.
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: { logSession: { mode: "fill", value: true } } });
+    await core.addOrUpdateInventorySource(referencingSource("src-1", "t1", "r1"));
+    register(core);
+
+    // Gate ONLY the editor Save's whole-array persist (the FIRST saveDeviceTemplates
+    // call after the gate is armed). Every later persist (the delete's own sweep)
+    // runs freely, so the Save's persist is the one that lands LAST when released.
+    const realSaveTemplates = repo.saveDeviceTemplates.bind(repo);
+    let gateArmed = true;
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    repo.saveDeviceTemplates = async (templates) => {
+      if (gateArmed) {
+        gateArmed = false;
+        await gate; // hold the Save's persist (and, with the lock, the lock itself)
+      }
+      return realSaveTemplates(templates);
+    };
+
+    // Open the EDIT editor (seeded at T's original revision) and capture its onSubmit.
+    registeredCommands.get("nexus.deviceTemplate.edit")!("t1");
+    const editOnSubmit = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!.options.onSubmit;
+    mockShowInformationMessage.mockResolvedValue(undefined);
+
+    // Kick off the Save UN-awaited. It passes its revalidation, installs T's NEW
+    // incarnation in memory (fresh revision), and blocks inside the gated persist —
+    // holding configMutationLock while it waits, when the lock is present.
+    const savePromise = editOnSubmit({ name: "Core", mode_logSession: "override", logSession: false });
+    await tick();
+
+    // Now invoke the delete concurrently. It captures T at the Save's in-memory
+    // incarnation, its confirm modal returns "Delete", and it enters its own
+    // revalidate-then-persist section — which must QUEUE behind the Save under the
+    // lock. (Without the lock it sweeps immediately: removes T, clears src-1's rule,
+    // and persists both — before the Save's late persist resurrects T.)
+    mockShowWarningMessage.mockResolvedValue("Delete");
+    const deletePromise = registeredCommands.get("nexus.deviceTemplate.delete")!("t1");
+    await tick();
+
+    // Release the gate LAST — the Save's persist commits, then (with the lock) the
+    // queued delete runs against the freshly-committed state.
+    releaseGate();
+    await savePromise;
+    await deletePromise;
+
+    // DISK is the authority — reload a fresh core.
+    const reloaded = new NexusCore(repo);
+    await reloaded.initialize();
+    // COHERENT: with the lock, the Save commits then the delete sweeps CLEANLY —
+    // template gone AND its referencing rule gone. Falsification: with the lock
+    // removed, the delete sweeps first and the Save's late whole-array persist
+    // RESURRECTS t1 (getDeviceTemplate would be defined) while src-1's rule is
+    // already cleared — a torn template-present-but-rule-absent state.
+    expect(reloaded.getDeviceTemplate("t1")).toBeUndefined();
+    expect(reloaded.getInventorySource("src-1")!.templateRules ?? []).toEqual([]);
   });
 
   it("delete ABORTS when the referencing-source set changed under the open confirm modal (removeDeviceTemplate not called)", async () => {
