@@ -341,8 +341,10 @@ describe("NexusCore inventory sources", () => {
         // (a row-6 divergence). The value is live, so nothing is cleared and the
         // equality gate never fires — value AND stamp both stand.
         { id: "U5", name: "Target U5", host: "u5", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "SURV", origin: { sourceId: "source-1", externalId: "device:U5", syncedAt: 1, templated: { ipmiGatewayServerId: "GHOST-A" } } },
-        // U6: value GHOST-B is dangling (cleared), but the stamp names GHOST-C, NOT
-        // the value being cleared — the round-5 gate preserves the divergence.
+        // U6: value GHOST-B is dangling, and the stamp names GHOST-C, NOT the value —
+        // so GHOST-B is a HAND value the user diverged to (cur !== stamp). Round 8:
+        // a hand/diverged gateway is §8.4 leave-alone, so BOTH the dangling value and
+        // the diverged stamp are preserved (the sync never overwrites a hand field).
         { id: "U6", name: "Target U6", host: "u6", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "GHOST-B", origin: { sourceId: "source-1", externalId: "device:U6", syncedAt: 1, templated: { ipmiGatewayServerId: "GHOST-C" } } }
       ],
       removeServerIds: [],
@@ -354,11 +356,38 @@ describe("NexusCore inventory sources", () => {
     expect(u5?.ipmiGatewayServerId).toBe("SURV");
     expect(u5?.origin?.templated?.ipmiGatewayServerId).toBe("GHOST-A");
     const u6 = core.getServer("U6");
-    // Dangling value cleared…
-    expect(u6?.ipmiGatewayServerId).toBeUndefined();
-    // …but the diverged stamp (≠ the cleared value) survives — a later sync must not
-    // read it as never-configured and template-write over the user's edit.
+    // A dangling but HAND-diverged value (cur GHOST-B ≠ stamp GHOST-C) is preserved
+    // — the sync only cleans a gateway it OWNS (cur === stamp) that went stale.
+    expect(u6?.ipmiGatewayServerId).toBe("GHOST-B");
     expect(u6?.origin?.templated?.ipmiGatewayServerId).toBe("GHOST-C");
+  });
+
+  it("(PR-T3, PR #66 round 8) the upserted-gateway revalidation LEAVES a hand-configured dangling gateway alone (kills clearing a hand field the planner deliberately carried through)", async () => {
+    // U7 carries a dangling gateway "PHANTOM" that was ALREADY dangling at plan time
+    // and is purely HAND-configured (no origin.templated stamp names it). The planner
+    // carries such a gateway through unchanged (§8.4 — it degrades to local at
+    // runtime); clearing it at application would overwrite a hand field and diverge
+    // from the preview even though nothing was deleted after planning. MUST fail
+    // against 1f16bdb, whose unconditional value clear wipes "PHANTOM".
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [
+        // No templated stamp at all → a hand-owned gateway. It is dangling (PHANTOM
+        // resolves to no server), but that is the user's field, not the sync's.
+        { id: "U7", name: "Target U7", host: "u7", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "PHANTOM", origin: { sourceId: "source-1", externalId: "device:U7", syncedAt: 1 } }
+      ],
+      removeServerIds: [],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    expect(core.getServer("U7")?.ipmiGatewayServerId).toBe("PHANTOM");
   });
 
   it("(F12) writes lastSyncAt on the applied source only — a second source's lastSyncAt is untouched", async () => {

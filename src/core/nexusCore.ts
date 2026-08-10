@@ -1287,6 +1287,24 @@ export class NexusCore {
       if (!live || live.ipmiGatewayServerId === undefined || this.servers.has(live.ipmiGatewayServerId)) {
         continue;
       }
+      // REVIEW FINDING (PR #66 Codex round 8) — restrict this cleanup to a
+      // TEMPLATE-OWNED gateway (the sync's own write: stamp === value, on the live
+      // origin OR its detached `formerlySynced` twin). A HAND-configured gateway —
+      // unstamped, or a value the user diverged to (`cur !== stamp`) — is §8.4
+      // leave-alone: `computeSyncPlan` deliberately carries even an ALREADY-DANGLING
+      // hand gateway through unchanged (it degrades to "reachable locally" at
+      // runtime), so clearing it during application would silently overwrite a
+      // hand-owned field AND make the persisted result diverge from the approved
+      // preview, even though nothing was deleted after planning. Round 7's value
+      // clear was unconditional here; the stamp clear below was already gated this
+      // way, so this lifts the same ownership gate to cover the value — only a
+      // gateway the sync wrote and that WENT stale after plan time is cleaned.
+      const templateOwnsGateway =
+        live.origin?.templated?.ipmiGatewayServerId === live.ipmiGatewayServerId ||
+        live.formerlySynced?.templated?.ipmiGatewayServerId === live.ipmiGatewayServerId;
+      if (!templateOwnsGateway) {
+        continue;
+      }
       captureServerPrior(upserted.id);
       // Clear the dangling value and, UNDER THE ROUND-5 EQUALITY GATE, its stamp
       // twin(s). Same mechanics `clearGatewayReferencesTo` uses (stamp === the
