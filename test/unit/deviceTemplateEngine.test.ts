@@ -2108,3 +2108,56 @@ describe("PR-T3 review round 9 — adoption reject restores the gateway stamp fr
     expect(after.origin?.templated?.ipmiGatewayServerId).toBe("gw-a");
   });
 });
+
+// -------- PR #66 Codex round 10 — retained-gateway PART 2 resolves ownership from the DETACHED receipt --------
+describe("Round 10 — GATEWAY PART 2 handles a KEPT server's detached formerlySynced.templated stamp", () => {
+  const DEVICE_INSTANCE_R10 = "https://netbox.example.com";
+  it("a KEPT server (no origin) whose formerlySynced.templated owns a delete-pruned gateway is PROMOTED to an update dropping the value AND the detached stamp, with a warning (kills reading ownership from origin only — clearGatewayReferencesTo would clear it at apply while the preview showed nothing)", () => {
+    const gwId = deterministicServerId("source-1", "device:gwret");
+    // The gateway is a THIS-source owned server whose device vanished this fetch →
+    // delete-pruned. It is NOT a survivor.
+    const gw: ServerConfig = {
+      id: gwId,
+      name: "gw-ret",
+      host: "10.9.9.9",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox",
+      origin: { sourceId: "source-1", externalId: "device:gwret", syncedAt: 1000 }
+    };
+    // A kept record from a REMOVED source: no `origin`, its ownership receipt (incl.
+    // the template gateway stamp) lives in `formerlySynced.templated`. Its device is
+    // absent this fetch, so it is not adopted — it stays an UNPLANNED candidate that
+    // GATEWAY PART 2b must inspect.
+    const s = keptServer({
+      ipmiGatewayServerId: gwId,
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: DEVICE_INSTANCE_R10,
+        externalId: "device:1",
+        detachedAt: 900,
+        templated: { ipmiGatewayServerId: gwId }
+      }
+    });
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [], // both devices absent → gw delete-pruned; S not adopted, stays kept
+      servers: [s, gw],
+      providerInstanceKey: DEVICE_INSTANCE_R10
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === gwId)).toBe(true);
+    // Promoted to an update that drops the dangling gateway value AND clears the
+    // DETACHED stamp — matching what clearGatewayReferencesTo persists at apply.
+    const after = afterFor(p, "kept-1");
+    expect(after).toBeDefined();
+    expect(after!.ipmiGatewayServerId).toBeUndefined();
+    expect(after!.formerlySynced?.templated?.ipmiGatewayServerId).toBeUndefined();
+    expect(
+      p.warnings.some((w) => /IPMI gateway/i.test(w) && /will not survive this sync/.test(w) && /was removed/.test(w))
+    ).toBe(true);
+  });
+});

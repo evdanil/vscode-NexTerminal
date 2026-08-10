@@ -3300,11 +3300,33 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // ownership receipt stay consistent. The `templatedHasAnyStamp` collapse keeps a
   // still-valid `ipmiAuthProfileId` / proxy stamp — mirror of `dropTemplateProxy`.
   const dropTemplateGateway = (record: ServerConfig): ServerConfig => {
-    const origin = record.origin!;
-    const templated = origin.templated !== undefined ? { ...origin.templated } : {};
-    delete templated.ipmiGatewayServerId;
+    // PR #66 Codex round 10 — the ownership stamp can live on the live `origin`
+    // OR, for a server KEPT from a removed source (no `origin`), the detached
+    // `formerlySynced` receipt. Clear it from whichever receipt holds THIS gateway
+    // id, rather than assuming `origin` exists (`dropTemplateProxy` predates the
+    // detached-receipt case; gateway must not follow it). Gated on `=== cur` so a
+    // divergent stamp on the other receipt is left intact — and so the persisted
+    // result matches what `NexusCore.clearGatewayReferencesTo` clears at apply.
+    const cur = record.ipmiGatewayServerId;
     const { ipmiGatewayServerId: _droppedGateway, ...withoutGateway } = record;
-    return { ...withoutGateway, origin: { ...origin, templated: templatedHasAnyStamp(templated) ? templated : undefined } };
+    let next: ServerConfig = withoutGateway;
+    // `cur !== undefined` first so the `=== cur` comparisons narrow the optional
+    // chains (this pass only runs for a defined dangling gateway id; the guard makes
+    // that explicit to the type checker).
+    if (cur !== undefined && record.origin?.templated?.ipmiGatewayServerId === cur) {
+      const templated = { ...record.origin.templated };
+      delete templated.ipmiGatewayServerId;
+      next = { ...next, origin: { ...record.origin, templated: templatedHasAnyStamp(templated) ? templated : undefined } };
+    }
+    if (cur !== undefined && record.formerlySynced?.templated?.ipmiGatewayServerId === cur) {
+      const templated = { ...record.formerlySynced.templated };
+      delete templated.ipmiGatewayServerId;
+      next = {
+        ...next,
+        formerlySynced: { ...record.formerlySynced, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+      };
+    }
+    return next;
   };
   // Is a record's EFFECTIVE gateway an INVALID template-OWNED reference this pass
   // must clean? Returns the dangling gateway id, or undefined when there is
@@ -3316,7 +3338,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // true and it is correctly NOT flagged.
   const invalidTemplateGateway = (record: ServerConfig): string | undefined => {
     const cur = record.ipmiGatewayServerId;
-    const stampedGateway = record.origin?.templated?.ipmiGatewayServerId;
+    // PR #66 Codex round 10 — resolve template ownership from the live origin OR
+    // the detached `formerlySynced` receipt: a server KEPT from a removed source
+    // has no `origin`, so a gateway it template-owns is stamped only on the
+    // receipt. Without this, GATEWAY PART 2 emitted neither an update nor a warning
+    // for such a survivor, yet `clearGatewayReferencesTo` cleared both its value and
+    // detached stamp at apply — the persisted result then differed from the preview.
+    const stampedGateway =
+      record.origin?.templated?.ipmiGatewayServerId ?? record.formerlySynced?.templated?.ipmiGatewayServerId;
     if (
       cur === undefined ||
       stampedGateway === undefined ||
