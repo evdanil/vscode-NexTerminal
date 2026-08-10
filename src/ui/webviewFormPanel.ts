@@ -159,9 +159,9 @@ export class WebviewFormPanel {
     return instance;
   }
 
-  public addSelectOption(key: string, value: string, label: string): void {
+  public addSelectOption(key: string, value: string, label: string, description?: string): void {
     if (!this.disposed) {
-      void this.panel.webview.postMessage({ type: "addSelectOption", key, value, label });
+      void this.panel.webview.postMessage({ type: "addSelectOption", key, value, label, description });
     }
   }
 

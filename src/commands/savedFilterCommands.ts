@@ -17,22 +17,29 @@ import { naturalCompare } from "../utils/naturalCompare";
  * `NexusCore.removeSavedFilter`.
  */
 
-const EMPTY_STATE = "No saved filters yet. Save one to reuse a Device Filter across inventory sources.";
+const EMPTY_STATE =
+  'No saved filters yet. Create one here, or use "Save current filter as…" next to a source\'s Device Filter.';
 
 async function promptFilterFields(seed?: SavedFilterDefinition): Promise<{ name: string; filter: string } | undefined> {
+  // U1/U4 — both steps are titled as one coherent 2-step progress flow that keeps
+  // the "Saved Filter" context (not the old "Rename Saved Filter" / "Edit Filter
+  // Query" split, which mis-titled the edit and hid the second step). `ignoreFocusOut`
+  // on BOTH steps (U4) so clicking away on either does not silently abort the flow.
+  const verb = seed ? "Edit" : "New";
   const name = await vscode.window.showInputBox({
-    title: seed ? "Rename Saved Filter" : "New Saved Filter",
+    title: `${verb} Saved Filter (1/2) — Name`,
     prompt: "Name this saved filter.",
     placeHolder: "e.g. Sydney core switches",
     value: seed?.name ?? "",
+    ignoreFocusOut: true,
     validateInput: (v) => (v.trim().length === 0 ? "Enter a name." : undefined)
   });
   if (name === undefined) {
     return undefined;
   }
   const filter = await vscode.window.showInputBox({
-    title: seed ? "Edit Filter Query" : "Filter Query",
-    prompt: "The NetBox Device Filter query string this saved filter applies.",
+    title: `${verb} Saved Filter (2/2) — Filter Query`,
+    prompt: "The NetBox Device Filter query string this saved filter applies. Leave empty to match all devices.",
     placeHolder: "e.g. role=core-switch&site=syd",
     value: seed?.filter ?? "",
     // An empty query is a legal catch-all (the Device Filter field admits ""),
@@ -42,7 +49,8 @@ async function promptFilterFields(seed?: SavedFilterDefinition): Promise<{ name:
   if (filter === undefined) {
     return undefined;
   }
-  return { name: name.trim(), filter };
+  // P3 — trim the query, matching the inline "Save current filter as…" path.
+  return { name: name.trim(), filter: filter.trim() };
 }
 
 async function addSavedFilter(ctx: CommandContext): Promise<void> {
@@ -81,14 +89,21 @@ async function deleteSavedFilterFlow(ctx: CommandContext): Promise<void> {
       .slice()
       .sort((a, b) => naturalCompare(a.name, b.name))
       .map((f) => ({ label: f.name, description: f.filter || "(empty filter)", filter: f })),
-    { title: "Delete Saved Filter", placeHolder: "Select a saved filter to delete" }
+    // P5 — matchOnDescription so typing a fragment of the query string finds the filter.
+    { title: "Delete Saved Filter", placeHolder: "Select a saved filter to delete", matchOnDescription: true }
   );
   if (!pick) {
     return;
   }
+  // P4 — the consequence sentence lives in the modal `detail` slot, mirroring the
+  // device-template delete house style (deviceTemplateCommands.ts). Copy verbatim.
   const confirm = await vscode.window.showWarningMessage(
-    `Delete saved filter "${pick.filter.name}"? Inventory sources that already use this filter keep their own copy — only the reusable definition is removed.`,
-    { modal: true },
+    `Delete saved filter "${pick.filter.name}"?`,
+    {
+      modal: true,
+      detail:
+        "Inventory sources that already use this filter keep their own copy — only the reusable definition is removed."
+    },
     "Delete"
   );
   if (confirm !== "Delete") {
@@ -128,7 +143,12 @@ async function manageSavedFilters(ctx: CommandContext): Promise<void> {
         })),
       { label: DELETE, action: "delete" as ManageAction, filter: undefined as SavedFilterDefinition | undefined }
     ],
-    { title: "Manage Saved Filters", placeHolder: "Select a saved filter to edit, create a new one, or delete one" }
+    {
+      title: "Manage Saved Filters",
+      placeHolder: "Select a saved filter to edit, create a new one, or delete one",
+      // P5 — matchOnDescription so typing a fragment of the query string finds the filter.
+      matchOnDescription: true
+    }
   );
   if (!pick) {
     return;

@@ -1481,8 +1481,15 @@ export function inventorySourceFormDefinition(
       // control. The picker renders only for a provider that declares a `filter`
       // config field (NetBox does); other providers get their config fields
       // unchanged, byte-for-byte.
+      //
+      // P8 — gated on field TYPE, not just id: the picker fills the target field
+      // with a filter STRING via autofill, so it may only attach to a text/string
+      // field. A third-party provider that happened to name a boolean / password /
+      // number / select field `filter` must not get a string autofill written at
+      // it. NetBox's `filter` is a `type: "string"` field, so this is a defensive
+      // no-op for the only provider that ships the picker today.
       ...provider.configFields.flatMap((field) =>
-        field.id === SAVED_FILTER_TARGET_FIELD_ID
+        field.id === SAVED_FILTER_TARGET_FIELD_ID && field.type === "string"
           ? [savedFilterSelectField(savedFilters), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
           : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
       )

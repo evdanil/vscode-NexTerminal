@@ -1988,6 +1988,39 @@ describe("backup import", () => {
     ]);
   });
 
+  it("(T-M4) SAVED FILTER DEFINITIONS (PR-E) — replace mode removes a pre-existing local saved filter that the backup does NOT contain (kills deleting the replace-mode removal loop)", async () => {
+    const store = new InMemoryMacroStore();
+    await store.initialize();
+    setActiveMacroStore(store);
+
+    // A local saved filter whose id the incoming backup does NOT carry — replace
+    // mode must wipe it. If the removal loop (configCommands `for (const filter of
+    // snapshot.savedFilters) removeSavedFilter`) were deleted, this stale local
+    // filter would survive: existingIds is empty in replace mode, so
+    // importPreservingIds never touches it, and nothing else clears it.
+    await core.addOrUpdateSavedFilter({ id: "local-A", name: "Local only", filter: "site=local" });
+
+    const backup = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      savedFilters: [{ id: "sf-B", name: "From backup", filter: "role=edge" }],
+      settings: {}
+    };
+
+    await runBackupImport(backup, "replace");
+
+    const filters = core.getSnapshot().savedFilters;
+    // The stale local filter is GONE...
+    expect(filters.find((f) => f.id === "local-A")).toBeUndefined();
+    // ...and only the backup's filter remains.
+    expect(filters).toEqual([{ id: "sf-B", name: "From backup", filter: "role=edge" }]);
+  });
+
+
   it("merge still skips by ID, so a macro edited locally is not re-added from the backup as a second copy", async () => {
     // The two dedupe keys are independent and this is the half the content key cannot do:
     // the record's content has DIVERGED from the file's, so only the id identifies it. This
@@ -5194,6 +5227,46 @@ describe("share export round-trip", () => {
     expect(exported.inventorySources).toBeUndefined();
     expect(exported.servers).toHaveLength(1);
     expect(exported.servers[0].origin).toBeUndefined();
+  });
+
+  /**
+   * T-M1 (PR-E) — share export EXCLUDES saved filters. Mirrors §B6: a real saved
+   * filter is populated on the exporting core, the ACTUAL share command path
+   * (`nexus.config.export`) produces the bundle, and the serialized payload is
+   * asserted to carry no `savedFilters` key.
+   *
+   * Non-vacuous: the premise is asserted (the store DID hold a saved filter on the
+   * way in, so the exclusion cannot pass merely because there was nothing to
+   * exclude), and the assertion is on the serialized JSON that actually travels.
+   * Under the realistic break — adding `savedFilters: snapshot.savedFilters` to
+   * `exportShare`'s `exportData` literal — the key is present and this fails.
+   */
+  it("(T-M1) share export carries NO savedFilters key even when the store holds one (kills leaking saved filters into a shared bundle)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    // The premise: a real saved filter exists on the exporting core.
+    await sourceCore.addOrUpdateSavedFilter({ id: "sf1", name: "Syd core", filter: "role=core&site=syd" });
+    expect(sourceCore.getSnapshot().savedFilters).toHaveLength(1);
+
+    registerConfigCommands(sourceCore, vault);
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/share.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    await registeredCommands.get("nexus.config.export")!();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.savedFilters).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(exported, "savedFilters")).toBe(false);
   });
 
   /**

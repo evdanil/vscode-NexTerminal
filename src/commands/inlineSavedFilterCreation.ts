@@ -59,6 +59,9 @@ export function createInlineSavedFilterCreation(ctx: InlineSavedFilterContext): 
           prompt: "Name this saved filter so you can reuse it on other sources.",
           placeHolder: "e.g. Sydney core switches",
           value: "",
+          // U4 — this box floats over the webview form; clicking back to the form
+          // to re-check the filter must not silently dismiss it and save nothing.
+          ignoreFocusOut: true,
           validateInput: (v) => (v.trim().length === 0 ? "Enter a name." : undefined)
         });
         if (name === undefined) {
@@ -79,7 +82,10 @@ export function createInlineSavedFilterCreation(ctx: InlineSavedFilterContext): 
         }
         // Append + select it in the picker (its autofill re-fills the Device
         // Filter with the same value it was saved from — a harmless no-op).
-        capturedPanel.addSelectOption(SAVED_FILTER_SELECT_KEY, definition.id, definition.name);
+        // P1 — carry the definition's query as the option's description so the
+        // just-saved row shows its query line immediately, like every other row,
+        // rather than being the one row missing it until the form reopens.
+        capturedPanel.addSelectOption(SAVED_FILTER_SELECT_KEY, definition.id, definition.name, definition.filter);
       })();
     }
   };

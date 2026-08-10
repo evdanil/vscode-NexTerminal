@@ -75,7 +75,7 @@ const NETBOX_CONFIG_FIELDS: InventoryConfigField[] = [
       { label: "Prefer IPv6", value: "prefer-ipv6" }
     ],
     description:
-      "Which address to import when a device has both IPv4 and IPv6 primary IPs. Automatic uses NetBox's primary_ip (IPv6 when both exist)."
+      "Which address to import when a device has both IPv4 and IPv6 primary IPs. Automatic uses NetBox's own primary IP (IPv6 when both exist). Prefer options fall back to the primary IP when the device has no address in that family. The out-of-band (BMC) address is never affected."
   }
 ];
 
@@ -104,15 +104,22 @@ function readPrimaryAddress(obj: Record<string, unknown>, family: PrimaryIpFamil
     const field = obj[key] as { address?: unknown } | null | undefined;
     return field && typeof field === "object" ? field.address : undefined;
   };
+  // H1 (N2) — the family field counts as PRESENT only when it carries a
+  // non-empty (trimmed) string. A present-but-empty `primary_ip4: { address: "" }`
+  // is not a usable endpoint, so it must fall back to `primary_ip` rather than
+  // returning "" and dropping the SSH endpoint. NetBox does not emit that shape
+  // today; this hardens the theoretical case without changing any real read.
+  const usableAddress = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
   const primary = addressOf("primary_ip");
   if (family === "prefer-ipv4") {
     const v4 = addressOf("primary_ip4");
-    return typeof v4 === "string" ? v4 : primary;
+    return usableAddress(v4) ? v4 : primary;
   }
   if (family === "prefer-ipv6") {
     const v6 = addressOf("primary_ip6");
-    return typeof v6 === "string" ? v6 : primary;
+    return usableAddress(v6) ? v6 : primary;
   }
+  // `auto` reads `primary_ip` directly — byte-identical to pre-PR-E behaviour.
   return primary;
 }
 

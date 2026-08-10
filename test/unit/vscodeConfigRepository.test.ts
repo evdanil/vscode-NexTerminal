@@ -75,6 +75,34 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     await expect(repo.getGroups()).resolves.toEqual(["a", "b"]);
   });
 
+  it("(T-M3) SAVED FILTER DEFINITIONS (PR-E) getSavedFilters DROPS a malformed entry WHOLE while a valid sibling in the same array survives (kills a validator loosened to accept a non-string filter or an empty name)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Five malformed shapes `validateSavedFilter` must reject, plus one valid
+    // sibling in the SAME array — so the assertion cannot pass merely because the
+    // array was empty. Each malformed entry must be dropped WHOLE, never partially
+    // loaded. This is the store-getter read boundary (no `ensureId` synthesis), so
+    // a missing-id and a non-object entry are exercised faithfully here.
+    const repo = new VscodeConfigRepository(
+      makeContext({
+        "nexus.savedFilters": [
+          { id: "bad-filter-type", name: "Bad filter type", filter: 42 }, // filter not a string
+          { id: "bad-empty-name", name: "", filter: "x=1" }, // empty name
+          { name: "no-id", filter: "x=1" }, // missing id
+          "not-an-object", // non-object entry
+          null, // null entry
+          { id: "good", name: "Good", filter: "role=core" } // the valid sibling
+        ]
+      })
+    );
+
+    const filters = await repo.getSavedFilters();
+
+    // Only the valid sibling survives; every malformed entry was dropped whole.
+    expect(filters).toEqual([{ id: "good", name: "Good", filter: "role=core" }]);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
   it("(F13/FIX 5) getServers strips a malformed origin and keeps the rest of the server, warning once — the row is NOT dropped (kills both 'rejects whole server' and 'never strips at all')", async () => {
     const serverWithBadOrigin: ServerConfig = {
       ...validServer,

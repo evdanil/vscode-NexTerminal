@@ -817,7 +817,19 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             var newOpt = document.createElement("div");
             newOpt.className = "custom-select-option";
             newOpt.dataset.value = msg.value;
-            newOpt.textContent = msg.label;
+            // P1 — mirror the initial render's label+desc structure so an
+            // inline-created row carries its query line (msg.description) like
+            // every other option, instead of a bare label-only node.
+            var newLabelEl = document.createElement("div");
+            newLabelEl.className = "custom-select-option-label";
+            newLabelEl.textContent = msg.label;
+            newOpt.appendChild(newLabelEl);
+            if (msg.description) {
+              var newDescEl = document.createElement("div");
+              newDescEl.className = "custom-select-option-desc";
+              newDescEl.textContent = msg.description;
+              newOpt.appendChild(newDescEl);
+            }
             var dropdown = wrapper.querySelector('.custom-select-dropdown');
             var createOpt = dropdown.querySelector('.custom-select-option[data-value^="__create__"]');
             var inserted = false;

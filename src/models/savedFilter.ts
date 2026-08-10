@@ -26,25 +26,3 @@ export interface SavedFilterDefinition {
   name: string; // user-facing
   filter: string; // query-string, e.g. "role=core-switch&site=syd"; "" is allowed but discouraged
 }
-
-/**
- * Order-insensitive structural equality over the full list, used by tests and by
- * any caller that needs to detect a no-op write. Two definitions are equal iff
- * their id, name and filter all match; two lists are equal iff they name the same
- * ids each carrying the same name/filter (order irrelevant).
- */
-export function savedFilterDefinitionsEqual(
-  a: readonly SavedFilterDefinition[] | undefined,
-  b: readonly SavedFilterDefinition[] | undefined
-): boolean {
-  const ar = a ?? [];
-  const br = b ?? [];
-  if (ar.length !== br.length) {
-    return false;
-  }
-  const byId = new Map(br.map((f) => [f.id, f]));
-  return ar.every((f) => {
-    const other = byId.get(f.id);
-    return other !== undefined && other.name === f.name && other.filter === f.filter;
-  });
-}

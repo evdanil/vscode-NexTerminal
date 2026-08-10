@@ -136,8 +136,14 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
     expect(filters).toHaveLength(1);
     expect(filters[0].name).toBe("Reusable");
     expect(filters[0].filter).toBe("role=core&site=syd");
-    // Appended to the picker so the user sees it land.
-    expect(panel.addSelectOption).toHaveBeenCalledWith(SAVED_FILTER_SELECT_KEY, filters[0].id, "Reusable");
+    // Appended to the picker so the user sees it land — P1: with its query as the
+    // option description, so the just-saved row shows its query line immediately.
+    expect(panel.addSelectOption).toHaveBeenCalledWith(
+      SAVED_FILTER_SELECT_KEY,
+      filters[0].id,
+      "Reusable",
+      "role=core&site=syd"
+    );
   });
 
   it("with no Device Filter typed yet, warns and saves NOTHING (kills saving an empty definition)", async () => {
