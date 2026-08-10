@@ -348,6 +348,54 @@ describe("nexus.server.connectBmcSol", () => {
     ]);
     expect(createdTerminals[0].env).toEqual({ IPMITOOL_PASSWORD: "s3cr3t-bmc", IPMI_PASSWORD: "s3cr3t-bmc" });
   });
+
+  it("Codex round 7 P2 — warns when a CONFIGURED gateway no longer resolves (deleted), then still runs the local -E flow", async () => {
+    // The gateway server was deleted (its id dangles); the target still NAMES it.
+    // The command must surface this — a BMC only reachable from the now-missing
+    // gateway would otherwise be silently dialed from here — while still delivering
+    // the local `-E` flow (non-blocking).
+    const ctx = gatewayContext({ servers: [], secrets: VAULTED });
+    await connectBmcSol(ctx, { server: server({ ipmiGatewayServerId: "ghost" }) });
+
+    // The warning fired (c1a00a1 was silent here — this is the falsifying assertion).
+    expect(showWarningMessage).toHaveBeenCalledTimes(1);
+    const warn = String(showWarningMessage.mock.calls[0][0]);
+    expect(warn).toContain("Core Switch");
+    expect(warn).toContain("no longer available");
+    // ...and the local `-E` flow still ran.
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].sent).toEqual([
+      " ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -E sol activate\n"
+    ]);
+    expect(createdTerminals[0].env).toEqual({ IPMITOOL_PASSWORD: "s3cr3t-bmc", IPMI_PASSWORD: "s3cr3t-bmc" });
+  });
+
+  it("Codex round 7 P2 — does NOT warn when NO gateway is configured (local is the configured route)", async () => {
+    // ipmiGatewayServerId unset: local delivery is correct, not a broken-config
+    // fallback — no warning must appear.
+    await connectBmcSol(context(VAULTED), { server: server() });
+
+    expect(showWarningMessage).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(1);
+  });
+
+  it("Codex round 7 P2 — does NOT warn when the configured gateway RESOLVES (gateway path)", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion", ipmiHost: "10.9.9.9" });
+    const gwTerminal = { name: "Nexus SSH: Bastion", show: vi.fn(), sendText: vi.fn() };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
+
+    await connectBmcSol(ctx, { server: target });
+
+    // Gateway path taken — no broken-config warning, no local terminal.
+    expect(showWarningMessage).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(0);
+  });
 });
 
 describe("nexus.server.openBmcWebConsole", () => {

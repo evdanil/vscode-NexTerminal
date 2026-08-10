@@ -150,6 +150,18 @@ export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise
     return;
   }
 
+  // The target NAMES an IPMI gateway that no longer resolves (deleted, or an
+  // invalid self-reference) — distinct from a server that never had one, where
+  // local IS the configured route. The macro path surfaces this via
+  // noGatewayFallbackNote; the direct command must too, or a BMC only reachable
+  // from the now-missing gateway is silently dialed from a machine that can't
+  // reach it. Non-blocking (local delivery still proceeds below).
+  if (server.ipmiGatewayServerId) {
+    void vscode.window.showWarningMessage(
+      `The IPMI gateway configured for "${server.name}" is no longer available — connecting to the BMC from this machine instead.`
+    );
+  }
+
   const resolution = resolveProfileTokens(BMC_SOL_COMMAND, profileTokenServer(ctx, server), { form: "command" });
   if (!resolution.ok) {
     // Subject-phrased: a menu click has no macro, so the refusal names the command

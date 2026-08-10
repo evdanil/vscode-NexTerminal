@@ -1752,6 +1752,33 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 -E sol activate\n"]);
   });
 
+  it("WARNS on a gateway command whose `-E` is QUOTED — the shell strips the quotes, ipmitool still reads the env (Codex round 7 P2)", async () => {
+    // `ipmitool '-E' sol activate`: the shell hands ipmitool a standalone `-E`, so
+    // it still fails on the bastion. Round 6 required horizontal whitespace before
+    // the dash and returned false → no warning → red against c1a00a1, green after
+    // widening the delimiter to accept quotes.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus SSH: Bastion", sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([
+      { id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} '-E' sol activate\n", runIn: "localTerminal", route: "ipmiGateway", provideIpmiCredentials: true }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("reads the IPMI password from the environment (-E)");
+    expect(status).toContain("it will fail on Bastion");
+    expect(gwSent).toEqual([" ipmitool -H 10.0.0.9 '-E' sol activate\n"]);
+  });
+
   it("does NOT emit the `-E` warning for an `-a` gateway command — that gets the (accurate) inert note", async () => {
     const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
     const gateway = server({ id: "gw-1", name: "Bastion" });
@@ -1852,6 +1879,15 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
     expect(commandReadsIpmiEnv("/usr/bin/ipmitool -H 10.0.0.9 -E sol activate")).toBe(true);
   });
 
+  it("matches a QUOTED standalone `-E` the shell strips to `-E` (Codex round 7 P2)", () => {
+    // `ipmitool '-E' sol activate` / `ipmitool "-E" sol activate`: the shell strips
+    // the quotes and ipmitool receives a standalone `-E`. Round 6 required
+    // horizontal whitespace immediately before the dash and returned false here —
+    // this asserts a quote delimiter around `-E` is accepted too.
+    expect(commandReadsIpmiEnv("ipmitool '-E' sol activate")).toBe(true);
+    expect(commandReadsIpmiEnv('ipmitool "-E" sol activate')).toBe(true);
+  });
+
   it("matches `-E` at end of line and before a trailing newline (same segment)", () => {
     expect(commandReadsIpmiEnv("ipmitool sol activate -E")).toBe(true);
     expect(commandReadsIpmiEnv("ipmitool sol activate -E\n")).toBe(true);
@@ -1908,6 +1944,15 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
     expect(commandReadsIpmiEnv("ipmitool -Example sol")).toBe(false);
     expect(commandReadsIpmiEnv("foo-E bar")).toBe(false);
     expect(commandReadsIpmiEnv("ipmitool -Env")).toBe(false);
+    // A quoted `-Example` must not match either — the char after -E is `x`, so the
+    // trailing `[\s'"]|$` lookahead rejects it (Codex round 7 P2).
+    expect(commandReadsIpmiEnv("ipmitool '-Example'")).toBe(false);
+  });
+
+  it("does NOT match a QUOTED `-E` owned by a wrapper before ipmitool (round 7 P2)", () => {
+    // `sudo '-E' ipmitool … -a`: the quoted `-E` is still BEFORE ipmitool; ipmitool
+    // itself uses `-a`. The `\bipmitool\b` prefix keeps this out of scope.
+    expect(commandReadsIpmiEnv("sudo '-E' ipmitool -I lanplus -H x -U y -a sol activate")).toBe(false);
   });
 
   it("does NOT match a command with no `-E` flag", () => {

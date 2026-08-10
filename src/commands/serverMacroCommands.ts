@@ -399,10 +399,12 @@ export function gatewayInertCredentialsNote(macro: TerminalMacro): string | unde
  * the same segment ties it to the invocation that actually reads the env.
  */
 // \bipmitool\b, then within the same segment ([^;&|\n]* — cannot cross ; & | or
-// an unescaped newline), a -E preceded by HORIZONTAL whitespace ([^\S\n], so a
-// bare newline does NOT put a next-line -E on this command) and followed by
-// whitespace (incl. the newline that ends the command) or end of string.
-const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*[^\S\n]-E(?=\s|$)/;
+// an unescaped newline), a -E preceded by HORIZONTAL whitespace OR a quote
+// ((?:[^\S\n]|['"]), so a shell-stripped `'-E'`/`"-E"` counts but a bare newline
+// does NOT put a next-line -E on this command) and followed by whitespace (incl.
+// the newline that ends the command), a closing quote, or end of string (so
+// `-Example`/`'-Example'`/`-Env` still do not match — the char after -E is `x`/`n`).
+const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*(?:[^\S\n]|['"])-E(?=[\s'"]|$)/;
 
 /**
  * Whether a command reads the IPMI password from the environment via ipmitool's
