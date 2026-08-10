@@ -4502,4 +4502,32 @@ describe("computeSyncPlan — altHost (alternate host, Phase 2)", () => {
     expect(after.altHost).toBeUndefined();
     expect(after.origin?.syncedAltHost).toBeUndefined();
   });
+
+  // P2 (PR #67 Codex round 1) — the drop must be PROVENANCE-GATED: a HAND-entered
+  // `altHost` (no `syncedAltHost` stamp) that a device later reports as its new
+  // primary must be PRESERVED, never deleted — hand edits are untouched, and
+  // clearing it would permanently lose the user's fallback if the primary flips
+  // back with no provider-supplied alternate. Against the unconditional drop this
+  // hand value was wiped.
+  it("P2 — a HAND-entered altHost the device reports as its new primary is PRESERVED, not dropped (provenance gate)", () => {
+    const owned = makeOwnedServer({
+      host: "10.0.0.1",
+      altHost: "2001:db8::1", // hand-entered
+      // Origin carries NO syncedAltHost — the sync does not own this altHost.
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 }
+    });
+
+    const after = onlyUpdate(
+      computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "2001:db8::1" }] })]),
+        currentServers: [owned],
+        now: 2000
+      })
+    );
+
+    expect(after.host).toBe("2001:db8::1");
+    // Hand value untouched even though it now equals `host`; the sync never owned it.
+    expect(after.altHost).toBe("2001:db8::1");
+  });
 });

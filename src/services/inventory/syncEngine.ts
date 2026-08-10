@@ -1683,7 +1683,19 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // `ipmiHost` paths are deliberately untouched (they carry no such invariant).
       // Self-healing: the run that regains a second family re-fills `altHost` as an
       // ordinary row-1 write.
-      if (after.altHost !== undefined && after.altHost === after.host && after.origin !== undefined) {
+      // PROVENANCE-GATED (PR #67 Codex round 1, P2) — drop ONLY a value the sync
+      // OWNS (`syncedAltHost === altHost`). A HAND-entered `altHost` that a device
+      // later reports as its new primary is NOT the sync's to delete: hand edits are
+      // untouched (the whole point of `syncOwnsAltHost`), and clearing it would
+      // permanently lose the user's fallback if the primary later flips back with no
+      // provider-supplied alternate. A hand value that happens to equal `host` stays;
+      // `SshPty` simply skips the redundant retry while it does.
+      if (
+        after.altHost !== undefined &&
+        after.altHost === after.host &&
+        after.origin !== undefined &&
+        after.origin.syncedAltHost === after.altHost
+      ) {
         after.altHost = undefined;
         after.origin = { ...after.origin, syncedAltHost: undefined };
       }
@@ -2341,7 +2353,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // `altHost === host` here exactly as it can on an owned update. Drop the
         // dangling self-duplicate and clear its stamp, AFTER the origin rebuilds
         // above so the clear survives them; the `ipmiHost` path is untouched.
-        if (after.altHost !== undefined && after.altHost === after.host && after.origin !== undefined) {
+        // PROVENANCE-GATED (PR #67 Codex round 1, P2) — same as the owned-update
+        // path: drop ONLY a sync-owned duplicate (`syncedAltHost === altHost`), never
+        // a hand-entered `altHost` the adoptee brought that now equals the primary.
+        if (
+          after.altHost !== undefined &&
+          after.altHost === after.host &&
+          after.origin !== undefined &&
+          after.origin.syncedAltHost === after.altHost
+        ) {
           after.altHost = undefined;
           after.origin = { ...after.origin, syncedAltHost: undefined };
         }

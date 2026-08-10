@@ -1049,6 +1049,35 @@ describe("SshPty", () => {
       pty.dispose();
     });
 
+    it("does NOT fall back on ssh2's handshake readyTimeout — the peer was reached, so retrying risks a second auth attempt (PR #67 P1)", async () => {
+      const connect = vi.fn(async () => {
+        // ssh2's `readyTimeout` fires AFTER the TCP socket connected; its message
+        // classifies as `tcp`, but the peer IS reachable (handshake/auth may be
+        // in flight), so the fallback must NOT fire.
+        throw new Error("Timed out while waiting for handshake");
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "primary.example.com", altHost: "2001:db8::1" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      // Exactly once (primary only). Against the pre-fix gate (handshake timeout →
+      // tcp → fall back) this would be 2 — a second auth attempt / lockout risk.
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
+      expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
+
+      pty.dispose();
+    });
+
     it("does NOT retry when no altHost is configured, even on a TCP failure (unchanged behavior)", async () => {
       const connect = vi.fn(async () => {
         throw econnrefused("example.com");

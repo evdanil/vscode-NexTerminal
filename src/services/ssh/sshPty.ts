@@ -320,7 +320,16 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         // re-fail the same way, and re-attempting could cost a second
         // credential prompt or trip a lockout, so those rethrow unchanged.
         const stage = classifySshConnectionError(primaryError).stage;
-        const isConnectionLevel = stage === "tcp" || stage === "dns";
+        // ssh2's `readyTimeout` ("Timed out while waiting for handshake") fires AFTER
+        // the TCP socket has connected — the peer is reachable and the handshake/auth
+        // may already be in flight (slow MFA / keyboard-interactive), so the alternate
+        // address would not help and a retry could cost a second auth attempt or trip
+        // a lockout. Only a PRE-connection timeout ("connect ETIMEDOUT") is a genuine
+        // transport failure worth falling back on. Both currently classify as `tcp`,
+        // so exclude the handshake timeout explicitly (PR #67 Codex round 1, P1).
+        const primaryMessage = primaryError instanceof Error ? primaryError.message.toLowerCase() : "";
+        const isHandshakeTimeout = primaryMessage.includes("timed out while waiting for handshake");
+        const isConnectionLevel = (stage === "tcp" || stage === "dns") && !isHandshakeTimeout;
         if (
           !isConnectionLevel ||
           altHost === undefined ||
