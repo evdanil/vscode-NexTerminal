@@ -251,19 +251,30 @@ function selectSshEndpoint(device: InventoryDevice) {
 
 /**
  * ALTERNATE HOST (issue #48, Phase 2) — selects the endpoint the sync maps to
- * `ServerConfig.altHost`: the SECOND ssh endpoint with a non-empty host.
+ * `ServerConfig.altHost`: the first non-empty ssh endpoint whose host DIFFERS
+ * from the primary ssh endpoint's host.
  *
  * THE CONVENTION (models/inventory.ts): the FIRST ssh endpoint is the primary
- * host — `selectSshEndpoint` above — and the SECOND is the alternate. The
- * provider (netboxProvider.ts) emits the second ssh endpoint only when the
- * alternate address is present, CIDR-stripped-non-empty and DISTINCT from the
- * primary, so a single-IP device has no second ssh endpoint and this returns
- * `undefined`. `[1]` after filtering to non-empty ssh hosts is exactly "the
- * second such endpoint"; a THIRD-or-later ssh endpoint is accepted on the tree
- * and left unused, per the model doc.
+ * host — `selectSshEndpoint` above — and the alternate is the next one carrying
+ * a genuinely different address. The provider (netboxProvider.ts) emits the
+ * second ssh endpoint only when the alternate address is present,
+ * CIDR-stripped-non-empty and DISTINCT from the primary, so a single-IP device
+ * has no second ssh endpoint and this returns `undefined`.
+ *
+ * REVIEW FIX (issue #48, M3a) — the distinctness check is enforced HERE rather
+ * than merely "the SECOND ssh endpoint". `computeSyncPlan` (~1110) RELIES on
+ * this selector never handing it an `altHost` equal to the primary `host`; the
+ * old `[1]`-after-filter would hand back a self-duplicate whenever a third-party
+ * provider emitted two IDENTICAL ssh endpoints (`[A, A, …]` → `A`), persisting a
+ * dangling `altHost === host` the connect-fallback would have to guard away. The
+ * natural meaning of "alternate" is "an address that is not the primary", so we
+ * take the first ssh host that actually differs from `selectSshEndpoint`'s. A
+ * THIRD-or-later distinct ssh endpoint is still accepted on the tree and left
+ * unused (this returns the first differing one), per the model doc.
  */
 function selectAltEndpoint(device: InventoryDevice) {
-  return device.endpoints.filter((e) => e.kind === "ssh" && e.host.length > 0)[1];
+  const primary = selectSshEndpoint(device);
+  return device.endpoints.find((e) => e.kind === "ssh" && e.host.length > 0 && e.host !== primary?.host);
 }
 
 /**
@@ -1659,6 +1670,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         bump(retainedByProfile, rolledBackProfileId);
       }
 
+      // ALTERNATE HOST (issue #48, M3b) — enforce the `altHost !== host` invariant
+      // `computeSyncPlan` claims (~1110). `selectAltEndpoint` (M3a) guarantees any
+      // value THIS sync WRITES already differs from the primary, so the only way
+      // `after` can leave here with `altHost === host` is the pure-carry route (b):
+      // a device that lost its second address family so the primary `host` flips to
+      // the value the CARRIED `altHost` was still holding (matrix row 6 carried the
+      // old alternate forward, and `endpoint.host` is now that same address). A
+      // dangling self-duplicate is not a value the sync should persist — drop it and
+      // clear its stamp so the record and its provenance agree the field is unset.
+      // Run AFTER the origin rebuilds above so the stamp clear survives them; the
+      // `ipmiHost` paths are deliberately untouched (they carry no such invariant).
+      // Self-healing: the run that regains a second family re-fills `altHost` as an
+      // ordinary row-1 write.
+      if (after.altHost !== undefined && after.altHost === after.host && after.origin !== undefined) {
+        after.altHost = undefined;
+        after.origin = { ...after.origin, syncedAltHost: undefined };
+      }
+
       // AUTH 3 — authProfileId joins the comparison because a retro-apply stamp
       // can be the ONLY difference between `before` and `after` (the device
       // itself is usually identical on the sync that first carries a profile).
@@ -2304,6 +2333,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           const names = overrideRefusedByProfile.get(authDecision.profileId) ?? [];
           names.push(device.name);
           overrideRefusedByProfile.set(authDecision.profileId, names);
+        }
+        // ALTERNATE HOST (issue #48, M3b) — the same `altHost !== host` invariant
+        // enforcement as the update path (~1660), applied to the adoptee. Adoption
+        // writes `host = endpoint.host` while carrying the adoptee's own `altHost`
+        // through the `...adoptee` spread, so the pure-carry route (b) can land an
+        // `altHost === host` here exactly as it can on an owned update. Drop the
+        // dangling self-duplicate and clear its stamp, AFTER the origin rebuilds
+        // above so the clear survives them; the `ipmiHost` path is untouched.
+        if (after.altHost !== undefined && after.altHost === after.host && after.origin !== undefined) {
+          after.altHost = undefined;
+          after.origin = { ...after.origin, syncedAltHost: undefined };
         }
         // No `changed` comparison, unlike the owned-update path above: gaining
         // `origin` guarantees before !== after, so an adoption is ALWAYS an

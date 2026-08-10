@@ -4384,7 +4384,19 @@ describe("computeSyncPlan — altHost (alternate host, Phase 2)", () => {
     expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
   });
 
-  it("an altHost write is enough to make an otherwise-identical server an UPDATE rather than unchanged (kills forgetting `altHost` in the `changed` comparison)", () => {
+  // A first-seen alternate is SURFACED as an update (it does not vanish into
+  // unchangedCount). This is TRUE via the `syncedAltHost` stamp write — every
+  // altHost value write also writes its stamp, and `!serverOriginStampsEqual`
+  // alone already flags the update — so the fixture asserts exactly that: the
+  // field is written AND the plan reports it. It does NOT claim to "kill omitting
+  // `altHost` from the `changed` comparator": removing that one clause leaves this
+  // (and every altHost fixture) green, because the stamp change re-flags the row.
+  // The value clause is defense-in-depth that no fixture can isolate today — every
+  // matrix altHost write re-stamps, and the stamp comparator covers stamps — but
+  // it guards the implicit "value write ⇒ stamp write" invariant against a future
+  // path that writes a value without a stamp (mirror of `updateStillChanged`'s
+  // "unexploitable today" note in syncEngine.ts).
+  it("a first-seen synced altHost value is surfaced as an update, not folded into unchangedCount", () => {
     const owned = makeOwnedServer();
 
     const plan = computeSyncPlan({
@@ -4420,5 +4432,74 @@ describe("computeSyncPlan — altHost (alternate host, Phase 2)", () => {
     // ...and did not take the alternate-host stamp with it.
     expect(after.altHost).toBe("2001:db8::1");
     expect(after.origin?.syncedAltHost).toBe("2001:db8::1");
+  });
+
+  // M3a — `selectAltEndpoint` must pick the first ssh endpoint whose host DIFFERS
+  // from the primary, not merely "the second ssh endpoint". A third-party provider
+  // emitting two IDENTICAL ssh endpoints must NOT yield `altHost === host`.
+  // Against 0f9e47b the `[1]`-after-filter selected the duplicate and the add
+  // persisted a self-duplicate `altHost` equal to `host`.
+  it("M3a — two IDENTICAL ssh endpoints yield NO altHost (never a self-duplicate altHost === host)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({ endpoints: [PRIMARY, { kind: "ssh", host: "10.0.0.1" }] })
+      ]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].host).toBe("10.0.0.1");
+    // The duplicate is rejected — no dangling altHost, and no stamp for one.
+    expect(plan.adds[0].altHost).toBeUndefined();
+    expect(plan.adds[0].origin?.syncedAltHost).toBeUndefined();
+  });
+
+  it("M3a — a distinct alternate is still selected even when an identical duplicate precedes it", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        // primary, an identical duplicate of the primary, then a genuinely
+        // different address: the first DIFFERING host wins, not the second slot.
+        makeDevice({ endpoints: [PRIMARY, { kind: "ssh", host: "10.0.0.1" }, { kind: "ssh", host: "2001:db8::1" }] })
+      ]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds[0].host).toBe("10.0.0.1");
+    expect(plan.adds[0].altHost).toBe("2001:db8::1");
+  });
+
+  // M3b — the pure-carry route to `altHost === host`: a sync-owned server carrying
+  // an alternate, whose device loses its second address family so the primary
+  // `host` flips to the value the carried `altHost` was still holding. The engine
+  // must drop the now-duplicate `altHost` and clear its stamp rather than persist a
+  // dangling `altHost === host`. Against 0f9e47b row 6 carried the alternate forward
+  // and `after.altHost` was left equal to `after.host`.
+  it("M3b — host flips to the carried altHost's value: the duplicate altHost is dropped and its stamp cleared", () => {
+    const owned = makeOwnedServer({
+      host: "10.0.0.1",
+      altHost: "2001:db8::1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "2001:db8::1" }
+    });
+
+    const after = onlyUpdate(
+      computeSyncPlan({
+        source: makeSource(),
+        // The device now reports a SINGLE ssh endpoint at what used to be the
+        // alternate address — its second family is gone, so `host` becomes
+        // "2001:db8::1" and the old carried `altHost` would duplicate it.
+        tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "2001:db8::1" }] })]),
+        currentServers: [owned],
+        now: 2000
+      })
+    );
+
+    expect(after.host).toBe("2001:db8::1");
+    // The duplicate is dropped, not persisted, and its stamp goes with it.
+    expect(after.altHost).toBeUndefined();
+    expect(after.origin?.syncedAltHost).toBeUndefined();
   });
 });

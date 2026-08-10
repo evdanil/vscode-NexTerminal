@@ -85,6 +85,32 @@ export function classifySshConnectionError(error: unknown): ConnectionDiagnostic
     };
   }
 
+  // ALTERNATE HOST (issue #48) — "no route to host" / "network is unreachable"
+  // are TCP-stage (pre-auth) failures exactly like ECONNREFUSED / ETIMEDOUT:
+  // the transport never reached a peer, so no credential was ever offered. They
+  // MUST classify as `tcp` — not `unknown` — because the `SshPty` connect-fallback
+  // (services/ssh/sshPty.ts) only retries the alternate address on a `tcp`/`dns`
+  // stage, and the feature's headline scenario is precisely one of these: a
+  // primary `host` on an IP family the client has no route to (an IPv6 address
+  // with no IPv6 route) rejects INSTANTLY with `connect ENETUNREACH …`, and
+  // before this branch that landed in `unknown` and the alternate was never tried.
+  //
+  // Deliberately NOT `econnreset`: a mid-handshake reset is ambiguous — the peer
+  // WAS reachable and answered, then dropped the connection — so falling back
+  // would re-attempt a reachable-but-flaky host and could cost a second
+  // credential prompt or trip a lockout. Left `unknown` (conservative): the
+  // existing "review the profile settings and retry" path is the safer default
+  // for a reset than an automatic alternate-host retry.
+  if (/ehostunreach|enetunreach|no route to host|network is unreachable/.test(message)) {
+    return {
+      ok: false,
+      stage: "tcp",
+      title: "Host unreachable",
+      detail: "Nexus could not reach the host — there is no network route to the address.",
+      suggestion: "Check that the address is reachable from this machine (routing, IP family, VPN) and that firewalls allow SSH traffic."
+    };
+  }
+
   if (/auth|permission denied|all configured authentication methods failed|login denied/.test(message)) {
     return {
       ok: false,

@@ -927,6 +927,72 @@ describe("SshPty", () => {
       pty.dispose();
     });
 
+    // ALTERNATE HOST (issue #48) — the feature's HEADLINE scenario: the primary
+    // `host` is on an IP family the client cannot route to, so the transport
+    // rejects INSTANTLY with `connect ENETUNREACH …`. Before the diagnostics fix
+    // this classified as `unknown` and the fallback never fired — the session
+    // never opened. This fixture fails against 0f9e47b for exactly that reason.
+    it("falls back to altHost on an ENETUNREACH (no network route) primary failure — the headline unroutable-IP-family case", async () => {
+      const stream = new PassThrough();
+      const { connection } = createConnection(stream);
+      const connect = vi.fn(async (cfg: ServerConfig) => {
+        if (cfg.host === "2001:db8::1") {
+          throw Object.assign(new Error("connect ENETUNREACH 2001:db8::1:22 - Local (:::0)"), { code: "ENETUNREACH" });
+        }
+        return connection;
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "2001:db8::1", altHost: "10.0.0.2" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      // A no-fallback impl (unreachable → unknown → rethrow) never reaches this.
+      expect(callbacks.onSessionOpened).toHaveBeenCalledTimes(1);
+      expect(callbacks.onConnectFailed).not.toHaveBeenCalled();
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(connect.mock.calls[0][0].host).toBe("2001:db8::1");
+      expect(connect.mock.calls[1][0].host).toBe("10.0.0.2");
+
+      pty.dispose();
+    });
+
+    it("falls back to altHost on an EHOSTUNREACH primary failure too", async () => {
+      const stream = new PassThrough();
+      const { connection } = createConnection(stream);
+      const connect = vi.fn(async (cfg: ServerConfig) => {
+        if (cfg.host === "primary.example.com") {
+          throw Object.assign(new Error("connect EHOSTUNREACH 203.0.113.10:22"), { code: "EHOSTUNREACH" });
+        }
+        return connection;
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "primary.example.com", altHost: "10.0.0.2" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      expect(callbacks.onSessionOpened).toHaveBeenCalledTimes(1);
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(connect.mock.calls[1][0].host).toBe("10.0.0.2");
+
+      pty.dispose();
+    });
+
     it("falls back on a DNS-stage (ENOTFOUND) primary failure too", async () => {
       const stream = new PassThrough();
       const { connection } = createConnection(stream);
