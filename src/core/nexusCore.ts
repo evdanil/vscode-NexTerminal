@@ -1985,8 +1985,18 @@ export class NexusCore {
         // Scoping falls out for free — the helper is only entered for a server
         // whose gateway VALUE names a deleted server, so a server whose gateway
         // the user already hand-cleared is never reached and its stamp (opt-out)
-        // survives, consistent with FIX A. Cleared only when the stamp itself
-        // names a deleted server. Same single-member mechanics as `removeAuthProfile`
+        // survives, consistent with FIX A. Cleared only when the stamp equals the
+        // CURRENT gateway value being cleared (`stamp === server.ipmiGatewayServerId`),
+        // i.e. the sync still OWNS the link (cur === stamp) — NOT merely when the
+        // stamp names some deleted server. This is what the single-record deletion
+        // and the auth-profile paths require, and it matters in a BATCH deletion
+        // (folder cascade / inventory prune): a referrer template-stamped with
+        // gateway A whose user later hand-changed the value to B, when BOTH A and B
+        // are deleted in one batch, would — under a membership test — lose its
+        // divergence stamp A along with the value, so the next sync would read it as
+        // never-configured and template-write a new gateway over the user's edit.
+        // The equality gate preserves the diverged stamp (cur B ≠ stamp A) exactly
+        // as row 6 intends. Same single-member mechanics as `removeAuthProfile`
         // (mirror of `dropTemplateProxy` / `clearTemplatedStamps`): rebuild the
         // bag without the member, collapse to `undefined` when nothing else is
         // stamped.
@@ -2000,7 +2010,7 @@ export class NexusCore {
         // owns the template field.
         if (
           server.origin?.templated?.ipmiGatewayServerId !== undefined &&
-          deletedServerIds.has(server.origin.templated.ipmiGatewayServerId)
+          server.origin.templated.ipmiGatewayServerId === server.ipmiGatewayServerId
         ) {
           const templated = { ...server.origin.templated };
           delete templated.ipmiGatewayServerId;
@@ -2010,10 +2020,12 @@ export class NexusCore {
           };
         }
         // The detached twin, swept the same way and for the same adoption reason
-        // as the auth stamp's `formerlySynced` clear.
+        // as the auth stamp's `formerlySynced` clear — and under the same equality
+        // gate (stamp === the current gateway value being cleared), so a user's
+        // divergence on a detached record survives a batch deletion too.
         if (
           server.formerlySynced?.templated?.ipmiGatewayServerId !== undefined &&
-          deletedServerIds.has(server.formerlySynced.templated.ipmiGatewayServerId)
+          server.formerlySynced.templated.ipmiGatewayServerId === server.ipmiGatewayServerId
         ) {
           const templated = { ...server.formerlySynced.templated };
           delete templated.ipmiGatewayServerId;

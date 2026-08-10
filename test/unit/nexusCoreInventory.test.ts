@@ -202,6 +202,70 @@ describe("NexusCore inventory sources", () => {
     expect(core.getServer("C")?.origin?.templated?.ipmiGatewayServerId).toBe("D");
   });
 
+  it("(PR-T3, PR #66 round 5) a BATCH prune of BOTH a diverged gateway stamp's target AND the current value preserves the user's divergence stamp (kills the membership test that erased stamp A)", async () => {
+    // Referrer R was template-stamped with gateway A, then the user hand-changed
+    // its current gateway to B (cur B ≠ stamp A — a row-6 divergence). A sync prune
+    // removes BOTH A and B in the same batch. R's current value B is deleted, so R
+    // enters the sweep — but its stamp names A, NOT the value being cleared, so the
+    // divergence stamp must SURVIVE. Under the old `deletedServerIds.has(stamp)`
+    // membership test, stamp A (also in the batch) was wrongly erased, leaving R
+    // value-less AND stamp-less → the next sync would template-write a new gateway
+    // over the user's edit. The equality gate (stamp === current value cleared)
+    // preserves it.
+    const repository = new InMemoryConfigRepository([
+      { id: "A", name: "Gateway A", host: "a", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:A", syncedAt: 1 } },
+      { id: "B", name: "Gateway B", host: "b", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:B", syncedAt: 1 } },
+      // R: current gateway B (hand-diverged), stamp names A (the template's write).
+      { id: "R", name: "Referrer R", host: "r", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "B", origin: { sourceId: "source-1", externalId: "device:R", syncedAt: 1, templated: { ipmiGatewayServerId: "A" } } }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["A", "B"], // batch removes BOTH the stamp target and the current value
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    const r = core.getServer("R");
+    // Current value B is deleted → cleared.
+    expect(r?.ipmiGatewayServerId).toBeUndefined();
+    // Divergence stamp A (≠ the cleared value B) must SURVIVE — this is the assertion
+    // that fails under the membership test (which deletes A because it's in the batch).
+    expect(r?.origin?.templated?.ipmiGatewayServerId).toBe("A");
+  });
+
+  it("(PR-T3, PR #66 round 5) a batch prune still clears an OWNED gateway stamp (cur === stamp) — regression", async () => {
+    // The owned case (cur === stamp === the deleted gateway) must still clear both,
+    // so the equality gate did not over-narrow.
+    const repository = new InMemoryConfigRepository([
+      { id: "B", name: "Gateway B", host: "b", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:B", syncedAt: 1 } },
+      { id: "X", name: "Other X", host: "x", port: 22, username: "u", authType: "agent", isHidden: false, origin: { sourceId: "source-1", externalId: "device:X", syncedAt: 1 } },
+      { id: "R", name: "Referrer R", host: "r", port: 22, username: "u", authType: "agent", isHidden: false, ipmiGatewayServerId: "B", origin: { sourceId: "source-1", externalId: "device:R", syncedAt: 1, templated: { ipmiGatewayServerId: "B" } } }
+    ]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 1000,
+      upsertServers: [],
+      removeServerIds: ["B", "X"],
+      folders: [],
+      expectedSource: makeSourceConfig()
+    });
+
+    const r = core.getServer("R");
+    expect(r?.ipmiGatewayServerId).toBeUndefined();
+    // cur === stamp === B → both cleared, bag collapses.
+    expect(r?.origin?.templated).toBeUndefined();
+  });
+
   it("(F12) writes lastSyncAt on the applied source only — a second source's lastSyncAt is untouched", async () => {
     const repository = new InMemoryConfigRepository();
     const core = new NexusCore(repository);
