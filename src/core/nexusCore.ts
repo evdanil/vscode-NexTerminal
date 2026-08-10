@@ -1240,6 +1240,88 @@ export class NexusCore {
         }
       }
     }
+    // APPLICATION-TIME UPSERTED-GATEWAY REVALIDATION (issue #48 PR-T3, PR #66
+    // Codex round 7) — the sync-apply SIBLING of round 6's manual-apply per-write
+    // revalidation (deviceTemplateCommands.ts `applyPlanWrites`), same class, same
+    // graceful-degradation symptom. `computeSyncPlan` validated each upserted
+    // server's `ipmiGatewayServerId` against a `liveServerIds` SNAPSHOT taken at
+    // PLAN time (syncEngine.ts). A folder delete (`nexus.group.remove`) does NOT
+    // take `configMutationLock` and does not revise the source/template, so it can
+    // prune the selected gateway AFTER that snapshot — e.g. from another window
+    // while this apply's confirmation modal is open — and the pre-apply guards
+    // (`sourceConfigUnchanged` / the "absent" structural checks) still pass. The
+    // upsert then lands in `this.servers` above carrying a gateway id that no
+    // longer names any server. The `gatewayDeletedIds` sweep just above only
+    // covers servers THIS plan removes (`removeServerIds`), so it misses that
+    // externally-deleted gateway, the dangling link persists, and IPMI silently
+    // falls back to local (`resolveIpmiGatewayServer` treats a dangling id as
+    // "reachable locally"). Close it on this path too: after the deletions,
+    // upserts, and the removeServerIds-sweep have all landed, revalidate each
+    // UPSERTED server against the FINAL `this.servers` and clear a gateway that no
+    // longer resolves — folded into this method's EXISTING persist/rollback
+    // envelope exactly like the sweep above (capture the PRE-clear record into
+    // `priorServers` before mutating — `captureServerPrior` is idempotent, so an
+    // upsert already captured at its original value keeps that prior — then record
+    // the CLEARED record as this batch's write in `batchWrittenServers`, riding
+    // the one `saveServers` + one emit below: NO second write, NO second emit).
+    // Only `ipmiGatewayServerId` (+ its stamp under the round-5 gate) on the
+    // affected upserts is touched; every other field, which servers remain, auth
+    // links, and origins stay exactly as the deletions/upserts left them.
+    //
+    // `ipmiAuthProfileId` is deliberately NOT revalidated here — auth profiles are
+    // validated against the never-pruned profile store; a server-ref (gateway) is
+    // the one that races with folder deletion. And folder deletion is NOT
+    // serialized (the lower-blast-radius revalidation is the chosen fix, mirroring
+    // round 6).
+    for (const upserted of upsertServers) {
+      const live = this.servers.get(upserted.id);
+      // Only a server THIS batch still owns in the live map, whose gateway is set
+      // but resolves to no surviving server. A gateway whose target was removed by
+      // THIS plan's own `removeServerIds` was already cleared by the sweep above,
+      // so `live.ipmiGatewayServerId` reads `undefined` here and it is skipped —
+      // no double processing. A gateway still present (`this.servers.has(gw)`) is
+      // live and left alone, which is also what keeps a DIVERGED stamp (value
+      // present-and-live, stamp naming some other now-absent id) untouched: the
+      // value is live, there is nothing to clear, and the round-5 equality gate
+      // below never fires on it anyway.
+      if (!live || live.ipmiGatewayServerId === undefined || this.servers.has(live.ipmiGatewayServerId)) {
+        continue;
+      }
+      captureServerPrior(upserted.id);
+      // Clear the dangling value and, UNDER THE ROUND-5 EQUALITY GATE, its stamp
+      // twin(s). Same mechanics `clearGatewayReferencesTo` uses (stamp === the
+      // gateway value being cleared; the `formerlySynced` twin likewise; collapse
+      // the bag via `templatedHasAnyStamp`), inlined here rather than shared
+      // because that helper gates on membership in a DELETED set while this pass
+      // gates on "no longer resolves in the FINAL set" — see round 5's
+      // `clearGatewayReferencesTo` doc for why the equality gate (not a membership
+      // test) is what preserves a user's real divergence.
+      let cleared: ServerConfig = { ...live, ipmiGatewayServerId: undefined };
+      if (
+        live.origin?.templated?.ipmiGatewayServerId !== undefined &&
+        live.origin.templated.ipmiGatewayServerId === live.ipmiGatewayServerId
+      ) {
+        const templated = { ...live.origin.templated };
+        delete templated.ipmiGatewayServerId;
+        cleared = {
+          ...cleared,
+          origin: { ...live.origin, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+        };
+      }
+      if (
+        live.formerlySynced?.templated?.ipmiGatewayServerId !== undefined &&
+        live.formerlySynced.templated.ipmiGatewayServerId === live.ipmiGatewayServerId
+      ) {
+        const templated = { ...live.formerlySynced.templated };
+        delete templated.ipmiGatewayServerId;
+        cleared = {
+          ...cleared,
+          formerlySynced: { ...live.formerlySynced, templated: templatedHasAnyStamp(templated) ? templated : undefined }
+        };
+      }
+      this.servers.set(upserted.id, cleared);
+      batchWrittenServers.set(upserted.id, cloneServerConfig(cleared));
+    }
     // OWNERSHIP FIX (USE is not ownership) — a folder the user pre-created by
     // hand (e.g. "NetBox/RackA" made via the tree UI before this source ever
     // synced) that a sync merely PLACES a device into must never enter

@@ -3666,6 +3666,175 @@ describe("share import", () => {
   });
 
   /**
+   * PR #66 Codex review round 7 (P2) — the two `origin.templated` IPMI stamps are
+   * the template-ownership half of the same references the VALUES carry, and the
+   * share path remapped only the values. `remapOriginStamp` remapped
+   * `syncedAuthProfileId` alone AND early-returned whenever that field was absent,
+   * so both templated IPMI stamps stayed in the EXPORTER's id namespace. Left
+   * there, `cur` (the remapped local value) `!==` `stamp` (the old foreign id), and
+   * the template matrix reads a PERMANENT hand divergence (row 6) that can never
+   * again manage a field that was actually template-owned. The stamp must pass
+   * through the SAME lens as its value so ownership (`cur === stamp`) survives
+   * import.
+   *
+   * BOTH IPMI fields are template-owned here (source `cur === stamp`), and the auth
+   * profile AND the gateway server are BOTH in the bundle, so both survive import.
+   * The assertion is the invariant — value equals stamp, in LOCAL ids — not a
+   * literal. Under HEAD 99207c5 the stamp stays "src-AP"/"src-B" while the value is
+   * remapped, so `cur !== stamp` on both fields.
+   */
+  it("share import remaps both origin.templated IPMI stamps with their values, so a template-owned server stays template-owned (cur === stamp) in local ids (kills leaving the stamps in the exporter's namespace)", async () => {
+    // Pre-existing servers/profiles so the import-time idMap must reassign ids (a
+    // no-op remap would be indistinguishable from carrying the ids verbatim).
+    await core.addOrUpdateServer(makeServer({ id: "local-1", name: "Local A" }));
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({
+          id: "src-A",
+          name: "Target",
+          ipmiAuthProfileId: "src-AP",
+          ipmiGatewayServerId: "src-B",
+          // Template-owned on BOTH IPMI fields: value === stamp at the source.
+          origin: {
+            sourceId: "src-on-the-other-machine",
+            externalId: "device:A",
+            syncedAt: 1000,
+            templated: { ipmiAuthProfileId: "src-AP", ipmiGatewayServerId: "src-B" }
+          }
+        }),
+        makeServer({ id: "src-B", name: "Bastion" })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [makeAuthProfile({ id: "src-AP", name: "IPMI Auth" })]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-ipmi-stamps.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.name === "Target")!;
+    const gateway = snapshot.servers.find((s) => s.name === "Bastion")!;
+    const authProfile = snapshot.authProfiles.find((p) => p.name === "IPMI Auth")!;
+
+    // The premise: the origin survived import and both referenced records landed.
+    expect(target.origin?.externalId).toBe("device:A");
+    expect(gateway).toBeDefined();
+    expect(authProfile).toBeDefined();
+
+    // AUTH stamp — value and stamp still name the same profile, and it is the
+    // LOCAL one. Under HEAD 99207c5 the stamp stays "src-AP".
+    expect(target.ipmiAuthProfileId).toBe(authProfile.id);
+    expect(target.origin?.templated?.ipmiAuthProfileId).toBe(target.ipmiAuthProfileId);
+    expect(target.origin?.templated?.ipmiAuthProfileId).not.toBe("src-AP");
+
+    // GATEWAY stamp — value and stamp still name the same server, and it is the
+    // LOCAL one. Under HEAD 99207c5 the stamp stays "src-B".
+    expect(target.ipmiGatewayServerId).toBe(gateway.id);
+    expect(target.origin?.templated?.ipmiGatewayServerId).toBe(target.ipmiGatewayServerId);
+    expect(target.origin?.templated?.ipmiGatewayServerId).not.toBe("src-B");
+  });
+
+  /**
+   * PR #66 Codex review round 7 (P2) — the gateway stamp is FINALIZED like its
+   * value: raw-remapped in `remapOriginStamp`, then narrowed to the surviving set
+   * by `linkToImportedServer` in the finalize loop. So a template-owned gateway
+   * whose target is NOT in the bundle collapses BOTH value and stamp to
+   * `undefined` — cleared together, no false divergence. Under HEAD 99207c5 the
+   * value is dropped (already correct) but the stamp keeps the foreign id, so
+   * `undefined !== "src-absent"` reads as a divergence that never existed.
+   */
+  it("share import clears BOTH the gateway value and its origin.templated stamp when the gateway server is not in the bundle (kills a false divergence from a stranded stamp)", async () => {
+    await core.addOrUpdateServer(makeServer({ id: "local-1", name: "Local A" }));
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({
+          id: "src-A",
+          name: "Target",
+          ipmiGatewayServerId: "src-absent",
+          origin: {
+            sourceId: "src-on-the-other-machine",
+            externalId: "device:A",
+            syncedAt: 1000,
+            templated: { ipmiGatewayServerId: "src-absent" }
+          }
+        })
+      ],
+      tunnels: [],
+      serialProfiles: []
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-ipmi-stamp-absent.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.name === "Target")!;
+    // The origin survived (its only stamp collapsed away, so `templated` is gone
+    // entirely) but the record is intact.
+    expect(target.origin?.externalId).toBe("device:A");
+    // Value cleared (already correct on HEAD) AND stamp cleared together — the
+    // whole point: no `cur !== stamp` from a stranded foreign stamp.
+    expect(target.ipmiGatewayServerId).toBeUndefined();
+    expect(target.origin?.templated?.ipmiGatewayServerId).toBeUndefined();
+  });
+
+  /**
+   * PR #66 Codex review round 7 (P2) — the early-return-guard fix, isolated. An
+   * origin whose ONLY stamps are the templated IPMI ones (NO `syncedAuthProfileId`)
+   * must still be remapped: the old guard `origin.syncedAuthProfileId === undefined`
+   * short-circuited before it, leaving the stamps foreign. Here the auth profile is
+   * in the bundle, so the templated auth stamp must land on the LOCAL id.
+   */
+  it("share import remaps templated stamps on an origin that has ONLY templated stamps and no syncedAuthProfileId (kills the early-return guard skipping a templated-only origin)", async () => {
+    await core.addOrUpdateServer(makeServer({ id: "local-1", name: "Local A" }));
+
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [
+        makeServer({
+          id: "src-A",
+          name: "Target",
+          ipmiAuthProfileId: "src-AP",
+          // No `syncedAuthProfileId` on the origin — only the templated stamp.
+          origin: {
+            sourceId: "src-on-the-other-machine",
+            externalId: "device:A",
+            syncedAt: 1000,
+            templated: { ipmiAuthProfileId: "src-AP" }
+          }
+        })
+      ],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [makeAuthProfile({ id: "src-AP", name: "IPMI Auth" })]
+    });
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share-templated-only.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    await registeredCommands.get("nexus.config.import")!();
+
+    const snapshot = core.getSnapshot();
+    const target = snapshot.servers.find((s) => s.name === "Target")!;
+    const authProfile = snapshot.authProfiles.find((p) => p.name === "IPMI Auth")!;
+
+    expect(target.origin?.syncedAuthProfileId).toBeUndefined();
+    // Under HEAD 99207c5 the early return leaves this "src-AP"; the fix remaps it
+    // to the local profile alongside its value.
+    expect(target.ipmiAuthProfileId).toBe(authProfile.id);
+    expect(target.origin?.templated?.ipmiAuthProfileId).toBe(target.ipmiAuthProfileId);
+    expect(target.origin?.templated?.ipmiAuthProfileId).not.toBe("src-AP");
+  });
+
+  /**
    * ADOPT 1 — the share path keeps `origin` (it only remaps the stamp inside it),
    * and by that same spread it used to keep `formerlySynced`. The two must NOT be
    * handled alike. A stale `origin` is inert on the recipient — no source here

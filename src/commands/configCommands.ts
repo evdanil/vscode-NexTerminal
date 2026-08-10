@@ -1793,10 +1793,44 @@ export function registerConfigCommands(
      * work with no reader anyway.
      */
     const remapOriginStamp = (origin: ServerOrigin | undefined): ServerOrigin | undefined => {
-      if (!isValidServerOrigin(origin) || origin.syncedAuthProfileId === undefined) {
+      // REVIEW FINDING (P2, PR #66 Codex round 7) — the guard used to early-return
+      // whenever `syncedAuthProfileId === undefined`, which left BOTH
+      // `origin.templated` IPMI stamps in the EXPORTER's id namespace on any origin
+      // that carried only templated stamps. Proceed when EITHER the SSH auth stamp
+      // is set OR the origin carries any templated stamp — an origin whose ONLY
+      // stamps are the templated IPMI ones must still be remapped, or its stamps
+      // survive import as foreign ids and the template matrix reads a PERMANENT
+      // hand divergence (row 6), locking a field that was actually template-owned.
+      if (
+        !isValidServerOrigin(origin) ||
+        (origin.syncedAuthProfileId === undefined && !templatedHasAnyStamp(origin.templated))
+      ) {
         return origin;
       }
-      return { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
+      // `syncedAuthProfileId` through the SAME lens the SSH auth VALUE uses
+      // (`linkToImportedProfile`); `linkToImportedProfile(undefined)` is `undefined`,
+      // so an origin carrying only templated stamps keeps `syncedAuthProfileId`
+      // absent, exactly as before.
+      const next: ServerOrigin = { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
+      // Each templated stamp is remapped through the SAME lens its VALUE passes
+      // through on the remapped server below: the auth stamp through
+      // `linkToImportedProfile` (FINAL — profiles are fully resolved here), the
+      // gateway stamp RAW through `idMap` (mirroring the value's raw remap at the
+      // `ipmiGatewayServerId:` line below; the final `linkToImportedServer`
+      // narrowing happens in the finalize loop, since the surviving-server set is
+      // not known at this point). Collapse the rebuilt bag via `templatedHasAnyStamp`
+      // so a template-owned field survives as `cur === stamp` in LOCAL ids and a
+      // real divergence is preserved. `formerlySynced` is dropped whole on share
+      // import below, so no twin remap is needed here.
+      if (origin.templated !== undefined) {
+        const templated = cloneTemplatedStamps(origin.templated);
+        templated.ipmiAuthProfileId = linkToImportedProfile(origin.templated.ipmiAuthProfileId);
+        templated.ipmiGatewayServerId = origin.templated.ipmiGatewayServerId
+          ? (idMap.get(origin.templated.ipmiGatewayServerId) ?? undefined)
+          : undefined;
+        next.templated = templatedHasAnyStamp(templated) ? templated : undefined;
+      }
+      return next;
     };
 
     /**
@@ -1912,9 +1946,25 @@ export function registerConfigCommands(
       remapped !== undefined && importedServerIds.has(remapped) ? remapped : undefined;
 
     for (const remappedServer of remappedServers) {
+      // Narrow the gateway VALUE and, the SAME way, its STAMP (PR #66 Codex round
+      // 7). `remapOriginStamp` above raw-remapped `origin.templated.ipmiGatewayServerId`
+      // through `idMap`, mirroring the value's raw remap; both are FINALIZED here
+      // through `linkToImportedServer`, so a gateway whose target did not survive
+      // import collapses BOTH value and stamp to `undefined` (no false divergence),
+      // and an owned gateway (`cur === stamp` at the source) keeps identical
+      // value+stamp — both raw-remapped, both narrowed → equal → still
+      // template-owned in LOCAL ids. Collapse the rebuilt bag via
+      // `templatedHasAnyStamp`.
+      let finalizedOrigin = remappedServer.origin;
+      if (finalizedOrigin?.templated?.ipmiGatewayServerId !== undefined) {
+        const templated = cloneTemplatedStamps(finalizedOrigin.templated);
+        templated.ipmiGatewayServerId = linkToImportedServer(finalizedOrigin.templated.ipmiGatewayServerId);
+        finalizedOrigin = { ...finalizedOrigin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+      }
       const finalizedServer: ServerConfig = {
         ...remappedServer,
-        ipmiGatewayServerId: linkToImportedServer(remappedServer.ipmiGatewayServerId)
+        ipmiGatewayServerId: linkToImportedServer(remappedServer.ipmiGatewayServerId),
+        origin: finalizedOrigin
       };
       tally(await addIfValid(finalizedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
