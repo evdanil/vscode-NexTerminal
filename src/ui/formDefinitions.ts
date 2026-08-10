@@ -340,6 +340,11 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
     // profile (services/profileTokens.ts). Advanced, because a server that has
     // no BMC should not be asked about one.
     { type: "text", key: "ipmiHost", label: "IPMI / BMC Host", placeholder: "10.0.0.1 or bmc.example.com", value: seed?.ipmiHost, hint: "Optional out-of-band management address — the address only, no https:// or path (e.g. 10.0.0.1, not https://10.0.0.1/). Used by macros through ${profile.ipmiHost}; never used to connect over SSH.", advanced: true, visibleWhen: vw },
+    // ALTERNATE HOST (issue #48) — a second SSH address tried automatically when
+    // the primary Host is unreachable at the TCP/DNS level. Advanced, because
+    // most servers have a single address; the connect-fallback (SshPty.start)
+    // only ever engages when this is set. Not required.
+    { type: "text", key: "altHost", label: "Alternate host", placeholder: "2001:db8::1 or 10.0.0.2", value: seed?.altHost, hint: "A second address (e.g. the IPv6 to this host's IPv4) tried automatically if the primary Host can't be reached. Leave blank for none. Applies to the SSH terminal only — tunnels and jump hosts stay on the primary Host.", advanced: true, visibleWhen: vw },
     ipmiAuthProfileSelectField(authProfiles, seed?.ipmiAuthProfileId, vw),
     ipmiGatewaySelectField(seed, servers, vw),
     // Two literals, never a free-text scheme: `ipmiHost` is an address (no `/`,

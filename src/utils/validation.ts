@@ -288,6 +288,16 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.ipmiHost !== undefined && typeof obj.ipmiHost !== "string") {
     return false;
   }
+  // ALTERNATE HOST (issue #48) — the same tolerant TYPE check as `ipmiHost`
+  // above, for the same reasons: reject a shape no writer of ours produces, but
+  // never a merely untidy value. An empty or whitespace `altHost` reads
+  // identically to absent at the connect-fallback site (`SshPty.start` trims and
+  // treats blank as "no alternate host"), so it is tolerated here exactly as the
+  // form normalizes empty → undefined on save. Not required — a server without a
+  // second address must still validate.
+  if (obj.altHost !== undefined && typeof obj.altHost !== "string") {
+    return false;
+  }
   // Same shape check as `authProfileId` above — it is the same kind of value (a
   // profile id), read at the same kind of site, and an empty string is not a
   // link to anything.

@@ -877,6 +877,154 @@ describe("SshPty", () => {
     expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
   });
 
+  /**
+   * ALTERNATE HOST (issue #48) — the connect-fallback. A CONNECTION-LEVEL
+   * failure (TCP/DNS) against the primary `host` retries once against `altHost`;
+   * auth / host-key / key / proxy failures do NOT. These tests drive the fake
+   * factory by the `host` it is called with, so a no-fallback `start` (which
+   * only ever calls the primary) leaves the session unopened and fails the
+   * happy-path assertions.
+   */
+  describe("altHost connect-fallback", () => {
+    function econnrefused(host: string): Error {
+      return Object.assign(new Error(`connect ECONNREFUSED ${host}:22`), { code: "ECONNREFUSED" });
+    }
+
+    it("falls back to altHost on a TCP-level (ECONNREFUSED) primary failure, opens the session, and names the winning address", async () => {
+      const stream = new PassThrough();
+      const { connection } = createConnection(stream);
+      const connect = vi.fn(async (cfg: ServerConfig) => {
+        if (cfg.host === "primary.example.com") throw econnrefused("primary.example.com");
+        return connection;
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const writes: string[] = [];
+      const pty = new SshPty(
+        makeServer({ host: "primary.example.com", altHost: "2001:db8::1" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+      pty.onDidWrite((s) => writes.push(s));
+
+      pty.open();
+      await flushAsync();
+
+      // Session actually opened — a no-fallback start would never reach here.
+      expect(callbacks.onSessionOpened).toHaveBeenCalledTimes(1);
+      expect(callbacks.onConnectFailed).not.toHaveBeenCalled();
+      // Exactly two connect attempts, the second against altHost.
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(connect.mock.calls[0][0].host).toBe("primary.example.com");
+      expect(connect.mock.calls[1][0].host).toBe("2001:db8::1");
+      // The user is told which address won.
+      const combined = writes.join("");
+      expect(combined).toContain("trying alternate host 2001:db8::1");
+      expect(combined).toContain("Connected via alternate host 2001:db8::1.");
+
+      pty.dispose();
+    });
+
+    it("falls back on a DNS-stage (ENOTFOUND) primary failure too", async () => {
+      const stream = new PassThrough();
+      const { connection } = createConnection(stream);
+      const connect = vi.fn(async (cfg: ServerConfig) => {
+        if (cfg.host === "primary.example.com") {
+          throw Object.assign(new Error("getaddrinfo ENOTFOUND primary.example.com"), { code: "ENOTFOUND" });
+        }
+        return connection;
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "primary.example.com", altHost: "10.0.0.2" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      expect(callbacks.onSessionOpened).toHaveBeenCalledTimes(1);
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(connect.mock.calls[1][0].host).toBe("10.0.0.2");
+
+      pty.dispose();
+    });
+
+    it("does NOT fall back on an AUTH-stage failure — retrying would just re-fail and risk a second prompt", async () => {
+      const connect = vi.fn(async () => {
+        throw new Error("All configured authentication methods failed");
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "primary.example.com", altHost: "2001:db8::1" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      // Called exactly once (primary only) — an impl that falls back on any
+      // error would call it twice.
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
+      expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+
+      pty.dispose();
+    });
+
+    it("does NOT retry when no altHost is configured, even on a TCP failure (unchanged behavior)", async () => {
+      const connect = vi.fn(async () => {
+        throw econnrefused("example.com");
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+
+      pty.open();
+      await flushAsync();
+
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
+
+      pty.dispose();
+    });
+
+    it("does NOT retry when altHost equals the primary host (defensive)", async () => {
+      const connect = vi.fn(async () => {
+        throw econnrefused("dup.example.com");
+      });
+      const sshFactory = { connect };
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "dup.example.com", altHost: "dup.example.com" }),
+        sshFactory as any,
+        callbacks,
+        logger as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
+
+      pty.dispose();
+    });
+  });
+
   it("does not fire onConnectFailed for a failed RECONNECT — that path rethrows to reconnect()", async () => {
     const stream = new PassThrough();
     const { connection, emitClose } = createConnection(stream);

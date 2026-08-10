@@ -439,6 +439,28 @@ export interface ServerConfig {
   group?: string;
   host: string;
   port: number;
+  /**
+   * ALTERNATE HOST (issue #48) — an OPTIONAL, ADDITIVE second SSH address tried
+   * as a fallback when the primary `host` is unreachable at the TCP/DNS level
+   * (unreachable / refused / timed out / name-resolution failure). Family-agnostic:
+   * it is any address — typically the IPv6 to the primary's IPv4 or vice-versa —
+   * and "preferred" is simply whichever address the user (or a later sync) put in
+   * `host`. The connect-fallback lives in `SshPty.start` (services/ssh/sshPty.ts):
+   * it retries against this address exactly once, and ONLY on a connection-level
+   * failure — never on auth / host-key / key / proxy failures, which would just
+   * re-fail on the other address and risk extra credential prompts.
+   *
+   * SCOPE IN v1 is the SSH TERMINAL target host ONLY. It is NOT read by the
+   * IPMI/BMC path (that is `ipmiHost`, a different address for a different
+   * purpose), and NOT by tunnels or jump-hosts, which stay on the primary `host`.
+   * A future phase may auto-populate it from an inventory sync's secondary
+   * primary-IP; nothing here reads or writes it from sync yet.
+   *
+   * Optional and additive, like every other field added after 1.0 — records
+   * written by older builds have none, and older builds round-trip it untouched
+   * (servers are stored as whole objects under `nexus.servers`).
+   */
+  altHost?: string;
   username: string;
   authType: AuthType;
   keyPath?: string;
@@ -796,6 +818,7 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.group === b.group &&
     a.host === b.host &&
     a.port === b.port &&
+    a.altHost === b.altHost &&
     a.username === b.username &&
     a.authType === b.authType &&
     a.keyPath === b.keyPath &&
@@ -844,6 +867,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.group !== batchSnapshot.group) merged.group = current.group;
   if (current.host !== batchSnapshot.host) merged.host = current.host;
   if (current.port !== batchSnapshot.port) merged.port = current.port;
+  if (current.altHost !== batchSnapshot.altHost) merged.altHost = current.altHost;
   if (current.username !== batchSnapshot.username) merged.username = current.username;
   if (current.authType !== batchSnapshot.authType) merged.authType = current.authType;
   if (current.keyPath !== batchSnapshot.keyPath) merged.keyPath = current.keyPath;

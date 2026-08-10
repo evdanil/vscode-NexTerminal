@@ -6,6 +6,7 @@ import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection, SshFactory } from "./contracts";
 import { hasContextAwareConnect } from "./contracts";
+import { classifySshConnectionError } from "./connectionDiagnostics";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
@@ -287,10 +288,65 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       }
       this.writeEmitter.fire(normalized);
     };
+    // ALTERNATE HOST (issue #48) — did the connection that actually opened come
+    // from the alternate address? Set only when the fallback below is taken and
+    // succeeds, so the confirmation banner names the winning address and only
+    // then. `undefined` = primary won (the ordinary case, no banner).
+    let connectedViaAltHost: string | undefined;
     try {
-      connection = hasContextAwareConnect(this.sshFactory)
-        ? await this.sshFactory.connectWithContext(this.serverConfig, { onAuthMessage })
-        : await this.sshFactory.connect(this.serverConfig);
+      // ALTERNATE HOST (issue #48) — try the primary `host`, then fall back once
+      // to `altHost` on a CONNECTION-LEVEL failure only. Wrapped INSIDE the
+      // existing try so a fallback attempt that also fails flows to the same
+      // catch below as any other connect failure — the terminal is left open on
+      // the "press any key" notice and `onConnectFailed` fires exactly once.
+      const connectOnce = (cfg: ServerConfig): Promise<SshConnection> =>
+        hasContextAwareConnect(this.sshFactory)
+          ? this.sshFactory.connectWithContext(cfg, { onAuthMessage })
+          : this.sshFactory.connect(cfg);
+
+      // Blank / whitespace reads as "no alternate host", matching the form's
+      // empty → undefined normalization and validation's tolerance of "".
+      const altHost =
+        typeof this.serverConfig.altHost === "string" && this.serverConfig.altHost.trim() !== ""
+          ? this.serverConfig.altHost.trim()
+          : undefined;
+
+      try {
+        connection = await connectOnce(this.serverConfig);
+      } catch (primaryError) {
+        // Fall back ONLY for a TCP/DNS-stage failure — unreachable, refused,
+        // timed out, name-resolution failure. Auth / host-key / key / proxy
+        // failures are NOT connection-level: the alternate address would just
+        // re-fail the same way, and re-attempting could cost a second
+        // credential prompt or trip a lockout, so those rethrow unchanged.
+        const stage = classifySshConnectionError(primaryError).stage;
+        const isConnectionLevel = stage === "tcp" || stage === "dns";
+        if (
+          !isConnectionLevel ||
+          altHost === undefined ||
+          altHost === this.serverConfig.host ||
+          this.disposed ||
+          this.shuttingDown ||
+          generation !== this.connectionGeneration
+        ) {
+          // Auth/host-key/key/proxy, no alt configured, alt equals primary, or
+          // this attempt was torn down/superseded → existing failure path.
+          throw primaryError;
+        }
+        this.logger.log(`primary host unreachable (${stage}); trying altHost ${altHost}`);
+        this.writeEmitter.fire(
+          `\r\n[Nexus SSH] ${this.serverConfig.host} unreachable — trying alternate host ${altHost}…\r\n`
+        );
+        // KNOWN v1 LIMITATION — double prompt. For a password-auth server with
+        // NO saved password, `SilentAuthSshFactory` prompts for the password
+        // BEFORE the transport connects, so a primary TCP failure followed by
+        // this altHost retry can prompt for the same password twice. Accepted
+        // for v1: the fleet norm is saved-credential and key/agent servers,
+        // which never hit it. The deferred fix is to centralize the fallback in
+        // `SilentAuthSshFactory` (which would also cover tunnels and jump-hosts).
+        connection = await connectOnce({ ...this.serverConfig, host: altHost });
+        connectedViaAltHost = altHost;
+      }
       if (this.disposed || this.shuttingDown || generation !== this.connectionGeneration) {
         connection.dispose();
         return;
@@ -312,6 +368,13 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
       this.callbacks.onSessionOpened(this.sessionId);
       this.logger.log(`connected to ${this.serverConfig.name}`);
+
+      // ALTERNATE HOST (issue #48) — surface WHICH address won, but only when the
+      // fallback was actually taken (the primary-wins path is silent, unchanged).
+      if (connectedViaAltHost !== undefined) {
+        this.logger.log(`connected via alternate host ${connectedViaAltHost}`);
+        this.writeEmitter.fire(`[Nexus SSH] Connected via alternate host ${connectedViaAltHost}.\r\n`);
+      }
 
       const banner = connection.getBanner();
       if (banner) {

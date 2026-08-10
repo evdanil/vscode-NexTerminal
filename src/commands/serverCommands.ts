@@ -634,6 +634,10 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     // all-whitespace value would otherwise read as "set" here and as "not set"
     // in `resolveProfileTokens`, which trims before it decides.
     ipmiHost: typeof values.ipmiHost === "string" && values.ipmiHost.trim() ? values.ipmiHost.trim() : undefined,
+    // ALTERNATE HOST (issue #48) — trimmed and blank-canonicalized like every
+    // other optional text field: an all-whitespace value would otherwise read as
+    // "set" here and as "not set" in the connect-fallback, which trims first.
+    altHost: typeof values.altHost === "string" && values.altHost.trim() ? values.altHost.trim() : undefined,
     group: normalizedGroup,
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
