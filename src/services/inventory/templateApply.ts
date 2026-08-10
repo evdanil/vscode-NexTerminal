@@ -1,4 +1,4 @@
-import type { AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../models/config";
+import type { AuthProfile, DetachedServerOrigin, ProxyConfig, ServerConfig, ServerOrigin } from "../../models/config";
 import { authProfileNeedsServerKeyPath, templatedHasAnyStamp } from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, TemplateRule } from "../../models/inventory";
 import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "../../models/deviceTemplate";
@@ -1400,15 +1400,24 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
   return plan;
 }
 
-export function clearTemplatedStamps(origin: ServerOrigin | undefined, writtenFields: readonly TemplatableField[]): ServerOrigin | undefined {
-  if (origin === undefined) {
-    return origin;
-  }
-  const next: ServerOrigin = { ...origin };
+/**
+ * PR-T3 review round 9 (Codex) — the STAMP-CLEAR CORE, shared by `clearTemplatedStamps`
+ * (live `origin`) and `clearDetachedTemplatedStamps` (the detached `formerlySynced`
+ * receipt). Both stamp-bearing origin shapes carry the SAME two ownership members —
+ * `syncedAuthProfileId?` and `templated?` (of the identical `ServerOrigin["templated"]`
+ * shape) — so the members read/written here are the whole overlap between them, and a
+ * `DetachedServerOrigin`'s REQUIRED receipt fields (`sourceId`/`providerId`/…) are never
+ * touched. It mutates `target`'s two members IN PLACE (each wrapper passes a shallow copy),
+ * reading the current values from `source`, so a wrapper can copy its own concrete shape
+ * first and let this fill in only the cleared members — keeping each wrapper's declared
+ * return type intact.
+ */
+type StampBearer = { syncedAuthProfileId?: string; templated?: ServerOrigin["templated"] };
+function clearStampMembers(source: StampBearer, target: StampBearer, writtenFields: readonly TemplatableField[]): void {
   if (writtenFields.includes("authProfileId")) {
-    next.syncedAuthProfileId = undefined;
+    target.syncedAuthProfileId = undefined; // the auth link's twin keys off `authProfileId`, not a `templated` member
   }
-  const templated = origin.templated ? { ...origin.templated } : undefined;
+  const templated = source.templated ? { ...source.templated } : undefined;
   if (templated !== undefined) {
     for (const field of writtenFields) {
       if (
@@ -1422,7 +1431,37 @@ export function clearTemplatedStamps(origin: ServerOrigin | undefined, writtenFi
         delete templated[field];
       }
     }
-    next.templated = templatedHasAnyStamp(templated) ? templated : undefined;
+    target.templated = templatedHasAnyStamp(templated) ? templated : undefined;
   }
+}
+
+export function clearTemplatedStamps(origin: ServerOrigin | undefined, writtenFields: readonly TemplatableField[]): ServerOrigin | undefined {
+  if (origin === undefined) {
+    return origin;
+  }
+  const next: ServerOrigin = { ...origin };
+  clearStampMembers(origin, next, writtenFields);
+  return next;
+}
+
+/**
+ * PR-T3 review round 9 (Codex) — the DETACHED twin of `clearTemplatedStamps`. A server
+ * KEPT from a removed source carries its ownership receipt in `formerlySynced`, a
+ * `DetachedServerOrigin`, not `origin`. The §7.4 manual-apply clear must strip the written
+ * members from THAT receipt too, or a manual Override claiming a value as hand-owned leaves
+ * the detached stamp intact and a later ADOPTION resurrects it into a live `origin` as
+ * template-owned — silently breaking the consent modal's ownership promise. Only the two
+ * stamp members (`templated` + `syncedAuthProfileId`) are cleared; the receipt's REQUIRED
+ * fields ride through untouched, so a `DetachedServerOrigin` never collapses to `undefined`.
+ */
+export function clearDetachedTemplatedStamps(
+  detached: DetachedServerOrigin | undefined,
+  writtenFields: readonly TemplatableField[]
+): DetachedServerOrigin | undefined {
+  if (detached === undefined) {
+    return detached;
+  }
+  const next: DetachedServerOrigin = { ...detached };
+  clearStampMembers(detached, next, writtenFields);
   return next;
 }

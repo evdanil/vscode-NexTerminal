@@ -1430,3 +1430,93 @@ describe("applyPlanWrites — reference revalidation (PR-T3, PR #66 Codex round 
     expect(core.getServer("R")?.ipmiGatewayServerId).toBe("GW");
   });
 });
+
+// ============================================================================
+// FALSIFICATION-CRITICAL: PR-T3 review round 9 (Codex) — FIX B. The §7.4 manual-apply
+// stamp clear must also strip the written members from the DETACHED `formerlySynced`
+// receipt, not only from `live.origin`. A server KEPT from a removed source carries its
+// ownership receipt in `formerlySynced` (no `origin`); when a manual Override claims the
+// existing value as a hand edit, the detached stamp must be cleared too — otherwise a later
+// ADOPTION restores it into a live `origin` as template-owned, silently breaking the consent
+// modal's "this becomes hand-owned" promise. Built to FAIL against 229730e, which clears
+// only `live.origin` and leaves the detached stamp intact.
+// ============================================================================
+describe("applyPlanWrites — detached receipt stamp clear (PR-T3, PR #66 Codex round 9)", () => {
+  /** A server KEPT from a removed source: no `origin`, a `formerlySynced` receipt whose `templated` stamps the two IPMI ids the sync last wrote. */
+  function keptServer(templated: { ipmiGatewayServerId?: string; ipmiAuthProfileId?: string }, live: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "K",
+      name: "Kept",
+      host: "k",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      group: "DC",
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "NetBox (removed)",
+        providerId: "netbox",
+        instanceKey: "https://netbox.example.com",
+        externalId: "K",
+        templated,
+        detachedAt: 1
+      },
+      ...live
+    };
+  }
+
+  it("CLEARS the detached gateway stamp when an Override claims the SAME gateway as a hand edit (kills clearing only live.origin — the detached stamp survives and a later adoption resurrects it as template-owned)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "X", name: "Gateway X", host: "x", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    // Kept server currently points at gateway X, and its DETACHED receipt stamps X as the
+    // removed source's template-owned value. No `origin` — the stamp lives only on the receipt.
+    await core.addOrUpdateServer(keptServer({ ipmiGatewayServerId: "X" }, { ipmiGatewayServerId: "X" }));
+
+    // An Override rule writes the SAME value X, deliberately claiming it as a hand edit —
+    // an override always writes (even a no-op value), so `ipmiGatewayServerId` is written.
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "X" } } },
+      servers: [core.getServer("K")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "X" || id === "K"
+    });
+    expect(plan.serverWrites.find((w) => w.serverId === "K")?.writtenFields).toContain("ipmiGatewayServerId");
+
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    expect(applied).toBe(1);
+    const next = core.getServer("K")!;
+    // The value the Override wrote is present…
+    expect(next.ipmiGatewayServerId).toBe("X");
+    // …and the DETACHED stamp is CLEARED — the whole point of FIX B. Against 229730e only
+    // `live.origin` is cleared, so the detached stamp survives and this assertion fails.
+    // The bag held only the gateway stamp, so it collapses to `undefined`.
+    expect(next.formerlySynced?.templated?.ipmiGatewayServerId).toBeUndefined();
+    // The receipt's REQUIRED fields are never touched — a DetachedServerOrigin never
+    // collapses to `undefined`.
+    expect(next.formerlySynced?.sourceId).toBe("removed-source");
+    expect(next.formerlySynced?.externalId).toBe("K");
+  });
+
+  it("clears ONLY the written member — a co-stamped ipmiAuthProfileId survives when only the gateway is written (proves the clear keys off writtenFields, not a blanket wipe)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateServer({ id: "X", name: "Gateway X", host: "x", port: 22, username: "u", authType: "agent", isHidden: false, group: "Other" });
+    // Receipt stamps BOTH IPMI ids; the Override writes only the gateway.
+    await core.addOrUpdateServer(keptServer({ ipmiGatewayServerId: "X", ipmiAuthProfileId: "PA" }, { ipmiGatewayServerId: "X", ipmiAuthProfileId: "PA" }));
+
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { ipmiGatewayServerId: { mode: "override", value: "X" } } },
+      servers: [core.getServer("K")!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: (id: string) => id === "X" || id === "K"
+    });
+
+    const applied = await applyPlanWrites(ctxFor(core), plan);
+    expect(applied).toBe(1);
+    const next = core.getServer("K")!;
+    expect(next.formerlySynced?.templated?.ipmiGatewayServerId).toBeUndefined(); // cleared
+    expect(next.formerlySynced?.templated?.ipmiAuthProfileId).toBe("PA"); // untouched — not written
+  });
+});

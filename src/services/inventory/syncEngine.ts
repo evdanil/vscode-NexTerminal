@@ -2929,7 +2929,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     const danglingGatewayId = gw;
     const priorGateway = before?.ipmiGatewayServerId; // A_live on a row-3 override MOVE; undefined on a row-1 write
-    const priorStamp = before?.origin?.templated?.ipmiGatewayServerId;
+    // PR-T3 review round 9 (Codex) — read the prior gateway stamp from the live
+    // origin OR the DETACHED receipt. On a normal update the stamp sits in
+    // `before.origin.templated`; but on an ADOPTION update `before` is the
+    // pre-adoption KEPT record whose `origin` is absent and whose value stamp lives
+    // in `before.formerlySynced.templated`. Falling back to the detached twin lets a
+    // restored template-owned gateway A keep its ownership stamp — without it the
+    // restore branch below leaves A stamp-less, so it reads as HAND-configured
+    // (`cur !== stamp`) and a later override template could never manage it again.
+    // Origin first: on a normal update `before.formerlySynced` is absent so the `??`
+    // tail is `undefined` and behavior is byte-identical.
+    const priorStamp =
+      before?.origin?.templated?.ipmiGatewayServerId ?? before?.formerlySynced?.templated?.ipmiGatewayServerId;
     if (priorGateway !== undefined && survivorIds.has(priorGateway)) {
       // Row-5 carry of a STILL-VALID prior gateway on a row-3 override MOVE. The guard
       // is what distinguishes this from proxy: a prior gateway that is itself pruned is

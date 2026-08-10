@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ProxyConfig, ServerConfig } from "../models/config";
 import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "../models/deviceTemplate";
 import {
+  clearDetachedTemplatedStamps,
   clearTemplatedStamps,
   filterLabel,
   parseTemplateFilter,
@@ -610,6 +611,18 @@ export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan
       delete next.origin;
     } else {
       next.origin = clearedOrigin;
+    }
+    // PR-T3 review round 9 (Codex) — a server KEPT from a removed source carries its
+    // ownership receipt in `formerlySynced` (a DetachedServerOrigin), not `origin`. Clear
+    // the same written members from THAT detached receipt too: without it, a manual Override
+    // claiming the existing value as a hand edit leaves the detached stamp intact, and a
+    // later ADOPTION restores it into a live `origin` as template-owned — silently breaking
+    // the modal's "this becomes hand-owned" promise. A DetachedServerOrigin never collapses
+    // to `undefined` (only its `templated`/`syncedAuthProfileId` members clear), so this is a
+    // straight reassign when `formerlySynced` is present and a no-op when it is absent.
+    const clearedFormerly = clearDetachedTemplatedStamps(live.formerlySynced, writtenFields);
+    if (clearedFormerly !== undefined) {
+      next.formerlySynced = clearedFormerly;
     }
     await ctx.core.addOrUpdateServer(next);
     applied++;
