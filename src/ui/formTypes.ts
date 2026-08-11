@@ -96,7 +96,6 @@ export type FormMessage =
   | { type: "test"; values: FormValues };
 
 export type ExtensionMessage =
-  | { type: "init"; definition: FormDefinition; values: FormValues }
   | { type: "browseResult"; key: string; path: string }
   | { type: "validationError"; errors: Record<string, string> }
   | { type: "addSelectOption"; key: string; value: string; label: string; description?: string; fillValue?: string }

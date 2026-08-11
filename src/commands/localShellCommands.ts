@@ -401,8 +401,6 @@ export function resolveLocalShellLaunchOptions(profile: LocalShellProfile): Loca
   };
 }
 
-export const resolveLocalShellTerminalOptions = resolveLocalShellLaunchOptions;
-
 function localShellDescription(profile: LocalShellProfile): string {
   return profile.launchMode === "vscodeProfile"
     ? `VS Code: ${profile.vscodeProfileName ?? ""}`

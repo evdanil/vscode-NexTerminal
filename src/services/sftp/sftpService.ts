@@ -3,7 +3,7 @@ import { createReadStream, promises as fsp } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { SFTPWrapper, FileEntry, Stats, TransferOptions } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import { clamp } from "../../utils/helpers";
+import { clamp, normalizeBoundedNumber as normalizeConfigValue } from "../../utils/helpers";
 import { shellEscape } from "../../utils/shellEscape";
 import { isSafeEntryName, joinRemoteEntryPath } from "../../utils/pathSafety";
 import { resolveTransferTuning } from "../../utils/networkPath";
@@ -121,12 +121,6 @@ function isStrictMissingPathError(error: unknown): boolean {
     candidate.code === "2" ||
     candidate.code === "ENOENT"
   );
-}
-
-function normalizeConfigValue(value: number | undefined, fallback: number, min: number, max: number): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? clamp(Math.floor(value), min, max)
-    : fallback;
 }
 
 function toDirectoryEntry(entry: FileEntry): DirectoryEntry {

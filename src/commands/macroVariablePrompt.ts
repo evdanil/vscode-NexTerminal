@@ -31,7 +31,6 @@ const EMPTY_VALUES: Readonly<Record<string, string>> = Object.freeze(Object.crea
 interface InFlightRun {
   key: string;
   macroName: string;
-  promise: Promise<void>;
 }
 
 let inFlight: InFlightRun | undefined;
@@ -290,7 +289,7 @@ export async function runMacroWithTarget(
   // would run `releaseInFlight` against a still-empty `inFlight`, after which this
   // assignment would install an already-completed run and lock out every macro until
   // the window reloads. That is the exact failure the guard exists to prevent.
-  const entry: InFlightRun = { key, macroName: macro.name, promise: Promise.resolve() };
+  const entry: InFlightRun = { key, macroName: macro.name };
   inFlight = entry;
 
   const run = (async (): Promise<void> => {
@@ -326,6 +325,5 @@ export async function runMacroWithTarget(
     }
   })();
 
-  entry.promise = run;
   await run;
 }

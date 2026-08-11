@@ -17,7 +17,6 @@ import {
   normalizeOptionalFolderPath,
   INVALID_FOLDER_PATH_MESSAGE,
   folderDisplayName,
-  isDescendantOrSelf,
   MAX_FOLDER_DEPTH
 } from "../utils/folderPaths";
 

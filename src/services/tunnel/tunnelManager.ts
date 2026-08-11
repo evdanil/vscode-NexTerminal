@@ -2,11 +2,9 @@ import * as net from "node:net";
 import { randomUUID } from "node:crypto";
 import type { ActiveTunnel, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile, TunnelType } from "../../models/config";
 import { resolveTunnelType } from "../../models/config";
-import { clamp } from "../../utils/helpers";
+import { normalizeBoundedNumber } from "../../utils/helpers";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { handleSocks5Handshake, sendSocks5Failure, sendSocks5Success, Socks5HandshakeAbortedError } from "./socks5";
-
-export type TunnelSshFactory = SshFactory;
 
 export type TunnelEvent =
   | { type: "started"; tunnel: ActiveTunnel }
@@ -47,7 +45,7 @@ function closeServer(server: net.Server): Promise<void> {
 }
 
 function normalizeSocks5HandshakeTimeoutMs(timeoutMs: number): number {
-  return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 2_000, 60_000) : 10_000;
+  return normalizeBoundedNumber(timeoutMs, 10_000, 2_000, 60_000);
 }
 
 export class TunnelManager {

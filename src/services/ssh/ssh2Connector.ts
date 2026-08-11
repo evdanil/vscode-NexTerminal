@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
 import { Client, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
 import type { ServerConfig } from "../../models/config";
-import { clamp } from "../../utils/helpers";
+import { normalizeBoundedNumber as normalizeTimeout } from "../../utils/helpers";
 import type {
   HostKeyVerifier,
   KeyboardInteractiveHandler,
@@ -193,12 +193,6 @@ export interface SshConnectionOptions {
   readyTimeoutMs?: number;
   keepaliveIntervalMs?: number;
   keepaliveCountMax?: number;
-}
-
-function normalizeTimeout(value: number | undefined, fallback: number, min: number, max: number): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? clamp(Math.floor(value), min, max)
-    : fallback;
 }
 
 function normalizeConnectionOptions(options?: SshConnectionOptions): Required<SshConnectionOptions> {
