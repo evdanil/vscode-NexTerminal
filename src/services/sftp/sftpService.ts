@@ -67,15 +67,15 @@ function createTimeoutError(label: string, timeoutMs: number): Error {
 }
 
 /**
- * ssh2's SFTP WriteStream, typed for the two things this file asks of it.
- * `@types/ssh2` narrows `destroy()` to zero arguments, but ssh2 leaves node's own
- * `Writable.prototype.destroy(error, cb)` in place on every Node version this
- * extension runs on, and passing the error is what suppresses the misleading
+ * ssh2's SFTP WriteStream, typed for what this file asks of it: `write(chunk, cb)`
+ * and `end()` come from `NodeJS.WritableStream`; `destroy(error)` has to be widened
+ * because `@types/ssh2` narrows `destroy()` to zero arguments while ssh2 leaves
+ * node's own `Writable.prototype.destroy(error, cb)` in place on every Node version
+ * this extension runs on — and passing the error is what suppresses the misleading
  * 'close' that a bare `destroy()` would emit after an aborted write.
  */
 type SftpWriteStream = NodeJS.WritableStream & {
   destroy(error?: Error): void;
-  end(chunk: Buffer): void;
 };
 
 function withTimeout<T>(
@@ -367,6 +367,50 @@ export class SftpService {
     });
   }
 
+  /**
+   * Pushes a buffer through an ssh2 SFTP WriteStream, resolving ONLY once the
+   * server has acknowledged every byte AND closed the handle cleanly.
+   *
+   * The success signal cannot be the 'close' event on its own, and that is the
+   * whole point of this helper. Verified against ssh2 1.17.0
+   * (`lib/protocol/SFTP.js`) driven through a stubbed SFTP on the Node 20 the
+   * extension host runs: a REFUSED write and a fully SUCCESSFUL one emit exactly
+   * the same thing — one 'close', nothing else.
+   *  - `WriteStream.prototype._write` (:3970) answers a rejected SSH_FXP_WRITE
+   *    with `this.destroy()` — WITHOUT the error — and only THEN `cb(er)`. Node's
+   *    `errorOrDestroy` short-circuits on the already-destroyed stream, so no
+   *    'error' is ever emitted. `_writev` (:3993) is identical.
+   *  - `closeStream` (:3807) emits 'close' whenever the SSH_FXP_CLOSE itself
+   *    succeeded, which it does: the handle closes fine, it just has nothing (or
+   *    a truncated prefix) in it. So the old `on("close", succeed)` reported
+   *    ENOSPC, an over-quota home directory, or an appliance refusing the path as
+   *    a completed write.
+   *
+   * 'finish' cannot be the gate either, tempting as it looks. `_final` (:3887)
+   * calls `this.destroy()` BEFORE its callback, and node's `needFinish()` requires
+   * `!state.destroyed`, so 'finish' NEVER fires on this stream — not on the
+   * refused path, and not on the successful one either (`writableFinished` is
+   * false even after a write that moved every byte). Gating on it would fail every
+   * elevated save. `end(content, cb)` is unusable for the same reason: that
+   * `destroy()` drains the end-callbacks through `errorBuffer`, so on a SUCCESSFUL
+   * write the callback fires with `ERR_STREAM_DESTROYED: Cannot call end after a
+   * stream was destroyed`.
+   *
+   * What does report truthfully is the per-write callback of `write(chunk, cb)`.
+   * Node routes a failed write through `onwriteError`, which invokes that callback
+   * with the server's own error before the destroyed state can swallow it (ssh2
+   * carries the SSH_FXP_STATUS message through, so it reads "No space left on
+   * device" rather than a bare code), and invokes it with no argument only once
+   * `SFTP.prototype.write` has seen every split chunk of the buffer acknowledged.
+   * Both halves are then required for success: the bytes ACKed, and a clean
+   * 'close' — a server that defers ENOSPC to SSH_FXP_CLOSE reports it there, and a
+   * failing close arrives as 'error' rather than 'close'.
+   *
+   * This matters most for its caller. `writeFileElevated` sudo-moves the staged
+   * file over a privileged target with no size verification anywhere on the path,
+   * so a promise resolved here is the only thing between a refused write and an
+   * /etc file overwritten with a truncated one.
+   */
   private writeFileWithTimeout(
     timeoutMs: number,
     content: Buffer,
@@ -374,6 +418,7 @@ export class SftpService {
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
+      let bytesAcknowledged = false;
       const fail = (reason: unknown): void => {
         if (settled) {
           return;
@@ -397,9 +442,26 @@ export class SftpService {
       }, timeoutMs);
 
       const stream = createStream();
-      stream.on("close", succeed);
+      stream.on("close", () => {
+        if (bytesAcknowledged) {
+          succeed();
+          return;
+        }
+        // The handle closed cleanly without the write ever being acknowledged or
+        // reported as failed. Unreachable through ssh2's own paths, which is
+        // exactly why it must not be assumed success: nothing downstream checks
+        // the staged file's size.
+        fail(new Error("SFTP writeFile failed: the file was closed before the server acknowledged the data"));
+      });
       stream.on("error", fail);
-      stream.end(content);
+      stream.write(content, (error) => {
+        if (error) {
+          fail(new Error(`SFTP writeFile failed: the server rejected the write (${error.message})`));
+          return;
+        }
+        bytesAcknowledged = true;
+      });
+      stream.end();
     });
   }
 

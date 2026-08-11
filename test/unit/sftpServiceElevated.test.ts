@@ -65,20 +65,94 @@ function createMockFactory(connection: SshConnection): SshFactory {
   };
 }
 
-/** A fake SFTP write stream whose "close" listener fires synchronously from end(). */
-function createFakeWriteStream() {
-  let closeHandler: (() => void) | undefined;
+/**
+ * How the staged write is answered. Modelled on ssh2 1.17.0
+ * `lib/protocol/SFTP.js`, verified by driving the real `WriteStream` through a
+ * stubbed SFTP on the Node 20 the extension host runs.
+ */
+type FakeWriteBehaviour =
+  /** Server ACKs the WRITE, then the handle closes cleanly. */
+  | { kind: "accept" }
+  /** `_write` (:3970): `this.destroy()` WITHOUT the error, and only THEN `cb(er)`. */
+  | { kind: "refuse"; error: Error }
+  /** The WRITE is never answered at all, yet the handle still closes cleanly. */
+  | { kind: "silent" }
+  /** Nothing is ever answered — a wedged channel, for the timeout path. */
+  | { kind: "stall" };
+
+/**
+ * A double for ssh2's SFTP WriteStream, modelling how it REPORTS each outcome.
+ *
+ * The load-bearing detail: an accepted write and a refused one emit the exact same
+ * event — a single 'close'. On refusal `_write` destroys the stream without the
+ * error, so node's `errorOrDestroy` never emits 'error', while `closeStream`
+ * (:3807) still emits 'close' because the SSH_FXP_CLOSE itself succeeded. Only the
+ * `write(chunk, cb)` callback tells the two apart, which is what makes the
+ * refused-write test below non-vacuous.
+ *
+ * 'finish' is deliberately never emitted, on any path: `_final` (:3887) calls
+ * `destroy()` BEFORE its callback, so node's `needFinish()` is false and
+ * `writableFinished` stays false even after a write that moved every byte.
+ */
+function createFakeWriteStream(behaviour: FakeWriteBehaviour = { kind: "accept" }) {
+  const handlers = new Map<string, Array<(arg?: unknown) => void>>();
+  const emitted: string[] = [];
+  const written: Buffer[] = [];
+  let destroyed = false;
+
+  const emit = (event: string, arg?: Error): void => {
+    emitted.push(event);
+    for (const handler of handlers.get(event) ?? []) {
+      handler(arg);
+    }
+  };
+  /** closeStream (:3807): 'close' is emitted only when the close carried no error. */
+  const closeStream = (error?: Error): void => {
+    if (destroyed) {
+      return; // node's destroy() is a no-op once the stream is destroyed
+    }
+    destroyed = true;
+    queueMicrotask(() => emit(error ? "error" : "close", error));
+  };
+
   const stream = {
-    on: vi.fn((event: string, handler: () => void) => {
-      if (event === "close") {
-        closeHandler = handler;
-      }
+    emitted,
+    written,
+    on: vi.fn((event: string, handler: (arg?: unknown) => void) => {
+      const existing = handlers.get(event) ?? [];
+      existing.push(handler);
+      handlers.set(event, existing);
       return stream;
     }),
-    end: vi.fn(() => {
-      closeHandler?.();
+    write: vi.fn((chunk: Buffer, callback: (error?: Error | null) => void) => {
+      queueMicrotask(() => {
+        if (behaviour.kind === "stall" || behaviour.kind === "silent") {
+          return; // WRITE sent, reply never comes
+        }
+        if (behaviour.kind === "refuse") {
+          closeStream();
+          callback(behaviour.error);
+          return;
+        }
+        written.push(chunk);
+        callback(null);
+      });
+      return true;
     }),
-    destroy: vi.fn(),
+    end: vi.fn(() => {
+      // _final → destroy() → closeStream, one hop behind the write reply: the real
+      // stream only finalizes once the write it is waiting on has come back.
+      queueMicrotask(() => {
+        if (behaviour.kind !== "stall") {
+          closeStream();
+        }
+      });
+      return stream;
+    }),
+    destroy: vi.fn((error?: Error) => {
+      closeStream(error);
+      return stream;
+    }),
   };
   return stream;
 }
@@ -268,6 +342,88 @@ describe("SftpService elevated writes", () => {
 
     expect(capturedCommand).toContain("umask 26");
     expect(capturedCommand).not.toContain("umask 22");
+  });
+
+  // THE defect on this path, and it bites harder here than on an ordinary save:
+  // the staged file is handed to sudo, which moves it over a root-owned target,
+  // and nothing anywhere on the path verifies its size. A staging write the server
+  // refused emitted 'close' and nothing else — the same single event a clean write
+  // emits — so 'close' as the success signal meant sudo overwrote /etc/hosts with
+  // an empty file and the save was reported as having worked.
+  it("a staging write the server refuses fails the save instead of sudo-installing a truncated file", async () => {
+    const writeStream = createFakeWriteStream({
+      kind: "refuse",
+      error: Object.assign(new Error("No space left on device"), { code: 4 }),
+    });
+    sftp.createWriteStream.mockReturnValue(writeStream);
+    let unlinkedPath: string | undefined;
+    sftp.unlink.mockImplementation((remotePath: string, cb: (err?: Error) => void) => {
+      unlinkedPath = remotePath;
+      cb();
+    });
+    // A sudo install that WOULD succeed if it were ever reached: without it the
+    // flip-check would fail on an unstubbed exec rather than on the save being
+    // reported as having worked.
+    const execStream = createExecStream();
+    (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(execStream);
+
+    const promise = service.writeFileElevated("srv-1", "/etc/hosts", Buffer.from("hi"));
+    await flush();
+    execStream.emit("close", 0);
+
+    await expect(promise).rejects.toThrow(/rejected the write \(No space left on device\)/);
+
+    // The stream emitted the success-shaped event trace anyway — that is the
+    // point, and the reason a 'close' listener could not tell the difference.
+    expect(writeStream.emitted).toEqual(["close"]);
+    expect(writeStream.written).toHaveLength(0);
+    // Decisive: sudo must never run, or a truncated temp file lands on the target.
+    expect(connection.exec).not.toHaveBeenCalled();
+    // ...and the staged file is still cleaned up.
+    expect(unlinkedPath).toBe(expectedTempPath);
+  });
+
+  // The inverse invariant, stated on its own: a clean SSH_FXP_CLOSE is evidence
+  // about the HANDLE, never about the data. Unreachable through ssh2's own paths,
+  // and deliberately so — an unexplained close must fail loudly rather than be
+  // assumed to have written something.
+  it("a handle that closes cleanly without the data ever being acknowledged is a failure, not a save", async () => {
+    const writeStream = createFakeWriteStream({ kind: "silent" });
+    sftp.createWriteStream.mockReturnValue(writeStream);
+    sftp.unlink.mockImplementation((_remotePath: string, cb: (err?: Error) => void) => cb());
+    const execStream = createExecStream();
+    (connection.exec as ReturnType<typeof vi.fn>).mockResolvedValue(execStream);
+
+    const promise = service.writeFileElevated("srv-1", "/etc/hosts", Buffer.from("hi"));
+    await flush();
+    execStream.emit("close", 0);
+
+    await expect(promise).rejects.toThrow(/closed before the server acknowledged the data/);
+
+    expect(writeStream.emitted).toEqual(["close"]);
+    expect(connection.exec).not.toHaveBeenCalled();
+  });
+
+  // A wedged channel must still be reported as the timeout it is — the
+  // acknowledgement gate above must not swallow it into a generic "did not
+  // complete", which would hide that the write was aborted rather than refused.
+  it("a staging write that is never answered fails as a timeout", async () => {
+    (service as any).commandTimeoutMs = 50;
+    const writeStream = createFakeWriteStream({ kind: "stall" });
+    sftp.createWriteStream.mockReturnValue(writeStream);
+    let unlinkedPath: string | undefined;
+    sftp.unlink.mockImplementation((remotePath: string, cb: (err?: Error) => void) => {
+      unlinkedPath = remotePath;
+      cb();
+    });
+
+    await expect(service.writeFileElevated("srv-1", "/etc/hosts", Buffer.from("hi"))).rejects.toThrow(
+      "SFTP writeFile timed out"
+    );
+
+    expect(writeStream.destroy).toHaveBeenCalledWith(expect.any(Error));
+    expect(connection.exec).not.toHaveBeenCalled();
+    expect(unlinkedPath).toBe(expectedTempPath);
   });
 
   it("writeFileElevated installs via sudo using the operation timeout, not the default command timeout", async () => {
