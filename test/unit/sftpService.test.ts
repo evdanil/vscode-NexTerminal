@@ -762,20 +762,69 @@ describe("SftpService", () => {
     expect(mockStream.destroy).toHaveBeenCalled();
   });
 
-  it("writeFile times out and destroys the stream", async () => {
+  // There is deliberately no `destroy()` assertion here any more. writeFile now
+  // goes through `sftp.writeFile`, which hands back no stream to destroy — the
+  // accepted cost of never widening the file's mode. The old destroy() only sent
+  // SSH_FXP_CLOSE down the very channel that is wedged in this scenario, and
+  // fastPut/fastGet already time out with no cancellation handle at all.
+  it("writeFile times out when the server never answers", async () => {
     await service.connect(testServer);
     (service as any).commandTimeoutMs = 50;
 
-    const mockStream = {
-      on: vi.fn(() => mockStream),
-      destroy: vi.fn(),
-      end: vi.fn(),
-    };
-    sftp.createWriteStream.mockReturnValue(mockStream);
+    sftp.writeFile.mockImplementation(() => {
+      /* never calls back — a wedged SFTP channel */
+    });
 
     await expect(service.writeFile("srv-1", "/hung.txt", Buffer.from("data"))).rejects.toThrow("SFTP writeFile timed out");
-    expect(mockStream.end).toHaveBeenCalledWith(Buffer.from("data"));
-    expect(mockStream.destroy).toHaveBeenCalled();
+    expect(sftp.writeFile).toHaveBeenCalledWith(
+      "/hung.txt",
+      Buffer.from("data"),
+      { flag: "w" },
+      expect.any(Function)
+    );
+  });
+
+  // The editor-save mirror of the upload-path T8a/T8b pair below. Same ssh2
+  // defect, second caller: `NexusFileSystemProvider.writeFile` on Ctrl+S, and the
+  // File Explorer's New File command.
+  it("saving over an existing remote file leaves its permissions alone", async () => {
+    await service.connect(testServer);
+    const remote = installRemoteWriteModel(sftp);
+    // A secret the owner alone may read — an SSH key, a credentials file.
+    remote.modes.set("/remote/id_rsa", 0o600);
+
+    await expect(service.writeFile("srv-1", "/remote/id_rsa", Buffer.from("key"))).resolves.toBeUndefined();
+
+    // ssh2's createWriteStream fchmods every open to its `mode` (0o666 by
+    // default) BEFORE any data flows, which would have made this world-readable
+    // AND world-writable on every save — including a save that then failed.
+    expect(remote.modes.get("/remote/id_rsa")).toBe(0o600);
+    expect(sftp.createWriteStream).not.toHaveBeenCalled();
+  });
+
+  it("saving a new remote file passes no mode attr, leaving the server's umask in charge", async () => {
+    await service.connect(testServer);
+    const remote = installRemoteWriteModel(sftp, 0o644);
+
+    await expect(service.writeFile("srv-1", "/remote/fresh.txt", Buffer.from("hello"))).resolves.toBeUndefined();
+
+    // An explicit mode would be applied by the fchmod AFTER the server's umask
+    // has filtered the open attrs, so 0o666 lands verbatim as 0o666.
+    expect(remote.writes).toHaveLength(1);
+    expect(remote.writes[0].options?.mode).toBeUndefined();
+    expect(remote.writes[0].data).toEqual(Buffer.from("hello"));
+    expect(remote.modes.get("/remote/fresh.txt")).toBe(0o644);
+  });
+
+  it("the File Explorer's New File command does not create a world-writable file", async () => {
+    await service.connect(testServer);
+    const remote = installRemoteWriteModel(sftp, 0o644);
+
+    // Exactly the call fileCommands.ts's nexus.files.createFile makes.
+    await expect(service.writeFile("srv-1", "/remote/notes.txt", Buffer.alloc(0))).resolves.toBeUndefined();
+
+    expect(remote.modes.get("/remote/notes.txt")).toBe(0o644);
+    expect(sftp.createWriteStream).not.toHaveBeenCalled();
   });
 
   it("allows uploads to exceed the timeout while transfer progress continues", async () => {

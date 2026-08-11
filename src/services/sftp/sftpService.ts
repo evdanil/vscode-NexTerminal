@@ -431,13 +431,28 @@ export class SftpService {
     );
   }
 
+  /**
+   * The whole-file write behind an editor save (`NexusFileSystemProvider.writeFile`)
+   * and the File Explorer's New File command.
+   *
+   * Routed through `putBufferPreservingMode` for the reason documented there:
+   * ssh2's `createWriteStream` fchmods every open to its `mode` — 0o666 when the
+   * caller passes none — so saving over a 0600 file (an SSH private key, a
+   * credentials file) silently made it world-readable AND world-writable. That
+   * happened at OPEN time, before a single byte moved, so even a save that then
+   * failed had already widened the file; and a newly created file landed at
+   * exactly 0666, the follow-up fchmod defeating the server's umask.
+   *
+   * The trade: `sftp.writeFile` hands back no stream, so a timeout can no longer
+   * `destroy()` one. That costs little — destroy only sends SSH_FXP_CLOSE down
+   * the same channel, which is precisely what is undeliverable in the wedged-
+   * channel case behind most timeouts — and it matches what this service already
+   * accepts for `fastPut`/`fastGet`, which expose no cancellation handle at all
+   * (see `abortTimedOutTransfer` / `teardownSession`).
+   */
   public async writeFile(serverId: string, remotePath: string, content: Buffer): Promise<void> {
     const sftp = this.getSftp(serverId);
-    await this.writeFileWithTimeout(
-      this.commandTimeoutMs,
-      content,
-      () => sftp.createWriteStream(remotePath) as NodeJS.WritableStream & { destroy(error?: Error): void; end(chunk: Buffer): void }
-    );
+    await this.putBufferPreservingMode(sftp, remotePath, content);
     this.invalidateCache(serverId, parentDir(remotePath));
   }
 
