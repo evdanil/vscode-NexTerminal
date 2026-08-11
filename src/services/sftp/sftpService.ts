@@ -707,23 +707,34 @@ export class SftpService {
   /**
    * Downloads `remotePath` into `localPath`.
    *
-   * ORDER MATTERS, and it mirrors ssh2's own (SFTP.js `fastXfer`): the remote
-   * file is opened/stat'd FIRST, and only once that succeeds is the local
-   * destination touched. ssh2 does `src.open(srcPath,'r')` -> `fstat` and opens
-   * `dst` with `'w'` inside that callback; an earlier version of this method
-   * claimed it was matching fastGet by opening the local file up front, which
-   * was simply wrong and cost the user their existing local file whenever the
-   * remote had vanished, was unreadable, or the connection was down.
+   * THIS METHOD NEVER TRUNCATES THE DESTINATION. That is left entirely to ssh2,
+   * which already does it at the only safe moment: `fastXfer` (SFTP.js) runs
+   * `src.open(srcPath,'r')` -> fstat and opens `dst` with `'w'` INSIDE that
+   * callback, so the local file is emptied only once the remote file is known
+   * to be open and readable. An early version of this method opened the local
+   * file with `'w'` up front and cost the user their existing local copy
+   * whenever the remote had vanished, was unreadable, or the connection was
+   * down; moving that open after our own `stat()` narrowed the window but did
+   * not close it — a file deleted or rotated between our `stat()` and ssh2's
+   * `open()` still left a truncated local file behind. Deferring truncation to
+   * ssh2 closes it: our pre-flight opens with `'a'` (append — validates the
+   * path, creates the file if absent, destroys nothing).
    *
-   * What the local `'w'` pre-flight IS for: ssh2 opens the destination from
-   * inside the remote callback chain, which runs on the `net.Socket` 'data'
-   * stack, so a synchronous throw from Node's path validation there (VS Code's
-   * UNC restriction raises `ERR_UNC_HOST_NOT_ALLOWED` exactly that way) unwinds
-   * the ssh2 protocol parser and destroys the `ssh2.Client` that every terminal
-   * tab multiplexes onto. Doing the same open on OUR stack, immediately before
-   * `fastGet`, turns that class of fault into an ordinary rejection. It still
-   * truncates — but only at the moment the transfer commences, which is the
-   * same instant `fastGet` would have truncated anyway.
+   * The pre-flight therefore exists for ONE reason, and it is not truncation:
+   * containment of SYNCHRONOUS throws. ssh2 opens the destination from inside
+   * the remote callback chain, which runs on the `net.Socket` 'data' stack, so
+   * a synchronous throw from Node's path validation there (VS Code's UNC
+   * restriction raises `ERR_UNC_HOST_NOT_ALLOWED` exactly that way, as do null
+   * bytes and non-string paths) unwinds the ssh2 protocol parser and destroys
+   * the `ssh2.Client` that every terminal tab multiplexes onto. Performing an
+   * open on OUR stack first turns that class of fault into an ordinary
+   * rejection. Node validates `path` BEFORE it parses `flags`, so `'a'` trips
+   * exactly the same validation `'w'` did.
+   *
+   * The remote `stat()` still comes first, mirroring ssh2's own ordering: a
+   * remote file that is already gone should not so much as create a placeholder
+   * on disk. When one is created anyway and the transfer then fails, the outer
+   * catch removes it — see `discardPreflightPlaceholder`.
    *
    * The claimed-zero branch needs no pre-flight at all: `fsp.writeFile` is our
    * own local write, on our own stack, and it runs only after the remote bytes
@@ -735,6 +746,9 @@ export class SftpService {
   public async download(serverId: string, remotePath: string, localPath: string): Promise<void> {
     const session = this.getSession(serverId);
     const startedAt = Date.now();
+    // Set only when the pre-flight itself brought the destination into
+    // existence, so a failure can undo exactly what we created and no more.
+    let createdByPreflight = false;
 
     try {
       const remoteEntry = await this.stat(serverId, remotePath);
@@ -756,7 +770,7 @@ export class SftpService {
         await fsp.writeFile(localPath, content);
       } else {
         expectedBytes = remoteEntry.size;
-        await this.openLocalDestination(localPath);
+        createdByPreflight = await this.openLocalDestination(localPath);
         await this.runTransferWithIdleTimeout(serverId, session, "download", (options, callback) => {
           session.sftp.fastGet(
             remotePath,
@@ -773,6 +787,7 @@ export class SftpService {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.diagnostics?.(`[sftp] download ${serverId}:${remotePath} -> ${localPath} FAILED: ${message}`);
+      await this.discardPreflightPlaceholder(localPath, createdByPreflight);
       throw error;
     }
   }
@@ -840,15 +855,71 @@ export class SftpService {
   }
 
   /**
-   * The `'w'` open of a download destination, performed on OUR stack so Node's
+   * Pre-flight open of a download destination, performed on OUR stack so Node's
    * synchronous path validation (VS Code's UNC restriction, null bytes, bad
    * argument types) becomes a rejection here instead of a throw inside ssh2's
-   * socket-data callback. See `download()` for why this runs only after the
-   * remote side has been validated.
+   * socket-data callback. See `download()`.
+   *
+   * NON-TRUNCATING BY DESIGN. `'a'` validates the path and creates the file if
+   * it is absent, but leaves any existing contents alone; `'w'` would empty the
+   * user's file before ssh2 had even opened the remote one. Node runs the path
+   * validation this exists to trigger before it so much as parses `flags`
+   * (`getValidatedPath` precedes `stringToFlags`), and the UNC allowlist is a
+   * per-host policy that fires on flagless calls too — `fsp.stat` raises the
+   * same `ERR_UNC_HOST_NOT_ALLOWED`, which is what `upload()`'s pre-stat and
+   * the remediation re-probe already rely on. So `'a'` catches exactly what
+   * `'w'` caught. Truncation stays with ssh2's own `dst.open(dstPath,'w')`,
+   * which runs only after the remote open and fstat have succeeded.
+   *
+   * Returns true when the destination did NOT exist beforehand — i.e. when the
+   * empty file now on disk is ours, and ours alone, to clean up if the transfer
+   * fails. The probe is deliberately pessimistic: only a definite ENOENT counts
+   * as absent, because deleting a file we did not create is far worse than
+   * leaving a stray empty one. Its errors are swallowed so the canonical
+   * failure the caller sees is still the open's, with `err.code` intact.
    */
-  private async openLocalDestination(localPath: string): Promise<void> {
-    const handle = await fsp.open(localPath, "w");
+  private async openLocalDestination(localPath: string): Promise<boolean> {
+    const absentBefore = await this.destinationIsAbsent(localPath);
+    const handle = await fsp.open(localPath, "a");
     await handle.close();
+    return absentBefore;
+  }
+
+  private async destinationIsAbsent(localPath: string): Promise<boolean> {
+    try {
+      await fsp.stat(localPath);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+    }
+  }
+
+  /**
+   * Removes the empty placeholder the pre-flight created, and ONLY that.
+   *
+   * Because the pre-flight opens with `'a'`, a download into a path that did
+   * not exist creates the file — so a failure would otherwise leave a zero-byte
+   * file standing in for one that was never there, which reads as "the download
+   * worked and the file is empty". Three guards keep this from destroying real
+   * data: it runs only when the pre-flight itself created the file, only while
+   * that file is still empty (any bytes on disk are the user's to inspect or
+   * resume from), and it can never throw over the transfer error that brought
+   * us here — cleanup failing is a log line, not the error the caller sees.
+   */
+  private async discardPreflightPlaceholder(localPath: string, createdByPreflight: boolean): Promise<void> {
+    if (!createdByPreflight) {
+      return;
+    }
+    try {
+      if ((await fsp.stat(localPath)).size !== 0) {
+        return;
+      }
+      await fsp.unlink(localPath);
+      this.diagnostics?.(`[sftp] download removed the empty placeholder left at ${localPath}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.diagnostics?.(`[sftp] download could not remove the empty placeholder at ${localPath}: ${message}`);
+    }
   }
 
   /**

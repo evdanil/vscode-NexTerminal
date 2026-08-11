@@ -8,6 +8,7 @@ const { fsPromisesMock, fsCreateReadStream } = vi.hoisted(() => ({
   fsPromisesMock: {
     stat: vi.fn(),
     open: vi.fn(),
+    unlink: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn()
   },
@@ -228,12 +229,14 @@ describe("SftpService", () => {
 
     fsPromisesMock.stat.mockReset();
     fsPromisesMock.open.mockReset();
+    fsPromisesMock.unlink.mockReset();
     fsPromisesMock.readFile.mockReset();
     fsPromisesMock.writeFile.mockReset();
     fsCreateReadStream.mockReset();
     // Benign defaults; individual transfer tests override them.
     fsPromisesMock.stat.mockResolvedValue({ size: 1024 });
     fsPromisesMock.open.mockResolvedValue({ close: vi.fn(async () => {}) });
+    fsPromisesMock.unlink.mockResolvedValue(undefined);
     fsPromisesMock.readFile.mockResolvedValue(Buffer.alloc(0));
     fsPromisesMock.writeFile.mockResolvedValue(undefined);
     fsCreateReadStream.mockImplementation(() => createMockReadStream([]));
@@ -905,7 +908,7 @@ describe("SftpService", () => {
       // Pre-flight open of the destination + remote stat both settle first.
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(fsPromisesMock.open).toHaveBeenCalledWith("/tmp/big.bin", "w");
+      expect(fsPromisesMock.open).toHaveBeenCalledWith("/tmp/big.bin", "a");
       expect(sftp.fastGet).toHaveBeenCalledWith(
         "/remote/big.bin",
         "/tmp/big.bin",
@@ -1073,9 +1076,11 @@ describe("SftpService", () => {
       // inside its own socket-data callback.
       expect(sftp.fastGet).not.toHaveBeenCalled();
       // The remote side is validated FIRST (this is also ssh2's own ordering);
-      // the local 'w' open happens immediately before fastGet, not before it.
+      // the local open happens immediately before fastGet, not before it.
       expect(sftp.stat).toHaveBeenCalledTimes(1);
-      expect(fsPromisesMock.open).toHaveBeenCalledWith("\\\\192.168.2.10\\share\\f.bin", "w");
+      // 'a', not 'w': Node validates the path before it parses the flags, so
+      // the containment is identical while the destination stays intact.
+      expect(fsPromisesMock.open).toHaveBeenCalledWith("\\\\192.168.2.10\\share\\f.bin", "a");
     });
 
     it("T4b — a download whose remote file cannot be stat'd never touches the existing local file", async () => {
@@ -1092,6 +1097,87 @@ describe("SftpService", () => {
       expect(fsPromisesMock.open).not.toHaveBeenCalled();
       expect(fsPromisesMock.writeFile).not.toHaveBeenCalled();
       expect(sftp.fastGet).not.toHaveBeenCalled();
+    });
+
+    it("T4c — a remote file that vanishes AFTER our stat still leaves the existing local file whole", async () => {
+      await service.connect(testServer);
+      // Our stat sees a healthy remote file...
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(4096)));
+      // ...and the destination already holds the user's only copy.
+      fsPromisesMock.stat.mockResolvedValue({ size: 4096 });
+      // ...but by the time ssh2 issues its OWN remote open, the file has been
+      // deleted/rotated/revoked. This is the window the pre-flight used to lose:
+      // with a 'w' pre-flight the local file was already empty by now.
+      sftp.fastGet.mockImplementation((_r: string, _l: string, _o: unknown, cb: Function) =>
+        cb(missingPathError("No such file"))
+      );
+
+      await expect(service.download("srv-1", "/remote/rotated.log", "/tmp/precious.log")).rejects.toThrow(
+        /no such file/i
+      );
+
+      // The load-bearing assertion: we opened non-destructively, and truncation
+      // was left to ssh2 — which only reaches its own dst.open('w') once the
+      // remote side is proven good.
+      expect(fsPromisesMock.open).toHaveBeenCalledWith("/tmp/precious.log", "a");
+      expect(fsPromisesMock.open).not.toHaveBeenCalledWith("/tmp/precious.log", "w");
+      // A file we did not create is never removed, whatever its size.
+      expect(fsPromisesMock.unlink).not.toHaveBeenCalled();
+    });
+
+    it("T4d — a failed download removes the empty file its own pre-flight created", async () => {
+      await service.connect(testServer);
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(4096)));
+      // Absent when probed; 0 bytes afterwards, because the 'a' open created it.
+      fsPromisesMock.stat.mockResolvedValue({ size: 0 });
+      fsPromisesMock.stat.mockRejectedValueOnce(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+      sftp.fastGet.mockImplementation((_r: string, _l: string, _o: unknown, cb: Function) =>
+        cb(new Error("connection lost"))
+      );
+
+      await expect(service.download("srv-1", "/remote/f.bin", "/tmp/brand-new.bin")).rejects.toThrow(
+        "connection lost"
+      );
+
+      // Otherwise a failed download leaves a zero-byte file standing in for one
+      // that never existed — which reads as "it worked, the file is empty".
+      expect(fsPromisesMock.unlink).toHaveBeenCalledWith("/tmp/brand-new.bin");
+    });
+
+    it("T4e — a failed download never removes a destination that already existed, even an empty one", async () => {
+      await service.connect(testServer);
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(4096)));
+      // Pre-existing AND empty: the one fixture where a "delete it if it is
+      // empty" implementation looks correct and is not. Only the "did we create
+      // it?" answer separates this from T4d.
+      fsPromisesMock.stat.mockResolvedValue({ size: 0 });
+      sftp.fastGet.mockImplementation((_r: string, _l: string, _o: unknown, cb: Function) =>
+        cb(new Error("connection lost"))
+      );
+
+      await expect(service.download("srv-1", "/remote/f.bin", "/tmp/users-own.bin")).rejects.toThrow(
+        "connection lost"
+      );
+
+      expect(fsPromisesMock.unlink).not.toHaveBeenCalled();
+    });
+
+    it("T4f — a download that got partway through keeps the bytes it did write", async () => {
+      await service.connect(testServer);
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(4096)));
+      // Absent when probed, but ssh2 had already written 2 KB when the link
+      // dropped. Those bytes are the user's — to inspect, or to resume from.
+      fsPromisesMock.stat.mockResolvedValue({ size: 2048 });
+      fsPromisesMock.stat.mockRejectedValueOnce(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+      sftp.fastGet.mockImplementation((_r: string, _l: string, _o: unknown, cb: Function) =>
+        cb(new Error("connection lost"))
+      );
+
+      await expect(service.download("srv-1", "/remote/f.bin", "/tmp/partial.bin")).rejects.toThrow(
+        "connection lost"
+      );
+
+      expect(fsPromisesMock.unlink).not.toHaveBeenCalled();
     });
 
     it("T5 — an upload pre-stat failure propagates with err.code intact", async () => {
