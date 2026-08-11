@@ -79,4 +79,6 @@ export interface CommandContext {
   cwdLastOutputAt?: Map<string, number>;
   /** Diagnostics sink for directory-sync suppressions/failures (§7.6). */
   cwdSyncOutputChannel?: vscode.OutputChannel;
+  /** Timestamped line sink for the "Nexus SSH" channel (transfers, UNC blocks). */
+  sshDiagnostics?: (line: string) => void;
 }

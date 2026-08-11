@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
-import { clamp } from "../utils/helpers";
+import { clamp, normalizeBoundedNumber as clampLength } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import { resolveMacroRunTarget } from "../models/terminalMacro";
@@ -177,10 +177,6 @@ function clampSeconds(value: number | undefined, fallback: number, min: number, 
   return typeof value === "number" && Number.isFinite(value) ? clamp(value, min, max) : fallback;
 }
 
-function clampLength(value: number | undefined, fallback: number, min: number, max: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? clamp(Math.floor(value), min, max) : fallback;
-}
-
 interface CompiledTriggerRule {
   regex: RegExp;
   macroText: string;
@@ -211,7 +207,6 @@ export class MacroAutoTrigger implements vscode.Disposable {
   private readonly enabledKeys = new Set<string>();
   private readonly observers = new Set<ObserverState>();
   private readonly intervalOwners = new Map<string, ObserverState>();
-  private readonly observersBySession = new Map<string, ObserverState>();
   private readonly filterStacks = new Map<string, ScriptMacroFilter[]>();
   private readonly onDidChangeEmitter = new vscode.EventEmitter<void>();
   private disposed = false;
@@ -611,13 +606,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
         ownedIntervals.clear();
         clearAllTimers();
         this.observers.delete(observerState);
-        if (boundSessionId && this.observersBySession.get(boundSessionId) === observerState) {
-          this.observersBySession.delete(boundSessionId);
-        }
       }
     };
     this.observers.add(observerState);
-    if (boundSessionId) this.observersBySession.set(boundSessionId, observerState);
 
     const observer: PtyOutputObserver & { __bindSessionId?: (id: string) => void } = {
       onOutput: (text: string) => {
@@ -648,11 +639,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
       dispose: () => observerState.dispose()
     };
     observer.__bindSessionId = (id: string) => {
-      if (boundSessionId && this.observersBySession.get(boundSessionId) === observerState) {
-        this.observersBySession.delete(boundSessionId);
-      }
       boundSessionId = id;
-      this.observersBySession.set(id, observerState);
     };
     return observer;
   }

@@ -32,13 +32,14 @@ export default defineConfig({
           // child processes. Running them concurrently with each other (or
           // with the unit project) causes CPU/event-loop contention that
           // makes their timing-based predicates time out under CI load.
-          // Force a single fork so all integration files share one process
-          // and run one after the other, and give each test more headroom
-          // than the unit default of 5s.
+          // Force the integration files to run one after the other rather than
+          // in parallel, and give each test more headroom than the unit
+          // default of 5s. `fileParallelism: false` is the Vitest 4 spelling —
+          // the former `poolOptions.forks.singleFork` was removed in v4 and
+          // was being silently ignored (it only printed a DEPRECATED notice),
+          // so this serialisation had stopped taking effect.
           pool: "forks",
-          poolOptions: {
-            forks: { singleFork: true }
-          },
+          fileParallelism: false,
           testTimeout: 30_000,
           hookTimeout: 30_000,
           groupOrder: 1

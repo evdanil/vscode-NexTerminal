@@ -289,10 +289,10 @@ export const SETTINGS_META: SettingMeta[] = [
   {
     key: "maxOpenFileSizeMB",
     section: "nexus.sftp",
-    label: "Max File Size to Open",
+    label: "Max File Size to Hold in Memory",
     type: "number",
     category: "sftp",
-    description: "Maximum file size (in MB) that can be opened in the editor. Larger files can still be downloaded via right-click.",
+    description: "Largest single file Nexus keeps in memory — opening a remote file in the editor, and transferring a file that reports its size as 0. Ordinary transfers stream and are not limited by this.",
     min: 1,
     max: 200,
     unit: "MB"

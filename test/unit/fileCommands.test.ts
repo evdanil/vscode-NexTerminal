@@ -59,6 +59,7 @@ vi.mock("vscode", () => ({
     },
     getConfiguration: (...args: unknown[]) => mockGetConfiguration(...args)
   },
+  ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   env: {
     clipboard: { writeText: vi.fn() }
   },
@@ -410,6 +411,58 @@ describe("fileCommands title bar actions", () => {
     expect(ctx.sftpService.upload).not.toHaveBeenCalled();
     expect(mockShowErrorMessage).toHaveBeenCalledWith('Failed to check remote target "a.txt": permission denied (not found)');
     expect(mockShowWarningMessage).toHaveBeenCalledWith("Upload completed with issues (uploaded 0, skipped 0, conflicts 0, failed 1, canceled 0).");
+  });
+
+  it("T30 — upload rejects unsafe basenames before touching the server", async () => {
+    const ctx = createContext();
+    // A backslash-bearing name would otherwise be path.posix.join'd straight
+    // into the remote path. The drag-drop path has always guarded this; the
+    // command path did not.
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/tmp/evil\\name.txt" }]);
+    registerFileCommands(ctx);
+
+    const upload = registeredCommands.get("nexus.files.upload");
+    await upload!(undefined);
+
+    expect(ctx.sftpService.upload).not.toHaveBeenCalled();
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      'Cannot upload "evil\\name.txt": name contains unsupported characters.'
+    );
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      "Upload completed with issues (uploaded 0, skipped 0, conflicts 0, failed 1, canceled 0)."
+    );
+  });
+
+  it("T31 — a UNC-blocked download destination gets the actionable message, not the generic one", async () => {
+    const ctx = createContext();
+    const first = createFileTreeItem({
+      entry: { name: "a.txt", isDirectory: false, isSymlink: false, size: 10, modifiedAt: 1700000000, permissions: 0o644 }
+    });
+    const second = createFileTreeItem({
+      entry: { name: "b.txt", isDirectory: false, isSymlink: false, size: 10, modifiedAt: 1700000000, permissions: 0o644 }
+    });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "\\\\192.168.2.10\\share" }]);
+    const vscode = await import("vscode");
+    vi.mocked(vscode.workspace.fs.stat).mockRejectedValue(Object.assign(new Error("missing"), { code: "ENOENT" }));
+    ctx.sftpService.download = vi.fn(async () => {
+      throw Object.assign(new Error("UNC host '192.168.2.10' access is not allowed"), {
+        code: "ERR_UNC_HOST_NOT_ALLOWED"
+      });
+    });
+    registerFileCommands(ctx);
+
+    const download = registeredCommands.get("nexus.files.download");
+    await download!(undefined, [first, second]);
+
+    const errorMessages = mockShowErrorMessage.mock.calls.map((args) => String(args[0]));
+    expect(errorMessages.join("\n")).toContain('VS Code blocked access to network host "192.168.2.10"');
+    // A policy block must not hide behind the generic per-file message.
+    expect(errorMessages.some((message) => message.includes("Failed to download"))).toBe(false);
+    // One prompt per distinct host, not one per file.
+    expect(errorMessages.filter((message) => message.includes("VS Code blocked access"))).toHaveLength(1);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      "Download completed with issues (downloaded 0, skipped 0, conflicts 0, failed 2, canceled 0)."
+    );
   });
 
   it("returns early when no active server/root is available", async () => {

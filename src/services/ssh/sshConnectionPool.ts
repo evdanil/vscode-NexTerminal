@@ -26,7 +26,6 @@ interface PoolEntry {
   refCount: number;
   healthy: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
-  connectedAt: number;
   closeUnsubscribe: () => void;
 }
 
@@ -404,7 +403,6 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       connection,
       refCount: 0,
       healthy: true,
-      connectedAt: Date.now(),
       closeUnsubscribe: () => {}
     };
 

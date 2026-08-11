@@ -25,11 +25,6 @@ export function getMacros(_resource?: vscode.Uri): TerminalMacro[] {
   return getActiveMacroStore().getAll();
 }
 
-/** @deprecated Macros no longer live in settings.json — kept for signature compat with callers. */
-export function getMacroSettingsTarget(_resource?: vscode.Uri): vscode.ConfigurationTarget {
-  return vscode.ConfigurationTarget.Global;
-}
-
 export async function saveMacros(macros: TerminalMacro[], _resource?: vscode.Uri): Promise<void> {
   await getActiveMacroStore().save(macros);
 }

@@ -41,7 +41,3 @@ export interface OpenPortParams {
   parity?: SerialParity;
   rtscts?: boolean;
 }
-
-export interface OpenPortResult {
-  sessionId: string;
-}

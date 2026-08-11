@@ -16,6 +16,7 @@ import {
   isValidServerOrigin,
   isValidDetachedServerOrigin
 } from "../utils/validation";
+import { asArray } from "../utils/helpers";
 
 const SERVERS_KEY = "nexus.servers";
 const TUNNELS_KEY = "nexus.tunnels";
@@ -26,16 +27,6 @@ const AUTH_PROFILES_KEY = "nexus.authProfiles";
 const INVENTORY_SOURCES_KEY = "nexus.inventorySources";
 const DEVICE_TEMPLATES_KEY = "nexus.deviceTemplates";
 const SAVED_FILTERS_KEY = "nexus.savedFilters";
-
-/**
- * `globalState.get(key, [])` only substitutes the default when the key is ABSENT.
- * A corrupt non-array value (object/string/null from a Settings Sync conflict or
- * storage corruption) would otherwise reach `.filter(...)` and throw during
- * activation. Degrade any non-array shape to an empty list.
- */
-function asArray<T>(raw: unknown): T[] {
-  return Array.isArray(raw) ? (raw as T[]) : [];
-}
 
 export class VscodeConfigRepository implements ConfigRepository {
   public constructor(private readonly context: vscode.ExtensionContext) {}

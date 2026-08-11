@@ -476,8 +476,6 @@ export interface DetachedServerOrigin {
 /** Scheme "Open BMC Web Console" opens a BMC's web UI with. See `ServerConfig.bmcWebProtocol`. */
 export type BmcWebProtocol = "https" | "http";
 
-export const BMC_WEB_PROTOCOLS: readonly BmcWebProtocol[] = ["https", "http"];
-
 /**
  * The scheme a BMC web console open ACTUALLY uses, applied at every read site
  * (the untrusted-field discipline `resolveMacroRunTarget` set): absent, a

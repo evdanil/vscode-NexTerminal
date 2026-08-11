@@ -1,7 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 
-export const INVENTORY_CONTRACT_VERSION = 1 as const;
-
 export type InventoryEndpointKind = "ssh" | "redfish" | "url" | "ipmi-sol";
 
 /**

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { EventEmitter } from "node:events";
 
 vi.mock("vscode", () => {
   const EventEmitter = vi.fn().mockImplementation(function () {
@@ -107,8 +108,11 @@ function permissionDeniedError(message = "Permission denied"): Error & { code: n
   return Object.assign(new Error(message), { code: 3 }); // SSH_FX_PERMISSION_DENIED
 }
 
+// Composed over a real EventEmitter: SftpService attaches 'error'/'close'
+// listeners to the SFTP channel so a fatal protocol error is contained instead
+// of throwing through ssh2's socket-data stack.
 function createMockSftp() {
-  return {
+  return Object.assign(new EventEmitter(), {
     readdir: vi.fn(),
     stat: vi.fn(),
     lstat: vi.fn(),
@@ -122,7 +126,7 @@ function createMockSftp() {
     fastGet: vi.fn(),
     fastPut: vi.fn(),
     end: vi.fn(),
-  };
+  });
 }
 
 function createMockConnection(sftp: ReturnType<typeof createMockSftp>): SshConnection {

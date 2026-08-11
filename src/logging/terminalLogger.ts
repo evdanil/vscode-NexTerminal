@@ -1,5 +1,6 @@
 import { closeSync, existsSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import * as path from "node:path";
+import { clamp } from "../utils/helpers";
 
 export interface SessionLogger {
   log(line: string): void;
@@ -15,10 +16,6 @@ export const DEFAULT_ROTATION_OPTIONS: LoggerRotationOptions = {
   maxFileSizeBytes: 10 * 1024 * 1024,
   maxRotatedFiles: 1
 };
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(Math.max(value, min), max);
-}
 
 export function normalizeLoggerRotationOptions(options?: Partial<LoggerRotationOptions>): LoggerRotationOptions {
   const maxFileSizeBytes = options?.maxFileSizeBytes ?? DEFAULT_ROTATION_OPTIONS.maxFileSizeBytes;

@@ -199,6 +199,66 @@ describe("Ssh2Connector.connect banner handling", () => {
     expect(onAuthMessage).not.toHaveBeenCalled();
   });
 
+  it("T11 — post-ready client errors reach the diagnostics sink instead of being discarded", async () => {
+    const sink = vi.fn();
+    const connector = new Ssh2Connector(undefined, undefined, sink);
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connectPromise;
+
+    // Post-ready this used to return silently, which is why "all my terminals
+    // disconnected" was undiagnosable: a keepalive timeout destroys the socket
+    // 30s after the last response and left no trace anywhere.
+    client.emit("error", Object.assign(new Error("Keepalive timeout"), { level: "client-timeout" }));
+
+    const logged = sink.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(logged).toContain("Keepalive timeout");
+    expect(logged).toContain("client-timeout");
+    expect(logged).toContain("Test Server (example.com)");
+    expect(connection).toBeDefined();
+  });
+
+  it("T11 — a pre-ready error still rejects the connect promise and is NOT logged instead", async () => {
+    const sink = vi.fn();
+    const connector = new Ssh2Connector(undefined, undefined, sink);
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    client.emit("error", new Error("All configured authentication methods failed"));
+
+    await expect(connectPromise).rejects.toThrow("All configured authentication methods failed");
+    // Logging must not replace rejection: the connect flow (auth retry,
+    // host-key prompts) reads pre-ready errors.
+    expect(sink).not.toHaveBeenCalled();
+  });
+
+  it("T11 — a connection close is logged once, even though ssh2 emits both 'close' and 'end'", async () => {
+    const sink = vi.fn();
+    const connector = new Ssh2Connector(undefined, undefined, sink);
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    await connectPromise;
+
+    client.emit("close");
+    client.emit("end");
+
+    const closeLines = sink.mock.calls
+      .map((args) => String(args[0]))
+      .filter((line) => line.includes("connection closed"));
+    expect(closeLines).toHaveLength(1);
+    expect(closeLines[0]).toContain("Test Server (example.com)");
+  });
+
   it("swallows an onAuthMessage callback that throws instead of aborting the handshake", async () => {
     const connector = new Ssh2Connector();
     const onAuthMessage = vi.fn(() => {

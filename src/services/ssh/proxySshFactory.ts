@@ -2,7 +2,7 @@ import * as net from "node:net";
 import type { Duplex } from "node:stream";
 import { SocksClient } from "socks";
 import type { ServerConfig, ProxyConfig, Socks5Proxy, HttpConnectProxy } from "../../models/config";
-import { clamp } from "../../utils/helpers";
+import { normalizeBoundedNumber } from "../../utils/helpers";
 import type {
   ContextAwareSshFactory,
   SecretVault,
@@ -53,7 +53,7 @@ interface ResolvedProxyPassword {
 }
 
 function normalizeProxyTimeoutMs(timeoutMs: number): number {
-  return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 5_000, 300_000) : 60_000;
+  return normalizeBoundedNumber(timeoutMs, 60_000, 5_000, 300_000);
 }
 
 export class ProxySshFactory implements ContextAwareSshFactory {
