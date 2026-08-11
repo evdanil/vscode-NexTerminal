@@ -449,19 +449,14 @@ export class SftpService {
    * failed had already widened the file; and a newly created file landed at
    * exactly 0666, the follow-up fchmod defeating the server's umask.
    *
-   * That fix originally routed the write through `sftp.writeFile`, whose lack of
-   * a cancellation handle was justified as matching `fastPut`/`fastGet`. The
-   * justification was wrong: those two COMPENSATE for having no handle by tearing
-   * the session down on timeout (`abortTimedOutTransfer`), so the write path was
-   * strictly less protected than the precedent it cited — a timed-out save kept
-   * writing in the background and could overwrite the user's next save.
-   * `putBufferPreservingMode` now opens the handle itself and injects it into
-   * `createWriteStream`, which restores a real abort without reintroducing the
-   * fchmod and without disturbing the session the File Explorer shares.
+   * Note there is no post-write size verification on this path, unlike
+   * `upload()`/`download()`. That is precisely why the helper's error reporting
+   * has to be exact: nothing downstream would catch a write that silently moved
+   * no bytes.
    */
   public async writeFile(serverId: string, remotePath: string, content: Buffer): Promise<void> {
-    const sftp = this.getSftp(serverId);
-    await this.putBufferPreservingMode(sftp, remotePath, content);
+    const session = this.getSession(serverId);
+    await this.putBufferPreservingMode(serverId, session, remotePath, content);
     this.invalidateCache(serverId, parentDir(remotePath));
   }
 
@@ -823,7 +818,7 @@ export class SftpService {
           () => createReadStream(localPath)
         );
         expectedBytes = content.length;
-        await this.putBufferPreservingMode(session.sftp, remotePath, content);
+        await this.putBufferPreservingMode(serverId, session, remotePath, content);
       } else {
         expectedBytes = localSize;
         await this.runTransferWithIdleTimeout(serverId, session, "upload", (options, callback) => {
@@ -907,104 +902,102 @@ export class SftpService {
 
   /**
    * Writes a whole buffer to `remotePath` WITHOUT touching the file's mode, and
-   * with a timeout that actually aborts the write rather than only reporting it.
+   * reports the outcome truthfully.
    *
-   * Not a plain `createWriteStream(remotePath)`: ssh2's WriteStream sends
-   * SSH_FXP_OPEN with its `mode` attr AND then issues an unconditional
-   * `fchmod(handle, mode)` on every open (SFTP.js `WriteStream.prototype.open`),
-   * falling back to `chmod(path, mode)` if the server refuses fchmod. With the
-   * default mode of 0o666 that silently widens an existing remote file to
-   * world-readable and world-writable, and on a NEW file it also defeats the
-   * server's umask — neither of which `fastPut` does, so the size-planned and
-   * claimed-zero branches of `upload()` would disagree about permissions.
+   * NOT `createWriteStream`, on either of the two shapes that were tried.
    *
-   * Not `sftp.writeFile` either. It preserves the mode (no `mode` option ⇒
-   * `open(path, flag, undefined, cb)` ⇒ SSH_FXP_OPEN with no ATTRS, and no chmod
-   * anywhere), but it hands back neither stream nor handle, so a timeout can
-   * cancel nothing: `writeAll` keeps chaining SSH_FXP_WRITE in the background
-   * long after the save has been reported as failed, and those stale bytes can
-   * land on top of the newer save the user makes in response. `fastPut`/`fastGet`
-   * are no precedent for tolerating that — they compensate for having no
-   * cancellation handle by tearing the whole session down
-   * (`abortTimedOutTransfer`), which is far too blunt a response to one stalled
-   * editor save on a session the File Explorer shares.
+   * `createWriteStream(remotePath)` plain: ssh2's WriteStream sends SSH_FXP_OPEN
+   * with its `mode` attr AND then issues an unconditional `fchmod(handle, mode)`
+   * on every open (SFTP.js `WriteStream.prototype.open`), falling back to
+   * `chmod(path, mode)` if the server refuses fchmod. With the default mode of
+   * 0o666 that silently widens an existing remote file to world-readable and
+   * world-writable, and on a NEW file it also defeats the server's umask —
+   * neither of which `fastPut` does, so the size-planned and claimed-zero
+   * branches of `upload()` would disagree about permissions.
    *
-   * So the handle is opened here instead. `open(path, "w", cb)` — callback in the
-   * attrs position, so `attrsFlags` is 0 — is byte-for-byte the mode-preserving
-   * open `writeFile` and `fastPut` perform. Handing that handle to
-   * `createWriteStream` makes WriteStream skip `open()` entirely (SFTP.js:
-   * `if (!Buffer.isBuffer(this.handle)) this.open();`), so the fchmod never
-   * happens, while `destroy()` still routes through `closeStream` →
-   * SSH_FXP_CLOSE. Once the server has processed that close the handle is dead,
-   * so no further byte of this buffer can reach the file; only WRITEs already
-   * queued ahead of the close on the wire can still land, and ssh2's own
-   * overflow chain stops at the first one the server rejects.
+   * `createWriteStream(remotePath, { handle })` — opening the handle ourselves so
+   * the WriteStream skips `open()`, and with it the fchmod — fixed the mode but
+   * introduced something worse, and is what this now reverses:
    *
-   * `autoClose` defaults to true, so the handle is closed exactly once on every
-   * path: from `_final` → `destroy()` on success, from `destroy(error)` on
-   * timeout or write error (node's `destroy` is idempotent, so the two cannot
-   * both close), and — the one case ssh2 cannot cover, because the stream does
-   * not exist yet — explicitly below when the open callback lands after we have
-   * already given up.
+   *  1. A FAILED WRITE REPORTED SUCCESS. `WriteStream.prototype._write`
+   *     (SFTP.js:3970) reacts to a rejected SSH_FXP_WRITE with
+   *     `if (this.autoClose) this.destroy();` — `destroy()` with NO error — and
+   *     only then `cb(er)`. Because the stream is already destroyed by the time
+   *     that callback runs, node's `errorOrDestroy` short-circuits and never
+   *     emits 'error'; `closeStream` then sees no error and emits 'close'. A
+   *     success listener on 'close' therefore fires for a write that moved no
+   *     bytes — ENOSPC, an over-quota mailbox, an appliance refusing the path.
+   *     `_writev` (:3993) has the identical shape. Verified empirically on the
+   *     Node 20 the extension host runs.
+   *  2. THE OVERFLOW CHAIN OUTLIVED THE STREAM. `SFTP.prototype.write` (:442)
+   *     splits a buffer over `_maxWriteLen` and continues from inside its own
+   *     request callback with the captured handle, so `destroy()` cannot stop it.
+   *     If the server recycled that opaque handle value for a retry's OPEN, a
+   *     stale WRITE could land on the retry's file.
+   *
+   * `sftp.writeFile(path, content, { flag: "w" }, cb)` has neither problem. It is
+   * mode-preserving for the same reason the injected handle was — an options
+   * OBJECT with no `mode` leaves `options.mode` undefined, so
+   * `open(path, flag, undefined, cb)` sends SSH_FXP_OPEN with no ATTRS and
+   * nothing chmods anywhere — and, decisively, it reports failure through a
+   * CALLBACK rather than through stream events: `writeAll` (:2393) answers a
+   * rejected write with `sftp.close(handle, () => callback(writeErr))`, so the
+   * error reaches us on every path. That is the property this path needs above
+   * all others, because `writeFile()` above has no post-write size check to fall
+   * back on. The options object is not optional: OMITTING it makes ssh2 default
+   * `mode` to 0o666 and the widening returns.
+   *
+   * Cancellation is then the same mechanism `fastPut`/`fastGet` already use.
+   * `writeFile` exposes no handle, so on timeout the SFTP SESSION is torn down
+   * (`teardownSession`, exactly as `abortTimedOutTransfer` does): `sftp.end()`
+   * closes the channel, ssh2's `cleanupRequests` (:2723) errors every pending
+   * request so the in-flight `writeAll` chain terminates instead of dribbling on,
+   * and any retry runs on a fresh session with its own handle space — which is
+   * also what makes the recycled-handle race of (2) unreachable.
+   *
+   * The cost is real and accepted: teardown drops the SFTP session the File
+   * Explorer shares, so the next browse reconnects. That is proportionate for a
+   * save that has already been stalled for `commandTimeoutMs` — the session is
+   * demonstrably not serving anyone at that point — and it releases the pool
+   * lease rather than leaking it, which a bare `cleanupSession()` would not.
+   * Terminal sessions leasing the same `ssh2.Client` are unaffected.
    */
-  private putBufferPreservingMode(sftp: SFTPWrapper, remotePath: string, content: Buffer): Promise<void> {
+  private putBufferPreservingMode(
+    serverId: string,
+    session: SftpSession,
+    remotePath: string,
+    content: Buffer
+  ): Promise<void> {
     const timeoutMs = this.commandTimeoutMs;
     return new Promise<void>((resolve, reject) => {
       let settled = false;
-      let stream: SftpWriteStream | undefined;
-
-      const succeed = (): void => {
+      const settle = (reason?: unknown): void => {
         if (settled) {
           return;
         }
         settled = true;
         clearTimeout(timer);
-        resolve();
-      };
-      const fail = (reason: unknown): void => {
-        if (settled) {
-          return;
+        if (reason) {
+          reject(reason);
+        } else {
+          resolve();
         }
-        settled = true;
-        clearTimeout(timer);
-        reject(reason);
       };
 
       const timer = setTimeout(() => {
-        const error = createTimeoutError("writeFile", timeoutMs);
-        // Settle BEFORE destroying: destroy(error) makes the stream emit
-        // 'error', and `settled` is also what the open callback below reads to
-        // learn that its handle is now ownerless.
-        fail(error);
-        stream?.destroy(error);
+        // Settle BEFORE tearing down: `cleanupRequests` errors the pending
+        // request, which reaches writeAll's callback below, and the caller must
+        // see the timeout rather than ssh2's 'No response from server'.
+        settle(createTimeoutError("writeFile", timeoutMs));
+        this.teardownSession(serverId, session, "whole-file write timed out");
       }, timeoutMs);
 
       try {
-        sftp.open(remotePath, "w", (openError, handle) => {
-          if (openError) {
-            fail(openError);
-            return;
-          }
-          if (settled) {
-            // Timed out while the open was in flight. Nothing owns this handle
-            // and no stream will ever close it, so close it here — leaked
-            // handles pin server-side state for the life of the SFTP session.
-            sftp.close(handle, () => {
-              // Best effort: the caller has already been told the write failed.
-            });
-            return;
-          }
-          const writeStream = sftp.createWriteStream(remotePath, { handle }) as SftpWriteStream;
-          stream = writeStream;
-          // WriteStream forces `emitClose: false`, so the only 'close' is the one
-          // ssh2's `closeStream` emits itself, and only when SSH_FXP_CLOSE
-          // carried no error — i.e. it means "written and closed cleanly".
-          writeStream.on("close", succeed);
-          writeStream.on("error", fail);
-          writeStream.end(content);
+        session.sftp.writeFile(remotePath, content, { flag: "w" }, (error) => {
+          settle(error ?? undefined);
         });
       } catch (error) {
-        fail(error);
+        settle(error);
       }
     });
   }
