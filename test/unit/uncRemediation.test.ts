@@ -96,6 +96,20 @@ describe("offerUNCHostRemediation", () => {
       expect(mockUpdate).toHaveBeenCalledWith("security.allowedUNCHosts", ["existing.host", "192.168.2.10"], 1);
     });
 
+    it("(c) an already-allowed host is not duplicated when the existing entry differs in case", async () => {
+      // The same-case fixture above passes even against a case-sensitive
+      // `includes()`, so it cannot tell the two implementations apart. VS Code
+      // lower-cases before matching its allowlist, so re-adding "NAS" next to
+      // "nas" would leave a duplicate entry that grants nothing new.
+      mockGet.mockReturnValue(["existing.host", "nas"]);
+      mockShowErrorMessage.mockResolvedValue("Allow Host…");
+      mockShowWarningMessage.mockResolvedValue("Allow");
+
+      await offerUNCHostRemediation("NAS", "\\\\NAS\\share\\a.txt");
+
+      expect(mockUpdate).toHaveBeenCalledWith("security.allowedUNCHosts", ["existing.host", "nas"], 1);
+    });
+
     it("tolerates a non-array current value instead of corrupting the setting", async () => {
       mockGet.mockReturnValue("not-an-array");
       mockShowErrorMessage.mockResolvedValue("Allow Host…");

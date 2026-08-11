@@ -3514,7 +3514,7 @@
           "minimum": 1,
           "maximum": 200,
           "order": 24,
-          "markdownDescription": "Maximum file size (in MB) that can be opened in the editor by clicking in the File Explorer. Larger files can still be downloaded via the right-click menu."
+          "markdownDescription": "Maximum size (in MB) of a single file Nexus will hold in memory. Applies to opening a remote file in the editor, and to transferring a file whose reported size is `0` (pseudo-files and appliances that mis-report size have to be read to the end to find out how big they are). Ordinary uploads and downloads stream and are not limited by this."
         },
         "nexus.ssh.connectionTimeout": {
           "type": "number",

@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { promises as fsp } from "node:fs";
+import { createReadStream, promises as fsp } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { SFTPWrapper, FileEntry, Stats, TransferOptions } from "ssh2";
 import type { ServerConfig } from "../../models/config";
@@ -42,6 +42,25 @@ const MAX_DELETE_DEPTH = 100;
 const MAX_DELETE_OPS = 10_000;
 const SSH_FX_NO_SUCH_FILE = 2;
 const SSH_FX_PERMISSION_DENIED = 3;
+
+/**
+ * Ceiling on how many bytes of a single file may be held in the extension
+ * host's heap at once. Only the "claimed-zero" transfer paths buffer at all —
+ * a file whose stat reports 0 bytes cannot be size-planned, so it has to be
+ * read to EOF to find out what is really there. Without a cap, a remote
+ * `/dev/zero`, a pseudo-file that never EOFs, or an appliance file that
+ * mis-reports its size exhausts the heap, and an extension-host OOM takes down
+ * every terminal session — the exact failure class this transfer work exists to
+ * eliminate. The idle timeout bounds TIME, not MEMORY.
+ *
+ * Backed by `nexus.sftp.maxOpenFileSizeMB`, which already governs the other
+ * whole-file-into-memory path (opening a remote file in the editor). Same
+ * resource, same unit, one dial.
+ */
+const MAX_IN_MEMORY_TRANSFER_SETTING = "nexus.sftp.maxOpenFileSizeMB";
+const DEFAULT_MAX_IN_MEMORY_TRANSFER_BYTES = 5 * 1024 * 1024;
+const MIN_MAX_IN_MEMORY_TRANSFER_BYTES = 1024 * 1024;
+const MAX_MAX_IN_MEMORY_TRANSFER_BYTES = 200 * 1024 * 1024;
 
 function createTimeoutError(label: string, timeoutMs: number): Error {
   return new Error(`SFTP ${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
@@ -162,6 +181,8 @@ export interface SftpServiceConfig {
   operationTimeoutMs?: number;
   maxDeleteDepth?: number;
   maxDeleteOps?: number;
+  /** See `MAX_IN_MEMORY_TRANSFER_SETTING`. Sourced from `nexus.sftp.maxOpenFileSizeMB`. */
+  maxInMemoryTransferBytes?: number;
 }
 
 export class SftpService {
@@ -177,6 +198,7 @@ export class SftpService {
   private operationTimeoutMs: number;
   private maxDeleteDepth: number;
   private maxDeleteOps: number;
+  private maxInMemoryTransferBytes: number;
 
   public constructor(
     private readonly sshFactory: SshFactory,
@@ -189,6 +211,12 @@ export class SftpService {
     this.operationTimeoutMs = normalizeConfigValue(config?.operationTimeoutMs, DEFAULT_OPERATION_TIMEOUT_MS, 5_000, 300_000);
     this.maxDeleteDepth = normalizeConfigValue(config?.maxDeleteDepth, MAX_DELETE_DEPTH, 10, 500);
     this.maxDeleteOps = normalizeConfigValue(config?.maxDeleteOps, MAX_DELETE_OPS, 100, 100_000);
+    this.maxInMemoryTransferBytes = normalizeConfigValue(
+      config?.maxInMemoryTransferBytes,
+      DEFAULT_MAX_IN_MEMORY_TRANSFER_BYTES,
+      MIN_MAX_IN_MEMORY_TRANSFER_BYTES,
+      MAX_MAX_IN_MEMORY_TRANSFER_BYTES
+    );
   }
 
   public updateConfig(config: SftpServiceConfig): void {
@@ -205,6 +233,14 @@ export class SftpService {
     }
     if (config.maxDeleteOps != null) {
       this.maxDeleteOps = normalizeConfigValue(config.maxDeleteOps, MAX_DELETE_OPS, 100, 100_000);
+    }
+    if (config.maxInMemoryTransferBytes != null) {
+      this.maxInMemoryTransferBytes = normalizeConfigValue(
+        config.maxInMemoryTransferBytes,
+        DEFAULT_MAX_IN_MEMORY_TRANSFER_BYTES,
+        MIN_MAX_IN_MEMORY_TRANSFER_BYTES,
+        MAX_MAX_IN_MEMORY_TRANSFER_BYTES
+      );
     }
     this.evictCacheIfNeeded();
   }
@@ -308,9 +344,14 @@ export class SftpService {
       stream.on("data", (chunk: Buffer | string) => {
         const buffer = toBufferChunk(chunk);
         totalSize += buffer.length;
-        if (maxSize && totalSize > maxSize) {
+        if (maxSize !== undefined && totalSize > maxSize) {
           stream.destroy();
-          fail(new Error(`File exceeds maximum size of ${Math.round(maxSize / 1024 / 1024)}MB`));
+          fail(
+            new Error(
+              `File exceeds maximum size of ${Math.round(maxSize / 1024 / 1024)}MB ` +
+                `(raise ${MAX_IN_MEMORY_TRANSFER_SETTING} to allow more)`
+            )
+          );
           return;
         }
         chunks.push(buffer);
@@ -429,9 +470,12 @@ export class SftpService {
         this.commandTimeoutMs,
         content,
         () =>
-          // mode is set at SSH_FXP_OPEN time, not via a later chmod: createWriteStream
-          // otherwise defaults to 0666 & umask, leaving the staged content readable by
-          // every local user on the remote host for the whole upload window.
+          // An explicit 0600 is REQUIRED here: ssh2's createWriteStream both
+          // opens with `mode` and fchmods to it (see putBufferPreservingMode),
+          // so the default 0666 would leave the staged content readable AND
+          // writable by every local user on the remote host for the whole
+          // upload window. Narrowing rather than widening, and the target is a
+          // freshly-named temp path we own, so the fchmod is wanted here.
           session.sftp.createWriteStream(tempPath, { mode: 0o600 }) as NodeJS.WritableStream & {
             destroy(error?: Error): void;
             end(chunk: Buffer): void;
@@ -648,17 +692,27 @@ export class SftpService {
   /**
    * Downloads `remotePath` into `localPath`.
    *
-   * The local destination is opened HERE, on our own stack, before any remote
-   * work happens. That is the fix for the "a download to a blocked path kills
-   * every terminal" failure: ssh2's `fastGet` opens the destination from inside
-   * the remote `open`/`fstat` callback chain, which runs on the `net.Socket`
-   * 'data' stack, so a synchronous throw from Node's path validation there (VS
-   * Code's UNC restriction raises `ERR_UNC_HOST_NOT_ALLOWED` exactly that way)
-   * unwinds the ssh2 protocol parser and destroys the `ssh2.Client` that every
-   * terminal tab multiplexes onto. Doing the same `'w'` open first turns that
-   * class of fault into an ordinary rejection with its real `err.code` intact,
-   * before a single remote packet is sent. Semantics are unchanged: `fastGet`
-   * would create/truncate the destination with the same flags anyway.
+   * ORDER MATTERS, and it mirrors ssh2's own (SFTP.js `fastXfer`): the remote
+   * file is opened/stat'd FIRST, and only once that succeeds is the local
+   * destination touched. ssh2 does `src.open(srcPath,'r')` -> `fstat` and opens
+   * `dst` with `'w'` inside that callback; an earlier version of this method
+   * claimed it was matching fastGet by opening the local file up front, which
+   * was simply wrong and cost the user their existing local file whenever the
+   * remote had vanished, was unreadable, or the connection was down.
+   *
+   * What the local `'w'` pre-flight IS for: ssh2 opens the destination from
+   * inside the remote callback chain, which runs on the `net.Socket` 'data'
+   * stack, so a synchronous throw from Node's path validation there (VS Code's
+   * UNC restriction raises `ERR_UNC_HOST_NOT_ALLOWED` exactly that way) unwinds
+   * the ssh2 protocol parser and destroys the `ssh2.Client` that every terminal
+   * tab multiplexes onto. Doing the same open on OUR stack, immediately before
+   * `fastGet`, turns that class of fault into an ordinary rejection. It still
+   * truncates — but only at the moment the transfer commences, which is the
+   * same instant `fastGet` would have truncated anyway.
+   *
+   * The claimed-zero branch needs no pre-flight at all: `fsp.writeFile` is our
+   * own local write, on our own stack, and it runs only after the remote bytes
+   * are already in hand — so a failed remote read leaves the local file intact.
    *
    * Errors from the pre-flight propagate UNWRAPPED — callers match on
    * `err.code` (see `isUNCAccessError`), never on message text.
@@ -666,9 +720,6 @@ export class SftpService {
   public async download(serverId: string, remotePath: string, localPath: string): Promise<void> {
     const session = this.getSession(serverId);
     const startedAt = Date.now();
-
-    const handle = await fsp.open(localPath, "w");
-    await handle.close();
 
     try {
       const remoteEntry = await this.stat(serverId, remotePath);
@@ -679,8 +730,10 @@ export class SftpService {
         // `fsize <= 0` as "done" and calls back with NO error — a green toast
         // over an empty file. Read to EOF instead and transfer what is actually
         // there; a genuinely empty file still round-trips as an empty file.
+        // Bounded: an unknown-size read into the extension host's heap without a
+        // ceiling is an OOM waiting for /dev/zero.
         const content = await this.readFileWithTimeout(
-          undefined,
+          this.maxInMemoryTransferBytes,
           this.commandTimeoutMs,
           () => session.sftp.createReadStream(remotePath) as NodeJS.ReadableStream & { destroy(error?: Error): void }
         );
@@ -688,6 +741,7 @@ export class SftpService {
         await fsp.writeFile(localPath, content);
       } else {
         expectedBytes = remoteEntry.size;
+        await this.openLocalDestination(localPath);
         await this.runTransferWithIdleTimeout(serverId, session, "download", (options, callback) => {
           session.sftp.fastGet(
             remotePath,
@@ -732,17 +786,16 @@ export class SftpService {
       if (localSize === 0) {
         // See download(): a claimed-zero source is read to EOF rather than
         // size-planned, so a lying stat transfers the real bytes instead of
-        // producing a truthful-looking empty upload.
-        const content = await fsp.readFile(localPath);
-        expectedBytes = content.length;
-        await this.writeFileWithTimeout(
+        // producing a truthful-looking empty upload. Streamed through the same
+        // bounded reader as the remote side — a plain `fsp.readFile` here would
+        // happily pull /dev/zero into the extension host's heap.
+        const content = await this.readFileWithTimeout(
+          this.maxInMemoryTransferBytes,
           this.commandTimeoutMs,
-          content,
-          () => session.sftp.createWriteStream(remotePath) as NodeJS.WritableStream & {
-            destroy(error?: Error): void;
-            end(chunk: Buffer): void;
-          }
+          () => createReadStream(localPath)
         );
+        expectedBytes = content.length;
+        await this.putBufferPreservingMode(session.sftp, remotePath, content);
       } else {
         expectedBytes = localSize;
         await this.runTransferWithIdleTimeout(serverId, session, "upload", (options, callback) => {
@@ -769,6 +822,47 @@ export class SftpService {
       // the listing cache is stale either way.
       this.invalidateCache(serverId, parentDir(remotePath));
     }
+  }
+
+  /**
+   * The `'w'` open of a download destination, performed on OUR stack so Node's
+   * synchronous path validation (VS Code's UNC restriction, null bytes, bad
+   * argument types) becomes a rejection here instead of a throw inside ssh2's
+   * socket-data callback. See `download()` for why this runs only after the
+   * remote side has been validated.
+   */
+  private async openLocalDestination(localPath: string): Promise<void> {
+    const handle = await fsp.open(localPath, "w");
+    await handle.close();
+  }
+
+  /**
+   * Writes a whole buffer to `remotePath` WITHOUT touching the file's mode.
+   *
+   * Not `createWriteStream`: ssh2's WriteStream sends SSH_FXP_OPEN with its
+   * `mode` attr AND then issues an unconditional `fchmod(handle, mode)` on
+   * every open (SFTP.js `WriteStream.prototype.open`), falling back to
+   * `chmod(path, mode)` if the server refuses fchmod. With the default mode of
+   * 0o666 that silently widens an existing remote file to world-readable and
+   * world-writable, and on a NEW file it also defeats the server's umask —
+   * neither of which `fastPut` does, so the size-planned and claimed-zero
+   * branches of `upload()` would disagree about permissions.
+   *
+   * `sftp.writeFile` with no `mode` opens with no ATTRS at all and never
+   * chmods, which is byte-for-byte the open `fastPut` performs: the server
+   * applies its own default-and-umask when creating, and leaves an existing
+   * file's mode alone. Uploading can therefore never widen permissions.
+   */
+  private putBufferPreservingMode(sftp: SFTPWrapper, remotePath: string, content: Buffer): Promise<void> {
+    return withTimeout<void>("writeFile", this.commandTimeoutMs, (resolve, reject) => {
+      sftp.writeFile(remotePath, content, { flag: "w" }, (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
   }
 
   /**
@@ -900,8 +994,15 @@ export class SftpService {
     sftp.on("close", () => {
       this.teardownSession(server.id, session, "SFTP channel closed");
     });
+    // Full teardown, not a bare cleanupSession(): dropping only the map entry
+    // left `connection.dispose()` uncalled, so the pool kept this session's
+    // SFTP refcount forever and the entry could never reach orphan cleanup once
+    // the terminal leases released. Re-entry is safe — cleanupSession() drops
+    // the mapping and unsubscribes this very listener before `sftp.end()` runs,
+    // so the identity guard short-circuits the follow-on 'close', and
+    // PooledSshConnection.dispose() carries its own `disposed` guard on top.
     const unsub = connection.onClose(() => {
-      this.cleanupSession(server.id);
+      this.teardownSession(server.id, session, "SSH connection closed");
     });
     this.unsubscribers.set(server.id, unsub);
   }
@@ -996,8 +1097,8 @@ export class SftpService {
 
   /**
    * The single teardown path for an SFTP session — reached from `disconnect()`,
-   * from a stalled-transfer abort, and from the `'error'`/`'close'` listeners on
-   * the SFTP channel (C1).
+   * from a stalled-transfer abort, from the `'error'`/`'close'` listeners on the
+   * SFTP channel (C1), and from the underlying client's own close.
    *
    * Idempotent by session identity: `sftp.end()` makes ssh2 emit `'close'`, which
    * re-enters here, and a re-entrant `connection.dispose()` would release a pool

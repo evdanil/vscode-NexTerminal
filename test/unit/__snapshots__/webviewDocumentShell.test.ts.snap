@@ -9418,8 +9418,8 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.sftp.remoteWatchMode"></span>
 </div>
   <div class="form-group">
-  <label for="setting-nexus-sftp-maxOpenFileSizeMB">Max File Size to Open</label>
-  <div class="setting-desc">Maximum file size (in MB) that can be opened in the editor. Larger files can still be downloaded via right-click.</div>
+  <label for="setting-nexus-sftp-maxOpenFileSizeMB">Max File Size to Hold in Memory</label>
+  <div class="setting-desc">Largest single file Nexus keeps in memory — opening a remote file in the editor, and transferring a file that reports its size as 0. Ordinary transfers stream and are not limited by this.</div>
   <div class="number-with-unit">
     <input type="number" id="setting-nexus-sftp-maxOpenFileSizeMB" data-section="nexus.sftp" data-key="maxOpenFileSizeMB" value="1" min="1" max="200" />
     <span class="unit-suffix">MB</span>

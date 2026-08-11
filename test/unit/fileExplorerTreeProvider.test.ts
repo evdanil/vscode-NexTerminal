@@ -1088,7 +1088,7 @@ describe("FileExplorerTreeProvider", () => {
       expect(vscode.window.showWarningMessage).toHaveBeenCalled();
     });
 
-    it("handleDrop skips uploads when remote destination checks fail", async () => {
+    it("handleDrop reports a failed remote destination check as a failure, counted once", async () => {
       const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
       fsPromisesMock.lstat.mockResolvedValue(localStat("file"));
@@ -1107,9 +1107,56 @@ describe("FileExplorerTreeProvider", () => {
       await provider.handleDrop(targetDir, mockTransfer as any);
 
       expect(sftp.upload).not.toHaveBeenCalled();
-      expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to check remote path "/home/dev/subdir/local.txt"')
-      );
+      const errors = shownMessages(vscode.window.showErrorMessage);
+      expect(errors.join("\n")).toContain('Failed to check remote path "/home/dev/subdir/local.txt"');
+      // A rejecting remote stat is an I/O failure, not a deliberate skip — and
+      // the old code counted it in BOTH buckets (once in the resolver, once in
+      // the caller's `decision === "skip"` branch).
+      expect(errors.join("\n")).toContain("failed 1");
+      expect(errors.join("\n")).toContain("skipped 0");
+    });
+
+    it("handleDrop reports a failed remote directory check as a failure, not a skip", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockResolvedValue(localStat("directory"));
+      (sftp.stat as any).mockRejectedValue(new Error("connection reset"));
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/mydir");
+
+      await provider.handleDrop(targetDir, {
+        get: (mime: string) => (mime === "text/uri-list" ? uriListItem : undefined),
+      } as any);
+
+      const errors = shownMessages(vscode.window.showErrorMessage);
+      expect(errors.join("\n")).toContain('Failed to check remote directory "/home/dev/subdir/mydir"');
+      expect(errors.join("\n")).toContain("failed 1");
+      // "Upload completed with skips" for a server that never answered is the
+      // same lie this PR exists to remove.
+      expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("handleDrop reports a failed remote mkdir as a failure, not a skip", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockResolvedValue(localStat("directory"));
+      (sftp.stat as any).mockRejectedValue(missingRemoteError());
+      (sftp.createDirectory as any).mockRejectedValue(new Error("read-only file system"));
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem("file:///tmp/mydir");
+
+      await provider.handleDrop(targetDir, {
+        get: (mime: string) => (mime === "text/uri-list" ? uriListItem : undefined),
+      } as any);
+
+      const errors = shownMessages(vscode.window.showErrorMessage);
+      expect(errors.join("\n")).toContain('Failed to create remote directory "/home/dev/subdir/mydir"');
+      expect(errors.join("\n")).toContain("failed 1");
+      expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
     });
 
     it("handleDrag sets text/uri-list with nexterm:// URIs", async () => {
@@ -1159,6 +1206,10 @@ describe("FileExplorerTreeProvider", () => {
       expect(vscode.window.showErrorMessage).not.toHaveBeenCalled();
     });
 
+    // SCOPE: T20 asserts a property of node:path, not of this provider — it is a
+    // documentation test for design decision D8 and would stay green through any
+    // change to the drop path. T19's remote-destination assertion is what
+    // actually covers the behaviour.
     it("T20 — a UNC basename resolves to the entry name alone and passes the safety guard", async () => {
       const nodePath = await import("node:path");
       // Documents D8: the host's platform-default basename IS win32 on Windows,
@@ -1183,6 +1234,37 @@ describe("FileExplorerTreeProvider", () => {
       expect(mockConfigUpdate).not.toHaveBeenCalled();
       expect(diagnosticsText()).toContain("192.168.2.10");
       expect(sftp.upload).not.toHaveBeenCalled();
+    });
+
+    it("T21b — one blocked host spelled two ways prompts once, using the spelling first seen", async () => {
+      const vscode = await import("vscode");
+      const { DataTransferItem } = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockRejectedValue(uncAccessError("NAS"));
+
+      // Deliberately NOT the uri-list route: `Uri.parse` runs through `URL`,
+      // which lower-cases the authority and would make the two spellings
+      // identical before the provider ever sees them — a fixture in which the
+      // broken and the fixed implementation produce the same state. File items
+      // carry their fsPath verbatim, which is what a Windows Explorer drag does.
+      const fileItem = (fsPath: string) =>
+        new DataTransferItem("", { uri: { scheme: "file", authority: "", path: fsPath, fsPath } } as any);
+      const items = [fileItem("//NAS/share/a.txt"), fileItem("//nas/share/b.txt")];
+
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      await provider.handleDrop(targetDir, {
+        get: () => undefined,
+        forEach: (fn: (item: unknown) => void) => { for (const item of items) { fn(item); } },
+      } as any);
+
+      // Both spellings reached the provider…
+      expect(fsPromisesMock.lstat).toHaveBeenCalledTimes(2);
+      // …but Windows treats them as one host, so one consent flow, not two.
+      const remediationPrompts = (vscode.window.showErrorMessage as any).mock.calls.filter(
+        (args: unknown[]) => typeof args[0] === "string" && args[0].includes("blocked access to network host")
+      );
+      expect(remediationPrompts).toHaveLength(1);
+      expect(remediationPrompts[0][0]).toContain('"NAS"');
     });
 
     it("T22 — a drop whose file items carry no URI is never a silent no-op", async () => {

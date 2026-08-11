@@ -6,7 +6,7 @@ import type { DirectoryEntry } from "../services/sftp/sftpService";
 import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
-import { getUNCHost, isUNCAccessError } from "../utils/networkPath";
+import { isUNCAccessError, recordBlockedUNCHost, type BlockedUNCHosts } from "../utils/networkPath";
 import { readBoundedNumber } from "../utils/boundedConfig";
 import { naturalCompare } from "../utils/naturalCompare";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "./conflictResolution";
@@ -46,12 +46,8 @@ interface UploadSummary {
   failed: number;
   conflicts: number;
   canceled: boolean;
-  /**
-   * Hosts VS Code's UNC restriction blocked during this drop, mapped to one
-   * representative path per host. The path is what the remediation flow
-   * re-probes after the setting is written, so a bare host set would not do.
-   */
-  blockedUNCHosts: Map<string, string>;
+  /** Hosts VS Code's UNC restriction blocked during this drop (see `BlockedUNCHosts`). */
+  blockedUNCHosts: BlockedUNCHosts;
 }
 
 function normalizeRemoteDir(remotePath: string): string | undefined {
@@ -605,7 +601,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return;
     }
 
-    const blockedUNCHosts = new Map<string, string>();
+    const blockedUNCHosts: BlockedUNCHosts = new Map();
 
     // Wrapped at the outermost operation (not per file) so a 500-file directory
     // upload counts as one busy span — currentRootPath is the fallback write target
@@ -690,7 +686,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     // Deliberately outside the busy span: the remediation flow blocks on a modal
     // for as long as the user takes, and isBusy() gates write-target redirection,
     // not UI. One prompt per distinct host, never one per file.
-    for (const [host, probePath] of blockedUNCHosts) {
+    for (const { host, probePath } of blockedUNCHosts.values()) {
       await offerUNCHostRemediation(host, probePath, this.diagnostics);
     }
   }
@@ -892,6 +888,10 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     }
 
     const decision = await this.resolveUploadDecision(serverId, remotePath, conflictState, summary);
+    if (decision === "fail") {
+      // Already counted as `failed` and reported by resolveUploadDecision.
+      return;
+    }
     if (decision === "cancel") {
       summary.canceled = true;
       return;
@@ -945,14 +945,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     if (!isUNCAccessError(err)) {
       return false;
     }
-    const host = getUNCHost(localPath);
-    if (!host) {
-      return false;
-    }
-    if (!summary.blockedUNCHosts.has(host)) {
-      summary.blockedUNCHosts.set(host, localPath);
-    }
-    return true;
+    return recordBlockedUNCHost(summary.blockedUNCHosts, localPath);
   }
 
   private async ensureRemoteDirectory(serverId: string, remoteDir: string, summary: UploadSummary): Promise<boolean> {
@@ -960,7 +953,10 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     try {
       existing = await this.sftp.tryStat(serverId, remoteDir);
     } catch (err: unknown) {
-      summary.skipped += 1;
+      // Remote I/O that errored is a failure, not a skip — see the counter
+      // contract on UploadSummary. Counting it as a skip made a drop where the
+      // server was unreachable report "Upload completed with skips".
+      summary.failed += 1;
       const message = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Failed to check remote directory "${remoteDir}": ${message}`);
       return false;
@@ -969,6 +965,7 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       if (existing.isDirectory) {
         return true;
       }
+      // A deliberate refusal, not an I/O failure: this one really is a skip.
       summary.conflicts += 1;
       summary.skipped += 1;
       void vscode.window.showWarningMessage(`Skipping "${remoteDir}" because destination exists as a file.`);
@@ -979,27 +976,33 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       await this.sftp.createDirectory(serverId, remoteDir);
       return true;
     } catch (err: unknown) {
-      summary.skipped += 1;
+      summary.failed += 1;
       const message = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Failed to create remote directory "${remoteDir}": ${message}`);
       return false;
     }
   }
 
+  /**
+   * `"fail"` is distinct from `"skip"` on purpose: the caller counts a `"skip"`
+   * itself, so a branch that has already counted a `failed` must not return
+   * `"skip"` — the previous code did, which both mislabeled the outcome and
+   * double-counted it.
+   */
   private async resolveUploadDecision(
     serverId: string,
     remotePath: string,
     conflictState: { mode: ConflictMode },
     summary: UploadSummary
-  ): Promise<ConflictDecision> {
+  ): Promise<ConflictDecision | "fail"> {
     let existing: DirectoryEntry | undefined;
     try {
       existing = await this.sftp.tryStat(serverId, remotePath);
     } catch (err: unknown) {
-      summary.skipped += 1;
+      summary.failed += 1;
       const message = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Failed to check remote path "${remotePath}": ${message}`);
-      return "skip";
+      return "fail";
     }
     if (!existing) {
       return "overwrite";

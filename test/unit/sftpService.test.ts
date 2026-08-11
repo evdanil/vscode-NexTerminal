@@ -4,18 +4,23 @@ import { EventEmitter } from "node:events";
 // Controllable node:fs promises. SftpService now does its local-side IO here —
 // the pre-flight open/stat that keeps a bad local path off ssh2's socket-callback
 // stack, and the post-transfer size verification.
-const { fsPromisesMock } = vi.hoisted(() => ({
+const { fsPromisesMock, fsCreateReadStream } = vi.hoisted(() => ({
   fsPromisesMock: {
     stat: vi.fn(),
     open: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn()
-  }
+  },
+  // The claimed-zero upload branch reads the local source through a bounded
+  // stream, not fsp.readFile — an unbounded readFile is how /dev/zero reaches
+  // the extension host's heap.
+  fsCreateReadStream: vi.fn()
 }));
 
 vi.mock("node:fs", () => ({
   promises: fsPromisesMock,
-  default: { promises: fsPromisesMock }
+  createReadStream: (...args: unknown[]) => fsCreateReadStream(...args),
+  default: { promises: fsPromisesMock, createReadStream: (...args: unknown[]) => fsCreateReadStream(...args) }
 }));
 
 import { SftpService } from "../../src/services/sftp/sftpService";
@@ -39,6 +44,7 @@ type MockSftp = EventEmitter & {
   lstat: ReturnType<typeof vi.fn>;
   createReadStream: ReturnType<typeof vi.fn>;
   createWriteStream: ReturnType<typeof vi.fn>;
+  writeFile: ReturnType<typeof vi.fn>;
   unlink: ReturnType<typeof vi.fn>;
   rename: ReturnType<typeof vi.fn>;
   mkdir: ReturnType<typeof vi.fn>;
@@ -60,6 +66,7 @@ function createMockSftp(): MockSftp {
     lstat: vi.fn(),
     createReadStream: vi.fn(),
     createWriteStream: vi.fn(),
+    writeFile: vi.fn(),
     unlink: vi.fn(),
     rename: vi.fn(),
     mkdir: vi.fn(),
@@ -92,6 +99,49 @@ function createMockWriteStream() {
     written
   };
   return stream;
+}
+
+/**
+ * A remote filesystem double that models the MODE side-effects of ssh2's two
+ * whole-file write paths. Verified against ssh2 1.17.0 `lib/protocol/SFTP.js`:
+ *
+ * - `createWriteStream(path, opts)` → `WriteStream.prototype.open()` sends
+ *   SSH_FXP_OPEN carrying `mode` (default 0o666) AND then issues an
+ *   UNCONDITIONAL `fchmod(handle, mode)` — on every open, existing file or not.
+ *   So this path rewrites the mode of a file it overwrites.
+ * - `writeFile(path, data, { flag })` with no `mode` → `open(path, flag,
+ *   undefined, cb)`, i.e. SSH_FXP_OPEN with NO attrs, and no chmod anywhere.
+ *   The server applies its default-and-umask when creating; an existing file
+ *   keeps whatever mode it had. This is byte-for-byte what `fastPut` does.
+ *
+ * Without modelling the fchmod, a mode-preservation assertion is vacuous: the
+ * mock would report the mode it was seeded with no matter which path ran.
+ */
+function installRemoteWriteModel(sftp: MockSftp, serverCreateMode = 0o644) {
+  const modes = new Map<string, number>();
+  const writes: Array<{ path: string; data: Buffer; options?: { mode?: number; flag?: string } }> = [];
+
+  sftp.createWriteStream.mockImplementation((remotePath: string, options?: { mode?: number }) => {
+    // open()'s `mode` attr applies only on create; the fchmod that follows it
+    // applies always — so the effective mode is the same either way.
+    modes.set(remotePath, options?.mode ?? 0o666);
+    return createMockWriteStream();
+  });
+
+  sftp.writeFile.mockImplementation((
+    remotePath: string,
+    data: Buffer,
+    options: { mode?: number; flag?: string } | undefined,
+    callback: (error?: Error | null) => void
+  ) => {
+    if (!modes.has(remotePath)) {
+      modes.set(remotePath, options?.mode ?? serverCreateMode);
+    }
+    writes.push({ path: remotePath, data, options });
+    queueMicrotask(() => callback(null));
+  });
+
+  return { modes, writes };
 }
 
 /** Read stream double for `readFileWithTimeout` (registers 'data'/'end'/'error'). */
@@ -180,11 +230,13 @@ describe("SftpService", () => {
     fsPromisesMock.open.mockReset();
     fsPromisesMock.readFile.mockReset();
     fsPromisesMock.writeFile.mockReset();
+    fsCreateReadStream.mockReset();
     // Benign defaults; individual transfer tests override them.
     fsPromisesMock.stat.mockResolvedValue({ size: 1024 });
     fsPromisesMock.open.mockResolvedValue({ close: vi.fn(async () => {}) });
     fsPromisesMock.readFile.mockResolvedValue(Buffer.alloc(0));
     fsPromisesMock.writeFile.mockResolvedValue(undefined);
+    fsCreateReadStream.mockImplementation(() => createMockReadStream([]));
   });
 
   it("connects to a server via SSH factory and opens SFTP", async () => {
@@ -959,8 +1011,9 @@ describe("SftpService", () => {
   });
 
   describe("local pre-flight and verified transfers (C3)", () => {
-    it("T4 — download pre-flights the local destination before any remote work", async () => {
+    it("T4 — the local destination is opened on our stack, so ssh2 never opens it from its own socket callback", async () => {
       await service.connect(testServer);
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(100)));
       fsPromisesMock.open.mockRejectedValueOnce(uncAccessError());
 
       await expect(
@@ -970,7 +1023,26 @@ describe("SftpService", () => {
       // The whole point: ssh2 must never get the chance to open this path from
       // inside its own socket-data callback.
       expect(sftp.fastGet).not.toHaveBeenCalled();
-      expect(sftp.stat).not.toHaveBeenCalled();
+      // The remote side is validated FIRST (this is also ssh2's own ordering);
+      // the local 'w' open happens immediately before fastGet, not before it.
+      expect(sftp.stat).toHaveBeenCalledTimes(1);
+      expect(fsPromisesMock.open).toHaveBeenCalledWith("\\\\192.168.2.10\\share\\f.bin", "w");
+    });
+
+    it("T4b — a download whose remote file cannot be stat'd never touches the existing local file", async () => {
+      await service.connect(testServer);
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(missingPathError("No such file")));
+
+      await expect(service.download("srv-1", "/remote/gone.bin", "/tmp/precious.bin")).rejects.toThrow(
+        /no such file/i
+      );
+
+      // The old order truncated the destination before asking the server
+      // anything, so a vanished remote file destroyed the user's local copy —
+      // or left an empty file standing in for one that never existed.
+      expect(fsPromisesMock.open).not.toHaveBeenCalled();
+      expect(fsPromisesMock.writeFile).not.toHaveBeenCalled();
+      expect(sftp.fastGet).not.toHaveBeenCalled();
     });
 
     it("T5 — an upload pre-stat failure propagates with err.code intact", async () => {
@@ -999,30 +1071,110 @@ describe("SftpService", () => {
     it("T7 — a source whose stat claims zero bytes is streamed to EOF, not size-planned", async () => {
       await service.connect(testServer);
       fsPromisesMock.stat.mockResolvedValue({ size: 0 });
-      fsPromisesMock.readFile.mockResolvedValue(Buffer.from("actual"));
-      const writeStream = createMockWriteStream();
-      sftp.createWriteStream.mockReturnValue(writeStream);
+      fsCreateReadStream.mockImplementation(() => createMockReadStream([Buffer.from("actual")]));
+      const remote = installRemoteWriteModel(sftp);
       sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(6)));
 
       await expect(service.upload("srv-1", "/proc/lying", "/remote/lying")).resolves.toBeUndefined();
 
       // fastPut with a planned size of 0 is ssh2's silent-success branch.
       expect(sftp.fastPut).not.toHaveBeenCalled();
-      expect(writeStream.written).toEqual([Buffer.from("actual")]);
+      expect(fsCreateReadStream).toHaveBeenCalledWith("/proc/lying");
+      expect(remote.writes.map((w) => w.data)).toEqual([Buffer.from("actual")]);
     });
 
     it("T8 — a genuinely empty file still uploads successfully as an empty remote file", async () => {
       await service.connect(testServer);
       fsPromisesMock.stat.mockResolvedValue({ size: 0 });
-      fsPromisesMock.readFile.mockResolvedValue(Buffer.alloc(0));
-      const writeStream = createMockWriteStream();
-      sftp.createWriteStream.mockReturnValue(writeStream);
+      fsCreateReadStream.mockImplementation(() => createMockReadStream([]));
+      const remote = installRemoteWriteModel(sftp);
       sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(0)));
 
       await expect(service.upload("srv-1", "/tmp/empty.txt", "/remote/empty.txt")).resolves.toBeUndefined();
 
-      expect(sftp.createWriteStream).toHaveBeenCalledWith("/remote/empty.txt");
-      expect(writeStream.written).toEqual([Buffer.alloc(0)]);
+      expect(remote.writes).toEqual([
+        { path: "/remote/empty.txt", data: Buffer.alloc(0), options: { flag: "w" } }
+      ]);
+    });
+
+    it("T8a — an upload over an existing remote file leaves its permissions alone", async () => {
+      await service.connect(testServer);
+      fsPromisesMock.stat.mockResolvedValue({ size: 0 });
+      fsCreateReadStream.mockImplementation(() => createMockReadStream([]));
+      const remote = installRemoteWriteModel(sftp);
+      // A secret the owner alone may read — an SSH key, a credentials file.
+      remote.modes.set("/remote/id_rsa", 0o600);
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(0)));
+
+      await expect(service.upload("srv-1", "/tmp/empty.txt", "/remote/id_rsa")).resolves.toBeUndefined();
+
+      // ssh2's createWriteStream fchmods every open to its `mode` (0o666 by
+      // default), which would have made this world-readable AND world-writable.
+      expect(remote.modes.get("/remote/id_rsa")).toBe(0o600);
+      expect(sftp.createWriteStream).not.toHaveBeenCalled();
+    });
+
+    it("T8b — a newly created remote file is opened with no mode attr, leaving the server's umask in charge", async () => {
+      await service.connect(testServer);
+      fsPromisesMock.stat.mockResolvedValue({ size: 0 });
+      fsCreateReadStream.mockImplementation(() => createMockReadStream([]));
+      const remote = installRemoteWriteModel(sftp, 0o644);
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(0)));
+
+      await expect(service.upload("srv-1", "/tmp/empty.txt", "/remote/fresh.txt")).resolves.toBeUndefined();
+
+      // Passing any explicit mode here would defeat the server's umask on
+      // create, which fastPut (open with no attrs) never does.
+      expect(remote.writes[0].options?.mode).toBeUndefined();
+      expect(remote.modes.get("/remote/fresh.txt")).toBe(0o644);
+    });
+
+    it("T8c — a claimed-zero upload that keeps producing bytes is capped, naming the limit and the setting", async () => {
+      await service.connect(testServer);
+      (service as any).maxInMemoryTransferBytes = 1024;
+      fsPromisesMock.stat.mockResolvedValue({ size: 0 });
+      // /dev/zero: stats as 0, streams forever.
+      fsCreateReadStream.mockImplementation(() => createMockReadStream([Buffer.alloc(4096)]));
+      installRemoteWriteModel(sftp);
+      // Present so that an UNBOUNDED implementation completes cleanly rather
+      // than hanging on the verification stat — the flip-check must fail on the
+      // missing cap, not on a fixture timeout.
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(4096)));
+
+      await expect(service.upload("srv-1", "/dev/zero", "/remote/zero")).rejects.toThrow(
+        /exceeds maximum size.*nexus\.sftp\.maxOpenFileSizeMB/s
+      );
+      expect(sftp.writeFile).not.toHaveBeenCalled();
+    });
+
+    it("T8d — a claimed-zero download that keeps producing bytes is capped and writes nothing locally", async () => {
+      await service.connect(testServer);
+      (service as any).maxInMemoryTransferBytes = 1024;
+      sftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(0)));
+      sftp.createReadStream.mockImplementation(() => createMockReadStream([Buffer.alloc(4096)]));
+
+      await expect(service.download("srv-1", "/dev/zero", "/tmp/zero")).rejects.toThrow(
+        /exceeds maximum size.*nexus\.sftp\.maxOpenFileSizeMB/s
+      );
+      // Bounding TIME (the idle timeout) never bounded MEMORY; an extension-host
+      // OOM takes every terminal session with it.
+      expect(fsPromisesMock.writeFile).not.toHaveBeenCalled();
+    });
+
+    it("T8e — the in-memory cap is configurable and clamped", async () => {
+      const configured = new SftpService(factory, {
+        cacheTtlMs: 10_000,
+        maxCacheEntries: 500,
+        maxInMemoryTransferBytes: 20 * 1024 * 1024
+      });
+      expect((configured as any).maxInMemoryTransferBytes).toBe(20 * 1024 * 1024);
+
+      configured.updateConfig({
+        cacheTtlMs: 10_000,
+        maxCacheEntries: 500,
+        maxInMemoryTransferBytes: 5_000 * 1024 * 1024
+      });
+      expect((configured as any).maxInMemoryTransferBytes).toBe(200 * 1024 * 1024);
     });
 
     it("T9a — a download whose local size does not match the remote is reported as failed", async () => {
@@ -1090,7 +1242,12 @@ describe("SftpService", () => {
       return { innerSftp, innerConnection, pool };
     }
 
-    it("T15a — a stalled transfer times out without disposing the multiplexed connection a terminal still leases", async () => {
+    // NOTE ON SCOPE: T15a covers the idle-timeout teardown ONLY. It says nothing
+    // about the S2 mechanism (the local open that used to run on ssh2's socket
+    // stack) — T15c does that. What T15a freezes is that the timeout path
+    // releases the SFTP lease via `connection.dispose()` and never reaches for
+    // `pool.disconnect()`, which would end a Client terminal tabs still hold.
+    it("T15a — the idle-timeout teardown releases only the SFTP lease, not the pooled client a terminal holds", async () => {
       vi.useFakeTimers();
       const { innerSftp, innerConnection, pool } = createPooledFixture();
       try {
@@ -1130,6 +1287,69 @@ describe("SftpService", () => {
       expect(pooledService.isConnected("srv-1")).toBe(false);
       expect(innerConnection.dispose).not.toHaveBeenCalled();
       await expect(terminalLease.openShell()).resolves.toBeDefined();
+    });
+
+    it("T15c — S2: a download into a blocked UNC destination fails as a rejection, and ssh2 never opens the path itself", async () => {
+      const { innerSftp, innerConnection, pool } = createPooledFixture();
+      const pooledService = new SftpService(pool);
+      await pooledService.connect(testServer);
+      const terminalLease = await pool.connect(testServer);
+
+      innerSftp.stat.mockImplementation((_path: string, cb: Function) => cb(null, remoteStatsOfSize(100)));
+      fsPromisesMock.open.mockRejectedValueOnce(uncAccessError("192.168.2.10"));
+      // Stands in for what ssh2 really does: `fastGet` opens the local
+      // destination from inside its remote open/fstat callback, which runs on
+      // the net.Socket 'data' stack — so this throw would unwind the protocol
+      // parser and destroy the Client every terminal tab multiplexes onto.
+      innerSftp.fastGet.mockImplementation(() => {
+        throw uncAccessError("192.168.2.10");
+      });
+
+      await expect(
+        pooledService.download("srv-1", "/remote/f.bin", "\\\\192.168.2.10\\share\\f.bin")
+      ).rejects.toMatchObject({ code: "ERR_UNC_HOST_NOT_ALLOWED" });
+
+      // The load-bearing assertion: the pre-flight took the fault, so ssh2 was
+      // never handed the path at all.
+      expect(innerSftp.fastGet).not.toHaveBeenCalled();
+      // A bad LOCAL path is not an SFTP fault — the session must survive it.
+      expect(pooledService.isConnected("srv-1")).toBe(true);
+      expect(innerConnection.dispose).not.toHaveBeenCalled();
+      await expect(terminalLease.openShell()).resolves.toBeDefined();
+    });
+
+    it("T15d — a client-wide close releases the SFTP pool lease exactly once", async () => {
+      const { innerSftp, innerConnection, pool } = createPooledFixture();
+      let clientClose: (() => void) | undefined;
+      (innerConnection.onClose as ReturnType<typeof vi.fn>).mockImplementation((listener: () => void) => {
+        const previous = clientClose;
+        clientClose = () => {
+          previous?.();
+          listener();
+        };
+        return () => {
+          /* the pool's own unsubscribe is not exercised here */
+        };
+      });
+
+      const pooledService = new SftpService(pool);
+      await pooledService.connect(testServer);
+      const terminalLease = await pool.connect(testServer);
+
+      // The whole SSH client dropped (network loss, server restart).
+      clientClose?.();
+
+      expect(pooledService.isConnected("srv-1")).toBe(false);
+      // Before the fix this only deleted the map entry: `connection.dispose()`
+      // never ran, so the pool held the SFTP refcount forever and the entry
+      // could never reach orphan cleanup once the terminals released theirs.
+      terminalLease.dispose();
+      expect(innerConnection.dispose).toHaveBeenCalledTimes(1);
+
+      // …and never twice: a second decrement would end a Client other tabs hold.
+      innerSftp.emit("close");
+      pooledService.disconnect("srv-1");
+      expect(innerConnection.dispose).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -5,7 +5,9 @@ import {
   getUNCHost,
   isUNCAccessError,
   isWindowsNetworkPath,
-  resolveTransferTuning
+  recordBlockedUNCHost,
+  resolveTransferTuning,
+  type BlockedUNCHosts
 } from "../../src/utils/networkPath";
 
 describe("isWindowsNetworkPath (T-N1)", () => {
@@ -79,5 +81,43 @@ describe("isUNCAccessError (T-N3)", () => {
     expect(isUNCAccessError(new Error("plain"))).toBe(false);
     expect(isUNCAccessError(undefined)).toBe(false);
     expect(isUNCAccessError("ERR_UNC_HOST_NOT_ALLOWED")).toBe(false);
+  });
+});
+
+describe("recordBlockedUNCHost (T-N4)", () => {
+  it("collapses spellings that differ only in case into one entry", () => {
+    const collected: BlockedUNCHosts = new Map();
+
+    expect(recordBlockedUNCHost(collected, "\\\\NAS\\share\\a.txt")).toBe(true);
+    expect(recordBlockedUNCHost(collected, "\\\\nas\\share\\b.txt")).toBe(true);
+
+    // Windows treats these as one host, so one operation must produce one
+    // consent flow — not one per spelling.
+    expect(collected.size).toBe(1);
+  });
+
+  it("keeps the first spelling seen, so messages echo what the user typed", () => {
+    const collected: BlockedUNCHosts = new Map();
+
+    recordBlockedUNCHost(collected, "\\\\NAS\\share\\a.txt");
+    recordBlockedUNCHost(collected, "\\\\nas\\share\\b.txt");
+
+    expect([...collected.values()]).toEqual([{ host: "NAS", probePath: "\\\\NAS\\share\\a.txt" }]);
+  });
+
+  it("keeps genuinely different hosts apart", () => {
+    const collected: BlockedUNCHosts = new Map();
+
+    recordBlockedUNCHost(collected, "\\\\nas\\share\\a.txt");
+    recordBlockedUNCHost(collected, "\\\\backup\\share\\a.txt");
+
+    expect([...collected.keys()]).toEqual(["nas", "backup"]);
+  });
+
+  it("records nothing for a path with no UNC host", () => {
+    const collected: BlockedUNCHosts = new Map();
+
+    expect(recordBlockedUNCHost(collected, "C:\\local\\a.txt")).toBe(false);
+    expect(collected.size).toBe(0);
   });
 });

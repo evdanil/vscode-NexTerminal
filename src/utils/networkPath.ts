@@ -59,6 +59,43 @@ export function isUNCAccessError(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "ERR_UNC_HOST_NOT_ALLOWED";
 }
 
+/**
+ * One blocked host, plus a representative blocked path the remediation flow
+ * re-probes after the setting is written (a bare host set would not do).
+ * `host` keeps the ORIGINAL spelling so messages echo what the user typed.
+ */
+export interface BlockedUNCHost {
+  host: string;
+  probePath: string;
+}
+
+/**
+ * Hosts VS Code's UNC restriction blocked during ONE operation, keyed by
+ * lower-cased host name.
+ *
+ * Case-insensitive on purpose: Windows treats `\\NAS\share` and `\\nas\share`
+ * as the same host, and VS Code's own allowlist check lower-cases before
+ * comparing. Keying on the raw spelling made a single share that appeared in
+ * both spellings inside one drop produce two consent flows for one host.
+ */
+export type BlockedUNCHosts = Map<string, BlockedUNCHost>;
+
+/**
+ * Records `localPath`'s UNC host in `collected`, first spelling wins.
+ * Returns false when the path is not a UNC path at all (nothing recorded).
+ */
+export function recordBlockedUNCHost(collected: BlockedUNCHosts, localPath: string): boolean {
+  const host = getUNCHost(localPath);
+  if (!host) {
+    return false;
+  }
+  const key = host.toLowerCase();
+  if (!collected.has(key)) {
+    collected.set(key, { host, probePath: localPath });
+  }
+  return true;
+}
+
 const UNC_ROOTS = ["\\\\.\\UNC\\", "\\\\?\\UNC\\", "\\\\"] as const;
 
 /**

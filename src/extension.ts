@@ -279,6 +279,10 @@ function readSftpServiceConfig(): SftpServiceConfig {
     operationTimeoutMs: readBoundedMs("nexus.sftp", "operationTimeout", 30, 5, 300),
     maxDeleteDepth: Math.floor(readBoundedNumber("nexus.sftp", "deleteDepthLimit", 100, 10, 500)),
     maxDeleteOps: Math.floor(readBoundedNumber("nexus.sftp", "deleteOperationLimit", 10000, 100, 100000)),
+    // Same dial as the editor-open limit: both are "how many bytes of one file
+    // Nexus will hold in the extension host's heap".
+    maxInMemoryTransferBytes:
+      Math.floor(readBoundedNumber("nexus.sftp", "maxOpenFileSizeMB", 5, 1, 200)) * 1024 * 1024,
   };
 }
 
@@ -1223,7 +1227,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       event.affectsConfiguration("nexus.sftp.commandTimeout") ||
       event.affectsConfiguration("nexus.sftp.operationTimeout") ||
       event.affectsConfiguration("nexus.sftp.deleteDepthLimit") ||
-      event.affectsConfiguration("nexus.sftp.deleteOperationLimit")
+      event.affectsConfiguration("nexus.sftp.deleteOperationLimit") ||
+      event.affectsConfiguration("nexus.sftp.maxOpenFileSizeMB")
     ) {
       sftpService.updateConfig(readSftpServiceConfig());
     }

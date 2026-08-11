@@ -7,7 +7,12 @@ import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "../ui/conflictResolution";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
-import { getUNCHost, isUNCAccessError } from "../utils/networkPath";
+import {
+  getUNCHost,
+  isUNCAccessError,
+  recordBlockedUNCHost,
+  type BlockedUNCHosts
+} from "../utils/networkPath";
 import { offerUNCHostRemediation } from "../ui/uncRemediation";
 import { naturalCompare } from "../utils/naturalCompare";
 import type { CommandContext } from "./types";
@@ -116,13 +121,9 @@ function resolveSelectedItems(arg: unknown, allSelected: unknown): FileTreeItem[
   return [];
 }
 
-/**
- * Hosts VS Code's UNC restriction blocked during one operation, mapped to a
- * representative blocked path per host (the remediation flow re-probes it).
- * Collected rather than toasted per item: one cause affecting a 200-file
- * directory transfer must produce one actionable message, not 200.
- */
-type BlockedUNCHosts = Map<string, string>;
+// Hosts are collected rather than toasted per item: one cause affecting a
+// 200-file directory transfer must produce one actionable message, not 200.
+// See `BlockedUNCHosts` for why the keying is case-insensitive.
 
 interface DownloadSummary {
   downloaded: number;
@@ -155,14 +156,8 @@ function reportTransferFailure(
   error: unknown,
   buildMessage: (message: string) => string
 ): void {
-  if (isUNCAccessError(error)) {
-    const host = getUNCHost(localPath);
-    if (host) {
-      if (!blockedUNCHosts.has(host)) {
-        blockedUNCHosts.set(host, localPath);
-      }
-      return;
-    }
+  if (isUNCAccessError(error) && recordBlockedUNCHost(blockedUNCHosts, localPath)) {
+    return;
   }
   const message = error instanceof Error ? error.message : String(error);
   void vscode.window.showErrorMessage(buildMessage(message));
@@ -172,7 +167,7 @@ async function offerCollectedUNCRemediation(
   blockedUNCHosts: BlockedUNCHosts,
   diagnostics?: (line: string) => void
 ): Promise<void> {
-  for (const [host, probePath] of blockedUNCHosts) {
+  for (const { host, probePath } of blockedUNCHosts.values()) {
     await offerUNCHostRemediation(host, probePath, diagnostics);
   }
 }
