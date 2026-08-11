@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.8.180] — 2026-08-11
+
+### Fixed
+
+- **Dragging files from a Windows network share (`\\server\share`) onto the File Explorer no longer reports a successful-looking upload while nothing reaches the server.** VS Code blocks file access to network hosts that are not in its `security.allowedUNCHosts` list, and that block was being swallowed and counted as a "skip", producing "Upload completed with skips (uploaded 0, skipped 1)". The block is now named for what it is, with a one-click fix: an error message identifying the host, and an **Allow Host…** action that — only after a confirmation dialog naming the host and the setting — adds it to VS Code's own trusted-hosts list and offers to reload the window if that is required. Nothing is written to that setting unless you confirm.
+- **Downloading a file into a network share no longer disconnects every SSH terminal for that server.** The local destination is now opened and validated before any remote work begins, so a rejected path fails as a single clear error instead of tearing down the SSH connection that all your terminal tabs share.
+- **Transfers are verified.** After every upload and download, the destination's size is checked against the source. A transfer that moved no bytes — previously reported as success — now fails with an explicit "verification failed" message. Empty files still transfer normally, and files whose reported size is wrong (`/proc` entries, some appliances) now transfer their real contents instead of arriving empty.
+- **Drag-and-drop upload summaries are honest.** Failures are counted as failures (with an error, not a "completed with skips" warning), unreadable files and folders each say why, skipped symlinks and unusable names are reported, and a drop that produced nothing usable now says so instead of doing nothing silently.
+- **The `Upload…` command now rejects file names containing unsupported characters** instead of sending them to the server, matching the drag-and-drop path.
+- **Transfers to and from Windows network paths use gentler pipelining** (8 parallel chunks instead of 64), which stops a slow or stalled share from starving the extension host. Local-disk transfers are unchanged.
+
+### Added
+
+- **New "Nexus SSH" output channel.** Records SSH connection errors that were previously discarded — including keepalive timeouts, the usual cause of an unexplained "Connection lost" on every tab — plus connection closes, SFTP channel faults, blocked network-host access, and a per-transfer line with byte counts. No configuration; it is inert until you open it.
+
 ## [2.8.177] — 2026-08-10
 
 ### Fixed

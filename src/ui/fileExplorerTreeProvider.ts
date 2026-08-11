@@ -1,13 +1,16 @@
 import * as path from "node:path";
+import { promises as fsp, type Dirent, type Stats } from "node:fs";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
 import type { DirectoryEntry } from "../services/sftp/sftpService";
 import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
+import { getUNCHost, isUNCAccessError } from "../utils/networkPath";
 import { readBoundedNumber } from "../utils/boundedConfig";
 import { naturalCompare } from "../utils/naturalCompare";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "./conflictResolution";
+import { offerUNCHostRemediation } from "./uncRemediation";
 
 const FILE_DRAG_MIME = "application/vnd.nexus.fileitem";
 const URI_LIST_MIME = "text/uri-list";
@@ -37,9 +40,18 @@ interface ValidDraggedItem extends DraggedFilePayloadItem {
 
 interface UploadSummary {
   uploaded: number;
+  /** Items we deliberately did not upload (symlinks, unsafe names, conflicts). */
   skipped: number;
+  /** Items we tried and could not upload. Never folded into `skipped`. */
+  failed: number;
   conflicts: number;
   canceled: boolean;
+  /**
+   * Hosts VS Code's UNC restriction blocked during this drop, mapped to one
+   * representative path per host. The path is what the remediation flow
+   * re-probes after the setting is written, so a bare host set would not do.
+   */
+  blockedUNCHosts: Map<string, string>;
 }
 
 function normalizeRemoteDir(remotePath: string): string | undefined {
@@ -83,8 +95,9 @@ function parseDraggedPayload(raw: string): DraggedFilePayloadItem[] {
   return items;
 }
 
-function parseUriList(raw: string): vscode.Uri[] {
+function parseUriList(raw: string): { uris: vscode.Uri[]; malformedCount: number } {
   const uris: vscode.Uri[] = [];
+  let malformedCount = 0;
   const lines = raw.split(/\r?\n/).map((line) => line.trim());
   for (const line of lines) {
     if (!line || line.startsWith("#")) {
@@ -93,10 +106,12 @@ function parseUriList(raw: string): vscode.Uri[] {
     try {
       uris.push(vscode.Uri.parse(line, true));
     } catch {
-      // Ignore malformed URI entries from foreign drag sources.
+      // Counted, not swallowed: a drop made entirely of unparsable entries must
+      // still tell the user why nothing happened.
+      malformedCount += 1;
     }
   }
-  return uris;
+  return { uris, malformedCount };
 }
 
 export class FileExplorerServerItem extends vscode.TreeItem {
@@ -192,7 +207,10 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
   private lastBusy = false;
   private readonly busyListeners = new Set<() => void>();
 
-  public constructor(private readonly sftp: SftpService) {}
+  public constructor(
+    private readonly sftp: SftpService,
+    private readonly diagnostics?: (line: string) => void
+  ) {}
 
   public getActiveServerId(): string | undefined {
     return this.activeServerId;
@@ -587,6 +605,8 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return;
     }
 
+    const blockedUNCHosts = new Map<string, string>();
+
     // Wrapped at the outermost operation (not per file) so a 500-file directory
     // upload counts as one busy span — currentRootPath is the fallback write target
     // for drag-drop upload, and an auto-follow re-root mid-drag would redirect it.
@@ -594,17 +614,24 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     try {
       const { localUris, unsupportedCount } = await this.collectDroppedLocalUris(dataTransfer);
       if (localUris.length === 0) {
-        if (unsupportedCount > 0) {
-          void vscode.window.showWarningMessage("Only local files can be uploaded. Non-file URIs were ignored.");
-        }
+        // Unconditional: a drop that produced nothing usable must never be a
+        // silent no-op. Drags originating outside VS Code routinely carry
+        // `asFile()` items with no `.uri`, and those used to vanish without a
+        // single message.
+        void vscode.window.showWarningMessage(
+          "Nothing was uploaded: the dropped items did not include usable local file paths."
+        );
+        this.diagnostics?.(`[upload] drop produced no usable local paths (${unsupportedCount} unusable item(s))`);
         return;
       }
 
       const summary: UploadSummary = {
         uploaded: 0,
         skipped: unsupportedCount,
+        failed: 0,
         conflicts: 0,
-        canceled: false
+        canceled: false,
+        blockedUNCHosts
       };
       const conflictState: { mode: ConflictMode } = { mode: "ask" };
       const serverId = this.activeServerId;
@@ -616,13 +643,24 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
             if (summary.canceled) {
               break;
             }
-            const rootName = path.basename(uri.fsPath);
+            // The boundary where a Uri becomes a plain host-OS path: everything
+            // below this line works on strings and talks to node:fs, which is
+            // where the platform's real errors (UNC policy included) live.
+            const localPath = uri.fsPath;
+            // `path.basename` stays the platform default on purpose (D8):
+            // `uri.fsPath` is always host-OS-format, and on Windows the default
+            // IS win32 — `path.win32.basename("\\\\srv\\share\\f.txt")` is
+            // "f.txt", which passes isSafeEntryName. Forcing win32 everywhere
+            // would mis-split legitimate backslash-bearing names on Linux hosts.
+            const rootName = path.basename(localPath);
             if (!isSafeEntryName(rootName)) {
               summary.skipped += 1;
+              void vscode.window.showWarningMessage(`Skipping "${rootName}": name contains unsupported characters.`);
+              this.diagnostics?.(`[upload] skipped "${localPath}": unsupported characters in name`);
               continue;
             }
             const remoteDest = path.posix.join(targetDirNormalized, rootName);
-            await this.uploadLocalUri(serverId, uri, remoteDest, progress, conflictState, summary);
+            await this.uploadLocalPath(serverId, localPath, remoteDest, progress, conflictState, summary);
           }
         }
       );
@@ -632,39 +670,52 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
         this.onDidChangeTreeDataEmitter.fire(undefined);
       }
 
-      const detail = `uploaded ${summary.uploaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}`;
+      const detail =
+        `uploaded ${summary.uploaded}, failed ${summary.failed}, ` +
+        `skipped ${summary.skipped}, conflicts ${summary.conflicts}`;
+      this.diagnostics?.(`[upload] drop into ${serverId}:${targetDirNormalized} — ${detail}`);
       if (summary.canceled) {
         void vscode.window.showWarningMessage(`Upload canceled (${detail}).`);
-        return;
-      }
-      if (summary.skipped > 0 || summary.conflicts > 0) {
+      } else if (summary.failed > 0) {
+        void vscode.window.showErrorMessage(`Upload finished with failures (${detail}).`);
+      } else if (summary.skipped > 0 || summary.conflicts > 0) {
         void vscode.window.showWarningMessage(`Upload completed with skips (${detail}).`);
-        return;
-      }
-      if (summary.uploaded > 0) {
+      } else if (summary.uploaded > 0) {
         void vscode.window.showInformationMessage(`Upload completed (${detail}).`);
       }
     } finally {
       endBusy();
     }
+
+    // Deliberately outside the busy span: the remediation flow blocks on a modal
+    // for as long as the user takes, and isBusy() gates write-target redirection,
+    // not UI. One prompt per distinct host, never one per file.
+    for (const [host, probePath] of blockedUNCHosts) {
+      await offerUNCHostRemediation(host, probePath, this.diagnostics);
+    }
   }
 
   private async collectDroppedLocalUris(dataTransfer: vscode.DataTransfer): Promise<{ localUris: vscode.Uri[]; unsupportedCount: number }> {
     const allUris: vscode.Uri[] = [];
+    let unsupportedCount = 0;
 
     const uriListItem = dataTransfer.get(URI_LIST_MIME);
     if (uriListItem) {
       try {
-        allUris.push(...parseUriList(await uriListItem.asString()));
+        const { uris, malformedCount } = parseUriList(await uriListItem.asString());
+        allUris.push(...uris);
+        unsupportedCount += malformedCount;
       } catch {
-        // Ignore malformed uri-list payloads from external sources.
+        // A payload we cannot even read is one unusable item, not silence.
+        unsupportedCount += 1;
       }
     }
 
-    allUris.push(...this.collectFileUrisFromDataTransfer(dataTransfer));
+    const { uris: fileUris, unusableCount } = this.collectFileUrisFromDataTransfer(dataTransfer);
+    allUris.push(...fileUris);
+    unsupportedCount += unusableCount;
 
     const uniqueLocalUris = new Map<string, vscode.Uri>();
-    let unsupportedCount = 0;
     for (const uri of allUris) {
       if (uri.scheme !== "file") {
         unsupportedCount += 1;
@@ -681,8 +732,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     return { localUris: [...uniqueLocalUris.values()], unsupportedCount };
   }
 
-  private collectFileUrisFromDataTransfer(dataTransfer: vscode.DataTransfer): vscode.Uri[] {
+  private collectFileUrisFromDataTransfer(dataTransfer: vscode.DataTransfer): { uris: vscode.Uri[]; unusableCount: number } {
     const uris: vscode.Uri[] = [];
+    let unusableCount = 0;
     const seenItems = new Set<vscode.DataTransferItem>();
     const addFromItem = (item: vscode.DataTransferItem | undefined): void => {
       if (!item || seenItems.has(item)) {
@@ -692,6 +744,14 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       const file = item.asFile();
       if (file?.uri) {
         uris.push(file.uri);
+        return;
+      }
+      if (file) {
+        // A file item with no `.uri` — the usual shape for drags originating
+        // outside VS Code, where only the in-memory bytes are offered. We do not
+        // upload those (see non-goals), but they must be counted so the drop
+        // reports itself instead of disappearing.
+        unusableCount += 1;
       }
     };
 
@@ -702,41 +762,65 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       });
     }
 
-    return uris;
+    return { uris, unusableCount };
   }
 
-  private async uploadLocalUri(
+  /**
+   * Local-side IO deliberately uses `node:fs` rather than `vscode.workspace.fs`.
+   *
+   * Node is where the platform's real errors live: VS Code's UNC restriction
+   * raises `ERR_UNC_HOST_NOT_ALLOWED` from Node's path validation, and
+   * `workspace.fs` launders that into a `FileSystemError` with code `"Unknown"`
+   * — which is exactly how a hard policy failure used to reach the bare
+   * `catch { skipped += 1 }` below and present as "Upload completed with skips".
+   * Switching does not bypass the restriction (nothing does); it makes the
+   * failure identifiable by `err.code` and explainable to the user. It also
+   * matches the transfer engine, which already uses raw `fs` on the same path.
+   *
+   * The drop path filters to `uri.scheme === "file"` before we get here, so no
+   * virtual filesystem provider was ever served by the old call either.
+   */
+  private async uploadLocalPath(
     serverId: string,
-    localUri: vscode.Uri,
+    localPath: string,
     remoteDest: string,
     progress: vscode.Progress<{ message?: string; increment?: number }>,
     conflictState: { mode: ConflictMode },
     summary: UploadSummary
   ): Promise<void> {
-    let localStat: vscode.FileStat;
+    let localStat: Stats;
     try {
-      localStat = await vscode.workspace.fs.stat(localUri);
-    } catch {
+      // lstat, not stat: native symlink detection without following the link,
+      // preserving the existing skip-symlinks behavior.
+      localStat = await fsp.lstat(localPath);
+    } catch (err: unknown) {
+      this.recordLocalIoFailure(summary, localPath, err, "item");
+      return;
+    }
+
+    if (localStat.isSymbolicLink()) {
       summary.skipped += 1;
+      this.diagnostics?.(`[upload] skipped "${localPath}": symbolic link`);
       return;
     }
 
-    if ((localStat.type & vscode.FileType.SymbolicLink) !== 0) {
-      summary.skipped += 1;
+    if (localStat.isDirectory()) {
+      await this.uploadLocalDirectory(serverId, localPath, remoteDest, progress, conflictState, summary, 0);
       return;
     }
 
-    if ((localStat.type & vscode.FileType.Directory) !== 0) {
-      await this.uploadLocalDirectory(serverId, localUri, remoteDest, progress, conflictState, summary, 0);
+    if (localStat.isFile()) {
+      await this.uploadLocalFile(serverId, localPath, remoteDest, progress, conflictState, summary);
       return;
     }
 
-    await this.uploadLocalFile(serverId, localUri, remoteDest, progress, conflictState, summary);
+    summary.skipped += 1;
+    this.diagnostics?.(`[upload] skipped "${localPath}": not a regular file`);
   }
 
   private async uploadLocalDirectory(
     serverId: string,
-    localUri: vscode.Uri,
+    localPath: string,
     remoteDir: string,
     progress: vscode.Progress<{ message?: string; increment?: number }>,
     conflictState: { mode: ConflictMode },
@@ -748,7 +832,8 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     }
     if (depth > MAX_UPLOAD_DEPTH) {
       summary.skipped += 1;
-      void vscode.window.showWarningMessage(`Skipping "${localUri.fsPath}" because directory nesting exceeds ${MAX_UPLOAD_DEPTH} levels.`);
+      void vscode.window.showWarningMessage(`Skipping "${localPath}" because directory nesting exceeds ${MAX_UPLOAD_DEPTH} levels.`);
+      this.diagnostics?.(`[upload] skipped "${localPath}": nesting exceeds ${MAX_UPLOAD_DEPTH} levels`);
       return;
     }
 
@@ -757,40 +842,46 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return;
     }
 
-    let entries: [string, vscode.FileType][];
+    let entries: Dirent[];
     try {
-      entries = await vscode.workspace.fs.readDirectory(localUri);
-    } catch {
-      summary.skipped += 1;
+      entries = await fsp.readdir(localPath, { withFileTypes: true });
+    } catch (err: unknown) {
+      this.recordLocalIoFailure(summary, localPath, err, "directory");
       return;
     }
 
-    for (const [name, fileType] of entries) {
+    for (const entry of entries) {
       if (summary.canceled) {
         return;
       }
+      const name = entry.name;
       if (!isSafeEntryName(name)) {
         summary.skipped += 1;
-        continue;
-      }
-      if ((fileType & vscode.FileType.SymbolicLink) !== 0) {
-        summary.skipped += 1;
+        this.diagnostics?.(`[upload] skipped "${path.join(localPath, name)}": unsupported characters in name`);
         continue;
       }
 
-      const childLocal = vscode.Uri.joinPath(localUri, name);
+      const childLocal = path.join(localPath, name);
       const childRemote = path.posix.join(remoteDir, name);
-      if ((fileType & vscode.FileType.Directory) !== 0) {
+      if (entry.isSymbolicLink()) {
+        summary.skipped += 1;
+        this.diagnostics?.(`[upload] skipped "${childLocal}": symbolic link`);
+        continue;
+      }
+      if (entry.isDirectory()) {
         await this.uploadLocalDirectory(serverId, childLocal, childRemote, progress, conflictState, summary, depth + 1);
-      } else if ((fileType & vscode.FileType.File) !== 0) {
+      } else if (entry.isFile()) {
         await this.uploadLocalFile(serverId, childLocal, childRemote, progress, conflictState, summary);
+      } else {
+        summary.skipped += 1;
+        this.diagnostics?.(`[upload] skipped "${childLocal}": not a regular file`);
       }
     }
   }
 
   private async uploadLocalFile(
     serverId: string,
-    localUri: vscode.Uri,
+    localPath: string,
     remotePath: string,
     progress: vscode.Progress<{ message?: string; increment?: number }>,
     conflictState: { mode: ConflictMode },
@@ -810,15 +901,58 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
       return;
     }
 
-    progress.report({ message: path.basename(localUri.fsPath) });
+    progress.report({ message: path.basename(localPath) });
     try {
-      await this.sftp.upload(serverId, localUri.fsPath, remotePath);
+      await this.sftp.upload(serverId, localPath, remotePath);
       summary.uploaded += 1;
+      this.diagnostics?.(`[upload] uploaded "${localPath}" -> ${serverId}:${remotePath}`);
     } catch (err: unknown) {
-      summary.skipped += 1;
+      // A failed upload is a failure, not a skip. The old code counted it as
+      // `skipped`, which turned a batch where nothing reached the server into a
+      // warning that read like success.
+      summary.failed += 1;
       const message = err instanceof Error ? err.message : String(err);
-      void vscode.window.showErrorMessage(`Failed to upload "${path.basename(localUri.fsPath)}": ${message}`);
+      this.noteBlockedUNCHost(summary, localPath, err);
+      this.diagnostics?.(`[upload] failed "${localPath}" -> ${serverId}:${remotePath}: ${message}`);
+      void vscode.window.showErrorMessage(`Failed to upload "${path.basename(localPath)}": ${message}`);
     }
+  }
+
+  /**
+   * Records a local `lstat`/`readdir` failure. Nothing here is silent: either the
+   * user gets a per-item error toast, or — for a UNC policy block, which is one
+   * cause affecting a whole subtree — the host is collected so a single
+   * actionable remediation prompt fires once the drop finishes.
+   */
+  private recordLocalIoFailure(
+    summary: UploadSummary,
+    localPath: string,
+    err: unknown,
+    kind: "item" | "directory"
+  ): void {
+    summary.failed += 1;
+    const message = err instanceof Error ? err.message : String(err);
+    if (this.noteBlockedUNCHost(summary, localPath, err)) {
+      this.diagnostics?.(`[upload] blocked "${localPath}": ${message}`);
+      return;
+    }
+    this.diagnostics?.(`[upload] failed to read local ${kind} "${localPath}": ${message}`);
+    void vscode.window.showErrorMessage(`Cannot read local ${kind} "${path.basename(localPath)}": ${message}`);
+  }
+
+  /** Returns true when `err` was VS Code's UNC restriction and the host was recorded. */
+  private noteBlockedUNCHost(summary: UploadSummary, localPath: string, err: unknown): boolean {
+    if (!isUNCAccessError(err)) {
+      return false;
+    }
+    const host = getUNCHost(localPath);
+    if (!host) {
+      return false;
+    }
+    if (!summary.blockedUNCHosts.has(host)) {
+      summary.blockedUNCHosts.set(host, localPath);
+    }
+    return true;
   }
 
   private async ensureRemoteDirectory(serverId: string, remoteDir: string, summary: UploadSummary): Promise<boolean> {

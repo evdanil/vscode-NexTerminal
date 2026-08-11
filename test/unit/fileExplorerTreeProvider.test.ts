@@ -1,5 +1,28 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
+// The drag-drop upload path reads the LOCAL side through node:fs, not
+// vscode.workspace.fs — that is the fix under test (workspace.fs launders
+// ERR_UNC_HOST_NOT_ALLOWED into code "Unknown", which is how a hard policy
+// failure used to reach a bare `catch { skipped += 1 }`).
+const { fsPromisesMock, mockConfigGet, mockConfigUpdate, mockExecuteCommand } = vi.hoisted(() => ({
+  fsPromisesMock: {
+    lstat: vi.fn(),
+    readdir: vi.fn(),
+    stat: vi.fn(),
+    open: vi.fn(),
+    readFile: vi.fn(),
+    writeFile: vi.fn()
+  },
+  mockConfigGet: vi.fn(),
+  mockConfigUpdate: vi.fn(),
+  mockExecuteCommand: vi.fn()
+}));
+
+vi.mock("node:fs", () => ({
+  promises: fsPromisesMock,
+  default: { promises: fsPromisesMock }
+}));
+
 vi.mock("vscode", () => {
   const EventEmitter = vi.fn().mockImplementation(function () {
     const listeners: Array<(e: unknown) => void> = [];
@@ -44,11 +67,18 @@ vi.mock("vscode", () => {
       })),
       parse: vi.fn((value: string) => {
         const parsed = new URL(value);
+        const scheme = parsed.protocol.replace(":", "");
+        const authority = parsed.host;
         return {
-          scheme: parsed.protocol.replace(":", ""),
-          authority: parsed.host,
+          scheme,
+          authority,
           path: parsed.pathname,
-          fsPath: parsed.pathname,
+          // Real VS Code turns an authority-bearing file: URI into the UNC form
+          // (`\\server\share\...` on win32). The mock produces the
+          // forward-slash spelling so the POSIX `path` module used by the test
+          // host parses it the same way — dropping the authority (as this mock
+          // used to) makes the field bug unrepresentable.
+          fsPath: authority && scheme === "file" ? `//${authority}${parsed.pathname}` : parsed.pathname,
           toString: () => value,
         };
       }),
@@ -89,8 +119,15 @@ vi.mock("vscode", () => {
         stat: vi.fn(),
         readDirectory: vi.fn(),
       },
-      getConfiguration: vi.fn(() => ({ get: (_key: string, def: unknown) => def })),
+      getConfiguration: vi.fn(() => ({
+        get: (key: string, def: unknown) => mockConfigGet(key, def),
+        update: (...args: unknown[]) => mockConfigUpdate(...args),
+      })),
     },
+    commands: {
+      executeCommand: (...args: unknown[]) => mockExecuteCommand(...args),
+    },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     EventEmitter,
   };
 });
@@ -98,6 +135,7 @@ vi.mock("vscode", () => {
 import { FileExplorerTreeProvider, FileExplorerServerItem, FileTreeItem, ParentDirItem } from "../../src/ui/fileExplorerTreeProvider";
 import type { DirectoryEntry } from "../../src/services/sftp/sftpService";
 import type { ServerConfig } from "../../src/models/config";
+import { isSafeEntryName } from "../../src/utils/pathSafety";
 import { createMockSftpService } from "../helpers/mockSftpService";
 
 const testServer: ServerConfig = {
@@ -132,6 +170,28 @@ function missingRemoteError(message = "No such file"): Error & { code: number } 
   return Object.assign(new Error(message), { code: 2 });
 }
 
+type LocalKind = "file" | "directory" | "symlink" | "other";
+
+/** node:fs Stats double — only the three type predicates the provider consults. */
+function localStat(kind: LocalKind) {
+  return {
+    isSymbolicLink: () => kind === "symlink",
+    isDirectory: () => kind === "directory",
+    isFile: () => kind === "file",
+  };
+}
+
+/** node:fs Dirent double for `readdir(path, { withFileTypes: true })`. */
+function dirent(name: string, kind: LocalKind) {
+  return { name, ...localStat(kind) };
+}
+
+function uncAccessError(host = "192.168.2.10"): Error & { code: string } {
+  return Object.assign(new Error(`UNC host '${host}' access is not allowed`), {
+    code: "ERR_UNC_HOST_NOT_ALLOWED",
+  });
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -145,10 +205,16 @@ function createDeferred<T>() {
 describe("FileExplorerTreeProvider", () => {
   let sftp: ReturnType<typeof createMockSftpService>;
   let provider: FileExplorerTreeProvider;
+  let diagnostics: ReturnType<typeof vi.fn>;
+
+  const diagnosticsText = (): string => diagnostics.mock.calls.map((args) => String(args[0])).join("\n");
+  const shownMessages = (spy: unknown): string[] =>
+    (spy as { mock: { calls: unknown[][] } }).mock.calls.map((args) => String(args[0]));
 
   beforeEach(async () => {
     sftp = createMockSftpService();
-    provider = new FileExplorerTreeProvider(sftp);
+    diagnostics = vi.fn();
+    provider = new FileExplorerTreeProvider(sftp, diagnostics);
     const vscode = await import("vscode");
     (vscode.window.showQuickPick as any).mockReset();
     (vscode.window.showErrorMessage as any).mockReset();
@@ -158,6 +224,15 @@ describe("FileExplorerTreeProvider", () => {
     (vscode.window.withProgress as any).mockImplementation(async (_opts: unknown, task: any) => task({ report: vi.fn() }));
     (vscode.workspace.fs.stat as any).mockReset();
     (vscode.workspace.fs.readDirectory as any).mockReset();
+    fsPromisesMock.lstat.mockReset();
+    fsPromisesMock.readdir.mockReset();
+    fsPromisesMock.stat.mockReset();
+    fsPromisesMock.stat.mockRejectedValue(uncAccessError());
+    mockConfigGet.mockReset();
+    mockConfigGet.mockImplementation((_key: string, def: unknown) => def);
+    mockConfigUpdate.mockReset();
+    mockConfigUpdate.mockResolvedValue(undefined);
+    mockExecuteCommand.mockReset();
   });
 
   it("returns empty children when no active server", async () => {
@@ -883,9 +958,8 @@ describe("FileExplorerTreeProvider", () => {
     });
 
     it("handleDrop uploads local file from text/uri-list", async () => {
-      const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
-      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      fsPromisesMock.lstat.mockResolvedValue(localStat("file"));
       (sftp.stat as any).mockRejectedValue(missingRemoteError());
       (sftp.upload as any).mockResolvedValue(undefined);
 
@@ -909,12 +983,9 @@ describe("FileExplorerTreeProvider", () => {
     });
 
     it("handleDrop uploads dropped local directory recursively", async () => {
-      const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
-      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.Directory });
-      (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
-        ["nested.txt", vscode.FileType.File],
-      ]);
+      fsPromisesMock.lstat.mockResolvedValue(localStat("directory"));
+      fsPromisesMock.readdir.mockResolvedValue([dirent("nested.txt", "file")]);
       (sftp.stat as any).mockRejectedValue(missingRemoteError());
       (sftp.createDirectory as any).mockResolvedValue(undefined);
       (sftp.upload as any).mockResolvedValue(undefined);
@@ -942,10 +1013,8 @@ describe("FileExplorerTreeProvider", () => {
     it("handleDrop enforces max upload depth for local directories", async () => {
       const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
-      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.Directory });
-      (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
-        ["nested", vscode.FileType.Directory],
-      ]);
+      fsPromisesMock.lstat.mockResolvedValue(localStat("directory"));
+      fsPromisesMock.readdir.mockResolvedValue([dirent("nested", "directory")]);
       (sftp.stat as any).mockRejectedValue(missingRemoteError());
       (sftp.createDirectory as any).mockResolvedValue(undefined);
 
@@ -970,11 +1039,8 @@ describe("FileExplorerTreeProvider", () => {
     it("handleDrop supports skip-all conflict decision", async () => {
       const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
-      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.Directory });
-      (vscode.workspace.fs.readDirectory as any).mockResolvedValue([
-        ["one.txt", vscode.FileType.File],
-        ["two.txt", vscode.FileType.File],
-      ]);
+      fsPromisesMock.lstat.mockResolvedValue(localStat("directory"));
+      fsPromisesMock.readdir.mockResolvedValue([dirent("one.txt", "file"), dirent("two.txt", "file")]);
       (sftp.createDirectory as any).mockResolvedValue(undefined);
       (sftp.stat as any).mockImplementation(async (_serverId: string, remotePath: string) => {
         if (remotePath.endsWith("/mydir")) {
@@ -1025,7 +1091,7 @@ describe("FileExplorerTreeProvider", () => {
     it("handleDrop skips uploads when remote destination checks fail", async () => {
       const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
-      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      fsPromisesMock.lstat.mockResolvedValue(localStat("file"));
       (sftp.stat as any).mockRejectedValue(new Error("permission denied"));
 
       const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
@@ -1064,6 +1130,169 @@ describe("FileExplorerTreeProvider", () => {
     });
   });
 
+  describe("external drop: honest reporting and UNC sources (S1)", () => {
+    async function dropUriList(payload: string): Promise<void> {
+      const { DataTransferItem } = await import("vscode");
+      const uriListItem = new DataTransferItem(payload);
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      await provider.handleDrop(targetDir, {
+        get: (mime: string) => (mime === "text/uri-list" ? uriListItem : undefined),
+      } as any);
+    }
+
+    it("T19 — a UNC-sourced drop is actually uploaded (the S1 regression test)", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      // Any implementation still consulting workspace.fs stays red: this is the
+      // laundered error VS Code hands extensions for a blocked UNC host.
+      (vscode.workspace.fs.stat as any).mockRejectedValue(
+        Object.assign(new Error("UNC host 'fileserver' access is not allowed"), { code: "Unknown" })
+      );
+      fsPromisesMock.lstat.mockResolvedValue(localStat("file"));
+      (sftp.tryStat as any).mockResolvedValue(undefined);
+      (sftp.upload as any).mockResolvedValue(undefined);
+
+      await dropUriList("file://fileserver/share/file.txt");
+
+      expect(sftp.upload).toHaveBeenCalledWith("srv-1", "//fileserver/share/file.txt", "/home/dev/subdir/file.txt");
+      expect(shownMessages(vscode.window.showInformationMessage).join("\n")).toContain("uploaded 1");
+      expect(vscode.window.showErrorMessage).not.toHaveBeenCalled();
+    });
+
+    it("T20 — a UNC basename resolves to the entry name alone and passes the safety guard", async () => {
+      const nodePath = await import("node:path");
+      // Documents D8: the host's platform-default basename IS win32 on Windows,
+      // so a UNC path was never the rejection site. Forcing path.win32 globally
+      // would mis-split legitimate backslash-bearing names on Linux hosts.
+      expect(nodePath.win32.basename("\\\\server\\share\\file.txt")).toBe("file.txt");
+      expect(isSafeEntryName(nodePath.win32.basename("\\\\server\\share\\file.txt"))).toBe(true);
+    });
+
+    it("T21 — a blocked UNC source produces the actionable message, not a silent skip", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockRejectedValue(uncAccessError("192.168.2.10"));
+
+      await dropUriList("file://192.168.2.10/share/file.txt");
+
+      const errors = shownMessages(vscode.window.showErrorMessage);
+      expect(errors.join("\n")).toContain("failed 1");
+      expect(errors.join("\n")).toContain('VS Code blocked access to network host "192.168.2.10"');
+      // The security setting is NEVER written without the modal consent, which
+      // was not given here (the toast mock resolves undefined = dismissed).
+      expect(mockConfigUpdate).not.toHaveBeenCalled();
+      expect(diagnosticsText()).toContain("192.168.2.10");
+      expect(sftp.upload).not.toHaveBeenCalled();
+    });
+
+    it("T22 — a drop whose file items carry no URI is never a silent no-op", async () => {
+      const vscode = await import("vscode");
+      const { DataTransferItem } = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+
+      // The usual shape for drags originating outside VS Code.
+      const filesItem = new DataTransferItem("", { uri: undefined });
+      const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
+      await provider.handleDrop(targetDir, {
+        get: (mime: string) => (mime === "files" ? filesItem : undefined),
+      } as any);
+
+      expect(shownMessages(vscode.window.showWarningMessage).join("\n")).toContain(
+        "did not include usable local file paths"
+      );
+      expect(sftp.upload).not.toHaveBeenCalled();
+    });
+
+    it("T23 — an unreadable local item is reported, not silently skipped", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockRejectedValue(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+
+      await dropUriList("file:///tmp/locked.txt");
+
+      const errors = shownMessages(vscode.window.showErrorMessage);
+      expect(errors.join("\n")).toContain('Cannot read local item "locked.txt"');
+      expect(errors.join("\n")).toContain("failed 1");
+      expect(sftp.upload).not.toHaveBeenCalled();
+    });
+
+    it("T24 — an unreadable local directory is reported, not silently skipped", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockResolvedValue(localStat("directory"));
+      fsPromisesMock.readdir.mockRejectedValue(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+      (sftp.tryStat as any).mockResolvedValue(undefined);
+      (sftp.createDirectory as any).mockResolvedValue(undefined);
+
+      await dropUriList("file:///tmp/locked");
+
+      const errors = shownMessages(vscode.window.showErrorMessage);
+      expect(errors.join("\n")).toContain('Cannot read local directory "locked"');
+      expect(errors.join("\n")).toContain("failed 1");
+    });
+
+    it("T25 — a failed upload counts as failed and the summary is an error, not a 'completed with skips' warning", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockResolvedValue(localStat("file"));
+      (sftp.tryStat as any).mockResolvedValue(undefined);
+      (sftp.upload as any).mockRejectedValue(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+
+      await dropUriList("file:///tmp/local.txt");
+
+      const errors = shownMessages(vscode.window.showErrorMessage);
+      expect(errors.join("\n")).toContain('Failed to upload "local.txt"');
+      expect(errors.join("\n")).toContain("uploaded 0");
+      expect(errors.join("\n")).toContain("failed 1");
+      // The old code counted this as `skipped` and showed a warning that read
+      // like a partial success.
+      expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("T26 — a malformed uri-list payload is counted and reported", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+
+      await dropUriList("::not a uri::");
+
+      expect(shownMessages(vscode.window.showWarningMessage).join("\n")).toContain(
+        "did not include usable local file paths"
+      );
+      expect(sftp.upload).not.toHaveBeenCalled();
+    });
+
+    it("T27 — a skipped symlink is logged with its reason and counted", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+      fsPromisesMock.lstat.mockResolvedValue(localStat("directory"));
+      fsPromisesMock.readdir.mockResolvedValue([dirent("link", "symlink"), dirent("real.txt", "file")]);
+      (sftp.tryStat as any).mockResolvedValue(undefined);
+      (sftp.createDirectory as any).mockResolvedValue(undefined);
+      (sftp.upload as any).mockResolvedValue(undefined);
+
+      await dropUriList("file:///tmp/mydir");
+
+      expect(diagnosticsText()).toContain("/tmp/mydir/link");
+      expect(diagnosticsText()).toContain("symbolic link");
+      expect(shownMessages(vscode.window.showWarningMessage).join("\n")).toContain("skipped 1");
+      expect(sftp.upload).toHaveBeenCalledWith("srv-1", "/tmp/mydir/real.txt", "/home/dev/subdir/mydir/real.txt");
+    });
+
+    it("a dropped path with no usable entry name is skipped with a warning, not silently", async () => {
+      const vscode = await import("vscode");
+      provider.setActiveServer(testServer, "/home/dev");
+
+      // basename("/") === "" — isSafeEntryName rejects it; the old code took
+      // this branch with no message at all.
+      await dropUriList("file:///");
+
+      expect(shownMessages(vscode.window.showWarningMessage).join("\n")).toContain(
+        "name contains unsupported characters"
+      );
+      expect(sftp.upload).not.toHaveBeenCalled();
+    });
+  });
+
   describe("isBusy / beginBusy (§5.1, §7.4)", () => {
     it("is false with no active requests or uploads", () => {
       expect(provider.isBusy()).toBe(false);
@@ -1092,9 +1321,8 @@ describe("FileExplorerTreeProvider", () => {
     });
 
     it("is true during an in-flight external-drop upload and false after it completes", async () => {
-      const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
-      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      fsPromisesMock.lstat.mockResolvedValue(localStat("file"));
       (sftp.stat as any).mockRejectedValue(missingRemoteError());
       const deferred = createDeferred<void>();
       (sftp.upload as any).mockImplementation(() => deferred.promise);
@@ -1118,7 +1346,7 @@ describe("FileExplorerTreeProvider", () => {
     it("releases the busy span even when the external-drop upload throws", async () => {
       const vscode = await import("vscode");
       provider.setActiveServer(testServer, "/home/dev");
-      (vscode.workspace.fs.stat as any).mockResolvedValue({ type: vscode.FileType.File });
+      fsPromisesMock.lstat.mockResolvedValue(localStat("file"));
       (vscode.window.withProgress as any).mockRejectedValueOnce(new Error("boom"));
 
       const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);

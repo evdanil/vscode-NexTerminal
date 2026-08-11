@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { SftpService } from "../../src/services/sftp/sftpService";
 import { buildSudoInstallCommand, buildTempStagePath } from "../../src/services/sftp/elevatedWrite";
@@ -22,8 +23,11 @@ const testServer: ServerConfig = {
 
 // No `chmod` entry here: the elevated write path sets the temp file's mode at
 // SSH_FXP_OPEN time via createWriteStream's `mode` option, not a separate chmod call.
+// Composed over a real EventEmitter: SftpService attaches 'error'/'close'
+// listeners to the SFTP channel so a fatal protocol error is contained instead
+// of throwing through ssh2's socket-data stack.
 function createMockSftp() {
-  return {
+  return Object.assign(new EventEmitter(), {
     readdir: vi.fn(),
     stat: vi.fn(),
     lstat: vi.fn(),
@@ -37,7 +41,7 @@ function createMockSftp() {
     fastGet: vi.fn(),
     fastPut: vi.fn(),
     end: vi.fn(),
-  };
+  });
 }
 
 function createMockConnection(sftp: ReturnType<typeof createMockSftp>): SshConnection {

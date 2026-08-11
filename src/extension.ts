@@ -355,8 +355,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // is populated. Does not block activation.
   void maybeWarnMacroKeybindingsBlocked(context);
 
+  // Post-ready SSH client errors, connection closes, SFTP channel faults, UNC
+  // blocks and per-transfer byte counts all land here. Always on and free — an
+  // output channel is inert until someone opens it — because the failure modes
+  // this fixes (a keepalive timeout dropping every tab, a transfer that moved
+  // zero bytes) were previously undiagnosable from the field. Follows the
+  // per-feature channel naming used by "Nexus Scripts" / "Nexus Local Shell" /
+  // "Nexus Directory Sync".
+  const sshDiagnosticsChannel = vscode.window.createOutputChannel("Nexus SSH");
+  context.subscriptions.push(sshDiagnosticsChannel);
+  const sshDiagnostics = (line: string): void => {
+    sshDiagnosticsChannel.appendLine(`${new Date().toISOString()} ${line}`);
+  };
+
   const hostKeyVerifier = new VscodeHostKeyVerifier(context.globalState);
-  const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions());
+  const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions(), sshDiagnostics);
   const sshFactory = new SilentAuthSshFactory(
     sshConnector,
     secretVault,
@@ -615,7 +628,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
-  const sftpService = new SftpService(pool, readSftpServiceConfig());
+  const sftpService = new SftpService(pool, readSftpServiceConfig(), sshDiagnostics);
   const elevationBroker = new SudoElevationBroker(sftpService, (id) => core.getServer(id));
   const fileSystemProvider = new NexusFileSystemProvider(sftpService, elevationBroker);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
@@ -634,7 +647,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 
   // Keep nexterm:// labels in POSIX style on Windows.
   tryRegisterResourceLabelFormatter(vscode.workspace, NEXTERM_SCHEME);
-  const fileExplorerProvider = new FileExplorerTreeProvider(sftpService);
+  const fileExplorerProvider = new FileExplorerTreeProvider(sftpService, sshDiagnostics);
   const defaultSessionLogDir = path.join(context.globalStorageUri.fsPath, "session-logs");
 
   const ctx: CommandContext = {
@@ -667,7 +680,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     localShellOutputChannel,
     globalStoragePath,
     extensionPath: context.extensionPath,
-    globalState: context.globalState
+    globalState: context.globalState,
+    sshDiagnostics
   };
   const terminalRegistry = new TerminalRegistry(core);
   context.subscriptions.push(terminalRegistry);

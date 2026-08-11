@@ -1,10 +1,12 @@
 import * as path from "node:path";
+import { promises as fsp } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { SFTPWrapper, FileEntry, Stats, TransferOptions } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { clamp } from "../../utils/helpers";
 import { shellEscape } from "../../utils/shellEscape";
 import { isSafeEntryName, joinRemoteEntryPath } from "../../utils/pathSafety";
+import { resolveTransferTuning } from "../../utils/networkPath";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { RemoteDirectoryWatcher, type RemoteChangeEvent, type WatchMode } from "./remoteDirectoryWatcher";
 import {
@@ -135,6 +137,10 @@ function parentDir(remotePath: string): string {
   return path.posix.dirname(remotePath);
 }
 
+function formatSeconds(elapsedMs: number): string {
+  return (elapsedMs / 1000).toFixed(1);
+}
+
 function toBufferChunk(chunk: Buffer | string): Buffer {
   return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 }
@@ -172,7 +178,11 @@ export class SftpService {
   private maxDeleteDepth: number;
   private maxDeleteOps: number;
 
-  public constructor(private readonly sshFactory: SshFactory, config?: SftpServiceConfig) {
+  public constructor(
+    private readonly sshFactory: SshFactory,
+    config?: SftpServiceConfig,
+    private readonly diagnostics?: (line: string) => void
+  ) {
     this.cacheTtlMs = normalizeConfigValue(config?.cacheTtlMs, DEFAULT_CACHE_TTL_MS, 0, 300_000);
     this.maxCacheEntries = normalizeConfigValue(config?.maxCacheEntries, DEFAULT_MAX_CACHE_ENTRIES, 10, 5_000);
     this.commandTimeoutMs = normalizeConfigValue(config?.commandTimeoutMs, DEFAULT_COMMAND_TIMEOUT_MS, 10_000, 3_600_000);
@@ -217,9 +227,7 @@ export class SftpService {
     if (!session) {
       return;
     }
-    session.sftp.end();
-    session.connection.dispose();
-    this.cleanupSession(serverId);
+    this.teardownSession(serverId, session, "disconnect requested");
   }
 
   public isConnected(serverId: string): boolean {
@@ -637,19 +645,157 @@ export class SftpService {
     this.invalidateCache(serverId, parentDir(destPath));
   }
 
+  /**
+   * Downloads `remotePath` into `localPath`.
+   *
+   * The local destination is opened HERE, on our own stack, before any remote
+   * work happens. That is the fix for the "a download to a blocked path kills
+   * every terminal" failure: ssh2's `fastGet` opens the destination from inside
+   * the remote `open`/`fstat` callback chain, which runs on the `net.Socket`
+   * 'data' stack, so a synchronous throw from Node's path validation there (VS
+   * Code's UNC restriction raises `ERR_UNC_HOST_NOT_ALLOWED` exactly that way)
+   * unwinds the ssh2 protocol parser and destroys the `ssh2.Client` that every
+   * terminal tab multiplexes onto. Doing the same `'w'` open first turns that
+   * class of fault into an ordinary rejection with its real `err.code` intact,
+   * before a single remote packet is sent. Semantics are unchanged: `fastGet`
+   * would create/truncate the destination with the same flags anyway.
+   *
+   * Errors from the pre-flight propagate UNWRAPPED — callers match on
+   * `err.code` (see `isUNCAccessError`), never on message text.
+   */
   public async download(serverId: string, remotePath: string, localPath: string): Promise<void> {
     const session = this.getSession(serverId);
-    return this.runTransferWithIdleTimeout(serverId, session, "download", (options, callback) => {
-      session.sftp.fastGet(remotePath, localPath, options, callback);
-    });
+    const startedAt = Date.now();
+
+    const handle = await fsp.open(localPath, "w");
+    await handle.close();
+
+    try {
+      const remoteEntry = await this.stat(serverId, remotePath);
+      let expectedBytes: number;
+      if (remoteEntry.size === 0) {
+        // A remote stat of 0 is not trustworthy (procfs, sysfs, some appliances
+        // report 0 for readable files), and ssh2's size-planned path treats
+        // `fsize <= 0` as "done" and calls back with NO error — a green toast
+        // over an empty file. Read to EOF instead and transfer what is actually
+        // there; a genuinely empty file still round-trips as an empty file.
+        const content = await this.readFileWithTimeout(
+          undefined,
+          this.commandTimeoutMs,
+          () => session.sftp.createReadStream(remotePath) as NodeJS.ReadableStream & { destroy(error?: Error): void }
+        );
+        expectedBytes = content.length;
+        await fsp.writeFile(localPath, content);
+      } else {
+        expectedBytes = remoteEntry.size;
+        await this.runTransferWithIdleTimeout(serverId, session, "download", (options, callback) => {
+          session.sftp.fastGet(
+            remotePath,
+            localPath,
+            { ...options, ...resolveTransferTuning(localPath), fileSize: remoteEntry.size },
+            callback
+          );
+        });
+      }
+      await this.verifyTransferredSize("download", localPath, expectedBytes, async () => (await fsp.stat(localPath)).size);
+      this.diagnostics?.(
+        `[sftp] download ${serverId}:${remotePath} -> ${localPath}: ${expectedBytes} bytes OK (${formatSeconds(Date.now() - startedAt)}s)`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.diagnostics?.(`[sftp] download ${serverId}:${remotePath} -> ${localPath} FAILED: ${message}`);
+      throw error;
+    }
   }
 
+  /**
+   * Uploads `localPath` to `remotePath`.
+   *
+   * The pre-stat doubles as the local-side pre-flight (UNC policy, permissions,
+   * existence all fail here, on our stack, with the true `err.code`) and as the
+   * size ssh2 plans the transfer with — passing it explicitly makes ssh2's
+   * `fsize <= 0` "success with no bytes moved" branch structurally unreachable.
+   *
+   * Known unchanged ssh2 edge: a source file that SHRINKS mid-transfer can spin
+   * fastXfer's short-read loop until the idle timeout fires. That is pre-existing
+   * behavior; passing `fileSize` does not widen the exposure (ssh2 would have
+   * fstat'd the same size itself).
+   */
   public async upload(serverId: string, localPath: string, remotePath: string): Promise<void> {
     const session = this.getSession(serverId);
-    await this.runTransferWithIdleTimeout(serverId, session, "upload", (options, callback) => {
-      session.sftp.fastPut(localPath, remotePath, options, callback);
-    });
-    this.invalidateCache(serverId, parentDir(remotePath));
+    const startedAt = Date.now();
+
+    const localSize = (await fsp.stat(localPath)).size;
+
+    try {
+      let expectedBytes: number;
+      if (localSize === 0) {
+        // See download(): a claimed-zero source is read to EOF rather than
+        // size-planned, so a lying stat transfers the real bytes instead of
+        // producing a truthful-looking empty upload.
+        const content = await fsp.readFile(localPath);
+        expectedBytes = content.length;
+        await this.writeFileWithTimeout(
+          this.commandTimeoutMs,
+          content,
+          () => session.sftp.createWriteStream(remotePath) as NodeJS.WritableStream & {
+            destroy(error?: Error): void;
+            end(chunk: Buffer): void;
+          }
+        );
+      } else {
+        expectedBytes = localSize;
+        await this.runTransferWithIdleTimeout(serverId, session, "upload", (options, callback) => {
+          session.sftp.fastPut(
+            localPath,
+            remotePath,
+            { ...options, ...resolveTransferTuning(localPath), fileSize: localSize },
+            callback
+          );
+        });
+      }
+      await this.verifyTransferredSize("upload", remotePath, expectedBytes, async () =>
+        (await this.stat(serverId, remotePath)).size
+      );
+      this.diagnostics?.(
+        `[sftp] upload ${localPath} -> ${serverId}:${remotePath}: ${expectedBytes} bytes OK (${formatSeconds(Date.now() - startedAt)}s)`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.diagnostics?.(`[sftp] upload ${localPath} -> ${serverId}:${remotePath} FAILED: ${message}`);
+      throw error;
+    } finally {
+      // A failed or partial upload has still mutated the remote directory, so
+      // the listing cache is stale either way.
+      this.invalidateCache(serverId, parentDir(remotePath));
+    }
+  }
+
+  /**
+   * Post-transfer size check. SIZE ONLY — this catches truncation and the
+   * zero-byte "success" that ssh2 could previously report, not corruption. The
+   * baseline is the exact byte count the transfer was planned with, so a
+   * mismatch means the destination does not hold what we sent.
+   */
+  private async verifyTransferredSize(
+    label: "upload" | "download",
+    targetPath: string,
+    expectedBytes: number,
+    readActualSize: () => Promise<number>
+  ): Promise<void> {
+    let actualBytes: number;
+    try {
+      actualBytes = await readActualSize();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`SFTP ${label} completed but verification failed: ${message}`);
+    }
+    if (actualBytes !== expectedBytes) {
+      const side = label === "upload" ? "remote" : "local";
+      throw new Error(
+        `SFTP ${label} verification failed for "${targetPath}": expected ${expectedBytes} bytes, ${side} reports ${actualBytes}`
+      );
+    }
   }
 
   public invalidateCache(serverId: string, remotePath?: string): void {
@@ -739,7 +885,21 @@ export class SftpService {
       connection.dispose();
       throw error;
     }
-    this.sessions.set(server.id, { connection, sftp });
+    const session: SftpSession = { connection, sftp };
+    this.sessions.set(server.id, session);
+    // Without these two listeners a fatal SFTP protocol error (ssh2's
+    // `doFatalSFTPError`) reaches an unlistened EventEmitter, so Node throws
+    // ERR_UNHANDLED_ERROR *synchronously inside* the SFTP packet handler — which
+    // runs on the ssh2 CHANNEL_DATA / `net.Socket` 'data' stack. That exception
+    // unwinds the protocol parser and tears down the shared `ssh2.Client`, i.e.
+    // every terminal tab multiplexed onto this server drops at once. Listening
+    // turns the same fault into a contained session teardown.
+    sftp.on("error", (error: Error) => {
+      this.teardownSession(server.id, session, `SFTP channel error: ${error.message}`);
+    });
+    sftp.on("close", () => {
+      this.teardownSession(server.id, session, "SFTP channel closed");
+    });
     const unsub = connection.onClose(() => {
       this.cleanupSession(server.id);
     });
@@ -831,20 +991,45 @@ export class SftpService {
   }
 
   private abortTimedOutTransfer(serverId: string, session: SftpSession): void {
+    this.teardownSession(serverId, session, "transfer idle timeout");
+  }
+
+  /**
+   * The single teardown path for an SFTP session — reached from `disconnect()`,
+   * from a stalled-transfer abort, and from the `'error'`/`'close'` listeners on
+   * the SFTP channel (C1).
+   *
+   * Idempotent by session identity: `sftp.end()` makes ssh2 emit `'close'`, which
+   * re-enters here, and a re-entrant `connection.dispose()` would release a pool
+   * lease we no longer hold. The mapping is therefore dropped BEFORE `end()` so
+   * the identity guard short-circuits the re-entry.
+   *
+   * `connection.dispose()` is a refcount decrement under multiplexing
+   * (`sshConnectionPool.ts`), so this releases only the SFTP lease — terminals
+   * leasing the same `ssh2.Client` are unaffected. Operators who want hard
+   * isolation for transfers already have per-server `multiplexing: false` (or the
+   * global `nexus.ssh.multiplexing.enabled`); no separate transfer connection is
+   * opened here, because that would cost a full auth round-trip (a second MFA
+   * push) per transfer session.
+   */
+  private teardownSession(serverId: string, session: SftpSession, reason: string): void {
     if (this.sessions.get(serverId) !== session) {
       return;
     }
+    this.cleanupSession(serverId);
     try {
       session.sftp.end();
     } catch {
-      // Ignore teardown errors; the timeout is already terminal for this session.
+      // Ignore teardown errors; the session state is already cleared above.
     }
     try {
       session.connection.dispose();
     } catch {
-      // Ignore teardown errors; cleanup below still clears local session state.
+      // Ignore teardown errors; the session state is already cleared above.
     }
-    this.cleanupSession(serverId);
+    this.diagnostics?.(
+      `[sftp] ${serverId}: ${reason} — SFTP session closed; terminal sessions are not affected`
+    );
   }
 
   private cleanupSession(serverId: string): void {

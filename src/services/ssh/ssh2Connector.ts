@@ -51,13 +51,23 @@ class Ssh2Connection implements SshConnection {
   private banner?: string;
   private closed = false;
 
-  public constructor(private readonly client: Client, banner?: string) {
+  public constructor(
+    private readonly client: Client,
+    banner?: string,
+    private readonly label?: string,
+    private readonly diagnostics?: (line: string) => void
+  ) {
     this.banner = banner;
     const emitClose = (): void => {
       if (this.closed) {
         return;
       }
       this.closed = true;
+      // Logged once (the `closed` latch covers ssh2 emitting both 'close' and
+      // 'end'): a connection drop is the visible half of every "all my terminals
+      // just disconnected" report, and the matching cause line — a keepalive
+      // timeout, a protocol error — is written by the connector's error handler.
+      this.diagnostics?.(`[ssh] ${this.label ?? "connection"}: connection closed`);
       for (const listener of this.closeListeners) {
         listener();
       }
@@ -244,7 +254,8 @@ export class Ssh2Connector implements SshConnector {
 
   public constructor(
     private readonly hostKeyVerifier?: HostKeyVerifier,
-    connectionOptions?: SshConnectionOptions
+    connectionOptions?: SshConnectionOptions,
+    private readonly diagnostics?: (line: string) => void
   ) {
     this.connectionOptions = normalizeConnectionOptions(connectionOptions);
   }
@@ -321,15 +332,28 @@ export class Ssh2Connector implements SshConnector {
         }
         finish([]);
       });
+      const label = `${server.name} (${server.host})`;
       client.on("ready", () => {
         settled = true;
-        resolve(new Ssh2Connection(client, banner));
+        resolve(new Ssh2Connection(client, banner, label, this.diagnostics));
       });
       client.on("error", (error: Error) => {
         if (!settled) {
+          // Pre-ready errors are the caller's to handle and MUST stay a plain
+          // rejection — the connect flow (auth retry, host-key prompts) reads
+          // them. Nothing is logged here on purpose.
           reject(error);
           return;
         }
+        // Post-ready these used to be dropped on the floor, which is why a
+        // keepalive timeout (30s of silence -> sock.destroy()) or a protocol
+        // error surfaced to the user as nothing but "Connection lost" on every
+        // tab, with no way to learn the cause. ssh2 tags them via `err.level`
+        // ("client-timeout", "protocol", ...).
+        const level = (error as { level?: string }).level;
+        this.diagnostics?.(
+          `[ssh] ${label}: post-ready client error: ${error.message}${level ? ` (level: ${level})` : ""}`
+        );
       });
       client.connect(config);
     });

@@ -7,6 +7,8 @@ import { ServerTreeItem } from "../ui/nexusTreeProvider";
 import { FileTreeItem } from "../ui/fileExplorerTreeProvider";
 import { type ConflictMode, type ConflictDecision, resolveConflict } from "../ui/conflictResolution";
 import { isSafeEntryName, joinRemoteEntryPath } from "../utils/pathSafety";
+import { getUNCHost, isUNCAccessError } from "../utils/networkPath";
+import { offerUNCHostRemediation } from "../ui/uncRemediation";
 import { naturalCompare } from "../utils/naturalCompare";
 import type { CommandContext } from "./types";
 
@@ -114,6 +116,14 @@ function resolveSelectedItems(arg: unknown, allSelected: unknown): FileTreeItem[
   return [];
 }
 
+/**
+ * Hosts VS Code's UNC restriction blocked during one operation, mapped to a
+ * representative blocked path per host (the remediation flow re-probes it).
+ * Collected rather than toasted per item: one cause affecting a 200-file
+ * directory transfer must produce one actionable message, not 200.
+ */
+type BlockedUNCHosts = Map<string, string>;
+
 interface DownloadSummary {
   downloaded: number;
   skipped: number;
@@ -121,6 +131,7 @@ interface DownloadSummary {
   failed: number;
   canceled: boolean;
   canceledCount: number;
+  blockedUNCHosts: BlockedUNCHosts;
 }
 
 interface UploadSummary {
@@ -129,6 +140,41 @@ interface UploadSummary {
   conflicts: number;
   failed: number;
   canceled: number;
+  blockedUNCHosts: BlockedUNCHosts;
+}
+
+/**
+ * Reports a local-side transfer failure. A UNC policy block is recorded for the
+ * one deferred remediation prompt instead of producing a generic "Failed to
+ * download …" toast that tells the user nothing about the actual cause; any
+ * other error keeps the generic per-item message.
+ */
+function reportTransferFailure(
+  blockedUNCHosts: BlockedUNCHosts,
+  localPath: string,
+  error: unknown,
+  buildMessage: (message: string) => string
+): void {
+  if (isUNCAccessError(error)) {
+    const host = getUNCHost(localPath);
+    if (host) {
+      if (!blockedUNCHosts.has(host)) {
+        blockedUNCHosts.set(host, localPath);
+      }
+      return;
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  void vscode.window.showErrorMessage(buildMessage(message));
+}
+
+async function offerCollectedUNCRemediation(
+  blockedUNCHosts: BlockedUNCHosts,
+  diagnostics?: (line: string) => void
+): Promise<void> {
+  for (const [host, probePath] of blockedUNCHosts) {
+    await offerUNCHostRemediation(host, probePath, diagnostics);
+  }
 }
 
 interface DownloadItem {
@@ -287,8 +333,12 @@ async function downloadItemToLocal(
       summary.downloaded += 1;
     } catch (error) {
       summary.failed += 1;
-      const message = error instanceof Error ? error.message : String(error);
-      void vscode.window.showErrorMessage(`Failed to download "${path.basename(localUri.fsPath)}": ${message}`);
+      reportTransferFailure(
+        summary.blockedUNCHosts,
+        localUri.fsPath,
+        error,
+        (message) => `Failed to download "${path.basename(localUri.fsPath)}": ${message}`
+      );
     }
   }
 }
@@ -363,8 +413,12 @@ async function downloadDirectoryToLocal(
         summary.downloaded += 1;
       } catch (error) {
         summary.failed += 1;
-        const message = error instanceof Error ? error.message : String(error);
-        void vscode.window.showErrorMessage(`Failed to download "${entry.name}": ${message}`);
+        reportTransferFailure(
+          summary.blockedUNCHosts,
+          childLocal.fsPath,
+          error,
+          (message) => `Failed to download "${entry.name}": ${message}`
+        );
       }
     }
   }
@@ -522,7 +576,8 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       skipped: 0,
       conflicts: 0,
       failed: 0,
-      canceled: 0
+      canceled: 0,
+      blockedUNCHosts: new Map()
     };
 
     // This command uploads directly via ctx.sftpService rather than through the
@@ -540,7 +595,17 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
             if (summary.canceled > 0) {
               break;
             }
+            // Platform-default basename by design (see the drag-drop path): on
+            // Windows the default IS win32, so a UNC source yields a clean
+            // "file.txt". The guard the drag-drop path has always had was
+            // missing here, so a backslash-bearing name could be posix-joined
+            // straight into the remote path.
             const fileName = path.basename(file.fsPath);
+            if (!isSafeEntryName(fileName)) {
+              summary.failed += 1;
+              vscode.window.showErrorMessage(`Cannot upload "${fileName}": name contains unsupported characters.`);
+              continue;
+            }
             progress.report({ message: fileName });
             const remoteDest = path.posix.join(target.dirPath, fileName);
 
@@ -571,8 +636,12 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
               summary.uploaded += 1;
             } catch (error) {
               summary.failed += 1;
-              const message = error instanceof Error ? error.message : String(error);
-              vscode.window.showErrorMessage(`Failed to upload "${fileName}": ${message}`);
+              reportTransferFailure(
+                summary.blockedUNCHosts,
+                file.fsPath,
+                error,
+                (message) => `Failed to upload "${fileName}": ${message}`
+              );
             }
           }
         }
@@ -580,6 +649,10 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     } finally {
       endBusy();
     }
+
+    // Outside the busy span: the remediation flow blocks on a modal for as long
+    // as the user takes to answer it.
+    await offerCollectedUNCRemediation(summary.blockedUNCHosts, ctx.sshDiagnostics);
 
     if (summary.uploaded > 0) {
       ctx.sftpService.invalidateCache(target.serverId, target.dirPath);
@@ -627,6 +700,13 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
         );
         vscode.window.showInformationMessage(`Downloaded ${item.entry.name}`);
       } catch (error) {
+        if (isUNCAccessError(error)) {
+          const host = getUNCHost(dest.fsPath);
+          if (host) {
+            await offerUNCHostRemediation(host, dest.fsPath, ctx.sshDiagnostics);
+            return;
+          }
+        }
         const message = error instanceof Error ? error.message : String(error);
         vscode.window.showErrorMessage(`Failed to download "${item.entry.name}": ${message}`);
       }
@@ -651,7 +731,8 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       conflicts: 0,
       failed: 0,
       canceled: false,
-      canceledCount: 0
+      canceledCount: 0,
+      blockedUNCHosts: new Map()
     };
 
     await vscode.window.withProgress(
@@ -679,12 +760,18 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
             );
           } catch (error) {
             summary.failed += 1;
-            const message = error instanceof Error ? error.message : String(error);
-            void vscode.window.showErrorMessage(`Failed to download "${item.entry.name}": ${message}`);
+            reportTransferFailure(
+              summary.blockedUNCHosts,
+              destinationUri.fsPath,
+              error,
+              (message) => `Failed to download "${item.entry.name}": ${message}`
+            );
           }
         }
       }
     );
+
+    await offerCollectedUNCRemediation(summary.blockedUNCHosts, ctx.sshDiagnostics);
 
     const detail = `downloaded ${summary.downloaded}, skipped ${summary.skipped}, conflicts ${summary.conflicts}, failed ${summary.failed}, canceled ${summary.canceledCount}`;
     if (summary.canceled) {
