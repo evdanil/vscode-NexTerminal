@@ -49,6 +49,8 @@ type MockSftp = EventEmitter & {
   createReadStream: ReturnType<typeof vi.fn>;
   createWriteStream: ReturnType<typeof vi.fn>;
   writeFile: ReturnType<typeof vi.fn>;
+  open: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
   unlink: ReturnType<typeof vi.fn>;
   rename: ReturnType<typeof vi.fn>;
   mkdir: ReturnType<typeof vi.fn>;
@@ -71,6 +73,8 @@ function createMockSftp(): MockSftp {
     createReadStream: vi.fn(),
     createWriteStream: vi.fn(),
     writeFile: vi.fn(),
+    open: vi.fn(),
+    close: vi.fn(),
     unlink: vi.fn(),
     rename: vi.fn(),
     mkdir: vi.fn(),
@@ -106,46 +110,169 @@ function createMockWriteStream() {
 }
 
 /**
- * A remote filesystem double that models the MODE side-effects of ssh2's two
- * whole-file write paths. Verified against ssh2 1.17.0 `lib/protocol/SFTP.js`:
+ * A remote filesystem double that models the MODE side-effects AND the handle
+ * lifecycle of ssh2's whole-file write paths. Verified against ssh2 1.17.0
+ * `lib/protocol/SFTP.js`:
  *
- * - `createWriteStream(path, opts)` → `WriteStream.prototype.open()` sends
- *   SSH_FXP_OPEN carrying `mode` (default 0o666) AND then issues an
- *   UNCONDITIONAL `fchmod(handle, mode)` — on every open, existing file or not.
- *   So this path rewrites the mode of a file it overwrites.
- * - `writeFile(path, data, { flag })` with no `mode` → `open(path, flag,
- *   undefined, cb)`, i.e. SSH_FXP_OPEN with NO attrs, and no chmod anywhere.
- *   The server applies its default-and-umask when creating; an existing file
- *   keeps whatever mode it had. This is byte-for-byte what `fastPut` does.
+ * - `open(path, flags, cb)` — callback in the ATTRS slot — takes the
+ *   `typeof attrs === 'function'` branch, leaving `attrsFlags` 0: SSH_FXP_OPEN
+ *   with NO attrs. The server applies its own default-and-umask when creating,
+ *   and leaves an existing file's mode alone. `open(path, flags, attrs, cb)`
+ *   instead sends the attrs, so a `mode` there applies on create.
+ * - `createWriteStream(path, opts)` runs `WriteStream.prototype.open()` — which
+ *   sends SSH_FXP_OPEN carrying `mode` (0o666 by default) AND then issues an
+ *   UNCONDITIONAL `fchmod(handle, mode)`, existing file or not — but ONLY when
+ *   no handle was supplied. The constructor ends with
+ *   `if (!Buffer.isBuffer(this.handle)) this.open();`, so injecting a handle
+ *   skips the open, and with it the fchmod, entirely. Nothing outside `open()`
+ *   ever touches `this.mode`.
+ * - `destroy()`/`_final` both funnel into `closeStream` → `sftp.close(handle)`,
+ *   which emits 'close' only when the close carried no error. node's `destroy`
+ *   is idempotent, so the handle is closed exactly once however the write ends.
  *
  * Without modelling the fchmod, a mode-preservation assertion is vacuous: the
- * mock would report the mode it was seeded with no matter which path ran.
+ * mock would report the mode it was seeded with no matter which path ran. And
+ * without modelling "handle supplied ⇒ no open", it would pass just as happily
+ * for an implementation that let ssh2 open (and chmod) the file itself.
  */
 function installRemoteWriteModel(sftp: MockSftp, serverCreateMode = 0o644) {
   const modes = new Map<string, number>();
-  const writes: Array<{ path: string; data: Buffer; options?: { mode?: number; flag?: string } }> = [];
+  const writes: Array<{ path: string; data: Buffer }> = [];
+  const opens: Array<{ path: string; flags: string; attrs: unknown }> = [];
+  const closedHandles: Buffer[] = [];
+  const streams: Array<ReturnType<typeof createHandleWriteStream>> = [];
+  const heldOpens: Array<() => void> = [];
+  let holdOpens = false;
+  let stallWrites = false;
+  let nextHandleId = 1;
 
-  sftp.createWriteStream.mockImplementation((remotePath: string, options?: { mode?: number }) => {
-    // open()'s `mode` attr applies only on create; the fchmod that follows it
-    // applies always — so the effective mode is the same either way.
-    modes.set(remotePath, options?.mode ?? 0o666);
-    return createMockWriteStream();
-  });
+  const closeHandle = (handle: Buffer, callback?: (error?: Error | null) => void): void => {
+    closedHandles.push(handle);
+    queueMicrotask(() => callback?.(null));
+  };
 
-  sftp.writeFile.mockImplementation((
+  /** Write stream double for the handle-injected `createWriteStream` path. */
+  function createHandleWriteStream(remotePath: string, handle: Buffer) {
+    const handlers = new Map<string, Array<(arg?: unknown) => void>>();
+    let destroyed = false;
+    const emit = (event: string, arg?: unknown): void => {
+      for (const handler of handlers.get(event) ?? []) {
+        handler(arg);
+      }
+    };
+    const closeOnce = (error?: Error): void => {
+      if (destroyed) {
+        return; // node's destroy() is a no-op once the stream is destroyed
+      }
+      destroyed = true;
+      closeHandle(handle, () => {
+        // closeStream(): `cb(er)` first — which is what makes node emit 'error'
+        // — and 'close' only `if (!er)`.
+        if (error) {
+          emit("error", error);
+        } else {
+          emit("close");
+        }
+      });
+    };
+    const stream = {
+      handle,
+      get destroyed() {
+        return destroyed;
+      },
+      on: vi.fn((event: string, handler: (arg?: unknown) => void) => {
+        const existing = handlers.get(event) ?? [];
+        existing.push(handler);
+        handlers.set(event, existing);
+        return stream;
+      }),
+      end: vi.fn((chunk: Buffer) => {
+        if (destroyed) {
+          return stream; // ERR_STREAM_DESTROYED: no SSH_FXP_WRITE is issued
+        }
+        writes.push({ path: remotePath, data: chunk });
+        if (stallWrites) {
+          return stream; // WRITE sent, response never comes — a wedged channel
+        }
+        queueMicrotask(() => closeOnce()); // _final → destroy() → closeStream
+        return stream;
+      }),
+      destroy: vi.fn((error?: Error) => {
+        closeOnce(error);
+        return stream;
+      })
+    };
+    return stream;
+  }
+
+  sftp.open.mockImplementation((
     remotePath: string,
-    data: Buffer,
-    options: { mode?: number; flag?: string } | undefined,
-    callback: (error?: Error | null) => void
+    flags: string,
+    attrsOrCallback: unknown,
+    maybeCallback?: (error: Error | undefined, handle: Buffer) => void
   ) => {
-    if (!modes.has(remotePath)) {
-      modes.set(remotePath, options?.mode ?? serverCreateMode);
+    const callback = (typeof attrsOrCallback === "function" ? attrsOrCallback : maybeCallback) as
+      (error: Error | undefined, handle: Buffer) => void;
+    const attrs = typeof attrsOrCallback === "function" ? undefined : attrsOrCallback;
+    opens.push({ path: remotePath, flags, attrs });
+    const handle = Buffer.from([nextHandleId++]);
+    const grant = (): void => {
+      if (!modes.has(remotePath)) {
+        const attrMode = attrs && typeof attrs === "object" ? (attrs as { mode?: number }).mode : undefined;
+        modes.set(remotePath, attrMode ?? serverCreateMode);
+      }
+      callback(undefined, handle);
+    };
+    if (holdOpens) {
+      heldOpens.push(grant);
+      return;
     }
-    writes.push({ path: remotePath, data, options });
-    queueMicrotask(() => callback(null));
+    queueMicrotask(grant);
   });
 
-  return { modes, writes };
+  sftp.close.mockImplementation(closeHandle);
+
+  sftp.writeFile.mockImplementation(() => {
+    // The path this service deliberately does not take: it hands back neither
+    // stream nor handle, so a timeout cannot cancel the write. Throwing here
+    // makes a regression to it say so, instead of hanging on a bare vi.fn().
+    throw new Error("sftp.writeFile exposes no handle, so a timed-out write could not be cancelled");
+  });
+
+  sftp.createWriteStream.mockImplementation((remotePath: string, options?: { mode?: number; handle?: Buffer }) => {
+    if (!Buffer.isBuffer(options?.handle)) {
+      // No handle ⇒ WriteStream.open() ⇒ SSH_FXP_OPEN carrying `mode` plus the
+      // unconditional fchmod. open()'s `mode` attr applies only on create, the
+      // fchmod applies always — so the effective mode is the same either way.
+      modes.set(remotePath, options?.mode ?? 0o666);
+      return createMockWriteStream();
+    }
+    const stream = createHandleWriteStream(remotePath, options.handle);
+    streams.push(stream);
+    return stream;
+  });
+
+  return {
+    modes,
+    writes,
+    opens,
+    closedHandles,
+    streams,
+    /** Park every open's callback until `grantHeldOpens()` runs. */
+    holdOpens(): void {
+      holdOpens = true;
+    },
+    grantHeldOpens(): void {
+      holdOpens = false;
+      for (const grant of heldOpens.splice(0)) {
+        grant();
+      }
+    },
+    /** Accept the bytes but never answer the write — a wedged SFTP channel. */
+    stallWrites(): void {
+      stallWrites = true;
+    }
+  };
 }
 
 /** Read stream double for `readFileWithTimeout` (registers 'data'/'end'/'error'). */
@@ -770,26 +897,66 @@ describe("SftpService", () => {
     expect(mockStream.destroy).toHaveBeenCalled();
   });
 
-  // There is deliberately no `destroy()` assertion here any more. writeFile now
-  // goes through `sftp.writeFile`, which hands back no stream to destroy — the
-  // accepted cost of never widening the file's mode. The old destroy() only sent
-  // SSH_FXP_CLOSE down the very channel that is wedged in this scenario, and
-  // fastPut/fastGet already time out with no cancellation handle at all.
-  it("writeFile times out when the server never answers", async () => {
+  // A timed-out write must be CANCELLED, not merely reported. `sftp.writeFile`
+  // exposes neither stream nor handle, so its `writeAll` chain kept issuing
+  // SSH_FXP_WRITE in the background after the save was reported as failed — and
+  // those stale bytes could land on top of the newer save the user makes in
+  // response. Injecting our own handle into `createWriteStream` restores
+  // `destroy()`, whose SSH_FXP_CLOSE invalidates the handle server-side.
+  it("writeFile times out and cancels the stalled write by closing the handle", async () => {
     await service.connect(testServer);
     (service as any).commandTimeoutMs = 50;
+    const remote = installRemoteWriteModel(sftp);
+    remote.stallWrites();
 
-    sftp.writeFile.mockImplementation(() => {
-      /* never calls back — a wedged SFTP channel */
-    });
-
-    await expect(service.writeFile("srv-1", "/hung.txt", Buffer.from("data"))).rejects.toThrow("SFTP writeFile timed out");
-    expect(sftp.writeFile).toHaveBeenCalledWith(
-      "/hung.txt",
-      Buffer.from("data"),
-      { flag: "w" },
-      expect.any(Function)
+    await expect(service.writeFile("srv-1", "/hung.txt", Buffer.from("data"))).rejects.toThrow(
+      "SFTP writeFile timed out"
     );
+
+    expect(remote.streams).toHaveLength(1);
+    expect(remote.streams[0].destroyed).toBe(true);
+    expect(remote.closedHandles).toEqual([remote.streams[0].handle]);
+    // One WRITE was in flight when the timeout fired; the abort must not let a
+    // second one follow it.
+    expect(remote.writes).toEqual([{ path: "/hung.txt", data: Buffer.from("data") }]);
+  });
+
+  // The handle is opened before the stream exists, so ssh2 cannot close a handle
+  // that arrives after the timeout — nothing owns it and nothing will ever ask
+  // for it again. Leaked handles pin server-side state for the life of the
+  // session.
+  it("writeFile closes a handle that arrives after the timeout instead of leaking it", async () => {
+    await service.connect(testServer);
+    (service as any).commandTimeoutMs = 50;
+    const remote = installRemoteWriteModel(sftp);
+    remote.holdOpens();
+
+    const pending = service.writeFile("srv-1", "/slow-open.txt", Buffer.from("data"));
+    await expect(pending).rejects.toThrow("SFTP writeFile timed out");
+
+    // The server finally answers the open, long after we gave up on it.
+    remote.grantHeldOpens();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(remote.closedHandles).toHaveLength(1);
+    // Nothing was written, and no stream was ever built around the late handle.
+    expect(remote.streams).toHaveLength(0);
+    expect(remote.writes).toHaveLength(0);
+  });
+
+  it("writeFile closes the handle exactly once on the success path", async () => {
+    await service.connect(testServer);
+    const remote = installRemoteWriteModel(sftp);
+
+    await expect(service.writeFile("srv-1", "/ok.txt", Buffer.from("data"))).resolves.toBeUndefined();
+
+    // The one close comes from autoClose/_final. A second would mean the service
+    // also destroyed the stream itself, and would target a handle the server has
+    // already recycled.
+    expect(remote.closedHandles).toHaveLength(1);
+    expect(remote.opens).toHaveLength(1);
+    expect(remote.closedHandles).toEqual([remote.streams[0].handle]);
+    expect(remote.streams[0].destroy).not.toHaveBeenCalled();
   });
 
   // The editor-save mirror of the upload-path T8a/T8b pair below. Same ssh2
@@ -805,9 +972,10 @@ describe("SftpService", () => {
 
     // ssh2's createWriteStream fchmods every open to its `mode` (0o666 by
     // default) BEFORE any data flows, which would have made this world-readable
-    // AND world-writable on every save — including a save that then failed.
+    // AND world-writable on every save — including a save that then failed. The
+    // handle we inject is what suppresses that open, and with it the fchmod.
     expect(remote.modes.get("/remote/id_rsa")).toBe(0o600);
-    expect(sftp.createWriteStream).not.toHaveBeenCalled();
+    expect(sftp.createWriteStream).toHaveBeenCalledWith("/remote/id_rsa", { handle: expect.any(Buffer) });
   });
 
   it("saving a new remote file passes no mode attr, leaving the server's umask in charge", async () => {
@@ -818,9 +986,8 @@ describe("SftpService", () => {
 
     // An explicit mode would be applied by the fchmod AFTER the server's umask
     // has filtered the open attrs, so 0o666 lands verbatim as 0o666.
-    expect(remote.writes).toHaveLength(1);
-    expect(remote.writes[0].options?.mode).toBeUndefined();
-    expect(remote.writes[0].data).toEqual(Buffer.from("hello"));
+    expect(remote.opens).toEqual([{ path: "/remote/fresh.txt", flags: "w", attrs: undefined }]);
+    expect(remote.writes).toEqual([{ path: "/remote/fresh.txt", data: Buffer.from("hello") }]);
     expect(remote.modes.get("/remote/fresh.txt")).toBe(0o644);
   });
 
@@ -832,7 +999,7 @@ describe("SftpService", () => {
     await expect(service.writeFile("srv-1", "/remote/notes.txt", Buffer.alloc(0))).resolves.toBeUndefined();
 
     expect(remote.modes.get("/remote/notes.txt")).toBe(0o644);
-    expect(sftp.createWriteStream).not.toHaveBeenCalled();
+    expect(sftp.createWriteStream).toHaveBeenCalledWith("/remote/notes.txt", { handle: expect.any(Buffer) });
   });
 
   it("allows uploads to exceed the timeout while transfer progress continues", async () => {
@@ -1218,9 +1385,7 @@ describe("SftpService", () => {
 
       await expect(service.upload("srv-1", "/tmp/empty.txt", "/remote/empty.txt")).resolves.toBeUndefined();
 
-      expect(remote.writes).toEqual([
-        { path: "/remote/empty.txt", data: Buffer.alloc(0), options: { flag: "w" } }
-      ]);
+      expect(remote.writes).toEqual([{ path: "/remote/empty.txt", data: Buffer.alloc(0) }]);
     });
 
     it("T8a — an upload over an existing remote file leaves its permissions alone", async () => {
@@ -1236,8 +1401,10 @@ describe("SftpService", () => {
 
       // ssh2's createWriteStream fchmods every open to its `mode` (0o666 by
       // default), which would have made this world-readable AND world-writable.
+      // Injecting our own handle is what keeps that open — and its fchmod — from
+      // ever running.
       expect(remote.modes.get("/remote/id_rsa")).toBe(0o600);
-      expect(sftp.createWriteStream).not.toHaveBeenCalled();
+      expect(sftp.createWriteStream).toHaveBeenCalledWith("/remote/id_rsa", { handle: expect.any(Buffer) });
     });
 
     it("T8b — a newly created remote file is opened with no mode attr, leaving the server's umask in charge", async () => {
@@ -1251,7 +1418,7 @@ describe("SftpService", () => {
 
       // Passing any explicit mode here would defeat the server's umask on
       // create, which fastPut (open with no attrs) never does.
-      expect(remote.writes[0].options?.mode).toBeUndefined();
+      expect(remote.opens).toEqual([{ path: "/remote/fresh.txt", flags: "w", attrs: undefined }]);
       expect(remote.modes.get("/remote/fresh.txt")).toBe(0o644);
     });
 
@@ -1261,7 +1428,7 @@ describe("SftpService", () => {
       fsPromisesMock.stat.mockResolvedValue({ size: 0 });
       // /dev/zero: stats as 0, streams forever.
       fsCreateReadStream.mockImplementation(() => createMockReadStream([Buffer.alloc(4096)]));
-      installRemoteWriteModel(sftp);
+      const remote = installRemoteWriteModel(sftp);
       // Present so that an UNBOUNDED implementation completes cleanly rather
       // than hanging on the verification stat — the flip-check must fail on the
       // missing cap, not on a fixture timeout.
@@ -1270,7 +1437,8 @@ describe("SftpService", () => {
       await expect(service.upload("srv-1", "/dev/zero", "/remote/zero")).rejects.toThrow(
         /exceeds maximum size.*nexus\.sftp\.maxOpenFileSizeMB/s
       );
-      expect(sftp.writeFile).not.toHaveBeenCalled();
+      // The cap must trip before the remote file is even opened for writing.
+      expect(remote.opens).toHaveLength(0);
     });
 
     it("T8d — a claimed-zero download that keeps producing bytes is capped and writes nothing locally", async () => {
