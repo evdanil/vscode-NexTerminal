@@ -16,9 +16,6 @@
 import * as path from "node:path";
 import { modify, applyEdits } from "jsonc-parser";
 
-/** UTF-8 BOM byte sequence (EF BB BF). */
-export const UTF8_BOM_BYTES = [0xef, 0xbb, 0xbf] as const;
-
 /**
  * Derive the ACTIVE profile's user settings.json path from the extension's
  * globalStorage filesystem path. VS Code lays globalStorage out as

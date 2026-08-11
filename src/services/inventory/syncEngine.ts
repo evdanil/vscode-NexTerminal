@@ -477,40 +477,6 @@ function hasOwnKeyPath(server: ServerConfig): boolean {
 }
 
 /**
- * AUTH 2 / REVIEW FINDING (P2, detached auth opt-outs) — "which profile did a
- * SYNC last apply to this server?", asked of an owned server and of a kept one
- * by the one function that can answer for both.
- *
- * WHAT THE ANSWER DECIDES. Beside a cleared `authProfileId`, a defined answer
- * means the sync linked that profile and the USER took it off — the per-server
- * opt-out — while `undefined` means no sync ever put a profile there, which is
- * precisely the state retro-apply exists to fill. Nothing else can tell those
- * two apart: both records carry no link at all.
- *
- * ONE FIELD PER RECORD SHAPE, AND NEVER BOTH. An owned server answers from its
- * `origin` stamp; a kept server — which by definition has no origin — answers
- * from the copy the detach preserved for exactly this reader
- * (`DetachedServerOrigin.syncedAuthProfileId`, models/config.ts). The marker is
- * consulted ONLY in the absence of an origin, which keeps the documented rule
- * that a record carrying both is inert rather than dangerous: an origin-bearing
- * server with a stale marker beside it answers from its origin, exactly as it
- * did before this function existed.
- *
- * THE FINDING THIS CLOSES. Without the marker half, the opt-out survived the
- * detach as data and died as behaviour. A user who cleared a sync-applied
- * profile and THEN removed the source with Keep Servers had it silently
- * re-attached by the adoption — the predicate saw an origin-less record with no
- * link and read it as "never configured" — while the identical clear made after
- * the adoption is respected on every later run. One decision, opposite outcomes,
- * settled by which side of a source removal it happened to fall on. Preserving
- * a receipt and then not reading it is the worst of both: the data says the user
- * opted out and the code overwrites anyway.
- */
-function lastSyncAppliedProfileId(server: ServerConfig): string | undefined {
-  return server.origin !== undefined ? server.origin.syncedAuthProfileId : server.formerlySynced?.syncedAuthProfileId;
-}
-
-/**
  * AUTH 2b — what this sync must do about ONE owned server's link to a profile
  * that can no longer honour it. Three outcomes, and the two that are not "none"
  * are both reportable: `unlink` is what the sync DID, `retain-own-key` is what
@@ -2276,8 +2242,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // own, no link, and a username the source still recognises.
         //
         // REVIEW FINDING (P2, detached auth opt-outs) — WITH ONE CLAUSE THAT AN
-        // ADOPTEE CAN NOW FAIL. `lastSyncAppliedProfileId` reads the marker when
-        // there is no origin, so a kept server whose sync-applied profile the
+        // ADOPTEE CAN NOW FAIL. `authFillEligible`'s opt-out clause reads the
+        // preserved `formerlySynced` marker when there is no origin — an owned
+        // server answers from its `origin` stamp, a kept one from the copy the
+        // detach preserved (`DetachedServerOrigin.syncedAuthProfileId`), and a
+        // record carrying both answers from its origin. So a kept server whose
+        // sync-applied profile the
         // user CLEARED before the source was removed is refused here, exactly as
         // the same record would be refused on every run after an adoption. The
         // preview's disclosure is not a substitute for that: it says a profile is

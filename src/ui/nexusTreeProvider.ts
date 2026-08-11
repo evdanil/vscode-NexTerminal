@@ -29,11 +29,6 @@ export class FolderTreeItem extends vscode.TreeItem {
   }
 }
 
-/** @deprecated Use FolderTreeItem instead */
-export const GroupTreeItem = FolderTreeItem;
-/** @deprecated Use FolderTreeItem instead */
-export type GroupTreeItem = FolderTreeItem;
-
 function proxyTooltipSuffix(proxy?: ProxyConfig, serverLookup?: (id: string) => ServerConfig | undefined): string {
   if (!proxy) return "";
   if (proxy.type === "ssh") {

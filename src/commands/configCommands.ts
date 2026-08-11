@@ -75,18 +75,6 @@ import { MAX_SCRIPT_WAIT_TIMEOUT_MS, MAX_SCRIPT_WAIT_TIMEOUT_SECONDS } from "../
 import { getConfiguredSettingValue } from "../utils/configurationInspection";
 import { configMutationLock } from "../services/configMutationLock";
 
-interface MacroEntry {
-  name?: string;
-  text?: string;
-  secret?: boolean;
-  keybinding?: string;
-  triggerPattern?: string;
-  triggerCooldown?: number;
-  triggerInterval?: number;
-  triggerInitiallyDisabled?: boolean;
-  [key: string]: unknown;
-}
-
 interface NexusConfigExport {
   version: 1 | 2;
   exportType?: "backup" | "share";

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
-import type { AuthProfile, ProxyConfig, ServerConfig } from "../models/config";
+import type { AuthProfile, ServerConfig } from "../models/config";
 import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps } from "../models/config";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
@@ -333,14 +333,6 @@ async function pickInventorySource(core: NexusCore, registry: InventoryProviderR
 
 interface ProviderPickResult {
   provider: InventoryProvider;
-  /**
-   * Whether a QuickPick was actually displayed to the user. False when
-   * exactly one provider is registered (the auto-select branch below) — kept
-   * for callers that care whether a picker interrupted the flow, though
-   * addSource itself no longer needs it now that the form replaces the
-   * sequential-prompt wizard's step numbering.
-   */
-  shown: boolean;
 }
 
 /** Auto-skips the picker when exactly one provider is registered. */
@@ -351,13 +343,13 @@ async function promptProviderPick(registry: InventoryProviderRegistry): Promise<
     return undefined;
   }
   if (providers.length === 1) {
-    return { provider: providers[0], shown: false };
+    return { provider: providers[0] };
   }
   const pick = await vscode.window.showQuickPick(
     providers.map((provider) => ({ label: provider.label, provider })),
     { title: "Select Inventory Provider" }
   );
-  return pick ? { provider: pick.provider, shown: true } : undefined;
+  return pick ? { provider: pick.provider } : undefined;
 }
 
 /**

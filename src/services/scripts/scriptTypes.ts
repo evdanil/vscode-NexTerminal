@@ -106,10 +106,3 @@ export type WorkerOutbound =
   | { kind: "log"; level: "info" | "warn" | "error"; text: string }
   | { kind: "complete" }
   | { kind: "failed"; error: { message: string; stack?: string; code?: string } };
-
-export class ScriptRuntimeError extends Error {
-  public constructor(message: string, public readonly code: string, public readonly extra?: Record<string, unknown>) {
-    super(message);
-    this.name = "ScriptRuntimeError";
-  }
-}

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as readline from "node:readline";
-import { clamp } from "../../utils/helpers";
+import { normalizeBoundedNumber } from "../../utils/helpers";
 import {
   PORT_DATA_NOTIFICATION,
   PORT_DISCONNECTED_NOTIFICATION,
@@ -24,7 +24,7 @@ interface PendingRequest {
 }
 
 function normalizeRpcTimeoutMs(timeoutMs: number): number {
-  return Number.isFinite(timeoutMs) ? clamp(Math.floor(timeoutMs), 2_000, 60_000) : 10_000;
+  return normalizeBoundedNumber(timeoutMs, 10_000, 2_000, 60_000);
 }
 
 export class SerialSidecarManager {

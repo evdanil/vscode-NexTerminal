@@ -204,6 +204,26 @@ export function isValidMacroId(id: unknown): id is string {
 }
 
 /**
+ * Fix 1 — the persistence chokepoint (`save()`) is documented as guaranteeing
+ * every stored macro is usable, but previously only enforced id uniqueness.
+ * A caller bug (e.g. `moveToFolder` writing through a stale/out-of-bounds
+ * index) can turn `{ ...undefined }` into `{}` and have it survive a save —
+ * the tree then crashes forever after on `macro.text.replace(...)`
+ * (`macroTreeProvider.ts`), because nothing sanitizes an already-malformed
+ * record out of existence. A macro is not usable without a string `name` and
+ * a string `text`; anything else is dropped here rather than persisted.
+ *
+ * Shared by BOTH `MacroStore` implementations. It previously existed as a
+ * private copy in each, with a comment in one promising it mirrored the other —
+ * a drift between them would change which records the in-memory double discards
+ * versus the production store, which is exactly the divergence those comments
+ * were afraid of.
+ */
+export function isUsableMacro(m: TerminalMacro): boolean {
+  return !!m && typeof m === "object" && typeof m.name === "string" && typeof m.text === "string";
+}
+
+/**
  * Legacy `slot` → `keybinding` normalization, applied on the READ path (and again on the
  * write path so an old backup restored through `save()` converges too).
  *

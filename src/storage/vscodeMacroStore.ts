@@ -11,10 +11,12 @@ import {
   canonicalMacroTriggerTerms,
   canonicalMacroVariableTerms,
   isValidMacroId,
+  isUsableMacro,
   withMigratedSlot,
   type MacroStore,
   type MacroStoreChangeListener
 } from "./macroStore";
+import { asArray } from "../utils/helpers";
 import { withRedactedVariables } from "../services/macroVariables";
 import { dropNonPathGroup, sanitizeMacroFolderList } from "../services/macroFolders";
 
@@ -22,29 +24,6 @@ const MACROS_KEY = "nexus.macros";
 const SECRET_PREFIX = "macro-secret-text-";
 const MACRO_FOLDERS_KEY = "nexus.macros.folders";
 
-/**
- * Fix 1 — the persistence chokepoint (`save()`) is documented as guaranteeing
- * every stored macro is usable, but previously only enforced id uniqueness.
- * A caller bug (e.g. `moveToFolder` writing through a stale/out-of-bounds
- * index) can turn `{ ...undefined }` into `{}` and have it survive a save —
- * the tree then crashes forever after on `macro.text.replace(...)`
- * (`macroTreeProvider.ts`), because nothing sanitizes an already-malformed
- * record out of existence. A macro is not usable without a string `name` and
- * a string `text`; anything else is dropped here rather than persisted.
- */
-function isUsableMacro(m: TerminalMacro): boolean {
-  return !!m && typeof m === "object" && typeof m.name === "string" && typeof m.text === "string";
-}
-
-/**
- * `globalState.get(key, [])` returns the default only when the key is ABSENT.
- * A corrupt non-array value (object/string/null from a Settings Sync conflict or
- * storage corruption) would otherwise be iterated directly and throw during
- * `initialize()`. Degrade any non-array shape to an empty list.
- */
-function asArray<T>(raw: unknown): T[] {
-  return Array.isArray(raw) ? (raw as T[]) : [];
-}
 
 export interface VscodeMacroStoreOptions {
   /** If false, skip the one-time legacy-settings absorption (used by tests). Default: true. */

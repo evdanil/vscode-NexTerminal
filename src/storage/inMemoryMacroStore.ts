@@ -1,21 +1,12 @@
 import type { TerminalMacro } from "../models/terminalMacro";
 import {
   assignUniqueMacroIds,
+  isUsableMacro,
   withMigratedSlot,
   type MacroStore,
   type MacroStoreChangeListener
 } from "./macroStore";
 import { dropNonPathGroup, sanitizeMacroFolderList } from "../services/macroFolders";
-
-/**
- * Fix 1 — mirrors `VscodeMacroStore`'s `isUsableMacro()`: a macro is not
- * usable without a string `name` and a string `text`; anything else (e.g. a
- * caller writing through a stale/out-of-bounds index) is dropped here rather
- * than persisted, so a malformed record can never reach the tree.
- */
-function isUsableMacro(m: TerminalMacro): boolean {
-  return !!m && typeof m === "object" && typeof m.name === "string" && typeof m.text === "string";
-}
 
 export class InMemoryMacroStore implements MacroStore {
   private macros: TerminalMacro[] = [];

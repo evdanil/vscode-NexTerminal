@@ -374,8 +374,6 @@ export interface FieldProvenance {
   templateName: string;
   /** The winning rule's raw filter; undefined for a catch-all rule or the implicit source rule. */
   ruleFilter?: string;
-  /** True when the value came from the implicit source-level auth rule (§4.2), not an explicit rule. */
-  implicit: boolean;
 }
 
 export interface CascadeResult {
@@ -514,7 +512,7 @@ export function selectFieldWinners(
         `Device "${device.name}": rules "${filterLabel(winner.rule.filter)}" and "${filterLabel(disagreeing.rule.filter)}" tie for ${TEMPLATE_FIELD_SHORT_LABELS[fieldKey]}; applied "${filterLabel(winner.rule.filter)}" (rule order is not used — make one rule more specific to choose deliberately).`
       );
     }
-    provenance[fieldKey] = { templateName: winner.template.name, ruleFilter: winner.rule.filter, implicit: false };
+    provenance[fieldKey] = { templateName: winner.template.name, ruleFilter: winner.rule.filter };
     return { field: winField, templateName: winner.template.name };
   };
 
