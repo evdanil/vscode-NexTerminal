@@ -793,3 +793,65 @@ describe("package contributions", () => {
     });
   });
 });
+
+describe("terminal output performance defaults (2.8.181)", () => {
+  const props = packageJson.contributes.configuration?.properties ?? {};
+
+  describe("nexus.logging.terminalOutputTrace", () => {
+    it("is contributed as a boolean that defaults to off", () => {
+      expect(props["nexus.logging.terminalOutputTrace"]).toMatchObject({
+        type: "boolean",
+        default: false
+      });
+    });
+
+    it("tells the user why it is off — the cost and the plaintext session data", () => {
+      const description: string = props["nexus.logging.terminalOutputTrace"].markdownDescription;
+      expect(description).toMatch(/troubleshooting only/i);
+      expect(description).toMatch(/plaintext/i);
+      expect(description).toMatch(/password/i);
+    });
+
+    it("is exposed in the Settings UI and documented", async () => {
+      const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+      const meta = SETTINGS_META.find(
+        (item) => item.section === "nexus.logging" && item.key === "terminalOutputTrace"
+      );
+      expect(meta).toBeDefined();
+      expect(meta?.default).toBe(false);
+      expect(readme).toContain("nexus.logging.terminalOutputTrace");
+      expect(functionalDocs).toContain("nexus.logging.terminalOutputTrace");
+    });
+  });
+
+  describe("nexus.terminal.highlighting.rules defaults", () => {
+    const defaultRules = (props["nexus.terminal.highlighting.rules"].default ?? []) as Array<{
+      pattern: string;
+      color: string;
+    }>;
+
+    function highlights(sample: string): boolean {
+      return defaultRules.some((rule) => new RegExp(rule.pattern, rule.flags ?? "gi").test(sample));
+    }
+
+    it("no longer ships the IPv6 or the UUID rule — the two most expensive patterns", () => {
+      expect(defaultRules.some((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"))).toBe(false);
+      expect(defaultRules.some((rule) => rule.pattern.includes("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}"))).toBe(false);
+      expect(highlights("2001:0db8:85a3:0000:0000:8a2e:0370:7334")).toBe(false);
+      expect(highlights("3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toBe(false);
+    });
+
+    it("keeps every other default rule, including IPv4 and MAC addresses", () => {
+      expect(highlights("10.0.0.1")).toBe(true);
+      expect(highlights("aa:bb:cc:dd:ee:ff")).toBe(true);
+      expect(highlights("ERROR")).toBe(true);
+      expect(highlights("https://example.com")).toBe(true);
+    });
+
+    it("tells the user how to add the two rules back", () => {
+      const description: string = props["nexus.terminal.highlighting.rules"].markdownDescription;
+      expect(description).toContain("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}");
+      expect(description).toMatch(/IPv6/);
+    });
+  });
+});

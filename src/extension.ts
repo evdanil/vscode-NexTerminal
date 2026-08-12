@@ -20,6 +20,7 @@ import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
+import { flushSessionTranscripts } from "./logging/sessionTranscriptLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { registerEditAsRootHint } from "./services/sftp/editAsRootHint";
@@ -96,6 +97,21 @@ const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
 // §4.10 — a SEPARATE key from the Hub's, so macro-folder collapse state never
 // collides with the Connectivity Hub's folder-of-the-same-name collapse state.
 const MACRO_COLLAPSED_FOLDERS_KEY = "nexus.macros.ui.collapsedFolders";
+
+function readTerminalOutputTrace(): boolean {
+  return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("terminalOutputTrace", false);
+}
+
+/**
+ * Cached value of `nexus.logging.terminalOutputTrace`, refreshed by the
+ * configuration listener in `activate()`.
+ *
+ * It is read once per received chunk, on the terminal's hot path — far too
+ * often to go through `getConfiguration()` each time, which is the whole point
+ * of the setting. Caching also means the flag reads as a single property load
+ * in the overwhelmingly common case where the trace is off.
+ */
+let terminalOutputTraceEnabled = false;
 
 function resolveLogRotationOptions(): LoggerRotationOptions {
   const loggingConfig = vscode.workspace.getConfiguration("nexus.logging");
@@ -307,9 +323,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const core = new NexusCore(repository);
   await core.initialize();
 
+  terminalOutputTraceEnabled = readTerminalOutputTrace();
   const loggerFactory = new TerminalLoggerFactory(
     path.join(context.globalStorageUri.fsPath, "logs"),
-    resolveLogRotationOptions
+    resolveLogRotationOptions,
+    () => terminalOutputTraceEnabled
   );
   const secretVault = new VscodeSecretVault(context);
 
@@ -1192,6 +1210,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     if (event.affectsConfiguration("nexus.terminal.highlighting")) {
       highlighter.reload();
     }
+    if (event.affectsConfiguration("nexus.logging.terminalOutputTrace")) {
+      // Applies to sessions that are already open — loggers read the flag per
+      // chunk through the provider handed to TerminalLoggerFactory.
+      terminalOutputTraceEnabled = readTerminalOutputTrace();
+    }
     if (
       event.affectsConfiguration("terminal.integrated.sendKeybindingsToShell") ||
       event.affectsConfiguration("terminal.integrated.commandsToSkipShell") ||
@@ -1420,5 +1443,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 }
 
 export async function deactivate(): Promise<void> {
-  // Cleanup is handled via context.subscriptions disposables
+  // Cleanup is handled via context.subscriptions disposables. VS Code calls
+  // this function first and disposes those subscriptions immediately
+  // afterwards, without waiting for the promise returned here — so the PTY
+  // teardown that pushes each session's transcript tail into the writer has
+  // not run yet at this point. Yield a turn to let it run, then wait for the
+  // tail to actually reach disk: the writer is buffered, and a drain that was
+  // already in flight when the tail was queued can only chain it, which
+  // nothing else in the teardown path would wait on.
+  //
+  // The wait is bounded inside flushSessionTranscripts — a hung filesystem
+  // must not hold extension-host shutdown open.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await flushSessionTranscripts();
 }

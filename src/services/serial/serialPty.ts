@@ -137,6 +137,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.disconnected = true;
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
+    // Extension deactivate reaches the PTYs here — force the buffered
+    // transcript tail to disk before the host goes away.
+    this.transcript?.flush?.();
     this.releaseSubscriptions();
     this.activityIndicator = false;
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
@@ -192,6 +195,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.observerHub.pauseIntervalMacros();
     this.disconnected = true;
     this.highlighterStream?.flush();
+    this.transcript?.flush?.();
 
     const sessionId = this.releaseSubscriptions();
 
@@ -228,7 +232,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
           return;
         }
         const output = data.toString("utf8");
-        this.logger.log(`serial stdout ${JSON.stringify(output)}`);
+        this.logger.logOutput?.(`serial stdout ${JSON.stringify(output)}`);
         this.transcript?.write(output);
         this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
           this.writeEmitter.fire(rendered)

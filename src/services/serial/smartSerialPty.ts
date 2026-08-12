@@ -129,7 +129,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
         return;
       }
       const output = data.toString("utf8");
-      this.logger.log(`smart serial stdout ${JSON.stringify(output)}`);
+      this.logger.logOutput?.(`smart serial stdout ${JSON.stringify(output)}`);
       this.transcript?.write(output);
       this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
         this.writeEmitter.fire(rendered)
@@ -252,6 +252,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.stopPolling();
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
+    // Extension deactivate reaches the PTYs here — force the buffered
+    // transcript tail to disk before the host goes away.
+    this.transcript?.flush?.();
     this.waiting = false;
     this.currentPath = undefined;
     this.transportSessionId = undefined;
@@ -586,6 +589,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     }
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
+    this.transcript?.flush?.();
     const lostPath = this.currentPath ?? this.preferredPath;
     this.logger.log(`smart serial port disconnected: ${reason}`);
     this.transportSessionId = undefined;
@@ -612,6 +616,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.stopped = true;
     this.stopPolling();
     this.highlighterStream?.flush();
+    this.transcript?.flush?.();
     this.waiting = false;
     this.currentPath = undefined;
     this.transportSessionId = undefined;

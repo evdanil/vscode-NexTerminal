@@ -175,6 +175,87 @@ describe("TerminalCaptureBuffer", () => {
     });
   });
 
+  /**
+   * `maxLines` bounds completed lines only. Output that never emits a `\n` —
+   * cursor-addressed full-screen programs (htop, watch, vim), `\r`-only
+   * progress bars — all accumulates in `pending`, which every append()
+   * re-concatenates and re-splits. Unbounded, that is both a leak and a
+   * per-chunk cost that grows with the session.
+   */
+  describe("unterminated-line bound", () => {
+    const MAX_PENDING = 65536;
+
+    it("bounds pending at 64 KiB across 1 MB of newline-free output", () => {
+      const buf = new TerminalCaptureBuffer({ maxLines: 1000 });
+      const chunk = "\r" + "y".repeat(2047); // 2 KiB, no \n anywhere
+      for (let i = 0; i < 512; i++) {
+        buf.append(chunk);
+      }
+
+      // getText() is pending here (no line ever completed), so its length IS
+      // the bound. Uncapped this would be ~1 MB.
+      expect(buf.getText().length).toBeLessThanOrEqual(MAX_PENDING);
+      expect(buf.lineCount()).toBe(1);
+    });
+
+    it("keeps the tail — the most recent bytes — when it truncates", () => {
+      const buf = new TerminalCaptureBuffer({ maxLines: 1000 });
+      buf.append("OLDEST-MARKER" + "z".repeat(MAX_PENDING));
+      buf.append("NEWEST-MARKER");
+
+      const text = buf.getText();
+      expect(text.length).toBeLessThanOrEqual(MAX_PENDING);
+      expect(text.endsWith("NEWEST-MARKER")).toBe(true);
+      expect(text).not.toContain("OLDEST-MARKER");
+    });
+
+    it("leaves short partial lines completely untouched", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("prompt> ");
+      buf.append("ls -la");
+      expect(buf.getText()).toBe("prompt> ls -la");
+    });
+
+    it("still closes a capped pending line into the ring buffer when a newline arrives", () => {
+      const buf = new TerminalCaptureBuffer({ maxLines: 10 });
+      buf.append("q".repeat(MAX_PENDING * 2));
+      buf.append("-TAIL\nnext line");
+
+      const lines = buf.getText().split("\n");
+      expect(lines).toHaveLength(2);
+      // The completed line carries the capped pending tail plus whatever this
+      // chunk added — bounded, unlike the 128 KiB it would be uncapped.
+      expect(lines[0].length).toBeLessThanOrEqual(MAX_PENDING + 1024);
+      expect(lines[0].endsWith("-TAIL")).toBe(true);
+      expect(lines[1]).toBe("next line");
+      expect(buf.lineCount()).toBe(2);
+    });
+
+    it("keeps per-append cost flat once the bound is reached", () => {
+      const buf = new TerminalCaptureBuffer({ maxLines: 1000 });
+      const chunk = "\r" + "w".repeat(2047);
+
+      // Seed well past the cap. Without the cap this loop alone builds a 4 MB
+      // pending string, and each of the 2000 appends below then copies it.
+      for (let i = 0; i < 2048; i++) {
+        buf.append(chunk);
+      }
+
+      const start = performance.now();
+      for (let i = 0; i < 2000; i++) {
+        buf.append(chunk);
+      }
+      const elapsed = performance.now() - start;
+
+      // Capped, 2000 appends of 2 KiB onto a 64 KiB buffer measure in the tens
+      // of milliseconds. Uncapped, the same 2000 appends copy an average of
+      // ~6 MB each and take seconds. The threshold is deliberately loose: it is
+      // a guard against the growth curve returning, not a benchmark.
+      expect(elapsed).toBeLessThan(1500);
+      expect(buf.getText().length).toBeLessThanOrEqual(MAX_PENDING);
+    });
+  });
+
   describe("dispose()", () => {
     it("unsubscribes the config listener and empties the buffer", () => {
       const buf = new TerminalCaptureBuffer();

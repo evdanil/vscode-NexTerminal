@@ -13,6 +13,7 @@ vi.mock("vscode", () => ({
 }));
 
 import { TerminalHighlighter, TerminalHighlighterStream } from "../../src/services/terminalHighlighter";
+import { PtyObserverHub } from "../../src/services/terminal/ptyObserverHub";
 
 function setConfig(enabled: boolean, rules: Array<Record<string, unknown>>): void {
   mockConfig = { enabled, rules };
@@ -74,22 +75,124 @@ describe("TerminalHighlighter", () => {
     expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m happened\r\n"]);
   });
 
-  it("flushes partial no-newline output on a hard deadline without extending it forever", () => {
+  it("flushes partial no-newline output on a ceiling without extending it forever", () => {
     vi.useFakeTimers();
     setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
     const h = new TerminalHighlighter();
     const emitted: string[] = [];
     const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
 
-    stream.push("ER");
-    vi.advanceTimersByTime(10);
-    stream.push("RO");
-    vi.advanceTimersByTime(9);
-    stream.push("R");
+    // Chunks 15 ms apart against a 20 ms flush delay: the idle timer is
+    // restarted by every one of them and so can never fire. Nothing here is a
+    // line boundary, and the whole run is two orders of magnitude short of the
+    // 16 KiB pending cap — so the ceiling (6 flush periods = 120 ms) is the
+    // only thing that can get these bytes onto the screen. Eight chunks are in
+    // by the time it fires.
+    for (let elapsed = 0; elapsed < 115; elapsed += 15) {
+      stream.push("x".repeat(64));
+      vi.advanceTimersByTime(15);
+    }
+
+    // One emission, at the ceiling, holding back nothing. The ceiling used to
+    // retain the 256-byte margin here; it cannot, because retention is allowed
+    // to emit nothing at all (whenever the buffer is smaller than the margin)
+    // and a deadline that can emit nothing bounds nothing. See the trickle test
+    // below, which is that same path with a buffer under the margin.
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toBe("x".repeat(64 * 8));
+  });
+
+  it("renders a trickle below the idle delay within the ceiling period", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const flushDelay = 20;
+    const ceiling = flushDelay * 6;
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), flushDelay);
+
+    // One character every 15 ms against a 20 ms idle delay: the idle timer is
+    // restarted before it can ever fire, no character is a line boundary, and
+    // the whole run stays two orders of magnitude under both the 16 KiB cap and
+    // — this is the part that used to break the ceiling — the 256-character
+    // retention margin. Emitting "everything except the last 256 characters" of
+    // a 40-character buffer emits nothing, and the ceiling cleared itself
+    // anyway, so the next push started a fresh ceiling period from a new anchor.
+    // Repeat forever: the first character stayed invisible until the buffer
+    // crossed 256 characters, ~3.6 s at this rate.
+    const text = Array.from({ length: 40 }, (_, index) =>
+      String.fromCharCode(97 + (index % 26))
+    ).join("");
+
+    const arrivedAt: number[] = [];
+    let now = 0;
+    for (const character of text) {
+      stream.push(character);
+      arrivedAt.push(now);
+      vi.advanceTimersByTime(15);
+      now += 15;
+
+      const rendered = emitted.join("");
+      // The guarantee, asserted continuously rather than at one instant: every
+      // character that arrived a full ceiling period ago is on the screen.
+      const due = arrivedAt.filter((at) => at + ceiling <= now).length;
+      expect(rendered.length).toBeGreaterThanOrEqual(due);
+      // ...and nothing is reordered, duplicated or invented on the way there.
+      expect(text.startsWith(rendered)).toBe(true);
+    }
+
+    // Non-vacuous: the run really did exercise the ceiling (the deadline came
+    // up while data was still arriving) and really did stay under the margin.
+    expect(now).toBeGreaterThan(ceiling);
+    expect(text.length).toBeLessThan(256);
+    expect(emitted.length).toBeGreaterThan(0);
+  });
+
+  it("does not split a token whose fragments straddle the flush deadline", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // Fragments 15 ms apart — each well inside one flush period, but the run
+    // spans longer than a period, so a deadline anchored to the *first* push
+    // expires while the token is still arriving. There is no line boundary and
+    // the total is far below the 16 KiB cap, so the flush timer is the only
+    // thing that can cut it.
+    stream.push("boot: ERR");
+    vi.advanceTimersByTime(15);
+    stream.push("O");
+    vi.advanceTimersByTime(5); // t=20 — where a first-push anchor would expire
+    expect(emitted).toEqual([]);
+
+    stream.push("R at 03:00");
+    vi.advanceTimersByTime(19); // t=39 — the deadline runs from the last push
     expect(emitted).toEqual([]);
 
     vi.advanceTimersByTime(1);
-    expect(emitted).toEqual(["\x1b[31mERROR\x1b[39m"]);
+    expect(emitted).toEqual(["boot: \x1b[31mERROR\x1b[39m at 03:00"]);
+  });
+
+  it("keeps the pending buffer bounded by the hard cap when the stream never goes quiet", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // 1 KiB every 5 ms with no line boundary: the idle timer is restarted
+    // before it can ever fire. Restarting it must not turn the pending buffer
+    // into an unbounded one — the 16 KiB cap is what stands behind it.
+    const chunk = "x".repeat(1024);
+    let pushed = 0;
+    for (let index = 0; index < 40; index += 1) {
+      stream.push(chunk);
+      pushed += chunk.length;
+      vi.advanceTimersByTime(5);
+      expect(pushed - emitted.join("").length).toBeLessThanOrEqual(16384);
+    }
+    expect(emitted.length).toBeGreaterThan(0);
   });
 
   it("starts a fresh flush deadline for a new trailing fragment after a completed line", () => {
@@ -146,7 +249,7 @@ describe("TerminalHighlighter", () => {
     expect(emitted[1]).toBe(`\x1b[31m${"A".repeat(256)}\x1b[39m`);
   });
 
-  it("retains trailing bytes on idle flush so cross-chunk IP matches still highlight", () => {
+  it("keeps a cross-chunk match intact when both chunks land inside one flush window", () => {
     vi.useFakeTimers();
     setConfig(true, [
       { pattern: "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b", color: "magenta", flags: "g" }
@@ -155,22 +258,41 @@ describe("TerminalHighlighter", () => {
     const emitted: string[] = [];
     const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
 
-    // First chunk: padding past the retention margin, ending mid-IP, no newline
+    // TCP segmentation splits a token across chunks that arrive microseconds
+    // apart — well inside one flush window. Both are still pending when the
+    // deadline expires, so the match resolves against the joined text. The
+    // deadline runs from the *last* chunk, so the quiet period is measured from
+    // there.
     const padding = "x".repeat(300);
     stream.push(padding + " 110.");
+    vi.advanceTimersByTime(5);
+    stream.push("231.10.231");
+    expect(emitted).toEqual([]);
 
-    // Idle timer fires — emits everything except the last 256 bytes, which are retained
     vi.advanceTimersByTime(20);
     expect(emitted).toHaveLength(1);
-    // The "110." prefix must stay in the retained tail, NOT in the emitted slice
-    expect(emitted[0]).not.toContain("110.");
+    expect(emitted[0]).toContain("\x1b[35m110.231.10.231\x1b[39m");
+  });
 
-    // Second chunk completes the IP on the same line
-    stream.push("231.10.231\r\n");
+  it("emits the whole pending tail on the idle flush, in one tick", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
 
-    // Retained tail + continuation emits as one unit with the full IP matched
-    expect(emitted).toHaveLength(2);
-    expect(emitted[1]).toContain("\x1b[35m110.231.10.231\x1b[39m");
+    // A prompt tail longer than the 256-byte retention margin, no newline.
+    // The idle flush used to hold that margin back for one more flush period,
+    // so the tail of every quiet-ending burst arrived in two stages.
+    const tail = `${"x".repeat(300)}prompt$ `;
+    stream.push(tail);
+
+    vi.advanceTimersByTime(20);
+    expect(emitted).toEqual([tail]);
+
+    // Nothing is left over to arrive a period later.
+    vi.advanceTimersByTime(1000);
+    expect(emitted).toEqual([tail]);
   });
 
   it("preserves match context across hard-cap flush for cross-chunk matches", () => {
@@ -640,5 +762,302 @@ describe("TerminalHighlighter", () => {
     stream.flush();
     const full = emitted.join("");
     expect(full.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Typing latency. A keystroke echo carries neither \n nor \r, so it can only
+ * leave the stream when the flush timer fires: the flush delay IS the terminal's
+ * echo latency floor, and it applied even when highlighting was switched off.
+ */
+describe("TerminalHighlighter — output latency", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("renders a keystroke echo on the arriving tick when highlighting is disabled", () => {
+    vi.useFakeTimers();
+    setConfig(false, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+    const hub = new PtyObserverHub();
+
+    hub.notifyOutput("a", stream, h, (rendered) => emitted.push(rendered));
+
+    // No timer advanced: with highlighting off the byte must already be rendered.
+    expect(emitted).toEqual(["a"]);
+  });
+
+  it("renders a keystroke echo on the arriving tick when highlighting is on but no rules compile", () => {
+    vi.useFakeTimers();
+    setConfig(true, []);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+    const hub = new PtyObserverHub();
+
+    hub.notifyOutput("a", stream, h, (rendered) => emitted.push(rendered));
+
+    expect(emitted).toEqual(["a"]);
+  });
+
+  it("reports whether highlighting can change output, and re-reads it on reload", () => {
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    expect(h.isEnabled()).toBe(true);
+
+    setConfig(false, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    h.reload();
+    expect(h.isEnabled()).toBe(false);
+
+    setConfig(true, []);
+    h.reload();
+    expect(h.isEnabled()).toBe(false);
+  });
+
+  it("holds a no-newline fragment for the default flush delay of 15 ms, not longer", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    // No explicit delay — this asserts the shipped default.
+    const stream = h.createStream((text) => emitted.push(text));
+
+    stream.push("user@host:~$ ");
+    vi.advanceTimersByTime(14);
+    expect(emitted).toEqual([]);
+
+    vi.advanceTimersByTime(1);
+    expect(emitted).toEqual(["user@host:~$ "]);
+  });
+
+  it("renders a quiet-ending burst tail on a single tick, at the default delay", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    let now = 0;
+    const ticks: number[] = [];
+    const stream = h.createStream(() => ticks.push(now));
+
+    // Longer than the 256-byte retention margin, with no line boundary — the
+    // shape a shell prompt arrives in at the end of a burst. The two-stage idle
+    // flush rendered it at [0, 15, 30]; it must land on one tick, at 15.
+    stream.push(`${"x".repeat(300)}user@host:~$ `);
+    for (let step = 0; step < 500; step += 1) {
+      now += 1;
+      vi.advanceTimersByTime(1);
+    }
+
+    expect(ticks).toEqual([15]);
+  });
+
+  /**
+   * The shipped ceiling, pinned from both sides. STREAM_MAX_PENDING_PERIODS
+   * is bracketed: the first test fails if the ceiling rises above 90 ms (the
+   * released v2.8.180 painted this pattern at 100 ms, and a latency fix must
+   * not measure worse than the release it fixes); the second fails if it
+   * drops below ~83 ms, the time a full 80-column line needs to arrive at
+   * 9600 baud — a ceiling below that fires mid-line on every ordinary serial
+   * console line and clips whatever highlight straddles the fire.
+   */
+  it("renders a sub-idle trickle within 90 ms — six flush periods — at the shipped defaults", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    // No explicit delay — this asserts the shipped ceiling: 15 ms × 6.
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // One character every 10 ms: below the 15 ms idle delay, so the idle
+    // timer is restarted before it can ever fire; no character is a boundary;
+    // the run never nears the 16 KiB cap. Only the ceiling can render this.
+    for (let index = 0; index < 9; index += 1) {
+      stream.push("x");
+      vi.advanceTimersByTime(index === 8 ? 9 : 10);
+    }
+    // t = 89 ms — one tick short of the ceiling, and nothing has rendered:
+    // neither the idle timer nor an early ceiling fired on the way here.
+    expect(emitted).toEqual([]);
+
+    vi.advanceTimersByTime(1);
+    // t = 90 ms — the ceiling fires and renders every byte pushed so far.
+    expect(emitted.join("")).toBe("x".repeat(9));
+  });
+
+  it("lets a full 80-column 9600-baud console line reach its boundary unsplit", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // A full-width line on a 9600-baud serial console — the slowest console
+    // rate in common use — arriving character by character at the rate the
+    // wire actually delivers them: 8N1 is 10 bits per character, so 960
+    // characters a second, 1.042 ms each, and the line's own \r\n is two more
+    // characters on that wire rather than free. Eighty columns plus CR LF is
+    // 85.4 ms, not 82, and the difference is the whole point of the fixture:
+    // it is what a ceiling of 83, 84 or 85 ms would split and a 1 ms/char
+    // fixture would call safe. The token straddles character 45, exactly where
+    // a 45 ms (three-period) ceiling would cut.
+    const line = `${"x".repeat(41)} ERROR ${"y".repeat(32)}`;
+    expect(line).toHaveLength(80);
+    let now = 0;
+    const completesAt = (index: number): number => Math.round(((index + 1) * 1000) / 960);
+    for (let index = 0; index < line.length; index += 1) {
+      stream.push(line[index]);
+      vi.advanceTimersByTime(completesAt(index) - now);
+      now = completesAt(index);
+    }
+    // The CR LF is two more characters on the same wire: it completes at 85 ms,
+    // not at 82. (One push, as a driver read delivers it — a lone CR is a
+    // boundary in its own right and would cut the line one character early.)
+    vi.advanceTimersByTime(completesAt(81) - now);
+    now = completesAt(81);
+    stream.push("\r\n");
+    // Non-vacuous: the line really did take longer than 82 ms, and really did
+    // fit inside the 90 ms ceiling — a bracket with 4.6 ms of headroom.
+    expect(now).toBe(85);
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toBe(`${"x".repeat(41)} \x1b[31mERROR\x1b[39m ${"y".repeat(32)}\r\n`);
+  });
+
+  /**
+   * The ceiling's deadline belongs to the oldest byte that is STILL pending,
+   * not to the oldest byte that ever was. These three pin that distinction:
+   * an emit that renders everything the timer was armed for and leaves a fresh
+   * tail behind must re-anchor it (the first two), and an emit that leaves
+   * carried-over bytes behind must not (the third).
+   */
+  it("re-anchors the ceiling to the fragment a completed line leaves behind", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // Sub-idle output (10 ms apart against the 15 ms idle delay) arms the
+    // ceiling at t=0 and keeps the idle timer from ever firing.
+    for (let elapsed = 0; elapsed < 80; elapsed += 10) {
+      stream.push("x");
+      vi.advanceTimersByTime(10);
+    }
+
+    // t=80: one chunk ends the line and opens the next. Everything the ceiling
+    // was armed for is now on the screen; "ER" arrived this instant.
+    stream.push(" end-of-line\r\nER");
+    expect(emitted).toEqual(["xxxxxxxx end-of-line\r\n"]);
+
+    // t=93 — past the deadline the ceiling started with, and 13 ms into "ER"'s
+    // own. Firing here would render a bare "ER" and leave the continuation
+    // that is already on its way unmatchable.
+    vi.advanceTimersByTime(13);
+    stream.push("ROR happened");
+    expect(emitted).toHaveLength(1);
+
+    // The idle timer, restarted by that push, renders the line whole at t=108.
+    vi.advanceTimersByTime(15);
+    expect(emitted[1]).toBe("\x1b[31mERROR\x1b[39m happened");
+  });
+
+  it("never reaches the ceiling while line boundaries keep flowing through the buffer", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // Continuous scroll delivered in mid-line chunks — USB-batched serial at
+    // 19200 baud and up, `tail -f` over a congested hop. Every chunk finishes
+    // the previous line and opens the next, so `pending` is never empty; 10 ms
+    // apart, so the idle timer never fires. An anchor that only moves when the
+    // buffer empties therefore never moves at all here, and the ceiling cuts
+    // the stream mid-line once per period for as long as the output runs —
+    // one needless split every 90 ms, on a pattern v2.8.180's boundary-cleared
+    // timer never split at all.
+    const chunks = ["boot ERR"];
+    for (let index = 0; index < 12; index += 1) {
+      chunks.push(`OR on line ${index}\r\nlog ERR`);
+    }
+    stream.push(chunks[0]);
+    for (const chunk of chunks.slice(1)) {
+      vi.advanceTimersByTime(10);
+      stream.push(chunk);
+    }
+    stream.flush();
+
+    // Every cut but the closing flush fell on a line boundary...
+    expect(emitted.slice(0, -1).filter((chunk) => !chunk.endsWith("\r\n"))).toEqual([]);
+    // ...so every one of the twelve tokens survived, in order, whole.
+    const raw = chunks.join("");
+    expect(emitted.join("")).toBe(raw.replace(/ERROR/g, "\x1b[31mERROR\x1b[39m"));
+    expect(emitted.join("").match(/\x1b\[31mERROR\x1b\[39m/g)).toHaveLength(12);
+  });
+
+  it("keeps the ceiling anchored when a cut backs off and carries older bytes over", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // The one shape where the tail a boundary emit leaves behind is NOT a
+    // suffix of the chunk that just arrived: an OSC opened at t=0 swallows the
+    // \r\n that lands at t=10 (see the known gap on createAnsiRegex), so the
+    // cut backs off ahead of it and bytes from the first push stay pending.
+    // Their deadline is the older one, and it is the one that must be kept —
+    // re-anchoring here would push a 90 ms-old byte past its ceiling.
+    stream.push("xx\x1b]0;title");
+    vi.advanceTimersByTime(10);
+    stream.push(" more\r\nrest");
+    expect(emitted).toEqual(["xx"]);
+
+    // Sub-idle from t=10 to t=89, so nothing but the ceiling can fire.
+    for (let index = 0; index < 8; index += 1) {
+      stream.push("z");
+      vi.advanceTimersByTime(index === 7 ? 9 : 10);
+    }
+    // t=89: the second cut landed (the OSC now starts at 0, so safeCutIndex
+    // stops backing off), and "rest" — carried over from t=10 — is still
+    // pending under the t=0 anchor.
+    expect(emitted).toEqual(["xx", "\x1b]0;title more\r\n"]);
+
+    vi.advanceTimersByTime(1);
+    // t=90: the ceiling fires on the original anchor, on time.
+    expect(emitted).toEqual(["xx", "\x1b]0;title more\r\n", "restzzzzzzzz"]);
+  });
+});
+
+/**
+ * F6 — the IPv6 and UUID rules are no longer shipped as defaults because the
+ * two of them cost more than every other rule combined. A user who adds them
+ * back by hand must get exactly the highlighting they had before, so the
+ * patterns published in the CHANGELOG and the settings description are pinned
+ * here verbatim.
+ */
+describe("TerminalHighlighter — restoring the opt-in IPv6 / UUID rules", () => {
+  const IPV6_PATTERN =
+    "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b";
+  const UUID_PATTERN =
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+
+  it("highlights IPv6 addresses once the documented rule is added back", () => {
+    setConfig(true, [{ pattern: IPV6_PATTERN, color: "magenta", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("addr fe80::1")).toContain("\x1b[35mfe80::1\x1b[39m");
+    expect(h.apply("addr 2001:db8::1")).toContain("\x1b[35m2001:db8::1\x1b[39m");
+    expect(h.apply("peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334 up")).toContain(
+      "\x1b[35m2001:0db8:85a3:0000:0000:8a2e:0370:7334\x1b[39m"
+    );
+  });
+
+  it("highlights UUIDs once the documented rule is added back", () => {
+    setConfig(true, [{ pattern: UUID_PATTERN, color: "brightBlue", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("id: 3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toContain(
+      "\x1b[94m3f2504e0-4f89-11d3-9a0c-0305e82c3301\x1b[39m"
+    );
   });
 });

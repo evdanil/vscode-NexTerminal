@@ -67,8 +67,22 @@ export class PtyObserverHub {
 
   /**
    * Fan output out to every observer, then render it: push to the highlighter
-   * stream when present, otherwise hand the (optionally highlighted) text to
-   * `emit`. Mirrors the inline data-handler block in each PTY exactly.
+   * stream when highlighting is actually active, otherwise hand the text
+   * straight to `emit`.
+   *
+   * The stream buffers for a flush period so a token split across chunks can
+   * still be matched. That cost only buys something when the highlighter has
+   * work to do. With highlighting off (or with no compiled rules) `apply()` is
+   * an identity function, so routing through the stream added a full flush
+   * period of latency to every keystroke echo in exchange for nothing — which
+   * is why turning highlighting off never fixed the typing lag it appeared to
+   * cause. The gate is evaluated per chunk rather than at PTY construction
+   * because `nexus.terminal.highlighting.enabled` is live: it must take effect
+   * on open sessions, not just new ones.
+   *
+   * Toggling mid-session must not strand or reorder output, so the bypass
+   * branch flushes the stream first. `flush()` is a no-op on an empty pending
+   * buffer, so the steady-state cost of that call is a single branch.
    */
   public notifyOutput(
     text: string,
@@ -83,9 +97,13 @@ export class PtyObserverHub {
         /* tolerate misbehaving observer — one throw must not break delivery to the others */
       }
     });
-    if (highlighterStream) {
+    // `isEnabled` is optional-called: partial highlighter doubles (tests, and
+    // the same duck-typing each PTY already applies to `createStream`) predate
+    // it, and for those the historical "always stream" behaviour is correct.
+    if (highlighterStream && highlighter?.isEnabled?.() !== false) {
       highlighterStream.push(text);
     } else {
+      highlighterStream?.flush();
       emit(highlighter ? highlighter.apply(text) : text);
     }
   }

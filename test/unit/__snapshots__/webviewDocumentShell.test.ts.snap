@@ -9089,6 +9089,15 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="validation-error" data-for="nexus.logging.maxRotatedFiles"></span>
   <span class="save-indicator" aria-live="polite" data-for="nexus.logging.maxRotatedFiles"></span>
 </div>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-logging-terminalOutputTrace">
+    <input type="checkbox" id="setting-nexus-logging-terminalOutputTrace" data-section="nexus.logging" data-key="terminalOutputTrace" />
+    Terminal Output Trace
+  </label>
+  
+  <div class="setting-desc">Troubleshooting only. Writes every chunk of terminal output to the diagnostic log as it arrives — which slows terminal output and stores session data, including anything echoed on screen such as passwords, as plaintext on disk. Leave off unless support asks for it.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.logging.terminalOutputTrace"></span>
+</div>
 
   <h3 id="section-ssh">SSH</h3>
   <h4 class="settings-subgroup">Connection</h4>

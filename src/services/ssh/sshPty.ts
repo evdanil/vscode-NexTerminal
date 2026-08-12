@@ -165,6 +165,9 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.shuttingDown = true;
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
+    // Extension deactivate reaches the PTYs here. The transcript writer is
+    // buffered, so anything still queued has to be forced out now.
+    this.transcript?.flush?.();
     this.stream?.destroy();
     this.connection?.dispose();
     this.stream = undefined;
@@ -207,6 +210,9 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.observerHub.pauseIntervalMacros();
     this.disconnected = true;
     this.highlighterStream?.flush();
+    // The session can sit disconnected indefinitely (or be reconnected), so the
+    // buffered transcript tail must reach disk at the moment of disconnect.
+    this.transcript?.flush?.();
     this.stream?.destroy();
     this.connection?.dispose();
     this.stream = undefined;
@@ -403,7 +409,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       stream.on("data", (data: Buffer | string) => {
         const rawText = typeof data === "string" ? data : data.toString("utf8");
         const text = this.oscFilter.filter(rawText);
-        this.logger.log(`stdout ${JSON.stringify(text)}`);
+        this.logger.logOutput?.(`stdout ${JSON.stringify(text)}`);
         this.transcript?.write(text);
         this.observerHub.notifyOutput(text, this.highlighterStream, this.highlighter, (rendered) =>
           this.writeEmitter.fire(rendered)
