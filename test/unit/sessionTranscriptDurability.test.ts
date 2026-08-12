@@ -96,20 +96,37 @@ function allTranscriptText(dir: string, prefix: string): string {
 }
 
 /**
- * The writer's carried-over bytes, in the two stages the writer keeps them in:
+ * The writer's carried-over bytes, in the stages the writer keeps them in:
  * `owed` — bytes already placed in the live file (any rotation they required
  * has been performed; only the append remains) — and `pending` — chunks whose
  * placement has not been decided yet, one per write() call, carrying no
- * decisions at all. Read through a function rather than captured once: both
- * are reassigned as drains progress.
+ * decisions at all. `inFlight` is the fourth: placed bytes taken out of `owed`
+ * for exactly as long as one `fs.write` holds them, and the only thing the
+ * retention cap does not count. Read through a function rather than captured
+ * once: all of them are reassigned as drains progress.
  */
-function stagesOf(transcript: SessionTranscript): { owed: Buffer; pending: Buffer[]; queue: string[] } {
-  return transcript as unknown as { owed: Buffer; pending: Buffer[]; queue: string[] };
+function stagesOf(transcript: SessionTranscript): {
+  owed: Buffer;
+  inFlight: Buffer;
+  pending: Buffer[];
+  queue: string[];
+} {
+  return transcript as unknown as {
+    owed: Buffer;
+    inFlight: Buffer;
+    pending: Buffer[];
+    queue: string[];
+  };
 }
 
 function retainedBytesOf(transcript: SessionTranscript): number {
   const { owed, pending } = stagesOf(transcript);
   return pending.reduce((total, chunk) => total + chunk.length, owed.length);
+}
+
+/** Everything the writer holds in its own stages: `owed` + `pending` + `queue`. */
+function heldBytesOf(transcript: SessionTranscript): number {
+  return shedableBytesOf(transcript) + stagesOf(transcript).owed.length;
 }
 
 /**
@@ -476,38 +493,44 @@ describe("session transcript failure paths", () => {
 
   /**
    * E3 — the retention cap exempted the last batch standing, so it only ever
-   * bounded a queue of *several* batches. `takeBatches()` coalesces every
-   * adjacent chunk bound for the same file into one batch, so the common shape
-   * under a permanently failing fd is a single batch holding everything — and
-   * that one was exempt. The stated 1 MiB bound did not hold.
+   * bounded a queue of *several* batches. Coalescing puts every adjacent chunk
+   * bound for the same file into one placed buffer, so the common shape under
+   * a permanently failing fd was a single unit holding everything — and that
+   * one was exempt. The stated 1 MiB bound did not hold.
+   *
+   * Coalescing now stops at one capful, so 3 MiB of same-file output is held
+   * as a placed buffer plus undecided chunks rather than as one unit; what
+   * this test guards is unchanged and is asserted across the stages, because
+   * which stage a surviving byte sits in was never the point.
    */
   it("bounds a single oversized retained batch, keeping the newest bytes", async () => {
     const dir = makeTempDir();
-    // A file limit far above anything written here, so nothing rotates and the
-    // whole queue coalesces into exactly one batch.
+    // A file limit far above anything written here, so nothing rotates and
+    // every chunk is bound for the same generation.
     const transcript = open(dir, "cap", 64 * 1024 * 1024, 1);
 
+    let refusals = 0;
     hooks.write = (...args: unknown[]) => {
       const callback = args[args.length - 1] as (error: Error | null, written: number) => void;
+      refusals += 1;
       setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
     };
 
-    // 3 MiB, three times the cap, in chunks that land in one batch. The first
-    // and last carry markers so it is visible which end survived.
+    // 3 MiB, three times the cap. The first and last chunks carry markers so
+    // it is visible which end survived.
     transcript.write(`HEAD-MARKER${"a".repeat(1024 * 1024 - 11)}`);
     transcript.write("b".repeat(1024 * 1024));
     transcript.write(`${"c".repeat(1024 * 1024 - 11)}TAIL-MARKER`);
-    await sleep(400); // timer drain — every write fails
+    await sleep(400); // timer drain — the write fails
 
-    const { owed, pending } = stagesOf(transcript);
-    // Non-vacuous: coalescing really did put everything into one placed
-    // buffer — the single-unit shape the old cap exempted outright.
-    expect(pending).toHaveLength(0);
-    expect(owed.length).toBeGreaterThan(0);
-    expect(retainedBytesOf(transcript)).toBeLessThanOrEqual(1024 * 1024);
+    // Non-vacuous: the fd really did refuse, so the writer really was left
+    // holding 3 MiB it could not get rid of, and the cap had to shed two
+    // thirds of it — exactly, not approximately.
+    expect(refusals).toBeGreaterThan(0);
+    expect(retainedBytesOf(transcript)).toBe(1024 * 1024);
 
     // Oldest-first shedding, so it is the tail that survives.
-    const held = owed.toString("utf8");
+    const held = heldTextOf(transcript);
     expect(held.endsWith("TAIL-MARKER")).toBe(true);
     expect(held).not.toContain("HEAD-MARKER");
 
@@ -696,32 +719,42 @@ describe("session transcript failure paths", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return (hooks.actual!.unlinkSync as any)(...args);
     };
-    let writes = 0;
+    // The fault, expressed in bytes rather than in syscalls: exactly `partial`
+    // bytes of this chunk are allowed to reach the file, however many appends
+    // the writer splits it into, and the next append after that fails outright
+    // — stranding a remainder larger than the cap. Counting calls instead
+    // would be asserting how the writer chooses to slice its syscalls, which
+    // is not what this test is about.
+    let landed = 0;
+    let refused = false;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     hooks.write = (...args: any[]) => {
-      const [fd, data, offset, , callback] = args;
-      writes += 1;
-      if (writes === 1) {
-        // A short write: only the prefix lands.
-        hooks.actual!.write(fd, data, offset, partial, callback);
+      const [fd, data, offset, length, callback] = args;
+      if (refused) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (hooks.actual!.write as any)(...args);
         return;
       }
-      if (writes === 2) {
-        // The resume fails, stranding a remainder larger than the cap.
+      const room = partial - landed;
+      if (room <= 0) {
+        refused = true;
         setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
         return;
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (hooks.actual!.write as any)(...args);
+      const take = Math.min(length as number, room);
+      landed += take;
+      hooks.actual!.write(fd, data, offset, take, callback);
     };
 
     transcript.write(chunk);
     await sleep(400); // timer drain: rotate once, prefix lands, resume fails, cap trims
 
     // Non-vacuous: the rotation really happened — at maxRotatedFiles: 0 that
-    // is one unlink of the live file — and the prefix really is on disk.
+    // is one unlink of the live file — the prefix really is on disk, and the
+    // fd really did refuse the rest.
     expect(unlinks).toBe(1);
-    expect(writes).toBe(2);
+    expect(landed).toBe(partial);
+    expect(refused).toBe(true);
     const file = transcriptPath(dir, "double_");
     expect(statSync(file).size).toBe(partial);
 
@@ -751,26 +784,34 @@ describe("session transcript failure paths", () => {
     const partial = 1536 * 1024;
     const chunk = `PREFIX-MARKER${"x".repeat(3 * 1024 * 1024 - 24)}TAIL-MARKER`;
 
-    let writes = 0;
+    // Same fault as F1, in bytes rather than syscalls: `partial` bytes land
+    // however the writer slices its appends, then the next one fails.
+    let landed = 0;
+    let refused = false;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     hooks.write = (...args: any[]) => {
-      const [fd, data, offset, , callback] = args;
-      writes += 1;
-      if (writes === 1) {
-        hooks.actual!.write(fd, data, offset, partial, callback);
+      const [fd, data, offset, length, callback] = args;
+      if (refused) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (hooks.actual!.write as any)(...args);
         return;
       }
-      if (writes === 2) {
+      const room = partial - landed;
+      if (room <= 0) {
+        refused = true;
         setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
         return;
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (hooks.actual!.write as any)(...args);
+      const take = Math.min(length as number, room);
+      landed += take;
+      hooks.actual!.write(fd, data, offset, take, callback);
     };
 
     transcript.write(chunk);
     await sleep(400);
-    expect(writes).toBe(2); // non-vacuous: the partial write and the failure both happened
+    // Non-vacuous: the partial write and the failure both happened.
+    expect(landed).toBe(partial);
+    expect(refused).toBe(true);
 
     transcript.flush?.();
 
@@ -918,10 +959,14 @@ describe("session transcript failure paths", () => {
     expect(shedableBytesOf(transcript)).toBeLessThanOrEqual(1024 * 1024);
     // The buffer inside the wedged syscall is exempt — the kernel owns it and
     // dropping it would free nothing — but it is a single append that cannot
-    // grow, not a leak: it still holds only the pre-wedge write.
-    const { owed } = stagesOf(transcript);
-    expect(owed.length).toBeLessThan(1024);
-    expect(shedableBytesOf(transcript) + owed.length).toBeLessThanOrEqual(2 * 1024 * 1024);
+    // grow, not a leak: it still holds only the pre-wedge write. It is read
+    // from `inFlight` rather than `owed` because that is where an append's
+    // bytes now live for the duration of the syscall; the claim is the one
+    // this assertion always made.
+    const { owed, inFlight } = stagesOf(transcript);
+    expect(owed.length).toBe(0);
+    expect(inFlight.length).toBeLessThan(1024);
+    expect(heldBytesOf(transcript) + inFlight.length).toBeLessThanOrEqual(2 * 1024 * 1024);
 
     // Newest-first survival, the same policy the drain-time cap applies.
     const held = heldTextOf(transcript);
@@ -931,5 +976,198 @@ describe("session transcript failure paths", () => {
     // Nothing on the hot path blocked: no synchronous write, no open.
     expect(syncWrites).toBe(0);
     expect(opens).toBe(0);
+  });
+
+  /**
+   * The hole in J2's own bound. J2 wedges on a *small* pre-wedge write, so the
+   * buffer the exemption covers is a few dozen bytes and the 2 × cap bound
+   * holds by accident rather than by construction.
+   *
+   * The exemption was justified by "promote() only moves bytes already inside
+   * the cap" — true of every drain except the first. Before the first drain
+   * there is a whole flush interval with no cap in force at all, and rightly
+   * so: the file has been offered nothing and has refused nothing. Everything
+   * that arrives in that window is then ingested wholesale, coalesced into one
+   * placed buffer, and handed to a single `fs.write`. Wedge that write and the
+   * entire burst is pinned *and* exempt, with another capful retained behind
+   * it: 9 MiB against a stated 1 MiB, for as long as the descriptor stays
+   * wedged.
+   */
+  it("bounds a burst that arrived before the first drain and then wedged", async () => {
+    const dir = makeTempDir();
+    // Far above anything written here: this is about the memory bound, not
+    // rotation.
+    const transcript = open(dir, "burstcap", 64 * 1024 * 1024, 1);
+
+    // Record the size of every buffer handed to the kernel, and never call
+    // back. Measuring the syscall argument rather than a field is the point:
+    // the exempt memory is whatever `fs.write` was given.
+    const appends: number[] = [];
+    const park = deferringWrite(Number.MAX_SAFE_INTEGER);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.write = (...args: any[]) => {
+      appends.push(args[3] as number);
+      park(...args);
+    };
+
+    // 8 MiB before any drain has started — the window where no cap applies,
+    // because holding one flush interval of output is this writer's premise.
+    let produced = 0;
+    const produce = (text: string): void => {
+      produced += Buffer.byteLength(text, "utf8");
+      transcript.write(text);
+    };
+    produce(`OLDEST-MARKER${"o".repeat(64 * 1024)}`);
+    for (let index = 0; index < 64; index += 1) {
+      produce("x".repeat(128 * 1024));
+    }
+    produce(`${"p".repeat(64 * 1024)}PRE-DRAIN-TAIL`);
+
+    // Non-vacuous: the burst really did arrive before anything was offered to
+    // the file, and it really is many times the cap.
+    expect(appends).toHaveLength(0);
+    expect(produced).toBeGreaterThan(8 * 1024 * 1024);
+
+    // The timer fires: the drain takes the whole burst on and wedges on its
+    // first append.
+    for (let attempt = 0; attempt < 200 && appends.length === 0; attempt += 1) {
+      await sleep(5);
+    }
+    expect(appends).toHaveLength(1);
+    // The one buffer the cap can never reclaim is one capful — not the burst.
+    expect(appends[0]).toBeLessThanOrEqual(1024 * 1024);
+
+    // Output keeps arriving while that append stays outstanding. Past the
+    // stall threshold the bytes queued behind it stop counting as bytes on
+    // their way out, and the cap reaches them.
+    await sleep(400);
+    produce(`${"n".repeat(1024 * 1024)}NEWEST-MARKER`);
+
+    // Still wedged: not one byte has reached the file, and no second append
+    // was ever attempted.
+    expect(appends).toHaveLength(1);
+    expect(statSync(transcriptPath(dir, "burstcap_")).size).toBe(0);
+
+    // The bound. One capful in the writer's own stages, one capful inside the
+    // syscall, and nothing else anywhere.
+    expect(heldBytesOf(transcript)).toBeLessThanOrEqual(1024 * 1024);
+    expect(heldBytesOf(transcript) + appends[0]).toBeLessThanOrEqual(2 * 1024 * 1024);
+
+    // Oldest-first shedding: the burst went, the newest bytes stayed.
+    const held = heldTextOf(transcript);
+    expect(held.endsWith("NEWEST-MARKER")).toBe(true);
+    expect(held).not.toContain("OLDEST-MARKER");
+    expect(held).not.toContain("PRE-DRAIN-TAIL");
+  });
+
+  /**
+   * The other half of that bound, and the property it must not buy. Shedding
+   * is for a file that is refusing bytes — never for a burst the writer has
+   * merely not finished handing over. A burst larger than the cap now reaches
+   * the file as several appends, and terminal output does not politely stop
+   * while that happens: a chunk arrives while one of those appends is
+   * outstanding and more than a capful is still committed behind it. That is
+   * the exact moment a cap that counted committed-but-not-yet-offered bytes
+   * would throw away the middle of a healthy burst.
+   */
+  it("writes a burst larger than the cap in full and in order while the descriptor is healthy", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "healthy", 64 * 1024 * 1024, 1);
+
+    let appends = 0;
+    const park = deferringWrite(1); // hold the first append; the rest are real
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.write = (...args: any[]) => {
+      appends += 1;
+      park(...args);
+    };
+
+    // 3 MiB before the first drain.
+    const burst = Array.from(
+      { length: 48 },
+      (_, index) => `chunk-${String(index).padStart(3, "0")}:${"=".repeat(64 * 1024)}\n`
+    );
+    for (const chunk of burst) {
+      transcript.write(chunk);
+    }
+
+    // The drain starts and parks inside its first append.
+    for (let attempt = 0; attempt < 200 && parked.length === 0; attempt += 1) {
+      await sleep(5);
+    }
+    expect(parked).toHaveLength(1);
+
+    // Non-vacuous: at this instant the writer is holding well over a capful in
+    // the stages the cap can reach, with an append outstanding — the state
+    // that decides whether splitting the append cost us the burst.
+    expect(heldBytesOf(transcript)).toBeGreaterThan(1024 * 1024);
+
+    const tail = Array.from(
+      { length: 4 },
+      (_, index) => `chunk-${String(48 + index).padStart(3, "0")}:${"=".repeat(64 * 1024)}\n`
+    );
+    for (const chunk of tail) {
+      transcript.write(chunk);
+    }
+
+    // The descriptor was never broken — it was mid-syscall. Let it go.
+    parked.splice(0, parked.length)[0].run();
+
+    const file = transcriptPath(dir, "healthy_");
+    const expected = [...burst, ...tail].join("");
+    const last = tail[tail.length - 1];
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      if (readFileSync(file, "utf8").endsWith(last)) {
+        break;
+      }
+      await sleep(20);
+    }
+
+    // Every byte, in order, with nothing shed and nothing duplicated across
+    // the append boundaries.
+    const body = readFileSync(file, "utf8").split("\n").slice(1).join("\n");
+    expect(body).toBe(expected);
+    // Non-vacuous: the burst really was split across several appends rather
+    // than handed over in one.
+    expect(appends).toBeGreaterThan(3);
+  });
+
+  /**
+   * The other side of leaving committed bytes alone while an append is
+   * progressing: what arrives *behind* that append is growth, and it is what
+   * bounds a descriptor that simply cannot keep up with the session. `queue`
+   * is the only stage that cap can reach, so a chunk it cuts in half must stay
+   * there — a survivor moved into any other stage is exempt from the very cap
+   * that just measured it, and one cut per arriving chunk turns a slow write
+   * into a slow leak.
+   */
+  it("holds arrivals to one capful while an append is still progressing", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "arrivals", 64 * 1024 * 1024, 1);
+    hooks.write = deferringWrite(1);
+
+    transcript.write("first\n");
+    for (let attempt = 0; attempt < 200 && parked.length === 0; attempt += 1) {
+      await sleep(5);
+    }
+    expect(parked).toHaveLength(1);
+    // The drain took everything it had into that append, so what the writer
+    // holds from here on is arrivals and nothing else.
+    expect(heldBytesOf(transcript)).toBe(0);
+
+    // 4 MiB of arrivals in two sizes, so the cap has to cut a chunk rather
+    // than only drop whole ones.
+    for (let index = 0; index < 40; index += 1) {
+      transcript.write("L".repeat(100 * 1024));
+      transcript.write(`s${"s".repeat(3 * 1024)}`);
+    }
+
+    // Non-vacuous: the append never came back, so this is the healthy-but-slow
+    // case rather than a wedge that has been recognised as one.
+    expect(parked).toHaveLength(1);
+    expect(heldBytesOf(transcript)).toBeLessThanOrEqual(1024 * 1024);
+
+    // Newest-first survival, as everywhere else.
+    expect(heldTextOf(transcript).endsWith("s".repeat(3 * 1024))).toBe(true);
   });
 });
