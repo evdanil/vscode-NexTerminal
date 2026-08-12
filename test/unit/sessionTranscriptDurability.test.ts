@@ -103,13 +103,33 @@ function allTranscriptText(dir: string, prefix: string): string {
  * decisions at all. Read through a function rather than captured once: both
  * are reassigned as drains progress.
  */
-function stagesOf(transcript: SessionTranscript): { owed: Buffer; pending: Buffer[] } {
-  return transcript as unknown as { owed: Buffer; pending: Buffer[] };
+function stagesOf(transcript: SessionTranscript): { owed: Buffer; pending: Buffer[]; queue: string[] } {
+  return transcript as unknown as { owed: Buffer; pending: Buffer[]; queue: string[] };
 }
 
 function retainedBytesOf(transcript: SessionTranscript): number {
   const { owed, pending } = stagesOf(transcript);
   return pending.reduce((total, chunk) => total + chunk.length, owed.length);
+}
+
+/**
+ * The bytes the writer is holding that it could still choose to drop: the
+ * undecided chunks plus the raw queue. Counted independently of the writer's
+ * own accounting — the point of the test that uses this is that the accounting
+ * was measuring a subset.
+ */
+function shedableBytesOf(transcript: SessionTranscript): number {
+  const { pending, queue } = stagesOf(transcript);
+  return queue.reduce(
+    (total, chunk) => total + Buffer.byteLength(chunk, "utf8"),
+    pending.reduce((total, chunk) => total + chunk.length, 0)
+  );
+}
+
+/** Everything still held, oldest first, as text. */
+function heldTextOf(transcript: SessionTranscript): string {
+  const { owed, pending, queue } = stagesOf(transcript);
+  return [owed.toString("utf8"), ...pending.map((chunk) => chunk.toString("utf8")), ...queue].join("");
 }
 
 /** Every generation of a transcript on disk, base file included. */
@@ -832,5 +852,84 @@ describe("session transcript failure paths", () => {
     // satisfied.
     expect(parked.length).toBeGreaterThan(0);
     expect(existsSync(transcriptPath(dir, "wedged_"))).toBe(true);
+  });
+
+  /**
+   * J2 — the retention cap measured `owed` plus `pending` and ignored `queue`,
+   * the one stage that can grow while a write is wedged. An `fs.write` whose
+   * callback never fires (a stalled network share is the realistic case) leaves
+   * the drain awaiting forever: `trimRetained` is never reached, every later
+   * drain queues behind the blocked promise, and terminal output piles into a
+   * queue nothing was measuring. A busy session could exhaust the extension
+   * host despite MAX_RETAINED_BYTES.
+   */
+  it("bounds what it holds while a write stays wedged forever, keeping the newest bytes", async () => {
+    const dir = makeTempDir();
+    // A file limit far above anything written here: nothing rotates, so this
+    // is about the memory bound and nothing else.
+    const transcript = open(dir, "wedgecap", 64 * 1024 * 1024, 1);
+
+    hooks.write = deferringWrite(Number.MAX_SAFE_INTEGER); // never calls back
+
+    // Wedge a drain: it takes the header, hands it to fs.write, and never hears
+    // back. From here on no drain can complete, so nothing this session writes
+    // can ever reach the drain-time trim.
+    transcript.write("wedge me\n");
+    await sleep(400);
+    expect(parked).toHaveLength(1);
+
+    // The hot path must stay off blocking syscalls even while the bound is
+    // being enforced — a cap that holds by draining synchronously would put a
+    // wedged fd's latency straight onto the render path.
+    let syncWrites = 0;
+    let opens = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.writeSync = (...args: any[]) => {
+      syncWrites += 1;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (hooks.actual!.writeSync as any)(...args);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.openSync = (...args: any[]) => {
+      opens += 1;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (hooks.actual!.openSync as any)(...args);
+    };
+
+    // 8 MiB of output into a writer that cannot write anything at all.
+    let produced = 0;
+    const produce = (text: string): void => {
+      produced += Buffer.byteLength(text, "utf8");
+      transcript.write(text);
+    };
+    produce(`OLDEST-MARKER${"o".repeat(64 * 1024)}`);
+    for (let index = 0; index < 63; index += 1) {
+      produce("x".repeat(128 * 1024));
+    }
+    produce(`${"n".repeat(64 * 1024)}NEWEST-MARKER`);
+    await sleep(400);
+
+    // Non-vacuous: the write really never came back, so no drain ever ran the
+    // trim, and 8 MiB really did arrive behind it.
+    expect(parked).toHaveLength(1);
+    expect(produced).toBeGreaterThan(8 * 1024 * 1024);
+
+    // The bound, enforced with the drain permanently out of the picture.
+    expect(shedableBytesOf(transcript)).toBeLessThanOrEqual(1024 * 1024);
+    // The buffer inside the wedged syscall is exempt — the kernel owns it and
+    // dropping it would free nothing — but it is a single append that cannot
+    // grow, not a leak: it still holds only the pre-wedge write.
+    const { owed } = stagesOf(transcript);
+    expect(owed.length).toBeLessThan(1024);
+    expect(shedableBytesOf(transcript) + owed.length).toBeLessThanOrEqual(2 * 1024 * 1024);
+
+    // Newest-first survival, the same policy the drain-time cap applies.
+    const held = heldTextOf(transcript);
+    expect(held.endsWith("NEWEST-MARKER")).toBe(true);
+    expect(held).not.toContain("OLDEST-MARKER");
+
+    // Nothing on the hot path blocked: no synchronous write, no open.
+    expect(syncWrites).toBe(0);
+    expect(opens).toBe(0);
   });
 });

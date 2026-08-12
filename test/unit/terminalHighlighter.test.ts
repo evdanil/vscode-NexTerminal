@@ -92,10 +92,59 @@ describe("TerminalHighlighter", () => {
       vi.advanceTimersByTime(15);
     }
 
-    // One emission, at the ceiling, holding back only the retention margin —
-    // which is correct here because data really is still arriving.
+    // One emission, at the ceiling, holding back nothing. The ceiling used to
+    // retain the 256-byte margin here; it cannot, because retention is allowed
+    // to emit nothing at all (whenever the buffer is smaller than the margin)
+    // and a deadline that can emit nothing bounds nothing. See the trickle test
+    // below, which is that same path with a buffer under the margin.
     expect(emitted).toHaveLength(1);
-    expect(emitted[0]).toBe("x".repeat(64 * 11 - 256));
+    expect(emitted[0]).toBe("x".repeat(64 * 11));
+  });
+
+  it("renders a trickle below the idle delay within the ceiling period", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const flushDelay = 20;
+    const ceiling = flushDelay * 8;
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), flushDelay);
+
+    // One character every 15 ms against a 20 ms idle delay: the idle timer is
+    // restarted before it can ever fire, no character is a line boundary, and
+    // the whole run stays two orders of magnitude under both the 16 KiB cap and
+    // — this is the part that used to break the ceiling — the 256-character
+    // retention margin. Emitting "everything except the last 256 characters" of
+    // a 40-character buffer emits nothing, and the ceiling cleared itself
+    // anyway, so the next push started a fresh 160 ms period from a new anchor.
+    // Repeat forever: the first character stayed invisible until the buffer
+    // crossed 256 characters, ~3.6 s at this rate.
+    const text = Array.from({ length: 40 }, (_, index) =>
+      String.fromCharCode(97 + (index % 26))
+    ).join("");
+
+    const arrivedAt: number[] = [];
+    let now = 0;
+    for (const character of text) {
+      stream.push(character);
+      arrivedAt.push(now);
+      vi.advanceTimersByTime(15);
+      now += 15;
+
+      const rendered = emitted.join("");
+      // The guarantee, asserted continuously rather than at one instant: every
+      // character that arrived a full ceiling period ago is on the screen.
+      const due = arrivedAt.filter((at) => at + ceiling <= now).length;
+      expect(rendered.length).toBeGreaterThanOrEqual(due);
+      // ...and nothing is reordered, duplicated or invented on the way there.
+      expect(text.startsWith(rendered)).toBe(true);
+    }
+
+    // Non-vacuous: the run really did exercise the ceiling (the deadline came
+    // up while data was still arriving) and really did stay under the margin.
+    expect(now).toBeGreaterThan(ceiling);
+    expect(text.length).toBeLessThan(256);
+    expect(emitted.length).toBeGreaterThan(0);
   });
 
   it("does not split a token whose fragments straddle the flush deadline", () => {

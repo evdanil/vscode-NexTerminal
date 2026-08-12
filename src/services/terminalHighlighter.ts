@@ -18,12 +18,11 @@ const STREAM_MAX_PENDING_LENGTH = 16384;
 // continuation arrives. Covers every built-in rule; user patterns whose matches
 // can exceed this length may still split at chunk boundaries.
 //
-// Retention applies on the two paths that fire while data is still flowing —
-// the hard cap below and STREAM_MAX_PENDING_PERIODS — where the continuation is
-// moments away, so holding a tail costs nothing and saves the match. The *idle*
-// flush is the opposite situation: it only fires when the stream has gone quiet
-// for a whole flush period, so a retained tail is not waiting for an imminent
-// continuation, it is just output the user cannot see yet. See onIdleFlush().
+// Retention applies on exactly one path: the hard cap below, which fires only
+// because 16 KiB arrived faster than a flush period — the continuation really
+// is moments away, so holding a tail costs no perceptible latency and saves the
+// match. Neither timer retains: both are latency deadlines, and a deadline that
+// holds bytes back is not one. See onIdleFlush() and STREAM_MAX_PENDING_PERIODS.
 const STREAM_RETAIN_MARGIN = 256;
 
 // Ceiling on how long the oldest pending byte may wait, expressed in flush
@@ -36,8 +35,24 @@ const STREAM_RETAIN_MARGIN = 256;
 // `base64 -w0` line over a slow hop — can hold well under 16 KiB for a long
 // while. This bounds it in time as well.
 //
-// Unlike the idle flush it emits *with* retention: it fires while data is still
-// arriving, which is exactly the situation STREAM_RETAIN_MARGIN exists for.
+// GUARANTEE: no byte waits longer than one ceiling period before it is
+// rendered, for any arrival pattern. Two properties carry that, and both are
+// load-bearing. (1) The timer is armed only when a byte enters an *empty*
+// buffer and is never restarted while bytes remain, so its deadline always
+// belongs to the oldest pending byte — see rearmTimers(). (2) When it fires it
+// emits everything, so that byte is actually rendered.
+//
+// (2) is why it retains nothing, even though it is the one deadline that fires
+// while data is still arriving. Retaining STREAM_RETAIN_MARGIN here emitted
+// *nothing at all* whenever the buffer held less than the margin, and the
+// cleared timer was then re-armed by the next push from a fresh anchor — so a
+// trickle of one character every 14 ms stayed invisible until it crossed 256
+// characters, about 3.6 s. A latency backstop that can emit nothing is not a
+// backstop, and the guarantee its comment claimed was simply false. The cost of
+// emitting everything is at most one split token per ceiling period, and only
+// during a stream that produces no line boundary for that long — the same trade
+// onIdleFlush() already makes, for the same reason: rendering beats matching
+// once a deadline is up.
 const STREAM_MAX_PENDING_PERIODS = 8;
 
 const VALID_FLAGS_RE = /^[gi]*$/;
@@ -415,6 +430,22 @@ export class TerminalHighlighterStream implements vscode.Disposable {
 
   public flush(): void {
     this.clearTimers();
+    this.emitAllPending();
+  }
+
+  public dispose(): void {
+    this.flush();
+  }
+
+  /**
+   * Render everything pending, in ONE tick, retaining nothing.
+   *
+   * Both deadlines end here. Neither may retain a margin: a deadline exists to
+   * bound how long a byte can stay invisible, and a path that can emit nothing
+   * — which is exactly what emitWithRetention() does when the buffer is
+   * smaller than the margin — bounds nothing at all.
+   */
+  private emitAllPending(): void {
     if (!this.pending) {
       return;
     }
@@ -422,10 +453,14 @@ export class TerminalHighlighterStream implements vscode.Disposable {
     this.pending = "";
   }
 
-  public dispose(): void {
-    this.flush();
-  }
-
+  /**
+   * Emit all but the trailing margin, so a token that is still arriving keeps
+   * enough context to match when its continuation lands. Only the hard cap
+   * calls this: it fires because bytes are arriving faster than a flush period,
+   * never because time ran out, so holding a tail back costs nothing in
+   * latency. Emits nothing when the buffer is at or under the margin — which is
+   * why no deadline may route through here.
+   */
   private emitWithRetention(): void {
     if (this.pending.length <= STREAM_RETAIN_MARGIN) {
       return;
@@ -449,6 +484,13 @@ export class TerminalHighlighterStream implements vscode.Disposable {
    *
    * The ceiling timer is the opposite: it must not be restarted, or a stream
    * that never goes quiet would never reach it either.
+   *
+   * That asymmetry is what makes the ceiling's deadline belong to the *oldest*
+   * pending byte: it is armed here only while none is running, and every path
+   * that leaves it un-armed — this method when the buffer is empty, both flush
+   * paths, and the ceiling firing — has emptied the buffer first. So an arm
+   * always follows a byte entering an empty buffer, and that byte's deadline is
+   * the one the timer carries until it fires.
    */
   private rearmTimers(): void {
     this.clearFlushTimer();
@@ -463,7 +505,10 @@ export class TerminalHighlighterStream implements vscode.Disposable {
     if (this.ceilingTimer === undefined) {
       this.ceilingTimer = setTimeout(() => {
         this.ceilingTimer = undefined;
-        this.emitWithRetention();
+        // Everything, not emitWithRetention(): see STREAM_MAX_PENDING_PERIODS.
+        // Emptying the buffer is also what keeps the next arm honest — the next
+        // push anchors a fresh period to its own byte.
+        this.emitAllPending();
       }, this.flushDelayMs * STREAM_MAX_PENDING_PERIODS);
     }
   }
@@ -480,12 +525,7 @@ export class TerminalHighlighterStream implements vscode.Disposable {
    * flush period late, in two stages instead of one.
    */
   private onIdleFlush(): void {
-    if (!this.pending) {
-      this.clearCeilingTimer();
-      return;
-    }
-    this.emit(this.highlighter.apply(this.pending));
-    this.pending = "";
+    this.emitAllPending();
     this.clearCeilingTimer();
   }
 
