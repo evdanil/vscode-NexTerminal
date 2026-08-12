@@ -25,6 +25,16 @@ const SHUTDOWN_FLUSH_TIMEOUT_MS = 1000;
 // amount of heap rather than the extension host.
 const MAX_RETAINED_BYTES = 1024 * 1024;
 
+// Backoff for the tail a `close()` could not land. The descriptor and the
+// transcript's registration are held open across these attempts, so the budget
+// is deliberately short and finite: a permanently failing fd must cost a
+// bounded delay and one descriptor, not either of them for the rest of the
+// session. Timers only — `close()` itself must not block terminal closure.
+const CLOSE_RETRY_DELAYS_MS = [50, 250, 1000];
+
+/** `fd` value meaning "this transcript owns no descriptor right now". */
+const NO_FD = -1;
+
 function stripTerminalCodes(data: string): string {
   return data.replace(createAnsiRegex(), "").replace(CTRL_RE, "");
 }
@@ -74,9 +84,13 @@ interface PendingBatch {
  *   leaves the unwritten bytes queued for the next drain instead of dropping
  *   them. `currentSize` only ever advances by bytes that actually reached the
  *   file, so rotation cannot drift out of step with the file on disk.
+ * - **Descriptor ownership.** `fd` holds a descriptor this transcript owns, or
+ *   {@link NO_FD}. It is never left holding a number the process has already
+ *   handed back — see {@link releaseFd}.
  */
 class FileSessionTranscript implements SessionTranscript {
-  private fd: number;
+  /** Open descriptor, or {@link NO_FD} when none is currently owned. */
+  private fd: number = NO_FD;
   private currentSize: number;
   private closed = false;
   private queue: string[] = [];
@@ -90,6 +104,15 @@ class FileSessionTranscript implements SessionTranscript {
   private flushTimer?: ReturnType<typeof setTimeout>;
   private flushChain: Promise<void> = Promise.resolve();
   private draining = false;
+  /**
+   * The generations have been shifted but no descriptor has been acquired for
+   * the new file yet — a rotation that got half-way. A retry must finish it,
+   * not restart it: shifting twice would move the just-rotated content another
+   * generation along, and at `maxRotatedFiles: 1` would delete it outright.
+   */
+  private rotationShifted = false;
+  private closeAttempt = 0;
+  private closeRetryTimer?: ReturnType<typeof setTimeout>;
 
   public constructor(
     private readonly filepath: string,
@@ -97,7 +120,7 @@ class FileSessionTranscript implements SessionTranscript {
   ) {
     mkdirSync(path.dirname(filepath), { recursive: true });
     this.currentSize = this.readCurrentSize();
-    this.fd = openSync(filepath, "a");
+    this.openFd();
     const header = `--- Session started ${new Date().toISOString()} ---\n`;
     this.enqueue(header);
     liveTranscripts.add(this);
@@ -145,9 +168,19 @@ class FileSessionTranscript implements SessionTranscript {
         break;
       }
     }
-    if (this.closed || this.draining) {
-      // `draining` here means the chain outran the loop above. Leave the fd to
-      // the drain that owns it rather than interleaving a synchronous write.
+    if (this.draining) {
+      // The chain outran the loop above. Leave the fd to the drain that owns it
+      // rather than interleaving a synchronous write.
+      return;
+    }
+    if (this.closed) {
+      // A close that could not land its tail stays registered, with its
+      // descriptor open, until the retry budget runs out. Teardown is the last
+      // chance those bytes get, so spend it here rather than waiting for a
+      // timer the host is about to stop running.
+      if (this.retained.length > 0) {
+        this.finishClose();
+      }
       return;
     }
     // Nothing is in flight now, so the tail (and anything a failed write put
@@ -167,16 +200,70 @@ class FileSessionTranscript implements SessionTranscript {
     if (this.draining) {
       // Rare: a timer drain is in flight. Finish the close behind it so the
       // file is never written to after closeSync.
-      this.flushChain = this.flushChain.then(() => {
-        this.drainSync();
-        closeSync(this.fd);
-        liveTranscripts.delete(this);
-      });
+      this.flushChain = this.flushChain.then(() => this.finishClose());
       return;
     }
+    this.finishClose();
+  }
+
+  /**
+   * Land the tail, then let the descriptor go.
+   *
+   * The drain can fail — a transient EIO, a network share that blinked — and
+   * when it does the tail and the session footer sit in `retained`. Closing the
+   * descriptor and deregistering here would put them out of reach of every
+   * retry path there is, which loses precisely the bytes retention exists to
+   * keep. So a failed drain keeps both, and a timer retries on a short, finite
+   * budget. `close()` itself stays synchronous and returns immediately either
+   * way: terminal closure must not wait on a wedged filesystem.
+   */
+  private finishClose(): void {
+    this.clearCloseRetryTimer();
     this.drainSync();
-    closeSync(this.fd);
+    if (this.retained.length > 0) {
+      this.scheduleCloseRetry();
+      return;
+    }
+    this.releaseFd();
     liveTranscripts.delete(this);
+  }
+
+  private scheduleCloseRetry(): void {
+    const delay = CLOSE_RETRY_DELAYS_MS[this.closeAttempt];
+    if (delay === undefined) {
+      this.abandonTail();
+      return;
+    }
+    this.closeAttempt += 1;
+    this.closeRetryTimer = setTimeout(() => {
+      this.closeRetryTimer = undefined;
+      this.finishClose();
+    }, delay);
+    // Never hold the host process open for a transcript that is already closed.
+    (this.closeRetryTimer as { unref?: () => void }).unref?.();
+  }
+
+  private clearCloseRetryTimer(): void {
+    if (this.closeRetryTimer !== undefined) {
+      clearTimeout(this.closeRetryTimer);
+      this.closeRetryTimer = undefined;
+    }
+  }
+
+  /**
+   * The retry budget is spent. Report the loss rather than swallowing it — a
+   * transcript that silently ends short is worse than one that says it did —
+   * and release the descriptor so a permanently failing file costs nothing
+   * further.
+   */
+  private abandonTail(): void {
+    const lost = this.retained.reduce((total, batch) => total + batch.data.length, 0);
+    this.retained = [];
+    this.releaseFd();
+    liveTranscripts.delete(this);
+    console.error(
+      `[Nexus] Session transcript ${this.filepath}: the last ${lost} byte(s) could not be written and have been dropped.`
+    );
   }
 
   private enqueue(text: string): void {
@@ -347,6 +434,9 @@ class FileSessionTranscript implements SessionTranscript {
    * owed and the caller must retain it.
    */
   private appendSync(data: Buffer): number {
+    if (!this.ensureOpen()) {
+      return 0;
+    }
     let offset = 0;
     while (offset < data.length) {
       let written: number;
@@ -366,6 +456,9 @@ class FileSessionTranscript implements SessionTranscript {
 
   /** Asynchronous twin of {@link appendSync}, with the same contract. */
   private async appendAsync(data: Buffer): Promise<number> {
+    if (!this.ensureOpen()) {
+      return 0;
+    }
     let offset = 0;
     while (offset < data.length) {
       let written: number;
@@ -399,9 +492,85 @@ class FileSessionTranscript implements SessionTranscript {
     }
   }
 
-  private rotate(): void {
-    closeSync(this.fd);
+  /**
+   * Take ownership of a descriptor for the live file. The assignment and the
+   * half-rotated flag move together, so a successful open always cancels a
+   * rotation that was left part-finished.
+   */
+  private openFd(): void {
+    this.fd = openSync(this.filepath, "a");
+    this.rotationShifted = false;
+  }
 
+  /**
+   * Hand the descriptor back. The field is cleared *before* the syscall, and
+   * only a descriptor we still hold is closed, so `fd` can never be left
+   * naming a number the process has already returned to the OS. That matters
+   * more than the failure it guards: file descriptors are reused, so a second
+   * `closeSync` on a stale number does not merely fail with EBADF — once the
+   * number has been handed out again it closes an unrelated file belonging to
+   * some other part of the extension host.
+   */
+  private releaseFd(): void {
+    const fd = this.fd;
+    this.fd = NO_FD;
+    if (fd === NO_FD) {
+      return;
+    }
+    try {
+      closeSync(fd);
+    } catch {
+      // Already gone as far as the OS is concerned; nothing left to release.
+    }
+  }
+
+  /**
+   * Reacquire a descriptor after one was lost — a rotation whose open failed,
+   * or a give-up that released it. Returns false if the file still cannot be
+   * opened, in which case the caller retains its bytes and the next drain
+   * tries again. This is what keeps a transient failure during rotation from
+   * ending the transcript permanently.
+   */
+  private ensureOpen(): boolean {
+    if (this.fd !== NO_FD) {
+      return true;
+    }
+    try {
+      this.openFd();
+    } catch {
+      return false;
+    }
+    // The descriptor is new and the file underneath it may not be the one the
+    // old accounting described, so trust the file's own size.
+    this.currentSize = this.readCurrentSize();
+    return true;
+  }
+
+  /**
+   * Rotate the file: release the live descriptor, shift the generations, open
+   * the new file.
+   *
+   * The descriptor has to be released before the renames — Windows will not
+   * reliably rename a file the process still holds open, and transcripts can
+   * live on UNC shares where that is stricter still — so there is unavoidably
+   * a window with no descriptor. What must not happen is that window becoming
+   * permanent: if the open throws, `fd` stays {@link NO_FD} (never the closed
+   * number), `rotationShifted` records that the renames are already done, and
+   * the next attempt finishes the rotation rather than restarting it.
+   */
+  private rotate(): void {
+    if (this.rotationShifted) {
+      // The renames already happened; only the descriptor is still owed.
+      this.openFd();
+      return;
+    }
+    this.releaseFd();
+    this.shiftGenerations();
+    this.rotationShifted = true;
+    this.openFd();
+  }
+
+  private shiftGenerations(): void {
     if (this.rotation.maxRotatedFiles > 0) {
       for (let index = this.rotation.maxRotatedFiles; index >= 1; index -= 1) {
         const source = index === 1 ? this.filepath : `${this.filepath}.${index - 1}`;
@@ -424,8 +593,6 @@ class FileSessionTranscript implements SessionTranscript {
         // file doesn't exist
       }
     }
-
-    this.fd = openSync(this.filepath, "a");
   }
 }
 

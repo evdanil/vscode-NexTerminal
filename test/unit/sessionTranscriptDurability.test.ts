@@ -19,7 +19,11 @@ const hooks = vi.hoisted(() => ({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   write: undefined as undefined | ((...args: any[]) => void),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  writeSync: undefined as undefined | ((...args: any[]) => number)
+  writeSync: undefined as undefined | ((...args: any[]) => number),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  openSync: undefined as undefined | ((...args: any[]) => number),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  closeSync: undefined as undefined | ((...args: any[]) => void)
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -30,7 +34,11 @@ vi.mock("node:fs", async (importOriginal) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     write: (...args: any[]) => (hooks.write ?? (actual.write as any))(...args),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    writeSync: (...args: any[]) => (hooks.writeSync ?? (actual.writeSync as any))(...args)
+    writeSync: (...args: any[]) => (hooks.writeSync ?? (actual.writeSync as any))(...args),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    openSync: (...args: any[]) => (hooks.openSync ?? (actual.openSync as any))(...args),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    closeSync: (...args: any[]) => (hooks.closeSync ?? (actual.closeSync as any))(...args)
   };
 });
 
@@ -70,12 +78,17 @@ function transcriptPath(dir: string, prefix: string): string {
   return path.join(dir, name);
 }
 
-/** Base file plus every rotated generation, concatenated oldest-first. */
+/**
+ * Base file plus every rotated generation, concatenated oldest-first. The base
+ * file may legitimately be absent (a rotation that could not reopen it), so it
+ * is skipped rather than throwing over the assertion that wanted to run.
+ */
 function allTranscriptText(dir: string, prefix: string): string {
   const names = readdirSync(dir).filter((entry) => entry.startsWith(prefix));
   const base = names.find((entry) => entry.endsWith(".log"));
   const rotated = names.filter((entry) => /\.log\.\d+$/.test(entry)).sort().reverse();
-  return [...rotated, base!].map((entry) => readFileSync(path.join(dir, entry), "utf8")).join("");
+  const ordered = base === undefined ? rotated : [...rotated, base];
+  return ordered.map((entry) => readFileSync(path.join(dir, entry), "utf8")).join("");
 }
 
 /**
@@ -107,6 +120,8 @@ afterEach(async () => {
   // behind a drain that can never finish.
   hooks.write = undefined;
   hooks.writeSync = undefined;
+  hooks.openSync = undefined;
+  hooks.closeSync = undefined;
   for (const write of parked.splice(0, parked.length)) {
     write.fail(new Error("released by test cleanup"));
   }
@@ -252,6 +267,155 @@ describe("session transcript failure paths", () => {
     expect(text).toContain("alpha");
     expect(text).toContain("omega");
     expect(text.indexOf("alpha")).toBeLessThan(text.indexOf("omega"));
+  });
+
+  /**
+   * E1 — rotation closes the live descriptor before it opens the next one. If
+   * that open fails (permissions, a directory that vanished, EMFILE), the old
+   * descriptor is already gone but `this.fd` still holds its number, so every
+   * later attempt closes a number the process no longer owns: EBADF forever if
+   * the number is free, and *somebody else's file* once the OS reuses it.
+   *
+   * The load-bearing assertion is the second one — a transcript that recovers
+   * its content but corrupts an unrelated descriptor on the way is not fixed.
+   */
+  it("recovers from a failed rotation without closing a descriptor it no longer owns", async () => {
+    const dir = makeTempDir();
+    // Same shape as D1: 200-byte files against 18-byte lines, so the queue is
+    // cut into several batches and the first of them has to rotate.
+    const transcript = open(dir, "rotfail", 200, 5);
+    const firstFd = (transcript as unknown as { fd: number }).fd;
+
+    // Every descriptor this transcript legitimately holds. A close for anything
+    // not in here is a close of a descriptor the process does not own.
+    const owned = new Set<number>([firstFd]);
+    const closedWhileUnowned: number[] = [];
+    let openFailures = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.openSync = (...args: any[]) => {
+      if (openFailures === 0) {
+        openFailures += 1;
+        throw Object.assign(new Error("EACCES: permission denied, open"), { code: "EACCES" });
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const fd = (hooks.actual!.openSync as any)(...args);
+      owned.add(fd);
+      return fd;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.closeSync = (...args: any[]) => {
+      const fd = args[0] as number;
+      if (!owned.has(fd)) {
+        closedWhileUnowned.push(fd);
+      }
+      owned.delete(fd);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (hooks.actual!.closeSync as any)(...args);
+    };
+
+    const lines = Array.from({ length: 24 }, (_, index) => `chunk-${String(index).padStart(3, "0")} pay\n`);
+    for (const line of lines) {
+      transcript.write(line);
+    }
+    await sleep(400); // timer drain — the rotation's open fails
+    expect(openFailures).toBe(1); // non-vacuous: a rotation really did break
+
+    // A later write drives the retry that has to recover the descriptor.
+    transcript.write("chunk-024 pay\n");
+    await sleep(400);
+    transcript.flush?.();
+    await sleep(50);
+
+    // The fd-reuse hazard: the failed rotation must not leave a stale number
+    // behind for a later close to hand back to the OS. Checked first — a
+    // transcript that recovers its own content while closing somebody else's
+    // descriptor is not fixed.
+    expect(closedWhileUnowned).toEqual([]);
+
+    // The transcript is recording again, and nothing was lost on the way.
+    const text = allTranscriptText(dir, "rotfail_");
+    const order = [...text.matchAll(/chunk-(\d{3})/g)].map((match) => Number(match[1]));
+    expect(order).toEqual(Array.from({ length: 25 }, (_, index) => index));
+  });
+
+  /**
+   * E2 — `close()` drained, and then closed the descriptor and deregistered the
+   * transcript whether or not the drain landed. A transient failure on that
+   * last write moved the tail and the session footer into `retained`, where
+   * nothing could ever retry them: terminal closure lost exactly the bytes the
+   * retention stage exists to preserve.
+   */
+  it("does not discard the tail when the close-time write fails", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "closefail", 1024 * 1024, 1);
+    transcript.write("tail line\n");
+
+    let failures = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.writeSync = (...args: any[]) => {
+      if (failures === 0) {
+        failures += 1;
+        throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (hooks.actual!.writeSync as any)(...args);
+    };
+
+    transcript.close();
+
+    // Non-vacuous: the close really did fail to write, and nothing reached the
+    // file — the tail only survives if something retries it after close().
+    expect(failures).toBe(1);
+    const file = transcriptPath(dir, "closefail_");
+    expect(readFileSync(file, "utf8")).toBe("");
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (readFileSync(file, "utf8").includes("--- Session ended")) {
+        break;
+      }
+      await sleep(20);
+    }
+
+    const text = readFileSync(file, "utf8");
+    expect(text).toContain("--- Session started");
+    expect(text).toContain("tail line");
+    expect(text).toContain("--- Session ended");
+    expect(text.indexOf("tail line")).toBeLessThan(text.indexOf("--- Session ended"));
+  });
+
+  it("gives up the close-time retry on a bounded budget and says what was lost", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "closelost", 1024 * 1024, 1);
+    transcript.write("tail that never lands\n");
+    const fd = (transcript as unknown as { fd: number }).fd;
+
+    const closed: number[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.closeSync = (...args: any[]) => {
+      closed.push(args[0] as number);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (hooks.actual!.closeSync as any)(...args);
+    };
+    hooks.writeSync = () => {
+      throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+    };
+    const reported = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      transcript.close();
+      for (let attempt = 0; attempt < 200 && reported.mock.calls.length === 0; attempt += 1) {
+        await sleep(20);
+      }
+
+      // Surfaced rather than swallowed...
+      expect(reported).toHaveBeenCalledTimes(1);
+      expect(String(reported.mock.calls[0][0])).toContain("closelost");
+      // ...and the descriptor was handed back rather than held open forever by
+      // a retry that can never succeed.
+      expect(closed).toContain(fd);
+    } finally {
+      reported.mockRestore();
+    }
   });
 
   it("shutdown flush gives up rather than hanging on a wedged write", async () => {
