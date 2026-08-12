@@ -19,8 +19,8 @@ const FLUSH_INTERVAL_MS = 250;
 const SHUTDOWN_FLUSH_TIMEOUT_MS = 1000;
 
 // Ceiling on the bytes a transcript holds in memory, across every stage the
-// writer keeps them in (`queue`, `pending`, `owed`). Enforced at the one point
-// bytes enter the writer and nowhere else — see pushQueued() — so the bound
+// writer keeps them in (`pending`, `owed`). Enforced at the one point
+// bytes enter the writer and nowhere else — see admit() — so the bound
 // depends on nothing downstream: not on a drain running, not on the descriptor
 // answering, not on further output ever arriving.
 //
@@ -123,10 +123,15 @@ const NOOP_TRANSCRIPT: SessionTranscript = { write() {}, flush() {}, close() {} 
  *
  * Every byte this writer holds is in exactly one of two states:
  *
- * - **Undecided** — `queue` (raw strings, straight off the hot path) and
- *   `pending` (byte-accurate chunks, one per `write()` call). No rotation
- *   decision of any kind is attached to them, and none has been made about
- *   them — the types cannot even express one.
+ * - **Undecided** — `pending`: byte-accurate chunks, one per `write()` call,
+ *   encoded to UTF-8 in the same synchronous step that admitted them. No
+ *   rotation decision of any kind is attached to them, and none has been made
+ *   about them — the types cannot even express one. There is no separate
+ *   raw-string stage: encoding at admission means the writer never holds a
+ *   chunk in two representations, so the footprint bound below holds at every
+ *   instant, including mid-drain. (The old drain-time conversion held the
+ *   entire raw queue and its encoded copy simultaneously — a transient
+ *   footprint of twice the retention cap that no stated invariant covered.)
  * - **Placed** — `owed`: bytes whose file generation is settled. The rotation
  *   their chunk required, if any, has already been performed; all that
  *   remains is to finish appending them to the live file. Bytes on disk are
@@ -162,9 +167,9 @@ const NOOP_TRANSCRIPT: SessionTranscript = { write() {}, flush() {}, close() {} 
  *   buffer, leaves the unwritten bytes in `owed` for the next drain instead
  *   of dropping them. `currentSize` only ever advances by bytes that actually
  *   reached the file, so rotation cannot drift out of step with the disk.
- * - **Bounded.** Everything the writer holds — `queue`, `pending` and `owed`
- *   — is capped at `maxRetainedBytes`, enforced in {@link pushQueued}: the
- *   single point bytes enter the writer, so the bound holds for any arrival
+ * - **Bounded.** Everything the writer holds — `pending` and `owed` — is
+ *   capped at `maxRetainedBytes`, enforced in {@link admit}: the single
+ *   point bytes enter the writer, so the bound holds for any arrival
  *   pattern and any descriptor behaviour, including a lone chunk larger than
  *   the cap followed by silence. Nothing is ever shed below the cap — not
  *   for a slow append, not for a failed drain, not for a wedge — and above
@@ -175,7 +180,11 @@ const NOOP_TRANSCRIPT: SessionTranscript = { write() {}, flush() {}, close() {} 
  *   thing outside the cap is `inFlight`, the buffer the kernel is holding,
  *   and it is one {@link MAX_APPEND_BYTES} batch at most because that is all
  *   an append is ever given — so the whole footprint is at most
- *   `maxRetainedBytes` + {@link MAX_APPEND_BYTES}.
+ *   `maxRetainedBytes` + {@link MAX_APPEND_BYTES}, at every instant: no
+ *   drain stage re-encodes or duplicates what admission already holds. The
+ *   only transient on top is the single chunk being admitted, which exists
+ *   as the caller's string and the writer's buffer for the duration of one
+ *   {@link admit} call and is itself trimmed to the cap in that same call.
  * - **Descriptor ownership.** `fd` holds a descriptor this transcript owns,
  *   or {@link NO_FD}. It is never left holding a number the process has
  *   already handed back — see {@link releaseFd}.
@@ -185,25 +194,17 @@ class FileSessionTranscript implements SessionTranscript {
   private fd: number = NO_FD;
   private currentSize: number;
   private closed = false;
-  /** Raw chunks off the hot path. Moved into `pending` when a drain starts. */
-  private queue: string[] = [];
   /**
-   * UTF-8 size of `queue`, maintained incrementally so the retention cap can
-   * be checked on the hot path without walking it. Kept in bytes, not
-   * characters, because that is the unit the cap and every other stage use.
-   */
-  private queuedBytes = 0;
-  /**
-   * Undecided bytes, one buffer per `write()` call, oldest first. Placement
-   * is decided in {@link promote} and nowhere else — these carry no flags.
+   * Undecided bytes, one buffer per `write()` call, oldest first, encoded at
+   * admission. Placement is decided in {@link promote} and nowhere else —
+   * these carry no flags.
    */
   private pending: Buffer[] = [];
   /**
-   * Byte size of `pending`, maintained incrementally for the same reason
-   * `queuedBytes` is: the retention cap is consulted once per chunk on the hot
-   * path, and `pending` is no longer guaranteed to be short — a burst larger
-   * than one append batch stays there, chunk by chunk, while the drain works
-   * through it.
+   * Byte size of `pending`, maintained incrementally: the retention cap is
+   * consulted once per chunk on the hot path, and `pending` is not
+   * guaranteed to be short — a burst larger than one append batch stays
+   * there, chunk by chunk, while the drain works through it.
    */
   private pendingBytes = 0;
   /**
@@ -315,7 +316,7 @@ class FileSessionTranscript implements SessionTranscript {
     this.closed = true;
     this.clearFlushTimer();
     const footer = `\n--- Session ended ${new Date().toISOString()} ---\n`;
-    this.pushQueued(footer);
+    this.admit(footer);
     if (this.draining) {
       // Rare: a timer drain is in flight. Finish the close behind it so the
       // file is never written to after closeSync.
@@ -381,8 +382,6 @@ class FileSessionTranscript implements SessionTranscript {
     this.owed = NO_BYTES;
     this.pending = [];
     this.pendingBytes = 0;
-    this.queue = [];
-    this.queuedBytes = 0;
     this.releaseFd();
     liveTranscripts.delete(this);
     console.error(
@@ -392,18 +391,23 @@ class FileSessionTranscript implements SessionTranscript {
 
   /**
    * The one place bytes enter the writer — `write()` chunks, the session
-   * header, the close() footer — so the one place `queuedBytes` grows and the
-   * one place the retention cap is enforced. Every stage downstream of here
-   * only moves bytes between stages or removes them, so holding the bound at
-   * admission holds it everywhere, for any arrival pattern: a chunk larger
-   * than the whole cap is trimmed in this same synchronous step, never left
-   * for an enforcement that would only run if more output happened to arrive.
-   * No syscall and no queue walk: a byte count, a comparison, and — only when
-   * the cap is crossed — a shed of the oldest bytes.
+   * header, the close() footer — so the one place the retention cap is
+   * enforced. The chunk is encoded to UTF-8 here, in the same synchronous
+   * step that accepts it: from this point on the writer holds exactly one
+   * representation of every byte, so no later stage can double the footprint
+   * by converting a backlog it is still holding (the defect the old
+   * drain-time `ingest()` had). Every stage downstream of here only moves
+   * bytes between stages or removes them, so holding the bound at admission
+   * holds it everywhere, for any arrival pattern: a chunk larger than the
+   * whole cap is trimmed in this same synchronous step, never left for an
+   * enforcement that would only run if more output happened to arrive.
+   * No syscall and no queue walk: one UTF-8 encode (the same O(n) the old
+   * shape spent on `Buffer.byteLength` here and `Buffer.from` at drain
+   * time, now paid once), a comparison, and — only when the cap is crossed
+   * — a shed of the oldest bytes.
    */
-  private pushQueued(text: string): void {
-    this.queue.push(text);
-    this.queuedBytes += Buffer.byteLength(text, "utf8");
+  private admit(text: string): void {
+    this.pushPending(Buffer.from(text, "utf8"));
     if (this.retainedByteCount() > this.maxRetainedBytes) {
       this.trimRetained();
     }
@@ -429,7 +433,7 @@ class FileSessionTranscript implements SessionTranscript {
 
   /**
    * Take a chunk off the hot path. Admission — and with it the retention cap,
-   * see {@link pushQueued} — is synchronous and cheap; everything that can
+   * see {@link admit} — is synchronous and cheap; everything that can
    * block happens later, on the drain the timer schedules. There is nothing
    * here about what the descriptor is doing, and that is the design: the old
    * shape of this method shed differently depending on whether it judged the
@@ -437,7 +441,7 @@ class FileSessionTranscript implements SessionTranscript {
    * directions (see {@link DEFAULT_MAX_RETAINED_BYTES}).
    */
   private enqueue(text: string): void {
-    this.pushQueued(text);
+    this.admit(text);
     if (this.flushTimer === undefined) {
       this.flushTimer = setTimeout(() => {
         this.flushTimer = undefined;
@@ -455,7 +459,7 @@ class FileSessionTranscript implements SessionTranscript {
    * `flushChain.then(...)` every 250 ms is itself an unbounded queue — of
    * closures rather than of terminal output, but growing for the same reason
    * and for as long. One waiting drain is all that can ever be useful: it
-   * ingests whatever is queued at the moment it finally runs.
+   * takes on everything the writer holds at the moment it finally runs.
    */
   private scheduleDrain(): void {
     if (this.drainQueued) {
@@ -487,12 +491,12 @@ class FileSessionTranscript implements SessionTranscript {
   }
 
   /**
-   * Every byte this writer is holding: placed but unwritten (`owed`),
-   * undecided (`pending`), and raw off the hot path (`queue`).
-   *
-   * All three, and not a subset: `queue` used to be excluded, which made the
-   * cap measure the one stage that cannot grow while a write is wedged and
-   * ignore the only stage that can.
+   * Every byte this writer is holding: placed but unwritten (`owed`) and
+   * undecided (`pending`). Both stages, and not a subset — a raw-string
+   * stage used to sit in front of these and was once excluded from the
+   * count, which made the cap measure the stages that cannot grow while a
+   * write is wedged and ignore the only one that could. Encoding at
+   * admission removed that stage outright.
    *
    * `inFlight` is deliberately not here, and it is the only thing that is not.
    * Those bytes are inside a syscall: counting them would make the cap shed
@@ -502,16 +506,7 @@ class FileSessionTranscript implements SessionTranscript {
    * arrival patterns.
    */
   private retainedByteCount(): number {
-    return this.owed.length + this.pendingBytes + this.queuedBytes;
-  }
-
-  /** Move raw queued chunks into the undecided stage, byte-accurate. */
-  private ingest(): void {
-    for (const chunk of this.queue) {
-      this.pushPending(Buffer.from(chunk, "utf8"));
-    }
-    this.queue = [];
-    this.queuedBytes = 0;
+    return this.owed.length + this.pendingBytes;
   }
 
   /**
@@ -648,18 +643,18 @@ class FileSessionTranscript implements SessionTranscript {
   }
 
   /**
-   * Hold everything the writer has (`owed`, then `pending`, then `queue`) to
+   * Hold everything the writer has (`owed`, then `pending`) to
    * `maxRetainedBytes`, shedding the oldest bytes first — placed before
-   * undecided, undecided before raw, head before tail — so it is exactly the
-   * newest bytes that survive. Reached only from {@link pushQueued}, when an
-   * admission crosses the cap: shedding is a function of how much the writer
-   * holds, never of what the descriptor is doing. The writer holds no opinion
+   * undecided, head before tail — so it is exactly the newest bytes that
+   * survive. Reached only from {@link admit}, when an admission crosses the
+   * cap: shedding is a function of how much the writer holds, never of what
+   * the descriptor is doing. The writer holds no opinion
    * on whether an outstanding append is slow or wedged, because every opinion
    * it could form was wrong in one direction or the other — see
    * {@link DEFAULT_MAX_RETAINED_BYTES} for that history.
    *
    * There is no exemption to arrange here. The buffer a syscall owns is not
-   * in `owed`, `pending` or `queue` at all — {@link takeAppendBatch} takes it
+   * in `owed` or `pending` at all — {@link takeAppendBatch} takes it
    * out and {@link returnUnwritten} puts back whatever did not land — so
    * there is nothing to skip over, no excess to discount, and no way for
    * memory the writer cannot free to make the cap shed newer bytes in its
@@ -681,7 +676,12 @@ class FileSessionTranscript implements SessionTranscript {
     this.shedOldest(this.retainedByteCount() - this.maxRetainedBytes);
   }
 
-  /** Drop `excess` bytes, oldest first: placed, then undecided, then raw. */
+  /**
+   * Drop `excess` bytes, oldest first: placed, then undecided. A pending
+   * chunk that survives a partial cut stays at the head of `pending`, where
+   * the next admission's cap check can still see it — a survivor moved
+   * anywhere else would drift out of the stage its byte count is tracked in.
+   */
   private shedOldest(excess: number): void {
     if (excess <= 0) {
       return;
@@ -709,39 +709,9 @@ class FileSessionTranscript implements SessionTranscript {
         excess = 0;
       }
     }
-    // Raw chunks last — they are the newest bytes the writer holds. Reaching
-    // here means `pending` is empty (the loop above only exits with excess
-    // left when it is), so the queue's head is now the oldest byte there is.
-    this.shedQueued(excess);
-  }
-
-  /**
-   * Drop `excess` bytes off the head of the raw queue.
-   *
-   * A chunk that survives a partial cut goes back to the head of the queue,
-   * where the next admission's cap check can still see it — a survivor moved
-   * anywhere else would drift out of the stage its byte count is tracked in.
-   * The cut lands on a UTF-8 boundary, so the survivor re-encodes to exactly
-   * the bytes it was measured as.
-   */
-  private shedQueued(excess: number): void {
-    while (excess > 0 && this.queue.length > 0) {
-      const head = this.queue.shift()!;
-      const size = Buffer.byteLength(head, "utf8");
-      this.queuedBytes -= size;
-      if (excess >= size) {
-        excess -= size;
-        continue;
-      }
-      const survivor = cutUtf8Head(Buffer.from(head, "utf8"), excess).toString("utf8");
-      this.queue.unshift(survivor);
-      this.queuedBytes += Buffer.byteLength(survivor, "utf8");
-      excess = 0;
-    }
   }
 
   private drainSync(): void {
-    this.ingest();
     for (;;) {
       this.promote();
       if (this.owed.length === 0) {
@@ -761,12 +731,11 @@ class FileSessionTranscript implements SessionTranscript {
   }
 
   private async drainAsync(): Promise<void> {
-    if (this.closed || (this.queue.length === 0 && this.pending.length === 0 && this.owed.length === 0)) {
+    if (this.closed || (this.pending.length === 0 && this.owed.length === 0)) {
       return;
     }
     this.draining = true;
     try {
-      this.ingest();
       for (;;) {
         this.promote();
         if (this.owed.length === 0) {

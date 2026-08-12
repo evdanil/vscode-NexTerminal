@@ -85,9 +85,10 @@ describe("TerminalHighlighter", () => {
     // Chunks 15 ms apart against a 20 ms flush delay: the idle timer is
     // restarted by every one of them and so can never fire. Nothing here is a
     // line boundary, and the whole run is two orders of magnitude short of the
-    // 16 KiB pending cap — so the ceiling (8 flush periods = 160 ms) is the
-    // only thing that can get these bytes onto the screen.
-    for (let elapsed = 0; elapsed < 165; elapsed += 15) {
+    // 16 KiB pending cap — so the ceiling (6 flush periods = 120 ms) is the
+    // only thing that can get these bytes onto the screen. Eight chunks are in
+    // by the time it fires.
+    for (let elapsed = 0; elapsed < 115; elapsed += 15) {
       stream.push("x".repeat(64));
       vi.advanceTimersByTime(15);
     }
@@ -98,7 +99,7 @@ describe("TerminalHighlighter", () => {
     // and a deadline that can emit nothing bounds nothing. See the trickle test
     // below, which is that same path with a buffer under the margin.
     expect(emitted).toHaveLength(1);
-    expect(emitted[0]).toBe("x".repeat(64 * 11));
+    expect(emitted[0]).toBe("x".repeat(64 * 8));
   });
 
   it("renders a trickle below the idle delay within the ceiling period", () => {
@@ -107,7 +108,7 @@ describe("TerminalHighlighter", () => {
     const h = new TerminalHighlighter();
     const emitted: string[] = [];
     const flushDelay = 20;
-    const ceiling = flushDelay * 8;
+    const ceiling = flushDelay * 6;
     const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), flushDelay);
 
     // One character every 15 ms against a 20 ms idle delay: the idle timer is
@@ -116,7 +117,7 @@ describe("TerminalHighlighter", () => {
     // — this is the part that used to break the ceiling — the 256-character
     // retention margin. Emitting "everything except the last 256 characters" of
     // a 40-character buffer emits nothing, and the ceiling cleared itself
-    // anyway, so the next push started a fresh 160 ms period from a new anchor.
+    // anyway, so the next push started a fresh ceiling period from a new anchor.
     // Repeat forever: the first character stayed invisible until the buffer
     // crossed 256 characters, ~3.6 s at this rate.
     const text = Array.from({ length: 40 }, (_, index) =>
@@ -849,6 +850,64 @@ describe("TerminalHighlighter — output latency", () => {
     }
 
     expect(ticks).toEqual([15]);
+  });
+
+  /**
+   * The shipped ceiling, pinned from both sides. STREAM_MAX_PENDING_PERIODS
+   * is bracketed: the first test fails if the ceiling rises above 90 ms (the
+   * released v2.8.180 painted this pattern at 100 ms, and a latency fix must
+   * not measure worse than the release it fixes); the second fails if it
+   * drops below ~83 ms, the time a full 80-column line needs to arrive at
+   * 9600 baud — a ceiling below that fires mid-line on every ordinary serial
+   * console line and clips whatever highlight straddles the fire.
+   */
+  it("renders a sub-idle trickle within 90 ms — six flush periods — at the shipped defaults", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    // No explicit delay — this asserts the shipped ceiling: 15 ms × 6.
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // One character every 10 ms: below the 15 ms idle delay, so the idle
+    // timer is restarted before it can ever fire; no character is a boundary;
+    // the run never nears the 16 KiB cap. Only the ceiling can render this.
+    for (let index = 0; index < 9; index += 1) {
+      stream.push("x");
+      vi.advanceTimersByTime(index === 8 ? 9 : 10);
+    }
+    // t = 89 ms — one tick short of the ceiling, and nothing has rendered:
+    // neither the idle timer nor an early ceiling fired on the way here.
+    expect(emitted).toEqual([]);
+
+    vi.advanceTimersByTime(1);
+    // t = 90 ms — the ceiling fires and renders every byte pushed so far.
+    expect(emitted.join("")).toBe("x".repeat(9));
+  });
+
+  it("lets a full 80-column 9600-baud console line reach its boundary unsplit", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // Eighty characters arriving one per millisecond — a full-width line on a
+    // 9600-baud serial console, the slowest console rate in common use — with
+    // the token placed to straddle character 45, exactly where a 45 ms
+    // (three-period) ceiling would cut. The line's own \r\n lands at 80 ms,
+    // inside the 90 ms ceiling: the line must render whole, on its boundary,
+    // with the token's highlight intact.
+    const line = `${"x".repeat(41)} ERROR ${"y".repeat(32)}`;
+    expect(line).toHaveLength(80);
+    for (const character of line) {
+      stream.push(character);
+      vi.advanceTimersByTime(1);
+    }
+    stream.push("\r\n");
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toBe(`${"x".repeat(41)} \x1b[31mERROR\x1b[39m ${"y".repeat(32)}\r\n`);
   });
 });
 

@@ -123,22 +123,23 @@ function allTranscriptText(dir: string, prefix: string): string {
  * `owed` — bytes already placed in the live file (any rotation they required
  * has been performed; only the append remains) — and `pending` — chunks whose
  * placement has not been decided yet, one per write() call, carrying no
- * decisions at all. `inFlight` is the fourth: placed bytes taken out of `owed`
- * for exactly as long as one `fs.write` holds them, and the only thing the
- * retention cap does not count. Read through a function rather than captured
- * once: all of them are reassigned as drains progress.
+ * decisions at all, encoded to UTF-8 at admission (there is no raw-string
+ * stage any more: encoding at admission is what keeps the writer from ever
+ * holding a chunk in two representations). `inFlight` is the third: placed
+ * bytes taken out of `owed` for exactly as long as one `fs.write` holds
+ * them, and the only thing the retention cap does not count. Read through a
+ * function rather than captured once: all of them are reassigned as drains
+ * progress.
  */
 function stagesOf(transcript: SessionTranscript): {
   owed: Buffer;
   inFlight: Buffer;
   pending: Buffer[];
-  queue: string[];
 } {
   return transcript as unknown as {
     owed: Buffer;
     inFlight: Buffer;
     pending: Buffer[];
-    queue: string[];
   };
 }
 
@@ -147,29 +148,26 @@ function retainedBytesOf(transcript: SessionTranscript): number {
   return pending.reduce((total, chunk) => total + chunk.length, owed.length);
 }
 
-/** Everything the writer holds in its own stages: `owed` + `pending` + `queue`. */
+/** Everything the writer holds in its own stages: `owed` + `pending`. */
 function heldBytesOf(transcript: SessionTranscript): number {
   return shedableBytesOf(transcript) + stagesOf(transcript).owed.length;
 }
 
 /**
  * The bytes the writer is holding that it could still choose to drop: the
- * undecided chunks plus the raw queue. Counted independently of the writer's
- * own accounting — the point of the test that uses this is that the accounting
- * was measuring a subset.
+ * undecided chunks. Counted independently of the writer's own accounting —
+ * the point of the test that uses this is that the accounting once measured
+ * a subset of what the writer held.
  */
 function shedableBytesOf(transcript: SessionTranscript): number {
-  const { pending, queue } = stagesOf(transcript);
-  return queue.reduce(
-    (total, chunk) => total + Buffer.byteLength(chunk, "utf8"),
-    pending.reduce((total, chunk) => total + chunk.length, 0)
-  );
+  const { pending } = stagesOf(transcript);
+  return pending.reduce((total, chunk) => total + chunk.length, 0);
 }
 
 /** Everything still held, oldest first, as text. */
 function heldTextOf(transcript: SessionTranscript): string {
-  const { owed, pending, queue } = stagesOf(transcript);
-  return [owed.toString("utf8"), ...pending.map((chunk) => chunk.toString("utf8")), ...queue].join("");
+  const { owed, pending } = stagesOf(transcript);
+  return [owed.toString("utf8"), ...pending.map((chunk) => chunk.toString("utf8"))].join("");
 }
 
 /** Every generation of a transcript on disk, base file included. */
@@ -518,7 +516,7 @@ describe("session transcript failure paths", () => {
    * E3 — the retention cap exempted the last batch standing, so it only ever
    * bounded a queue of *several* batches. The stated bound did not hold.
    *
-   * The cap is now enforced at admission — pushQueued(), the one place bytes
+   * The cap is now enforced at admission — admit(), the one place bytes
    * enter the writer — so by the time a failing descriptor has refused a
    * drain, everything the writer holds is already within the cap. This
    * fixture injects a 1 MiB cap (the old constant) to keep the arithmetic:
@@ -613,13 +611,12 @@ describe("session transcript failure paths", () => {
     transcript.write("b".repeat(1024 * 1024));
     await sleep(400);
 
-    const { owed, pending, queue } = stagesOf(transcript);
+    const { owed, pending } = stagesOf(transcript);
     // Non-vacuous: shedding really did happen — everything that arrived ahead
     // of "b" was dropped — and "b" alone survives, placed in the live file
     // (the write itself failed, so it is still owed).
     expect(owed.length).toBe(1024 * 1024);
     expect(pending).toEqual([]);
-    expect(queue).toEqual([]);
 
     // Flush the at-cap backlog before the next admission — see E3.
     hooks.write = undefined;
@@ -1170,10 +1167,10 @@ describe("session transcript failure paths", () => {
    * Arrivals behind an outstanding append are bounded like everything else:
    * the cap reads backlog, not descriptor state, so it holds identically
    * whether that append is progressing, slow, or never coming back. A chunk
-   * the cap cuts in half must stay at the head of `queue` — a survivor moved
-   * into any other stage would drift out of the stage its byte count is
-   * tracked in, and one cut per arriving chunk would turn a slow write into
-   * a slow leak.
+   * the cap cuts in half must stay at the head of `pending` — a survivor
+   * moved into any other stage would drift out of the stage its byte count
+   * is tracked in, and one cut per arriving chunk would turn a slow write
+   * into a slow leak.
    */
   it("holds arrivals to one capful while an append is still outstanding", async () => {
     const dir = makeTempDir();
@@ -1507,5 +1504,66 @@ describe("session transcript failure paths", () => {
     const currentSize = (transcript as unknown as { currentSize: number }).currentSize;
     expect(currentSize).toBe(statSync(file).size);
     expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toEqual([]);
+  });
+
+  /**
+   * The footprint bound must hold at every INSTANT, not merely between
+   * calls. The old drain-time `ingest()` converted the whole raw queue to
+   * buffers while the queue — and its unchanged byte count — was still
+   * held, releasing the strings only after the loop finished: mid-ingest
+   * the writer owned both representations of the same bytes, a transient
+   * peak approaching twice the retention cap that no assertion between
+   * calls could ever see. Encoding at admission removes the second
+   * representation outright; this pins it by sampling the sum of every
+   * stage at each point a chunk enters `pending` — inside the loop, where
+   * the old shape peaked — and across the drain.
+   *
+   * Flip-checked: against the e7bafe5 `ingest()` implementation the peak
+   * reads ~7 MiB against the 5 MiB bound asserted here.
+   */
+  it("never holds two representations of its backlog, even mid-drain", () => {
+    const dir = makeTempDir();
+    const cap = 4 * 1024 * 1024;
+    const transcript = open(dir, "peak", 64 * 1024 * 1024, 1, cap);
+
+    // Sample every stage the writer has, wherever they live, tolerating
+    // stages that only one side of the flip has. The bound is the invariant
+    // as documented: retention cap + one append batch.
+    const t = transcript as unknown as {
+      owed: Buffer;
+      pending: Buffer[];
+      pendingBytes?: number;
+      queuedBytes?: number;
+      pushPending(chunk: Buffer): void;
+    };
+    let peak = 0;
+    const sample = (): void => {
+      const pending = t.pendingBytes ?? t.pending.reduce((total, chunk) => total + chunk.length, 0);
+      const held = t.owed.length + pending + (t.queuedBytes ?? 0);
+      peak = Math.max(peak, held);
+    };
+    const original = t.pushPending.bind(transcript);
+    t.pushPending = (chunk: Buffer): void => {
+      original(chunk);
+      sample();
+    };
+
+    // 3.5 MiB in 64 KiB chunks — under the cap, so nothing is shed and the
+    // whole backlog is present when the drain converts-and-coalesces it.
+    const chunkText = "x".repeat(64 * 1024);
+    for (let index = 0; index < 56; index += 1) {
+      transcript.write(chunkText);
+      sample();
+    }
+    transcript.flush?.();
+    sample();
+
+    expect(peak).toBeLessThanOrEqual(cap + 1024 * 1024);
+    // Non-vacuous the other way: the writer really did hold the full burst.
+    expect(peak).toBeGreaterThanOrEqual(56 * 64 * 1024);
+    // And the bound was not bought by dropping anything: every byte landed.
+    const text = readFileSync(transcriptPath(dir, "peak_"), "utf8");
+    expect(text.endsWith(chunkText)).toBe(true);
+    expect(text.length).toBeGreaterThanOrEqual(56 * 64 * 1024);
   });
 });

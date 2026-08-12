@@ -53,7 +53,35 @@ const STREAM_RETAIN_MARGIN = 256;
 // during a stream that produces no line boundary for that long — the same trade
 // onIdleFlush() already makes, for the same reason: rendering beats matching
 // once a deadline is up.
-const STREAM_MAX_PENDING_PERIODS = 8;
+//
+// The VALUE is bracketed from both sides, and 6 (90 ms at the shipped 15 ms
+// delay) is the only integer inside the bracket:
+//
+// - Upper bound: under 100 ms. The ceiling is the first paint for boundary-free
+//   interactive output — a cursor-addressed redraw over a slow link (BIOS setup
+//   over IPMI SOL, a TUI on a congested hop) answers a keypress with bytes that
+//   carry no \n or \r, so the ceiling is how long that answer stays invisible.
+//   100 ms is both the threshold where feedback stops reading as immediate and
+//   the first paint v2.8.180 shipped for this pattern (its 100 ms timer was
+//   anchored to the first push); a latency fix must not measure worse than the
+//   release it fixes on any pattern, and 8 periods (120 ms) did.
+//
+// - Lower bound: over ~83 ms. The commonest stream that runs sub-idle with no
+//   boundary *yet* is a serial console line still arriving: at 9600 baud — the
+//   default console rate on the network gear this extension exists for — a
+//   full 80-column line takes ~83 ms, and its \r\n then flushes it whole. A
+//   ceiling below that fires mid-line on every ordinary console line, and a
+//   fire splits whatever token straddles it (see the trade above) — clipping
+//   ERROR / IP / MAC highlights on the flagship serial-log surface to buy
+//   first-paint headroom that is already below perception. 2–3 periods
+//   (30–45 ms) would do exactly that.
+//
+// Lines longer than ~86 columns at 9600 baud still split once mid-line — they
+// did on v2.8.180 too (at its 100 ms anchor) — and links at 19200 baud or
+// faster deliver a full line well inside one period. Only the token actually
+// straddling the fire loses its match; everything on either side highlights
+// normally, and the next boundary resets the stream.
+const STREAM_MAX_PENDING_PERIODS = 6;
 
 const VALID_FLAGS_RE = /^[gi]*$/;
 
