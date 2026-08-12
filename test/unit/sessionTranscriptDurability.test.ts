@@ -23,7 +23,9 @@ const hooks = vi.hoisted(() => ({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   openSync: undefined as undefined | ((...args: any[]) => number),
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  closeSync: undefined as undefined | ((...args: any[]) => void)
+  closeSync: undefined as undefined | ((...args: any[]) => void),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  unlinkSync: undefined as undefined | ((...args: any[]) => void)
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -38,7 +40,9 @@ vi.mock("node:fs", async (importOriginal) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     openSync: (...args: any[]) => (hooks.openSync ?? (actual.openSync as any))(...args),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    closeSync: (...args: any[]) => (hooks.closeSync ?? (actual.closeSync as any))(...args)
+    closeSync: (...args: any[]) => (hooks.closeSync ?? (actual.closeSync as any))(...args),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    unlinkSync: (...args: any[]) => (hooks.unlinkSync ?? (actual.unlinkSync as any))(...args)
   };
 });
 
@@ -92,11 +96,20 @@ function allTranscriptText(dir: string, prefix: string): string {
 }
 
 /**
- * The writer's retained queue. Read through a function rather than captured
- * once: a failed drain *reassigns* `retained`, so a held reference goes stale.
+ * The writer's carried-over bytes, in the two stages the writer keeps them in:
+ * `owed` — bytes already placed in the live file (any rotation they required
+ * has been performed; only the append remains) — and `pending` — chunks whose
+ * placement has not been decided yet, one per write() call, carrying no
+ * decisions at all. Read through a function rather than captured once: both
+ * are reassigned as drains progress.
  */
-function retainedOf(transcript: SessionTranscript): Array<{ rotateFirst: boolean; data: Buffer }> {
-  return (transcript as unknown as { retained: Array<{ rotateFirst: boolean; data: Buffer }> }).retained;
+function stagesOf(transcript: SessionTranscript): { owed: Buffer; pending: Buffer[] } {
+  return transcript as unknown as { owed: Buffer; pending: Buffer[] };
+}
+
+function retainedBytesOf(transcript: SessionTranscript): number {
+  const { owed, pending } = stagesOf(transcript);
+  return pending.reduce((total, chunk) => total + chunk.length, owed.length);
 }
 
 /** Every generation of a transcript on disk, base file included. */
@@ -144,6 +157,7 @@ afterEach(async () => {
   hooks.writeSync = undefined;
   hooks.openSync = undefined;
   hooks.closeSync = undefined;
+  hooks.unlinkSync = undefined;
   for (const write of parked.splice(0, parked.length)) {
     write.fail(new Error("released by test cleanup"));
   }
@@ -465,15 +479,15 @@ describe("session transcript failure paths", () => {
     transcript.write(`${"c".repeat(1024 * 1024 - 11)}TAIL-MARKER`);
     await sleep(400); // timer drain — every write fails
 
-    const retained = (transcript as unknown as { retained: Array<{ data: Buffer }> }).retained;
-    // Non-vacuous: coalescing really did produce a single batch, which is the
-    // shape the old `length > 1` guard exempted outright.
-    expect(retained).toHaveLength(1);
-    const retainedBytes = retained.reduce((total, batch) => total + batch.data.length, 0);
-    expect(retainedBytes).toBeLessThanOrEqual(1024 * 1024);
+    const { owed, pending } = stagesOf(transcript);
+    // Non-vacuous: coalescing really did put everything into one placed
+    // buffer — the single-unit shape the old cap exempted outright.
+    expect(pending).toHaveLength(0);
+    expect(owed.length).toBeGreaterThan(0);
+    expect(retainedBytesOf(transcript)).toBeLessThanOrEqual(1024 * 1024);
 
     // Oldest-first shedding, so it is the tail that survives.
-    const held = Buffer.concat(retained.map((batch) => batch.data)).toString("utf8");
+    const held = owed.toString("utf8");
     expect(held.endsWith("TAIL-MARKER")).toBe(true);
     expect(held).not.toContain("HEAD-MARKER");
 
@@ -522,19 +536,20 @@ describe("session transcript failure paths", () => {
       setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
     };
 
-    // 1.5 MiB then 1 MiB against a 2 MiB file: the second batch is cut at the
-    // rotation the first one's bytes would have caused. The write fails, and
-    // the 1 MiB cap sheds the first batch — so that rotation is now for bytes
-    // that will never reach the file.
+    // 1.5 MiB then 1 MiB against a 2 MiB file: "a" is placed in the live
+    // file; "b" would overflow it once "a" lands, so it stays undecided. The
+    // write fails, and the 1 MiB cap sheds "a" — so nothing that remains
+    // justifies a rotation any more.
     transcript.write("a".repeat(1536 * 1024));
     transcript.write("b".repeat(1024 * 1024));
     await sleep(400);
 
-    const retained = (transcript as unknown as { retained: Array<{ rotateFirst: boolean; data: Buffer }> }).retained;
-    // Non-vacuous: shedding really did happen, and the survivor really is the
-    // batch that carried the rotation.
-    expect(retained).toHaveLength(1);
-    expect(retained[0].data.length).toBe(1024 * 1024);
+    const { owed, pending } = stagesOf(transcript);
+    // Non-vacuous: shedding really did happen — everything placed ahead of
+    // "b" was dropped — and "b", the chunk whose projected overflow the shed
+    // bytes caused, survives with its placement still undecided.
+    expect(owed.length).toBe(0);
+    expect(pending.map((chunk) => chunk.length)).toEqual([1024 * 1024]);
 
     hooks.write = undefined;
     transcript.write("after the drop\n");
@@ -555,26 +570,24 @@ describe("session transcript failure paths", () => {
   });
 
   /**
-   * E5 — the rest of E4's story. The cap's re-resolution only ever touched the
-   * *head* of the surviving queue, but `retained` routinely holds several
-   * batches accumulated across failed drains, and every one of them was sized
-   * against a projection that assumed the dropped bytes would land.
-   *
-   * Re-resolving the head alone can flip it from "rotate" to "do not rotate" —
-   * and then the rotation the batches behind it were projected against never
-   * happens. A batch still carrying a stale `rotateFirst: false` appends into a
-   * file that is already part-full and drives it past `maxFileSizeBytes`, which
-   * is exactly the byte boundary the synchronous writer this replaced would
-   * never have crossed.
+   * E5 — the rest of E4's story. When the cap sheds bytes, everything that
+   * survives must still land at the synchronous writer's byte boundaries,
+   * measured against what the file really holds — not against a projection
+   * that assumed the shed bytes would land. The old design cached a rotation
+   * flag per batch and had to re-resolve the whole queue here (finding 8 was
+   * that re-resolution resurrecting an already-performed rotation); now
+   * surviving undecided chunks simply take their one placement test later, so
+   * this test guards the outcome itself: the bound holds exactly, no
+   * generation overruns the limit, nothing rotates that does not have to, and
+   * nothing is lost but the oldest bytes the cap shed.
    */
-  it("re-resolves the whole retained sequence after the cap drops bytes", async () => {
+  it("keeps rotation at the synchronous writer's boundaries after the cap sheds the oldest bytes", async () => {
     const dir = makeTempDir();
     const maxFileSizeBytes = 400_000;
     const transcript = open(dir, "stale", maxFileSizeBytes, 5);
 
-    // One drain that lands first, so the live file has a size for the
-    // re-resolved flags to be measured against. At `currentSize: 0` the head's
-    // flip changes nothing downstream and the staleness cannot show.
+    // One drain that lands first, so the surviving bytes are measured against
+    // a live file that already holds something.
     transcript.write("P".repeat(100_000));
     await sleep(400);
     const file = transcriptPath(dir, "stale_");
@@ -584,35 +597,30 @@ describe("session transcript failure paths", () => {
     hooks.write = failingWrite;
 
     // Drain two, failing outright: "A" fits alongside what is already in the
-    // file, "B" does not, so the queue is cut in two and "B" carries the
-    // rotation. Still under the 1 MiB cap, so nothing is trimmed yet.
+    // file, so it is placed there; "B" would overflow once "A" lands, so it
+    // stays undecided. Still under the 1 MiB cap, so nothing is trimmed yet.
     transcript.write("A".repeat(250_000));
     transcript.write("B".repeat(250_000));
     await sleep(400);
-    expect(retainedOf(transcript).map((batch) => [batch.rotateFirst, batch.data.length])).toEqual([
-      [false, 250_000],
-      [true, 250_000]
-    ]);
+    expect(stagesOf(transcript).owed.length).toBe(250_000);
+    expect(stagesOf(transcript).pending.map((chunk) => chunk.length)).toEqual([250_000]);
 
-    // Drain three, also failing. These are cut against the projection the two
-    // retained batches leave behind — "C" fits the file "B" opens, "D" and "E"
-    // each need one of their own — and push the retained total over 1 MiB.
+    // Drain three, also failing, pushes the carried-over total to 1,100,000 —
+    // over the cap by 51,424 bytes.
     transcript.write("C".repeat(100_000));
     transcript.write("D".repeat(300_000));
     transcript.write("E".repeat(200_000));
     await sleep(400);
 
-    // The cap shed "A", and that is what invalidates the rest of the queue.
-    // "B" no longer overflows the live file, so its rotation goes away...
-    // ...which drops "C" in behind it rather than into the fresh file it was
-    // projected against, so "C" is the batch that has to rotate now, and "D"
-    // fits the file "C" opens.
-    expect(retainedOf(transcript).map((batch) => [batch.rotateFirst, batch.data.length])).toEqual([
-      [false, 250_000],
-      [true, 100_000],
-      [false, 300_000],
-      [true, 200_000]
+    // The cap shed exactly the oldest 51,424 bytes — the head of "A" — and
+    // nothing else: the bound holds while every newer byte survives. The
+    // shortened "A" stays placed in the live file; everything behind it is
+    // still undecided, with nothing about it resolved ahead of time.
+    expect(stagesOf(transcript).owed.length).toBe(198_576);
+    expect(stagesOf(transcript).pending.map((chunk) => chunk.length)).toEqual([
+      250_000, 100_000, 300_000, 200_000
     ]);
+    expect(retainedBytesOf(transcript)).toBe(1024 * 1024);
 
     hooks.write = undefined;
     transcript.write("after the drop\n");
@@ -623,20 +631,187 @@ describe("session transcript failure paths", () => {
       await sleep(20);
     }
 
-    // The invariant the flags exist to hold: the transcript rotates at the same
-    // byte boundaries the synchronous writer would have produced. No generation
-    // overruns the limit...
+    // The invariant this design holds by construction: the transcript rotates
+    // at the same byte boundaries the synchronous writer would have produced
+    // for the surviving chunks. No generation overruns the limit...
     expect(Math.max(...generationSizes(dir, "stale_"))).toBeLessThanOrEqual(maxFileSizeBytes);
-    // ...and nothing rotated that did not have to.
-    expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toHaveLength(2);
+    // ...and nothing rotated that did not have to: the trimmed "A" still fits
+    // the live file, "C" fits behind "B", and only "B", "D" and "E" each
+    // overflow the file left by the bytes settled ahead of them.
+    expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toHaveLength(3);
 
-    // Only the batch the cap shed is missing; everything else is intact and in
-    // order across the generations.
+    // Only the oldest bytes the cap shed are missing; everything else is
+    // intact and in order across the generations.
     const text = allTranscriptText(dir, "stale_");
     expect(text.startsWith("--- Session started")).toBe(true);
     expect(text.slice(headerBytes)).toBe(
-      `${"P".repeat(100_000)}${"B".repeat(250_000)}${"C".repeat(100_000)}${"D".repeat(300_000)}${"E".repeat(200_000)}after the drop\n`
+      `${"P".repeat(100_000)}${"A".repeat(198_576)}${"B".repeat(250_000)}${"C".repeat(100_000)}${"D".repeat(300_000)}${"E".repeat(200_000)}after the drop\n`
     );
+  });
+
+  /**
+   * F1 — finding 8. An oversized chunk rotates, lands only a prefix, and the
+   * failure leaves a remainder bigger than the retention cap. The rotation
+   * this chunk asked for has already been performed; nothing that happens
+   * afterwards — not the failure, not the cap shedding bytes — may perform it
+   * again. At `maxRotatedFiles: 0` a repeated rotation does not merely shift
+   * generations: it unlinks the live file, destroying the prefix that already
+   * reached disk.
+   */
+  it("does not rotate the same chunk twice when its remainder is trimmed by the cap", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "double", 2 * 1024 * 1024, 0);
+    await sleep(400); // the session header lands before the fault is armed
+
+    // One write() call, over maxFileSizeBytes on its own: 1.5 MiB of it will
+    // reach disk (more than the 1 MiB cap), the 1.5 MiB remainder will not
+    // (also more than the cap, so the trim has to shed into it).
+    const partial = 1536 * 1024;
+    const chunk = `PREFIX-MARKER${"x".repeat(3 * 1024 * 1024 - 24)}TAIL-MARKER`;
+
+    let unlinks = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.unlinkSync = (...args: any[]) => {
+      unlinks += 1;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (hooks.actual!.unlinkSync as any)(...args);
+    };
+    let writes = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.write = (...args: any[]) => {
+      const [fd, data, offset, , callback] = args;
+      writes += 1;
+      if (writes === 1) {
+        // A short write: only the prefix lands.
+        hooks.actual!.write(fd, data, offset, partial, callback);
+        return;
+      }
+      if (writes === 2) {
+        // The resume fails, stranding a remainder larger than the cap.
+        setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
+        return;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (hooks.actual!.write as any)(...args);
+    };
+
+    transcript.write(chunk);
+    await sleep(400); // timer drain: rotate once, prefix lands, resume fails, cap trims
+
+    // Non-vacuous: the rotation really happened — at maxRotatedFiles: 0 that
+    // is one unlink of the live file — and the prefix really is on disk.
+    expect(unlinks).toBe(1);
+    expect(writes).toBe(2);
+    const file = transcriptPath(dir, "double_");
+    expect(statSync(file).size).toBe(partial);
+
+    // The recovery drain. The remainder is bytes already owed to this very
+    // file — nothing about it may rotate again.
+    transcript.flush?.();
+
+    expect(unlinks).toBe(1); // the same logical chunk did not rotate a second time
+    const text = readFileSync(file, "utf8");
+    expect(text.startsWith("PREFIX-MARKER")).toBe(true); // the prefix that reached disk was not destroyed
+    expect(text.endsWith("TAIL-MARKER")).toBe(true); // the newest bytes of the remainder landed behind it
+    expect(statSync(file).size).toBe(partial + 1024 * 1024); // prefix + exactly the capped remainder
+  });
+
+  /**
+   * F2 — finding 8 with generations kept. The same double rotation at
+   * `maxRotatedFiles: 1` does not delete the prefix outright; it shifts the
+   * prefix into `.1` — destroying the generation that was already there — and
+   * strands the remainder alone in a fresh live file, splitting one `write()`
+   * call across a rotation boundary, which the synchronous writer never did.
+   */
+  it("keeps earlier generations when an oversized chunk's remainder is retried", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "keepgen", 2 * 1024 * 1024, 1);
+    await sleep(400); // header lands; the first rotation will shift it to .1
+
+    const partial = 1536 * 1024;
+    const chunk = `PREFIX-MARKER${"x".repeat(3 * 1024 * 1024 - 24)}TAIL-MARKER`;
+
+    let writes = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.write = (...args: any[]) => {
+      const [fd, data, offset, , callback] = args;
+      writes += 1;
+      if (writes === 1) {
+        hooks.actual!.write(fd, data, offset, partial, callback);
+        return;
+      }
+      if (writes === 2) {
+        setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
+        return;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (hooks.actual!.write as any)(...args);
+    };
+
+    transcript.write(chunk);
+    await sleep(400);
+    expect(writes).toBe(2); // non-vacuous: the partial write and the failure both happened
+
+    transcript.flush?.();
+
+    // The generation shifted when the chunk rotated still holds the session
+    // header; retrying the remainder must not shift (and so destroy) it.
+    const base = transcriptPath(dir, "keepgen_");
+    expect(readFileSync(`${base}.1`, "utf8")).toContain("--- Session started");
+    // And the chunk was not split across generations: prefix and remainder
+    // sit together in the live file.
+    const text = readFileSync(base, "utf8");
+    expect(text.startsWith("PREFIX-MARKER")).toBe(true);
+    expect(text.endsWith("TAIL-MARKER")).toBe(true);
+  });
+
+  /**
+   * The placement invariant behind F1/F2, without an oversized chunk: bytes a
+   * failed write leaves behind were already placed in a specific generation,
+   * and a retry may only finish that placement — while chunks queued behind
+   * them are placed afresh, against what the file really holds by then.
+   */
+  it("lands a failed remainder in the generation it was placed in, and later chunks behind it", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "placed", 200, 3);
+    await sleep(400); // header (49 bytes) lands
+
+    transcript.write("X".repeat(140)); // 49 + 140 ≤ 200 — same file
+    await sleep(400);
+
+    let writes = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.write = (...args: any[]) => {
+      const [fd, data, offset, , callback] = args;
+      writes += 1;
+      if (writes === 1) {
+        hooks.actual!.write(fd, data, offset, 5, callback); // "YYYYY" lands
+        return;
+      }
+      if (writes === 2) {
+        setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
+        return;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (hooks.actual!.write as any)(...args);
+    };
+    transcript.write("Y".repeat(100)); // 189 + 100 > 200 — rotates, then fails mid-write
+    await sleep(400);
+    expect(writes).toBe(2);
+
+    hooks.write = undefined;
+    transcript.write("Z".repeat(10));
+    await sleep(400);
+
+    // One rotation, exactly where the synchronous writer would have put it:
+    // the shifted generation ends at the X chunk, and the Y remainder landed
+    // in the file the Y chunk was placed in, with Z appended after it.
+    const base = transcriptPath(dir, "placed_");
+    expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toHaveLength(1);
+    const first = readFileSync(`${base}.1`, "utf8");
+    expect(first).toContain("--- Session started");
+    expect(first.endsWith("X".repeat(140))).toBe(true);
+    expect(readFileSync(base, "utf8")).toBe(`${"Y".repeat(100)}${"Z".repeat(10)}`);
   });
 
   it("shutdown flush gives up rather than hanging on a wedged write", async () => {

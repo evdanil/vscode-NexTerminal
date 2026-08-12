@@ -35,8 +35,23 @@ const CLOSE_RETRY_DELAYS_MS = [50, 250, 1000];
 /** `fd` value meaning "this transcript owns no descriptor right now". */
 const NO_FD = -1;
 
+/** A shared zero-length buffer: `owed` is never null, only empty. */
+const NO_BYTES = Buffer.alloc(0);
+
 function stripTerminalCodes(data: string): string {
   return data.replace(createAnsiRegex(), "").replace(CTRL_RE, "");
+}
+
+/**
+ * Drop `cut` bytes from the head of `data`, stepping forward off any UTF-8
+ * continuation byte so the cut never lands mid-glyph. Stepping forward drops
+ * at most three bytes more, so it can only ever cut deeper, never less.
+ */
+function cutUtf8Head(data: Buffer, cut: number): Buffer {
+  while (cut < data.length && (data[cut] & 0xc0) === 0x80) {
+    cut += 1;
+  }
+  return data.subarray(cut);
 }
 
 export interface SessionTranscript {
@@ -57,13 +72,6 @@ export interface SessionTranscript {
 
 const NOOP_TRANSCRIPT: SessionTranscript = { write() {}, flush() {}, close() {} };
 
-/** One append's worth of bytes, already resolved against the rotation boundary. */
-interface PendingBatch {
-  /** Rotate before writing this batch. Cleared once the rotation has happened. */
-  rotateFirst: boolean;
-  data: Buffer;
-}
-
 /**
  * Buffered transcript writer.
  *
@@ -71,46 +79,77 @@ interface PendingBatch {
  * chunk put a blocking syscall on the render path for every one of them.
  * Chunks are queued and drained on a timer via an asynchronous append instead.
  *
- * Invariants the queue must not break:
+ * ### The invariant everything hangs off
+ *
+ * Every byte this writer holds is in exactly one of two states:
+ *
+ * - **Undecided** — `queue` (raw strings, straight off the hot path) and
+ *   `pending` (byte-accurate chunks, one per `write()` call). No rotation
+ *   decision of any kind is attached to them, and none has been made about
+ *   them — the types cannot even express one.
+ * - **Placed** — `owed`: bytes whose file generation is settled. The rotation
+ *   their chunk required, if any, has already been performed; all that
+ *   remains is to finish appending them to the live file. Bytes on disk are
+ *   the completion of this state.
+ *
+ * A rotation decision exists only for the instant of {@link promote}: it is
+ * derived from settled state alone — `currentSize` plus bytes already owed to
+ * the live file — and acting on it (shifting the generations) is part of the
+ * same synchronous step that moves the deciding chunk from undecided to
+ * placed. Because no decision is ever stored, none can go stale when a write
+ * fails or the retention cap sheds bytes; and because {@link rotateNow} is
+ * only reachable while `owed` is empty, a chunk whose rotation has been
+ * performed can never trigger it again. "Stale rotation flag" and "rotated
+ * twice" — the shape of every accounting defect this file has had — have no
+ * representation.
+ *
+ * The invariants carried over from the synchronous writer:
  *
  * - **Ordering.** Drains are serialised through `flushChain`, so a drain that
  *   is still in flight when the next timer fires cannot interleave with it.
- * - **Rotation identity.** The queue is drained chunk by chunk against the same
- *   `currentSize + size > maxFileSizeBytes` test the synchronous writer applied
- *   per `write()` call, so a transcript rotates at exactly the same byte
- *   boundaries as before. Adjacent chunks that land in the same file are
- *   concatenated into one syscall; a batch is cut wherever a rotation falls.
- * - **Durability.** A write that fails, or that lands only part of its buffer,
- *   leaves the unwritten bytes queued for the next drain instead of dropping
- *   them. `currentSize` only ever advances by bytes that actually reached the
- *   file, so rotation cannot drift out of step with the file on disk.
- * - **Descriptor ownership.** `fd` holds a descriptor this transcript owns, or
- *   {@link NO_FD}. It is never left holding a number the process has already
- *   handed back — see {@link releaseFd}.
+ * - **Rotation identity.** Each chunk gets the same
+ *   `currentSize + size > maxFileSizeBytes` test the synchronous writer
+ *   applied per `write()` call — once, when it is promoted — so a transcript
+ *   rotates at exactly the same byte boundaries as before. Adjacent chunks
+ *   bound for the same generation are coalesced into one syscall; a chunk
+ *   that would cross the boundary stays undecided until the bytes ahead of
+ *   it have landed.
+ * - **Durability.** A write that fails, or that lands only part of its
+ *   buffer, leaves the unwritten bytes in `owed` for the next drain instead
+ *   of dropping them. `currentSize` only ever advances by bytes that actually
+ *   reached the file, so rotation cannot drift out of step with the disk.
+ * - **Bounded.** After a failed drain the carried-over bytes (`owed` plus
+ *   `pending`) are trimmed, oldest first, to {@link MAX_RETAINED_BYTES}.
+ *   Dropping undecided bytes invalidates nothing — no decision was made
+ *   about them or against them. Dropping placed bytes only shortens an
+ *   append whose destination was already settled. Neither can move a
+ *   rotation.
+ * - **Descriptor ownership.** `fd` holds a descriptor this transcript owns,
+ *   or {@link NO_FD}. It is never left holding a number the process has
+ *   already handed back — see {@link releaseFd}.
  */
 class FileSessionTranscript implements SessionTranscript {
   /** Open descriptor, or {@link NO_FD} when none is currently owned. */
   private fd: number = NO_FD;
   private currentSize: number;
   private closed = false;
+  /** Raw chunks off the hot path. Moved into `pending` when a drain starts. */
   private queue: string[] = [];
   /**
-   * Batches a previous drain could not write, or could only partly write. They
-   * go out at the head of the next drain, ahead of anything queued since, so a
-   * transient failure costs a retry rather than the data. Their rotation has
-   * already been resolved (and, for the batch that failed, already applied).
+   * Undecided bytes, one buffer per `write()` call, oldest first. Placement
+   * is decided in {@link promote} and nowhere else — these carry no flags.
    */
-  private retained: PendingBatch[] = [];
+  private pending: Buffer[] = [];
+  /**
+   * Placed bytes: the live file's settled future content that has not reached
+   * the disk yet. A failed or short write leaves its remainder here, and a
+   * retry may only finish the append — nothing about these bytes is ever
+   * decided again.
+   */
+  private owed: Buffer = NO_BYTES;
   private flushTimer?: ReturnType<typeof setTimeout>;
   private flushChain: Promise<void> = Promise.resolve();
   private draining = false;
-  /**
-   * The generations have been shifted but no descriptor has been acquired for
-   * the new file yet — a rotation that got half-way. A retry must finish it,
-   * not restart it: shifting twice would move the just-rotated content another
-   * generation along, and at `maxRotatedFiles: 1` would delete it outright.
-   */
-  private rotationShifted = false;
   private closeAttempt = 0;
   private closeRetryTimer?: ReturnType<typeof setTimeout>;
 
@@ -178,7 +217,7 @@ class FileSessionTranscript implements SessionTranscript {
       // descriptor open, until the retry budget runs out. Teardown is the last
       // chance those bytes get, so spend it here rather than waiting for a
       // timer the host is about to stop running.
-      if (this.retained.length > 0) {
+      if (this.retainedByteCount() > 0) {
         this.finishClose();
       }
       return;
@@ -210,17 +249,18 @@ class FileSessionTranscript implements SessionTranscript {
    * Land the tail, then let the descriptor go.
    *
    * The drain can fail — a transient EIO, a network share that blinked — and
-   * when it does the tail and the session footer sit in `retained`. Closing the
-   * descriptor and deregistering here would put them out of reach of every
-   * retry path there is, which loses precisely the bytes retention exists to
-   * keep. So a failed drain keeps both, and a timer retries on a short, finite
-   * budget. `close()` itself stays synchronous and returns immediately either
-   * way: terminal closure must not wait on a wedged filesystem.
+   * when it does the tail and the session footer are still held (placed or
+   * pending). Closing the descriptor and deregistering here would put them out
+   * of reach of every retry path there is, which loses precisely the bytes
+   * retention exists to keep. So a failed drain keeps both, and a timer
+   * retries on a short, finite budget. `close()` itself stays synchronous and
+   * returns immediately either way: terminal closure must not wait on a
+   * wedged filesystem.
    */
   private finishClose(): void {
     this.clearCloseRetryTimer();
     this.drainSync();
-    if (this.retained.length > 0) {
+    if (this.retainedByteCount() > 0) {
       this.scheduleCloseRetry();
       return;
     }
@@ -257,8 +297,9 @@ class FileSessionTranscript implements SessionTranscript {
    * further.
    */
   private abandonTail(): void {
-    const lost = this.retained.reduce((total, batch) => total + batch.data.length, 0);
-    this.retained = [];
+    const lost = this.retainedByteCount();
+    this.owed = NO_BYTES;
+    this.pending = [];
     this.releaseFd();
     liveTranscripts.delete(this);
     console.error(
@@ -287,227 +328,188 @@ class FileSessionTranscript implements SessionTranscript {
 
   /**
    * The rotation rule, in one place: does appending `size` bytes to a file
-   * already holding `projectedSize` push it past the boundary? Every path that
-   * resolves a rotation goes through here, because the class's rotation
-   * identity is precisely that this one test is applied the same way the
-   * synchronous writer applied it — two copies of it drifting apart is how that
-   * identity gets lost.
+   * already holding `settledSize` push it past the boundary? The class's
+   * rotation identity is precisely that this one test is applied the same way
+   * the synchronous writer applied it, so every rotation decision goes
+   * through here — and is acted on in the same step it is made.
    */
-  private overflowsFile(projectedSize: number, size: number): boolean {
-    return projectedSize + size > this.rotation.maxFileSizeBytes;
+  private overflowsFile(settledSize: number, size: number): boolean {
+    return settledSize + size > this.rotation.maxFileSizeBytes;
   }
 
-  /**
-   * Walk a projected file size forward through `batches` and return where it
-   * ends up: each batch either resets the projection (it rotates first) or adds
-   * to it, so the walk describes what the live file holds once the whole
-   * sequence has been written.
-   *
-   * `resolve` decides what happens to each batch's `rotateFirst`:
-   *
-   * - `false` — take it as given, and only move the projection. Retained
-   *   batches reach a drain in this state: their rotation was settled when they
-   *   were cut, and for the remainder a partial write left behind it has
-   *   already been *applied*, so recomputing would rotate that batch twice.
-   * - `true` — recompute it. Correct only once the projection those flags were
-   *   decided against no longer holds, which is exactly what dropping retained
-   *   bytes does — and it invalidates *every* surviving batch, not just the
-   *   first, since each one was sized against a file the dropped bytes were
-   *   going to fill.
-   */
-  private projectRotation(batches: PendingBatch[], startSize: number, resolve: boolean): number {
-    let projectedSize = startSize;
-    for (const batch of batches) {
-      const size = batch.data.length;
-      if (resolve) {
-        batch.rotateFirst = this.overflowsFile(projectedSize, size);
-      }
-      if (batch.rotateFirst) {
-        projectedSize = 0;
-      }
-      projectedSize += size;
+  /** Bytes carried over for retry: placed but unwritten, plus undecided. */
+  private retainedByteCount(): number {
+    let total = this.owed.length;
+    for (const chunk of this.pending) {
+      total += chunk.length;
     }
-    return projectedSize;
+    return total;
   }
 
-  /**
-   * Split the queue into batches that each land inside one file generation,
-   * applying rotation between batches. Returns the batches in write order —
-   * anything retained from a failed drain first — and leaves the queue empty;
-   * the caller performs the writes.
-   */
-  private takeBatches(): PendingBatch[] {
-    const batches = this.retained;
-    this.retained = [];
-
-    // Retained batches have already been sized against the rotation boundary;
-    // they only move the projection along so the chunks queued behind them
-    // rotate exactly where they would have without the failure.
-    let projectedSize = this.projectRotation(batches, this.currentSize, false);
-
-    let current: { rotateFirst: boolean; text: string } | undefined;
-    const fresh: Array<{ rotateFirst: boolean; text: string }> = [];
+  /** Move raw queued chunks into the undecided stage, byte-accurate. */
+  private ingest(): void {
     for (const chunk of this.queue) {
-      const size = Buffer.byteLength(chunk, "utf8");
-      const rotates = this.overflowsFile(projectedSize, size);
-      if (rotates) {
-        projectedSize = 0;
-      }
-      if (current === undefined || rotates) {
-        current = { rotateFirst: rotates, text: chunk };
-        fresh.push(current);
-      } else {
-        current.text += chunk;
-      }
-      projectedSize += size;
+      this.pending.push(Buffer.from(chunk, "utf8"));
     }
     this.queue = [];
-
-    for (const batch of fresh) {
-      batches.push({ rotateFirst: batch.rotateFirst, data: Buffer.from(batch.text, "utf8") });
-    }
-    return batches;
   }
 
   /**
-   * Put back everything a drain did not write: the batch it stopped in, minus
-   * the bytes that did land, followed by every batch after it. Order is
-   * preserved — retained batches go out ahead of whatever was queued while the
-   * failed drain was running.
+   * Move bytes from undecided to placed. When nothing is owed, the head chunk
+   * is placed first: it gets its one rotation test — the synchronous writer's
+   * rule, against the live file's settled size — and the generation shift it
+   * asks for happens here, in the same step. It is then placed
+   * unconditionally: a chunk larger than a whole file overfills its
+   * generation, exactly as the synchronous writer overfilled it, rather than
+   * ever being asked again.
    *
-   * No retry timer is armed from here. A live session enqueues again within
-   * milliseconds and takes the retained bytes with it; an idle one flushes on
-   * disconnect or close. Re-arming would spin a permanently failing fd forever.
+   * Chunks behind the head are coalesced in while they fit the same
+   * generation — a projection made of settled bytes only (`currentSize` plus
+   * what is already owed), so it is a statement of fact about this file, not
+   * a guess about writes that might fail. A chunk that would cross the
+   * boundary stays undecided; it takes its own test at a later promote, once
+   * the bytes ahead of it have landed.
    */
-  private retainFrom(batches: PendingBatch[], index: number, written: number): void {
-    const batch = batches[index];
-    const remainder = written > 0 ? batch.data.subarray(written) : batch.data;
-    const rest = batches.slice(index + 1);
-    if (remainder.length > 0) {
-      rest.unshift({ rotateFirst: batch.rotateFirst, data: remainder });
+  private promote(): void {
+    if (this.owed.length === 0) {
+      const head = this.pending.shift();
+      if (head === undefined) {
+        return;
+      }
+      if (this.overflowsFile(this.currentSize, head.length)) {
+        this.rotateNow();
+      }
+      this.owed = head;
     }
-    this.retained = rest.concat(this.retained);
-    this.trimRetained();
+    let projected = this.currentSize + this.owed.length;
+    const taken: Buffer[] = [];
+    while (this.pending.length > 0 && !this.overflowsFile(projected, this.pending[0].length)) {
+      const chunk = this.pending.shift()!;
+      taken.push(chunk);
+      projected += chunk.length;
+    }
+    if (taken.length > 0) {
+      this.owed = Buffer.concat([this.owed, ...taken]);
+    }
   }
 
   /**
-   * Hold the retained queue to {@link MAX_RETAINED_BYTES}, keeping the newest
-   * bytes.
+   * Shift the generations for the chunk being placed, in the same synchronous
+   * step as the decision that called for it.
    *
-   * Whole batches are shed oldest-first, and the last one standing is *not*
-   * exempt from the cap: `takeBatches()` coalesces every adjacent chunk bound
-   * for the same file into one batch, so a single batch can be an entire
-   * rotation generation — 10 MiB by default, up to 1 GiB when configured — and
-   * one `write()` can be larger still. Exempting it let a permanently failing
-   * fd retain orders of magnitude more than the stated bound. It is trimmed
-   * from the head instead, which keeps the same tail-most bytes that shedding
-   * oldest-first keeps.
+   * The descriptor is released first — Windows will not reliably rename a
+   * file the process still holds open, and transcripts can live on UNC shares
+   * where that is stricter still. Reacquiring one is deliberately *not* done
+   * here: opening is the append path's job ({@link ensureOpen}), which
+   * already retries across drains and re-reads the file's true size when it
+   * succeeds. With the fallible syscall out of it, rotation itself cannot
+   * fail — so "a rotation that half-happened" is not a state this writer can
+   * be in, and there is nothing about a rotation to remember, resume, or
+   * accidentally repeat.
+   */
+  private rotateNow(): void {
+    if (this.owed.length !== 0) {
+      // Unreachable: the only call site promotes with `owed` empty. If a
+      // future change breaks that, failing loudly here beats silently
+      // stranding placed bytes in a generation they were never placed in.
+      throw new Error(
+        `[Nexus] Session transcript ${this.filepath}: invariant violation — rotation while ${this.owed.length} byte(s) are still owed to the live file`
+      );
+    }
+    this.releaseFd();
+    this.shiftGenerations();
+    this.currentSize = 0;
+  }
+
+  /**
+   * Hold the carried-over bytes (`owed` plus `pending`) to
+   * {@link MAX_RETAINED_BYTES}, shedding the oldest bytes first — placed
+   * before undecided, head before tail — so it is exactly the newest bytes
+   * that survive. Called only after a failed or short drain; a healthy burst
+   * larger than the cap writes through without ever being trimmed.
+   *
+   * Shedding placed bytes shortens an append whose destination was already
+   * settled. Shedding undecided bytes shrinks or removes chunks nothing has
+   * been decided about — a shortened survivor simply takes its one rotation
+   * test later, at its new size, against whatever the file really holds by
+   * then. No stored decision exists to go stale, which is the difference
+   * between this cap and every previous shape of it.
    *
    * `currentSize` is deliberately untouched: it counts bytes that reached the
    * file, and everything dropped here is by definition unwritten, so the drop
-   * cannot move it out of step with the file on disk. What the drop *does*
-   * invalidate is the projection every surviving batch's `rotateFirst` was
-   * decided against — that projection assumed the dropped bytes would land. So
-   * the whole surviving sequence is re-resolved against the real file size,
-   * exactly as `takeBatches()` resolves freshly queued chunks.
-   *
-   * The head alone is not enough. Re-resolving it can flip its rotation either
-   * way, and every batch behind it was projected against the file that flip
-   * decides the shape of: a head that no longer rotates leaves the bytes behind
-   * it landing in a file that is already part-full, so a stale `rotateFirst:
-   * false` further down overruns `maxFileSizeBytes`, while a stale `true`
-   * shifts a generation (and, at `maxRotatedFiles: 1`, deletes one) to make
-   * room in a file the lost bytes never filled.
+   * cannot move it out of step with the file on disk.
    */
   private trimRetained(): void {
-    let total = 0;
-    for (const batch of this.retained) {
-      total += batch.data.length;
-    }
-    if (total <= MAX_RETAINED_BYTES) {
+    let excess = this.retainedByteCount() - MAX_RETAINED_BYTES;
+    if (excess <= 0) {
       return;
     }
-    while (total > MAX_RETAINED_BYTES && this.retained.length > 1) {
-      total -= this.retained.shift()!.data.length;
+    if (excess >= this.owed.length) {
+      excess -= this.owed.length;
+      this.owed = NO_BYTES;
+    } else {
+      this.owed = cutUtf8Head(this.owed, excess);
+      excess = 0;
     }
-    const head = this.retained[0];
-    if (head === undefined) {
-      return;
-    }
-    if (total > MAX_RETAINED_BYTES) {
-      let cut = total - MAX_RETAINED_BYTES;
-      // Never cut mid-glyph: step forward off any UTF-8 continuation byte. That
-      // drops at most three more bytes, so it cannot push the total back over.
-      while (cut < head.data.length && (head.data[cut] & 0xc0) === 0x80) {
-        cut += 1;
+    while (excess > 0 && this.pending.length > 0) {
+      const head = this.pending[0];
+      if (excess >= head.length) {
+        excess -= head.length;
+        this.pending.shift();
+      } else {
+        this.pending[0] = cutUtf8Head(head, excess);
+        excess = 0;
       }
-      head.data = head.data.subarray(cut);
     }
-    this.projectRotation(this.retained, this.currentSize, true);
-  }
-
-  /**
-   * Perform the rotation a batch asks for. Returns false if the rotation itself
-   * failed, in which case the batch and everything after it has been retained.
-   */
-  private applyRotation(batches: PendingBatch[], index: number): boolean {
-    const batch = batches[index];
-    if (!batch.rotateFirst) {
-      return true;
-    }
-    try {
-      this.rotate();
-    } catch {
-      this.retainFrom(batches, index, 0);
-      return false;
-    }
-    // The rotation has happened; a retry of this batch must not repeat it.
-    batch.rotateFirst = false;
-    this.currentSize = 0;
-    return true;
   }
 
   private drainSync(): void {
-    const batches = this.takeBatches();
-    for (let index = 0; index < batches.length; index += 1) {
-      const batch = batches[index];
-      if (!this.applyRotation(batches, index)) {
-        return;
+    this.ingest();
+    for (;;) {
+      this.promote();
+      if (this.owed.length === 0) {
+        return; // nothing placed and nothing left to place — fully drained
       }
-      const written = this.appendSync(batch.data);
+      const written = this.appendSync(this.owed);
       this.currentSize += written;
-      if (written < batch.data.length) {
-        this.retainFrom(batches, index, written);
+      this.owed = this.owed.subarray(written);
+      if (this.owed.length > 0) {
+        // Failure, or a short write that stopped making progress: keep what
+        // is left — placed bytes stay placed — on a bounded budget.
+        this.trimRetained();
         return;
       }
     }
   }
 
   private async drainAsync(): Promise<void> {
-    if (this.closed || (this.queue.length === 0 && this.retained.length === 0)) {
+    if (this.closed || (this.queue.length === 0 && this.pending.length === 0 && this.owed.length === 0)) {
       return;
     }
     this.draining = true;
     try {
-      const batches = this.takeBatches();
-      for (let index = 0; index < batches.length; index += 1) {
-        const batch = batches[index];
-        if (!this.applyRotation(batches, index)) {
+      this.ingest();
+      for (;;) {
+        this.promote();
+        if (this.owed.length === 0) {
           return;
         }
-        const written = await this.appendAsync(batch.data);
+        const written = await this.appendAsync(this.owed);
         this.currentSize += written;
-        if (written < batch.data.length) {
-          // Short write or hard failure: keep the rest for the next drain
-          // rather than dropping this batch and every batch behind it.
-          this.retainFrom(batches, index, written);
+        this.owed = this.owed.subarray(written);
+        if (this.owed.length > 0) {
+          this.trimRetained();
           return;
         }
       }
-    } catch {
-      // A failed transcript write must never take down a session, and must
-      // never reject the flush chain (which would strand everything queued
-      // behind it). The append paths already retain what they could not write.
+    } catch (error) {
+      // Nothing in the loop is expected to throw — the append paths catch
+      // their own syscall errors — so anything caught here is a logic fault
+      // worth hearing about. It must still never take down a session, and
+      // must never reject the flush chain (which would strand everything
+      // queued behind it). State is already consistent either way: unwritten
+      // bytes are still owed or pending.
+      console.error(`[Nexus] Session transcript ${this.filepath}: unexpected drain error: ${String(error)}`);
     } finally {
       this.draining = false;
     }
@@ -577,14 +579,9 @@ class FileSessionTranscript implements SessionTranscript {
     }
   }
 
-  /**
-   * Take ownership of a descriptor for the live file. The assignment and the
-   * half-rotated flag move together, so a successful open always cancels a
-   * rotation that was left part-finished.
-   */
+  /** Take ownership of a descriptor for the live file. */
   private openFd(): void {
     this.fd = openSync(this.filepath, "a");
-    this.rotationShifted = false;
   }
 
   /**
@@ -610,11 +607,13 @@ class FileSessionTranscript implements SessionTranscript {
   }
 
   /**
-   * Reacquire a descriptor after one was lost — a rotation whose open failed,
-   * or a give-up that released it. Returns false if the file still cannot be
-   * opened, in which case the caller retains its bytes and the next drain
-   * tries again. This is what keeps a transient failure during rotation from
-   * ending the transcript permanently.
+   * Reacquire a descriptor after one was released — by a rotation, or by a
+   * previous open that failed. Returns false if the file still cannot be
+   * opened, in which case the caller's bytes stay owed and the next drain
+   * tries again; this is what keeps a transient failure around rotation from
+   * ending the transcript permanently. On success the accounting trusts the
+   * file's own size: the descriptor is new, and the file underneath it may
+   * not be the one the old accounting described.
    */
   private ensureOpen(): boolean {
     if (this.fd !== NO_FD) {
@@ -625,34 +624,8 @@ class FileSessionTranscript implements SessionTranscript {
     } catch {
       return false;
     }
-    // The descriptor is new and the file underneath it may not be the one the
-    // old accounting described, so trust the file's own size.
     this.currentSize = this.readCurrentSize();
     return true;
-  }
-
-  /**
-   * Rotate the file: release the live descriptor, shift the generations, open
-   * the new file.
-   *
-   * The descriptor has to be released before the renames — Windows will not
-   * reliably rename a file the process still holds open, and transcripts can
-   * live on UNC shares where that is stricter still — so there is unavoidably
-   * a window with no descriptor. What must not happen is that window becoming
-   * permanent: if the open throws, `fd` stays {@link NO_FD} (never the closed
-   * number), `rotationShifted` records that the renames are already done, and
-   * the next attempt finishes the rotation rather than restarting it.
-   */
-  private rotate(): void {
-    if (this.rotationShifted) {
-      // The renames already happened; only the descriptor is still owed.
-      this.openFd();
-      return;
-    }
-    this.releaseFd();
-    this.shiftGenerations();
-    this.rotationShifted = true;
-    this.openFd();
   }
 
   private shiftGenerations(): void {
