@@ -92,6 +92,28 @@ function allTranscriptText(dir: string, prefix: string): string {
 }
 
 /**
+ * The writer's retained queue. Read through a function rather than captured
+ * once: a failed drain *reassigns* `retained`, so a held reference goes stale.
+ */
+function retainedOf(transcript: SessionTranscript): Array<{ rotateFirst: boolean; data: Buffer }> {
+  return (transcript as unknown as { retained: Array<{ rotateFirst: boolean; data: Buffer }> }).retained;
+}
+
+/** Every generation of a transcript on disk, base file included. */
+function generationSizes(dir: string, prefix: string): number[] {
+  return readdirSync(dir)
+    .filter((entry) => entry.startsWith(prefix))
+    .map((entry) => statSync(path.join(dir, entry)).size);
+}
+
+/** A write that always fails, asynchronously, the way a wedged fd would. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function failingWrite(...args: any[]): void {
+  const callback = args[args.length - 1] as (error: Error | null, written: number) => void;
+  setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
+}
+
+/**
  * A stub that keeps callbacks instead of writing. `deferCount` writes are
  * parked; every write after that goes to the real fs.
  */
@@ -530,6 +552,91 @@ describe("session transcript failure paths", () => {
     expect(text).toContain("after the drop");
     const currentSize = (transcript as unknown as { currentSize: number }).currentSize;
     expect(currentSize).toBe(statSync(file).size);
+  });
+
+  /**
+   * E5 — the rest of E4's story. The cap's re-resolution only ever touched the
+   * *head* of the surviving queue, but `retained` routinely holds several
+   * batches accumulated across failed drains, and every one of them was sized
+   * against a projection that assumed the dropped bytes would land.
+   *
+   * Re-resolving the head alone can flip it from "rotate" to "do not rotate" —
+   * and then the rotation the batches behind it were projected against never
+   * happens. A batch still carrying a stale `rotateFirst: false` appends into a
+   * file that is already part-full and drives it past `maxFileSizeBytes`, which
+   * is exactly the byte boundary the synchronous writer this replaced would
+   * never have crossed.
+   */
+  it("re-resolves the whole retained sequence after the cap drops bytes", async () => {
+    const dir = makeTempDir();
+    const maxFileSizeBytes = 400_000;
+    const transcript = open(dir, "stale", maxFileSizeBytes, 5);
+
+    // One drain that lands first, so the live file has a size for the
+    // re-resolved flags to be measured against. At `currentSize: 0` the head's
+    // flip changes nothing downstream and the staleness cannot show.
+    transcript.write("P".repeat(100_000));
+    await sleep(400);
+    const file = transcriptPath(dir, "stale_");
+    const headerBytes = statSync(file).size - 100_000;
+    expect(headerBytes).toBeGreaterThan(0);
+
+    hooks.write = failingWrite;
+
+    // Drain two, failing outright: "A" fits alongside what is already in the
+    // file, "B" does not, so the queue is cut in two and "B" carries the
+    // rotation. Still under the 1 MiB cap, so nothing is trimmed yet.
+    transcript.write("A".repeat(250_000));
+    transcript.write("B".repeat(250_000));
+    await sleep(400);
+    expect(retainedOf(transcript).map((batch) => [batch.rotateFirst, batch.data.length])).toEqual([
+      [false, 250_000],
+      [true, 250_000]
+    ]);
+
+    // Drain three, also failing. These are cut against the projection the two
+    // retained batches leave behind — "C" fits the file "B" opens, "D" and "E"
+    // each need one of their own — and push the retained total over 1 MiB.
+    transcript.write("C".repeat(100_000));
+    transcript.write("D".repeat(300_000));
+    transcript.write("E".repeat(200_000));
+    await sleep(400);
+
+    // The cap shed "A", and that is what invalidates the rest of the queue.
+    // "B" no longer overflows the live file, so its rotation goes away...
+    // ...which drops "C" in behind it rather than into the fresh file it was
+    // projected against, so "C" is the batch that has to rotate now, and "D"
+    // fits the file "C" opens.
+    expect(retainedOf(transcript).map((batch) => [batch.rotateFirst, batch.data.length])).toEqual([
+      [false, 250_000],
+      [true, 100_000],
+      [false, 300_000],
+      [true, 200_000]
+    ]);
+
+    hooks.write = undefined;
+    transcript.write("after the drop\n");
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (allTranscriptText(dir, "stale_").endsWith("after the drop\n")) {
+        break;
+      }
+      await sleep(20);
+    }
+
+    // The invariant the flags exist to hold: the transcript rotates at the same
+    // byte boundaries the synchronous writer would have produced. No generation
+    // overruns the limit...
+    expect(Math.max(...generationSizes(dir, "stale_"))).toBeLessThanOrEqual(maxFileSizeBytes);
+    // ...and nothing rotated that did not have to.
+    expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toHaveLength(2);
+
+    // Only the batch the cap shed is missing; everything else is intact and in
+    // order across the generations.
+    const text = allTranscriptText(dir, "stale_");
+    expect(text.startsWith("--- Session started")).toBe(true);
+    expect(text.slice(headerBytes)).toBe(
+      `${"P".repeat(100_000)}${"B".repeat(250_000)}${"C".repeat(100_000)}${"D".repeat(300_000)}${"E".repeat(200_000)}after the drop\n`
+    );
   });
 
   it("shutdown flush gives up rather than hanging on a wedged write", async () => {

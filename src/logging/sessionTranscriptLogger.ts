@@ -286,6 +286,51 @@ class FileSessionTranscript implements SessionTranscript {
   }
 
   /**
+   * The rotation rule, in one place: does appending `size` bytes to a file
+   * already holding `projectedSize` push it past the boundary? Every path that
+   * resolves a rotation goes through here, because the class's rotation
+   * identity is precisely that this one test is applied the same way the
+   * synchronous writer applied it — two copies of it drifting apart is how that
+   * identity gets lost.
+   */
+  private overflowsFile(projectedSize: number, size: number): boolean {
+    return projectedSize + size > this.rotation.maxFileSizeBytes;
+  }
+
+  /**
+   * Walk a projected file size forward through `batches` and return where it
+   * ends up: each batch either resets the projection (it rotates first) or adds
+   * to it, so the walk describes what the live file holds once the whole
+   * sequence has been written.
+   *
+   * `resolve` decides what happens to each batch's `rotateFirst`:
+   *
+   * - `false` — take it as given, and only move the projection. Retained
+   *   batches reach a drain in this state: their rotation was settled when they
+   *   were cut, and for the remainder a partial write left behind it has
+   *   already been *applied*, so recomputing would rotate that batch twice.
+   * - `true` — recompute it. Correct only once the projection those flags were
+   *   decided against no longer holds, which is exactly what dropping retained
+   *   bytes does — and it invalidates *every* surviving batch, not just the
+   *   first, since each one was sized against a file the dropped bytes were
+   *   going to fill.
+   */
+  private projectRotation(batches: PendingBatch[], startSize: number, resolve: boolean): number {
+    let projectedSize = startSize;
+    for (const batch of batches) {
+      const size = batch.data.length;
+      if (resolve) {
+        batch.rotateFirst = this.overflowsFile(projectedSize, size);
+      }
+      if (batch.rotateFirst) {
+        projectedSize = 0;
+      }
+      projectedSize += size;
+    }
+    return projectedSize;
+  }
+
+  /**
    * Split the queue into batches that each land inside one file generation,
    * applying rotation between batches. Returns the batches in write order —
    * anything retained from a failed drain first — and leaves the queue empty;
@@ -298,19 +343,13 @@ class FileSessionTranscript implements SessionTranscript {
     // Retained batches have already been sized against the rotation boundary;
     // they only move the projection along so the chunks queued behind them
     // rotate exactly where they would have without the failure.
-    let projectedSize = this.currentSize;
-    for (const batch of batches) {
-      if (batch.rotateFirst) {
-        projectedSize = 0;
-      }
-      projectedSize += batch.data.length;
-    }
+    let projectedSize = this.projectRotation(batches, this.currentSize, false);
 
     let current: { rotateFirst: boolean; text: string } | undefined;
     const fresh: Array<{ rotateFirst: boolean; text: string }> = [];
     for (const chunk of this.queue) {
       const size = Buffer.byteLength(chunk, "utf8");
-      const rotates = projectedSize + size > this.rotation.maxFileSizeBytes;
+      const rotates = this.overflowsFile(projectedSize, size);
       if (rotates) {
         projectedSize = 0;
       }
@@ -367,12 +406,18 @@ class FileSessionTranscript implements SessionTranscript {
    * `currentSize` is deliberately untouched: it counts bytes that reached the
    * file, and everything dropped here is by definition unwritten, so the drop
    * cannot move it out of step with the file on disk. What the drop *does*
-   * invalidate is the projection the surviving head's `rotateFirst` was decided
-   * against — that projection assumed the dropped bytes would land. So it is
-   * re-resolved against the real file size, exactly as `takeBatches()` would
-   * have: without this, a batch could rotate a file the lost bytes never filled,
-   * shifting a generation (and, at `maxRotatedFiles: 1`, deleting one) to make
-   * room for a file that is nowhere near its limit.
+   * invalidate is the projection every surviving batch's `rotateFirst` was
+   * decided against — that projection assumed the dropped bytes would land. So
+   * the whole surviving sequence is re-resolved against the real file size,
+   * exactly as `takeBatches()` resolves freshly queued chunks.
+   *
+   * The head alone is not enough. Re-resolving it can flip its rotation either
+   * way, and every batch behind it was projected against the file that flip
+   * decides the shape of: a head that no longer rotates leaves the bytes behind
+   * it landing in a file that is already part-full, so a stale `rotateFirst:
+   * false` further down overruns `maxFileSizeBytes`, while a stale `true`
+   * shifts a generation (and, at `maxRotatedFiles: 1`, deletes one) to make
+   * room in a file the lost bytes never filled.
    */
   private trimRetained(): void {
     let total = 0;
@@ -398,7 +443,7 @@ class FileSessionTranscript implements SessionTranscript {
       }
       head.data = head.data.subarray(cut);
     }
-    head.rotateFirst = this.currentSize + head.data.length > this.rotation.maxFileSizeBytes;
+    this.projectRotation(this.retained, this.currentSize, true);
   }
 
   /**
