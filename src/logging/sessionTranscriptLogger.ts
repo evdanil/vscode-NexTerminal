@@ -194,6 +194,22 @@ const NOOP_TRANSCRIPT: SessionTranscript = { write() {}, flush() {}, close() {} 
  *   single call larger than one batch, which is drained in place — `owed`
  *   walks it as a view — so the whole of it stays alive while the cap counts
  *   only the part still unwritten.
+ *
+ *   One consequence of that second transient is worth stating outright,
+ *   because the arithmetic above does not make it obvious. If an admission
+ *   trims while such a chunk is still being walked, {@link shedOldest} cuts a
+ *   survivor out of a view whose parent is still referenced, so parent and
+ *   survivor coexist for the duration of the copy — close to twice the cap at
+ *   that instant — and the copy itself runs synchronously inside
+ *   {@link admit}, on the terminal output path: measured at 32–41 ms for a
+ *   62.9 MiB survivor, to shed an excess that is at most one arriving chunk.
+ *   Reachability is the only thing that makes this acceptable: it needs a
+ *   single `write()` of tens of MiB, and every shipped transport delivers
+ *   ≤ ~64 KiB per call (ssh2 channel data, serial sidecar reads). If a future
+ *   caller can hand this writer a chunk that large, shed by re-deriving a
+ *   `subarray` from the split record instead of copying — the length guard in
+ *   {@link returnUnwritten} then correctly falls back to concatenation,
+ *   because contiguity really has been broken.
  * - **Descriptor ownership.** `fd` holds a descriptor this transcript owns,
  *   or {@link NO_FD}. It is never left holding a number the process has
  *   already handed back — see {@link releaseFd}.
