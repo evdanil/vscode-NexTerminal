@@ -455,6 +455,87 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  /**
+   * The per-chunk stdout trace goes through `logOutput`, which the logger gates
+   * on the opt-in `nexus.logging.terminalOutputTrace` setting. Lifecycle lines
+   * keep using `log` and are never gated.
+   */
+  it("routes the per-chunk stdout trace through logOutput, and lifecycle lines through log", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), logOutput: vi.fn(), close: vi.fn() };
+
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.open();
+    await flushAsync();
+
+    stream.push("hunter2\r\n");
+    await flushAsync();
+
+    expect(logger.logOutput).toHaveBeenCalledWith(`stdout ${JSON.stringify("hunter2\r\n")}`);
+    // Session data must NOT reach the always-on lifecycle channel.
+    const lifecycleLines = logger.log.mock.calls.map((call) => String(call[0]));
+    expect(lifecycleLines.some((line) => line.startsWith("stdout "))).toBe(false);
+    expect(lifecycleLines).toContain("connected to Server 1");
+
+    pty.dispose();
+    expect(logger.log).toHaveBeenCalledWith("terminal closed");
+  });
+
+  /**
+   * The transcript writer buffers and drains on a timer. A disconnected session
+   * can sit open indefinitely and deactivate can arrive at any moment, so both
+   * paths have to force the queue out.
+   */
+  it("flushes the buffered transcript on disconnect and on shutdown", async () => {
+    const stream = new PassThrough();
+    const first = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => first.connection) };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onDisconnected: vi.fn() };
+    const logger = { log: vi.fn(), logOutput: vi.fn(), close: vi.fn() };
+    const transcript = { write: vi.fn(), flush: vi.fn(), close: vi.fn() };
+
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any, transcript as any);
+    pty.open();
+    await flushAsync();
+
+    stream.push("output\r\n");
+    await flushAsync();
+    expect(transcript.write).toHaveBeenCalledWith("output\r\n");
+    expect(transcript.flush).not.toHaveBeenCalled();
+
+    first.emitClose();
+    await flushAsync();
+    expect(transcript.flush).toHaveBeenCalledTimes(1);
+    expect(transcript.close).not.toHaveBeenCalled();
+
+    pty.dispose();
+    expect(transcript.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("flushes the buffered transcript when the extension shuts the session down", async () => {
+    const stream = new PassThrough();
+    const { connection } = createConnection(stream);
+    const sshFactory = { connect: vi.fn(async () => connection) };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), logOutput: vi.fn(), close: vi.fn() };
+    const transcript = { write: vi.fn(), flush: vi.fn(), close: vi.fn() };
+
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any, transcript as any);
+    pty.open();
+    await flushAsync();
+
+    stream.push("output\r\n");
+    await flushAsync();
+
+    pty.markShuttingDown("Nexus extension is shutting down.");
+    expect(transcript.flush).toHaveBeenCalledTimes(1);
+
+    pty.dispose();
+  });
+
   it("flushes buffered highlighted output before disconnect messaging", async () => {
     const stream = new PassThrough();
     const { connection, emitClose } = createConnection(stream);

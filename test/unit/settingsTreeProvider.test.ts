@@ -164,12 +164,19 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("category children", () => {
-    it("returns 4 children for logging category", () => {
+    it("returns 5 children for logging category", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("logging");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(4);
+      expect(children).toHaveLength(5);
       expect(children.every((c) => c instanceof SettingsValueItem)).toBe(true);
+    });
+
+    it("exposes the opt-in terminal output trace in the logging category", () => {
+      const provider = createProvider();
+      const category = new SettingsCategoryItem("logging");
+      const children = provider.getChildren(category) as SettingsValueItem[];
+      expect(children.some((child) => child.label?.includes("Terminal Output Trace"))).toBe(true);
     });
 
     it("returns 7 children for ssh category after host trust moves to Security & Data", () => {

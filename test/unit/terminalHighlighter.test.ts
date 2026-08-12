@@ -13,6 +13,7 @@ vi.mock("vscode", () => ({
 }));
 
 import { TerminalHighlighter, TerminalHighlighterStream } from "../../src/services/terminalHighlighter";
+import { PtyObserverHub } from "../../src/services/terminal/ptyObserverHub";
 
 function setConfig(enabled: boolean, rules: Array<Record<string, unknown>>): void {
   mockConfig = { enabled, rules };
@@ -146,7 +147,7 @@ describe("TerminalHighlighter", () => {
     expect(emitted[1]).toBe(`\x1b[31m${"A".repeat(256)}\x1b[39m`);
   });
 
-  it("retains trailing bytes on idle flush so cross-chunk IP matches still highlight", () => {
+  it("keeps a cross-chunk match intact when both chunks land inside one flush window", () => {
     vi.useFakeTimers();
     setConfig(true, [
       { pattern: "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b", color: "magenta", flags: "g" }
@@ -155,22 +156,39 @@ describe("TerminalHighlighter", () => {
     const emitted: string[] = [];
     const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
 
-    // First chunk: padding past the retention margin, ending mid-IP, no newline
+    // TCP segmentation splits a token across chunks that arrive microseconds
+    // apart — well inside one flush window. Both are still pending when the
+    // deadline expires, so the match resolves against the joined text.
     const padding = "x".repeat(300);
     stream.push(padding + " 110.");
+    vi.advanceTimersByTime(5);
+    stream.push("231.10.231");
+    expect(emitted).toEqual([]);
 
-    // Idle timer fires — emits everything except the last 256 bytes, which are retained
-    vi.advanceTimersByTime(20);
+    vi.advanceTimersByTime(15);
     expect(emitted).toHaveLength(1);
-    // The "110." prefix must stay in the retained tail, NOT in the emitted slice
-    expect(emitted[0]).not.toContain("110.");
+    expect(emitted[0]).toContain("\x1b[35m110.231.10.231\x1b[39m");
+  });
 
-    // Second chunk completes the IP on the same line
-    stream.push("231.10.231\r\n");
+  it("emits the whole pending tail on the idle flush, in one tick", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
 
-    // Retained tail + continuation emits as one unit with the full IP matched
-    expect(emitted).toHaveLength(2);
-    expect(emitted[1]).toContain("\x1b[35m110.231.10.231\x1b[39m");
+    // A prompt tail longer than the 256-byte retention margin, no newline.
+    // The idle flush used to hold that margin back for one more flush period,
+    // so the tail of every quiet-ending burst arrived in two stages.
+    const tail = `${"x".repeat(300)}prompt$ `;
+    stream.push(tail);
+
+    vi.advanceTimersByTime(20);
+    expect(emitted).toEqual([tail]);
+
+    // Nothing is left over to arrive a period later.
+    vi.advanceTimersByTime(1000);
+    expect(emitted).toEqual([tail]);
   });
 
   it("preserves match context across hard-cap flush for cross-chunk matches", () => {
@@ -640,5 +658,105 @@ describe("TerminalHighlighter", () => {
     stream.flush();
     const full = emitted.join("");
     expect(full.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Typing latency. A keystroke echo carries neither \n nor \r, so it can only
+ * leave the stream when the flush timer fires: the flush delay IS the terminal's
+ * echo latency floor, and it applied even when highlighting was switched off.
+ */
+describe("TerminalHighlighter — output latency", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("renders a keystroke echo on the arriving tick when highlighting is disabled", () => {
+    vi.useFakeTimers();
+    setConfig(false, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+    const hub = new PtyObserverHub();
+
+    hub.notifyOutput("a", stream, h, (rendered) => emitted.push(rendered));
+
+    // No timer advanced: with highlighting off the byte must already be rendered.
+    expect(emitted).toEqual(["a"]);
+  });
+
+  it("renders a keystroke echo on the arriving tick when highlighting is on but no rules compile", () => {
+    vi.useFakeTimers();
+    setConfig(true, []);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+    const hub = new PtyObserverHub();
+
+    hub.notifyOutput("a", stream, h, (rendered) => emitted.push(rendered));
+
+    expect(emitted).toEqual(["a"]);
+  });
+
+  it("reports whether highlighting can change output, and re-reads it on reload", () => {
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    expect(h.isEnabled()).toBe(true);
+
+    setConfig(false, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    h.reload();
+    expect(h.isEnabled()).toBe(false);
+
+    setConfig(true, []);
+    h.reload();
+    expect(h.isEnabled()).toBe(false);
+  });
+
+  it("holds a no-newline fragment for the default flush delay of 15 ms, not longer", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    // No explicit delay — this asserts the shipped default.
+    const stream = h.createStream((text) => emitted.push(text));
+
+    stream.push("user@host:~$ ");
+    vi.advanceTimersByTime(14);
+    expect(emitted).toEqual([]);
+
+    vi.advanceTimersByTime(1);
+    expect(emitted).toEqual(["user@host:~$ "]);
+  });
+});
+
+/**
+ * F6 — the IPv6 and UUID rules are no longer shipped as defaults because the
+ * two of them cost more than every other rule combined. A user who adds them
+ * back by hand must get exactly the highlighting they had before, so the
+ * patterns published in the CHANGELOG and the settings description are pinned
+ * here verbatim.
+ */
+describe("TerminalHighlighter — restoring the opt-in IPv6 / UUID rules", () => {
+  const IPV6_PATTERN =
+    "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b";
+  const UUID_PATTERN =
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+
+  it("highlights IPv6 addresses once the documented rule is added back", () => {
+    setConfig(true, [{ pattern: IPV6_PATTERN, color: "magenta", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("addr fe80::1")).toContain("\x1b[35mfe80::1\x1b[39m");
+    expect(h.apply("addr 2001:db8::1")).toContain("\x1b[35m2001:db8::1\x1b[39m");
+    expect(h.apply("peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334 up")).toContain(
+      "\x1b[35m2001:0db8:85a3:0000:0000:8a2e:0370:7334\x1b[39m"
+    );
+  });
+
+  it("highlights UUIDs once the documented rule is added back", () => {
+    setConfig(true, [{ pattern: UUID_PATTERN, color: "brightBlue", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("id: 3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toContain(
+      "\x1b[94m3f2504e0-4f89-11d3-9a0c-0305e82c3301\x1b[39m"
+    );
   });
 });

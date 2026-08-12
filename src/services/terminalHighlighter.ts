@@ -4,12 +4,26 @@ import { validateRegexSafety } from "../utils/regexSafety";
 import { validateAndSanitizeHighlightRules, type HighlightRule } from "../utils/highlightRuleValidation";
 
 const MAX_INPUT_LENGTH = 65536;
-const STREAM_FLUSH_DELAY_MS = 100;
+// Upper bound on how long a fragment with no line boundary may sit in the
+// stream before it is rendered. This is the terminal's *typing latency floor*:
+// a keystroke echo carries neither \n nor \r, so it always waits out this
+// timer. 100 ms was measurable as lag on a LAN; 15 ms is below the threshold
+// where a local echo reads as delayed while still coalescing the sub-millisecond
+// chunk storms that TCP segmentation produces.
+const STREAM_FLUSH_DELAY_MS = 15;
 const STREAM_MAX_PENDING_LENGTH = 16384;
-// Bytes retained at the tail on non-newline flushes so cross-chunk matches
-// (IPs, MACs, UUIDs, etc.) still see enough context to identify the full token
-// when the next chunk arrives. Covers every built-in rule; user patterns whose
-// matches can exceed this length may still split at chunk boundaries.
+// Bytes retained at the tail when the pending buffer hits its hard cap
+// (STREAM_MAX_PENDING_LENGTH) mid-burst, so cross-chunk matches (IPs, MACs,
+// UUIDs, etc.) still see enough context to identify the full token when the
+// continuation arrives. Covers every built-in rule; user patterns whose matches
+// can exceed this length may still split at chunk boundaries.
+//
+// The hard cap is the only place retention applies. It fires while data is
+// still flowing — the continuation is guaranteed to be moments away — so
+// holding a tail costs nothing and saves the match. The *idle* flush is the
+// opposite situation: it only fires when the stream has gone quiet for a whole
+// flush period, so a retained tail is not waiting for an imminent continuation,
+// it is just output the user cannot see yet. See onIdleFlush().
 const STREAM_RETAIN_MARGIN = 256;
 
 const VALID_FLAGS_RE = /^[gi]*$/;
@@ -288,6 +302,19 @@ export class TerminalHighlighter {
     }
   }
 
+  /**
+   * True when `apply()` can actually change its input — the setting is on AND
+   * at least one rule compiled. Callers use this to decide whether output needs
+   * to go through the buffering `TerminalHighlighterStream` at all: when it is
+   * false the stream would spend a full flush period holding text it is going
+   * to hand back unmodified, which is pure added latency (see
+   * `PtyObserverHub.notifyOutput`). Re-read after every `reload()` — the setting
+   * is live and this must never be cached across a config change.
+   */
+  public isEnabled(): boolean {
+    return this.enabled && this.rules.length > 0;
+  }
+
   public apply(text: string): string {
     if (!this.enabled || this.rules.length === 0) {
       return text;
@@ -410,16 +437,19 @@ export class TerminalHighlighterStream implements vscode.Disposable {
     }, this.flushDelayMs);
   }
 
+  /**
+   * The stream has been quiet for a full flush period: render everything that
+   * is pending, in ONE tick.
+   *
+   * This deliberately does NOT retain a trailing margin. Retention exists to
+   * keep a token that is mid-arrival intact (see STREAM_RETAIN_MARGIN), and by
+   * definition nothing is mid-arrival here — the deadline expired with no new
+   * data. Retaining anyway meant the tail of every quiet-ending burst (the
+   * shell prompt the user is waiting to type at, most of all) emitted a whole
+   * flush period late, in two stages instead of one.
+   */
   private onIdleFlush(): void {
     if (!this.pending) {
-      return;
-    }
-    if (this.pending.length > STREAM_RETAIN_MARGIN) {
-      // Keep a trailing margin so cross-chunk matches can still resolve if
-      // more data arrives. Re-schedule so the retained tail eventually flushes
-      // even if the stream stays quiet.
-      this.emitWithRetention();
-      this.scheduleFlush();
       return;
     }
     this.emit(this.highlighter.apply(this.pending));

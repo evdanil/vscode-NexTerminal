@@ -54,6 +54,19 @@ export const SETTINGS_META: SettingMeta[] = [
     min: 0,
     max: 99
   },
+  {
+    key: "terminalOutputTrace",
+    section: "nexus.logging",
+    label: "Terminal Output Trace",
+    type: "boolean",
+    category: "logging",
+    // Deliberately no badge: every `.setting-badge` in this webview is wired to
+    // post `reloadWindow` on click, and this setting takes effect immediately
+    // on open sessions.
+    description:
+      "Troubleshooting only. Writes every chunk of terminal output to the diagnostic log as it arrives — which slows terminal output and stores session data, including anything echoed on screen such as passwords, as plaintext on disk. Leave off unless support asks for it.",
+    default: false
+  },
   // --- SSH ---
   {
     key: "enabled",

@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.180",
+  "version": "2.8.181",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -3205,6 +3205,12 @@
           "order": 4,
           "markdownDescription": "Directory for session transcript logs. Leave empty to use the default extension storage location."
         },
+        "nexus.logging.terminalOutputTrace": {
+          "type": "boolean",
+          "default": false,
+          "order": 5,
+          "markdownDescription": "Troubleshooting only. Write every chunk of terminal output to the diagnostic log as it arrives.\n\nLeave this off unless support asks for it. It writes to disk once for every chunk a session receives, which adds latency to terminal output, and it records session data verbatim — including anything typed or echoed on screen, such as passwords and keys — as plaintext in the extension's log folder. Session transcripts (`#nexus.logging.sessionTranscripts#`) are the supported way to keep a record of a session."
+        },
         "nexus.tunnel.defaultConnectionMode": {
           "type": "string",
           "enum": [
@@ -3414,16 +3420,6 @@
               "flags": "g"
             },
             {
-              "pattern": "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b",
-              "color": "magenta",
-              "flags": "g"
-            },
-            {
-              "pattern": "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-              "color": "brightBlue",
-              "flags": "g"
-            },
-            {
               "pattern": "https?://\\S+",
               "color": "blue",
               "flags": "gi",
@@ -3472,7 +3468,7 @@
               }
             }
           },
-          "markdownDescription": "Highlighting rules applied to SSH, serial, and Local Shell terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. Text already coloured by the terminal program is never re-highlighted."
+          "markdownDescription": "Highlighting rules applied to SSH, serial, and Local Shell terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. Text already coloured by the terminal program is never re-highlighted.\n\nIPv6 addresses and UUIDs are **not** highlighted by default: those two patterns cost more than every other rule combined, because they have to be tried at nearly every character of every line. Add them back with **Add Rule** in the Highlighting Rules editor if you want them — IPv6: `\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b` (magenta, flags `g`), UUID: `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` (brightBlue, flags `g`)."
         },
         "nexus.sftp.cacheTtlSeconds": {
           "type": "number",

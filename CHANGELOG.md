@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.8.181] — 2026-08-12
+
+### Fixed
+
+- **Typing in a terminal feels immediate again.** Every character a session received was held back for up to a tenth of a second before it was drawn, whether or not there was anything to do with it. Highlighting needs to hold a little output back — a match can be split across two arriving chunks, and colouring only half of an IP address would look worse than not colouring it — but that hold was being applied to *everything*, including a keystroke echoing back to you, and including sessions where highlighting was switched off entirely. That is why turning highlighting off never quite fixed the lag it seemed to cause. Now: with highlighting off, output is drawn the instant it arrives, with nothing in the way. With highlighting on, the hold is 15 ms instead of 100 ms, and the end of a burst — the shell prompt you are waiting to type at — arrives complete in one go, rather than in two pieces a tenth of a second apart. Split matches still highlight correctly.
+- **A long-running full-screen program no longer makes its terminal slower and slower.** `htop`, `watch`, `vim`, and progress bars that redraw with a carriage return rather than a new line produce output with no line breaks in it at all, and the buffer behind **Copy All** was keeping every byte of it for the life of the session — growing without limit and re-copying itself on every chunk that arrived. A terminal left on a monitoring command for an afternoon could end up spending tens of milliseconds of work per chunk on nothing but that copying, on top of steadily consuming memory. The buffer now keeps the last 64 KB of an unbroken line, which is far more than any real terminal line, and the cost per chunk stays flat no matter how long the session runs. Copy All is unchanged for ordinary output.
+- **Session transcripts no longer write to disk on the terminal's critical path.** Recording a session wrote a chunk to the log file with a blocking call for every chunk that arrived. Writes are now batched and written in the background, flushed at least every quarter second and always when a terminal closes, a session disconnects, or the extension shuts down. The contents of a transcript, its ordering, and where it rotates are unchanged.
+
+### Changed
+
+- **Terminal output is no longer copied verbatim into a diagnostic log by default, and there is now a setting for it.** Every byte of every session — anything you typed, anything the remote echoed back, including passwords and keys — was being written to a plaintext log file inside the extension's storage folder, with no way to turn it off. It also cost a blocking disk write for each chunk, doubling the write volume of a busy session and occasionally stalling the extension for tens of milliseconds when the machine was already busy writing. That trace is now **off by default** and controlled by a new setting, **`nexus.logging.terminalOutputTrace`** — turn it on only if support asks for it. Connection, disconnection, and error logging is untouched and still always on, and session transcripts (`nexus.logging.sessionTranscripts`, on by default) remain the supported way to keep a record of a session.
+- **IPv6 addresses and UUIDs are no longer highlighted by default.** Those two highlighting rules cost more than all of the other twenty combined — both have to be attempted at nearly every character of every line, and removing just those two roughly doubled how fast Nexus can colour plain terminal output. Everything else is unchanged: errors, warnings, status keywords, IPv4 addresses, MAC addresses, URLs, and interface counters all still highlight exactly as before. If you want IPv6 or UUID colouring, add it back in the Highlighting Rules editor with **Add Rule**:
+  - IPv6 — pattern `\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\b|\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\b`, colour magenta, flags `g`
+  - UUID — pattern `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`, colour brightBlue, flags `g`
+
+  If you have already customised your highlighting rules, your rules are yours and nothing changes for you — this only affects the set Nexus ships with, and what **Reset to Defaults** restores.
+
 ## [2.8.180] — 2026-08-12
 
 ### Fixed

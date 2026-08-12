@@ -164,12 +164,14 @@ Keeps the File Explorer pointed at whichever SSH terminal is focused, tracking t
 1. Terminal and tunnel event logs are enabled automatically.
 2. Each log file rotates when it reaches configured max size.
 3. Rotation defaults: `10MB` file size and `1` rotated file.
-4. Session transcript logs record clean terminal output with ANSI escape sequences and control characters stripped.
-5. Settings:
+4. Session transcript logs record clean terminal output with ANSI escape sequences and control characters stripped. Transcript writes are queued in memory and flushed on an interval (250 ms) rather than written synchronously per chunk; every orderly exit — terminal closed, session disconnected, extension deactivated — flushes the queue explicitly, and rotation cuts the file at exactly the same byte boundaries as the synchronous writer did.
+5. The per-chunk terminal data trace (`nexus.logging.terminalOutputTrace`) is **off by default** and is a troubleshooting aid only. When on, every chunk a session receives is written to the diagnostic log synchronously as it arrives — measurable latency on the terminal's output path, and a verbatim plaintext record of session data including anything echoed on screen (passwords, keys). Lifecycle logging (connect, disconnect, errors) is unaffected and always on.
+6. Settings:
    - `nexus.logging.maxFileSizeMb`
    - `nexus.logging.maxRotatedFiles` (`0-99`)
    - `nexus.logging.sessionTranscripts` (enable/disable)
    - `nexus.logging.sessionLogDirectory` (custom path)
+   - `nexus.logging.terminalOutputTrace` (per-chunk data trace; default off)
 
 ### 4.8 Group Management
 - Servers and serial profiles can be organized into named groups.
@@ -320,7 +322,8 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 | `nexus.terminal.macros.autoTrigger` | boolean | `true` | - | Enable auto-trigger for macros with a `triggerPattern` |
 | `nexus.terminal.macros.defaultCooldown` | number | `3` | 0–300 s | Default cooldown for auto-trigger macros |
 | `nexus.terminal.macros.bufferLength` | number | `2048` | 256–16384 chars | Max characters retained per terminal for pattern matching |
-| `nexus.terminal.highlighting.enabled` | boolean | `true` | — | Enable regex-based terminal highlighting. Rules are edited in the Highlighting Rules editor and unsafe regex shapes are rejected before use. |
+| `nexus.terminal.highlighting.enabled` | boolean | `true` | — | Enable regex-based terminal highlighting. Rules are edited in the Highlighting Rules editor and unsafe regex shapes are rejected before use. Output is buffered for up to 15 ms so a token split across chunks still matches; with highlighting off (or with no rules) that buffering is bypassed entirely and output renders as it arrives. |
+| `nexus.terminal.highlighting.rules` | array | 20 built-in rules | — | Highlighting rules. The IPv6 and UUID patterns are **not** shipped enabled — they cost more than every other rule combined because they must be attempted at nearly every character. Add them back with **Add Rule**: IPv6 `\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\b\|\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\b\|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\b` (magenta, flags `g`); UUID `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` (brightBlue, flags `g`). |
 
 ### 5.5 Logging
 
@@ -328,6 +331,7 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 |---------|------|---------|-------|-------------|
 | `nexus.logging.sessionTranscripts` | boolean | `true` | — | Enable session transcript logging |
 | `nexus.logging.sessionLogDirectory` | string | *(extension storage)* | — | Custom directory for session logs |
+| `nexus.logging.terminalOutputTrace` | boolean | `false` | — | Troubleshooting only: per-chunk trace of terminal output to the diagnostic log. Adds latency to terminal output and stores session data — including echoed passwords — as plaintext |
 | `nexus.logging.maxFileSizeMb` | number | `10` | 1–100 MB | Max log file size before rotation |
 | `nexus.logging.maxRotatedFiles` | number | `1` | 0–99 | Number of rotated log files to keep |
 
