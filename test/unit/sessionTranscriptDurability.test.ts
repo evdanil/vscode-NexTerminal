@@ -418,6 +418,120 @@ describe("session transcript failure paths", () => {
     }
   });
 
+  /**
+   * E3 — the retention cap exempted the last batch standing, so it only ever
+   * bounded a queue of *several* batches. `takeBatches()` coalesces every
+   * adjacent chunk bound for the same file into one batch, so the common shape
+   * under a permanently failing fd is a single batch holding everything — and
+   * that one was exempt. The stated 1 MiB bound did not hold.
+   */
+  it("bounds a single oversized retained batch, keeping the newest bytes", async () => {
+    const dir = makeTempDir();
+    // A file limit far above anything written here, so nothing rotates and the
+    // whole queue coalesces into exactly one batch.
+    const transcript = open(dir, "cap", 64 * 1024 * 1024, 1);
+
+    hooks.write = (...args: unknown[]) => {
+      const callback = args[args.length - 1] as (error: Error | null, written: number) => void;
+      setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
+    };
+
+    // 3 MiB, three times the cap, in chunks that land in one batch. The first
+    // and last carry markers so it is visible which end survived.
+    transcript.write(`HEAD-MARKER${"a".repeat(1024 * 1024 - 11)}`);
+    transcript.write("b".repeat(1024 * 1024));
+    transcript.write(`${"c".repeat(1024 * 1024 - 11)}TAIL-MARKER`);
+    await sleep(400); // timer drain — every write fails
+
+    const retained = (transcript as unknown as { retained: Array<{ data: Buffer }> }).retained;
+    // Non-vacuous: coalescing really did produce a single batch, which is the
+    // shape the old `length > 1` guard exempted outright.
+    expect(retained).toHaveLength(1);
+    const retainedBytes = retained.reduce((total, batch) => total + batch.data.length, 0);
+    expect(retainedBytes).toBeLessThanOrEqual(1024 * 1024);
+
+    // Oldest-first shedding, so it is the tail that survives.
+    const held = Buffer.concat(retained.map((batch) => batch.data)).toString("utf8");
+    expect(held.endsWith("TAIL-MARKER")).toBe(true);
+    expect(held).not.toContain("HEAD-MARKER");
+
+    // Let the retry land, then check the accounting against the real file.
+    hooks.write = undefined;
+    transcript.write("after the drop\n");
+    const file = transcriptPath(dir, "cap_");
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (readFileSync(file, "utf8").endsWith("after the drop\n")) {
+        break;
+      }
+      await sleep(20);
+    }
+
+    const text = readFileSync(file, "utf8");
+    expect(text.endsWith("after the drop\n")).toBe(true);
+    expect(text).toContain("TAIL-MARKER");
+    // `currentSize` counts bytes that reached the file, and dropping unwritten
+    // bytes must not move it out of step with what is on disk.
+    const currentSize = (transcript as unknown as { currentSize: number }).currentSize;
+    expect(currentSize).toBe(statSync(file).size);
+    // Nothing here came close to the 64 MiB file limit, so the trimmed batch
+    // must not have claimed a rotation the lost bytes never justified.
+    expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toEqual([]);
+  });
+
+  /**
+   * E4 — the other half of E3. A batch's `rotateFirst` was resolved against a
+   * projection that assumed every batch ahead of it would land. Shedding those
+   * batches makes that projection wrong, and a batch that then still claims its
+   * rotation shifts a generation to make room in a file the lost bytes never
+   * filled — at `maxRotatedFiles: 1`, deleting the oldest one outright.
+   */
+  it("does not rotate for bytes the retention cap dropped", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "rotcap", 2 * 1024 * 1024, 1);
+
+    // Land a first drain so the live file has content worth not shifting away.
+    transcript.write("PRECIOUS\n");
+    await sleep(400);
+    const file = transcriptPath(dir, "rotcap_");
+    expect(readFileSync(file, "utf8")).toContain("PRECIOUS");
+
+    hooks.write = (...args: unknown[]) => {
+      const callback = args[args.length - 1] as (error: Error | null, written: number) => void;
+      setTimeout(() => callback(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }), 0), 0);
+    };
+
+    // 1.5 MiB then 1 MiB against a 2 MiB file: the second batch is cut at the
+    // rotation the first one's bytes would have caused. The write fails, and
+    // the 1 MiB cap sheds the first batch — so that rotation is now for bytes
+    // that will never reach the file.
+    transcript.write("a".repeat(1536 * 1024));
+    transcript.write("b".repeat(1024 * 1024));
+    await sleep(400);
+
+    const retained = (transcript as unknown as { retained: Array<{ rotateFirst: boolean; data: Buffer }> }).retained;
+    // Non-vacuous: shedding really did happen, and the survivor really is the
+    // batch that carried the rotation.
+    expect(retained).toHaveLength(1);
+    expect(retained[0].data.length).toBe(1024 * 1024);
+
+    hooks.write = undefined;
+    transcript.write("after the drop\n");
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (readFileSync(file, "utf8").endsWith("after the drop\n")) {
+        break;
+      }
+      await sleep(20);
+    }
+
+    // No generation was shifted, and the live file kept everything it had.
+    expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toEqual([]);
+    const text = readFileSync(file, "utf8");
+    expect(text).toContain("PRECIOUS");
+    expect(text).toContain("after the drop");
+    const currentSize = (transcript as unknown as { currentSize: number }).currentSize;
+    expect(currentSize).toBe(statSync(file).size);
+  });
+
   it("shutdown flush gives up rather than hanging on a wedged write", async () => {
     const dir = makeTempDir();
     const transcript = open(dir, "wedged", 1024 * 1024, 1);

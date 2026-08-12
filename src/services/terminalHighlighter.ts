@@ -18,13 +18,27 @@ const STREAM_MAX_PENDING_LENGTH = 16384;
 // continuation arrives. Covers every built-in rule; user patterns whose matches
 // can exceed this length may still split at chunk boundaries.
 //
-// The hard cap is the only place retention applies. It fires while data is
-// still flowing — the continuation is guaranteed to be moments away — so
-// holding a tail costs nothing and saves the match. The *idle* flush is the
-// opposite situation: it only fires when the stream has gone quiet for a whole
-// flush period, so a retained tail is not waiting for an imminent continuation,
-// it is just output the user cannot see yet. See onIdleFlush().
+// Retention applies on the two paths that fire while data is still flowing —
+// the hard cap below and STREAM_MAX_PENDING_PERIODS — where the continuation is
+// moments away, so holding a tail costs nothing and saves the match. The *idle*
+// flush is the opposite situation: it only fires when the stream has gone quiet
+// for a whole flush period, so a retained tail is not waiting for an imminent
+// continuation, it is just output the user cannot see yet. See onIdleFlush().
 const STREAM_RETAIN_MARGIN = 256;
+
+// Ceiling on how long the oldest pending byte may wait, expressed in flush
+// periods, so the relationship holds whatever delay a stream is built with.
+//
+// The idle timer is restarted by every push (that is what makes it an *idle*
+// timer), so a stream whose chunks keep arriving closer together than one flush
+// period never reaches it. STREAM_MAX_PENDING_LENGTH bounds that case in bytes,
+// but not in time: a sustained trickle — a 9600-baud serial link, an unbroken
+// `base64 -w0` line over a slow hop — can hold well under 16 KiB for a long
+// while. This bounds it in time as well.
+//
+// Unlike the idle flush it emits *with* retention: it fires while data is still
+// arriving, which is exactly the situation STREAM_RETAIN_MARGIN exists for.
+const STREAM_MAX_PENDING_PERIODS = 8;
 
 const VALID_FLAGS_RE = /^[gi]*$/;
 
@@ -372,7 +386,10 @@ export class TerminalHighlighter {
 
 export class TerminalHighlighterStream implements vscode.Disposable {
   private pending = "";
+  /** Restarted by every push — fires only after the stream has gone quiet. */
   private flushTimer?: ReturnType<typeof setTimeout>;
+  /** Anchored to the oldest pending byte — never restarted by a push. */
+  private ceilingTimer?: ReturnType<typeof setTimeout>;
 
   public constructor(
     private readonly highlighter: TerminalHighlighter,
@@ -389,21 +406,15 @@ export class TerminalHighlighterStream implements vscode.Disposable {
         this.emit(this.highlighter.apply(this.pending.slice(0, boundary)));
         this.pending = this.pending.slice(boundary);
       }
-      this.clearFlushTimer();
     }
     if (this.pending.length >= STREAM_MAX_PENDING_LENGTH) {
       this.emitWithRetention();
-      this.clearFlushTimer();
     }
-    if (!this.pending) {
-      this.clearFlushTimer();
-      return;
-    }
-    this.scheduleFlush();
+    this.rearmTimers();
   }
 
   public flush(): void {
-    this.clearFlushTimer();
+    this.clearTimers();
     if (!this.pending) {
       return;
     }
@@ -427,14 +438,34 @@ export class TerminalHighlighterStream implements vscode.Disposable {
     this.pending = this.pending.slice(emitUpTo);
   }
 
-  private scheduleFlush(): void {
-    if (!this.pending || this.flushTimer !== undefined) {
+  /**
+   * Restart the idle deadline, and start the ceiling if nothing is running one.
+   *
+   * The idle timer is restarted — not left running — on every push. Anchoring
+   * it to the first push after the buffer was last emptied made it fire *while*
+   * data was still arriving, and since `onIdleFlush()` retains nothing, a token
+   * straddling that moment was emitted in halves: `ERRO` rendered, `R` arriving
+   * a millisecond later, and neither fragment matching an `ERROR` rule.
+   *
+   * The ceiling timer is the opposite: it must not be restarted, or a stream
+   * that never goes quiet would never reach it either.
+   */
+  private rearmTimers(): void {
+    this.clearFlushTimer();
+    if (!this.pending) {
+      this.clearCeilingTimer();
       return;
     }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
       this.onIdleFlush();
     }, this.flushDelayMs);
+    if (this.ceilingTimer === undefined) {
+      this.ceilingTimer = setTimeout(() => {
+        this.ceilingTimer = undefined;
+        this.emitWithRetention();
+      }, this.flushDelayMs * STREAM_MAX_PENDING_PERIODS);
+    }
   }
 
   /**
@@ -450,16 +481,30 @@ export class TerminalHighlighterStream implements vscode.Disposable {
    */
   private onIdleFlush(): void {
     if (!this.pending) {
+      this.clearCeilingTimer();
       return;
     }
     this.emit(this.highlighter.apply(this.pending));
     this.pending = "";
+    this.clearCeilingTimer();
+  }
+
+  private clearTimers(): void {
+    this.clearFlushTimer();
+    this.clearCeilingTimer();
   }
 
   private clearFlushTimer(): void {
     if (this.flushTimer !== undefined) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
+    }
+  }
+
+  private clearCeilingTimer(): void {
+    if (this.ceilingTimer !== undefined) {
+      clearTimeout(this.ceilingTimer);
+      this.ceilingTimer = undefined;
     }
   }
 }

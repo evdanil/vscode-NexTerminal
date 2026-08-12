@@ -351,14 +351,54 @@ class FileSessionTranscript implements SessionTranscript {
     this.trimRetained();
   }
 
+  /**
+   * Hold the retained queue to {@link MAX_RETAINED_BYTES}, keeping the newest
+   * bytes.
+   *
+   * Whole batches are shed oldest-first, and the last one standing is *not*
+   * exempt from the cap: `takeBatches()` coalesces every adjacent chunk bound
+   * for the same file into one batch, so a single batch can be an entire
+   * rotation generation — 10 MiB by default, up to 1 GiB when configured — and
+   * one `write()` can be larger still. Exempting it let a permanently failing
+   * fd retain orders of magnitude more than the stated bound. It is trimmed
+   * from the head instead, which keeps the same tail-most bytes that shedding
+   * oldest-first keeps.
+   *
+   * `currentSize` is deliberately untouched: it counts bytes that reached the
+   * file, and everything dropped here is by definition unwritten, so the drop
+   * cannot move it out of step with the file on disk. What the drop *does*
+   * invalidate is the projection the surviving head's `rotateFirst` was decided
+   * against — that projection assumed the dropped bytes would land. So it is
+   * re-resolved against the real file size, exactly as `takeBatches()` would
+   * have: without this, a batch could rotate a file the lost bytes never filled,
+   * shifting a generation (and, at `maxRotatedFiles: 1`, deleting one) to make
+   * room for a file that is nowhere near its limit.
+   */
   private trimRetained(): void {
     let total = 0;
     for (const batch of this.retained) {
       total += batch.data.length;
     }
+    if (total <= MAX_RETAINED_BYTES) {
+      return;
+    }
     while (total > MAX_RETAINED_BYTES && this.retained.length > 1) {
       total -= this.retained.shift()!.data.length;
     }
+    const head = this.retained[0];
+    if (head === undefined) {
+      return;
+    }
+    if (total > MAX_RETAINED_BYTES) {
+      let cut = total - MAX_RETAINED_BYTES;
+      // Never cut mid-glyph: step forward off any UTF-8 continuation byte. That
+      // drops at most three more bytes, so it cannot push the total back over.
+      while (cut < head.data.length && (head.data[cut] & 0xc0) === 0x80) {
+        cut += 1;
+      }
+      head.data = head.data.subarray(cut);
+    }
+    head.rotateFirst = this.currentSize + head.data.length > this.rotation.maxFileSizeBytes;
   }
 
   /**
