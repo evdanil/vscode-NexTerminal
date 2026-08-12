@@ -20,6 +20,7 @@ import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
+import { flushSessionTranscripts } from "./logging/sessionTranscriptLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { registerEditAsRootHint } from "./services/sftp/editAsRootHint";
@@ -1442,5 +1443,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 }
 
 export async function deactivate(): Promise<void> {
-  // Cleanup is handled via context.subscriptions disposables
+  // Cleanup is handled via context.subscriptions disposables. VS Code calls
+  // this function first and disposes those subscriptions immediately
+  // afterwards, without waiting for the promise returned here — so the PTY
+  // teardown that pushes each session's transcript tail into the writer has
+  // not run yet at this point. Yield a turn to let it run, then wait for the
+  // tail to actually reach disk: the writer is buffered, and a drain that was
+  // already in flight when the tail was queued can only chain it, which
+  // nothing else in the teardown path would wait on.
+  //
+  // The wait is bounded inside flushSessionTranscripts — a hung filesystem
+  // must not hold extension-host shutdown open.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await flushSessionTranscripts();
 }
