@@ -37,10 +37,27 @@ const STREAM_RETAIN_MARGIN = 256;
 //
 // GUARANTEE: no byte waits longer than one ceiling period before it is
 // rendered, for any arrival pattern. Two properties carry that, and both are
-// load-bearing. (1) The timer is armed only when a byte enters an *empty*
-// buffer and is never restarted while bytes remain, so its deadline always
-// belongs to the oldest pending byte — see rearmTimers(). (2) When it fires it
-// emits everything, so that byte is actually rendered.
+// load-bearing. (1) The deadline belongs to the oldest byte that is *still
+// pending*: the timer is armed when a byte enters an empty buffer, is never
+// restarted while the bytes it was armed for are still waiting, and is
+// re-anchored when an emit leaves behind only bytes that arrived after it —
+// see push() and rearmTimers(). (2) When it fires it emits everything, so that
+// byte is actually rendered.
+//
+// "Oldest byte that is still pending" is the whole of (1), and "oldest byte
+// that was once pending" is not a weaker form of it but a different and wrong
+// one. A boundary emit renders the bytes the ceiling was armed for and leaves
+// a fresh tail behind — which is what *every* chunk of continuous mid-line
+// output does — and an anchor that does not move then points at bytes already
+// on the screen: it fires early on a tail that has barely arrived, splitting
+// whatever token straddles it, and since such a stream never empties `pending`
+// it does that once per ceiling period for as long as the output runs. The
+// re-anchor is exact rather than merely safe: the tail is a suffix of the
+// chunk that has just arrived, so the fresh period really does start at its
+// arrival. Where that is not provable — a cut backed off past the start of
+// this chunk, leaving carried-over bytes in the tail (see safeCutIndex), or
+// the hard cap, whose retained margin may predate this push — the old anchor
+// is kept, which can only fire early, never late.
 //
 // (2) is why it retains nothing, even though it is the one deadline that fires
 // while data is still arriving. Retaining STREAM_RETAIN_MARGIN here emitted
@@ -78,9 +95,11 @@ const STREAM_RETAIN_MARGIN = 256;
 //
 // Lines longer than ~86 columns at 9600 baud still split once mid-line — they
 // did on v2.8.180 too (at its 100 ms anchor) — and links at 19200 baud or
-// faster deliver a full line well inside one period. Only the token actually
-// straddling the fire loses its match; everything on either side highlights
-// normally, and the next boundary resets the stream.
+// faster deliver a full line well inside one period. The ~86 is a per-line
+// figure precisely because of the re-anchor above: a line's period starts at
+// its own first byte, not at whenever the buffer last happened to empty. Only
+// the token actually straddling the fire loses its match; everything on either
+// side highlights normally, and the next boundary resets the stream.
 const STREAM_MAX_PENDING_PERIODS = 6;
 
 const VALID_FLAGS_RE = /^[gi]*$/;
@@ -431,7 +450,12 @@ export class TerminalHighlighterStream implements vscode.Disposable {
   private pending = "";
   /** Restarted by every push — fires only after the stream has gone quiet. */
   private flushTimer?: ReturnType<typeof setTimeout>;
-  /** Anchored to the oldest pending byte — never restarted by a push. */
+  /**
+   * Anchored to the oldest byte that is still pending. A push never restarts
+   * it while the bytes it was armed for are still waiting; a push that renders
+   * all of them and leaves a tail of its own re-anchors it. See
+   * STREAM_MAX_PENDING_PERIODS.
+   */
   private ceilingTimer?: ReturnType<typeof setTimeout>;
 
   public constructor(
@@ -441,6 +465,7 @@ export class TerminalHighlighterStream implements vscode.Disposable {
   ) {}
 
   public push(text: string): void {
+    const carried = this.pending.length;
     this.pending += text;
     const rawBoundary = findStableBoundary(this.pending);
     if (rawBoundary > 0) {
@@ -448,6 +473,26 @@ export class TerminalHighlighterStream implements vscode.Disposable {
       if (boundary > 0) {
         this.emit(this.highlighter.apply(this.pending.slice(0, boundary)));
         this.pending = this.pending.slice(boundary);
+        if (boundary >= carried) {
+          // The emit consumed everything that was pending before this push, so
+          // every byte still here arrived in it — and a ceiling left running
+          // would be anchored to bytes that are now on the screen. Drop it;
+          // rearmTimers() below anchors a fresh period to this tail, which is
+          // both the oldest pending byte and one that arrived just now, so the
+          // new deadline is exact. Without this, a stream that ends every
+          // chunk mid-line (USB-batched serial at 19200 baud and up, `tail -f`
+          // over a congested hop) never empties `pending`, the anchor never
+          // moves, and the ceiling fires once per period however many line
+          // boundaries flow through it — one needless mid-line split per
+          // 90 ms of continuous scroll.
+          //
+          // `boundary >= carried` is the proof, not a heuristic: the cut fell
+          // at or after the end of what was carried in, so the tail is a
+          // suffix of `text`. When safeCutIndex backs off further than that
+          // (an escape sequence spanning the chunk boundary), older bytes
+          // survive in the tail and their anchor is left alone.
+          this.clearCeilingTimer();
+        }
       }
     }
     if (this.pending.length >= STREAM_MAX_PENDING_LENGTH) {
@@ -513,12 +558,14 @@ export class TerminalHighlighterStream implements vscode.Disposable {
    * The ceiling timer is the opposite: it must not be restarted, or a stream
    * that never goes quiet would never reach it either.
    *
-   * That asymmetry is what makes the ceiling's deadline belong to the *oldest*
-   * pending byte: it is armed here only while none is running, and every path
-   * that leaves it un-armed — this method when the buffer is empty, both flush
-   * paths, and the ceiling firing — has emptied the buffer first. So an arm
-   * always follows a byte entering an empty buffer, and that byte's deadline is
-   * the one the timer carries until it fires.
+   * That asymmetry is what makes the ceiling's deadline belong to the oldest
+   * byte that is *still pending*. It is armed here only while none is running,
+   * and every path that leaves it un-armed has first either emptied the buffer
+   * (this method when the buffer is empty, both flush paths, and the ceiling
+   * firing) or established that everything left in the buffer arrived in the
+   * push that is running now — see the boundary emit in push(). So an arm
+   * always follows the arrival of what is then the oldest pending byte, and
+   * that byte's deadline is the one the timer carries until it fires.
    */
   private rearmTimers(): void {
     this.clearFlushTimer();

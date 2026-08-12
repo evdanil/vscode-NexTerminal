@@ -892,22 +892,141 @@ describe("TerminalHighlighter — output latency", () => {
     const emitted: string[] = [];
     const stream = h.createStream((text) => emitted.push(text));
 
-    // Eighty characters arriving one per millisecond — a full-width line on a
-    // 9600-baud serial console, the slowest console rate in common use — with
-    // the token placed to straddle character 45, exactly where a 45 ms
-    // (three-period) ceiling would cut. The line's own \r\n lands at 80 ms,
-    // inside the 90 ms ceiling: the line must render whole, on its boundary,
-    // with the token's highlight intact.
+    // A full-width line on a 9600-baud serial console — the slowest console
+    // rate in common use — arriving character by character at the rate the
+    // wire actually delivers them: 8N1 is 10 bits per character, so 960
+    // characters a second, 1.042 ms each, and the line's own \r\n is two more
+    // characters on that wire rather than free. Eighty columns plus CR LF is
+    // 85.4 ms, not 82, and the difference is the whole point of the fixture:
+    // it is what a ceiling of 83, 84 or 85 ms would split and a 1 ms/char
+    // fixture would call safe. The token straddles character 45, exactly where
+    // a 45 ms (three-period) ceiling would cut.
     const line = `${"x".repeat(41)} ERROR ${"y".repeat(32)}`;
     expect(line).toHaveLength(80);
-    for (const character of line) {
-      stream.push(character);
-      vi.advanceTimersByTime(1);
+    let now = 0;
+    const completesAt = (index: number): number => Math.round(((index + 1) * 1000) / 960);
+    for (let index = 0; index < line.length; index += 1) {
+      stream.push(line[index]);
+      vi.advanceTimersByTime(completesAt(index) - now);
+      now = completesAt(index);
     }
+    // The CR LF is two more characters on the same wire: it completes at 85 ms,
+    // not at 82. (One push, as a driver read delivers it — a lone CR is a
+    // boundary in its own right and would cut the line one character early.)
+    vi.advanceTimersByTime(completesAt(81) - now);
+    now = completesAt(81);
     stream.push("\r\n");
+    // Non-vacuous: the line really did take longer than 82 ms, and really did
+    // fit inside the 90 ms ceiling — a bracket with 4.6 ms of headroom.
+    expect(now).toBe(85);
 
     expect(emitted).toHaveLength(1);
     expect(emitted[0]).toBe(`${"x".repeat(41)} \x1b[31mERROR\x1b[39m ${"y".repeat(32)}\r\n`);
+  });
+
+  /**
+   * The ceiling's deadline belongs to the oldest byte that is STILL pending,
+   * not to the oldest byte that ever was. These three pin that distinction:
+   * an emit that renders everything the timer was armed for and leaves a fresh
+   * tail behind must re-anchor it (the first two), and an emit that leaves
+   * carried-over bytes behind must not (the third).
+   */
+  it("re-anchors the ceiling to the fragment a completed line leaves behind", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // Sub-idle output (10 ms apart against the 15 ms idle delay) arms the
+    // ceiling at t=0 and keeps the idle timer from ever firing.
+    for (let elapsed = 0; elapsed < 80; elapsed += 10) {
+      stream.push("x");
+      vi.advanceTimersByTime(10);
+    }
+
+    // t=80: one chunk ends the line and opens the next. Everything the ceiling
+    // was armed for is now on the screen; "ER" arrived this instant.
+    stream.push(" end-of-line\r\nER");
+    expect(emitted).toEqual(["xxxxxxxx end-of-line\r\n"]);
+
+    // t=93 — past the deadline the ceiling started with, and 13 ms into "ER"'s
+    // own. Firing here would render a bare "ER" and leave the continuation
+    // that is already on its way unmatchable.
+    vi.advanceTimersByTime(13);
+    stream.push("ROR happened");
+    expect(emitted).toHaveLength(1);
+
+    // The idle timer, restarted by that push, renders the line whole at t=108.
+    vi.advanceTimersByTime(15);
+    expect(emitted[1]).toBe("\x1b[31mERROR\x1b[39m happened");
+  });
+
+  it("never reaches the ceiling while line boundaries keep flowing through the buffer", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // Continuous scroll delivered in mid-line chunks — USB-batched serial at
+    // 19200 baud and up, `tail -f` over a congested hop. Every chunk finishes
+    // the previous line and opens the next, so `pending` is never empty; 10 ms
+    // apart, so the idle timer never fires. An anchor that only moves when the
+    // buffer empties therefore never moves at all here, and the ceiling cuts
+    // the stream mid-line once per period for as long as the output runs —
+    // one needless split every 90 ms, on a pattern v2.8.180's boundary-cleared
+    // timer never split at all.
+    const chunks = ["boot ERR"];
+    for (let index = 0; index < 12; index += 1) {
+      chunks.push(`OR on line ${index}\r\nlog ERR`);
+    }
+    stream.push(chunks[0]);
+    for (const chunk of chunks.slice(1)) {
+      vi.advanceTimersByTime(10);
+      stream.push(chunk);
+    }
+    stream.flush();
+
+    // Every cut but the closing flush fell on a line boundary...
+    expect(emitted.slice(0, -1).filter((chunk) => !chunk.endsWith("\r\n"))).toEqual([]);
+    // ...so every one of the twelve tokens survived, in order, whole.
+    const raw = chunks.join("");
+    expect(emitted.join("")).toBe(raw.replace(/ERROR/g, "\x1b[31mERROR\x1b[39m"));
+    expect(emitted.join("").match(/\x1b\[31mERROR\x1b\[39m/g)).toHaveLength(12);
+  });
+
+  it("keeps the ceiling anchored when a cut backs off and carries older bytes over", () => {
+    vi.useFakeTimers();
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = h.createStream((text) => emitted.push(text));
+
+    // The one shape where the tail a boundary emit leaves behind is NOT a
+    // suffix of the chunk that just arrived: an OSC opened at t=0 swallows the
+    // \r\n that lands at t=10 (see the known gap on createAnsiRegex), so the
+    // cut backs off ahead of it and bytes from the first push stay pending.
+    // Their deadline is the older one, and it is the one that must be kept —
+    // re-anchoring here would push a 90 ms-old byte past its ceiling.
+    stream.push("xx\x1b]0;title");
+    vi.advanceTimersByTime(10);
+    stream.push(" more\r\nrest");
+    expect(emitted).toEqual(["xx"]);
+
+    // Sub-idle from t=10 to t=89, so nothing but the ceiling can fire.
+    for (let index = 0; index < 8; index += 1) {
+      stream.push("z");
+      vi.advanceTimersByTime(index === 7 ? 9 : 10);
+    }
+    // t=89: the second cut landed (the OSC now starts at 0, so safeCutIndex
+    // stops backing off), and "rest" — carried over from t=10 — is still
+    // pending under the t=0 anchor.
+    expect(emitted).toEqual(["xx", "\x1b]0;title more\r\n"]);
+
+    vi.advanceTimersByTime(1);
+    // t=90: the ceiling fires on the original anchor, on time.
+    expect(emitted).toEqual(["xx", "\x1b]0;title more\r\n", "restzzzzzzzz"]);
   });
 });
 

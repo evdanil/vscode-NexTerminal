@@ -59,6 +59,14 @@ import {
   type SessionTranscript
 } from "../../src/logging/sessionTranscriptLogger";
 
+/**
+ * The writer's own `MAX_APPEND_BYTES`: the buffer one append syscall is handed,
+ * and therefore the bound on `inFlight` — the one stage the retention cap does
+ * not count, because dropping a reference to a buffer the kernel is reading
+ * frees nothing. Not exported (it is not a knob), so it is restated here.
+ */
+const MAX_APPEND_BYTES = 1024 * 1024;
+
 const tempDirs: string[] = [];
 const openTranscripts: SessionTranscript[] = [];
 /** Writes captured by a deferring stub, released by the test (or by cleanup). */
@@ -739,8 +747,11 @@ describe("session transcript failure paths", () => {
     await sleep(400); // the session header lands before the fault is armed
 
     // One write() call, over maxFileSizeBytes on its own: 1.5 MiB of it will
-    // reach disk (more than the 1 MiB cap), the 1.5 MiB remainder will not
-    // (also more than the cap, so the trim has to shed into it).
+    // reach disk — more than one append batch, so the writer has to split it
+    // across several appends — and the 1.5 MiB remainder will not. Both are a
+    // long way under the retention cap in force here (the 64 MiB default,
+    // uninjected), which is the point: nothing is shed, so every byte of the
+    // chunk has to land in the generation its one rotation test chose.
     const partial = 1536 * 1024;
     const chunk = `PREFIX-MARKER${"x".repeat(3 * 1024 * 1024 - 24)}TAIL-MARKER`;
 
@@ -1565,5 +1576,123 @@ describe("session transcript failure paths", () => {
     const text = readFileSync(transcriptPath(dir, "peak_"), "utf8");
     expect(text.endsWith(chunkText)).toBe(true);
     expect(text.length).toBeGreaterThanOrEqual(56 * 64 * 1024);
+  });
+
+  /**
+   * The in-flight exemption is a bound on the memory an append pins, not
+   * merely on the byte count it is asked to write — the two differ for a
+   * Buffer that is a *view*, which keeps the whole allocation it was taken
+   * from alive for as long as anything holds it.
+   *
+   * A single `write()` call larger than one append batch is the only thing
+   * that produces such a view: promote() must place it whole (rotation is
+   * per call), so `owed` is walked batch by batch. The prefix batches were
+   * already copied out for exactly this reason; the *last* one — at most a
+   * batch long, so it took the "hand the whole of `owed` over" path — went
+   * across as a view of the entire chunk. A 1 MiB append pinning 4 MiB,
+   * inside an exemption that promises one batch and a cap that counts none
+   * of it.
+   *
+   * Not reachable from any shipped transport (ssh2 channel data and
+   * serialport reads arrive in ≤64 KiB chunks), so this is the stated bound
+   * being held to, not a leak being chased.
+   */
+  it("hands the kernel no buffer that pins more than one append batch", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "pinned", 64 * 1024 * 1024, 1);
+    await sleep(400); // the session header lands before the probe is installed
+    const file = transcriptPath(dir, "pinned_");
+    const headerBytes = statSync(file).size;
+
+    // What each append pins: the allocation behind the buffer, not its length.
+    const pinned: number[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hooks.write = (...args: any[]) => {
+      const data = args[1] as Buffer;
+      pinned.push(data.buffer.byteLength);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (hooks.actual!.write as any)(...args);
+    };
+
+    const chunk = 4 * 1024 * 1024;
+    transcript.write("x".repeat(chunk));
+    await sleep(600);
+
+    // Non-vacuous: the chunk really was split into batches, and the last of
+    // them really did take the whole-of-`owed` path.
+    expect(pinned.length).toBeGreaterThanOrEqual(4);
+    expect(Math.max(...pinned)).toBeLessThanOrEqual(MAX_APPEND_BYTES);
+    // And every byte still reached the file.
+    expect(statSync(file).size).toBe(headerBytes + chunk);
+  });
+
+  /**
+   * The remainder of a short write goes back where it came from.
+   *
+   * `takeAppendBatch` splits an oversized chunk by copying the batch out and
+   * leaving the rest as a view; putting the unwritten head back *in front of*
+   * that view meant `Buffer.concat` allocating prefix + suffix while the
+   * chunk it was cut from and the batch copy were both still live — measured
+   * at ≈17 MiB transient for one 8 MiB write whose first append failed, on a
+   * writer whose stated footprint bound is the retention cap plus one batch.
+   * The two halves are one contiguous run of a buffer that is still intact,
+   * so nothing needs allocating at all.
+   */
+  it("puts a short write's remainder back without copying what is still owed", async () => {
+    const dir = makeTempDir();
+    const transcript = open(dir, "remainder", 64 * 1024 * 1024, 1);
+    await sleep(400);
+    const file = transcriptPath(dir, "remainder_");
+    const headerBytes = statSync(file).size;
+
+    // Every allocation this path makes, while it is making it. promote()
+    // coalesces through Buffer.concat too, but is bounded to one batch by
+    // construction — anything larger is a copy of the remainder.
+    const realConcat = Buffer.concat;
+    const allocated: number[] = [];
+    let recording = false;
+    Buffer.concat = ((list: readonly Uint8Array[], total?: number): Buffer => {
+      const result = realConcat(list as Uint8Array[], total);
+      if (recording) {
+        allocated.push(result.length);
+      }
+      return result;
+    }) as typeof Buffer.concat;
+
+    const chunk = 4 * 1024 * 1024;
+    const landed = 512 * 1024;
+    try {
+      // The first batch lands 512 KiB and then stops making progress, which
+      // is what a short write that cannot continue looks like to appendAsync.
+      let seen = 0;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      hooks.write = (...args: any[]) => {
+        const callback = args[args.length - 1] as (error: Error | null, written: number) => void;
+        seen += 1;
+        if (seen === 1) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (hooks.actual!.write as any)(args[0], args[1], args[2], landed, callback);
+          return;
+        }
+        setTimeout(() => callback(null, 0), 0);
+      };
+
+      recording = true;
+      transcript.write("x".repeat(chunk));
+      await sleep(600);
+      recording = false;
+    } finally {
+      Buffer.concat = realConcat;
+    }
+
+    // Nothing on this path allocated more than one append batch...
+    expect(allocated.filter((size) => size > MAX_APPEND_BYTES)).toEqual([]);
+    // ...and the remainder came back exact: no byte skipped, none repeated.
+    expect(stagesOf(transcript).owed.length).toBe(chunk - landed);
+
+    hooks.write = undefined;
+    transcript.flush?.();
+    expect(statSync(file).size).toBe(headerBytes + chunk);
+    expect(readFileSync(file, "utf8").slice(headerBytes)).toBe("x".repeat(chunk));
   });
 });

@@ -63,7 +63,9 @@ const MAX_APPEND_BYTES = 1024 * 1024;
 // transcript's registration are held open across these attempts, so the budget
 // is deliberately short and finite: a permanently failing fd must cost a
 // bounded delay and one descriptor, not either of them for the rest of the
-// session. Timers only — `close()` itself must not block terminal closure.
+// session. Timers only — `close()` returns without waiting for any of them
+// (though the attempt it makes on the spot is a writeSync, which a wedged
+// descriptor can stall in; see finishClose()).
 const CLOSE_RETRY_DELAYS_MS = [50, 250, 1000];
 
 /** `fd` value meaning "this transcript owns no descriptor right now". */
@@ -179,12 +181,19 @@ const NOOP_TRANSCRIPT: SessionTranscript = { write() {}, flush() {}, close() {} 
  *   destination was already settled. Neither can move a rotation. The one
  *   thing outside the cap is `inFlight`, the buffer the kernel is holding,
  *   and it is one {@link MAX_APPEND_BYTES} batch at most because that is all
- *   an append is ever given — so the whole footprint is at most
+ *   an append is ever given — and, since {@link takeAppendBatch} never hands
+ *   over a view of something larger, one batch of *pinned memory* rather than
+ *   just one batch of bytes written. So the whole footprint is at most
  *   `maxRetainedBytes` + {@link MAX_APPEND_BYTES}, at every instant: no
- *   drain stage re-encodes or duplicates what admission already holds. The
- *   only transient on top is the single chunk being admitted, which exists
- *   as the caller's string and the writer's buffer for the duration of one
- *   {@link admit} call and is itself trimmed to the cap in that same call.
+ *   drain stage re-encodes or duplicates what admission already holds, and
+ *   the remainder of a short write goes back where it came from rather than
+ *   being concatenated in front of what is still owed. Two transients sit on
+ *   top, both bounded by one `write()` call that admission already trimmed to
+ *   the cap: the chunk being admitted, which exists as the caller's string
+ *   and the writer's buffer for the duration of one {@link admit} call; and a
+ *   single call larger than one batch, which is drained in place — `owed`
+ *   walks it as a view — so the whole of it stays alive while the cap counts
+ *   only the part still unwritten.
  * - **Descriptor ownership.** `fd` holds a descriptor this transcript owns,
  *   or {@link NO_FD}. It is never left holding a number the process has
  *   already handed back — see {@link releaseFd}.
@@ -214,6 +223,23 @@ class FileSessionTranscript implements SessionTranscript {
    * decided again.
    */
   private owed: Buffer = NO_BYTES;
+  /**
+   * Set exactly while `owed` is a *view* of a larger buffer it was split from
+   * — the state a single `write()` call bigger than one append batch leaves
+   * behind — rather than an allocation that stands on its own. Holds that
+   * buffer and the view itself, so the pairing is checkable by identity:
+   * every other path that touches `owed` replaces it with a fresh object (see
+   * {@link setOwed}), so a stale record can never be mistaken for a live one.
+   *
+   * It exists so {@link returnUnwritten} can put a short write's remainder
+   * back by re-deriving the view — the unwritten head of the batch and
+   * everything owed behind it are one contiguous run of that same buffer —
+   * instead of concatenating a copy of the remainder in front of it. The
+   * concatenation allocated prefix + suffix while the parent and the batch
+   * copy were both still live: measured at ≈17 MiB transient for one 8 MiB
+   * write whose first append failed.
+   */
+  private owedSplitFrom?: { parent: Buffer; view: Buffer };
   /**
    * The placed bytes an append has handed to the kernel, for exactly as long
    * as that syscall lasts. They are taken out of `owed` rather than left in
@@ -335,8 +361,20 @@ class FileSessionTranscript implements SessionTranscript {
    * of reach of every retry path there is, which loses precisely the bytes
    * retention exists to keep. So a failed drain keeps both, and a timer
    * retries on a short, finite budget. `close()` itself stays synchronous and
-   * returns immediately either way: terminal closure must not wait on a
-   * wedged filesystem.
+   * does not wait for those retries: they are timers, and terminal closure
+   * returns without them.
+   *
+   * It is not, however, non-blocking. The drain below is {@link drainSync},
+   * which is {@link writeSync}, and on a descriptor that is wedged rather than
+   * failing — a hard-mounted NFS export in D-state, a dead UNC share — that
+   * syscall blocks the extension host for whatever the kernel's timeout is,
+   * once per attempt, so up to four times across the retry budget. That is
+   * accepted rather than overlooked: the writer this replaced took the same
+   * exposure on *every chunk* of a session, and the tail of a transcript is
+   * the part worth a bounded stall. Extension-host teardown draws the line
+   * differently — see {@link flushSessionTranscripts}, which refuses
+   * `writeSync` outright because a stall there eats a budget VS Code is about
+   * to end by force.
    */
   private finishClose(): void {
     this.clearCloseRetryTimer();
@@ -379,7 +417,7 @@ class FileSessionTranscript implements SessionTranscript {
    */
   private abandonTail(): void {
     const lost = this.retainedByteCount();
-    this.owed = NO_BYTES;
+    this.setOwed(NO_BYTES);
     this.pending = [];
     this.pendingBytes = 0;
     this.releaseFd();
@@ -420,6 +458,36 @@ class FileSessionTranscript implements SessionTranscript {
     }
     this.pending.push(chunk);
     this.pendingBytes += chunk.length;
+  }
+
+  /**
+   * Replace `owed` with a buffer that stands on its own, dropping any split
+   * record with it — the record describes one exact view, and every path
+   * through here produces a different object. The two paths that deliberately
+   * leave a view behind ({@link takeAppendBatch}'s split and
+   * {@link returnUnwritten}'s re-derivation) set the record themselves.
+   */
+  private setOwed(next: Buffer): void {
+    this.owed = next;
+    this.owedSplitFrom = undefined;
+  }
+
+  /**
+   * The buffer `owed` is currently a view of, or undefined when it stands on
+   * its own. Verified by identity rather than trusted: anything that replaced
+   * `owed` since the record was written — a trim shedding into it while an
+   * append was outstanding, most of all — leaves a different object here.
+   */
+  private owedSplit(): { parent: Buffer; view: Buffer } | undefined {
+    const split = this.owedSplitFrom;
+    if (split === undefined) {
+      return undefined;
+    }
+    if (split.view !== this.owed) {
+      this.owedSplitFrom = undefined;
+      return undefined;
+    }
+    return split;
   }
 
   /** The one place a whole chunk leaves `pending`'s head. */
@@ -546,7 +614,7 @@ class FileSessionTranscript implements SessionTranscript {
       if (this.overflowsFile(this.currentSize, head.length)) {
         this.rotateNow();
       }
-      this.owed = head;
+      this.setOwed(head);
     }
     let projected = this.currentSize + this.owed.length;
     let placed = this.owed.length;
@@ -562,7 +630,7 @@ class FileSessionTranscript implements SessionTranscript {
       placed += chunk.length;
     }
     if (taken.length > 0) {
-      this.owed = Buffer.concat([this.owed, ...taken]);
+      this.setOwed(Buffer.concat([this.owed, ...taken]));
     }
   }
 
@@ -571,24 +639,43 @@ class FileSessionTranscript implements SessionTranscript {
    * batch, off the head of `owed`, and out of the writer's stages for as long
    * as the syscall lasts.
    *
-   * This is what makes the in-flight exemption a bound rather than a claim.
+   * This is what makes the in-flight exemption a bound rather than a claim,
+   * and the bound is on *pinned* memory, not just on the byte count the kernel
+   * is asked to write: whatever this hands over, nothing bigger than a batch
+   * stays alive on its account for the duration of the syscall.
+   *
    * Coalescing already stops at a batch, so the whole of `owed` is normally
    * what goes — the split below only ever fires for a single `write()` call
    * larger than a batch, which promote() must place whole to keep rotation
-   * per-call. That split copies rather than slicing: a view would keep the
-   * oversized buffer it came from alive for as long as the kernel holds it,
-   * which is precisely the memory being bounded. The suffix left in `owed`
-   * stays a view of its parent, which is safe because the parent is itself
-   * within the retention cap — admission trimmed it before it ever reached a
-   * drain.
+   * per-call. Two rules follow from the bound, and both are about views:
+   *
+   * - The split copies its prefix rather than slicing it. A view would keep
+   *   the oversized buffer it came from alive for as long as the kernel holds
+   *   it, which is precisely the memory being bounded.
+   * - The *last* slice of such a buffer is copied for the same reason. It is
+   *   at most one batch long, so the untracked version handed it over as it
+   *   was — a view pinning every already-written byte of its parent behind it,
+   *   several batches of memory inside an exemption that claims one. Copying
+   *   it out releases the parent.
+   *
+   * The suffix left in `owed` mid-split stays a view: it is what the next
+   * batch comes off, and the parent it holds alive is bounded by the retention
+   * cap, which trimmed the chunk at admission before it ever reached a drain.
+   * That is also the one place the cap under-reports what the writer holds —
+   * it counts the unwritten suffix, while the whole chunk stays alive until
+   * its last batch is taken — and it is bounded by that chunk, which is to say
+   * by one `write()` call that admission already held to the cap.
    */
   private takeAppendBatch(): Buffer {
+    const split = this.owedSplit();
     if (this.owed.length <= MAX_APPEND_BYTES) {
-      this.inFlight = this.owed;
-      this.owed = NO_BYTES;
+      this.inFlight = split === undefined ? this.owed : Buffer.from(this.owed);
+      this.setOwed(NO_BYTES);
     } else {
-      this.inFlight = Buffer.from(this.owed.subarray(0, MAX_APPEND_BYTES));
-      this.owed = this.owed.subarray(MAX_APPEND_BYTES);
+      const parent = this.owed;
+      this.inFlight = Buffer.from(parent.subarray(0, MAX_APPEND_BYTES));
+      this.owed = parent.subarray(MAX_APPEND_BYTES);
+      this.owedSplitFrom = { parent, view: this.owed };
     }
     return this.inFlight;
   }
@@ -598,14 +685,33 @@ class FileSessionTranscript implements SessionTranscript {
    * it belongs — ahead of anything promote() placed behind it. Returns true
    * when something was left over, which is the drain's signal that the file
    * refused bytes and the loop should stop rather than spin.
+   *
+   * When the batch was split off a larger buffer that is still intact behind
+   * it, the two halves are put back by re-deriving the view — the unwritten
+   * head of the batch and everything owed behind it are one contiguous run of
+   * that buffer, so nothing needs allocating at all. The general path has to
+   * concatenate, and for an oversized chunk that concatenation is the whole
+   * remainder copied while the parent and the batch are both still live. It
+   * stays as the fallback for the case the re-derivation cannot cover: a trim
+   * that shed into `owed` while the append was outstanding, which leaves a
+   * buffer the batch is no longer the head of.
    */
   private returnUnwritten(batch: Buffer, written: number): boolean {
     this.inFlight = NO_BYTES;
     if (written >= batch.length) {
       return false;
     }
+    const split = this.owedSplit();
+    // The length test is the proof that `batch` really is the head this view
+    // was cut after, so re-deriving from `written` cannot skip or repeat a
+    // byte; it costs nothing and does not rely on the call order holding.
+    if (split !== undefined && split.parent.length - split.view.length === batch.length) {
+      this.owed = split.parent.subarray(written);
+      this.owedSplitFrom = { parent: split.parent, view: this.owed };
+      return true;
+    }
     const rest = batch.subarray(written);
-    this.owed = this.owed.length === 0 ? rest : Buffer.concat([rest, this.owed]);
+    this.setOwed(this.owed.length === 0 ? rest : Buffer.concat([rest, this.owed]));
     return true;
   }
 
@@ -688,9 +794,9 @@ class FileSessionTranscript implements SessionTranscript {
     }
     if (excess >= this.owed.length) {
       excess -= this.owed.length;
-      this.owed = NO_BYTES;
+      this.setOwed(NO_BYTES);
     } else {
-      this.owed = cutUtf8Head(this.owed, excess);
+      this.setOwed(cutUtf8Head(this.owed, excess));
       excess = 0;
     }
     while (excess > 0 && this.pending.length > 0) {
@@ -745,8 +851,17 @@ class FileSessionTranscript implements SessionTranscript {
         const written = await this.appendAsync(batch);
         this.currentSize += written;
         if (this.returnUnwritten(batch, written)) {
-          // See drainSync: unwritten bytes stay placed for the retry, and the
-          // cap needs no re-check — drains never grow the retained total.
+          // Unwritten bytes stay placed for the retry, as in drainSync — but
+          // not for the same reason about the cap. The synchronous drain
+          // cannot be interleaved with; this one awaits, and admissions during
+          // that await can have refilled `retained` all the way to the cap, so
+          // handing the batch back can leave it at cap + up to one batch until
+          // the next admission trims. That is a per-stage overshoot, not a
+          // footprint one: `inFlight` is empty at this instant, and the bytes
+          // being counted twice against the cap are the same bytes the
+          // exemption stopped counting when the batch was taken out. Trimming
+          // here instead would shed bytes a retry is about to write, to
+          // restore an invariant that the total bound does not need.
           return;
         }
       }
