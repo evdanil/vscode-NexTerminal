@@ -455,6 +455,40 @@ describe("TerminalHighlighter", () => {
     expect(h.apply("WARN")).toContain("\x1b[33m");
   });
 
+  it("a rule with enabled: false is never applied, even though its pattern would match", () => {
+    // Fails against a reload() that ignores `enabled` — the rule would compile
+    // and ERROR would highlight, changing the assertion below.
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", enabled: false }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("something ERROR happened")).toBe("something ERROR happened");
+  });
+
+  it("isEnabled() is false when every rule is disabled, even though the global setting is on", () => {
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", enabled: false }]);
+    const h = new TerminalHighlighter();
+    expect(h.isEnabled()).toBe(false);
+  });
+
+  it("a mixed set of enabled and disabled rules applies only the enabled rule", () => {
+    setConfig(true, [
+      { pattern: "\\bERROR\\b", color: "red", flags: "gi", enabled: false },
+      { pattern: "\\bWARN\\b", color: "yellow", flags: "gi" }
+    ]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("ERROR")).toBe("ERROR");
+    expect(h.apply("WARN")).toContain("\x1b[33m");
+  });
+
+  it("a malformed (non-boolean) enabled value fails closed — the rule is not applied", () => {
+    // A settings.json corrupted so `enabled` is the string "false" (not the
+    // boolean) must still leave an expensive/disabled rule off. A sanitizer
+    // that drops the malformed value instead of failing closed would leave
+    // `enabled` absent (the default-enabled case) and this rule would highlight.
+    setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", enabled: "false" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("something ERROR happened")).toBe("something ERROR happened");
+  });
+
   it("non-SGR ANSI sequences (CSI cursor moves) do not affect color tracking", () => {
     setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }]);
     const h = new TerminalHighlighter();

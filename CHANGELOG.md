@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.8.182] — 2026-08-14
+
+### Added
+
+- **Highlighting rules can now carry a name and a note, and be switched off without deleting them.** Each rule in `nexus.terminal.highlighting.rules` may now set an optional `label` (a short display name), `description` (what it matches and why), and `enabled` (defaults to `true`). The Highlighting Rules editor shows the label as the row's primary text with the pattern underneath in a dimmer, monospace line, and a new checkbox on every row lets you keep a rule saved while switching it off — the pattern is not retyped if you turn it back on later.
+- **IPv6 and UUID highlighting are back — shipped disabled.** 2.8.181 removed these two rules outright for performance, with the only way back being to hand-type their regex into a new rule. They are now back in the default rule set, positioned next to the IPv4/MAC rules, both with `enabled: false`: still off by default (they remain the two most expensive built-in patterns, together costing more than every other rule combined), but a tick in the Highlighting Rules editor turns either on — no regex to paste. This supersedes 2.8.181's "add it back with **Add Rule**" instructions. If you already customised your highlighting rules, nothing changes for you; this only affects the set Nexus ships with and what **Reset to Defaults** restores.
+
+### Fixed
+
+- **The returning IPv6 rule now matches addresses whose zero-compression reaches the end.** The pattern 2.8.181 told you to paste never matched `fe80::` or `2001:db8::` — every form it knew required a hex group after the final `::`. The rule that ships in this release covers trailing compression as well. The bare all-zeros address `::` stays deliberately unmatched: in terminal output a lone `::` is almost always a C++ or Ruby scope operator, not an address.
+- **Reordering a rule while the edit form was open could save the edit onto the wrong rule.** Moving a rule with Up/Down no longer confuses the editor about which rule is being edited — previously, staging the edit after a reorder could overwrite whichever rule had been moved into the edited rule's old position, leaving the rule you were actually editing untouched.
+- **The "Unsaved changes" indicator now clears when you undo your changes.** Toggling a rule's checkbox off and back on (or otherwise returning the list to exactly its saved state) no longer leaves the editor claiming there is something to apply.
+- **Backups and settings exports/imports made before this release are unaffected.** A highlighting rule saved without `label`/`description`/`enabled` still imports and applies exactly as before; the three fields are additive and optional.
+
 ## [2.8.181] — 2026-08-12
 
 ### Fixed

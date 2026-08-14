@@ -6,6 +6,9 @@ export interface HighlightRule {
   flags?: string;
   bold?: boolean;
   underline?: boolean;
+  label?: string;
+  description?: string;
+  enabled?: boolean;
 }
 
 export interface HighlightRuleValidationOk {
@@ -28,6 +31,8 @@ const VALID_COLORS = new Set([
 const VALID_FLAGS_RE = /^[gi]*$/;
 const MAX_RULES = 100;
 const MAX_PATTERN_LENGTH = 500;
+const MAX_LABEL_LENGTH = 100;
+const MAX_DESCRIPTION_LENGTH = 500;
 
 function isForegroundCode(code: number): boolean {
   return (code >= 30 && code <= 37) || (code >= 90 && code <= 97);
@@ -60,11 +65,31 @@ export function validateAndSanitizeHighlightRulesWithError(raw: unknown): Highli
     const flags = typeof obj.flags === "string" && VALID_FLAGS_RE.test(obj.flags) ? obj.flags : undefined;
     const bold = typeof obj.bold === "boolean" ? obj.bold : undefined;
     const underline = typeof obj.underline === "boolean" ? obj.underline : undefined;
+    // Label/description are cosmetic (shown only in the Highlighting Rules
+    // editor) — an over-length value is truncated rather than failing the
+    // whole array, matching the tolerance already given to a malformed
+    // `flags`/`bold`. Failing here would blank the editor ("No highlighting
+    // rules defined") on a hand-edited settings.json and set up a wipe-all
+    // if the user then hits Save.
+    const label = typeof obj.label === "string" && obj.label.length > 0 ? obj.label.slice(0, MAX_LABEL_LENGTH) : undefined;
+    const description = typeof obj.description === "string" && obj.description.length > 0
+      ? obj.description.slice(0, MAX_DESCRIPTION_LENGTH)
+      : undefined;
+    // `enabled` gates whether an (often expensive, e.g. IPv6/UUID) pattern
+    // actually runs, so unlike the cosmetic fields above a malformed value
+    // must fail CLOSED, never open: a present-but-non-boolean value is
+    // treated as `false` rather than dropped, so a rule the user disabled
+    // can never silently re-enable itself just because its stored value got
+    // corrupted to something other than a boolean.
+    const enabled = typeof obj.enabled === "boolean" ? obj.enabled : obj.enabled !== undefined ? false : undefined;
 
     const rule: HighlightRule = { pattern: obj.pattern, color: obj.color };
     if (flags !== undefined) rule.flags = flags;
     if (bold !== undefined) rule.bold = bold;
     if (underline !== undefined) rule.underline = underline;
+    if (label !== undefined) rule.label = label;
+    if (description !== undefined) rule.description = description;
+    if (enabled !== undefined) rule.enabled = enabled;
     result.push(rule);
   }
 

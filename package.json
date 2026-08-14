@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.181",
+  "version": "2.8.182",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -3332,108 +3332,164 @@
               "pattern": "\\bCRITICAL\\b|\\bFATAL\\b|\\bPANIC\\b|\\bEMERG(?:ENCY)?\\b",
               "color": "brightRed",
               "flags": "gi",
-              "bold": true
+              "bold": true,
+              "label": "Critical / fatal errors",
+              "description": "CRITICAL, FATAL, PANIC, EMERG(ENCY) — highest-severity log keywords, bold bright red."
             },
             {
               "pattern": "\\bERR(?:OR)?\\b",
               "color": "red",
               "flags": "gi",
-              "bold": true
+              "bold": true,
+              "label": "Errors",
+              "description": "ERR / ERROR — general error keyword, bold red."
             },
             {
               "pattern": "\\bFAIL(?:ED|URE)?\\b|\\bABORT(?:ED)?\\b",
               "color": "red",
               "flags": "gi",
-              "bold": true
+              "bold": true,
+              "label": "Failures / aborts",
+              "description": "FAIL(ED/URE), ABORT(ED) — operation failed or was aborted, bold red."
             },
             {
               "pattern": "\\bWARN(?:ING)?\\b",
               "color": "yellow",
               "flags": "gi",
-              "bold": true
+              "bold": true,
+              "label": "Warnings",
+              "description": "WARN / WARNING — cautionary log keyword, bold yellow."
             },
             {
               "pattern": "\\bNOTICE\\b",
               "color": "cyan",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Notices",
+              "description": "NOTICE — informational-but-notable log keyword, cyan."
             },
             {
               "pattern": "\\bINFO\\b",
               "color": "cyan",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Info",
+              "description": "INFO — routine informational log keyword, cyan."
             },
             {
               "pattern": "\\bDEBUG\\b|\\bTRACE\\b",
               "color": "brightBlack",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Debug / trace",
+              "description": "DEBUG, TRACE — low-priority diagnostic keywords, dimmed grey."
             },
             {
               "pattern": "\\bOK\\b|\\bPASS(?:ED)?\\b|\\bSUCCESS(?:FUL)?\\b|\\bDONE\\b|\\bLOADED\\b|\\bSTARTED\\b|\\bMOUNTED\\b",
               "color": "green",
               "flags": "gi",
-              "bold": true
+              "bold": true,
+              "label": "Success keywords",
+              "description": "OK, PASS(ED), SUCCESS(FUL), DONE, LOADED, STARTED, MOUNTED — positive outcome keywords, bold green."
             },
             {
               "pattern": "\\bDENIED\\b|\\bREJECT(?:ED)?\\b|\\bREFUSED\\b|\\bFORBIDDEN\\b|\\bBLOCKED\\b",
               "color": "red",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Denied / rejected",
+              "description": "DENIED, REJECT(ED), REFUSED, FORBIDDEN, BLOCKED — access/action refused, red."
             },
             {
               "pattern": "\\bACCEPTED\\b|\\bALLOWED\\b|\\bGRANTED\\b|\\bAUTHENTICATED\\b",
               "color": "green",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Accepted / granted",
+              "description": "ACCEPTED, ALLOWED, GRANTED, AUTHENTICATED — access/action allowed, green."
             },
             {
               "pattern": "\\bTIMEOUT\\b|\\bTIMED OUT\\b|\\bUNREACHABLE\\b|\\bNO ROUTE\\b|\\bRESET\\b|\\bRETRANSMIT\\b|\\bDUPLICATE\\b",
               "color": "red",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Timeout / unreachable",
+              "description": "TIMEOUT, TIMED OUT, UNREACHABLE, NO ROUTE, RESET, RETRANSMIT, DUPLICATE — network/connectivity failure keywords, red."
             },
             {
               "pattern": "\\bDOWN\\b|\\bINACTIVE\\b|\\bDISABLED\\b|\\bOFFLINE\\b|\\bDEAD\\b",
               "color": "red",
-              "flags": "g"
+              "flags": "g",
+              "label": "Down / inactive (case-sensitive)",
+              "description": "DOWN, INACTIVE, DISABLED, OFFLINE, DEAD — case-sensitive so lowercase prose words aren't matched, red."
             },
             {
               "pattern": "\\bUP\\b|\\bACTIVE\\b|\\bENABLED\\b|\\bRUNNING\\b|\\bESTABLISHED\\b|\\bCONNECTED\\b|\\bONLINE\\b|\\bALIVE\\b|\\bREACHABLE\\b",
               "color": "green",
-              "flags": "g"
+              "flags": "g",
+              "label": "Up / active (case-sensitive)",
+              "description": "UP, ACTIVE, ENABLED, RUNNING, ESTABLISHED, CONNECTED, ONLINE, ALIVE, REACHABLE — case-sensitive so lowercase prose words aren't matched, green."
             },
             {
               "pattern": "\\bPENDING\\b|\\bWAITING\\b|\\bLISTENING\\b|\\bSTARTING\\b|\\bRELOADING\\b|\\bSTOPPING\\b",
               "color": "yellow",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Pending / waiting",
+              "description": "PENDING, WAITING, LISTENING, STARTING, RELOADING, STOPPING — transitional state keywords, yellow."
             },
             {
               "pattern": "\\bDEPRECATED\\b|\\bOBSOLETE\\b",
               "color": "yellow",
               "flags": "gi",
-              "underline": true
+              "underline": true,
+              "label": "Deprecated",
+              "description": "DEPRECATED, OBSOLETE — flags outdated commands/features, underlined yellow."
             },
             {
               "pattern": "(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}",
               "color": "magenta",
-              "flags": "g"
+              "flags": "g",
+              "label": "MAC addresses",
+              "description": "Colon- or hyphen-separated MAC addresses (e.g. aa:bb:cc:dd:ee:ff), magenta."
             },
             {
               "pattern": "\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}(?:/\\d{1,2})?\\b",
               "color": "magenta",
-              "flags": "g"
+              "flags": "g",
+              "label": "IPv4 addresses",
+              "description": "IPv4 addresses, optionally with a /prefix (e.g. 10.0.0.1/24), magenta."
+            },
+            {
+              "pattern": "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:(?!:)",
+              "color": "magenta",
+              "flags": "g",
+              "label": "IPv6 addresses",
+              "description": "IPv6 addresses, full and compressed (including trailing-compressed forms like fe80:: or 2001:db8::), except the bare all-zeros \"::\" — a lone :: in terminal output is overwhelmingly a C++/Ruby scope operator. Disabled by default — this is one of the two most expensive built-in patterns, since it has to be tried at nearly every character. Enable it from the Highlighting Rules editor if you want it.",
+              "enabled": false
+            },
+            {
+              "pattern": "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+              "color": "brightBlue",
+              "flags": "g",
+              "label": "UUIDs",
+              "description": "Standard 8-4-4-4-12 hex UUIDs. Disabled by default — this is one of the two most expensive built-in patterns, since it has to be tried at nearly every character. Enable it from the Highlighting Rules editor if you want it.",
+              "enabled": false
             },
             {
               "pattern": "https?://\\S+",
               "color": "blue",
               "flags": "gi",
-              "underline": true
+              "underline": true,
+              "label": "URLs",
+              "description": "http(s):// links, underlined blue."
             },
             {
               "pattern": "\\b(?:errors|dropped|overruns|collisions|discards|giants|runts|throttles|CRC|frame|ignored|abort|resets|carrier transitions|no buffer|underruns|retransmits|failures|loss):",
               "color": "red",
-              "flags": "gi"
+              "flags": "gi",
+              "label": "Interface error counters",
+              "description": "Network-interface error counter labels (errors, dropped, CRC, collisions, overruns, …), red."
             },
             {
               "pattern": "\\b(?:exit-code|core-dump|signal|timeout|watchdog)\\b",
               "color": "red",
-              "flags": "g"
+              "flags": "g",
+              "label": "Exit-code / signal keywords",
+              "description": "exit-code, core-dump, signal, timeout, watchdog — process-death diagnostic keywords, red."
             }
           ],
           "items": {
@@ -3465,10 +3521,25 @@
                 "type": "boolean",
                 "default": false,
                 "description": "Apply underline style to matched text."
+              },
+              "label": {
+                "type": "string",
+                "maxLength": 100,
+                "description": "Short display name shown in the Highlighting Rules editor."
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "What the rule matches / notes, shown in the Highlighting Rules editor."
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Set to false to keep the rule but stop applying it."
               }
             }
           },
-          "markdownDescription": "Highlighting rules applied to SSH, serial, and Local Shell terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. Text already coloured by the terminal program is never re-highlighted.\n\nIPv6 addresses and UUIDs are **not** highlighted by default: those two patterns cost more than every other rule combined, because they have to be tried at nearly every character of every line. Add them back with **Add Rule** in the Highlighting Rules editor if you want them — IPv6: `\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b` (magenta, flags `g`), UUID: `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` (brightBlue, flags `g`)."
+          "markdownDescription": "Highlighting rules applied to SSH, serial, and Local Shell terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. A rule can also carry an optional `label` and `description` for its own entry in the Highlighting Rules editor, and an optional `enabled` flag (omitted/`true` means enabled) to keep a rule saved without applying it. Text already coloured by the terminal program is never re-highlighted.\n\nThe IPv6 and UUID rules ship **disabled** by default: those two patterns cost more than every other rule combined, because they have to be tried at nearly every character of every line. Switch either one on with its per-rule enable checkbox in the Highlighting Rules editor — no need to retype the regex."
         },
         "nexus.sftp.cacheTtlSeconds": {
           "type": "number",

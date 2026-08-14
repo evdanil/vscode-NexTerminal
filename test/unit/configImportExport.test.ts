@@ -710,6 +710,61 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  it("imports old-format highlighting rules (no label/description/enabled) unchanged — no fields invented", async () => {
+    mockShowWarningMessage.mockClear();
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.highlighting.rules": [
+          { pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }
+        ]
+      }
+    });
+    await runImport(exportData);
+
+    expect(configStore.get("nexus.terminal.highlighting.rules")).toEqual([
+      { pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }
+    ]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
+  it("preserves label/description/enabled:false on imported highlighting rules", async () => {
+    // A sanitizer that silently drops fields it doesn't recognize would still pass
+    // this test's "import succeeded" half — the applied value must actually carry
+    // the three new fields, not just avoid the invalid-value warning.
+    mockShowWarningMessage.mockClear();
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.highlighting.rules": [
+          {
+            pattern: "\\bUUID\\b",
+            color: "brightBlue",
+            flags: "g",
+            label: "UUIDs",
+            description: "Disabled by default — expensive pattern.",
+            enabled: false
+          }
+        ]
+      }
+    });
+    await runImport(exportData);
+
+    expect(configStore.get("nexus.terminal.highlighting.rules")).toEqual([
+      {
+        pattern: "\\bUUID\\b",
+        color: "brightBlue",
+        flags: "g",
+        label: "UUIDs",
+        description: "Disabled by default — expensive pattern.",
+        enabled: false
+      }
+    ]);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
   it("generates IDs for items with missing IDs", async () => {
     const exportData = makeExportData({
       servers: [{ ...makeServer(), id: "" }],
@@ -5881,6 +5936,67 @@ describe("backup export round-trip", () => {
 
     expect(configStore.get("nexus.terminal.passthroughKeys")).toEqual(["b", "q", "w"]);
     expect(configStore.get("nexus.ui.showTreeDescriptions")).toBe(false);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
+  it("backup export then import round-trips a disabled, labeled highlighting rule", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+
+    const sourceRepo = new InMemoryConfigRepository();
+    const sourceCore = new NexusCore(sourceRepo);
+    await sourceCore.initialize();
+    const rule = {
+      pattern: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+      color: "brightBlue",
+      flags: "g",
+      label: "UUIDs",
+      description: "Disabled by default — expensive pattern.",
+      enabled: false
+    };
+    configStore.set("nexus.terminal.highlighting.rules", [rule]);
+
+    registerConfigCommands(sourceCore, vault);
+
+    mockShowInputBox
+      .mockResolvedValueOnce("masterpass1")
+      .mockResolvedValueOnce("masterpass1");
+
+    let exportedJson = "";
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+    mockWriteFile.mockImplementation((_uri: unknown, data: Buffer) => {
+      exportedJson = Buffer.from(data).toString("utf8");
+    });
+
+    const backupCmd = registeredCommands.get("nexus.config.export.backup")!;
+    await backupCmd();
+
+    const exported = JSON.parse(exportedJson);
+    expect(exported.settings["nexus.terminal.highlighting.rules"]).toEqual([rule]);
+
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+
+    const destRepo = new InMemoryConfigRepository();
+    const destCore = new NexusCore(destRepo);
+    await destCore.initialize();
+    registerConfigCommands(destCore, vault);
+
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(exportedJson, "utf8"));
+    mockShowQuickPick.mockResolvedValue({ label: "Replace", value: "replace" });
+    mockShowInputBox.mockResolvedValueOnce("masterpass1");
+
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
+    const importCmd = registeredCommands.get("nexus.config.import")!;
+    await importCmd();
+
+    expect(configStore.get("nexus.terminal.highlighting.rules")).toEqual([rule]);
     expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
       "1 imported Nexus setting had an invalid value and was skipped."
     );
