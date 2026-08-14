@@ -9,6 +9,9 @@
 
 ### Fixed
 
+- **The returning IPv6 rule now matches addresses whose zero-compression reaches the end.** The pattern 2.8.181 told you to paste never matched `fe80::` or `2001:db8::` — every form it knew required a hex group after the final `::`. The rule that ships in this release covers trailing compression as well. The bare all-zeros address `::` stays deliberately unmatched: in terminal output a lone `::` is almost always a C++ or Ruby scope operator, not an address.
+- **Reordering a rule while the edit form was open could save the edit onto the wrong rule.** Moving a rule with Up/Down no longer confuses the editor about which rule is being edited — previously, staging the edit after a reorder could overwrite whichever rule had been moved into the edited rule's old position, leaving the rule you were actually editing untouched.
+- **The "Unsaved changes" indicator now clears when you undo your changes.** Toggling a rule's checkbox off and back on (or otherwise returning the list to exactly its saved state) no longer leaves the editor claiming there is something to apply.
 - **Backups and settings exports/imports made before this release are unaffected.** A highlighting rule saved without `label`/`description`/`enabled` still imports and applies exactly as before; the three fields are additive and optional.
 
 ## [2.8.181] — 2026-08-12
