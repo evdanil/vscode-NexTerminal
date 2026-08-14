@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.8.182] — 2026-08-14
+
+### Added
+
+- **Highlighting rules can now carry a name and a note, and be switched off without deleting them.** Each rule in `nexus.terminal.highlighting.rules` may now set an optional `label` (a short display name), `description` (what it matches and why), and `enabled` (defaults to `true`). The Highlighting Rules editor shows the label as the row's primary text with the pattern underneath in a dimmer, monospace line, and a new checkbox on every row lets you keep a rule saved while switching it off — the pattern is not retyped if you turn it back on later.
+- **IPv6 and UUID highlighting are back — shipped disabled.** 2.8.181 removed these two rules outright for performance, with the only way back being to hand-type their regex into a new rule. They are now back in the default rule set, positioned next to the IPv4/MAC rules, both with `enabled: false`: still off by default (they remain the two most expensive built-in patterns, together costing more than every other rule combined), but a tick in the Highlighting Rules editor turns either on — no regex to paste. This supersedes 2.8.181's "add it back with **Add Rule**" instructions. If you already customised your highlighting rules, nothing changes for you; this only affects the set Nexus ships with and what **Reset to Defaults** restores.
+
+### Fixed
+
+- **Backups and settings exports/imports made before this release are unaffected.** A highlighting rule saved without `label`/`description`/`enabled` still imports and applies exactly as before; the three fields are additive and optional.
+
 ## [2.8.181] — 2026-08-12
 
 ### Fixed

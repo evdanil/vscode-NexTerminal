@@ -20,9 +20,10 @@ import type { ExtensionMessage, FormDefinition, FormMessage, FormValues } from "
  * file input's baseline `readonly`).
  * ──────────────────────────────────────────────────────────────────────── */
 
-type DomListener = (event?: { preventDefault: () => void }) => void;
+type DomEvent = { preventDefault: () => void; target?: StubElement };
+type DomListener = (event?: DomEvent) => void;
 
-class StubElement {
+export class StubElement {
   public readonly children: StubElement[] = [];
   public parentElement: StubElement | undefined;
   public readonly dataset: Record<string, string | undefined> = {};
@@ -33,6 +34,7 @@ class StubElement {
   public disabled = false;
   public readOnly = false;
   public textContent = "";
+  public title: string | undefined;
   public type: string | undefined;
   public name: string | undefined;
   /** Only ever set on the <form> stub; the script reads `form.elements`. */
@@ -40,8 +42,49 @@ class StubElement {
   private readonly classes: Set<string>;
   private readonly listeners = new Map<string, DomListener[]>();
 
+  private innerHTMLValue = "";
+
   public constructor(public readonly tagName: string, classNames: string[] = []) {
     this.classes = new Set(classNames);
+  }
+
+  /**
+   * Real callers only ever assign `innerHTML = ""` to clear a container before
+   * re-rendering it (see `renderRulesList()`'s `list.innerHTML = "";`). That is
+   * the one case reproduced here — mirroring the browser's side effect of
+   * actually detaching the existing children — rather than a general HTML
+   * parser.
+   */
+  public get innerHTML(): string {
+    return this.innerHTMLValue;
+  }
+
+  public set innerHTML(value: string) {
+    this.innerHTMLValue = value;
+    if (value === "") {
+      for (const child of this.children) {
+        child.parentElement = undefined;
+      }
+      this.children.length = 0;
+    }
+  }
+
+  /**
+   * Additive: existing callers all use `classList.add`/`.remove`/`.toggle`,
+   * which already mutate `classes` directly. This exists because
+   * `renderRulesList()`'s `row.className = "rule-row" + (...)` — a plain DOM
+   * `className` assignment — needs the same Set to back it, or `classList`
+   * silently disagrees with what `className` was just set to.
+   */
+  public get className(): string {
+    return Array.from(this.classes).join(" ");
+  }
+
+  public set className(value: string) {
+    this.classes.clear();
+    for (const cls of value.split(/\s+/).filter(Boolean)) {
+      this.classes.add(cls);
+    }
   }
 
   public get classList(): {
@@ -113,6 +156,9 @@ class StubElement {
     return null;
   }
 
+  /** No-op: nothing here asserts on focus, only that calling it doesn't throw. */
+  public focus(): void {}
+
   public addEventListener(type: string, listener: DomListener): void {
     const existing = this.listeners.get(type) ?? [];
     existing.push(listener);
@@ -122,6 +168,26 @@ class StubElement {
   public dispatch(type: string): void {
     for (const listener of this.listeners.get(type) ?? []) {
       listener();
+    }
+  }
+
+  /**
+   * Fires `type` starting at this element and bubbling up through
+   * `parentElement` ancestors, invoking each ancestor's OWN listeners for
+   * `type` with an event object whose `target` is this element — the shape a
+   * delegated handler (`list.addEventListener("click", e => e.target.closest(...))`)
+   * needs. Purely additive alongside `dispatch()` above: existing callers that
+   * add a listener directly to the element they trigger (and ignore the event
+   * argument) are unaffected.
+   */
+  public bubble(type: string): void {
+    const event: DomEvent = { target: this, preventDefault: () => {} };
+    let node: StubElement | undefined = this;
+    while (node) {
+      for (const listener of node.listeners.get(type) ?? []) {
+        listener(event);
+      }
+      node = node.parentElement;
     }
   }
 

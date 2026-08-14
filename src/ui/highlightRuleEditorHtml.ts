@@ -60,6 +60,25 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .rule-label {
+      font-family: var(--vscode-font-family, sans-serif);
+      font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .rule-pattern-secondary {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-left: 6px;
+    }
+    .rule-row.rule-disabled .rule-pattern,
+    .rule-row.rule-disabled .rule-label,
+    .rule-row.rule-disabled .rule-pattern-secondary,
+    .rule-row.rule-disabled .rule-color-swatch {
+      opacity: 0.5;
+    }
     .rule-color-swatch {
       display: inline-block;
       width: 16px;
@@ -153,7 +172,7 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
       font-size: 12px;
     }`,
     body: `  <h3>Highlighting Rules</h3>
-  <div class="setting-desc">Rules use first-match precedence. Move specific rules above broader rules.</div>
+  <div class="setting-desc">Rules use first-match precedence. Move specific rules above broader rules. Untick a rule to keep it but stop applying it.</div>
 
   <div id="rules-list"></div>
   <div id="rules-empty-state" class="rules-empty-state">No highlighting rules defined.</div>
@@ -169,6 +188,16 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
 
   <div class="editor-section" id="editor-section">
     <h4 id="editor-title">Edit Rule</h4>
+
+    <div class="form-group">
+      <label for="edit-label">Label (optional)</label>
+      <input type="text" id="edit-label" maxlength="100" placeholder="e.g. Critical / fatal errors" />
+    </div>
+
+    <div class="form-group">
+      <label for="edit-description">Description (optional)</label>
+      <input type="text" id="edit-description" maxlength="500" placeholder="What this rule matches and why" />
+    </div>
 
     <div class="form-group">
       <label for="edit-pattern">Pattern (regex)</label>
@@ -238,19 +267,49 @@ DEBUG: packet sent 1024 bytes</div>
         applyBtn.disabled = !value;
       }
 
+      // Dirty is derived from actual content, not "something happened" — so
+      // reordering back to the original order, or unticking a checkbox and
+      // re-ticking it, clears the flag (and disables Apply) again instead of
+      // sticking dirty on any touch.
+      function recomputeDirty() {
+        setDirty(JSON.stringify(rules) !== JSON.stringify(originalRules));
+      }
+
       function renderRulesList() {
         var list = document.getElementById("rules-list");
         list.innerHTML = "";
         document.getElementById("rules-empty-state").style.display = rules.length === 0 ? "" : "none";
         for (var i = 0; i < rules.length; i++) {
           var r = rules[i];
+          var isEnabled = r.enabled !== false;
           var row = document.createElement("div");
-          row.className = "rule-row";
+          row.className = "rule-row" + (isEnabled ? "" : " rule-disabled");
           row.dataset.index = String(i);
+
+          var enabledCb = document.createElement("input");
+          enabledCb.type = "checkbox";
+          enabledCb.className = "rule-enabled-cb";
+          enabledCb.dataset.index = String(i);
+          enabledCb.checked = isEnabled;
+          enabledCb.title = isEnabled ? "Disable this rule" : "Enable this rule";
 
           var patSpan = document.createElement("span");
           patSpan.className = "rule-pattern";
-          patSpan.textContent = r.pattern;
+          // The description tooltip lives on this span, not the row — the row
+          // also contains the Up/Down/Edit/× buttons, and a row-wide title
+          // attribute covers them with the tooltip too, blocking their own
+          // titles (color swatch, checkbox) from showing.
+          if (r.description) patSpan.title = r.description;
+          if (r.label) {
+            patSpan.classList.add("rule-label");
+            patSpan.textContent = r.label;
+            var patSecondary = document.createElement("span");
+            patSecondary.className = "rule-pattern-secondary";
+            patSecondary.textContent = r.pattern;
+            patSpan.appendChild(patSecondary);
+          } else {
+            patSpan.textContent = r.pattern;
+          }
 
           var colorSwatch = document.createElement("span");
           colorSwatch.className = "rule-color-swatch";
@@ -290,6 +349,7 @@ DEBUG: packet sent 1024 bytes</div>
           delBtn.dataset.index = String(i);
           delBtn.textContent = "\\u00D7";
 
+          row.appendChild(enabledCb);
           row.appendChild(patSpan);
           row.appendChild(colorSwatch);
           row.appendChild(flagsSpan);
@@ -301,7 +361,25 @@ DEBUG: packet sent 1024 bytes</div>
         }
       }
 
+      document.getElementById("rules-list").addEventListener("change", function(e) {
+        var cb = e.target.closest(".rule-enabled-cb");
+        if (!cb) return;
+        var idx = parseInt(cb.dataset.index, 10);
+        var rule = rules[idx];
+        if (!rule) return;
+        if (cb.checked) {
+          delete rule.enabled;
+        } else {
+          rule.enabled = false;
+        }
+        renderRulesList();
+        recomputeDirty();
+      });
+
       document.getElementById("rules-list").addEventListener("click", function(e) {
+        if (e.target.closest(".rule-enabled-cb")) {
+          return;
+        }
         var editBtn = e.target.closest(".rule-edit-btn");
         if (editBtn) {
           openEditor(parseInt(editBtn.dataset.index, 10));
@@ -312,7 +390,7 @@ DEBUG: packet sent 1024 bytes</div>
           var idx = parseInt(delBtn.dataset.index, 10);
           rules.splice(idx, 1);
           renderRulesList();
-          setDirty(true);
+          recomputeDirty();
           if (editingIndex === idx) closeEditor();
           else if (editingIndex > idx) editingIndex--;
           return;
@@ -323,8 +401,15 @@ DEBUG: packet sent 1024 bytes</div>
           if (upIdx > 0) {
             var item = rules.splice(upIdx, 1)[0];
             rules.splice(upIdx - 1, 0, item);
+            // The item at upIdx swapped places with the item at upIdx-1 — keep
+            // editingIndex pointed at whichever rule it was tracking, not at
+            // whatever now happens to sit at the same array slot. Without this,
+            // Stage Rule after a reorder can overwrite the WRONG rule's slot
+            // (see the "moved index" regression in highlightRuleEditorHarness).
+            if (editingIndex === upIdx) editingIndex = upIdx - 1;
+            else if (editingIndex === upIdx - 1) editingIndex = upIdx;
             renderRulesList();
-            setDirty(true);
+            recomputeDirty();
           }
           return;
         }
@@ -334,8 +419,11 @@ DEBUG: packet sent 1024 bytes</div>
           if (downIdx >= 0 && downIdx < rules.length - 1) {
             var item2 = rules.splice(downIdx, 1)[0];
             rules.splice(downIdx + 1, 0, item2);
+            // Mirror of the Up case above.
+            if (editingIndex === downIdx) editingIndex = downIdx + 1;
+            else if (editingIndex === downIdx + 1) editingIndex = downIdx;
             renderRulesList();
-            setDirty(true);
+            recomputeDirty();
           }
         }
       });
@@ -378,14 +466,21 @@ DEBUG: packet sent 1024 bytes</div>
         var rule = { pattern: pattern, color: color, flags: flags };
         if (document.getElementById("edit-bold").checked) rule.bold = true;
         if (document.getElementById("edit-underline").checked) rule.underline = true;
+        var label = document.getElementById("edit-label").value.trim();
+        if (label) rule.label = label;
+        var description = document.getElementById("edit-description").value.trim();
+        if (description) rule.description = description;
 
         if (editingIndex >= 0 && editingIndex < rules.length) {
+          // Row checkbox owns enabled state — the form has no control for it, so
+          // carry over whatever the rule being edited already had.
+          if (rules[editingIndex].enabled === false) rule.enabled = false;
           rules[editingIndex] = rule;
         } else {
           rules.push(rule);
         }
         renderRulesList();
-        setDirty(true);
+        recomputeDirty();
         closeEditor();
       });
 
@@ -397,7 +492,7 @@ DEBUG: packet sent 1024 bytes</div>
         if (editingIndex >= 0 && editingIndex < rules.length) {
           rules.splice(editingIndex, 1);
           renderRulesList();
-          setDirty(true);
+          recomputeDirty();
           closeEditor();
         }
       });
@@ -525,6 +620,8 @@ DEBUG: packet sent 1024 bytes</div>
         if (index >= 0 && index < rules.length) {
           var r = rules[index];
           title.textContent = "Edit Rule " + (index + 1);
+          document.getElementById("edit-label").value = r.label || "";
+          document.getElementById("edit-description").value = r.description || "";
           patternInput.value = r.pattern;
           var f = r.flags || "gi";
           flagG.checked = f.indexOf("g") !== -1;
@@ -536,6 +633,8 @@ DEBUG: packet sent 1024 bytes</div>
           deleteBtn.style.display = "";
         } else {
           title.textContent = "Add New Rule";
+          document.getElementById("edit-label").value = "";
+          document.getElementById("edit-description").value = "";
           patternInput.value = "";
           flagG.checked = true;
           flagI.checked = true;

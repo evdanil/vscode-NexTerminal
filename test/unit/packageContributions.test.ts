@@ -794,7 +794,7 @@ describe("package contributions", () => {
   });
 });
 
-describe("terminal output performance defaults (2.8.181)", () => {
+describe("terminal output performance defaults", () => {
   const props = packageJson.contributes.configuration?.properties ?? {};
 
   describe("nexus.logging.terminalOutputTrace", () => {
@@ -828,17 +828,44 @@ describe("terminal output performance defaults (2.8.181)", () => {
     const defaultRules = (props["nexus.terminal.highlighting.rules"].default ?? []) as Array<{
       pattern: string;
       color: string;
+      flags?: string;
+      label?: string;
+      description?: string;
+      enabled?: boolean;
     }>;
 
+    // Enabled-only view — mirrors what TerminalHighlighter.reload() actually
+    // compiles (it skips rule.enabled === false before compiling). Using this
+    // for the "still off by default" assertions means the test fails if
+    // someone flips IPv6/UUID back to enabled by accident.
     function highlights(sample: string): boolean {
+      return defaultRules
+        .filter((rule) => rule.enabled !== false)
+        .some((rule) => new RegExp(rule.pattern, rule.flags ?? "gi").test(sample));
+    }
+
+    // Includes disabled rules — used to prove the shipped-but-off patterns
+    // still actually work, not merely that they're inert.
+    function highlightsIncludingDisabled(sample: string): boolean {
       return defaultRules.some((rule) => new RegExp(rule.pattern, rule.flags ?? "gi").test(sample));
     }
 
-    it("no longer ships the IPv6 or the UUID rule — the two most expensive patterns", () => {
-      expect(defaultRules.some((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"))).toBe(false);
-      expect(defaultRules.some((rule) => rule.pattern.includes("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}"))).toBe(false);
+    it("ships the IPv6 and UUID rules disabled by default — the two most expensive patterns", () => {
+      const ipv6Rule = defaultRules.find((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"));
+      const uuidRule = defaultRules.find((rule) => rule.pattern.includes("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}"));
+      expect(ipv6Rule).toBeDefined();
+      expect(uuidRule).toBeDefined();
+      expect(ipv6Rule?.enabled).toBe(false);
+      expect(uuidRule?.enabled).toBe(false);
+
+      // Enabled-only view (what actually compiles): both stay dark.
       expect(highlights("2001:0db8:85a3:0000:0000:8a2e:0370:7334")).toBe(false);
       expect(highlights("3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toBe(false);
+
+      // Including the disabled rules: both patterns still actually match —
+      // guards against shipping a broken pattern behind the disabled flag.
+      expect(highlightsIncludingDisabled("2001:0db8:85a3:0000:0000:8a2e:0370:7334")).toBe(true);
+      expect(highlightsIncludingDisabled("3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toBe(true);
     });
 
     it("keeps every other default rule, including IPv4 and MAC addresses", () => {
@@ -848,10 +875,33 @@ describe("terminal output performance defaults (2.8.181)", () => {
       expect(highlights("https://example.com")).toBe(true);
     });
 
-    it("tells the user how to add the two rules back", () => {
+    it("gives every default rule a non-empty label and description within the length caps", () => {
+      expect(defaultRules.length).toBeGreaterThan(0);
+      for (const rule of defaultRules) {
+        expect(rule.label, `label for pattern ${rule.pattern}`).toBeTruthy();
+        expect(rule.label!.length).toBeGreaterThan(0);
+        expect(rule.label!.length).toBeLessThanOrEqual(100);
+        expect(rule.description, `description for pattern ${rule.pattern}`).toBeTruthy();
+        expect(rule.description!.length).toBeGreaterThan(0);
+        expect(rule.description!.length).toBeLessThanOrEqual(500);
+      }
+    });
+
+    it("tells the user the IPv6 and UUID rules ship disabled, without instructing users to paste the regex", () => {
       const description: string = props["nexus.terminal.highlighting.rules"].markdownDescription;
-      expect(description).toContain("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}");
       expect(description).toMatch(/IPv6/);
+      expect(description).toMatch(/UUID/);
+      expect(description).toMatch(/disabled/i);
+      // The old copy told users to paste this literal UUID pattern into a new
+      // rule; that instruction (and the pattern literal) should be gone now
+      // that the rule ships in place, just switched off.
+      expect(description).not.toContain("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}");
+    });
+
+    it("passes every default rule through validateAndSanitizeHighlightRulesWithError", async () => {
+      const { validateAndSanitizeHighlightRulesWithError } = await import("../../src/utils/highlightRuleValidation");
+      const result = validateAndSanitizeHighlightRulesWithError(defaultRules);
+      expect(result.ok).toBe(true);
     });
   });
 });

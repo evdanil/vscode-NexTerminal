@@ -371,6 +371,9 @@ export class TerminalHighlighter {
     this.rules = [];
     for (const rule of rules) {
       if (!rule.pattern || !rule.color) { continue; }
+      // enabled === false means the rule stays in the persisted list but is not
+      // applied — absent/true is the enabled default.
+      if (rule.enabled === false) { continue; }
       const compiled = compileRule(rule);
       if (compiled) {
         this.rules.push(compiled);
@@ -380,12 +383,15 @@ export class TerminalHighlighter {
 
   /**
    * True when `apply()` can actually change its input — the setting is on AND
-   * at least one rule compiled. Callers use this to decide whether output needs
-   * to go through the buffering `TerminalHighlighterStream` at all: when it is
-   * false the stream would spend a full flush period holding text it is going
-   * to hand back unmodified, which is pure added latency (see
-   * `PtyObserverHub.notifyOutput`). Re-read after every `reload()` — the setting
-   * is live and this must never be cached across a config change.
+   * at least one *enabled* rule compiled (`reload()` drops `enabled: false`
+   * rules before compiling, so a config with only disabled rules leaves
+   * `this.rules` empty and this returns false with no special-casing here).
+   * Callers use this to decide whether output needs to go through the
+   * buffering `TerminalHighlighterStream` at all: when it is false the stream
+   * would spend a full flush period holding text it is going to hand back
+   * unmodified, which is pure added latency (see `PtyObserverHub.notifyOutput`).
+   * Re-read after every `reload()` — the setting is live and this must never
+   * be cached across a config change.
    */
   public isEnabled(): boolean {
     return this.enabled && this.rules.length > 0;
