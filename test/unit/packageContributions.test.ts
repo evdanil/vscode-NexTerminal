@@ -868,6 +868,46 @@ describe("terminal output performance defaults", () => {
       expect(highlightsIncludingDisabled("3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toBe(true);
     });
 
+    describe("IPv6 pattern coverage (trailing compression, PR #72)", () => {
+      const ipv6Rule = defaultRules.find((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"))!;
+
+      it("is defined", () => {
+        expect(ipv6Rule).toBeDefined();
+      });
+
+      it("matches addresses whose compression reaches the end (fe80::, 2001:db8::), plus ::1 and a full form", () => {
+        // Fails against the old three-alternative pattern — every alternative
+        // there requires a hex group after the final "::", so a trailing-
+        // compressed address like "fe80::" or "2001:db8::" matched nothing.
+        expect(highlightsIncludingDisabled("fe80::")).toBe(true);
+        expect(highlightsIncludingDisabled("2001:db8::")).toBe(true);
+        expect(highlightsIncludingDisabled("::1")).toBe(true);
+        expect(highlightsIncludingDisabled("2001:0db8:85a3:0000:0000:8a2e:0370:7334")).toBe(true);
+      });
+
+      it("matches a mixed compressed+trailing address (2001:db8::1) in full, not truncated at the ::", () => {
+        // The new trailing-compression alternative is appended LAST in the
+        // alternation, so a complete form like "2001:db8::1" must still be
+        // consumed whole by an earlier alternative rather than stopping short
+        // at "2001:db8::" via the new one.
+        const re = new RegExp(ipv6Rule.pattern, ipv6Rule.flags ?? "g");
+        const match = re.exec("2001:db8::1");
+        expect(match).not.toBeNull();
+        expect(match![0]).toBe("2001:db8::1");
+      });
+
+      it("does NOT match the bare all-zeros :: (a C++/Ruby scope operator in real terminal output) or std::map", () => {
+        expect(highlightsIncludingDisabled("::")).toBe(false);
+        expect(highlightsIncludingDisabled("std::map")).toBe(false);
+      });
+
+      it("stays dark in the enabled-only view for every positive IPv6 sample (rule ships disabled)", () => {
+        for (const sample of ["fe80::", "2001:db8::", "::1", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", "2001:db8::1"]) {
+          expect(highlights(sample), sample).toBe(false);
+        }
+      });
+    });
+
     it("keeps every other default rule, including IPv4 and MAC addresses", () => {
       expect(highlights("10.0.0.1")).toBe(true);
       expect(highlights("aa:bb:cc:dd:ee:ff")).toBe(true);

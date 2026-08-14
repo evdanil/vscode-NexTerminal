@@ -3454,11 +3454,11 @@
               "description": "IPv4 addresses, optionally with a /prefix (e.g. 10.0.0.1/24), magenta."
             },
             {
-              "pattern": "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b",
+              "pattern": "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:(?!:)",
               "color": "magenta",
               "flags": "g",
               "label": "IPv6 addresses",
-              "description": "IPv6 addresses (full and compressed forms). Disabled by default — this is one of the two most expensive built-in patterns, since it has to be tried at nearly every character. Enable it from the Highlighting Rules editor if you want it.",
+              "description": "IPv6 addresses, full and compressed (including trailing-compressed forms like fe80:: or 2001:db8::), except the bare all-zeros \"::\" — a lone :: in terminal output is overwhelmingly a C++/Ruby scope operator. Disabled by default — this is one of the two most expensive built-in patterns, since it has to be tried at nearly every character. Enable it from the Highlighting Rules editor if you want it.",
               "enabled": false
             },
             {
