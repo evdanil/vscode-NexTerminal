@@ -4892,8 +4892,38 @@ DEBUG: packet sent 1024 bytes</div>
       // reordering back to the original order, or unticking a checkbox and
       // re-ticking it, clears the flag (and disables Apply) again instead of
       // sticking dirty on any touch.
+      //
+      // Compares NORMALIZED rules, not the raw arrays: the checkbox handler
+      // deletes the enabled field when ticking a rule back on (see the
+      // "change" listener below) so the saved payload stays clean, but a
+      // rule saved with an explicit enabled: true (e.g. a hand-written or
+      // imported settings.json) never had the key removed in the first
+      // place. Diffing the raw JSON would then see "no enabled key" vs.
+      // "enabled: true" as a real difference and stay dirty forever after an
+      // untick/retick that changed nothing semantically. Normalizing both
+      // sides so enabled: true and "absent" collapse to the same shape fixes
+      // the comparison without touching what actually gets saved (stageRule
+      // / the checkbox handler still omit the key on enable).
+      function normalizeRulesForCompare(list) {
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+          var copy = {};
+          for (var key in list[i]) {
+            if (Object.prototype.hasOwnProperty.call(list[i], key)) {
+              copy[key] = list[i][key];
+            }
+          }
+          if (copy.enabled === true) {
+            delete copy.enabled;
+          }
+          out.push(copy);
+        }
+        return out;
+      }
+
       function recomputeDirty() {
-        setDirty(JSON.stringify(rules) !== JSON.stringify(originalRules));
+        var changed = JSON.stringify(normalizeRulesForCompare(rules)) !== JSON.stringify(normalizeRulesForCompare(originalRules));
+        setDirty(changed);
       }
 
       function renderRulesList() {

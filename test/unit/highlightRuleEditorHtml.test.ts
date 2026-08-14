@@ -125,6 +125,23 @@ describe("highlight rule editor — behavioral (rendered script against a stub D
     expect(h.isDirty()).toBe(false);
   });
 
+  it("clears dirty after untick/retick even when the rule was stored with an explicit enabled: true", () => {
+    // The checkbox handler deletes `enabled` when re-ticking (so the saved
+    // payload stays clean), but a rule imported/hand-written with an
+    // explicit `enabled: true` never had that key removed to begin with. A
+    // dirty check that diffs raw JSON sees "no key" vs. "enabled: true" as a
+    // real difference and never clears — this fails against that unfixed
+    // comparison.
+    const h = openHighlightRuleEditor([{ pattern: "\\bERROR\\b", color: "red", enabled: true }]);
+    expect(h.isDirty()).toBe(false);
+
+    h.toggleEnabled(0);
+    expect(h.isDirty()).toBe(true);
+
+    h.toggleEnabled(0);
+    expect(h.isDirty()).toBe(false);
+  });
+
   it("REGRESSION (stale editingIndex on reorder): editing B then moving C above it must edit B's slot, leave C intact, and not cross-contaminate the enabled flag", () => {
     // Reproduces the exact defect: with rules [A, B, C(enabled:false)],
     // open the editor on B, move C above it, then Stage Rule. Against the
