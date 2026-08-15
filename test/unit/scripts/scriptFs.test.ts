@@ -189,9 +189,19 @@ async function makeCtx(overrides?: Partial<ScriptFsContext>): Promise<{ ctx: Scr
     scriptDirUri: fileUri(scriptDir),
     scriptsRootUri: fileUri(root),
     log,
+    isAborted: () => false,
     ...overrides
   };
   return { ctx, root, scriptDir, log };
+}
+
+/** Polls `predicate` until true or `timeoutMs` elapses (rejects on timeout). */
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("waitFor: timed out");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -315,7 +325,8 @@ describe("scriptFsReadText — size cap (non-file scheme, best-effort — P1)", 
       scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
       scriptDirUri: remoteUri(authority, scriptDirPath),
       scriptsRootUri: undefined,
-      log: vi.fn()
+      log: vi.fn(),
+      isAborted: () => false
     };
 
     await expect(scriptFsReadText("lies.bin", ctx)).rejects.toMatchObject({ code: "FileTooLarge" });
@@ -557,6 +568,135 @@ describe("scriptFsReadText — global concurrency gate (P1: bounds host-side tra
   }, 10_000);
 });
 
+describe("scriptFsReadText — aborting the run drains its queued reads off the GLOBAL semaphore (P1: no starvation of other sessions)", () => {
+  it("reads still queued when the run ends never open the file, all settle (rejected Stopped), and the semaphore is left fully drained for a fresh, unrelated read", async () => {
+    // ⊘ a `scriptFsReadText` with no `isAborted()` check after `acquire()` at
+    // all — every one of the 6 reads still queued when the run "ends" below
+    // would, one by one as slots free up, still open and read its file, log
+    // a normal audit line, and try to post a result to a dead worker: this is
+    // the starvation this fix exists to prevent. The assertion that actually
+    // discriminates is `nodeOpenSpy` staying at exactly
+    // SCRIPT_FS_MAX_CONCURRENT_READS — WITHOUT the fix it climbs to 10.
+    const { ctx, scriptDir } = await makeCtx();
+    const n = 10;
+    for (let i = 0; i < n; i++) {
+      await fsp.writeFile(path.join(scriptDir, `q${i}.txt`), `content-${i}`);
+    }
+
+    let aborted = false;
+    const abortableCtx: ScriptFsContext = { ...ctx, isAborted: () => aborted };
+
+    // Deferred opens: each call gets its own resolver, so the test controls
+    // exactly when each ADMITTED read's I/O completes instead of racing
+    // timers — the "release the in-flight ones" step needs to be explicit
+    // and deterministic, not a fixed delay.
+    const openWaiters: Array<() => void> = [];
+    nodeOpenSpy.mockImplementation(async (...args: Parameters<typeof realNodeOpen>) => {
+      await new Promise<void>((resolve) => openWaiters.push(resolve));
+      return realNodeOpen(...args);
+    });
+
+    try {
+      const promises = Array.from({ length: n }, (_, i) => scriptFsReadText(`q${i}.txt`, abortableCtx));
+
+      // Let exactly SCRIPT_FS_MAX_CONCURRENT_READS reads acquire the
+      // semaphore and reach `open()` — the other 6 are still queued on it.
+      await waitFor(() => nodeOpenSpy.mock.calls.length >= SCRIPT_FS_MAX_CONCURRENT_READS);
+      expect(nodeOpenSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
+      expect(openWaiters).toHaveLength(SCRIPT_FS_MAX_CONCURRENT_READS);
+
+      // The run ends here — while 6 reads are still parked on the semaphore.
+      aborted = true;
+
+      // Now let the SCRIPT_FS_MAX_CONCURRENT_READS in-flight opens finish.
+      // As each releases its slot, the queued reads get admitted in turn —
+      // and each must see `isAborted()` immediately and bail before ever
+      // reaching `open()`.
+      openWaiters.forEach((resolve) => resolve());
+
+      const results = await Promise.all(promises.map((p) => p.catch((e: unknown) => e)));
+      expect(results).toHaveLength(n);
+
+      // The 4 already in flight before the abort complete normally (a
+      // preemptive design isn't what's being asked for — only QUEUED reads
+      // are skipped); the 6 that were still queued reject Stopped.
+      const succeeded = results.filter((r) => typeof r === "string");
+      const stopped = results.filter((r): r is Error & { code?: string } => r instanceof Error);
+      expect(succeeded).toHaveLength(SCRIPT_FS_MAX_CONCURRENT_READS);
+      expect(stopped).toHaveLength(n - SCRIPT_FS_MAX_CONCURRENT_READS);
+      for (const err of stopped) {
+        expect(err.code).toBe("Stopped");
+      }
+
+      // The discriminating assertion: open() was NEVER called for the 6
+      // skipped reads — the count stays exactly where it was before the
+      // abort, it does not climb toward 10.
+      expect(nodeOpenSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
+    } finally {
+      // Restore BEFORE the starvation check below — it does its own real
+      // open() and must not hang on a deferred resolver nothing will ever call.
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+    }
+
+    // Starvation check: the semaphore is fully drained (back to its full
+    // limit) — a FRESH read from a NON-aborted context proceeds immediately,
+    // not stuck behind anything left over from the dead run.
+    const freshStart = Date.now();
+    const freshText = await scriptFsReadText("q0.txt", ctx); // ctx: isAborted() => false
+    expect(freshText).toBe("content-0");
+    expect(Date.now() - freshStart).toBeLessThan(500);
+  }, 10_000);
+
+  it("the cheap pre-acquire early-out: an aborted call started while the semaphore is fully occupied settles immediately, without waiting in the FIFO queue", async () => {
+    // ⊘ removing the `isAborted()` check BEFORE `acquire()` specifically: the
+    // AFTER-acquire check alone would still eventually catch this call, but
+    // only once it reached the front of the semaphore's FIFO queue — i.e.
+    // only after waiting behind however long the busy reads below take. WITH
+    // the early-out, it settles near-instantly regardless of how busy the
+    // semaphore is, because it never calls `acquire()` at all.
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `busy${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "already-dead.txt"), "irrelevant");
+
+    const openWaiters: Array<() => void> = [];
+    nodeOpenSpy.mockImplementation(async (...args: Parameters<typeof realNodeOpen>) => {
+      await new Promise<void>((resolve) => openWaiters.push(resolve));
+      return realNodeOpen(...args);
+    });
+
+    try {
+      // Occupy every slot with slow reads that won't complete until told to.
+      const busyPromises = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
+        scriptFsReadText(`busy${i}.txt`, ctx)
+      );
+      await waitFor(() => nodeOpenSpy.mock.calls.length >= SCRIPT_FS_MAX_CONCURRENT_READS);
+
+      // The semaphore has zero free slots. Issue the aborted call now.
+      const deadCtx: ScriptFsContext = { ...ctx, isAborted: () => true };
+      const start = Date.now();
+      await expect(scriptFsReadText("already-dead.txt", deadCtx)).rejects.toMatchObject({ code: "Stopped" });
+      expect(Date.now() - start).toBeLessThan(100);
+
+      openWaiters.forEach((resolve) => resolve());
+      await Promise.all(busyPromises);
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+    }
+  });
+
+  it("scriptFsExists also gets the cheap pre-check — an aborted context's exists() probe throws Stopped without stat'ing anything", async () => {
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "already-dead.txt"), "irrelevant");
+    const deadCtx: ScriptFsContext = { ...ctx, isAborted: () => true };
+
+    statSpy.mockClear();
+    await expect(scriptFsExists("already-dead.txt", deadCtx)).rejects.toMatchObject({ code: "Stopped" });
+    expect(statSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe("scriptFsReadText — non-regular files are rejected before ANY read (file: scheme, P1)", () => {
   it.skipIf(process.platform === "win32")(
     "rejects a FIFO (named pipe) as not-a-regular-file, quickly and without ever opening it — opening a FIFO with no writer would hang forever",
@@ -675,7 +815,8 @@ describe("scriptFsReadText — real symlink follow (decision 3)", () => {
         scriptUri: fileUri(path.join(scriptDir, "probe.js")),
         scriptDirUri: fileUri(scriptDir),
         scriptsRootUri: fileUri(path.join(root, "scripts")),
-        log: vi.fn()
+        log: vi.fn(),
+        isAborted: () => false
       };
 
       const text = await scriptFsReadText("linked/secret.txt", ctx);
@@ -844,7 +985,8 @@ describe("remote (non-file) scheme — backslash traversal guard", () => {
       scriptUri: remoteUri("wsl+ubuntu", "/home/u/scripts/cisco/probe.js"),
       scriptDirUri: remoteUri("wsl+ubuntu", "/home/u/scripts/cisco"),
       scriptsRootUri: undefined,
-      log: vi.fn()
+      log: vi.fn(),
+      isAborted: () => false
     };
 
     await expect(scriptFsReadText("..\\..\\..\\etc\\passwd", ctx)).rejects.toMatchObject({ code: "InvalidPath" });
@@ -880,7 +1022,8 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
       scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
       scriptDirUri: remoteUri(authority, scriptDirPath),
       scriptsRootUri: undefined,
-      log: vi.fn()
+      log: vi.fn(),
+      isAborted: () => false
     };
 
     const text = await scriptFsReadText("data.txt", ctx);
@@ -896,7 +1039,8 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
       scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
       scriptDirUri: remoteUri(authority, scriptDirPath),
       scriptsRootUri: undefined,
-      log: vi.fn()
+      log: vi.fn(),
+      isAborted: () => false
     };
 
     expect(await scriptFsExists("present.txt", ctx)).toBe(true);

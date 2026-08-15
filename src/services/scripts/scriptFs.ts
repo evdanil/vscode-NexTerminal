@@ -68,6 +68,24 @@ export interface ScriptFsContext {
   scriptsRootUri: vscode.Uri | undefined;
   /** Record-bound `logEvent` closure — lines get the usual `[hh:mm:ss.sss] Script@Session` prefix. */
   log: (text: string) => void;
+  /**
+   * True once the run this call belongs to has ended (any final state —
+   * completed, failed, connection-lost, stopped). Backed by
+   * `scriptRuntimeManager.ts`'s own run-cleanup idempotency flag, so it flips
+   * the instant `cleanupRun` runs — no separate bookkeeping to keep in sync.
+   *
+   * Exists because `SCRIPT_FS_MAX_CONCURRENT_READS`'s semaphore is GLOBAL
+   * (shared across every run, by design — see its doc comment): a burst of
+   * reads queued on it by a script that then gets stopped would otherwise sit
+   * parked past the run's death, and as slots freed up each one would still
+   * perform its I/O, write audit lines for a run nobody's watching anymore,
+   * and post a result to a worker that's already gone — starving `nexus.fs`
+   * for OTHER, unrelated, still-running sessions for as long as the dead
+   * run's backlog takes to drain. `scriptFsReadText` checks this before
+   * queueing at all, and again the instant a slot is granted, so an aborted
+   * run's queued reads skip their I/O entirely instead of draining slowly.
+   */
+  isAborted: () => boolean;
 }
 
 /**
@@ -250,6 +268,13 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   // once several scripts are involved) raw requested value.
   const loggedPath = resolution.resolvedPath;
 
+  // Cheap early-out: the run already ended (this call didn't even reach the
+  // semaphore yet) — don't bother queueing behind slow reads for a session
+  // nobody's watching anymore.
+  if (ctx.isAborted()) {
+    throw makeAbortedError(ctx, "readText", loggedPath);
+  }
+
   // Gate the actual read (both branches — the non-file branch materializes
   // up to the cap via workspace.fs.readFile too) on the global concurrency
   // semaphore. Everything above this point is pure validation — no I/O, no
@@ -259,6 +284,18 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   // `fs.readText` RPC call, so it never nests a second acquire inside this
   // one — verified: there is no other gated call anywhere in this module.
   await readSemaphore.acquire();
+  // Check AGAIN, immediately: this is the case the early-out above can't
+  // catch — the run was alive when this call queued, but died while it sat
+  // parked on the semaphore (the module-global semaphore doesn't know or
+  // care about individual runs). Release in the SAME tick, before any I/O —
+  // an admitted-but-now-orphaned read must never perform its read, write the
+  // normal audit line, or try to post its result to a worker that's already
+  // gone (dispatchRpc's `postMessage` tolerates that fine, but there's no
+  // reason to do the work at all).
+  if (ctx.isAborted()) {
+    readSemaphore.release();
+    throw makeAbortedError(ctx, "readText", loggedPath);
+  }
   try {
     if (ctx.scriptUri.scheme === "file") {
       return await readLocalFileBounded(resolution.resolvedPath, loggedPath, ctx);
@@ -455,6 +492,12 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
     );
   }
 
+  // Not gated (no read hazard — see below), but cheap enough to skip anyway:
+  // no reason to stat and log on behalf of a run that's already ended.
+  if (ctx.isAborted()) {
+    throw makeAbortedError(ctx, "exists", resolution.resolvedPath);
+  }
+
   // No read hazard here — this is a plain existence probe, so `vscode.workspace.fs.stat`
   // (uniformly, for every scheme) is fine: no body is ever pulled into memory.
   const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
@@ -527,4 +570,21 @@ function fail(
 ): Error {
   ctx.log(`fs.${method} ${loggedPath} → ${code}`);
   return makeFsError(code, message, extra);
+}
+
+/**
+ * The call's run has already ended (`ctx.isAborted()`) — skip it. `"Stopped"`
+ * is not one of `nexus.fs`'s own codes (`ScriptFsErrorCode`); it's the same
+ * general RPC vocabulary `scriptRuntimeManager.ts` already uses for a
+ * user-requested stop (`rejectAllPending`) and is already in
+ * `EXPECTED_ERROR_CODES` there — cooperative control flow, no crash toast.
+ * Deliberately does NOT call `fail()`: this is not a normal refusal (no
+ * `InvalidPath`/`FileTooLarge`/... classification applies), and the caller's
+ * run is already gone, so the usual per-call audit line would just be noise
+ * about a session nobody's watching anymore — one distinct "skipped" line
+ * instead, not the normal read/refusal line shape.
+ */
+function makeAbortedError(ctx: ScriptFsContext, method: "readText" | "exists", loggedPath: string): Error {
+  ctx.log(`fs.${method} ${loggedPath} → skipped (run stopped)`);
+  return Object.assign(new Error("Script stopped — file operation skipped"), { code: "Stopped" });
 }

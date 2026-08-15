@@ -401,7 +401,13 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       scriptUri: record.scriptUri,
       scriptDirUri: record.scriptDirUri,
       scriptsRootUri: record.scriptsRootUri,
-      log: (text: string) => this.logEvent(record, text)
+      log: (text: string) => this.logEvent(record, text),
+      // `cleanedUp` is cleanupRun's own idempotency guard — flipped at the
+      // very top, before anything else about the run's teardown happens — so
+      // reusing it here (rather than a parallel flag) means nexus.fs sees
+      // "this run is over" at exactly the moment the manager itself would say
+      // so, with nothing new to keep in sync.
+      isAborted: () => record.cleanedUp
     };
   }
 

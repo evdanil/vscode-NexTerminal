@@ -663,6 +663,37 @@ describe("ScriptRuntimeManager — nexus.fs plumbing", () => {
     expect(result.error?.code).toBe("PathOutsideScope");
   });
 
+  it("fsContextFor's isAborted() tracks record.cleanedUp end to end: false while running, true for any fs call arriving after stopScript", async () => {
+    // ⊘ fsContextFor not wiring `isAborted` to `cleanedUp` (or wiring it to
+    // something that never flips) — a late RPC after stopScript would still
+    // succeed instead of surfacing the typed Stopped refusal scriptFs.ts's
+    // abort checks depend on.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    // While running: reads the script's own fixture file (always in its own
+    // scope), resolves normally.
+    h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: [h.scriptUri.fsPath] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 1));
+    const beforeStop = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 1
+    ) as { ok: boolean };
+    expect(beforeStop.ok).toBe(true);
+
+    await h.manager.stopScript("test-session");
+
+    // A late RPC "arriving" right after cleanup (the worker's message
+    // listener still holds its captured `record` reference even though the
+    // manager has already deregistered the run) sees isAborted() === true.
+    h.worker.emit({ kind: "rpc", id: 2, method: "fs.readText", args: [h.scriptUri.fsPath] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 2));
+    const afterStop = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 2
+    ) as { ok: boolean; error?: { code: string } };
+    expect(afterStop.ok).toBe(false);
+    expect(afterStop.error?.code).toBe("Stopped");
+  });
+
   it("fs.readText on a BigInt or a cyclic-object argument surfaces a typed InvalidPath rpc-result — not UnknownError — and logs the refusal", async () => {
     // ⊘ formatting the offending value with a bare JSON.stringify inside
     // scriptFsScope.ts / scriptFs.ts (instead of the non-throwing
