@@ -25,7 +25,7 @@
 export type PermitOutcome =
   /** The permit is the requester's; it now owes a `release()`. */
   | "granted"
-  /** `cancel()` won: the requester was unlinked before any permit reached it, and owes nothing. */
+  /** `cancel()` won: the requester was marked dead before any permit reached it, and owes nothing. */
   | "cancelled";
 
 /**
@@ -37,11 +37,14 @@ export interface PermitRequest {
   /** Settles exactly once, with whichever outcome won. */
   readonly promise: Promise<PermitOutcome>;
   /**
-   * Abandons the wait. True ⇒ the entry was still queued and is now unlinked:
-   * the promise settles `cancelled` and NOTHING of this request is retained.
-   * False ⇒ a `release()` already handed this request the permit (its
-   * resolution is an in-flight microtask), so the outcome is `granted` and the
-   * caller owes a `release()` — see invariant 6's forwarding.
+   * Abandons the wait. True ⇒ the entry was still waiting and is now dead: the
+   * promise settles `cancelled`, everything this request was holding on to is
+   * dropped, and the FIFO will never offer it a permit. False ⇒ either a
+   * `release()` already handed this request the permit (its resolution is an
+   * in-flight microtask), so the outcome is `granted` and the caller owes a
+   * `release()` — see invariant 6's forwarding — or this request was already
+   * cancelled. Either way there is nothing left to abandon and nothing is
+   * settled here.
    */
   cancel(): boolean;
 }
@@ -57,26 +60,68 @@ export interface PermitRequest {
  * state exit to pair the release with.
  *
  * `acquireCancellable()` is the same wait with an exit: a waiter that dies
- * before its turn (invariant 7) unlinks itself instead of leaving a resolver
- * nobody will ever call. `acquire()` is that request with the exit dropped,
- * for callers whose wait cannot be abandoned.
+ * before its turn (invariant 7) drops the resolver nobody will ever call
+ * instead of leaving it linked, and the inert entry that remains is compacted
+ * away in amortized O(1) (invariant 8). `acquire()` is that request with the
+ * exit dropped, for callers whose wait cannot be abandoned.
  */
 export interface Semaphore {
   acquire(): Promise<void>;
   acquireCancellable(): PermitRequest;
   release(): void;
-  /** Waiters still linked in the FIFO. Invariant 7's observable — dead waiters are not counted because they are not there. */
+  /** Waiters still waiting. Invariant 7's observable — dead entries are excluded, they are shells, not waiters. */
   queued(): number;
+  /** Invariant 8's observables: what the queue array is holding, and what maintaining it has cost. */
+  queueStats(): SemaphoreQueueStats;
 }
 
-/** A live waiter's slot in the FIFO. Identity, not index: the queue shifts under it. */
+/**
+ * The retention and cost observables of invariant 8. Nothing in the scheduler
+ * reads these — the amortization and the array bound are properties no
+ * caller-visible behaviour can distinguish (every scheme settles the same
+ * requests with the same outcomes in the same order), so this is the only seam
+ * a test can hold them to.
+ */
+export interface SemaphoreQueueStats {
+  /** Live waiters — the same number `queued()` reports. */
+  live: number;
+  /** Entries in the backing array: live waiters plus dead shells not yet compacted away. Bounded by `2 * live + 1`. */
+  capacity: number;
+  /** Compaction passes run so far. A halving series over the array, so log-many per fan-out, not one per cancellation. */
+  compactions: number;
+  /**
+   * Queue entries scanned or relocated on the CANCELLATION path, cumulatively —
+   * the unit the amortization claim is made in. Dequeueing is deliberately not
+   * counted: `shift()` is the engine's business (V8 left-trims it), and the
+   * release path is identical under every queue scheme, so counting it would
+   * add only noise common to all of them.
+   */
+  cancelWork: number;
+}
+
+/**
+ * A waiter's place in the FIFO. Identity, not index: the queue shifts under it.
+ *
+ * `settle` is the whole state machine of one waiter. Non-null ⇒ live and still
+ * owed an outcome. Null ⇒ settled and inert, by exactly one of the two paths
+ * that can settle it — `release()` (which also shifts it out) or `cancel()`
+ * (which leaves the now-empty shell behind for the next compaction). Nulling it
+ * is therefore three things at once: the arbiter of the cancel-vs-grant race,
+ * the mark that keeps a later `release()` from granting to a corpse, and the
+ * drop that releases the resolver — and through it the promise chain, the
+ * caller's slot, its label and every closure the wait captured.
+ */
 interface Waiter {
-  settle(outcome: PermitOutcome): void;
+  settle: ((outcome: PermitOutcome) => void) | null;
 }
 
 export function createSemaphore(limit: number): Semaphore {
   let available = limit;
   const queue: Waiter[] = [];
+  /** Shells currently in `queue` — cancelled waiters not yet compacted or walked past. */
+  let dead = 0;
+  let compactions = 0;
+  let cancelWork = 0;
 
   /**
    * Already-satisfied request: nothing was queued, so there is nothing to
@@ -85,8 +130,69 @@ export function createSemaphore(limit: number): Semaphore {
    */
   const immediate: PermitRequest = { promise: Promise.resolve<PermitOutcome>("granted"), cancel: () => false };
 
+  /** Rebuilds the queue from its live entries, in order. Stable: FIFO position survives it. */
+  const compact = (): void => {
+    const scanned = queue.length;
+    let write = 0;
+    for (let read = 0; read < scanned; read++) {
+      const waiter = queue[read];
+      if (waiter.settle !== null) queue[write++] = waiter;
+    }
+    queue.length = write;
+    dead = 0;
+    compactions++;
+    cancelWork += scanned;
+  };
+
+  /**
+   * MARK AND AMORTIZED-COMPACT, NOT SCAN-AND-SPLICE. Cancelling is O(1): the
+   * waiter is marked dead by nulling its resolver, which is also what drops
+   * everything the wait was holding on to, so what stays in the array is an
+   * inert one-field shell and nothing else — invariant 7 is a statement about
+   * BYTES retained, and it still holds in full.
+   *
+   * The shells themselves are then bounded by compacting HERE, on the
+   * cancellation path, rather than opportunistically from `release()`: the case
+   * that matters is a pool degraded to zero free permits, which by definition
+   * produces no releases to compact against, so a release-driven scheme would
+   * let the array grow without bound in precisely the situation it exists for.
+   * A pass runs when the shells come to outnumber the live waiters, which
+   * leaves two properties:
+   *
+   *  - the array never exceeds `2 * live + 1` entries, so retention stays
+   *    proportional to the LIVE waiters exactly as before, and
+   *  - the passes form a halving series, so N cancellations cost ~2N entry
+   *    moves in total — amortized O(1) each — against the ~N²/2 of scanning
+   *    for one's own entry and shifting the rest down. At the fan-out this
+   *    pool degrades into (tens of thousands of expiries against a dead
+   *    provider) that is the difference between a linear pass and seconds of
+   *    blocked extension host.
+   *
+   * The cost of the shells that a compaction does not catch is paid by
+   * `release()`, which walks past them; each walk retires one permanently, so
+   * it is charged to the cancellation that created it and adds nothing
+   * asymptotically.
+   */
+  const cancelWaiter = (waiter: Waiter): boolean => {
+    const settle = waiter.settle;
+    // Already null ⇒ this waiter has been settled: either `release()` shifted
+    // it and granted it (its resolution is an in-flight microtask) or it was
+    // cancelled before. Report "too late" rather than settling a second
+    // outcome — the mark, not presence in the array, is what arbitrates the
+    // race now that dead entries legitimately remain in it.
+    if (settle === null) return false;
+    // Mark first, settle second: from here on no `release()` can grant to this
+    // entry, and the promise is completed with the reference we already hold.
+    waiter.settle = null;
+    settle("cancelled");
+    dead++;
+    if (dead > queue.length - dead) compact();
+    return true;
+  };
+
   const semaphore: Semaphore = {
-    queued: () => queue.length,
+    queued: () => queue.length - dead,
+    queueStats: () => ({ live: queue.length - dead, capacity: queue.length, compactions, cancelWork }),
     acquire(): Promise<void> {
       // The uncancellable view of the same wait. It can only ever see
       // "granted": nothing but the returned handle can cancel a request, and
@@ -98,45 +204,40 @@ export function createSemaphore(limit: number): Semaphore {
         available--;
         return immediate;
       }
-      let settle!: (outcome: PermitOutcome) => void;
+      // Built inside the executor so the resolver has exactly one owner — the
+      // waiter — and nulling `settle` really is the last reference to it.
+      let waiter!: Waiter;
       const promise = new Promise<PermitOutcome>((resolve) => {
-        settle = resolve;
+        waiter = { settle: resolve };
       });
-      const waiter: Waiter = { settle };
       queue.push(waiter);
-      return {
-        promise,
-        cancel(): boolean {
-          const index = queue.indexOf(waiter);
-          // Absent ⇒ `release()` already shifted this waiter and its grant is
-          // an in-flight microtask. Report the loss rather than splicing at
-          // -1 (which would evict whichever waiter happens to be last) — and
-          // never settle here, so `granted` stays the request's one outcome.
-          if (index === -1) return false;
-          // SPLICE, NOT TOMBSTONE. A tombstone would leave the entry linked
-          // until some later `release()` walked past it, which is exactly the
-          // retention this exists to remove: in a fully degraded pool there
-          // are no releases, so the dead entries would pile up without bound
-          // and a permit that finally reopened would have to churn through
-          // every one of them. Unlinking makes retention provably zero for
-          // the cost of an O(queue) splice on a path that only runs when a
-          // wait is abandoned. Dropping the reference is also what lets the
-          // resolver, the promise and everything the waiter captured go.
-          queue.splice(index, 1);
-          settle("cancelled");
-          return true;
-        }
-      };
+      return { promise, cancel: () => cancelWaiter(waiter) };
     },
     release(): void {
-      const next = queue.shift();
       // Hand the slot straight to the next FIFO waiter rather than
       // incrementing `available` and letting it race a fresh `acquire()` —
-      // this is what makes queueing order (FIFO) actually meaningful. Every
-      // waiter still in the queue is live: a cancelled one unlinked itself,
-      // so this can never hand the permit to a corpse.
-      if (next) next.settle("granted");
-      else available++;
+      // this is what makes queueing order (FIFO) actually meaningful.
+      for (;;) {
+        const next = queue.shift();
+        if (next === undefined) {
+          available++;
+          return;
+        }
+        const settle = next.settle;
+        // A shell a compaction has not reached yet. Walking past it retires it
+        // for good (it is out of the array now), so this loop can only ever
+        // repeat as many times in total as there have been cancellations.
+        if (settle === null) {
+          dead--;
+          continue;
+        }
+        // Granted and settled in one synchronous step, so a `cancel()` racing
+        // this from the same tick finds the mark already set and correctly
+        // reports that the permit is the caller's.
+        next.settle = null;
+        settle("granted");
+        return;
+      }
     }
   };
   return semaphore;
@@ -225,7 +326,7 @@ export function createSemaphore(limit: number): Semaphore {
  *        machine — not a flag the two phases have to keep in sync — decides
  *        what the deadline means.
  *      - A GRANT MADE TO A DEAD SLOT IS FORWARDED, NEVER KEPT. An expiring slot
- *        normally unlinks itself from the FIFO (invariant 7), so it is not
+ *        normally marks itself dead in the FIFO (invariant 7), so it is not
  *        owed anything — but a `release()` that shifted it in the same tick
  *        the deadline fired gets there first, and that grant arrives with
  *        nobody left to use it. `claimPermit` checks the slot's state at the
@@ -237,18 +338,32 @@ export function createSemaphore(limit: number): Semaphore {
  *        still reachable, and still the only thing standing between that race
  *        and a permanently smaller pool.
  *
- *  7. AN EXPIRED CALL RETAINS NOTHING. A call that dies in the queue takes its
- *     place in the FIFO with it: `cancel()` unlinks the entry, which drops the
- *     resolver, the promise, the slot label and every closure the wait
- *     captured, and settles the wait so no continuation is left pending. This
- *     matters most exactly where it is hardest to see — a pool degraded to
- *     zero free permits expires EVERY later call, so a wait that could not be
- *     abandoned would retain one dead entry per call for the life of the host,
- *     and the permit that eventually reopened would have to be forwarded
- *     through every one of them before reaching a live caller. Retention is
- *     therefore bounded by the number of LIVE waiters; the only exception is
- *     the microtask-wide race window of invariant 6, where the entry is
- *     already out of the queue anyway and the grant is being handed on.
+ *  7. AN EXPIRED CALL RETAINS NOTHING. A call that dies in the queue lets go of
+ *     everything it was holding: `cancel()` settles the wait so no continuation
+ *     is left pending, and drops the resolver — and with it the promise chain,
+ *     the slot, its label and every closure the wait captured. What stays in
+ *     the FIFO is a one-field shell with a null in it, which the next
+ *     compaction (invariant 8) removes. This matters most exactly where it is
+ *     hardest to see — a pool degraded to zero free permits expires EVERY later
+ *     call, so a wait that could not be abandoned would retain one live entry
+ *     per call for the life of the host, and the permit that eventually
+ *     reopened would have to be forwarded through every one of them before
+ *     reaching a live caller. Retention is therefore bounded by the number of
+ *     LIVE waiters; the only exception is the microtask-wide race window of
+ *     invariant 6, where the entry has already been shifted out anyway and the
+ *     grant is being handed on.
+ *
+ *  8. ABANDONING A WAIT IS O(1), AMORTIZED. Invariant 7's dropping is not
+ *     allowed to cost a queue walk: the pool degrades all at once, so the
+ *     expiries arrive all at once too, and a scheme that scanned for its own
+ *     entry and shifted the rest down would turn a fan-out of N dead calls
+ *     into ~N²/2 element moves on the extension host's only thread. Marking is
+ *     O(1); the shells it leaves are bounded by compacting when they come to
+ *     outnumber the live waiters, which keeps the queue array under
+ *     `2 * live + 1` entries and costs ~2N moves for N cancellations — see
+ *     `createSemaphore` for why that compaction is triggered by cancellation
+ *     rather than by release. `queueStats()` is the observable; `queued()`
+ *     continues to report LIVE waiters only, because a shell is not a waiter.
  */
 type SlotState =
   | "queued"
@@ -406,7 +521,7 @@ export class ReadSlotScheduler {
         // microtask chain, and a timer callback is a macrotask, so the
         // deadline cannot land in between.)
         this.transition(slot, "expired");
-        // Then leave the FIFO, so this call retains nothing (invariant 7).
+        // Then abandon the wait, so this call retains nothing (invariant 7).
         // The transition comes FIRST: if `cancel()` reports the grant already
         // in flight, `claimPermit` needs to see the slot's real state to know
         // it must forward rather than admit (invariant 6).
@@ -472,13 +587,13 @@ export class ReadSlotScheduler {
    * rather than being left pending — a wait nobody will ever resume is the
    * retention invariant 7 exists to prevent:
    *
-   *  - CANCELLED. The deadline expired the slot and unlinked it. No permit was
-   *    ever granted, so there is nothing to hand back; this is the routine
+   *  - CANCELLED. The deadline expired the slot and marked it dead. No permit
+   *    was ever granted, so there is nothing to hand back; this is the routine
    *    cleanup path for a call that dies in the queue.
    *  - GRANTED TO AN EXPIRED SLOT. Invariant 6's forwarding, now narrowed to
    *    the race it always described: a `release()` that shifted this waiter in
-   *    the same tick the deadline fired, so `cancel()` had nothing left to
-   *    unlink. The grant is real and belongs to whoever is behind us, so it is
+   *    the same tick the deadline fired, so `cancel()` found the grant already
+   *    marked. The grant is real and belongs to whoever is behind us, so it is
    *    released straight back rather than dropped (which would shrink the
    *    pool) or used (which would start work for a rejected caller).
    *

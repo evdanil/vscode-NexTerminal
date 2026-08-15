@@ -891,6 +891,207 @@ describe("createSemaphore — a cancelled wait unlinks, and cancel-vs-grant sett
   });
 });
 
+describe("createSemaphore — mass cancellation is amortized, never quadratic", () => {
+  /**
+   * WHY A COUNTER AND NOT A STOPWATCH. The cost being asserted here is
+   * per-cancel queue maintenance, and every scheme produces the same
+   * caller-visible behaviour — the same outcomes, in the same order, for the
+   * same requests — so behaviour cannot tell them apart at all. Wall clock can,
+   * but only at sizes far past anything a suite should run: measured against
+   * the splice-per-cancel implementation this replaces, 30_000 FIFO
+   * cancellations move 450_015_000 array elements and still finish in ~70ms,
+   * because V8 left-trims a `splice(0, 1)`. A ceiling loose enough not to flake
+   * would therefore not fail against the quadratic implementation either — it
+   * would be a decoration, not a discriminator. `queueStats().cancelWork`
+   * counts the work directly (queue entries scanned or relocated on the
+   * cancellation path), which is exact, order-independent and machine-
+   * independent: ~2n for this scheme against ~n²/2 for a scan-and-splice one,
+   * four orders of magnitude apart at the sizes below.
+   */
+  async function cancelFanout(n: number): Promise<{
+    cancelWork: number;
+    compactions: number;
+    queued: number;
+    capacity: number;
+  }> {
+    const sem = createSemaphore(1);
+    // Degrade the pool: the single permit is taken and never handed back, so
+    // every request below queues and none of them can be granted — the exact
+    // state a stalled `nexus.fs` pool expires its whole fan-out in.
+    await sem.acquire();
+    const requests = Array.from({ length: n }, () => sem.acquireCancellable());
+    expect(sem.queued()).toBe(n);
+
+    const before = sem.queueStats();
+    // FIFO order is the real one: deadlines fire in the order they were armed.
+    let unlinked = 0;
+    for (const request of requests) if (request.cancel()) unlinked++;
+    expect(unlinked).toBe(n);
+
+    const after = sem.queueStats();
+    return {
+      cancelWork: after.cancelWork - before.cancelWork,
+      compactions: after.compactions - before.compactions,
+      queued: sem.queued(),
+      capacity: after.capacity
+    };
+  }
+
+  it("expiring a whole fan-out costs work LINEAR in the fan-out, and leaves the queue empty", async () => {
+    // ⊘ the splice-per-cancel implementation this replaces: each cancellation
+    // scans the queue for its own entry and then shifts every entry behind it
+    // down one, so N cancellations cost ~N²/2 element moves — 450 million of
+    // them for the 30_000 below, on the extension host's only thread. The
+    // assertion that discriminates is `cancelWork`: ~2N here (one halving
+    // series of compaction passes), ~N²/2 there.
+    const N = 30_000;
+    const run = await cancelFanout(N);
+
+    expect(run.queued).toBe(0);
+    // Amortized O(1) per cancellation. The scheme's own bound is ~2N (the
+    // compaction passes form a halving series over the array); 4N is slack for
+    // the exact trigger point, and still 7_500x below the quadratic cost.
+    expect(run.cancelWork).toBeLessThanOrEqual(4 * N);
+    // Halving series ⇒ log-many passes, not one per cancellation.
+    expect(run.compactions).toBeLessThanOrEqual(Math.ceil(Math.log2(N)) + 2);
+    // Nothing at all is retained once the last live waiter is gone: the final
+    // compaction has no survivors to keep, so the array itself is empty.
+    expect(run.capacity).toBe(0);
+  });
+
+  it("the cost SHAPE is linear: doubling the fan-out roughly doubles the work, it does not quadruple it", async () => {
+    // ⊘ any per-cancel-O(queue) scheme (splice, or a scan that compacts every
+    // time): the absolute bound above could in principle be met by a lucky
+    // constant, but the ratio cannot — quadratic work multiplies by 4 when the
+    // fan-out doubles, amortized-linear work by 2.
+    const small = await cancelFanout(8_000);
+    const big = await cancelFanout(16_000);
+
+    expect(big.cancelWork / small.cancelWork).toBeLessThanOrEqual(2.5);
+  });
+
+  it("the queue array never holds more than 2x the live waiters, and the survivors are still granted in FIFO order", async () => {
+    // ⊘ marking without ever compacting: the dead shells stay in the array
+    // forever, so `capacity` below reads 10_003 instead of <= 7 — the
+    // retention the round-19 unlink existed to remove, reintroduced in a
+    // cheaper-looking form. ⊘ a compaction that rebuilds the queue out of
+    // order: the three survivors would come back scrambled.
+    const DOOMED = 10_000;
+    const sem = createSemaphore(1);
+    await sem.acquire();
+
+    // Survivors sit at the front, the middle and the back of the wreckage, so
+    // a compaction that loses stability is visible in the grant order.
+    const outcomes: PermitOutcome[][] = [];
+    const survivors: ReturnType<typeof sem.acquireCancellable>[] = [];
+    const doomed: ReturnType<typeof sem.acquireCancellable>[] = [];
+    const addSurvivor = (): void => {
+      const request = sem.acquireCancellable();
+      const seen: PermitOutcome[] = [];
+      void request.promise.then((outcome) => seen.push(outcome));
+      outcomes.push(seen);
+      survivors.push(request);
+    };
+    addSurvivor();
+    for (let i = 0; i < DOOMED / 2; i++) doomed.push(sem.acquireCancellable());
+    addSurvivor();
+    for (let i = 0; i < DOOMED / 2; i++) doomed.push(sem.acquireCancellable());
+    addSurvivor();
+    expect(sem.queued()).toBe(DOOMED + 3);
+
+    let unlinked = 0;
+    for (const request of doomed) if (request.cancel()) unlinked++;
+    expect(unlinked).toBe(DOOMED);
+
+    // Live waiters only — the shells are not waiters, whatever the array
+    // happens to still hold.
+    expect(sem.queued()).toBe(3);
+    // THE BOUND: live waiters plus shells, never more than 2x live + 1.
+    expect(sem.queueStats().capacity).toBeLessThanOrEqual(2 * 3 + 1);
+    expect(sem.queueStats().live).toBe(3);
+
+    // Every cancelled wait settled, exactly once and as `cancelled` — the
+    // shells are inert, not merely unreachable.
+    const settled = await Promise.all(doomed.map((request) => request.promise));
+    expect(settled).toHaveLength(DOOMED);
+    expect(settled.filter((outcome) => outcome !== "cancelled")).toEqual([]);
+
+    // The survivors are still a working FIFO: one permit each, in order.
+    for (let i = 0; i < survivors.length; i++) {
+      sem.release();
+      await flushMicrotasks();
+      expect(outcomes.map((seen) => seen.join(""))).toEqual(
+        survivors.map((_, j) => (j <= i ? "granted" : ""))
+      );
+    }
+    expect(sem.queued()).toBe(0);
+    expect(sem.queueStats().capacity).toBe(0);
+  });
+
+  it("a release that meets a not-yet-compacted shell walks past it to the next live waiter", async () => {
+    // ⊘ a `release()` that hands the permit to whatever `shift()` returns now
+    // that cancellation leaves shells behind: the permit would land on a
+    // corpse — silently swallowed (the pool loses a slot per abandoned wait)
+    // or thrown on a null resolver — and `live` below would never start. The
+    // fixture is built so no compaction can have run yet: one dead, one live,
+    // and this scheme only compacts once the dead OUTNUMBER the live.
+    const sem = createSemaphore(1);
+    await sem.acquire();
+    const dead = sem.acquireCancellable();
+    const live = sem.acquireCancellable();
+    const deadOutcomes: PermitOutcome[] = [];
+    const liveOutcomes: PermitOutcome[] = [];
+    void dead.promise.then((outcome) => deadOutcomes.push(outcome));
+    void live.promise.then((outcome) => liveOutcomes.push(outcome));
+
+    expect(dead.cancel()).toBe(true);
+    // The shell is demonstrably still in the array — this is the state the
+    // release below has to survive.
+    expect(sem.queueStats()).toMatchObject({ capacity: 2, live: 1, compactions: 0 });
+
+    sem.release();
+    await flushMicrotasks();
+
+    expect(liveOutcomes).toEqual(["granted"]);
+    expect(deadOutcomes).toEqual(["cancelled"]);
+    expect(sem.queued()).toBe(0);
+    // The shell was retired by the walk, not left for the next release.
+    expect(sem.queueStats().capacity).toBe(0);
+  });
+
+  it("the cancel-vs-grant race is arbitrated by the MARK, not by presence in the array", async () => {
+    // ⊘ an arbiter that reads "is this entry still in the array?" — the
+    // obvious carry-over from the splice scheme, and wrong the moment dead
+    // entries legitimately stay in it: a second `cancel()` on an
+    // already-cancelled request finds its shell still there, reports an unlink
+    // that did not happen and counts the same corpse twice, after which
+    // `queued()` under-reports the live waiters (0 instead of 1 below) and a
+    // compaction can fire on a queue that has nothing to compact.
+    const sem = createSemaphore(1);
+    await sem.acquire();
+    const shell = sem.acquireCancellable();
+    const granted = sem.acquireCancellable();
+    const seen: PermitOutcome[] = [];
+    void granted.promise.then((outcome) => seen.push(outcome));
+
+    expect(shell.cancel()).toBe(true);
+    // One dead against one live is not enough to trigger a pass, so the shell
+    // is demonstrably still linked — the state the wrong arbiter misreads.
+    expect(sem.queueStats()).toMatchObject({ capacity: 2, live: 1, compactions: 0 });
+    expect(shell.cancel()).toBe(false);
+    expect(sem.queued()).toBe(1);
+
+    // And the other side of the race: a request the FIFO has already granted
+    // cannot be cancelled either — the caller owes that permit a release.
+    sem.release();
+    expect(granted.cancel()).toBe(false);
+
+    await flushMicrotasks();
+    expect(seen).toEqual(["granted"]);
+    expect(sem.queued()).toBe(0);
+  });
+});
+
 describe("ReadSlotScheduler — the grant that lands on an already-expired slot (the surviving race)", () => {
   /**
    * The race the unlink CANNOT close, reproduced deterministically. Two calls
