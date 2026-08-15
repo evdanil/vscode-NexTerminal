@@ -260,6 +260,23 @@ async function readLocalFileBounded(fsPath: string, loggedPath: string, ctx: Scr
   if (!stat.isFile()) {
     throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: is not a regular file`);
   }
+  // Checked BEFORE opening the file: when an honest stat already knows the
+  // file is oversized, there is no reason to pay for even a capped open+read
+  // — worst on `file:` URIs backed by a slow network mount. `stat.size` is
+  // trustworthy here specifically BECAUSE we haven't read anything yet to
+  // contradict it; the bounded read below (and its own post-read check) stays
+  // as the belt-and-braces layer for the case stat DIDN'T catch: a lying
+  // provider, or a file that grows between this stat and the read.
+  if (stat.size > SCRIPT_FS_MAX_BYTES) {
+    throw fail(
+      ctx,
+      "readText",
+      loggedPath,
+      "FileTooLarge",
+      `${loggedPath}: ${stat.size} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
+      { sizeBytes: stat.size, maxBytes: SCRIPT_FS_MAX_BYTES }
+    );
+  }
 
   let bytes: Buffer;
   try {

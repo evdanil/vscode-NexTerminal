@@ -32,8 +32,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     // OTHER test's fixture setup (writeFile/mkdir/symlink/...) and every OTHER
     // test's read path work unchanged. Only tests that explicitly
     // `mockImplementationOnce` see different behavior, and only for that one
-    // call.
-    stat: vi.fn(actual.stat)
+    // call. `open` is wrapped too (still real) purely so tests can assert it
+    // was never CALLED — the early-reject-before-opening test needs that.
+    stat: vi.fn(actual.stat),
+    open: vi.fn(actual.open)
   };
 });
 
@@ -138,6 +140,8 @@ const remoteFiles = (vscode as unknown as { __remoteFiles: Map<string, { content
 const remoteUri = (vscode as unknown as { __remoteUri: (authority: string, p: string) => vscode.Uri }).__remoteUri;
 /** `node:fs/promises`'s `stat`, wrapped (not replaced) — see the vi.mock above. */
 const nodeStatSpy = fsp.stat as unknown as ReturnType<typeof vi.fn>;
+/** `node:fs/promises`'s `open`, wrapped (not replaced) — see the vi.mock above. */
+const nodeOpenSpy = fsp.open as unknown as ReturnType<typeof vi.fn>;
 
 // -----------------------------------------------------------------------------
 // Fixture harness
@@ -225,6 +229,34 @@ describe("scriptFsReadText — size cap (file: scheme, bounded native read — P
       sizeBytes: 5 * 1024 * 1024,
       maxBytes: 4 * 1024 * 1024
     });
+    // Rejected from stat alone — the file was never opened for reading.
+    expect(nodeOpenSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects BEFORE opening the file when stat already reports an over-cap size — no I/O for an honestly-oversized file, worst on a slow network-backed file: mount", async () => {
+    // ⊘ the pre-fix implementation, which always ran the file through
+    // boundedReadFile (an open + capped read) regardless of what stat said,
+    // paying for I/O even when stat already knew the file was too large. A
+    // mocked stat — decoupled from the real (tiny) file on disk — proves the
+    // rejection is driven by stat.size ALONE, before any open() call: if the
+    // implementation still opened the file first, this would either read the
+    // real 4-byte content (no FileTooLarge at all) or, if it also trusted the
+    // mocked size correctly but only after opening, `open` would still have
+    // been called — either way this test would catch it.
+    const { ctx, scriptDir } = await makeCtx();
+    const filePath = path.join(scriptDir, "small-but-lies-big.bin");
+    await fsp.writeFile(filePath, "tiny"); // really 4 bytes on disk
+    const claimedSize = 10 * 1024 * 1024; // 10 MiB, far over the cap
+    nodeStatSpy.mockImplementationOnce(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: claimedSize }) as unknown as import("node:fs").Stats
+    );
+
+    await expect(scriptFsReadText("small-but-lies-big.bin", ctx)).rejects.toMatchObject({
+      code: "FileTooLarge",
+      sizeBytes: claimedSize,
+      maxBytes: 4 * 1024 * 1024
+    });
+    expect(nodeOpenSpy).not.toHaveBeenCalled();
   });
 
   it("caps memory via a bounded native read: a lying node fs.stat (small reported size) does NOT defeat the post-read cap on a real oversized file", async () => {
