@@ -217,9 +217,16 @@ function describeNonCloneable(p: unknown): string {
   try {
     return String(p);
   } catch {
-    // A hostile custom toString()/valueOf()/[Symbol.toPrimitive] can throw
-    // too — this never does.
-    return Object.prototype.toString.call(p);
+    // A hostile custom toString()/valueOf()/[Symbol.toPrimitive] can throw.
+    try {
+      return Object.prototype.toString.call(p);
+    } catch {
+      // ...and so can THIS, for a Proxy whose `get` trap throws — reading
+      // Symbol.toStringTag goes through the trap. The description chain must
+      // never throw (a throw here escapes as the trap's error instead of the
+      // typed InvalidPath), so the last resort is a constant.
+      return "[unrepresentable value]";
+    }
   }
 }
 
