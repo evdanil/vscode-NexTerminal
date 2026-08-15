@@ -26,20 +26,31 @@ export const SCRIPT_FS_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
 export const SCRIPT_FS_MAX_CONCURRENT_READS = 4;
 
 /**
- * Fixed (not configurable) deadline on the I/O every `nexus.fs` call performs.
+ * Fixed (not configurable) deadline on every `nexus.fs` call — the WHOLE call,
+ * not just its I/O (see `readSlotScheduler.ts`'s invariant 7): the wait for a
+ * read slot is inside the bound too, because the documented guarantee is made
+ * to the SCRIPT ("a nexus.fs call never blocks longer than 30 seconds") and a
+ * script cannot tell the two waits apart.
+ *
  * Neither `node:fs/promises` nor `vscode.workspace.fs` offers any way to
  * cancel an in-flight call, so a hung remote FileSystemProvider or a `file:`
  * read against a dead network mount produces a promise that simply never
- * settles. Both entry points need the deadline, for different reasons:
+ * settles. Each entry point needs the deadline for its own reason:
  *
  *  - `scriptFsReadText`'s admitted read would otherwise pin its permit
  *    forever, and `SCRIPT_FS_MAX_CONCURRENT_READS` such stalls would make
  *    every later `nexus.fs.readText` — from ANY session, not just the stalled
  *    one's — queue indefinitely behind them.
- *  - `scriptFsExists`'s `stat` holds no permit (see its own comment), but the
- *    SCRIPT is what hangs: `await nexus.fs.exists(...)` would never return,
- *    stalling the run until its max-runtime kill, while every concurrent
- *    probe piles up another pending provider operation nothing will retire.
+ *  - a QUEUED `scriptFsReadText` needs it for the residue of that same hazard:
+ *    once the orphan budget is full the pool stops handing timed-out permits
+ *    back (`SCRIPT_FS_MAX_ORPHANED_READS`), so a fully degraded pool has no
+ *    free permit and no prospect of one — a newcomer would wait forever on a
+ *    queue that is bounded by nothing else.
+ *  - `scriptFsExists`'s `stat` holds no permit and never queues (see its own
+ *    comment), but the SCRIPT is what hangs: `await nexus.fs.exists(...)`
+ *    would never return, stalling the run until its max-runtime kill, while
+ *    every concurrent probe piles up another pending provider operation
+ *    nothing will retire.
  */
 export const SCRIPT_FS_READ_TIMEOUT_MS = 30_000;
 
@@ -576,13 +587,27 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
  * context (see `withGuardedLog`), so a late settlement after the deadline
  * already fired logs nothing — the same suppression
  * `readLocalFileBounded`/`readRemoteFileBounded` get.
+ *
+ * ONLY A GENUINE NOT-FOUND ANSWERS `false`. A `stat` that failed for any other
+ * reason — no permission to look, an unavailable/erroring FileSystemProvider,
+ * a broken transport — did not establish absence; it established that the
+ * question could not be answered. That is the same "I couldn't tell" the
+ * deadline already refuses to collapse into `false` (see `scriptFsExists`'s
+ * comment), and it gets the same outcome: a `ReadFailed` throw carrying the
+ * provider's own detail. The not-found classification is
+ * `isNotFoundStatError`, shared verbatim with `readText`'s stat mapping, so
+ * "the file isn't there" means exactly one thing across the whole module.
  */
 async function statExists(uri: vscode.Uri, loggedPath: string, ctx: ScriptFsContext): Promise<boolean> {
   let found: boolean;
   try {
     await vscode.workspace.fs.stat(uri);
     found = true;
-  } catch {
+  } catch (err) {
+    if (!isNotFoundStatError(err)) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw fail(ctx, "exists", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
+    }
     found = false;
   }
   ctx.log(`fs.exists ${loggedPath} → ${found}`);

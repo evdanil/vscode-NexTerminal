@@ -268,8 +268,9 @@ declare global {
    * `ReadFailed` covers both "the path resolved but the read/probe itself
    * failed" (permissions, a misbehaving filesystem provider) and "the call hit
    * the fixed 30-second deadline every `nexus.fs` call is bounded by" — the
-   * latter's message ends in `timed out after 30s`. A timeout is never
-   * reported as a missing file, an empty read, or (for `exists`) a `false`.
+   * latter's message ends in `timed out after 30s`. Neither a timeout nor a
+   * failed probe is ever reported as a missing file, an empty read, or (for
+   * `exists`) a `false`.
    *
    * `FileTooLarge` additionally carries `sizeBytes` / `maxBytes` (see
    * `ScriptFsFileTooLargeError` below) — declared here too, optionally, so
@@ -322,9 +323,11 @@ declare global {
      * script's own folder subtree. Max 4 MiB. Every read is logged to the
      * "Nexus Scripts" Output Channel.
      *
-     * Never blocks longer than 30 seconds: a filesystem that hasn't answered
-     * by then throws `ReadFailed` ("timed out after 30s") instead of hanging
-     * the run.
+     * Never blocks longer than 30 seconds, measured over the WHOLE call —
+     * including any wait for a read slot when several `nexus.fs` calls are in
+     * flight at once. A filesystem that hasn't answered by then (or a slot
+     * that never came free) throws `ReadFailed` ("timed out after 30s")
+     * instead of hanging the run.
      */
     readText(path: string): Promise<string>;
     /**
@@ -340,7 +343,10 @@ declare global {
      *
      * Bounded by the same 30-second deadline as `readText`: a probe the
      * filesystem hasn't answered by then throws `ReadFailed` ("timed out after
-     * 30s"). "I couldn't tell" is deliberately never collapsed into `false`.
+     * 30s"). A probe that FAILED — no permission to look, an erroring or
+     * unavailable filesystem provider — throws `ReadFailed` too; only a
+     * genuine "nothing is there" answers `false`. "I couldn't tell" is
+     * deliberately never collapsed into `false`.
      */
     exists(path: string): Promise<boolean>;
   }

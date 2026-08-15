@@ -36,25 +36,30 @@ const TIMED_OUT = Object.assign(new Error("timed out"), { code: "ReadFailed" });
 /**
  * A gated operation that never settles on its own: the returned `gate` is the
  * only thing that can finish it. `logAllowed` is captured so a test can check
- * the audit guard at any point.
+ * the audit guard at any point, and `runs()` reports how many times the
+ * operation was actually STARTED — the observable that separates "waited in
+ * the queue and was admitted" from "waited in the queue and never ran".
  */
 function stalledWork(label: string, extra?: Partial<GatedWork<string>>): {
   work: GatedWork<string>;
   gate: { resolve: (value: string) => void; reject: (err: unknown) => void };
   logAllowed: () => boolean;
+  runs: () => number;
 } {
   const gate = deferred<string>();
   let allowed: () => boolean = () => true;
+  let runs = 0;
   const work: GatedWork<string> = {
     label,
     run: (logAllowed) => {
+      runs++;
       allowed = logAllowed;
       return gate.promise;
     },
     timeoutError: () => TIMED_OUT,
     ...extra
   };
-  return { work, gate, logAllowed: () => allowed() };
+  return { work, gate, logAllowed: () => allowed(), runs: () => runs };
 }
 
 /** Waits for `predicate` or fails after `timeoutMs`. */
@@ -320,6 +325,162 @@ describe("ReadSlotScheduler — admission", () => {
     gates[2].resolve("c");
     await expect(Promise.all(calls)).resolves.toEqual(["a", "b", "c"]);
     expect(scheduler.snapshot().permitsInUse).toBe(0);
+  });
+});
+
+describe("ReadSlotScheduler — the deadline bounds the WHOLE call, queueing included", () => {
+  /**
+   * Saturates a `maxOrphaned: 0` pool with one operation that will never give
+   * its permit back on its own: at its deadline it is `held` (there is no
+   * detachment capacity to move it to), so the permit comes back only when the
+   * returned gate is finally resolved. That makes "queued behind a pool that
+   * will not free a slot" a state a test can hold indefinitely and step out of
+   * on demand — the exact shape a stalled `nexus.fs` pool degrades into.
+   */
+  async function saturate(scheduler: ReadSlotScheduler): Promise<ReturnType<typeof stalledWork>> {
+    const hog = stalledWork("hog");
+    await expect(scheduler.runGated(hog.work)).rejects.toBe(TIMED_OUT);
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, orphaned: 0, held: ["hog"] });
+    return hog;
+  }
+
+  it("a call still queued when its deadline fires is rejected with the same timeoutError, and its work is never started", async () => {
+    // ⊘ the pre-fix `runGated`, which armed the deadline only AFTER
+    // `permits.acquire()` resolved: the queued call below would sit in the
+    // FIFO forever behind a pool that never frees a slot — it would never
+    // settle at all, and this test would fail on its own timeout rather than
+    // on an assertion. The second half is the other wrong implementation: a
+    // queued call that expires must never have started its work.
+    const scheduler = makeScheduler({ maxConcurrent: 1, maxOrphaned: 0 });
+    const hog = await saturate(scheduler);
+
+    const stranded = stalledWork("stranded");
+    await expect(scheduler.runGated(stranded.work)).rejects.toBe(TIMED_OUT);
+    expect(stranded.runs()).toBe(0);
+    // The expired slot took nothing with it: no permit, no detached charge,
+    // and it never joined the promotion queue.
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, orphaned: 0, held: ["hog"] });
+
+    hog.gate.resolve("late");
+    await waitFor(() => scheduler.snapshot().permitsInUse === 0);
+  });
+
+  it("declining at admission still works for a call that queued first — expiry is the only new way out of the queue", async () => {
+    // ⊘ a queued-deadline implementation that treats every grant to a
+    // still-queued slot as expired (e.g. checking the timer rather than the
+    // slot's own state): a call that queued and was admitted IN TIME would
+    // stop reaching `onAdmitted` at all, silently dropping the aborted-run
+    // check `scriptFs` relies on.
+    const scheduler = makeScheduler({ maxConcurrent: 1, deadlineMs: 5_000 });
+    const first = stalledWork("first");
+    const firstCall = scheduler.runGated(first.work);
+    await tick(1);
+
+    const refusal = new Error("run already stopped");
+    const queued = stalledWork("queued", {
+      onAdmitted: () => {
+        throw refusal;
+      }
+    });
+    const queuedCall = scheduler.runGated(queued.work);
+    await tick(1);
+    expect(scheduler.snapshot().permitsInUse).toBe(1);
+
+    first.gate.resolve("done");
+    await expect(firstCall).resolves.toBe("done");
+    await expect(queuedCall).rejects.toBe(refusal);
+    expect(queued.runs()).toBe(0);
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
+  });
+
+  it("the permit granted to a call that already expired in the queue goes straight to the next live waiter — the pool neither leaks nor gains capacity", async () => {
+    // ⊘ a queued-deadline implementation that forgets the grant the semaphore
+    // still owes an expired waiter: that permit is simply lost, so `next`
+    // below never starts (open capacity: 0) and the pool is permanently one
+    // slot poorer for every call that ever timed out while queued. The
+    // opposite mutation — releasing the grant AND keeping it — shows up in the
+    // final drain check, where a two-deep batch would start both members at
+    // once instead of one.
+    const scheduler = makeScheduler({ maxConcurrent: 1, maxOrphaned: 0, deadlineMs: 200 });
+    const hog = await saturate(scheduler);
+
+    // Expires in the queue: the semaphore still owes this call a grant.
+    const stranded = stalledWork("stranded");
+    await expect(scheduler.runGated(stranded.work)).rejects.toBe(TIMED_OUT);
+    expect(stranded.runs()).toBe(0);
+
+    // A live waiter, queued behind the dead one.
+    const next = stalledWork("next");
+    const nextCall = scheduler.runGated(next.work);
+    await tick(1);
+    expect(next.runs()).toBe(0);
+
+    // The hog's own work finally settles — `held → settled` hands exactly one
+    // permit back, and the FIFO offers it to the expired waiter first.
+    hog.gate.resolve("late");
+    await waitFor(() => next.runs() === 1);
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, orphaned: 0, held: [] });
+
+    next.gate.resolve("through");
+    await expect(nextCall).resolves.toBe("through");
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
+
+    // Full-drain check: capacity is EXACTLY maxConcurrent again — one of the
+    // two starts, the other waits, and both settle.
+    const a = stalledWork("a");
+    const b = stalledWork("b");
+    const aCall = scheduler.runGated(a.work);
+    const bCall = scheduler.runGated(b.work);
+    await tick(1);
+    expect([a.runs(), b.runs()]).toEqual([1, 0]);
+
+    a.gate.resolve("a");
+    await waitFor(() => b.runs() === 1);
+    b.gate.resolve("b");
+    await expect(Promise.all([aCall, bCall])).resolves.toEqual(["a", "b"]);
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
+  });
+
+  it("one timer per call: a call that queues and then runs still registers (and clears) exactly one deadline", async () => {
+    // ⊘ two independently-armed timers — one for the queue, a fresh one at
+    // admission: a call that queued for 29s would then get a WHOLE new 30s
+    // window, so the documented "never blocks longer than 30 seconds" bound
+    // would silently become 60. One timer per call is what makes the bound the
+    // whole call's.
+    const scheduler = makeScheduler({ maxConcurrent: 1, deadlineMs: 5_000 });
+    const first = stalledWork("first");
+    const firstCall = scheduler.runGated(first.work);
+    await tick(1);
+
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    const clearTimeoutSpy = vi.spyOn(global, "clearTimeout");
+    /** Only the scheduler's own deadline timers — this suite's polling helpers use short ones too. */
+    const deadlineTimers = (): unknown[] =>
+      setTimeoutSpy.mock.calls
+        .map((call, i) => ({ delay: call[1], handle: setTimeoutSpy.mock.results[i]!.value as unknown }))
+        .filter((entry) => entry.delay === 5_000)
+        .map((entry) => entry.handle);
+    try {
+      const queued = stalledWork("queued");
+      const queuedCall = scheduler.runGated(queued.work);
+      await tick(1);
+      expect(queued.runs()).toBe(0);
+      // Armed once, before the wait for a permit — not once per phase.
+      expect(deadlineTimers()).toHaveLength(1);
+
+      first.gate.resolve("done");
+      await expect(firstCall).resolves.toBe("done");
+      await waitFor(() => queued.runs() === 1);
+      // Admission did not arm a second one.
+      expect(deadlineTimers()).toHaveLength(1);
+
+      queued.gate.resolve("through");
+      await expect(queuedCall).resolves.toBe("through");
+      expect(clearTimeoutSpy.mock.calls.some((call) => call[0] === deadlineTimers()[0])).toBe(true);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }
   });
 });
 

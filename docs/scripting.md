@@ -371,7 +371,7 @@ for (const device of config.devices) {
 
 #### `nexus.fs.exists(path)` → `Promise<boolean>`
 
-`true` for any entry at the scoped path — file or directory. An out-of-scope path **throws** rather than returning `false`: there's no existence oracle outside the scope, so `exists` and `readText` fail the same way for a path you shouldn't be probing. A probe the filesystem never answers throws too (see **Deadline** below) — `false` always means "checked, nothing there", never "couldn't tell".
+`true` for any entry at the scoped path — file or directory. An out-of-scope path **throws** rather than returning `false`: there's no existence oracle outside the scope, so `exists` and `readText` fail the same way for a path you shouldn't be probing. A probe the filesystem never answers throws too (see **Deadline** below), and so does one it *refuses* — no permission to look, an erroring or unavailable filesystem provider — which throws `ReadFailed`. Only a genuine "nothing is there" answers `false`, so `false` always means "checked, nothing there", never "couldn't tell".
 
 ```js
 if (await nexus.fs.exists("./credentials.json")) {
@@ -388,7 +388,7 @@ Both `..` traversal and absolute paths are accepted, as long as the *result* lan
 
 **Limits.** Files over 4 MiB throw `FileTooLarge` — normally without the file being read at all, since the size is checked first. A FileSystemProvider that misreports a file's size is still caught, just one step later, by a second check against the actual bytes read. Non-UTF-8 content throws `NotUtf8`.
 
-**Deadline.** A `nexus.fs` call never blocks longer than **30 seconds**. The limit is fixed (not configurable) and covers both `readText` (its stat + read) and `exists` (its stat). When it expires — a hung remote filesystem provider, a `file:` path on a dead network mount; neither offers any way to cancel an in-flight call — the call throws `ReadFailed` with a message ending in `timed out after 30s`. A timeout is never reported as a missing file, an empty read, or a `false` from `exists()`: "I couldn't tell" and "it's definitely not there" justify opposite actions in a script, so they get different outcomes.
+**Deadline.** A `nexus.fs` call never blocks longer than **30 seconds**. The limit is fixed (not configurable) and covers the **whole call**, measured from the moment your script makes it: both `readText` (its stat + read) and `exists` (its stat), *and* any time spent waiting for a read slot when several `nexus.fs` calls are in flight at once. A call that never gets a slot is bounded exactly like one whose provider never answers. When the limit expires — a hung remote filesystem provider, a `file:` path on a dead network mount; neither offers any way to cancel an in-flight call — the call throws `ReadFailed` with a message ending in `timed out after 30s`. A timeout is never reported as a missing file, an empty read, or a `false` from `exists()`: "I couldn't tell" and "it's definitely not there" justify opposite actions in a script, so they get different outcomes.
 
 **Logging.** Every call — success or refusal — writes a line to the **Nexus Scripts** Output Channel with the resolved path (successes also include the byte count). The one exception is a call whose 30-second deadline fires *after* its run was already stopped — that run's log has ended, so the timeout isn't appended to it.
 
@@ -402,10 +402,10 @@ Both `..` traversal and absolute paths are accepted, as long as the *result* lan
 | `"FileNotFound"` | `readText` | Nothing exists at the path, or it's a directory. |
 | `"FileTooLarge"` | `readText` | The file is bigger than 4 MiB. `err.sizeBytes` / `err.maxBytes` carry the numbers — `sizeBytes` is a lower bound when the true size could not be determined (a file that grew mid-read, or a provider that under-reported it, reports the cap + 1). |
 | `"NotUtf8"` | `readText` | The bytes aren't valid UTF-8. |
-| `"ReadFailed"` | `readText`, `exists` | The path resolved and passed the size check, but the read (or `exists`'s probe) itself failed — permissions, a misbehaving remote filesystem provider — or the operation timed out (30 seconds; see **Deadline** above). |
+| `"ReadFailed"` | `readText`, `exists` | The path resolved and passed the size check, but the read (or `exists`'s probe) itself failed — permissions, a misbehaving remote filesystem provider — or the operation timed out (30 seconds; see **Deadline** above). A failed `exists` probe throws this rather than answering `false`. |
 | `"InvalidJson"` | `readJson` | The file read fine but isn't valid JSON. A `SyntaxError`, not a plain `Error`. |
 
-`exists()` throws `NoScriptDir` / `InvalidPath` / `PathOutsideScope` under the same conditions as `readText`, plus `ReadFailed` when its probe exceeds the 30-second deadline. It returns a plain boolean only when the filesystem actually answered.
+`exists()` throws `NoScriptDir` / `InvalidPath` / `PathOutsideScope` under the same conditions as `readText`, plus `ReadFailed` when its probe fails outright (permissions, a provider error) or exceeds the 30-second deadline. It returns a plain boolean only when the filesystem actually answered.
 
 An uncaught `nexus.fs` error is **not** one of the [expected error codes](#error-handling) — it toasts, the same as a syntax error would. If your script wants to branch on "this file might not be there", use `exists()` or wrap the call in `try/catch`.
 

@@ -908,13 +908,19 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
 
       // The pool is now fully saturated by stalls — this read queues on the
       // semaphore. Once admitted (after a stall's deadline frees a slot), it
-      // should use the REAL open() and succeed quickly.
+      // should use the REAL open() and succeed quickly. Issued one virtual
+      // millisecond short of the stalls' deadline rather than alongside them:
+      // the deadline bounds the whole call, queueing included (invariant 7),
+      // so a read issued back at t=0 would reach its OWN deadline in the same
+      // instant the stalls reach theirs. Issued here it has a full window of
+      // slack, which leaves admission the only thing this test observes.
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS - 1);
       nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
       const freshPromise = scriptFsReadText("healthy.txt", ctx);
 
-      // Advance to the deadline: all SCRIPT_FS_MAX_CONCURRENT_READS stalled
-      // reads time out and release their permits.
-      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      // Advance the last millisecond: all SCRIPT_FS_MAX_CONCURRENT_READS
+      // stalled reads time out and release their permits.
+      await vi.advanceTimersByTimeAsync(1);
 
       const results = await stalledSettled;
       for (const r of results) {
@@ -981,13 +987,18 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
       await vi.advanceTimersByTimeAsync(0);
       expect(readFileSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
 
+      // Issued one virtual millisecond short of the stalls' deadline, for the
+      // reason spelled out in the `file:` test above: the deadline covers the
+      // queueing half of a call too, so a read issued alongside the stalls
+      // would race its own deadline rather than simply waiting for a permit.
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS - 1);
       readFileSpy.mockImplementationOnce(async (uri: { path: string }) => {
         const entry = remoteFiles.get(uri.path);
         return entry!.content;
       });
       const freshPromise = scriptFsReadText("healthy.txt", ctx);
 
-      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(1);
 
       const results = await stalledSettled;
       for (const r of results) {
@@ -1181,7 +1192,16 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
       await vi.advanceTimersByTimeAsync(0);
       expect(nodeOpenSpy.mock.calls.length).toBe(totalStalls);
 
-      // The pool is fully occupied (0 free permits) — this queues.
+      // Wave 3 times out — the orphan pool is ALREADY at cap, so none of
+      // these release their permit; each holds it until its own work settles.
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      // The pool is fully occupied (0 free permits) — this queues. Issued
+      // only NOW, after wave 3's deadline window has closed: what this test
+      // asks is whether a permit is ever freed, and a probe issued earlier
+      // would share that window and hit its OWN queueing deadline inside it
+      // (bounding the queue is invariant 7's job, pinned by its own test
+      // above — here it would just mask the permit question).
       nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
       const probePromise = scriptFsReadText("probe.txt", ctx);
       let probeSettled = false;
@@ -1193,10 +1213,6 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
           probeSettled = true;
         }
       );
-
-      // Wave 3 times out — the orphan pool is ALREADY at cap, so none of
-      // these release their permit; each holds it until its own work settles.
-      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
 
       // Real-time margin so anything that COULD have settled genuinely has —
       // this is what makes the "still false" check below trustworthy rather
@@ -1212,6 +1228,102 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
       heldGates[0].resolve();
       await waitFor(() => probeSettled, 2_000);
       await expect(probePromise).resolves.toBe("p");
+
+      allGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("P1 — the deadline covers QUEUEING too: a read that never gets a permit still rejects ReadFailed at SCRIPT_FS_READ_TIMEOUT_MS, and the grant it was still owed passes to the next live waiter", async () => {
+    // ⊘ arming the deadline only once `permits.acquire()` has resolved (the
+    // pre-fix `runGated`). Behind a pool degraded to zero free permits — the
+    // orphan budget full, every remaining permit HELD by a read whose
+    // provider never answers — the queued read below waits forever:
+    // `settled` stays false past the advance and this test fails there. That
+    // is precisely the case the documented public guarantee ("a nexus.fs
+    // call never blocks longer than 30 seconds") breaks on first, since a
+    // jammed pool is the one thing that makes the queue unbounded.
+    //
+    // ⊘ (second half) dropping the grant the semaphore still owes a call
+    // that expired while queued: `next.txt` would never be admitted when a
+    // held read finally settles, and the pool would be permanently one
+    // permit poorer for every queued timeout it ever served.
+    const { ctx, scriptDir, log } = await makeCtx();
+    const jam = SCRIPT_FS_MAX_ORPHANED_READS + SCRIPT_FS_MAX_CONCURRENT_READS; // 8 orphans + 4 held permits
+    for (let i = 0; i < jam; i++) {
+      await fsp.writeFile(path.join(scriptDir, `j${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "queued.txt"), "q");
+    await fsp.writeFile(path.join(scriptDir, "next.txt"), "n");
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      // Three waves: the first two fill the orphan budget, the third times
+      // out with the budget already full and therefore HOLDS its permits.
+      const allGates: Array<{ resolve: () => void }> = [];
+      let heldGates: Array<{ resolve: () => void }> = [];
+      for (let wave = 0; wave < jam / SCRIPT_FS_MAX_CONCURRENT_READS; wave++) {
+        heldGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+        allGates.push(...heldGates);
+        for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+          void scriptFsReadText(`j${wave * SCRIPT_FS_MAX_CONCURRENT_READS + i}.txt`, ctx).catch(() => {});
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      }
+      expect(nodeOpenSpy.mock.calls.length).toBe(jam);
+      expect(heldPathNames()).toHaveLength(SCRIPT_FS_MAX_CONCURRENT_READS);
+
+      // Issued into a pool that cannot free a permit on its own.
+      let settled = false;
+      const queuedOutcome = scriptFsReadText("queued.txt", ctx).then(
+        (value) => {
+          settled = true;
+          return { ok: true as const, value };
+        },
+        (error: unknown) => {
+          settled = true;
+          return { ok: false as const, error };
+        }
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+      expect(nodeOpenSpy.mock.calls.length).toBe(jam); // never admitted, so never opened
+
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      expect(settled).toBe(true);
+      expect(await queuedOutcome).toMatchObject({
+        ok: false,
+        error: {
+          code: "ReadFailed",
+          message: expect.stringContaining(`timed out after ${SCRIPT_FS_READ_TIMEOUT_MS / 1000}s`)
+        }
+      });
+      // A call that never started work has nothing detached to suppress: the
+      // deadline's own line is written exactly as for an admitted timeout.
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.readText .*queued\.txt → ReadFailed$/));
+      expect(nodeOpenSpy.mock.calls.length).toBe(jam);
+
+      // A LIVE waiter, queued behind the dead one.
+      allGates.push(...gateOpens(1));
+      void scriptFsReadText("next.txt", ctx).catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy.mock.calls.length).toBe(jam); // still queued — no permit yet
+
+      // Settle exactly one held read: one permit comes back, and the FIFO
+      // offers it to the expired waiter FIRST. It must pass straight on.
+      vi.useRealTimers();
+      heldGates[0].resolve();
+      await waitFor(() => nodeOpenSpy.mock.calls.length === jam + 1);
 
       allGates.forEach((g) => g.resolve());
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1929,6 +2041,69 @@ describe("scriptFsExists", () => {
     // ⊘ exists() swallowing an out-of-scope path into a plain `false`.
     const { ctx } = await makeCtx();
     await expect(scriptFsExists("../../../secrets.txt", ctx)).rejects.toMatchObject({ code: "PathOutsideScope" });
+  });
+});
+
+describe("scriptFsExists — a FAILED probe is not a `false` answer (P2: only a genuine not-found is)", () => {
+  it("a NoPermissions stat failure throws ReadFailed carrying the provider's detail, instead of answering a silently-wrong `false`", async () => {
+    // ⊘ the pre-fix `catch { found = false }`, which mapped EVERY stat
+    // failure to `false`. A probe that couldn't be performed is exactly the
+    // "I couldn't tell" case the deadline already refuses to collapse into
+    // `false` — a permission error, an unavailable provider or a transport
+    // fault is the same class of non-answer, and a script that branches on
+    // the result would take the "definitely not there" path (create it,
+    // fall back, skip the read) on a file that may well be sitting right
+    // there. Mirrors readText's own stat mapping via `isNotFoundStatError`.
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "locked.txt"), "x");
+    statSpy.mockImplementationOnce(async () => {
+      throw Object.assign(new Error("EACCES: permission denied, stat 'locked.txt'"), { code: "NoPermissions" });
+    });
+
+    await expect(scriptFsExists("locked.txt", ctx)).rejects.toMatchObject({
+      code: "ReadFailed",
+      message: expect.stringContaining("permission denied")
+    });
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.exists .*locked\.txt → ReadFailed$/));
+    // The refusal is the ONLY line — no contradictory `→ false` alongside it.
+    expect(log).not.toHaveBeenCalledWith(expect.stringMatching(/→ (true|false)$/));
+  });
+
+  it("a non-Error rejection from a misbehaving provider is still ReadFailed, not `false`", async () => {
+    // ⊘ an `err instanceof Error` guard that falls back to `false` (rather
+    // than to `String(err)`) for a provider that rejects with a bare string.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "odd.txt"), "x");
+    statSpy.mockImplementationOnce(async () => {
+      throw "provider exploded";
+    });
+
+    await expect(scriptFsExists("odd.txt", ctx)).rejects.toMatchObject({
+      code: "ReadFailed",
+      message: expect.stringContaining("provider exploded")
+    });
+  });
+
+  it("a genuine FileNotFound stat failure still answers `false` (unchanged)", async () => {
+    // The other half of the mapping: `exists()` must keep ANSWERING for the
+    // case it exists to answer. ⊘ a fix that throws ReadFailed for every stat
+    // failure would make `exists()` useless for its primary purpose.
+    const { ctx, scriptDir, log } = await makeCtx();
+    statSpy.mockImplementationOnce(async () => {
+      throw Object.assign(new Error("file not found"), { code: "FileNotFound" });
+    });
+    void scriptDir;
+
+    await expect(scriptFsExists("gone.txt", ctx)).resolves.toBe(false);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.exists .*gone\.txt → false$/));
+  });
+
+  it("a raw ENOENT (node-style code, unwrapped by a provider) also still answers `false`", async () => {
+    // Pins the shared `NOT_FOUND_STAT_CODES` set rather than a
+    // `FileSystemError`-only check — `scriptFsExists` on a `file:` Uri goes
+    // through the mock's real `lstat`, which rejects with ENOENT.
+    const { ctx } = await makeCtx();
+    await expect(scriptFsExists("definitely-not-here.txt", ctx)).resolves.toBe(false);
   });
 });
 

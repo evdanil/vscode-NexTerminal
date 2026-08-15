@@ -5,12 +5,14 @@
  * directly testable) outside the extension host.
  *
  * WHY A STATE MACHINE RATHER THAN COOPERATING COUNTERS: the pipeline has to
- * hold four things true at once — a concurrency cap, a deadline that must not
- * pin a slot forever, a cap on the detached work left behind by that deadline,
- * and recovery once detachment capacity reopens. Expressed as separate
- * counters and flags, "the permit is released exactly once" becomes a property
- * you can only establish by cross-reading every branch. Expressed as one slot
- * whose state each transition consumes, it becomes a property of the table.
+ * hold five things true at once — a concurrency cap, a deadline that bounds
+ * the WHOLE call (the wait for a slot included) without pinning one forever, a
+ * cap on the detached work left behind by that deadline, recovery once
+ * detachment capacity reopens, and a permit pool that neither leaks nor grows
+ * when a call dies while still queued. Expressed as separate counters and
+ * flags, "the permit is released exactly once" becomes a property you can only
+ * establish by cross-reading every branch. Expressed as one slot whose state
+ * each transition consumes, it becomes a property of the table.
  */
 
 /**
@@ -18,7 +20,10 @@
  * `acquire()` resolves once a slot is free (immediately if one already is,
  * otherwise once an earlier waiter's slot is `release()`d, in queue order).
  * The caller MUST `release()` exactly once per `acquire()`; inside this module
- * that obligation belongs to `transition()` alone.
+ * that obligation belongs to `transition()` alone, with the single carve-out
+ * of invariant 7's forwarded grant (`claimPermit`) — the one `acquire()` whose
+ * slot never enters a permit-holding state, so `transition()` has no state
+ * exit to pair the release with.
  */
 export interface Semaphore {
   acquire(): Promise<void>;
@@ -52,23 +57,28 @@ export function createSemaphore(limit: number): Semaphore {
  * these at any instant, and every arrow below is an entry in `LEGAL_NEXT`:
  *
  *   queued ──permit──> admitted ──start──> running ──work wins──────> settled
- *                          │                  │
- *                          │                  ├─deadline, room─────> orphaned ──work settles──> retired
- *                          │                  │
- *                          │                  └─deadline, no room──> held ──┬─work settles────> settled
- *                          │                                                └─room reopens────> promoted ──work settles──> retired
- *                          │
- *                          └─caller declines─> abandoned
+ *     │                    │                  │
+ *     │                    │                  ├─deadline, room─────> orphaned ──work settles──> retired
+ *     │                    │                  │
+ *     │                    │                  └─deadline, no room──> held ──┬─work settles────> settled
+ *     │                    │                                                └─room reopens────> promoted ──work settles──> retired
+ *     │                    │
+ *     │                    └─caller declines─> abandoned
+ *     │
+ *     └─deadline─────────> expired
  *
- * INVARIANTS — all of them enforced inside `transition()`, so no call site
- * has to re-establish any of them:
+ * INVARIANTS — all of them enforced inside `transition()` (bar the one
+ * explicitly carved out in 2 and 7), so no call site has to re-establish any
+ * of them:
  *
  *  1. BOUNDED HOST MEMORY. A slot holds a caller buffer while it is in any
- *     state other than the three terminals. At most `maxConcurrent` slots hold
+ *     state other than the terminals. At most `maxConcurrent` slots hold
  *     a permit and at most `maxOrphaned` are charged to the detached pool, so
  *     at most `maxConcurrent + maxOrphaned` buffers can exist at once no matter
  *     how many callers pile in or how many providers stall. Promotion cannot
  *     widen that: it converts a held slot into an orphan slot, never adds one.
+ *     `expired` costs nothing on either budget — the work of a slot that died
+ *     in the queue was never started, so there is no buffer to bound.
  *
  *  2. EXACTLY-ONCE PERMIT RELEASE. `admitted`, `running` and `held` are the
  *     permit-holding states (`PERMIT_HOLDING`); `transition()` releases the
@@ -76,7 +86,10 @@ export function createSemaphore(limit: number): Semaphore {
  *     admission, timeout with room, timeout without room, and promotion are
  *     all the same one line. A slot can leave a given state only once (the
  *     transition overwrites it, and no edge leads back in), so a second
- *     release is not expressible rather than being guarded against.
+ *     release is not expressible rather than being guarded against. The single
+ *     release NOT written that way is the forwarded grant of invariant 7,
+ *     which pairs with an `acquire()` whose slot never entered the set at all —
+ *     there is no state exit for `transition()` to hang it off.
  *
  *  3. LIVENESS. A timed-out read hands its permit back immediately while
  *     detachment capacity remains, so healthy callers are never stuck behind a
@@ -106,11 +119,47 @@ export function createSemaphore(limit: number): Semaphore {
  *     guard without a permit or a detached slot: an operation that allocates no
  *     buffer has nothing for either budget to bound, and charging it would
  *     steal capacity from the reads those budgets exist for.
+ *
+ *  7. THE DEADLINE BOUNDS THE WHOLE CALL, QUEUEING INCLUDED. `deadlineMs` is a
+ *     promise made to the CALLER ("a `nexus.fs` call never blocks longer than
+ *     30 seconds"), and a caller cannot tell the wait for a slot apart from
+ *     the wait for a provider — so the wait for a slot has to be inside the
+ *     bound. Bounding only the admitted phase leaves the one case that most
+ *     needs the guarantee unbounded: a pool degraded to zero free permits
+ *     (detachment budget full, every remaining permit `held` by work that
+ *     never settles) queues newcomers indefinitely, which is precisely when a
+ *     script hangs. Two consequences, both structural:
+ *
+ *      - ONE TIMER PER CALL, armed before the FIRST thing the call waits on
+ *        and cleared once it settles either way. Not one per phase: a fresh
+ *        timer at admission would hand a call that queued for 29s a whole new
+ *        window, quietly doubling the advertised bound. The single fire
+ *        handler branches on which phase the call is actually in, so the
+ *        machine — not a flag the two phases have to keep in sync — decides
+ *        what the deadline means.
+ *      - A GRANT MADE TO A DEAD SLOT IS FORWARDED, NEVER KEPT. A slot that
+ *        expires in the queue is still owed a permit by the semaphore, and
+ *        that grant arrives later with nobody left to use it. `claimPermit`
+ *        checks the slot's state at the moment of the grant and releases it
+ *        straight back, so it reaches the next live waiter in FIFO order.
+ *        Dropping it would shrink the pool by one permit per queued timeout
+ *        until nothing could run at all; keeping it would start work for a
+ *        caller that was already rejected.
  */
-type SlotState = "queued" | "admitted" | "running" | "settled" | "abandoned" | "orphaned" | "held" | "promoted" | "retired";
+type SlotState =
+  | "queued"
+  | "admitted"
+  | "running"
+  | "settled"
+  | "abandoned"
+  | "expired"
+  | "orphaned"
+  | "held"
+  | "promoted"
+  | "retired";
 
 const LEGAL_NEXT: Record<SlotState, readonly SlotState[]> = {
-  queued: ["admitted"],
+  queued: ["admitted", "expired"],
   admitted: ["running", "abandoned"],
   running: ["settled", "orphaned", "held"],
   held: ["promoted", "settled"],
@@ -118,6 +167,7 @@ const LEGAL_NEXT: Record<SlotState, readonly SlotState[]> = {
   promoted: ["retired"],
   settled: [],
   abandoned: [],
+  expired: [],
   retired: []
 };
 
@@ -159,6 +209,25 @@ export interface GatedWork<T> extends DeadlineWork<T> {
    * thrown value.
    */
   onAdmitted?(): void;
+}
+
+/**
+ * One call's deadline: a single armed timer plus the two things the rest of
+ * the call needs from it — the audit guard (invariant 5) and a way to publish
+ * the operation once it starts, so the fire handler can tell "still queueing"
+ * (`started === undefined`) from "running" without a second flag to keep in
+ * sync. See invariant 7 for why there is exactly one of these per call rather
+ * than one per phase.
+ */
+interface CallDeadline<T> {
+  /** Rejects with `timeoutError()` when the timer fires; never resolves. */
+  readonly expiry: Promise<never>;
+  /** False from the instant the timer fires — invariant 5's log guard. */
+  readonly logAllowed: () => boolean;
+  /** Publishes the started operation to the fire handler. Called once, by `raceWork`. */
+  readonly started: (operation: Promise<T>) => void;
+  /** Disarms the timer. Called once, from the call's own `finally`. */
+  readonly clear: () => void;
 }
 
 export interface ReadSlotSnapshot {
@@ -210,63 +279,109 @@ export class ReadSlotScheduler {
    * Runs `work` under the deadline and the log guard ONLY — no permit, no
    * detached-slot accounting (invariant 6). A timed-out operation is simply
    * abandoned: it keeps running, its eventual result is discarded, and nothing
-   * here waits for it.
+   * here waits for it. Nothing queues, so the deadline has only the one phase
+   * to cover here.
    */
-  public runUngated<T>(work: DeadlineWork<T>): Promise<T> {
-    return this.race(work, () => {
+  public async runUngated<T>(work: DeadlineWork<T>): Promise<T> {
+    const deadline = this.armDeadline(work, () => {
       /* nothing to hand back and nothing to charge — see invariant 6 */
     });
+    try {
+      return await this.raceWork(work, deadline);
+    } finally {
+      deadline.clear();
+    }
   }
 
   /**
    * Queues for a permit, runs `work` under the deadline, and owns the permit
-   * for every way out: settle, decline at admission, timeout with detachment
-   * capacity, timeout without it, and promotion afterwards.
+   * for every way out: settle, decline at admission, expiry while still
+   * queued, timeout with detachment capacity, timeout without it, and
+   * promotion afterwards. The deadline armed here spans BOTH phases — the wait
+   * for a permit and the work itself (invariant 7).
    */
   public async runGated<T>(work: GatedWork<T>): Promise<T> {
     const slot: ReadSlot = { state: "queued", label: work.label };
-    await this.permits.acquire();
-    this.transition(slot, "admitted");
+    const deadline = this.armDeadline<T>(work, (started) => {
+      if (started === undefined) {
+        // Nothing was ever started, so this call is still in the FIFO: there
+        // is no work to detach and no buffer to charge — the slot just
+        // expires. (`started === undefined` is exactly `state === "queued"`:
+        // everything between admission and `run()` below is a single
+        // microtask chain, and a timer callback is a macrotask, so the
+        // deadline cannot land in between.) The permit this call is still
+        // owed is handled by `claimPermit` — invariant 7.
+        this.transition(slot, "expired");
+        return;
+      }
+      this.transition(slot, this.orphaned < this.maxOrphaned ? "orphaned" : "held");
+      started
+        // Whichever state the slot is in by the time its own work settles —
+        // still `held`, or `orphaned`/`promoted` — this retires it. `held`
+        // is the one case that still owes a permit.
+        //
+        // The transition runs in its own try so the catch below only ever
+        // swallows the DISCARDED work rejection — an illegal-edge throw from
+        // the machine itself must stay loud, not vanish into the same sink.
+        .finally(() => {
+          try {
+            this.transition(slot, slot.state === "held" ? "settled" : "retired");
+          } catch (err) {
+            queueMicrotask(() => {
+              throw err;
+            });
+          }
+        })
+        .catch(() => {
+          // The detached result is discarded by design; `raceWork()` already
+          // observes the operation itself, so only this derived promise
+          // needs its own handler to stay out of the unhandled-rejection
+          // reporter.
+        });
+    });
     try {
-      work.onAdmitted?.();
-    } catch (err) {
-      this.transition(slot, "abandoned");
-      throw err;
-    }
-    this.transition(slot, "running");
-    try {
-      return await this.race(work, (detached) => {
-        this.transition(slot, this.orphaned < this.maxOrphaned ? "orphaned" : "held");
-        detached
-          // Whichever state the slot is in by the time its own work settles —
-          // still `held`, or `orphaned`/`promoted` — this retires it. `held`
-          // is the one case that still owes a permit.
-          //
-          // The transition runs in its own try so the catch below only ever
-          // swallows the DISCARDED work rejection — an illegal-edge throw from
-          // the machine itself must stay loud, not vanish into the same sink.
-          .finally(() => {
-            try {
-              this.transition(slot, slot.state === "held" ? "settled" : "retired");
-            } catch (err) {
-              queueMicrotask(() => {
-                throw err;
-              });
-            }
-          })
-          .catch(() => {
-            // The detached result is discarded by design; `race()` already
-            // observes the operation itself, so only this derived promise
-            // needs its own handler to stay out of the unhandled-rejection
-            // reporter.
-          });
-      });
+      // Phase 1 — the FIFO, under the same deadline as everything after it.
+      // Losing this race means the call expired while queued: `claimPermit`
+      // stays alive to hand the grant on, but nothing else here runs.
+      await Promise.race([deadline.expiry, this.claimPermit(slot, deadline)]);
+      try {
+        work.onAdmitted?.();
+      } catch (err) {
+        this.transition(slot, "abandoned");
+        throw err;
+      }
+      this.transition(slot, "running");
+      try {
+        // Phase 2 — the work, under the REMAINDER of the same deadline.
+        return await this.raceWork(work, deadline);
+      } finally {
+        // Reached on both the fulfilled and the rejected path. The slot is
+        // still `running` only when the work itself won the race — after a
+        // deadline it has already moved on, and the transition table would
+        // reject this edge.
+        if (slot.state === "running") this.transition(slot, "settled");
+      }
     } finally {
-      // Reached on both the fulfilled and the rejected path. The slot is still
-      // `running` only when the work itself won the race — after a deadline it
-      // has already moved on, and the transition table would reject this edge.
-      if (slot.state === "running") this.transition(slot, "settled");
+      deadline.clear();
     }
+  }
+
+  /**
+   * Waits for this slot's turn in the semaphore's FIFO and takes the permit —
+   * unless the deadline already expired the slot while it waited, in which
+   * case the grant belongs to whoever is behind it (invariant 7). The
+   * already-settled `expiry` is adopted as this branch's own outcome rather
+   * than a fresh sentinel: the caller has been rejected with it either way, so
+   * there is exactly one rejection value in play no matter which promise the
+   * race in `runGated` happened to observe first.
+   */
+  private async claimPermit<T>(slot: ReadSlot, deadline: CallDeadline<T>): Promise<void> {
+    await this.permits.acquire();
+    if (slot.state === "expired") {
+      this.permits.release();
+      return deadline.expiry;
+    }
+    this.transition(slot, "admitted");
   }
 
   /**
@@ -325,29 +440,51 @@ export class ReadSlotScheduler {
   }
 
   /**
-   * The deadline race itself. `work` is never cancelled — there is no API to
-   * cancel it — so `onDeadline` receives the now-detached operation and is
-   * where a caller-side budget (if any) takes ownership of it.
+   * Arms the call's one and only deadline (invariant 7) and hands back the
+   * handle the phases share. `onFire` runs BEFORE the rejection is built, and
+   * receives the started operation — or `undefined` if the call had not got
+   * that far — so a single handler can account for whichever phase the
+   * deadline actually landed in.
+   *
+   * The returned `expiry` must be raced from synchronously by the caller: the
+   * timer cannot fire before the current synchronous block finishes, so a
+   * caller that subscribes in the same block can never see an unhandled
+   * rejection, and once subscribed it stays subscribed for the rest of the
+   * call.
    */
-  private async race<T>(work: DeadlineWork<T>, onDeadline: (detached: Promise<T>) => void): Promise<T> {
-    let deadlineWon = false;
-    const started = work.run(() => !deadlineWon);
-
+  private armDeadline<T>(work: DeadlineWork<T>, onFire: (started: Promise<T> | undefined) => void): CallDeadline<T> {
+    let fired = false;
+    let started: Promise<T> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<never>((_, reject) => {
+    const expiry = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         // First, before anything else can yield: work settling in this very
         // tick must not win the race to log (invariant 5).
-        deadlineWon = true;
-        onDeadline(started);
+        fired = true;
+        onFire(started);
         reject(work.timeoutError());
       }, this.deadlineMs);
     });
+    return {
+      expiry,
+      logAllowed: () => !fired,
+      started: (operation) => {
+        started = operation;
+      },
+      clear: () => clearTimeout(timer)
+    };
+  }
 
-    try {
-      return await Promise.race([started, deadline]);
-    } finally {
-      clearTimeout(timer);
-    }
+  /**
+   * The work half of the race. `work` is never cancelled — there is no API to
+   * cancel it — so the deadline's fire handler receives the now-detached
+   * operation and is where a caller-side budget (if any) takes ownership of
+   * it. Publishing `started` before awaiting is what lets that handler tell a
+   * detached operation from a call that never left the queue.
+   */
+  private async raceWork<T>(work: DeadlineWork<T>, deadline: CallDeadline<T>): Promise<T> {
+    const started = work.run(deadline.logAllowed);
+    deadline.started(started);
+    return await Promise.race([started, deadline.expiry]);
   }
 }
