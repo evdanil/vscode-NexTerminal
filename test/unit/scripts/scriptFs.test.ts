@@ -145,6 +145,7 @@ import {
   createSemaphore,
   SCRIPT_FS_MAX_CONCURRENT_READS,
   SCRIPT_FS_READ_TIMEOUT_MS,
+  SCRIPT_FS_MAX_ORPHANED_READS,
   type ScriptFsContext
 } from "../../../src/services/scripts/scriptFs";
 
@@ -203,6 +204,41 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     if (Date.now() > deadline) throw new Error("waitFor: timed out");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+/**
+ * A resolver-controlled promise — for mocking a "stalled" I/O call that a
+ * test can release on demand (rather than a bare `new Promise(() => {})`,
+ * which would hang FOREVER and, once round 11's orphan tracking exists,
+ * leave `orphanedReads` permanently incremented for every OTHER test sharing
+ * this file's module instance). Every test that stalls a call via this
+ * helper MUST eventually resolve it before the test ends.
+ */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Registers exactly `n` fresh `mockImplementationOnce` hangs on `nodeOpenSpy`,
+ * each gated by its own `deferred()`. Callers MUST arrange for exactly `n`
+ * real `open()` calls to consume these — registering more than will actually
+ * be called leaves unconsumed `mockImplementationOnce` entries queued on the
+ * shared spy, which `vi.clearAllMocks()` in `beforeEach` does NOT clear and
+ * which would then apply to a later, unrelated test's `open()` calls.
+ */
+function gateOpens(n: number): Array<{ resolve: () => void }> {
+  const gates = Array.from({ length: n }, () => deferred<void>());
+  gates.forEach((gate) => {
+    nodeOpenSpy.mockImplementationOnce(async (...args: Parameters<typeof realNodeOpen>) => {
+      await gate.promise;
+      return realNodeOpen(...args);
+    });
+  });
+  return gates;
 }
 
 // -----------------------------------------------------------------------------
@@ -788,8 +824,16 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS + 1; i++) {
         nodeStatSpy.mockImplementationOnce(fakeStat);
       }
-      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
-        nodeOpenSpy.mockImplementationOnce(() => new Promise(() => {}));
+      // Resolver-controlled, not a bare eternal hang — round 11 tracks these
+      // as orphans once their deadline fires, and this test releases them
+      // itself at the end so it doesn't leak into `orphanedReads` for every
+      // OTHER test sharing this file's module instance.
+      const stallGates = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, () => deferred<void>());
+      for (const gate of stallGates) {
+        nodeOpenSpy.mockImplementationOnce(async (...args: Parameters<typeof realNodeOpen>) => {
+          await gate.promise;
+          return realNodeOpen(...args);
+        });
       }
 
       const stalledPromises = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
@@ -827,6 +871,13 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       // read is admitted and completes — it was never stuck behind the
       // orphaned (still "running" but detached) stalled I/O.
       await expect(freshPromise).resolves.toBe("ok");
+
+      // Release the orphans and let their real (now-harmless, discarded)
+      // disk I/O actually finish — this drains `orphanedReads` back to
+      // baseline before the next test runs.
+      vi.useRealTimers();
+      stallGates.forEach((gate) => gate.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
       vi.useRealTimers();
     }
@@ -852,10 +903,17 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
 
     vi.useFakeTimers();
     try {
-      // Chained `mockImplementationOnce` — self-cleaning, never touches the
-      // shared default readFile implementation other tests depend on.
-      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
-        readFileSpy.mockImplementationOnce(() => new Promise(() => {}));
+      // Resolver-controlled, not a bare eternal hang — see `deferred`'s doc
+      // comment: round 11 tracks these as orphans, so this test releases
+      // them itself at the end to avoid leaking into `orphanedReads` for
+      // every OTHER test sharing this file's module instance.
+      const stallGates = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, () => deferred<void>());
+      for (const gate of stallGates) {
+        readFileSpy.mockImplementationOnce(async (uri: { path: string }) => {
+          await gate.promise;
+          const entry = remoteFiles.get(uri.path);
+          return entry!.content;
+        });
       }
 
       const stalledPromises = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
@@ -883,6 +941,11 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
         });
       }
       await expect(freshPromise).resolves.toBe("ok");
+
+      // Drain `orphanedReads` back to baseline before the next test.
+      vi.useRealTimers();
+      stallGates.forEach((gate) => gate.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
       vi.useRealTimers();
     }
@@ -911,6 +974,256 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       clearTimeoutSpy.mockRestore();
     }
   });
+
+  it("round 11, P1 — orphan capacity: a stalled read's permit releases immediately at the deadline AND its orphan slot returns to baseline once it settles", async () => {
+    // ⊘ round 10's implementation (unconditional immediate release, no
+    // orphan tracking at all) passes the FIRST half of this test too
+    // (liveness) — what specifically discriminates round 11 is the tail: a
+    // fresh batch of exactly SCRIPT_FS_MAX_ORPHANED_READS new stalls, issued
+    // only AFTER the original orphan settles, must ALL be able to release
+    // their own permits (proving the counter genuinely returned to 0, not
+    // stuck at 1 — a leaked counter would make the batch's own last member
+    // hit the cap one call early, leaving only 3 of 4 permits free
+    // afterward instead of all 4).
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "stall.txt"), "x");
+    await fsp.writeFile(path.join(scriptDir, "healthy.txt"), "ok");
+    for (let i = 0; i < SCRIPT_FS_MAX_ORPHANED_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `batch${i}.txt`), "x");
+    }
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `probe${i}.txt`), `p${i}`);
+    }
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      const [stallGate] = gateOpens(1);
+      const stalled = scriptFsReadText("stall.txt", ctx);
+      const stalledSettled = stalled.catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy.mock.calls.length).toBe(1);
+
+      // Only stall.txt's own deadline timer is registered at this point —
+      // advancing to it (and ONLY it) keeps this step isolated from any
+      // OTHER call's deadline window.
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      const stalledResult = await stalledSettled;
+      expect(stalledResult).toMatchObject({ code: "ReadFailed", message: expect.stringContaining("timed out") });
+
+      // Liveness: permit released immediately — a brand-new read (issued
+      // only now, so it can't share stall.txt's own deadline window) is not
+      // stuck behind it. Its real (fast) I/O resolves via genuine promise
+      // progression — no further timer advance needed.
+      nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
+      await expect(scriptFsReadText("healthy.txt", ctx)).resolves.toBe("ok");
+
+      // Settle the orphan for real and give its (discarded) result time to
+      // land — this should decrement `orphanedReads` back to 0.
+      vi.useRealTimers();
+      stallGate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      vi.useFakeTimers();
+
+      // Baseline-return proof: a FRESH batch of exactly
+      // SCRIPT_FS_MAX_ORPHANED_READS stalls (two waves of
+      // SCRIPT_FS_MAX_CONCURRENT_READS), issued only now.
+      const wavesNeeded = SCRIPT_FS_MAX_ORPHANED_READS / SCRIPT_FS_MAX_CONCURRENT_READS;
+      const batchGates: Array<{ resolve: () => void }> = [];
+      for (let wave = 0; wave < wavesNeeded; wave++) {
+        const gates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+        batchGates.push(...gates);
+        for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+          void scriptFsReadText(`batch${wave * SCRIPT_FS_MAX_CONCURRENT_READS + i}.txt`, ctx).catch(() => {});
+        }
+        // Flush first so all SCRIPT_FS_MAX_CONCURRENT_READS calls register
+        // their OWN deadline timer before the big jump — otherwise a call
+        // whose timer registers mid-jump can end up scheduled against a
+        // LATER virtual instant than intended.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(nodeOpenSpy.mock.calls.length).toBe(2 + (wave + 1) * SCRIPT_FS_MAX_CONCURRENT_READS);
+        await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      }
+
+      // All SCRIPT_FS_MAX_CONCURRENT_READS permits should now be free — every
+      // probe gets ADMITTED (reaches open()) immediately, none stuck queued.
+      // These probes are themselves GATED (not real quick reads): a real
+      // quick read would complete and release its OWN permit on its own,
+      // which could cascade-admit a queued probe regardless of whether the
+      // baseline genuinely reset — that would make this check pass either
+      // way and defeat the discriminator. Gating them means admission can
+      // ONLY come from the batch's own released permits, observed directly
+      // via the open() call count, exactly like the other round-11 tests.
+      const openCountBeforeProbes = nodeOpenSpy.mock.calls.length;
+      const probeGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+        void scriptFsReadText(`probe${i}.txt`, ctx).catch(() => {});
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy.mock.calls.length).toBe(openCountBeforeProbes + SCRIPT_FS_MAX_CONCURRENT_READS);
+
+      vi.useRealTimers();
+      batchGates.forEach((g) => g.resolve());
+      probeGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("round 11, P1 — beyond capacity: once SCRIPT_FS_MAX_ORPHANED_READS orphans are already in flight, the NEXT timeout holds its permit instead of releasing it; settling that one orphan releases exactly one permit", async () => {
+    // ⊘ round 10's implementation (always release on timeout, no cap at
+    // all) — the discriminator is that the probe read below stays QUEUED
+    // (not admitted) right after the third wave times out; under the old
+    // always-release behavior it would be admitted immediately, exactly like
+    // waves 1 and 2 were.
+    const { ctx, scriptDir } = await makeCtx();
+    const totalStalls = SCRIPT_FS_MAX_ORPHANED_READS + SCRIPT_FS_MAX_CONCURRENT_READS; // 8 orphans + 4 held permits
+    for (let i = 0; i < totalStalls; i++) {
+      await fsp.writeFile(path.join(scriptDir, `s${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "probe.txt"), "p");
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      const allGates: Array<{ resolve: () => void }> = [];
+      // Waves 1 + 2: fill the ORPHAN pool to exactly SCRIPT_FS_MAX_ORPHANED_READS.
+      for (let wave = 0; wave < SCRIPT_FS_MAX_ORPHANED_READS / SCRIPT_FS_MAX_CONCURRENT_READS; wave++) {
+        const gates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+        allGates.push(...gates);
+        for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+          void scriptFsReadText(`s${wave * SCRIPT_FS_MAX_CONCURRENT_READS + i}.txt`, ctx).catch(() => {});
+        }
+        // Flush first so all SCRIPT_FS_MAX_CONCURRENT_READS calls register
+        // their OWN deadline timer before the big jump — a timer registered
+        // mid-jump would end up scheduled against a LATER virtual instant.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(nodeOpenSpy.mock.calls.length).toBe((wave + 1) * SCRIPT_FS_MAX_CONCURRENT_READS);
+        await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      }
+
+      // Wave 3: SCRIPT_FS_MAX_CONCURRENT_READS more, admitted (permits are
+      // free again — waves 1-2 released theirs) — these will HOLD their
+      // permits once they time out, since the orphan pool is already full.
+      const heldGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+      allGates.push(...heldGates);
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+        void scriptFsReadText(`s${SCRIPT_FS_MAX_ORPHANED_READS + i}.txt`, ctx).catch(() => {});
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy.mock.calls.length).toBe(totalStalls);
+
+      // The pool is fully occupied (0 free permits) — this queues.
+      nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
+      const probePromise = scriptFsReadText("probe.txt", ctx);
+      let probeSettled = false;
+      probePromise.then(
+        () => {
+          probeSettled = true;
+        },
+        () => {
+          probeSettled = true;
+        }
+      );
+
+      // Wave 3 times out — the orphan pool is ALREADY at cap, so none of
+      // these release their permit; each holds it until its own work settles.
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      // Real-time margin so anything that COULD have settled genuinely has —
+      // this is what makes the "still false" check below trustworthy rather
+      // than a false pass from insufficient microtask flushing.
+      vi.useRealTimers();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      // Discriminator: the probe is still queued — no permit was freed.
+      expect(probeSettled).toBe(false);
+
+      // Settle exactly ONE of wave 3's held-permit reads — releases exactly
+      // one permit, admitting the queued probe.
+      heldGates[0].resolve();
+      await waitFor(() => probeSettled, 2_000);
+      await expect(probePromise).resolves.toBe("p");
+
+      allGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("round 11, P1 — unbounded-accumulation discriminator: repeated timeout waves plateau at SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS simultaneously-open handles, never beyond", async () => {
+    // ⊘ round 10's implementation (always release immediately, no orphan
+    // cap): each SCRIPT_FS_READ_TIMEOUT_MS window admits
+    // SCRIPT_FS_MAX_CONCURRENT_READS MORE calls regardless of how many
+    // orphans have already accumulated — 5 waves would reach 20
+    // concurrently-open (never-closed) handles, well past 12. Manually
+    // verified (mutation testing, see round-11 report) that reverting the
+    // fix makes `nodeOpenSpy.mock.calls.length` climb past the bound
+    // asserted below instead of plateauing at it.
+    const { ctx, scriptDir } = await makeCtx();
+    const cap = SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS; // 12
+    const attempted = 5 * SCRIPT_FS_MAX_CONCURRENT_READS; // 20 — deliberately more than can ever be admitted
+    for (let i = 0; i < attempted; i++) {
+      await fsp.writeFile(path.join(scriptDir, `a${i}.txt`), "x");
+    }
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      // Only `cap` (12) of these will ever actually be admitted and reach
+      // open() — the other 8 stay queued forever, never calling open() at
+      // all, so only `cap` gates are needed (see `gateOpens`'s doc comment on
+      // why over-registering would leak into a later test).
+      const gates = gateOpens(cap);
+      for (let i = 0; i < attempted; i++) {
+        void scriptFsReadText(`a${i}.txt`, ctx).catch(() => {});
+      }
+      // Flush first so the first admitted batch registers its deadline
+      // timers before any big jump — a timer registered mid-jump would end
+      // up scheduled against a LATER virtual instant than intended.
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Advance through several full deadline windows — well more than the
+      // 3 waves it actually takes to permanently jam the pool (waves 1-2
+      // fill the orphan pool; wave 3 holds its permits since the pool is
+      // already full; wave 4+ never even reach open() at all).
+      for (let round = 0; round < 5; round++) {
+        await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      }
+
+      expect(nodeOpenSpy.mock.calls.length).toBeLessThanOrEqual(cap);
+      // Not merely "bounded" — genuinely reaches the bound, proving the pool
+      // ran (rather than stalling at 0 for an unrelated reason).
+      expect(nodeOpenSpy.mock.calls.length).toBe(cap);
+
+      vi.useRealTimers();
+      gates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
 });
 
 describe("scriptFsReadText — non-regular files are rejected before ANY read (file: scheme, P1)", () => {

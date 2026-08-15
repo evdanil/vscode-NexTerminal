@@ -37,6 +37,41 @@ export const SCRIPT_FS_MAX_CONCURRENT_READS = 4;
 export const SCRIPT_FS_READ_TIMEOUT_MS = 30_000;
 
 /**
+ * Cap on DETACHED reads whose semaphore permit has already been released
+ * back to the pool after a `SCRIPT_FS_READ_TIMEOUT_MS` timeout, but whose
+ * underlying I/O (open handle + in-flight buffer) is still running to
+ * completion in the background — see `withReadDeadline`. Releasing a timed-
+ * out read's permit immediately (round 10) restores LIVENESS — a handful of
+ * hung reads no longer starve every other `nexus.fs` call — but taken alone
+ * it defeats the MEMORY budget `SCRIPT_FS_MAX_CONCURRENT_READS` exists to
+ * enforce: a script that keeps fanning out slow reads gets a fresh batch of
+ * `SCRIPT_FS_MAX_CONCURRENT_READS` admitted every `SCRIPT_FS_READ_TIMEOUT_MS`,
+ * each leaving its own orphaned handle/buffer behind — an unbounded number of
+ * detached operations, accumulating forever. This constant re-bounds that:
+ * once `SCRIPT_FS_MAX_ORPHANED_READS` orphans are already in flight, a NEWLY
+ * timed-out read's permit is held (not released) until ITS OWN orphaned work
+ * finally settles — trading liveness back for memory pressure, in the same
+ * direction `SCRIPT_FS_MAX_CONCURRENT_READS` already trades throughput for
+ * memory pressure.
+ *
+ * INVARIANT this buys: host-side in-flight read buffers are bounded by
+ * `SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS` (12 at
+ * current constants, ~48 MiB worst case at `SCRIPT_FS_MAX_BYTES`), while
+ * liveness (a fresh, healthy read is never stuck behind a stall) survives up
+ * to `SCRIPT_FS_MAX_ORPHANED_READS` simultaneous stalls — beyond that, the
+ * pool degrades (a new caller queues, same as before round 10 existed) rather
+ * than the detached-operation count growing without bound.
+ */
+export const SCRIPT_FS_MAX_ORPHANED_READS = 8;
+
+/**
+ * Count of currently-detached (permit already released, I/O still running)
+ * timed-out reads. Global — see `readSemaphore`'s doc comment for why a
+ * host-memory budget is per-host, not per-run.
+ */
+let orphanedReads = 0;
+
+/**
  * Tiny FIFO async semaphore — the classic promise-queue pattern, no deps.
  * `acquire()` resolves once a slot is free (immediately if one already is,
  * otherwise once an earlier waiter's slot is `release()`d, in queue order).
@@ -314,40 +349,82 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
     readSemaphore.release();
     throw makeAbortedError(ctx, "readText", loggedPath);
   }
-  try {
-    if (ctx.scriptUri.scheme === "file") {
-      return await withReadDeadline(readLocalFileBounded(resolution.resolvedPath, loggedPath, ctx), ctx, loggedPath);
-    }
-
-    const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
-    return await withReadDeadline(readRemoteFileBounded(uri, loggedPath, ctx), ctx, loggedPath);
-  } finally {
-    readSemaphore.release();
+  // `withReadDeadline` OWNS permit release for every path from here on
+  // (normal settle, timeout with orphan capacity to spare, timeout beyond
+  // capacity) — see its doc comment. No `finally { readSemaphore.release() }`
+  // wrapper here: that would be a SECOND release path, and the whole point of
+  // round 11's restructuring is exactly-once release, not two `finally`
+  // blocks that could both fire.
+  if (ctx.scriptUri.scheme === "file") {
+    return await withReadDeadline(readLocalFileBounded(resolution.resolvedPath, loggedPath, ctx), readSemaphore.release, ctx, loggedPath);
   }
+
+  const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
+  return await withReadDeadline(readRemoteFileBounded(uri, loggedPath, ctx), readSemaphore.release, ctx, loggedPath);
 }
 
 /**
  * Races the I/O portion of an admitted read (`work` — stat + read + decode,
  * already in flight on either branch by the time this is called) against a
- * fixed `SCRIPT_FS_READ_TIMEOUT_MS` deadline. On timeout, rejects with a
- * `ReadFailed` error; that rejection propagates straight through the
- * `try/finally` in `scriptFsReadText`, so the semaphore permit is released
- * IMMEDIATELY — not held until whatever `work` was actually blocked on
- * (a hung remote FileSystemProvider, a dead network mount, ...) eventually
- * settles, if it ever does. `work` itself is deliberately NOT cancelled —
- * neither `node:fs/promises` nor `vscode.workspace.fs` offers a way to abort
- * an in-flight call — so the underlying I/O keeps running to completion (or
- * forever) detached from this call; that's fine, because it no longer holds
- * a slot, which is precisely the property this exists to provide. An ordinary
- * `setTimeout` — cleared in `finally` — is enough: the fast (non-timeout)
- * path never leaks a timer, and `Promise.race` already subscribes to `work`
- * itself, so a later settlement of the orphaned promise can't surface as an
- * unhandled rejection either.
+ * fixed `SCRIPT_FS_READ_TIMEOUT_MS` deadline, and OWNS `release` (in
+ * production, `readSemaphore.release`) for every path out of this function —
+ * exactly once, never split across two `finally` blocks that could both
+ * fire. The CALLER always gets its `ReadFailed` "timed out" rejection at the
+ * deadline, unchanged from round 10 — a script must never block on a dead
+ * provider. What round 11 changes is what happens to the permit and the
+ * orphaned `work` promise itself once that deadline fires:
+ *
+ *  - Common case (`orphanedReads` under `SCRIPT_FS_MAX_ORPHANED_READS`): the
+ *    permit is released IMMEDIATELY — liveness preserved, exactly like round
+ *    10 — `work` is tracked as one more orphan, and its eventual settlement
+ *    (however long that takes, if ever) just decrements the orphan counter;
+ *    its actual result/error is discarded either way (the `.catch(() => {})`
+ *    exists ONLY to keep that discard from surfacing as an unhandled
+ *    rejection — `work` itself is still always observed by `Promise.race`
+ *    below, so `work` proper is never unhandled, only the NEW promise
+ *    `work.finally(...)` returns needs this).
+ *  - Pathological case (`SCRIPT_FS_MAX_ORPHANED_READS` orphans already in
+ *    flight): the permit is NOT released now — it stays held until THIS
+ *    read's own `work` eventually settles, at which point `release` runs
+ *    instead of the orphan-counter decrement. The pool degrades (new callers
+ *    queue, same as pre-round-10 behavior) rather than the detached-operation
+ *    count growing without bound.
+ *
+ * `work` itself is still never cancelled — neither `node:fs/promises` nor
+ * `vscode.workspace.fs` offers a way to abort an in-flight call — so the
+ * underlying I/O keeps running to completion (or forever) detached from this
+ * call regardless of which branch above fires; see `SCRIPT_FS_MAX_ORPHANED_READS`'s
+ * doc comment for the bound this now puts on how much of that can pile up.
  */
-async function withReadDeadline<T>(work: Promise<T>, ctx: ScriptFsContext, loggedPath: string): Promise<T> {
+async function withReadDeadline<T>(
+  work: Promise<T>,
+  release: () => void,
+  ctx: ScriptFsContext,
+  loggedPath: string
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // Set the instant the deadline fires — lets the `finally` below know NOT to
+  // release a second time; the timeout branch has already taken over that
+  // responsibility (immediately, or deferred to `work`'s own settlement).
+  let timedOut = false;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
+      timedOut = true;
+      if (orphanedReads < SCRIPT_FS_MAX_ORPHANED_READS) {
+        orphanedReads++;
+        work
+          .finally(() => {
+            orphanedReads--;
+          })
+          .catch(() => {
+            /* swallow — see doc comment above */
+          });
+        release();
+      } else {
+        work.finally(release).catch(() => {
+          /* swallow — see doc comment above */
+        });
+      }
       reject(
         fail(
           ctx,
@@ -363,6 +440,9 @@ async function withReadDeadline<T>(work: Promise<T>, ctx: ScriptFsContext, logge
     return await Promise.race([work, deadline]);
   } finally {
     clearTimeout(timer);
+    if (!timedOut) {
+      release();
+    }
   }
 }
 
