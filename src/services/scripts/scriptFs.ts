@@ -1,5 +1,6 @@
 import * as nodeFs from "node:fs/promises";
 import * as vscode from "vscode";
+import { ReadSlotScheduler } from "./readSlotScheduler";
 import { resolveScriptFsPath, safeStringify, type ScriptFsScope } from "./scriptFsScope";
 import type { ScriptFsErrorCode } from "./scriptTypes";
 
@@ -11,176 +12,82 @@ export const SCRIPT_FS_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
  * across every running script. Bounds the HOST-side (extension-host) transient
  * allocation at ~`SCRIPT_FS_MAX_CONCURRENT_READS × SCRIPT_FS_MAX_BYTES` (~16 MiB
  * at the current cap) no matter how many scripts are running or how many
- * `Promise.all(paths.map(nexus.fs.readText))` calls they issue: the size-hint
- * fix (`initialReadCapacity`) only bounds the allocation of a SINGLE read —
+ * `Promise.all(paths.map(nexus.fs.readText))` calls they issue: the size hint
+ * `initialReadCapacity` derives only bounds the allocation of a SINGLE read —
  * concurrent reads of files whose honest sizes are each near the cap still
  * multiply. (A script's own held RESULTS — the decoded strings it chooses to
  * keep around — live in the WORKER's heap; that's the script's own memory
  * budget to manage, not this module's problem. What this bounds is strictly
  * the main-thread-side buffer this module itself allocates per read.)
+ *
+ * GLOBAL, not per-run: a host-memory budget is a property of the host, so one
+ * script cannot fan out past it by virtue of being the only one running.
  */
 export const SCRIPT_FS_MAX_CONCURRENT_READS = 4;
 
 /**
- * Fixed (not configurable) deadline on the I/O every `nexus.fs` call performs
- * — see `raceAgainstReadDeadline`, which both call sites route through:
+ * Fixed (not configurable) deadline on the I/O every `nexus.fs` call performs.
+ * Neither `node:fs/promises` nor `vscode.workspace.fs` offers any way to
+ * cancel an in-flight call, so a hung remote FileSystemProvider or a `file:`
+ * read against a dead network mount produces a promise that simply never
+ * settles. Both entry points need the deadline, for different reasons:
  *
- *  - `scriptFsReadText`'s ADMITTED read (stat + read + decode, on BOTH the
- *    `file:` and non-`file:` branches), via `withReadDeadline`. Without a
- *    deadline, a single stalled read (a hung remote FileSystemProvider, a
- *    `file:` read against a dead network mount — neither of which
- *    `node:fs`/`vscode.workspace.fs` offers any cancellation for) would pin
- *    its `readSemaphore` slot forever: the slot is only ever released once
- *    the read settles, which never happens for a promise that never settles.
- *    Four such stalls exhaust `SCRIPT_FS_MAX_CONCURRENT_READS` entirely, and
- *    every later `nexus.fs.readText` call — from ANY session, not just the
- *    stalled one's — queues indefinitely behind them.
- *  - `scriptFsExists`'s `stat` (round 15). No semaphore slot is at stake
- *    there — that call is deliberately ungated, see its own comment — but
- *    the SCRIPT is: a `stat` against the same hung provider never settles
- *    either, so `await nexus.fs.exists(...)` would simply never return,
- *    stalling the run until its max-runtime kill, and every concurrent
- *    `exists()` would pile up another pending provider operation (each
- *    pinning this call's captured run-record references) with nothing to
- *    ever retire them. Same 30s, for the same reason it applies to a read: a
- *    script must never block forever on a dead provider.
+ *  - `scriptFsReadText`'s admitted read would otherwise pin its permit
+ *    forever, and `SCRIPT_FS_MAX_CONCURRENT_READS` such stalls would make
+ *    every later `nexus.fs.readText` — from ANY session, not just the stalled
+ *    one's — queue indefinitely behind them.
+ *  - `scriptFsExists`'s `stat` holds no permit (see its own comment), but the
+ *    SCRIPT is what hangs: `await nexus.fs.exists(...)` would never return,
+ *    stalling the run until its max-runtime kill, while every concurrent
+ *    probe piles up another pending provider operation nothing will retire.
  */
 export const SCRIPT_FS_READ_TIMEOUT_MS = 30_000;
 
 /**
- * Cap on DETACHED reads whose semaphore permit has already been released
- * back to the pool after a `SCRIPT_FS_READ_TIMEOUT_MS` timeout, but whose
- * underlying I/O (open handle + in-flight buffer) is still running to
- * completion in the background — see `withReadDeadline`. Releasing a timed-
- * out read's permit immediately (round 10) restores LIVENESS — a handful of
- * hung reads no longer starve every other `nexus.fs` call — but taken alone
- * it defeats the MEMORY budget `SCRIPT_FS_MAX_CONCURRENT_READS` exists to
- * enforce: a script that keeps fanning out slow reads gets a fresh batch of
- * `SCRIPT_FS_MAX_CONCURRENT_READS` admitted every `SCRIPT_FS_READ_TIMEOUT_MS`,
- * each leaving its own orphaned handle/buffer behind — an unbounded number of
- * detached operations, accumulating forever. This constant re-bounds that:
- * once `SCRIPT_FS_MAX_ORPHANED_READS` orphans are already in flight, a NEWLY
- * timed-out read's permit is held (not released) until ITS OWN orphaned work
- * finally settles — trading liveness back for memory pressure, in the same
- * direction `SCRIPT_FS_MAX_CONCURRENT_READS` already trades throughput for
- * memory pressure.
+ * Cap on DETACHED reads: those whose permit has already gone back to the pool
+ * after a `SCRIPT_FS_READ_TIMEOUT_MS` timeout, but whose underlying I/O (open
+ * handle + in-flight buffer) is still running to completion in the background.
  *
- * INVARIANT this buys: host-side in-flight read buffers are bounded by
- * `SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS` (12 at
- * current constants, ~48 MiB worst case at `SCRIPT_FS_MAX_BYTES`), while
- * liveness (a fresh, healthy read is never stuck behind a stall) survives up
- * to `SCRIPT_FS_MAX_ORPHANED_READS` simultaneous stalls — beyond that, the
- * pool DEGRADES TEMPORARILY (a new caller queues, same as before round 10
- * existed) rather than the detached-operation count growing without bound.
- * "Temporarily" — round 13: a permit-holding read that timed out while the
- * orphan pool was full doesn't just sit there forever even after orphan
- * capacity reopens; see `heldReads` / `promoteHeldReads()` below. The
- * invariant itself (bounded at `SCRIPT_FS_MAX_CONCURRENT_READS +
- * SCRIPT_FS_MAX_ORPHANED_READS` total detached operations) is unchanged by
- * promotion — it only ever converts a HELD slot into an ORPHAN slot, never
- * adds a new one.
+ * Handing a timed-out read's permit back immediately is what keeps a handful
+ * of stalls from starving every other `nexus.fs` call — but on its own it
+ * defeats the memory budget `SCRIPT_FS_MAX_CONCURRENT_READS` exists to
+ * enforce: a script that keeps fanning out slow reads would get a fresh batch
+ * admitted every `SCRIPT_FS_READ_TIMEOUT_MS`, each leaving its own handle and
+ * buffer behind, with nothing bounding the pile. Past this cap the scheduler
+ * withholds a newly timed-out read's permit instead — trading liveness back
+ * for memory pressure, the same direction `SCRIPT_FS_MAX_CONCURRENT_READS`
+ * already trades throughput for it — and restores it as soon as detachment
+ * capacity reopens.
+ *
+ * Net bound: host-side in-flight read buffers never exceed
+ * `SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS` (12 here,
+ * ~48 MiB worst case at `SCRIPT_FS_MAX_BYTES`), while liveness survives up to
+ * `SCRIPT_FS_MAX_ORPHANED_READS` simultaneous stalls. See
+ * `readSlotScheduler.ts` for how both halves are enforced.
  */
 export const SCRIPT_FS_MAX_ORPHANED_READS = 8;
 
-/**
- * Count of currently-detached (permit already released, I/O still running)
- * timed-out reads. Global — see `readSemaphore`'s doc comment for why a
- * host-memory budget is per-host, not per-run.
- */
-let orphanedReads = 0;
-
-/**
- * FIFO of reads that timed out while the orphan pool was already full (the
- * "beyond capacity" branch in `withReadDeadline`) and are therefore still
- * HOLDING their semaphore permit, bound to their own hung `work`. Round 13:
- * without this list, once the ORIGINAL orphans that filled the pool
- * eventually settle — freeing orphan capacity — these permit-holding reads
- * have no way to notice; they'd sit on their held permit until their OWN
- * (possibly never-settling) work finishes, leaving the pool fully degraded
- * (every new call queues) even though `orphanedReads` has dropped back to 0.
- * `promoteHeldReads()` drains this list, oldest-first, whenever room opens
- * up — converting a HELD permit into an ORPHAN (permit handed back to the
- * pool, the read's own hung work now counted against
- * `SCRIPT_FS_MAX_ORPHANED_READS` instead), never adding a new detached slot.
- */
-const heldReads: Array<{ promoted: boolean; loggedPath: string; release: () => void }> = [];
-
-/**
- * Read-only view of the module-global detached-read pool. Exported for unit
- * tests, and the ONLY way promotion ORDER can be checked at all: every other
- * effect of the pool is order-invariant. Each held entry releases its permit
- * exactly once, at `min(promotion time, its own settlement time)`, and a
- * promoted entry's settlement immediately promotes the next one — so permit
- * availability, admitted-read counts, orphan counts and audit output are
- * IDENTICAL whether `promoteHeldReads()` drains oldest-first or newest-first.
- * Only the identity of who is still waiting differs, which is what
- * `heldPaths` (oldest first — index 0 is promoted next) exposes.
- */
-export function scriptFsPoolSnapshot(): { orphanedReads: number; heldPaths: string[] } {
-  return { orphanedReads, heldPaths: heldReads.map((entry) => entry.loggedPath) };
+function createReadSlotScheduler(): ReadSlotScheduler {
+  return new ReadSlotScheduler({
+    maxConcurrent: SCRIPT_FS_MAX_CONCURRENT_READS,
+    deadlineMs: SCRIPT_FS_READ_TIMEOUT_MS,
+    maxOrphaned: SCRIPT_FS_MAX_ORPHANED_READS
+  });
 }
 
-/**
- * Promotes as many `heldReads` entries into orphans as there's currently
- * room for — called everywhere `orphanedReads` is decremented, since a
- * decrement is the only thing that can ever open up room. Each promotion:
- * removes the entry from `heldReads` and flips `promoted` to `true` (this,
- * plus the fact the entry's own `work.finally` handler in `withReadDeadline`
- * reads that flag exactly once when `work` finally settles, is what keeps
- * the eventual release/decrement exactly-once despite the flag being
- * flipped from OUTSIDE that handler — no separate "already handled" guard
- * needed), increments `orphanedReads`, and calls the entry's own `release`
- * — handing the permit back to the pool immediately, exactly as if this read
- * had taken the "under capacity" branch directly instead of having to wait
- * behind a full orphan pool first.
- */
-function promoteHeldReads(): void {
-  while (orphanedReads < SCRIPT_FS_MAX_ORPHANED_READS && heldReads.length > 0) {
-    const entry = heldReads.shift()!;
-    entry.promoted = true;
-    orphanedReads++;
-    entry.release();
-  }
-}
+/** One per host, for the reason `SCRIPT_FS_MAX_CONCURRENT_READS` is global. */
+let readSlots = createReadSlotScheduler();
 
 /**
- * Tiny FIFO async semaphore — the classic promise-queue pattern, no deps.
- * `acquire()` resolves once a slot is free (immediately if one already is,
- * otherwise once an earlier waiter's slot is `release()`d, in queue order).
- * The caller MUST `release()` exactly once per `acquire()` — normally from a
- * `finally`, so a throw can't leak the slot forever. Exported for direct unit
- * tests; scoped to a single module-level instance below (see
- * `SCRIPT_FS_MAX_CONCURRENT_READS`'s doc comment for why GLOBAL, not per-run).
+ * Installs a fresh scheduler and hands it back. Exists so a test can start
+ * from a known-empty machine and inspect it directly: detached work outlives
+ * the call that started it by design, so without this a read left in flight by
+ * one test would charge its capacity against every test after it.
  */
-export interface Semaphore {
-  acquire(): Promise<void>;
-  release(): void;
+export function resetReadSlotScheduler(): ReadSlotScheduler {
+  readSlots = createReadSlotScheduler();
+  return readSlots;
 }
-
-export function createSemaphore(limit: number): Semaphore {
-  let available = limit;
-  const queue: Array<() => void> = [];
-  return {
-    acquire(): Promise<void> {
-      if (available > 0) {
-        available--;
-        return Promise.resolve();
-      }
-      return new Promise<void>((resolve) => queue.push(resolve));
-    },
-    release(): void {
-      const next = queue.shift();
-      // Hand the slot straight to the next FIFO waiter rather than
-      // incrementing `available` and letting it race a fresh `acquire()` —
-      // this is what makes queueing order (FIFO) actually meaningful.
-      if (next) next();
-      else available++;
-    }
-  };
-}
-
-/** Global — a host-memory budget is per-host, not per-run. See the doc comment on `SCRIPT_FS_MAX_CONCURRENT_READS`. */
-const readSemaphore = createSemaphore(SCRIPT_FS_MAX_CONCURRENT_READS);
 
 export interface ScriptFsContext {
   scriptUri: vscode.Uri;
@@ -362,9 +269,9 @@ export async function boundedReadFile(fsPath: string, maxBytes: number, sizeHint
  * both entry points then use as their target AND as the value every subsequent
  * audit line names.
  *
- * Pure — no I/O, no allocation, and deliberately NOT gated on
- * `readSemaphore`: an already-doomed InvalidPath/NoScriptDir call has no
- * reason to wait behind slow reads to be told so.
+ * Pure — no I/O, no allocation, and deliberately NOT gated on the read
+ * scheduler: an already-doomed InvalidPath/NoScriptDir call has no reason to
+ * wait behind slow reads to be told so.
  *
  * Every refusal here is PRE-resolution, so its log line and thrown message
  * name the RAW requested value — there is no resolved path to name yet. Past
@@ -403,261 +310,69 @@ function validateAndResolve(requested: unknown, ctx: ScriptFsContext, method: "r
 export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext): Promise<string> {
   const resolvedPath = validateAndResolve(requested, ctx, "readText");
 
-  // Cheap early-out: the run already ended (this call didn't even reach the
-  // semaphore yet) — don't bother queueing behind slow reads for a session
+  // Cheap early-out: the run already ended (this call hasn't queued for a
+  // permit yet) — don't bother waiting behind slow reads for a session
   // nobody's watching anymore.
   if (ctx.isAborted()) {
     throw makeAbortedError(ctx, "readText", resolvedPath);
   }
 
-  // Gate the actual read (both branches — the non-file branch materializes
-  // up to the cap via workspace.fs.readFile too) on the global concurrency
-  // semaphore. Everything above this point is pure validation — no I/O, no
-  // allocation — so it stays ungated; gating it would just make an
-  // already-doomed InvalidPath/NoScriptDir call wait behind slow reads for
-  // nothing. `readJson` is worker-side JSON.parse over exactly one
-  // `fs.readText` RPC call, so it never nests a second acquire inside this
-  // one — verified: there is no other gated call anywhere in this module.
-  await readSemaphore.acquire();
-  // Check AGAIN, immediately: this is the case the early-out above can't
-  // catch — the run was alive when this call queued, but died while it sat
-  // parked on the semaphore (the module-global semaphore doesn't know or
-  // care about individual runs). Release in the SAME tick, before any I/O —
-  // an admitted-but-now-orphaned read must never perform its read, write the
-  // normal audit line, or try to post its result to a worker that's already
-  // gone (dispatchRpc's `postMessage` tolerates that fine, but there's no
-  // reason to do the work at all).
-  if (ctx.isAborted()) {
-    readSemaphore.release();
-    throw makeAbortedError(ctx, "readText", resolvedPath);
-  }
-  // `withReadDeadline` OWNS permit release for every path from here on
-  // (normal settle, timeout with orphan capacity to spare, timeout beyond
-  // capacity) — see its doc comment. No `finally { readSemaphore.release() }`
-  // wrapper here: that would be a SECOND release path, and the whole point of
-  // round 11's restructuring is exactly-once release, not two `finally`
-  // blocks that could both fire.
-  if (ctx.scriptUri.scheme === "file") {
-    return await withReadDeadline(
-      (guardedCtx) => readLocalFileBounded(resolvedPath, resolvedPath, guardedCtx),
-      readSemaphore.release,
-      ctx,
-      resolvedPath
-    );
-  }
+  // Both branches materialize up to the cap in the extension host, so both
+  // are gated. Everything above this point is pure validation — no I/O, no
+  // allocation — so it stays ungated. `readJson` is worker-side JSON.parse
+  // over exactly one `fs.readText` RPC call, so it never nests a second
+  // admission inside this one: there is no other gated call in this module.
+  const read =
+    ctx.scriptUri.scheme === "file"
+      ? (guarded: ScriptFsContext) => readLocalFileBounded(resolvedPath, resolvedPath, guarded)
+      : (guarded: ScriptFsContext) => readRemoteFileBounded(uriOf(resolvedPath, ctx.scriptUri), resolvedPath, guarded);
 
-  const uri = uriOf(resolvedPath, ctx.scriptUri);
-  return await withReadDeadline(
-    (guardedCtx) => readRemoteFileBounded(uri, resolvedPath, guardedCtx),
-    readSemaphore.release,
-    ctx,
-    resolvedPath
-  );
+  return await readSlots.runGated({
+    label: resolvedPath,
+    // The case the early-out above cannot catch: the run was alive when this
+    // call queued and died while it sat in the FIFO (a host-wide scheduler
+    // knows nothing about individual runs). Refusing here, in the same tick
+    // the permit is granted and before any I/O, keeps an already-dead run's
+    // backlog from draining slowly through slots other sessions are waiting
+    // for. The scheduler hands the permit straight back.
+    onAdmitted: () => {
+      if (ctx.isAborted()) throw makeAbortedError(ctx, "readText", resolvedPath);
+    },
+    run: (logAllowed) => read(withGuardedLog(ctx, logAllowed)),
+    timeoutError: () => readDeadlineError(ctx, "readText", resolvedPath)
+  });
 }
 
 /**
- * The deadline race itself — the part `nexus.fs.readText` and
- * `nexus.fs.exists` genuinely share, and nothing more. `readText` reaches it
- * through `withReadDeadline` below, which layers permit ownership and orphan
- * accounting on top; `exists` calls it DIRECTLY, because it has neither of
- * those things to manage (see `scriptFsExists`). Two responsibilities live
- * here because both callers need exactly these:
- *
- *  1. THE DEADLINE. `work` is raced against `SCRIPT_FS_READ_TIMEOUT_MS` and
- *     the caller always gets a `ReadFailed` "timed out" rejection when the
- *     deadline wins — a script must never block forever on a dead provider,
- *     whether what reached it was a bounded read or a bare `stat`. `work`
- *     itself is never cancelled (neither `node:fs/promises` nor
- *     `vscode.workspace.fs` offers any way to abort an in-flight call), so it
- *     keeps running detached from this call no matter which branch wins;
- *     `onDeadline` is where a caller that has something to hand back or
- *     bound because of that does it.
- *
- *  2. AUDIT OUTPUT BELONGS ONLY TO THE BRANCH THAT WINS THE RACE (round 12).
- *     Without this, a detached `work` continuation that settles AFTER its own
- *     deadline already fired would still write its own audit line — a success
- *     line (`readText`'s byte count, `exists`'s `→ true`/`→ false`) or a
- *     SECOND failure line via `fail()` — for a call whose result was already
- *     discarded, producing a contradictory entry (sometimes after the run's
- *     own `end` line). `workFactory` therefore receives a `ctx` whose `log`
- *     no-ops once `raceState.deadlineWon` flips — set as the very first thing
- *     the deadline callback does, before it logs its OWN `ReadFailed` line
- *     (that line uses the UNGUARDED `ctx`, since the deadline branch is
- *     always the one allowed to log). `fail()` routes through whatever `ctx`
- *     it's given, so a late failure inside `work` — which only ever sees the
- *     GUARDED `ctx` — is suppressed exactly like a late success: the error
- *     object is still constructed and still rejects `work`, it just never
- *     logs. On the normal (work-wins) path `deadlineWon` never flips, so the
- *     guard is a pure passthrough — zero behavior change.
- *
- * `method` picks the verb the deadline's own audit line is filed under, so an
- * `exists()` timeout reads `fs.exists <path> → ReadFailed` rather than being
- * misattributed to `fs.readText`.
- *
- * `onDeadline` runs exactly once, only if the deadline wins, AFTER
- * `deadlineWon` is already set and BEFORE the rejection. It receives the
- * now-detached `work` so a caller can track its eventual settlement. Note
- * that `work` is always observed by the `Promise.race` below, so `work`
- * proper can never surface as an unhandled rejection — only a NEW promise
- * derived from it inside `onDeadline` (e.g. `work.finally(...)`) needs its
- * own `.catch`.
+ * A view of `ctx` whose audit line is suppressed once this call's deadline has
+ * fired. Handed to the read/probe itself, never to the deadline branch: a
+ * detached operation that settles after its result was already discarded must
+ * not write a success line (a byte count, a `→ true`) or a second failure line
+ * for a call the caller already saw fail — sometimes landing after the run's
+ * own `end` line. `fail()` routes through whatever `ctx` it is given, so a
+ * late failure is suppressed exactly like a late success: the error object is
+ * still built and still rejects the detached work, it just never logs.
  */
-async function raceAgainstReadDeadline<T>(
-  workFactory: (ctx: ScriptFsContext) => Promise<T>,
-  ctx: ScriptFsContext,
-  loggedPath: string,
-  method: "readText" | "exists",
-  onDeadline: (work: Promise<T>) => void
-): Promise<T> {
-  const raceState = { deadlineWon: false };
-  const guardedCtx: ScriptFsContext = {
+function withGuardedLog(ctx: ScriptFsContext, logAllowed: () => boolean): ScriptFsContext {
+  return {
     ...ctx,
     log: (text: string) => {
-      if (!raceState.deadlineWon) {
-        ctx.log(text);
-      }
+      if (logAllowed()) ctx.log(text);
     }
   };
-  const work = workFactory(guardedCtx);
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      // MUST be set before anything else below — a `work` continuation that
-      // happens to settle in this very tick (e.g. it was already queued as a
-      // microtask when the timer fired) must never win the race to log.
-      raceState.deadlineWon = true;
-      onDeadline(work);
-      const message = `${loggedPath}: timed out after ${SCRIPT_FS_READ_TIMEOUT_MS / 1000}s`;
-      // The CALLER's rejection is the same either way — only the audit line is
-      // conditional. A run that ended while this call was already in flight has
-      // no audit trail worth appending to: the line would land after that run's
-      // own `end` line, for a session nobody is watching, exactly the noise
-      // `makeAbortedError` avoids for a read that never started.
-      reject(
-        ctx.isAborted()
-          ? makeFsError("ReadFailed", message)
-          : fail(ctx, method, loggedPath, "ReadFailed", message)
-      );
-    }, SCRIPT_FS_READ_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([work, deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
- * `nexus.fs.readText`'s wrapper around that race: it adds the two things a
- * BUFFER-HOLDING, SEMAPHORE-GATED read needs and an existence probe does not
- * — hence the split, so `scriptFsExists` can take the deadline without any of
- * the machinery below being reachable for it at all (round 15). Deliberately
- * takes `release` as a parameter rather than a "should I track orphans?"
- * flag: a caller with no permit doesn't pass a no-op release, it doesn't call
- * this function.
- *
- * OWNS `release` (in production, `readSemaphore.release`) for every path out
- * of this function —
- * exactly once, never split across two `finally` blocks that could both
- * fire. The CALLER always gets its `ReadFailed` "timed out" rejection at the
- * deadline, unchanged from round 10 — a script must never block on a dead
- * provider. What round 11 changes is what happens to the permit and the
- * orphaned `work` promise itself once that deadline fires:
- *
- *  - Common case (`orphanedReads` under `SCRIPT_FS_MAX_ORPHANED_READS`): the
- *    permit is released IMMEDIATELY — liveness preserved, exactly like round
- *    10 — `work` is tracked as one more orphan, and its eventual settlement
- *    (however long that takes, if ever) just decrements the orphan counter;
- *    its actual result/error is discarded either way (the `.catch(() => {})`
- *    exists ONLY to keep that discard from surfacing as an unhandled
- *    rejection — `work` itself is still always observed by the `Promise.race`
- *    inside `raceAgainstReadDeadline`, so `work` proper is never unhandled;
- *    only the NEW promise `work.finally(...)` returns needs this).
- *  - Pathological case (`SCRIPT_FS_MAX_ORPHANED_READS` orphans already in
- *    flight): the permit is NOT released now — it goes on the `heldReads`
- *    FIFO instead. From there, ONE of two things eventually happens: either
- *    THIS read's own `work` settles first (unchanged from round 11 — release
- *    runs, exactly once, and the entry removes itself from `heldReads`), or
- *    — round 13 — orphan capacity reopens first (an earlier orphan settles)
- *    and `promoteHeldReads()` promotes this entry: the permit is released
- *    RIGHT THEN (recovering liveness) while this read's still-hung `work`
- *    now occupies an orphan slot instead, so when `work` finally does settle
- *    it decrements the orphan counter rather than releasing a permit a
- *    second time. Either way the pool degrades only as long as it has to
- *    (new callers queue, same as pre-round-10 behavior, while ALL
- *    `SCRIPT_FS_MAX_ORPHANED_READS + SCRIPT_FS_MAX_CONCURRENT_READS` slots
- *    are genuinely occupied) rather than the detached-operation count
- *    growing without bound OR the pool staying degraded longer than that.
- *
- * `work` itself is still never cancelled — neither `node:fs/promises` nor
- * `vscode.workspace.fs` offers a way to abort an in-flight call — so the
- * underlying I/O keeps running to completion (or forever) detached from this
- * call regardless of which branch above fires; see `SCRIPT_FS_MAX_ORPHANED_READS`'s
- * doc comment for the bound this now puts on how much of that can pile up.
+ * The rejection a caller gets when its I/O outlives `SCRIPT_FS_READ_TIMEOUT_MS`
+ * — identical whether or not the run is still alive; only the audit line is
+ * conditional. A run that ended while this call was in flight has no trail
+ * worth appending to, exactly as `makeAbortedError` reasons for a read that
+ * never started. `method` keeps an `exists()` timeout filed under `fs.exists`
+ * rather than misattributed to `fs.readText`.
  */
-async function withReadDeadline<T>(
-  workFactory: (ctx: ScriptFsContext) => Promise<T>,
-  release: () => void,
-  ctx: ScriptFsContext,
-  loggedPath: string
-): Promise<T> {
-  // Set the instant the deadline fires — lets the `finally` below know NOT to
-  // release a second time; the timeout branch has already taken over that
-  // responsibility (immediately, or deferred to `work`'s own settlement).
-  let timedOut = false;
-  try {
-    return await raceAgainstReadDeadline(workFactory, ctx, loggedPath, "readText", (work) => {
-      timedOut = true;
-      if (orphanedReads < SCRIPT_FS_MAX_ORPHANED_READS) {
-        orphanedReads++;
-        work
-          .finally(() => {
-            orphanedReads--;
-            // A decrement is the only thing that can ever open up room to
-            // promote a permit-holding read off `heldReads` — see round 13.
-            promoteHeldReads();
-          })
-          .catch(() => {
-            /* swallow — see doc comment above */
-          });
-        release();
-      } else {
-        // Beyond capacity — hold the permit, but make it PROMOTABLE: if
-        // orphan capacity reopens before this read's own `work` settles,
-        // `promoteHeldReads()` flips `promoted` and releases on our behalf,
-        // instead of this read having to wait on its own (possibly
-        // never-settling) `work`.
-        const heldEntry: { promoted: boolean; loggedPath: string; release: () => void } = { promoted: false, loggedPath, release };
-        heldReads.push(heldEntry);
-        work
-          .finally(() => {
-            if (heldEntry.promoted) {
-              // Already promoted — the permit was released back at
-              // promotion time; `work` settling now just retires the orphan
-              // slot it was given instead, exactly like a direct ("under
-              // capacity") orphan's own decrement does.
-              orphanedReads--;
-              promoteHeldReads();
-            } else {
-              // Settled before any promotion — still sitting in `heldReads`;
-              // remove itself (nothing left to promote there) and release
-              // the permit exactly once, unchanged from round 11.
-              const idx = heldReads.indexOf(heldEntry);
-              if (idx !== -1) heldReads.splice(idx, 1);
-              release();
-            }
-          })
-          .catch(() => {
-            /* swallow — see doc comment above */
-          });
-      }
-    });
-  } finally {
-    if (!timedOut) {
-      release();
-    }
-  }
+function readDeadlineError(ctx: ScriptFsContext, method: "readText" | "exists", loggedPath: string): Error {
+  const message = `${loggedPath}: timed out after ${SCRIPT_FS_READ_TIMEOUT_MS / 1000}s`;
+  return ctx.isAborted() ? makeFsError("ReadFailed", message) : fail(ctx, method, loggedPath, "ReadFailed", message);
 }
 
 /**
@@ -826,53 +541,40 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
     throw makeAbortedError(ctx, "exists", resolvedPath);
   }
 
-  // No read hazard here — this is a plain existence probe, so `vscode.workspace.fs.stat`
-  // (uniformly, for every scheme) is fine: no body is ever pulled into memory.
+  // No read hazard here — this is a plain existence probe, so
+  // `vscode.workspace.fs.stat` (uniformly, for every scheme) is fine: no body
+  // is ever pulled into memory.
   //
-  // It DOES still need the deadline, though (round 15): a stalled remote
-  // FileSystemProvider's `stat()` hangs exactly like its `readFile()` does, and
-  // without a deadline this `await` never returns — the script blocks until its
-  // max-runtime kill, while every concurrent `exists()` piles up another pending
-  // provider operation that nothing will ever retire. On timeout the caller gets a
-  // `ReadFailed` throw, deliberately NOT `false`: "I couldn't tell" and "it is
-  // definitely not there" justify opposite actions in a script, so conflating them
-  // is the same class of bug as the out-of-scope-probe-returns-false one guarded
-  // above.
+  // It DOES still need the deadline: a stalled provider's `stat()` hangs
+  // exactly like its `readFile()` does. On timeout the caller gets a
+  // `ReadFailed` throw, deliberately NOT `false` — "I couldn't tell" and "it
+  // is definitely not there" justify opposite actions in a script, so
+  // conflating them is the same class of bug as the out-of-scope-probe-
+  // returns-false one guarded above.
   //
-  // WHY THIS CALLS THE RACE DIRECTLY, NOT `withReadDeadline`: that wrapper exists to
-  // own a semaphore permit and to charge a timed-out read against
-  // `SCRIPT_FS_MAX_ORPHANED_READS`. Neither applies here, and neither should be
-  // cargo-culted on later:
-  //  - NO PERMIT. This call is deliberately ungated (nothing above acquires
-  //    `readSemaphore`) — a `stat` allocates no buffer, so there is nothing for the
-  //    concurrency gate to bound and no reason to make an existence probe queue
-  //    behind slow reads. With no permit acquired there is nothing to release.
-  //  - NO ORPHAN SLOT. `SCRIPT_FS_MAX_ORPHANED_READS` bounds host-side READ BUFFERS
-  //    left in flight behind timed-out reads (see its doc comment) — a budget a
-  //    bufferless `stat` never spends. Charging detached stats to it would steal
-  //    capacity from the genuine buffer-holding orphans it exists to cap, degrading
-  //    the read pool to pay for memory that was never allocated. (A detached stat
-  //    does still pin this call's captured `ctx` until it settles, exactly as a
-  //    detached read does — that residue is the same trade round 11 already
-  //    accepted, and it is not what the orphan slots are counting.)
+  // WHY UNGATED, and why that must not be "tidied up" later into the gated
+  // path: a `stat` allocates no buffer, so there is nothing for the
+  // concurrency gate to bound and no reason to make an existence probe queue
+  // behind slow reads — and `SCRIPT_FS_MAX_ORPHANED_READS` budgets host-side
+  // READ BUFFERS, which a bufferless `stat` never spends. Charging detached
+  // stats to it would steal capacity from the genuine buffer-holding reads it
+  // exists to cap, degrading the pool to pay for memory nobody allocated. (A
+  // detached stat does still pin this call's captured `ctx` until it settles,
+  // exactly as a detached read does; that residue is not what the detached
+  // slots are counting.)
   const uri = uriOf(resolvedPath, ctx.scriptUri);
-  return await raceAgainstReadDeadline(
-    (guardedCtx) => statExists(uri, resolvedPath, guardedCtx),
-    ctx,
-    resolvedPath,
-    "exists",
-    () => {
-      /* nothing detached to bound and no permit to hand back — see above */
-    }
-  );
+  return await readSlots.runUngated({
+    run: (logAllowed) => statExists(uri, resolvedPath, withGuardedLog(ctx, logAllowed)),
+    timeoutError: () => readDeadlineError(ctx, "exists", resolvedPath)
+  });
 }
 
 /**
  * The existence probe proper, run as the deadline race's `work`. Any entry
  * type — file, directory, symlink — counts; `readText` on a directory still
- * fails, but this is a plain existence probe. `ctx` here is the GUARDED
- * context the race passes in, so a late settlement after the deadline already
- * fired logs nothing — the same round-12 suppression
+ * fails, but this is a plain existence probe. `ctx` here is the guarded
+ * context (see `withGuardedLog`), so a late settlement after the deadline
+ * already fired logs nothing — the same suppression
  * `readLocalFileBounded`/`readRemoteFileBounded` get.
  */
 async function statExists(uri: vscode.Uri, loggedPath: string, ctx: ScriptFsContext): Promise<boolean> {

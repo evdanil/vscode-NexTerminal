@@ -39,7 +39,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     // tracks how many opens are in flight at once.
     stat: vi.fn(actual.stat),
     open: vi.fn(actual.open),
-    __realOpen: actual.open
+    __realOpen: actual.open,
+    __realStat: actual.stat
   };
 });
 
@@ -142,13 +143,13 @@ import {
   buildScriptFsScope,
   boundedReadFile,
   initialReadCapacity,
-  createSemaphore,
-  scriptFsPoolSnapshot,
+  resetReadSlotScheduler,
   SCRIPT_FS_MAX_CONCURRENT_READS,
   SCRIPT_FS_READ_TIMEOUT_MS,
   SCRIPT_FS_MAX_ORPHANED_READS,
   type ScriptFsContext
 } from "../../../src/services/scripts/scriptFs";
+import { createSemaphore, type ReadSlotScheduler } from "../../../src/services/scripts/readSlotScheduler";
 
 const statSpy = vscode.workspace.fs.stat as unknown as ReturnType<typeof vi.fn>;
 const readFileSpy = vscode.workspace.fs.readFile as unknown as ReturnType<typeof vi.fn>;
@@ -160,20 +161,50 @@ const nodeStatSpy = fsp.stat as unknown as ReturnType<typeof vi.fn>;
 const nodeOpenSpy = fsp.open as unknown as ReturnType<typeof vi.fn>;
 /** The real (un-wrapped) `open`, for tests that need to stay on real disk while still overriding the spy's `mockImplementation`. */
 const realNodeOpen = (fsp as unknown as { __realOpen: typeof fsp.open }).__realOpen;
+/** The real (un-wrapped) `stat`, for restoring the spy's default between tests. */
+const realNodeStat = (fsp as unknown as { __realStat: typeof fsp.stat }).__realStat;
 
 // -----------------------------------------------------------------------------
 // Fixture harness
 // -----------------------------------------------------------------------------
 
 let tmpRoot: string;
+/**
+ * The scheduler `scriptFsReadText` / `scriptFsExists` are running against for
+ * the current test — replaced per test so no detached read can carry its
+ * permit or its detached-slot charge into the next one.
+ */
+let readSlots: ReadSlotScheduler;
+/**
+ * Every gate handed out by `gateOpens` / `gateStats` this test. Released
+ * unconditionally in `afterEach` so a FAILING assertion can't strand a real
+ * `open()`/`stat()` mid-flight.
+ */
+const pendingGates: Array<{ resolve: () => void }> = [];
 
 beforeEach(async () => {
   vi.clearAllMocks();
   remoteFiles.clear();
+  readSlots = resetReadSlotScheduler();
   tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "nexus-scriptfs-"));
 });
 
 afterEach(async () => {
+  // Order matters: real timers first (a gate resolved under fake timers would
+  // never see its continuation run), then the gates, then a real-time margin
+  // for the freed I/O to finish before the fixture directory disappears.
+  vi.useRealTimers();
+  const released = pendingGates.splice(0);
+  released.forEach((gate) => gate.resolve());
+  // `mockReset` also drops any `mockImplementationOnce` a test queued but
+  // never consumed — those would otherwise apply to an unrelated later test.
+  nodeOpenSpy.mockReset();
+  nodeOpenSpy.mockImplementation(realNodeOpen as never);
+  nodeStatSpy.mockReset();
+  nodeStatSpy.mockImplementation(realNodeStat as never);
+  statSpy.mockReset();
+  readFileSpy.mockReset();
+  if (released.length > 0) await new Promise((resolve) => setTimeout(resolve, 50));
   await fsp.rm(tmpRoot, { recursive: true, force: true });
 });
 
@@ -210,10 +241,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 /**
  * A resolver-controlled promise — for mocking a "stalled" I/O call that a
  * test can release on demand (rather than a bare `new Promise(() => {})`,
- * which would hang FOREVER and, once round 11's orphan tracking exists,
- * leave `orphanedReads` permanently incremented for every OTHER test sharing
- * this file's module instance). Every test that stalls a call via this
- * helper MUST eventually resolve it before the test ends.
+ * which would hang FOREVER and leave its detached-read slot charged against
+ * the scheduler for the rest of the test). Every gate handed out by
+ * `gateOpens` / `gateStats` is released by the shared `afterEach`, so a
+ * failing assertion cannot strand one mid-flight.
  */
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -225,16 +256,14 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
 
 /** The still-permit-holding reads, oldest first, by fixture filename. */
 function heldPathNames(): string[] {
-  return scriptFsPoolSnapshot().heldPaths.map((p) => path.basename(p));
+  return readSlots.snapshot().held.map((p) => path.basename(p));
 }
 
 /**
  * Registers exactly `n` fresh `mockImplementationOnce` hangs on `nodeOpenSpy`,
- * each gated by its own `deferred()`. Callers MUST arrange for exactly `n`
- * real `open()` calls to consume these — registering more than will actually
- * be called leaves unconsumed `mockImplementationOnce` entries queued on the
- * shared spy, which `vi.clearAllMocks()` in `beforeEach` does NOT clear and
- * which would then apply to a later, unrelated test's `open()` calls.
+ * each gated by its own `deferred()`. Callers SHOULD arrange for exactly `n`
+ * real `open()` calls to consume these; every gate is tracked and released by
+ * the shared `afterEach` either way.
  */
 function gateOpens(n: number): Array<{ resolve: () => void }> {
   const gates = Array.from({ length: n }, () => deferred<void>());
@@ -244,6 +273,30 @@ function gateOpens(n: number): Array<{ resolve: () => void }> {
       return realNodeOpen(...args);
     });
   });
+  pendingGates.push(...gates);
+  return gates;
+}
+
+/**
+ * Hangs the next `n` `vscode.workspace.fs.stat` calls behind their own
+ * `deferred()` gate, answering "it's a file" once released — the stalled
+ * remote FileSystemProvider an `exists()` probe has to survive.
+ *
+ * `scriptFsExists` routes EVERY scheme through `vscode.workspace.fs.stat` (a
+ * bare existence probe pulls no body into memory, so it has no reason to take
+ * `readText`'s bounded native `file:` path), so gating this one spy covers the
+ * local fixtures too AND keeps them entirely in-memory — real disk I/O isn't
+ * guaranteed to settle inside a single fake-timer microtask flush.
+ */
+function gateStats(n: number): Array<{ resolve: () => void }> {
+  const gates = Array.from({ length: n }, () => deferred<void>());
+  gates.forEach((gate) => {
+    statSpy.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { type: FileType.File, ctime: 0, mtime: 0, size: 1 };
+    });
+  });
+  pendingGates.push(...gates);
   return gates;
 }
 
@@ -540,7 +593,7 @@ describe("createSemaphore — direct unit coverage (P1: host-side FIFO concurren
 });
 
 describe("scriptFsReadText — release-on-error, no deadlock across the concurrency gate (P1)", () => {
-  it("readSemaphore releases its slot even when the gated read throws — subsequent reads never deadlock behind a failing batch", async () => {
+  it("the read scheduler releases its permit even when the gated read throws — subsequent reads never deadlock behind a failing batch", async () => {
     // ⊘ releasing the semaphore only on the success path (e.g. no `finally`,
     // or a `release()` call placed only after `return text`) — every one of
     // the SCRIPT_FS_MAX_CONCURRENT_READS failing calls below would leak its
@@ -739,9 +792,9 @@ describe("scriptFsReadText — aborting the run drains its queued reads off the 
     expect(statSpy).not.toHaveBeenCalled();
   });
 
-  it("the OR'd predicate (round 10, P2 — the stopScript grace-race window): a queued read granted a permit while ONLY a stop has been requested (cleanedUp still false) is rejected Stopped and never opens the file", async () => {
+  it("the OR'd predicate (P2 — the stopScript grace-race window): a queued read granted a permit while ONLY a stop has been requested (cleanedUp still false) is rejected Stopped and never opens the file", async () => {
     // ⊘ `isAborted` wired to `record.cleanedUp` ALONE (dropping the
-    // `|| record.stopReason !== undefined` half added in round 10). In the
+    // `|| record.stopReason !== undefined` half). In the
     // real `stopScript`, `record.stopReason` is set SYNCHRONOUSLY at the very
     // top — before the up-to-100ms `worker.terminate()` grace race — while
     // `record.cleanedUp` only flips once `cleanupRun` runs, AFTER that race
@@ -801,7 +854,7 @@ describe("scriptFsReadText — aborting the run drains its queued reads off the 
   }, 10_000);
 });
 
-describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call must not pin its semaphore slot forever)", () => {
+describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pin its permit forever)", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -830,10 +883,9 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS + 1; i++) {
         nodeStatSpy.mockImplementationOnce(fakeStat);
       }
-      // Resolver-controlled, not a bare eternal hang — round 11 tracks these
-      // as orphans once their deadline fires, and this test releases them
-      // itself at the end so it doesn't leak into `orphanedReads` for every
-      // OTHER test sharing this file's module instance.
+      // Resolver-controlled, not a bare eternal hang — these become tracked
+      // orphans once their deadline fires, and this test releases them itself
+      // at the end so the pool is back at baseline before it finishes.
       const stallGates = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, () => deferred<void>());
       for (const gate of stallGates) {
         nodeOpenSpy.mockImplementationOnce(async (...args: Parameters<typeof realNodeOpen>) => {
@@ -879,8 +931,8 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       await expect(freshPromise).resolves.toBe("ok");
 
       // Release the orphans and let their real (now-harmless, discarded)
-      // disk I/O actually finish — this drains `orphanedReads` back to
-      // baseline before the next test runs.
+      // disk I/O actually finish — this drains the orphan count back to
+      // baseline before the assertions that follow.
       vi.useRealTimers();
       stallGates.forEach((gate) => gate.resolve());
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -910,9 +962,8 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
     vi.useFakeTimers();
     try {
       // Resolver-controlled, not a bare eternal hang — see `deferred`'s doc
-      // comment: round 11 tracks these as orphans, so this test releases
-      // them itself at the end to avoid leaking into `orphanedReads` for
-      // every OTHER test sharing this file's module instance.
+      // comment: these become tracked orphans once their deadline fires, so
+      // this test releases them itself at the end.
       const stallGates = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, () => deferred<void>());
       for (const gate of stallGates) {
         readFileSpy.mockImplementationOnce(async (uri: { path: string }) => {
@@ -948,7 +999,7 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       }
       await expect(freshPromise).resolves.toBe("ok");
 
-      // Drain `orphanedReads` back to baseline before the next test.
+      // Drain the orphan count back to baseline.
       vi.useRealTimers();
       stallGates.forEach((gate) => gate.resolve());
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -958,7 +1009,7 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
   }, 10_000);
 
   it("fast path — a normal (non-timed-out) read does not leak its deadline timer: setTimeout is cleared in the same tick the read settles", async () => {
-    // ⊘ dropping the `clearTimeout` from `withReadDeadline`'s `finally` (or
+    // ⊘ dropping the `clearTimeout` from the deadline race's `finally` (or
     // putting it only on the timeout branch) — the fast, common-case read
     // below would still succeed (this alone wouldn't fail), but the timer it
     // registered would never be cleared: `clearTimeoutSpy` would stay at 0
@@ -981,10 +1032,10 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
     }
   });
 
-  it("round 11, P1 — orphan capacity: a stalled read's permit releases immediately at the deadline AND its orphan slot returns to baseline once it settles", async () => {
-    // ⊘ round 10's implementation (unconditional immediate release, no
-    // orphan tracking at all) passes the FIRST half of this test too
-    // (liveness) — what specifically discriminates round 11 is the tail: a
+  it("P1 — orphan capacity: a stalled read's permit releases immediately at the deadline AND its orphan slot returns to baseline once it settles", async () => {
+    // ⊘ unconditional immediate release with no orphan tracking at all: that
+    // passes the FIRST half of this test too (liveness) — what specifically
+    // discriminates the accounting is the tail: a
     // fresh batch of exactly SCRIPT_FS_MAX_ORPHANED_READS new stalls, issued
     // only AFTER the original orphan settles, must ALL be able to release
     // their own permits (proving the counter genuinely returned to 0, not
@@ -1030,7 +1081,7 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       await expect(scriptFsReadText("healthy.txt", ctx)).resolves.toBe("ok");
 
       // Settle the orphan for real and give its (discarded) result time to
-      // land — this should decrement `orphanedReads` back to 0.
+      // land — this should decrement the orphan count back to 0.
       vi.useRealTimers();
       stallGate.resolve();
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1064,7 +1115,7 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
       // baseline genuinely reset — that would make this check pass either
       // way and defeat the discriminator. Gating them means admission can
       // ONLY come from the batch's own released permits, observed directly
-      // via the open() call count, exactly like the other round-11 tests.
+      // via the open() call count, exactly like the other orphan tests.
       const openCountBeforeProbes = nodeOpenSpy.mock.calls.length;
       const probeGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
       for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
@@ -1084,12 +1135,11 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
     }
   }, 20_000);
 
-  it("round 11, P1 — beyond capacity: once SCRIPT_FS_MAX_ORPHANED_READS orphans are already in flight, the NEXT timeout holds its permit instead of releasing it; settling that one orphan releases exactly one permit", async () => {
-    // ⊘ round 10's implementation (always release on timeout, no cap at
-    // all) — the discriminator is that the probe read below stays QUEUED
-    // (not admitted) right after the third wave times out; under the old
-    // always-release behavior it would be admitted immediately, exactly like
-    // waves 1 and 2 were.
+  it("P1 — beyond capacity: once SCRIPT_FS_MAX_ORPHANED_READS orphans are already in flight, the NEXT timeout holds its permit instead of releasing it; settling that one orphan releases exactly one permit", async () => {
+    // ⊘ always releasing on timeout, with no orphan cap at all — the
+    // discriminator is that the probe read below stays QUEUED (not admitted)
+    // right after the third wave times out; under always-release it would be
+    // admitted immediately, exactly like waves 1 and 2 were.
     const { ctx, scriptDir } = await makeCtx();
     const totalStalls = SCRIPT_FS_MAX_ORPHANED_READS + SCRIPT_FS_MAX_CONCURRENT_READS; // 8 orphans + 4 held permits
     for (let i = 0; i < totalStalls; i++) {
@@ -1172,15 +1222,14 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
     }
   }, 20_000);
 
-  it("round 11, P1 — unbounded-accumulation discriminator: repeated timeout waves plateau at SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS simultaneously-open handles, never beyond", async () => {
-    // ⊘ round 10's implementation (always release immediately, no orphan
-    // cap): each SCRIPT_FS_READ_TIMEOUT_MS window admits
+  it("P1 — unbounded-accumulation discriminator: repeated timeout waves plateau at SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS simultaneously-open handles, never beyond", async () => {
+    // ⊘ always releasing immediately, with no orphan cap: each
+    // SCRIPT_FS_READ_TIMEOUT_MS window would admit
     // SCRIPT_FS_MAX_CONCURRENT_READS MORE calls regardless of how many
     // orphans have already accumulated — 5 waves would reach 20
-    // concurrently-open (never-closed) handles, well past 12. Manually
-    // verified (mutation testing, see round-11 report) that reverting the
-    // fix makes `nodeOpenSpy.mock.calls.length` climb past the bound
-    // asserted below instead of plateauing at it.
+    // concurrently-open (never-closed) handles, well past 12. Verified by
+    // mutation: ignoring the cap makes `nodeOpenSpy.mock.calls.length` climb
+    // past the bound asserted below instead of plateauing at it.
     const { ctx, scriptDir } = await makeCtx();
     const cap = SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS; // 12
     const attempted = 5 * SCRIPT_FS_MAX_CONCURRENT_READS; // 20 — deliberately more than can ever be admitted
@@ -1232,13 +1281,13 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
   }, 20_000);
 });
 
-describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13: a permit-holding read is promoted into an orphan once orphan capacity reopens)", () => {
+describe("scriptFsReadText — orphan-pool recovery via promotion (P2: a permit-holding read is promoted into an orphan once orphan capacity reopens)", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
 
   /**
-   * Drives the pool into the fully-degraded state round 13 exists to
+   * Drives the pool into the fully-degraded state promotion exists to
    * recover from: SCRIPT_FS_MAX_ORPHANED_READS orphans (two waves, permits
    * already released) plus SCRIPT_FS_MAX_CONCURRENT_READS MORE reads that
    * time out while the orphan pool is already full (a third wave — these
@@ -1274,11 +1323,11 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13:
   }
 
   it("recovery discriminator: settling the original orphans WITHOUT touching the held reads promotes them — the queued probe is admitted", async () => {
-    // ⊘ the pre-round-13 implementation (no heldReads / promoteHeldReads at
-    // all): the probe below would stay queued FOREVER — nothing ever
+    // ⊘ a scheduler with no held queue and no promotion at all: the probe
+    // below would stay queued FOREVER — nothing ever
     // notices that orphan capacity reopened once the 8 originals settle, so
     // none of the 4 permit-holding reads ever hand their slot back, even
-    // though `orphanedReads` has dropped to 0. `waitFor`'s own timeout (well
+    // though the orphan count has dropped to 0. `waitFor`'s own timeout (well
     // under this test's 20s limit) turns that "forever" into a clean,
     // reasonably fast test failure rather than an actual hang.
     const { ctx, scriptDir } = await makeCtx();
@@ -1346,7 +1395,7 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13:
     // held reads' real I/O regardless of whether promotion exists at all
     // (their own `work.finally(release)` still fires on an unmodified
     // implementation too), which would make the test pass under BOTH the
-    // fixed and the pre-round-13 implementation. Instead: promote first
+    // fixed and the promotion-free implementation. Instead: promote first
     // (settle ONLY the originals), fully RE-OCCUPY the pool with the 4
     // permits promotion freed, and only THEN settle the promoted reads —
     // so a double-release has something concrete (an already-occupied slot)
@@ -1429,20 +1478,20 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13:
   }, 20_000);
 
   it("promotion order is OLDEST-FIRST: each reopened orphan slot goes to the read that has been holding its permit longest", async () => {
-    // ⊘ `promoteHeldReads()` draining `heldReads` newest-first (`pop()`
-    // instead of `shift()`), which the doc comments on `heldReads` /
-    // `promoteHeldReads` explicitly promise against: under LIFO the OLDEST
+    // ⊘ the scheduler draining its held queue newest-first (`pop()` instead
+    // of taking index 0), which its FIFO-promotion invariant explicitly
+    // promises against: under LIFO the OLDEST
     // permit-holding read — the one that has already waited longest, and
     // whose own `work` is the most likely to never settle — is promoted LAST,
     // so a steady trickle of reopening orphan capacity can starve it
     // indefinitely while newer arrivals cycle through ahead of it.
     //
-    // WHY THIS ASSERTS ON `scriptFsPoolSnapshot()` RATHER THAN ON PERMITS,
+    // WHY THIS ASSERTS ON THE SCHEDULER SNAPSHOT RATHER THAN ON PERMITS,
     // open() COUNTS OR LOGS: promotion order has no other observable. Each
     // held entry releases its permit exactly once, at `min(promotion time,
     // own settle time)`, and a promoted entry's own settlement immediately
     // cascades into promoting the next one — so the number of free permits,
-    // the number of admitted reads, `orphanedReads`, and the audit output are
+    // the number of admitted reads, the orphan count, and the audit output are
     // all bit-identical under `shift()` and `pop()`. Only WHO is still
     // waiting differs. Verified by mutation: swapping `shift()` for `pop()`
     // leaves the entire rest of this file green and fails only here.
@@ -1451,7 +1500,7 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13:
       await fsp.writeFile(path.join(scriptDir, `orphan${i}.txt`), "x");
     }
     // Distinguishable held reads: held0 is admitted (and therefore times out,
-    // and therefore joins `heldReads`) first, held3 last.
+    // and therefore joins the held queue) first, held3 last.
     for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
       await fsp.writeFile(path.join(scriptDir, `held${i}.txt`), "x");
     }
@@ -1483,7 +1532,7 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13:
       ];
       for (let step = 0; step < SCRIPT_FS_MAX_CONCURRENT_READS; step++) {
         orphanGates[step].resolve();
-        await waitFor(() => scriptFsPoolSnapshot().heldPaths.length === SCRIPT_FS_MAX_CONCURRENT_READS - step - 1);
+        await waitFor(() => readSlots.snapshot().held.length === SCRIPT_FS_MAX_CONCURRENT_READS - step - 1);
         expect(heldPathNames()).toEqual(expectedRemaining[step]);
       }
     } finally {
@@ -1535,15 +1584,14 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13:
   }, 20_000);
 });
 
-describe("scriptFsReadText — audit suppression for a detached read that settles AFTER its own deadline (P2, round 12: only the branch that wins the race may log)", () => {
+describe("scriptFsReadText — audit suppression for a detached read that settles AFTER its own deadline (P2: only the branch that wins the race may log)", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
 
   it("late-success suppression: a detached read that eventually SUCCEEDS after its deadline already fired does not log a second (contradictory) success line", async () => {
-    // ⊘ the pre-round-12 implementation (the raw, unwrapped `ctx` handed
-    // straight into `readLocalFileBounded` instead of a per-call guarded
-    // one) — once the gate below is released, the detached work's own real,
+    // ⊘ the raw, unwrapped `ctx` handed straight into `readLocalFileBounded`
+    // instead of the per-call guarded one — once the gate below is released, the detached work's own real,
     // successful read would call `ctx.log` a SECOND time with a
     // "(N bytes)" success line for a call whose result was already
     // discarded at the timeout — exactly the contradictory audit entry this
@@ -1651,7 +1699,7 @@ describe("nexus.fs — a deadline that fires for an ALREADY-DEAD run writes no a
     // is left of the worker) still gets the same ReadFailed "timed out" error
     // object, because suppressing the AUDIT LINE and suppressing the ERROR are
     // different decisions. The `→ ReadFailed` line for a LIVE run is pinned by
-    // the round-12 suppression tests above, so removing the log outright
+    // the suppression tests above, so removing the log outright
     // (rather than guarding it) fails those.
     const { ctx, scriptDir, log } = await makeCtx();
     await fsp.writeFile(path.join(scriptDir, "inflight.txt"), "x");
@@ -1698,8 +1746,8 @@ describe("nexus.fs — a deadline that fires for an ALREADY-DEAD run writes no a
   }, 10_000);
 
   it("exists: same rule on the ungated probe path — an aborted run's timed-out stat writes no audit line either", async () => {
-    // ⊘ guarding only `withReadDeadline`'s call site instead of the shared
-    // race — `exists()` reaches the deadline directly (no permit, no orphan
+    // ⊘ guarding only the gated read's call site instead of the shared
+    // deadline race — `exists()` reaches the deadline directly (no permit, no orphan
     // slot), so a fix applied one level too high would leave this path still
     // logging for a dead run.
     const { ctx, scriptDir, log } = await makeCtx();
@@ -1884,37 +1932,10 @@ describe("scriptFsExists", () => {
   });
 });
 
-describe("scriptFsExists — stat deadline (P1, round 15: a stalled stat must not hang the script, and must never answer `false`)", () => {
+describe("scriptFsExists — stat deadline (P1: a stalled stat must not hang the script, and must never answer `false`)", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
-
-  /**
-   * Hangs the next `n` `vscode.workspace.fs.stat` calls behind their own
-   * `deferred()` gate, answering "it's a file" once released — the stalled
-   * remote FileSystemProvider this round exists to survive.
-   *
-   * `scriptFsExists` routes EVERY scheme through `vscode.workspace.fs.stat`
-   * (a bare existence probe pulls no body into memory, so it has no reason to
-   * take `readText`'s bounded native `file:` path), so gating this one spy
-   * covers the local fixtures used below AND keeps them entirely in-memory —
-   * real disk I/O isn't guaranteed to settle inside a single fake-timer
-   * microtask flush, exactly as the round-10 tests above note.
-   *
-   * Same self-cleaning `mockImplementationOnce` discipline as `gateOpens`:
-   * callers MUST arrange for exactly `n` `exists()` calls to consume these,
-   * and MUST eventually resolve every gate (see `deferred`'s doc comment).
-   */
-  function gateStats(n: number): Array<{ resolve: () => void }> {
-    const gates = Array.from({ length: n }, () => deferred<void>());
-    gates.forEach((gate) => {
-      statSpy.mockImplementationOnce(async () => {
-        await gate.promise;
-        return { type: FileType.File, ctime: 0, mtime: 0, size: 1 };
-      });
-    });
-    return gates;
-  }
 
   it("a hung stat rejects with ReadFailed at SCRIPT_FS_READ_TIMEOUT_MS rather than hanging the script forever — and never answers a silently-wrong `false`", async () => {
     // ⊘ the pre-fix implementation: `scriptFsExists` awaited
@@ -1979,7 +2000,7 @@ describe("scriptFsExists — stat deadline (P1, round 15: a stalled stat must no
       // ⊘ handing the RAW ctx (rather than the guarded one the deadline race
       // builds) to the detached stat: it would now write a contradictory
       // `fs.exists <path> → true` line for a call that already threw
-      // ReadFailed — the round-12 audit-suppression rule applies to this
+      // ReadFailed — the audit-suppression rule applies to this
       // work exactly as it does to readText's.
       expect(log.mock.calls.length).toBe(callCountAtTimeout);
       expect(log).not.toHaveBeenCalledWith(expect.stringMatching(/→ (true|false)$/));
@@ -2039,7 +2060,7 @@ describe("scriptFsExists — stat deadline (P1, round 15: a stalled stat must no
 
   it("orphan-pool isolation: timed-out exists() stats consume NO orphan slots — a readText wave timing out afterwards still finds room and releases its permits", async () => {
     // ⊘ routing exists() through readText's FULL orphan machinery (letting a
-    // timed-out stat increment `orphanedReads` / land on `heldReads`).
+    // timed-out stat take an orphan slot / land on the held queue).
     // `SCRIPT_FS_MAX_ORPHANED_READS` is a budget for host-side READ BUFFERS
     // (see its doc comment); a bare stat allocates none and holds no permit,
     // so counting it there would steal capacity from genuine reads and
@@ -2048,7 +2069,7 @@ describe("scriptFsExists — stat deadline (P1, round 15: a stalled stat must no
     // The discriminator: SCRIPT_FS_MAX_ORPHANED_READS hung exists() probes
     // are timed out FIRST. Under the wrong implementation they fill the
     // orphan pool exactly, so the readText wave that follows takes
-    // `withReadDeadline`'s "beyond capacity" branch, HOLDS its permits, and
+    // the scheduler's "beyond capacity" branch, HOLDS its permits, and
     // the probe read below stays queued — never reaching open(). Under the
     // correct implementation the pool is still empty, the wave orphans
     // normally, its four permits come back, and the probe is admitted.
@@ -2093,7 +2114,7 @@ describe("scriptFsExists — stat deadline (P1, round 15: a stalled stat must no
       await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
 
       // Discriminator: the probe is ADMITTED — it reaches open(). Gated (not
-      // a real quick read) for the same reason the round-11 tests gate
+      // a real quick read) for the same reason the orphan tests gate
       // theirs: admission must be observable directly, not inferable from a
       // completion that could have cascaded from something else.
       const probeGates = gateOpens(1);
@@ -2148,7 +2169,7 @@ describe("logging (decision 8)", () => {
     // (NoScriptDir / InvalidPath / PathOutsideScope) would then be filed in
     // the audit trail as a read that never happened, and an operator reading
     // the Output Channel would go looking for a `readText` call site that
-    // doesn't exist. Only the DEADLINE's verb was pinned before (round 15);
+    // doesn't exist. Only the DEADLINE's verb is pinned elsewhere;
     // the refusal verbs are the other half, and they are what a shared
     // preamble makes mis-attributable in one place for both codes below.
     const { ctx, log } = await makeCtx();
@@ -2366,18 +2387,18 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
   });
 });
 
-describe("scriptFsReadText — end-to-end with a correctly-rebased remote scripts root (round 14, P2: resolveScriptsDir on Remote-SSH)", () => {
-  it("a ../shared/... read inside the configured root resolves once the root carries the SCRIPT'S remote scheme+authority — exactly what resolveScriptsDir's round-14 rebase now produces", async () => {
-    // ⊘ the pre-round-14 snapshot: `resolveScriptsDir` handed back a LOCAL
+describe("scriptFsReadText — end-to-end with a correctly-rebased remote scripts root (P2: resolveScriptsDir on Remote-SSH)", () => {
+  it("a ../shared/... read inside the configured root resolves once the root carries the SCRIPT'S remote scheme+authority — exactly what resolveScriptsDir's rebase produces", async () => {
+    // ⊘ `resolveScriptsDir` handing back a LOCAL
     // `file:` Uri for an absolute `nexus.scripts.path` on a remote
     // workspace. Passing THAT shape here (scriptsRootUri.scheme === "file"
-    // while the script itself is `vscode-remote:`) reproduces the bug this
-    // round fixes — buildScriptFsScope's scheme/authority guard (already
+    // while the script itself is `vscode-remote:`) reproduces that bug —
+    // buildScriptFsScope's scheme/authority guard (already
     // covered directly in the "buildScriptFsScope — scheme guard" describe
     // block above) drops the root from the union, and this exact read
-    // rejects PathOutsideScope instead of resolving. Verified via manual
-    // mutation testing (see round-14 report) that swapping the root back to
-    // a `file:` Uri here makes this test fail with PathOutsideScope.
+    // rejects PathOutsideScope instead of resolving. Verified by mutation:
+    // swapping the root back to a `file:` Uri here makes this test fail with
+    // PathOutsideScope.
     const authority = "ssh-remote+devbox";
     const scriptsRootPath = "/remote/shared/nexus-scripts";
     const scriptDirPath = `${scriptsRootPath}/cisco`;
@@ -2386,7 +2407,7 @@ describe("scriptFsReadText — end-to-end with a correctly-rebased remote script
     const ctx: ScriptFsContext = {
       scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
       scriptDirUri: remoteUri(authority, scriptDirPath),
-      // Exactly the shape resolveScriptsDir's round-14 fix now produces for
+      // Exactly the shape resolveScriptsDir produces for
       // an absolute nexus.scripts.path on a remote workspace: the WORKSPACE
       // ROOT's own scheme+authority (here, deliberately the SAME authority
       // as the script — a real workspace root and its scripts necessarily
