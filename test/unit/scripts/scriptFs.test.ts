@@ -1934,3 +1934,38 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
     }
   });
 });
+
+describe("scriptFsReadText — end-to-end with a correctly-rebased remote scripts root (round 14, P2: resolveScriptsDir on Remote-SSH)", () => {
+  it("a ../shared/... read inside the configured root resolves once the root carries the SCRIPT'S remote scheme+authority — exactly what resolveScriptsDir's round-14 rebase now produces", async () => {
+    // ⊘ the pre-round-14 snapshot: `resolveScriptsDir` handed back a LOCAL
+    // `file:` Uri for an absolute `nexus.scripts.path` on a remote
+    // workspace. Passing THAT shape here (scriptsRootUri.scheme === "file"
+    // while the script itself is `vscode-remote:`) reproduces the bug this
+    // round fixes — buildScriptFsScope's scheme/authority guard (already
+    // covered directly in the "buildScriptFsScope — scheme guard" describe
+    // block above) drops the root from the union, and this exact read
+    // rejects PathOutsideScope instead of resolving. Verified via manual
+    // mutation testing (see round-14 report) that swapping the root back to
+    // a `file:` Uri here makes this test fail with PathOutsideScope.
+    const authority = "ssh-remote+devbox";
+    const scriptsRootPath = "/remote/shared/nexus-scripts";
+    const scriptDirPath = `${scriptsRootPath}/cisco`;
+    remoteFiles.set(`${scriptsRootPath}/shared/vars.json`, { content: new TextEncoder().encode('{"ok":true}') });
+
+    const ctx: ScriptFsContext = {
+      scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
+      scriptDirUri: remoteUri(authority, scriptDirPath),
+      // Exactly the shape resolveScriptsDir's round-14 fix now produces for
+      // an absolute nexus.scripts.path on a remote workspace: the WORKSPACE
+      // ROOT's own scheme+authority (here, deliberately the SAME authority
+      // as the script — a real workspace root and its scripts necessarily
+      // share one remote host), rebased onto the configured absolute path.
+      scriptsRootUri: remoteUri(authority, scriptsRootPath),
+      log: vi.fn(),
+      isAborted: () => false
+    };
+
+    const text = await scriptFsReadText("../shared/vars.json", ctx);
+    expect(text).toBe('{"ok":true}');
+  });
+});
