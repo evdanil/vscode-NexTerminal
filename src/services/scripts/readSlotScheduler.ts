@@ -241,7 +241,19 @@ export class ReadSlotScheduler {
           // Whichever state the slot is in by the time its own work settles —
           // still `held`, or `orphaned`/`promoted` — this retires it. `held`
           // is the one case that still owes a permit.
-          .finally(() => this.transition(slot, slot.state === "held" ? "settled" : "retired"))
+          //
+          // The transition runs in its own try so the catch below only ever
+          // swallows the DISCARDED work rejection — an illegal-edge throw from
+          // the machine itself must stay loud, not vanish into the same sink.
+          .finally(() => {
+            try {
+              this.transition(slot, slot.state === "held" ? "settled" : "retired");
+            } catch (err) {
+              queueMicrotask(() => {
+                throw err;
+              });
+            }
+          })
           .catch(() => {
             // The detached result is discarded by design; `race()` already
             // observes the operation itself, so only this derived promise
@@ -271,7 +283,16 @@ export class ReadSlotScheduler {
     slot.state = next;
 
     if (next === "held") this.held.push(slot);
-    if (from === "held") this.held.splice(this.held.indexOf(slot), 1);
+    if (from === "held") {
+      const idx = this.held.indexOf(slot);
+      // A held slot missing from the held list means the list invariant is
+      // already broken — fail loud rather than let splice(-1) silently evict
+      // whichever slot happens to be last.
+      if (idx === -1) {
+        throw new Error(`ReadSlotScheduler: held slot ${slot.label} missing from held list`);
+      }
+      this.held.splice(idx, 1);
+    }
 
     if (ORPHAN_OCCUPYING.has(next)) this.orphaned++;
     if (ORPHAN_OCCUPYING.has(from)) this.orphaned--;
