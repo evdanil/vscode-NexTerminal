@@ -332,7 +332,7 @@ declare global {
       | "CircularInclude"
       /** More than 16 levels of nesting. */
       | "IncludeDepthExceeded"
-      /** This run has already loaded 64 distinct modules. */
+      /** This run hit an include budget: 64 distinct modules per run, or 48 MiB of combined module source, whichever comes first. */
       | "IncludeLimitExceeded"
       /** The module's source did not compile. Names the file; V8 gives no line for this. */
       | "IncludeSyntaxError"
@@ -345,9 +345,12 @@ declare global {
     /** `IncludeDepthExceeded`: the depth that was refused, and the limit. */
     depth?: number;
     maxDepth?: number;
-    /** `IncludeLimitExceeded`: modules already loaded, and the limit. */
+    /** `IncludeLimitExceeded`, module-count budget: modules already loaded, and the limit. */
     count?: number;
     maxModules?: number;
+    /** `IncludeLimitExceeded`, source-size budget: bytes of module source already loaded, and the limit. */
+    totalBytes?: number;
+    maxTotalBytes?: number;
     /** `IncludeIsScript` / `IncludeSyntaxError`: the module's display name. */
     module?: string;
   }
@@ -430,7 +433,8 @@ declare global {
      *   compile or body threw keeps throwing the same error. Refusals are
      *   re-evaluated on every call.
      * - Cycles throw `CircularInclude` with the loop spelled out. Max 16 levels
-     *   deep, max 64 distinct modules per run.
+     *   deep, and 64 distinct modules per run, or 48 MiB of combined module
+     *   source, whichever comes first (`IncludeLimitExceeded`).
      * - Reads share `nexus.fs`'s cap, UTF-8 requirement, 30-second deadline and
      *   read pool, and every load is logged to the "Nexus Scripts" Output
      *   Channel.

@@ -29,7 +29,10 @@
  * (the cheap structural refusals — chain, depth, containment, extension, cycle
  * — all happen before the file is opened, and the module cap is checked before
  * the read rather than after it, so a run that has exhausted its budget never
- * spends a read slot to be told so), and EVERY refusal writes its audit line
+ * spends a read slot to be told so; the source-byte budget is checked in both
+ * places, cheaply before the read when nothing is left at all and
+ * authoritatively after it, where the module's size is finally known), and
+ * EVERY refusal writes its audit line
  * before it throws, so the Output Channel records the refusal even though the
  * error itself is on its way to a `catch` block that may swallow it.
  */
@@ -68,8 +71,36 @@ export const SCRIPT_INCLUDE_MAX_DEPTH = 16;
  * in the worker as a retained UTF-16 string plus its evaluated exports, inside
  * that isolate's own `maxOldGenerationSizeMb: 192` budget, and a worker that
  * hits it dies with an allocation failure rather than a diagnosable error.
+ * Counting modules is not by itself enough to keep that from happening — see
+ * `SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES`, which bounds the bytes.
  */
 export const SCRIPT_INCLUDE_MAX_MODULES = 64;
+
+/**
+ * Most module SOURCE one run may load in total, summed over every module whose
+ * source was delivered. Counts bytes, not files — and, like the module cap,
+ * counts each module once however many times it is included.
+ *
+ * WHY THE COUNT CAP ALONE WAS NOT ENOUGH: the two limits bound different
+ * things, and only this one bounds memory. Per-file size is governed by
+ * `ctx.maxBytes` (`nexus.scripts.maxReadSizeMb`, 1–16 MiB, default 4 MiB), so
+ * 64 modules at the ceiling is ~1 GiB of source — ~2 GiB once the worker holds
+ * it as UTF-16 — against that isolate's `maxOldGenerationSizeMb: 192`. A run
+ * that included many large-but-individually-legal modules therefore died with a
+ * worker allocation crash BEFORE the 64th module was ever reached, i.e. a
+ * supported configuration failing with a crash instead of the documented typed
+ * error. Delivered source is retained for the life of the run (V8 keeps
+ * function source for lazy compilation and `toString`), so it cannot be
+ * modelled as transient.
+ *
+ * WHY 48 MiB: as UTF-16 that is ≈96 MiB of worker heap — deliberately about
+ * HALF the worker's own 192 MiB, leaving the other half for what the script
+ * actually computes. Same posture as the rest of this feature's amendments (see
+ * A-F2 above): the worker's heap cap is the BACKSTOP, and a limit like this one
+ * exists so supported usage never has to reach it — a refusal names the budget,
+ * an allocation failure names nothing.
+ */
+export const SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES = 48 * 1024 * 1024; // 48 MiB
 
 /**
  * One loaded module, main-side.
@@ -112,6 +143,15 @@ export interface ScriptIncludeState {
    */
   pending: Map<string, Promise<IncludeModuleRecord>>;
   nextId: number;
+  /**
+   * Bytes of module source DELIVERED so far this run, against
+   * `SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES`. Charged once per module, when its
+   * record is minted — a refused load charges nothing (A-F4) and a cache hit
+   * charges nothing (the protocol sends the source once). Never decremented:
+   * the worker retains every module for the life of the run, so neither does
+   * this.
+   */
+  totalSourceBytes: number;
   /** Path semantics for this run, from `buildScriptFsScope`. */
   platform: ScriptFsPlatform;
 }
@@ -141,6 +181,7 @@ export function createScriptIncludeState(ctx: ScriptFsContext): ScriptIncludeSta
     byKey: new Map([[root.cacheKey, root]]),
     pending: new Map(),
     nextId: 1,
+    totalSourceBytes: 0,
     platform
   };
 }
@@ -267,6 +308,15 @@ export async function scriptIncludeLoad(
     });
   }
 
+  // 8b. Source budget, cheap half: a run with NOTHING left cannot admit any
+  //     module, whatever this one's size turns out to be, so it is refused here
+  //     rather than after a read that could cost a slot and a whole `maxBytes`
+  //     buffer. The authoritative check is in `readAndRegister`, where the size
+  //     is finally known.
+  if (state.totalSourceBytes >= SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES) {
+    throw failSourceBudget(ctx, label, state.totalSourceBytes);
+  }
+
   const displayName = includeDisplayName(resolvedPath, ctx, state.platform);
   const load = readAndRegister(resolvedPath, cacheKey, displayName, ctx, state, label);
   // The in-flight entry hands back only the RECORD: a concurrent caller that
@@ -330,6 +380,20 @@ async function readAndRegister(
     });
   }
 
+  // 10b. Source budget, authoritative half — the size is known only now, and
+  //      this is the last point before the module becomes committed. The total
+  //      is read HERE, not snapshotted before the read: registration runs
+  //      sequentially on the event loop, so a `Promise.all` fan-out of loads
+  //      whose sizes nobody knew in advance still settles one at a time through
+  //      this one check, and each sees every earlier commit. (Same reasoning as
+  //      the count cap's in-flight accounting at step 8, from the other end: the
+  //      count can be reserved before the read, bytes cannot.) Refusing here
+  //      costs one already-completed read and charges nothing — A-F4: a refused
+  //      load is never remembered.
+  if (state.totalSourceBytes + byteLength > SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES) {
+    throw failSourceBudget(ctx, label, state.totalSourceBytes);
+  }
+
   // 11. Mint the record and log.
   const record: IncludeModuleRecord = {
     id: `m${state.nextId++}`,
@@ -340,8 +404,26 @@ async function readAndRegister(
   };
   state.byId.set(record.id, record);
   state.byKey.set(record.cacheKey, record);
+  state.totalSourceBytes += byteLength;
   ctx.log(`include ${label} → ${displayName} (${byteLength} bytes)`);
   return { record, source: text };
+}
+
+/**
+ * The source-budget refusal, shared by both halves of the check so the message,
+ * the extras and the audit line cannot drift apart.
+ *
+ * `totalBytes` is the run's COMMITTED total at the moment of refusal — the
+ * bytes already delivered, never including the module being refused (which is
+ * delivered to nobody). It reads the same on both halves, and matches how the
+ * count cap reports `count`.
+ */
+function failSourceBudget(ctx: ScriptFsContext, label: string, loaded: number): Error {
+  const mib = SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES / (1024 * 1024);
+  return failInclude(ctx, label, "IncludeLimitExceeded", "source budget", {
+    message: `This run's include budget is exhausted: ${loaded} bytes of module source already loaded, the limit is ${SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES} (${mib} MiB). Split less, or include fewer/smaller modules.`,
+    extra: { totalBytes: loaded, maxTotalBytes: SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES }
+  });
 }
 
 function cachedResult(ctx: ScriptFsContext, label: string, record: IncludeModuleRecord): IncludeLoadResult {

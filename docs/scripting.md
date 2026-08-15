@@ -461,7 +461,7 @@ Caching is per **run**, never per session: the edit → run loop always picks up
 
 One shape the runtime cannot detect for you: if a module's body includes a module that is *itself still executing its body* (not a static cycle — the chain does not show it), the second include waits for an evaluation that is waiting for it, and the run hangs until `nexus.scripts.maxRuntimeSeconds` stops it. Keep top-level module bodies to definitions and cheap setup.
 
-**Limits and cost.** Max 16 levels of nesting (`IncludeDepthExceeded`) and 64 distinct modules per run (`IncludeLimitExceeded`) — both far past any real layering, and both refused before the file is read. An include is a file read, so it shares everything `nexus.fs` reads have: the same effective size cap (`nexus.scripts.maxReadSizeMb`), the same UTF-8 requirement, the same fixed 30-second deadline, and the same read pool — an include can queue behind a `readText` fan-out, bounded by that same 30 seconds.
+**Limits and cost.** Max 16 levels of nesting (`IncludeDepthExceeded`) and 64 distinct modules per run (`IncludeLimitExceeded`) — both far past any real layering, and both refused before the file is read. A run may also load at most **48 MiB of combined module source** in total, refused with `IncludeLimitExceeded` (`err.totalBytes`, `err.maxTotalBytes`) before the worker is ever handed the overage — the module count alone cannot bound memory, since each module may be as large as `nexus.scripts.maxReadSizeMb` allows, and that per-file cap still governs each file on its own. An include is a file read, so it shares everything `nexus.fs` reads have: the same effective size cap (`nexus.scripts.maxReadSizeMb`), the same UTF-8 requirement, the same fixed 30-second deadline, and the same read pool — an include can queue behind a `readText` fan-out, bounded by that same 30 seconds.
 
 **Every load is logged** to the Nexus Scripts Output Channel, naming what you asked for and what it resolved to:
 
@@ -479,7 +479,7 @@ include ./x.js → IncludeDepthExceeded (17 > 16)
 |---|---|---|
 | `"CircularInclude"` | The module is already on the chain including it | `cycle: string[]` |
 | `"IncludeDepthExceeded"` | More than 16 levels of nesting | `depth`, `maxDepth` |
-| `"IncludeLimitExceeded"` | More than 64 distinct modules in one run | `count`, `maxModules` |
+| `"IncludeLimitExceeded"` | More than 64 distinct modules in one run, or more than 48 MiB of combined module source | `count`, `maxModules` (count budget) / `totalBytes`, `maxTotalBytes` (source budget) |
 | `"IncludeSyntaxError"` | The module's source does not parse | `module` |
 | `"IncludeIsScript"` | The target carries `@nexus-script` | `module` |
 | `"IncludeInternal"` | A protocol violation inside the runtime — please file an issue | — |

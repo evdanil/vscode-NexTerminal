@@ -64,6 +64,7 @@ import {
   scriptIncludeLoad,
   SCRIPT_INCLUDE_MAX_DEPTH,
   SCRIPT_INCLUDE_MAX_MODULES,
+  SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES,
   type ScriptIncludeState
 } from "../../../src/services/scripts/scriptInclude";
 
@@ -422,6 +423,137 @@ describe("scriptIncludeLoad — distinct-module cap", () => {
     }
     // The ledger agrees: exactly 64 modules minted (byId also holds #root).
     expect(state.byId.size - 1).toBe(SCRIPT_INCLUDE_MAX_MODULES);
+  });
+});
+
+describe("scriptIncludeLoad — cumulative source-byte budget", () => {
+  // The count cap alone cannot bound the worker's heap: 64 modules of up to
+  // `ctx.maxBytes` each is 1 GiB at the 16 MiB ceiling, ~2 GiB as UTF-16 in a
+  // worker whose own limit is 192 MiB — so a SUPPORTED configuration would die
+  // with an allocation crash instead of the documented typed refusal. These
+  // tests pin the budget that closes that gap. They never write 48 MiB of
+  // fixtures: the run's committed total is pre-set next to the constant, which
+  // is the same arithmetic the real path performs one module at a time.
+  const LIMIT = SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES;
+
+  it("the module that exactly fills the budget loads and charges it; one byte over is refused with maxTotalBytes, mints nothing, and is logged", async () => {
+    // ⊘ never charging the budget (`totalSourceBytes` stays 0 — the exact-fit
+    // half below would then report 0 instead of the file's size, and nothing
+    // would ever be refused in a real run), and ⊘ a `>=` comparison in place of
+    // `>` (the module that exactly fits — a legal, supported load — would be
+    // refused, which is an off-by-one that only a boundary case can see).
+    const source = "exports.big = 1;";
+    const size = Buffer.byteLength(source);
+
+    {
+      const { ctx, state, root, lines } = await makeFixture();
+      await fsp.writeFile(path.join(root, "lib", "big.js"), source);
+      state.totalSourceBytes = LIMIT - size + 1;
+      const before = state.totalSourceBytes;
+
+      const err = await expectRejection(
+        scriptIncludeLoad("./lib/big.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state)
+      );
+
+      expect(err.code).toBe("IncludeLimitExceeded");
+      expect(err.maxTotalBytes).toBe(LIMIT);
+      expect(err.totalBytes).toBe(before);
+      // Nothing minted, nothing charged, nothing left in flight.
+      expect(state.byId.size).toBe(1); // #root only
+      expect(state.byKey.size).toBe(1);
+      expect(state.pending.size).toBe(0);
+      expect(state.totalSourceBytes).toBe(before);
+      expect(lines()).toContain("include ./lib/big.js → IncludeLimitExceeded (source budget)");
+    }
+
+    {
+      const { ctx, state, root } = await makeFixture();
+      await fsp.writeFile(path.join(root, "lib", "big.js"), source);
+      state.totalSourceBytes = LIMIT - size;
+
+      const res = await scriptIncludeLoad("./lib/big.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state);
+
+      expect(res.cached).toBe(false);
+      expect(res.source).toBe(source);
+      expect(state.totalSourceBytes).toBe(LIMIT);
+    }
+  });
+
+  it("an exhausted budget refuses BEFORE the file is opened", async () => {
+    // ⊘ a budget enforced only after the read: the run would spend a read slot,
+    // and up to one whole `maxBytes` of host memory, to be told it had no
+    // budget left — exactly what the cheap pre-read step of the ladder exists
+    // to avoid (same shape as the count cap's own no-I/O assertion).
+    const { ctx, state, root, lines } = await makeFixture();
+    await fsp.writeFile(path.join(root, "lib", "after.js"), "exports.after = 1;");
+    state.totalSourceBytes = LIMIT;
+    const opensBefore = nodeOpenSpy.mock.calls.length;
+
+    const err = await expectRejection(
+      scriptIncludeLoad("./lib/after.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state)
+    );
+
+    expect(err.code).toBe("IncludeLimitExceeded");
+    expect(err.totalBytes).toBe(LIMIT);
+    expect(err.maxTotalBytes).toBe(LIMIT);
+    expect(nodeOpenSpy.mock.calls.length).toBe(opensBefore);
+    expect(lines()).toContain("include ./lib/after.js → IncludeLimitExceeded (source budget)");
+  });
+
+  it("the budget holds against a concurrent fan-out: three includes with room for one commit exactly one", async () => {
+    // ⊘ a post-read check that compares against a total SNAPSHOTTED before the
+    // read (the natural way to write it, since the size is only known after the
+    // read): every member of a `Promise.all` fan-out would see the same stale
+    // total, all three would pass, and the run would overshoot the budget by
+    // however many loads were in flight. Registration runs sequentially on the
+    // event loop, so reading `state.totalSourceBytes` AT the check is what makes
+    // this safe.
+    const { ctx, state, root } = await makeFixture();
+    const sources = [0, 1, 2].map((i) => `exports.m = ${i};`);
+    const size = Buffer.byteLength(sources[0]);
+    expect(new Set(sources.map((s) => Buffer.byteLength(s))).size).toBe(1);
+    for (let i = 0; i < 3; i++) {
+      await fsp.writeFile(path.join(root, "lib", `f${i}.js`), sources[i]);
+    }
+    state.totalSourceBytes = LIMIT - size; // room for exactly one of them
+
+    const settled = await Promise.allSettled(
+      [0, 1, 2].map((i) => scriptIncludeLoad(`./lib/f${i}.js`, [SCRIPT_INCLUDE_ROOT_ID], ctx, state))
+    );
+
+    const fulfilled = settled.filter((s) => s.status === "fulfilled");
+    const refused = settled.filter((s): s is PromiseRejectedResult => s.status === "rejected");
+    expect(fulfilled.length).toBe(1);
+    expect(refused.length).toBe(2);
+    for (const r of refused) {
+      expect((r.reason as { code?: string }).code).toBe("IncludeLimitExceeded");
+    }
+    expect(state.totalSourceBytes).toBeLessThanOrEqual(LIMIT);
+    expect(state.totalSourceBytes).toBe(LIMIT);
+    expect(state.byId.size - 1).toBe(1);
+  });
+
+  it("a budget refusal is not sticky: the state is untouched and a module that still fits loads afterwards", async () => {
+    // ⊘ charging the budget (or minting the record) on the refusing path — the
+    // run would be poisoned by the very load it declined, and A-F4's "a refused
+    // load is never remembered" would hold for every refusal except this one.
+    const { ctx, state, root } = await makeFixture();
+    const big = "exports.big = " + "0".repeat(80) + ";";
+    const small = "exports.small = 1;";
+    await fsp.writeFile(path.join(root, "lib", "big.js"), big);
+    await fsp.writeFile(path.join(root, "lib", "small.js"), small);
+    const seeded = LIMIT - Buffer.byteLength(big) + 1;
+    state.totalSourceBytes = seeded;
+
+    await expectRejection(scriptIncludeLoad("./lib/big.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state));
+    expect(state.totalSourceBytes).toBe(seeded);
+    expect(state.byId.size).toBe(1);
+    expect(state.pending.size).toBe(0);
+
+    const res = await scriptIncludeLoad("./lib/small.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state);
+    expect(res.cached).toBe(false);
+    expect(res.source).toBe(small);
+    expect(state.totalSourceBytes).toBe(seeded + Buffer.byteLength(small));
   });
 });
 

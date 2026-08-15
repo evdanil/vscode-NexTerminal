@@ -127,7 +127,11 @@ export type ScriptIncludeErrorCode =
   | "CircularInclude"
   /** The chain is longer than `SCRIPT_INCLUDE_MAX_DEPTH` (extra: `depth`, `maxDepth`). */
   | "IncludeDepthExceeded"
-  /** This run already loaded `SCRIPT_INCLUDE_MAX_MODULES` distinct modules (extra: `count`, `maxModules`). */
+  /**
+   * This run already loaded `SCRIPT_INCLUDE_MAX_MODULES` distinct modules
+   * (extra: `count`, `maxModules`) — or `SCRIPT_INCLUDE_MAX_TOTAL_SOURCE_BYTES`
+   * of combined module source (extra: `totalBytes`, `maxTotalBytes`).
+   */
   | "IncludeLimitExceeded"
   /** The module's source did not compile (worker-side; extra: `module`). */
   | "IncludeSyntaxError"
