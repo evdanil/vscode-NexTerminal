@@ -103,7 +103,22 @@ let orphanedReads = 0;
  * pool, the read's own hung work now counted against
  * `SCRIPT_FS_MAX_ORPHANED_READS` instead), never adding a new detached slot.
  */
-const heldReads: Array<{ promoted: boolean; release: () => void }> = [];
+const heldReads: Array<{ promoted: boolean; loggedPath: string; release: () => void }> = [];
+
+/**
+ * Read-only view of the module-global detached-read pool. Exported for unit
+ * tests, and the ONLY way promotion ORDER can be checked at all: every other
+ * effect of the pool is order-invariant. Each held entry releases its permit
+ * exactly once, at `min(promotion time, its own settlement time)`, and a
+ * promoted entry's settlement immediately promotes the next one — so permit
+ * availability, admitted-read counts, orphan counts and audit output are
+ * IDENTICAL whether `promoteHeldReads()` drains oldest-first or newest-first.
+ * Only the identity of who is still waiting differs, which is what
+ * `heldPaths` (oldest first — index 0 is promoted next) exposes.
+ */
+export function scriptFsPoolSnapshot(): { orphanedReads: number; heldPaths: string[] } {
+  return { orphanedReads, heldPaths: heldReads.map((entry) => entry.loggedPath) };
+}
 
 /**
  * Promotes as many `heldReads` entries into orphans as there's currently
@@ -340,12 +355,29 @@ export async function boundedReadFile(fsPath: string, maxBytes: number, sizeHint
   }
 }
 
-export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext): Promise<string> {
+/**
+ * Every `nexus.fs` entry point's shared preamble: build the run's containment
+ * scope, refuse the two request shapes that can never resolve safely, and
+ * resolve the request against the scope — returning the absolute in-scope path
+ * both entry points then use as their target AND as the value every subsequent
+ * audit line names.
+ *
+ * Pure — no I/O, no allocation, and deliberately NOT gated on
+ * `readSemaphore`: an already-doomed InvalidPath/NoScriptDir call has no
+ * reason to wait behind slow reads to be told so.
+ *
+ * Every refusal here is PRE-resolution, so its log line and thrown message
+ * name the RAW requested value — there is no resolved path to name yet. Past
+ * this function it inverts: callers log the resolved absolute path, not the
+ * (possibly relative, possibly ambiguous across several scripts) request.
+ * `method` only picks the verb those refusal lines are filed under.
+ */
+function validateAndResolve(requested: unknown, ctx: ScriptFsContext, method: "readText" | "exists"): string {
   const scope = buildScriptFsScope(ctx);
   if ("code" in scope) {
     throw fail(
       ctx,
-      "readText",
+      method,
       safeStringify(requested),
       "NoScriptDir",
       "This script has no folder on disk (untitled editor). Save it first — nexus.fs paths resolve against the script's own directory."
@@ -354,7 +386,7 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   if (hasBackslashOnNonFileScheme(requested, ctx.scriptUri.scheme)) {
     throw fail(
       ctx,
-      "readText",
+      method,
       safeStringify(requested),
       "InvalidPath",
       `backslash is not a valid path separator for a remote script location: ${safeStringify(requested)}`
@@ -363,26 +395,19 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
 
   const resolution = resolveScriptFsPath(requested as string, scope);
   if (!resolution.ok) {
-    // Pre-resolution failure — no resolved path exists yet, so the log (and
-    // the thrown message) name the raw requested value.
-    throw fail(
-      ctx,
-      "readText",
-      safeStringify(requested),
-      resolution.code,
-      describeResolutionFailure(resolution, scope)
-    );
+    throw fail(ctx, method, safeStringify(requested), resolution.code, describeResolutionFailure(resolution, scope));
   }
-  // From here on, resolution succeeded — every failure log names the
-  // RESOLVED absolute path, not the (possibly relative, possibly confusing
-  // once several scripts are involved) raw requested value.
-  const loggedPath = resolution.resolvedPath;
+  return resolution.resolvedPath;
+}
+
+export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext): Promise<string> {
+  const resolvedPath = validateAndResolve(requested, ctx, "readText");
 
   // Cheap early-out: the run already ended (this call didn't even reach the
   // semaphore yet) — don't bother queueing behind slow reads for a session
   // nobody's watching anymore.
   if (ctx.isAborted()) {
-    throw makeAbortedError(ctx, "readText", loggedPath);
+    throw makeAbortedError(ctx, "readText", resolvedPath);
   }
 
   // Gate the actual read (both branches — the non-file branch materializes
@@ -404,7 +429,7 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   // reason to do the work at all).
   if (ctx.isAborted()) {
     readSemaphore.release();
-    throw makeAbortedError(ctx, "readText", loggedPath);
+    throw makeAbortedError(ctx, "readText", resolvedPath);
   }
   // `withReadDeadline` OWNS permit release for every path from here on
   // (normal settle, timeout with orphan capacity to spare, timeout beyond
@@ -414,19 +439,19 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   // blocks that could both fire.
   if (ctx.scriptUri.scheme === "file") {
     return await withReadDeadline(
-      (guardedCtx) => readLocalFileBounded(resolution.resolvedPath, loggedPath, guardedCtx),
+      (guardedCtx) => readLocalFileBounded(resolvedPath, resolvedPath, guardedCtx),
       readSemaphore.release,
       ctx,
-      loggedPath
+      resolvedPath
     );
   }
 
-  const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
+  const uri = uriOf(resolvedPath, ctx.scriptUri);
   return await withReadDeadline(
-    (guardedCtx) => readRemoteFileBounded(uri, loggedPath, guardedCtx),
+    (guardedCtx) => readRemoteFileBounded(uri, resolvedPath, guardedCtx),
     readSemaphore.release,
     ctx,
-    loggedPath
+    resolvedPath
   );
 }
 
@@ -503,14 +528,16 @@ async function raceAgainstReadDeadline<T>(
       // microtask when the timer fired) must never win the race to log.
       raceState.deadlineWon = true;
       onDeadline(work);
+      const message = `${loggedPath}: timed out after ${SCRIPT_FS_READ_TIMEOUT_MS / 1000}s`;
+      // The CALLER's rejection is the same either way — only the audit line is
+      // conditional. A run that ended while this call was already in flight has
+      // no audit trail worth appending to: the line would land after that run's
+      // own `end` line, for a session nobody is watching, exactly the noise
+      // `makeAbortedError` avoids for a read that never started.
       reject(
-        fail(
-          ctx,
-          method,
-          loggedPath,
-          "ReadFailed",
-          `${loggedPath}: timed out after ${SCRIPT_FS_READ_TIMEOUT_MS / 1000}s`
-        )
+        ctx.isAborted()
+          ? makeFsError("ReadFailed", message)
+          : fail(ctx, method, loggedPath, "ReadFailed", message)
       );
     }, SCRIPT_FS_READ_TIMEOUT_MS);
   });
@@ -601,7 +628,7 @@ async function withReadDeadline<T>(
         // `promoteHeldReads()` flips `promoted` and releases on our behalf,
         // instead of this read having to wait on its own (possibly
         // never-settling) `work`.
-        const heldEntry: { promoted: boolean; release: () => void } = { promoted: false, release };
+        const heldEntry: { promoted: boolean; loggedPath: string; release: () => void } = { promoted: false, loggedPath, release };
         heldReads.push(heldEntry);
         work
           .finally(() => {
@@ -791,41 +818,12 @@ async function readLocalFileBounded(fsPath: string, loggedPath: string, ctx: Scr
 }
 
 export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): Promise<boolean> {
-  const scope = buildScriptFsScope(ctx);
-  if ("code" in scope) {
-    throw fail(
-      ctx,
-      "exists",
-      safeStringify(requested),
-      "NoScriptDir",
-      "This script has no folder on disk (untitled editor). Save it first — nexus.fs paths resolve against the script's own directory."
-    );
-  }
-  if (hasBackslashOnNonFileScheme(requested, ctx.scriptUri.scheme)) {
-    throw fail(
-      ctx,
-      "exists",
-      safeStringify(requested),
-      "InvalidPath",
-      `backslash is not a valid path separator for a remote script location: ${safeStringify(requested)}`
-    );
-  }
-
-  const resolution = resolveScriptFsPath(requested as string, scope);
-  if (!resolution.ok) {
-    throw fail(
-      ctx,
-      "exists",
-      safeStringify(requested),
-      resolution.code,
-      describeResolutionFailure(resolution, scope)
-    );
-  }
+  const resolvedPath = validateAndResolve(requested, ctx, "exists");
 
   // Not gated (no read hazard — see below), but cheap enough to skip anyway:
   // no reason to stat and log on behalf of a run that's already ended.
   if (ctx.isAborted()) {
-    throw makeAbortedError(ctx, "exists", resolution.resolvedPath);
+    throw makeAbortedError(ctx, "exists", resolvedPath);
   }
 
   // No read hazard here — this is a plain existence probe, so `vscode.workspace.fs.stat`
@@ -857,11 +855,11 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
   //    does still pin this call's captured `ctx` until it settles, exactly as a
   //    detached read does — that residue is the same trade round 11 already
   //    accepted, and it is not what the orphan slots are counting.)
-  const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
+  const uri = uriOf(resolvedPath, ctx.scriptUri);
   return await raceAgainstReadDeadline(
-    (guardedCtx) => statExists(uri, resolution.resolvedPath, guardedCtx),
+    (guardedCtx) => statExists(uri, resolvedPath, guardedCtx),
     ctx,
-    resolution.resolvedPath,
+    resolvedPath,
     "exists",
     () => {
       /* nothing detached to bound and no permit to hand back — see above */

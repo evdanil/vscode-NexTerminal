@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v4
+// Nexus Scripts API types — v5
 /**
  * Nexus Terminal — Scripts API
  *
@@ -265,6 +265,12 @@ declare global {
   /**
    * Thrown by `nexus.fs` calls. Catch with `if (e.code === "FileNotFound") ...`.
    *
+   * `ReadFailed` covers both "the path resolved but the read/probe itself
+   * failed" (permissions, a misbehaving filesystem provider) and "the call hit
+   * the fixed 30-second deadline every `nexus.fs` call is bounded by" — the
+   * latter's message ends in `timed out after 30s`. A timeout is never
+   * reported as a missing file, an empty read, or (for `exists`) a `false`.
+   *
    * `FileTooLarge` additionally carries `sizeBytes` / `maxBytes` (see
    * `ScriptFsFileTooLargeError` below) — declared here too, optionally, so
    * `e.sizeBytes` type-checks straight off a plain `ScriptFsError`-typed
@@ -315,6 +321,10 @@ declare global {
      * directory; the target must stay inside the Nexus scripts folder or the
      * script's own folder subtree. Max 4 MiB. Every read is logged to the
      * "Nexus Scripts" Output Channel.
+     *
+     * Never blocks longer than 30 seconds: a filesystem that hasn't answered
+     * by then throws `ReadFailed` ("timed out after 30s") instead of hanging
+     * the run.
      */
     readText(path: string): Promise<string>;
     /**
@@ -324,7 +334,14 @@ declare global {
      * `await nexus.fs.readJson<{ devices: string[] }>("./config.json")`.
      */
     readJson<T = any>(path: string): Promise<T>;
-    /** True if an entry (file or directory) exists at the scoped path. Out-of-scope paths throw. */
+    /**
+     * True if an entry (file or directory) exists at the scoped path.
+     * Out-of-scope paths throw rather than answering `false`.
+     *
+     * Bounded by the same 30-second deadline as `readText`: a probe the
+     * filesystem hasn't answered by then throws `ReadFailed` ("timed out after
+     * 30s"). "I couldn't tell" is deliberately never collapsed into `false`.
+     */
     exists(path: string): Promise<boolean>;
   }
 

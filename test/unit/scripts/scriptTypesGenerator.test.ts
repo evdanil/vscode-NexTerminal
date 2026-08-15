@@ -109,27 +109,31 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
     expect(fsState.files.has("/globalStorage/scripts/types/nexus-scripts.d.ts")).toBe(true);
   });
 
-  it("v3 → v4 (nexus.fs): a workspace holding the OLD real v3 header is rewritten to the new bundled content on the next run", async () => {
-    // ⊘ shipping new d.ts content (e.g. adding nexus.fs / NexusApi) without
-    // bumping BUNDLED_DTS_VERSION_HEADER to match — existing users' seeded
-    // copies would keep comparing equal to the (un-bumped) constant and never
-    // get rewritten, so `nexus` would silently never appear in their
-    // IntelliSense no matter how many times they ran a script command.
+  it("v4 → v5 (nexus.fs 30s deadline): a workspace holding the OLD real v4 header is rewritten to the new bundled content on the next run", async () => {
+    // ⊘ shipping new d.ts content (adding nexus.fs / NexusApi in v4, then
+    // documenting the fixed 30-second nexus.fs deadline in v5) without bumping
+    // BUNDLED_DTS_VERSION_HEADER to match — existing users' seeded copies
+    // would keep comparing equal to the (un-bumped) constant and never get
+    // rewritten, so the new content would silently never reach their
+    // IntelliSense no matter how many times they ran a script command. The
+    // literals below are deliberately hardcoded rather than derived from the
+    // constant: a test that reads the constant on both sides would pass
+    // against ANY value, including an un-bumped one.
     fsState.dirs.add("/workspace/.nexus/scripts");
     fsState.dirs.add("/workspace/.nexus/scripts/types");
     fsState.files.set(
       "/workspace/.nexus/scripts/types/nexus-scripts.d.ts",
       new TextEncoder().encode(
-        "// Nexus Scripts API types — v3\ndeclare function expect(x: unknown): Promise<unknown>;\n"
+        "// Nexus Scripts API types — v4\ndeclare function expect(x: unknown): Promise<unknown>;\n"
       )
     );
     fsState.files.set("/workspace/.nexus/scripts/jsconfig.json", new TextEncoder().encode(BUNDLED_JSCONFIG));
 
-    expect(BUNDLED_DTS_VERSION_HEADER).toBe("// Nexus Scripts API types — v4");
+    expect(BUNDLED_DTS_VERSION_HEADER).toBe("// Nexus Scripts API types — v5");
     await ensureWorkspaceScriptTypes(scriptsDir("/workspace/.nexus/scripts"), getAssets);
 
     const dts = new TextDecoder().decode(fsState.files.get("/workspace/.nexus/scripts/types/nexus-scripts.d.ts")!);
     expect(dts).toBe(BUNDLED_DTS);
-    expect(dts.startsWith("// Nexus Scripts API types — v4")).toBe(true);
+    expect(dts.startsWith("// Nexus Scripts API types — v5")).toBe(true);
   });
 });

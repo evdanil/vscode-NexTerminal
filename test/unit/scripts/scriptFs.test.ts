@@ -143,6 +143,7 @@ import {
   boundedReadFile,
   initialReadCapacity,
   createSemaphore,
+  scriptFsPoolSnapshot,
   SCRIPT_FS_MAX_CONCURRENT_READS,
   SCRIPT_FS_READ_TIMEOUT_MS,
   SCRIPT_FS_MAX_ORPHANED_READS,
@@ -220,6 +221,11 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
     resolve = res;
   });
   return { promise, resolve };
+}
+
+/** The still-permit-holding reads, oldest first, by fixture filename. */
+function heldPathNames(): string[] {
+  return scriptFsPoolSnapshot().heldPaths.map((p) => path.basename(p));
 }
 
 /**
@@ -1422,6 +1428,74 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13:
     }
   }, 20_000);
 
+  it("promotion order is OLDEST-FIRST: each reopened orphan slot goes to the read that has been holding its permit longest", async () => {
+    // ⊘ `promoteHeldReads()` draining `heldReads` newest-first (`pop()`
+    // instead of `shift()`), which the doc comments on `heldReads` /
+    // `promoteHeldReads` explicitly promise against: under LIFO the OLDEST
+    // permit-holding read — the one that has already waited longest, and
+    // whose own `work` is the most likely to never settle — is promoted LAST,
+    // so a steady trickle of reopening orphan capacity can starve it
+    // indefinitely while newer arrivals cycle through ahead of it.
+    //
+    // WHY THIS ASSERTS ON `scriptFsPoolSnapshot()` RATHER THAN ON PERMITS,
+    // open() COUNTS OR LOGS: promotion order has no other observable. Each
+    // held entry releases its permit exactly once, at `min(promotion time,
+    // own settle time)`, and a promoted entry's own settlement immediately
+    // cascades into promoting the next one — so the number of free permits,
+    // the number of admitted reads, `orphanedReads`, and the audit output are
+    // all bit-identical under `shift()` and `pop()`. Only WHO is still
+    // waiting differs. Verified by mutation: swapping `shift()` for `pop()`
+    // leaves the entire rest of this file green and fails only here.
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_ORPHANED_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `orphan${i}.txt`), "x");
+    }
+    // Distinguishable held reads: held0 is admitted (and therefore times out,
+    // and therefore joins `heldReads`) first, held3 last.
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `held${i}.txt`), "x");
+    }
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    let orphanGates: Array<{ resolve: () => void }> = [];
+    let heldGates: Array<{ resolve: () => void }> = [];
+    try {
+      ({ orphanGates, heldGates } = await degradePool(ctx, scriptDir));
+
+      // Every held read is waiting, in admission order, with nothing promoted
+      // yet (the orphan pool is full).
+      expect(heldPathNames()).toEqual(["held0.txt", "held1.txt", "held2.txt", "held3.txt"]);
+
+      // Reopen orphan capacity ONE slot at a time and watch who leaves the
+      // queue. Each settled orphan frees exactly one slot, so exactly one
+      // held read is promoted per step — and it must always be the oldest.
+      vi.useRealTimers();
+      const expectedRemaining = [
+        ["held1.txt", "held2.txt", "held3.txt"],
+        ["held2.txt", "held3.txt"],
+        ["held3.txt"],
+        []
+      ];
+      for (let step = 0; step < SCRIPT_FS_MAX_CONCURRENT_READS; step++) {
+        orphanGates[step].resolve();
+        await waitFor(() => scriptFsPoolSnapshot().heldPaths.length === SCRIPT_FS_MAX_CONCURRENT_READS - step - 1);
+        expect(heldPathNames()).toEqual(expectedRemaining[step]);
+      }
+    } finally {
+      vi.useRealTimers();
+      orphanGates.forEach((g) => g.resolve());
+      heldGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+    }
+  }, 20_000);
+
   it("total-bound: promotion converts a held slot into an orphan slot WITHOUT ever opening a new handle — the high-water mark across the whole recovery stays at SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS", async () => {
     // Promotion only flips a flag and calls `release()` — it never touches
     // `open()` — so the open-handle high-water mark reached while degrading
@@ -1557,6 +1631,108 @@ describe("scriptFsReadText — audit suppression for a detached read that settle
     expect(log).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.readText .*quick\.txt \(2 bytes\)$/));
   });
+});
+
+describe("nexus.fs — a deadline that fires for an ALREADY-DEAD run writes no audit line (P2)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("readText: a run aborted while its read is in flight still gets its ReadFailed rejection, but the deadline logs nothing for it", async () => {
+    // ⊘ the deadline callback logging unconditionally through the UNGUARDED
+    // `ctx` (`fail(ctx, ...)`) — it would write `fs.readText <path> →
+    // ReadFailed` into the Output Channel of a run that has already ended,
+    // long after that run's own `end` line, for a session nobody is watching
+    // anymore. That is exactly the noise `makeAbortedError`'s "skipped (run
+    // stopped)" discipline avoids for the queued-read case; a read that was
+    // already admitted when the run died deserves the same silence.
+    //
+    // The rejection itself is deliberately NOT changed — the caller (whatever
+    // is left of the worker) still gets the same ReadFailed "timed out" error
+    // object, because suppressing the AUDIT LINE and suppressing the ERROR are
+    // different decisions. The `→ ReadFailed` line for a LIVE run is pinned by
+    // the round-12 suppression tests above, so removing the log outright
+    // (rather than guarding it) fails those.
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "inflight.txt"), "x");
+
+    let aborted = false;
+    const abortableCtx: ScriptFsContext = { ...ctx, isAborted: () => aborted };
+
+    // In-memory stat, as everywhere else under fake timers here: a real disk
+    // stat isn't guaranteed to settle inside a single microtask flush.
+    nodeStatSpy.mockImplementationOnce(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    const [gate] = gateOpens(1);
+    try {
+      const settled = scriptFsReadText("inflight.txt", abortableCtx).catch((e: unknown) => e);
+
+      // Admitted and genuinely in flight — past BOTH `isAborted()` checks,
+      // so this call can only be stopped by its own deadline from here on.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy).toHaveBeenCalledTimes(1);
+      expect(log).not.toHaveBeenCalled();
+
+      // The run ends WHILE the read is in flight.
+      aborted = true;
+
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      const err = await settled;
+      expect(err).toMatchObject({ code: "ReadFailed", message: expect.stringContaining("timed out") });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      // Drain unconditionally — a failed assertion above must not leave this
+      // read's orphan slot (and its unresolved gate) charged against the
+      // module-global pool for every later test in this file.
+      vi.useRealTimers();
+      gate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+    }
+    // The detached work has now finished for real — still nothing logged.
+    expect(log).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("exists: same rule on the ungated probe path — an aborted run's timed-out stat writes no audit line either", async () => {
+    // ⊘ guarding only `withReadDeadline`'s call site instead of the shared
+    // race — `exists()` reaches the deadline directly (no permit, no orphan
+    // slot), so a fix applied one level too high would leave this path still
+    // logging for a dead run.
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "hung.txt"), "x");
+
+    let aborted = false;
+    const abortableCtx: ScriptFsContext = { ...ctx, isAborted: () => aborted };
+
+    const gate = deferred<void>();
+    statSpy.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { type: FileType.File, ctime: 0, mtime: 0, size: 1 };
+    });
+
+    vi.useFakeTimers();
+    try {
+      const settled = scriptFsExists("hung.txt", abortableCtx).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(statSpy).toHaveBeenCalledTimes(1);
+
+      aborted = true;
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      const err = await settled;
+      expect(err).toMatchObject({ code: "ReadFailed", message: expect.stringContaining("timed out") });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      gate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(log).not.toHaveBeenCalled();
+  }, 10_000);
 });
 
 describe("scriptFsReadText — non-regular files are rejected before ANY read (file: scheme, P1)", () => {
@@ -1956,10 +2132,35 @@ describe("logging (decision 8)", () => {
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.readText .*a\.txt \(5 bytes\)$/));
   });
 
-  it("logs a refusal with the failing error code", async () => {
+  it("logs a refusal with the failing error code, under the `fs.readText` verb", async () => {
+    // The verb half is not cosmetic: readText and exists share one validation
+    // preamble, which takes the verb as a PARAMETER — ⊘ readText passing
+    // "exists" there would file every refused read as a probe. (The mirror
+    // case is pinned by the exists() refusal test above.)
     const { ctx, log } = await makeCtx();
     await expect(scriptFsReadText("../../../etc/passwd", ctx)).rejects.toBeTruthy();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("PathOutsideScope"));
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.readText .*→ PathOutsideScope$/));
+  });
+
+  it("files a REFUSAL from exists() under the `fs.exists` verb, not `fs.readText`", async () => {
+    // ⊘ `scriptFsExists` handing the wrong method literal to the validation
+    // preamble both entry points share — every pre-resolution refusal
+    // (NoScriptDir / InvalidPath / PathOutsideScope) would then be filed in
+    // the audit trail as a read that never happened, and an operator reading
+    // the Output Channel would go looking for a `readText` call site that
+    // doesn't exist. Only the DEADLINE's verb was pinned before (round 15);
+    // the refusal verbs are the other half, and they are what a shared
+    // preamble makes mis-attributable in one place for both codes below.
+    const { ctx, log } = await makeCtx();
+
+    await expect(scriptFsExists("../../../secrets.txt", ctx)).rejects.toMatchObject({ code: "PathOutsideScope" });
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.exists .*→ PathOutsideScope$/));
+
+    const untitledCtx: ScriptFsContext = { ...ctx, scriptDirUri: undefined };
+    await expect(scriptFsExists("a.txt", untitledCtx)).rejects.toMatchObject({ code: "NoScriptDir" });
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.exists .*→ NoScriptDir$/));
+
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining("fs.readText"));
   });
 
   it("logs exists() with the resolved boolean", async () => {
