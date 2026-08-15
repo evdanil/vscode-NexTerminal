@@ -1226,6 +1226,104 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
   }, 20_000);
 });
 
+describe("scriptFsReadText — audit suppression for a detached read that settles AFTER its own deadline (P2, round 12: only the branch that wins the race may log)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("late-success suppression: a detached read that eventually SUCCEEDS after its deadline already fired does not log a second (contradictory) success line", async () => {
+    // ⊘ the pre-round-12 implementation (the raw, unwrapped `ctx` handed
+    // straight into `readLocalFileBounded` instead of a per-call guarded
+    // one) — once the gate below is released, the detached work's own real,
+    // successful read would call `ctx.log` a SECOND time with a
+    // "(N bytes)" success line for a call whose result was already
+    // discarded at the timeout — exactly the contradictory audit entry this
+    // fix exists to prevent.
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "late-success.txt"), "hello");
+
+    vi.useFakeTimers();
+    try {
+      const [gate] = gateOpens(1);
+      const settled = scriptFsReadText("late-success.txt", ctx).catch((e: unknown) => e);
+
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      const timeoutErr = await settled;
+      expect(timeoutErr).toMatchObject({ code: "ReadFailed", message: expect.stringContaining("timed out") });
+      // Exactly the deadline's own audit line so far — `fail()`'s log format
+      // is `fs.readText <path> → <code>`, no message/timing detail in it.
+      expect(log.mock.calls).toEqual([[expect.stringContaining("→ ReadFailed")]]);
+      const callCountAtTimeout = log.mock.calls.length;
+
+      // Let the detached work actually succeed for real now.
+      vi.useRealTimers();
+      gate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // No NEW log lines beyond the timeout one — specifically, no late
+      // "(N bytes)" success line.
+      expect(log.mock.calls.length).toBe(callCountAtTimeout);
+      expect(log).not.toHaveBeenCalledWith(expect.stringContaining("bytes"));
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
+  it("late-failure suppression: a detached read that eventually FAILS after its deadline already fired does not log a second failure line", async () => {
+    // Same shape as the success case, but the detached work's own I/O fails
+    // (e.g. a permission error surfacing only once the stalled open() finally
+    // settles) rather than succeeding — `fail()` still constructs and
+    // rejects with the error, it just must not log a second time.
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "late-failure.txt"), "hello");
+
+    const openGate = deferred<void>();
+    nodeOpenSpy.mockImplementationOnce(async () => {
+      await openGate.promise;
+      throw Object.assign(new Error("EACCES: permission denied (simulated)"), { code: "EACCES" });
+    });
+
+    vi.useFakeTimers();
+    try {
+      const settled = scriptFsReadText("late-failure.txt", ctx).catch((e: unknown) => e);
+
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      const timeoutErr = await settled;
+      expect(timeoutErr).toMatchObject({ code: "ReadFailed", message: expect.stringContaining("timed out") });
+      expect(log.mock.calls).toEqual([[expect.stringContaining("→ ReadFailed")]]);
+      const callCountAtTimeout = log.mock.calls.length;
+
+      // Let the detached work actually fail for real now — its own `fail()`
+      // call would normally log an (identical-looking) SECOND
+      // "→ ReadFailed" line for this same path.
+      vi.useRealTimers();
+      openGate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(log.mock.calls.length).toBe(callCountAtTimeout);
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
+  it("fast path unchanged: a normal (non-timed-out) read still logs its single success line", async () => {
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "quick.txt"), "hi");
+
+    const text = await scriptFsReadText("quick.txt", ctx);
+
+    expect(text).toBe("hi");
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.readText .*quick\.txt \(2 bytes\)$/));
+  });
+});
+
 describe("scriptFsReadText — non-regular files are rejected before ANY read (file: scheme, P1)", () => {
   it.skipIf(process.platform === "win32")(
     "rejects a FIFO (named pipe) as not-a-regular-file, quickly and without ever opening it — opening a FIFO with no writer would hang forever",

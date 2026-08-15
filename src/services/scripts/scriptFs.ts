@@ -356,11 +356,21 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   // round 11's restructuring is exactly-once release, not two `finally`
   // blocks that could both fire.
   if (ctx.scriptUri.scheme === "file") {
-    return await withReadDeadline(readLocalFileBounded(resolution.resolvedPath, loggedPath, ctx), readSemaphore.release, ctx, loggedPath);
+    return await withReadDeadline(
+      (guardedCtx) => readLocalFileBounded(resolution.resolvedPath, loggedPath, guardedCtx),
+      readSemaphore.release,
+      ctx,
+      loggedPath
+    );
   }
 
   const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
-  return await withReadDeadline(readRemoteFileBounded(uri, loggedPath, ctx), readSemaphore.release, ctx, loggedPath);
+  return await withReadDeadline(
+    (guardedCtx) => readRemoteFileBounded(uri, loggedPath, guardedCtx),
+    readSemaphore.release,
+    ctx,
+    loggedPath
+  );
 }
 
 /**
@@ -395,13 +405,42 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
  * underlying I/O keeps running to completion (or forever) detached from this
  * call regardless of which branch above fires; see `SCRIPT_FS_MAX_ORPHANED_READS`'s
  * doc comment for the bound this now puts on how much of that can pile up.
+ *
+ * ROUND 12 — audit output belongs ONLY to the branch that actually wins the
+ * race. Without this, a detached `work` continuation that settles AFTER its
+ * own deadline already fired would still write its own audit line — either a
+ * success byte-count (`readLocalFileBounded`/`readRemoteFileBounded`'s own
+ * `ctx.log`) or a SECOND failure line (via `fail()`) — for a call whose
+ * result was already discarded, producing a contradictory entry (sometimes
+ * after the run's own `end` line). `workFactory` receives a `ctx` whose
+ * `log` is wrapped to no-op once `raceState.deadlineWon` flips — set as the
+ * very first thing the deadline callback does, before it even logs its OWN
+ * `ReadFailed` line (that line uses the UNGUARDED `ctx` passed into this
+ * function, since the deadline branch is always the one allowed to log).
+ * `fail()` routes through whatever `ctx` it's given, so a late failure
+ * inside `work` (which only ever sees the GUARDED `ctx`) is suppressed the
+ * same way a late success is — the error object is still constructed and
+ * still rejects `work`, it just never logs. On the normal (work-wins) path
+ * `raceState.deadlineWon` never flips, so the guard is a pure passthrough —
+ * zero behavior change.
  */
 async function withReadDeadline<T>(
-  work: Promise<T>,
+  workFactory: (ctx: ScriptFsContext) => Promise<T>,
   release: () => void,
   ctx: ScriptFsContext,
   loggedPath: string
 ): Promise<T> {
+  const raceState = { deadlineWon: false };
+  const guardedCtx: ScriptFsContext = {
+    ...ctx,
+    log: (text: string) => {
+      if (!raceState.deadlineWon) {
+        ctx.log(text);
+      }
+    }
+  };
+  const work = workFactory(guardedCtx);
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   // Set the instant the deadline fires — lets the `finally` below know NOT to
   // release a second time; the timeout branch has already taken over that
@@ -410,6 +449,10 @@ async function withReadDeadline<T>(
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
+      // MUST be set before anything else below — a `work` continuation that
+      // happens to settle in this very tick (e.g. it was already queued as a
+      // microtask when the timer fired) must never win the race to log.
+      raceState.deadlineWon = true;
       if (orphanedReads < SCRIPT_FS_MAX_ORPHANED_READS) {
         orphanedReads++;
         work
