@@ -6,6 +6,60 @@ import type { ScriptFsErrorCode } from "./scriptTypes";
 /** Decision 7 — not configurable. */
 export const SCRIPT_FS_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
 
+/**
+ * How many `nexus.fs.readText` calls may have a file body in memory at once,
+ * across every running script. Bounds the HOST-side (extension-host) transient
+ * allocation at ~`SCRIPT_FS_MAX_CONCURRENT_READS × SCRIPT_FS_MAX_BYTES` (~16 MiB
+ * at the current cap) no matter how many scripts are running or how many
+ * `Promise.all(paths.map(nexus.fs.readText))` calls they issue: the size-hint
+ * fix (`initialReadCapacity`) only bounds the allocation of a SINGLE read —
+ * concurrent reads of files whose honest sizes are each near the cap still
+ * multiply. (A script's own held RESULTS — the decoded strings it chooses to
+ * keep around — live in the WORKER's heap; that's the script's own memory
+ * budget to manage, not this module's problem. What this bounds is strictly
+ * the main-thread-side buffer this module itself allocates per read.)
+ */
+export const SCRIPT_FS_MAX_CONCURRENT_READS = 4;
+
+/**
+ * Tiny FIFO async semaphore — the classic promise-queue pattern, no deps.
+ * `acquire()` resolves once a slot is free (immediately if one already is,
+ * otherwise once an earlier waiter's slot is `release()`d, in queue order).
+ * The caller MUST `release()` exactly once per `acquire()` — normally from a
+ * `finally`, so a throw can't leak the slot forever. Exported for direct unit
+ * tests; scoped to a single module-level instance below (see
+ * `SCRIPT_FS_MAX_CONCURRENT_READS`'s doc comment for why GLOBAL, not per-run).
+ */
+export interface Semaphore {
+  acquire(): Promise<void>;
+  release(): void;
+}
+
+export function createSemaphore(limit: number): Semaphore {
+  let available = limit;
+  const queue: Array<() => void> = [];
+  return {
+    acquire(): Promise<void> {
+      if (available > 0) {
+        available--;
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => queue.push(resolve));
+    },
+    release(): void {
+      const next = queue.shift();
+      // Hand the slot straight to the next FIFO waiter rather than
+      // incrementing `available` and letting it race a fresh `acquire()` —
+      // this is what makes queueing order (FIFO) actually meaningful.
+      if (next) next();
+      else available++;
+    }
+  };
+}
+
+/** Global — a host-memory budget is per-host, not per-run. See the doc comment on `SCRIPT_FS_MAX_CONCURRENT_READS`. */
+const readSemaphore = createSemaphore(SCRIPT_FS_MAX_CONCURRENT_READS);
+
 export interface ScriptFsContext {
   scriptUri: vscode.Uri;
   /** undefined ⇢ untitled: script ⇢ every nexus.fs call throws NoScriptDir. */
@@ -196,80 +250,93 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   // once several scripts are involved) raw requested value.
   const loggedPath = resolution.resolvedPath;
 
-  if (ctx.scriptUri.scheme === "file") {
-    return readLocalFileBounded(resolution.resolvedPath, loggedPath, ctx);
-  }
-
-  const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
-
-  // Non-`file` schemes: `vscode.workspace.fs` is the only API surface a
-  // FileSystemProvider exposes, and it has no bounded-read variant — there is
-  // no syscall-level equivalent of `boundedReadFile` to drop down to for a
-  // remote target. The size cap here is therefore BEST-EFFORT: it protects
-  // *correctness* (a script never sees more than SCRIPT_FS_MAX_BYTES of
-  // content) but not *peak extension-host memory* — a misbehaving remote
-  // provider that lies about `stat.size` can still make `readFile` allocate
-  // its true (oversized) body before the post-read check below rejects it.
-  let stat: vscode.FileStat;
+  // Gate the actual read (both branches — the non-file branch materializes
+  // up to the cap via workspace.fs.readFile too) on the global concurrency
+  // semaphore. Everything above this point is pure validation — no I/O, no
+  // allocation — so it stays ungated; gating it would just make an
+  // already-doomed InvalidPath/NoScriptDir call wait behind slow reads for
+  // nothing. `readJson` is worker-side JSON.parse over exactly one
+  // `fs.readText` RPC call, so it never nests a second acquire inside this
+  // one — verified: there is no other gated call anywhere in this module.
+  await readSemaphore.acquire();
   try {
-    stat = await vscode.workspace.fs.stat(uri);
-  } catch (err) {
-    // Only a genuine "nothing is there" failure maps to FileNotFound; anything
-    // else (permissions, an unavailable provider, ...) is ReadFailed — the
-    // path resolved fine, the read itself is what didn't work.
-    if (isNotFoundStatError(err)) {
-      throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: not found`);
+    if (ctx.scriptUri.scheme === "file") {
+      return await readLocalFileBounded(resolution.resolvedPath, loggedPath, ctx);
     }
-    const detail = err instanceof Error ? err.message : String(err);
-    throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
-  }
-  // Bitmask test, not `===` — same discipline as scriptScanner.ts, so a
-  // symlinked directory is caught too.
-  if ((stat.type & vscode.FileType.Directory) !== 0) {
-    throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: is a directory`);
-  }
-  // Checked BEFORE reading so an honestly-reported multi-GB file is never
-  // pulled into memory in the common case — belt, not braces, here: see the
-  // post-read check below for the braces.
-  if (stat.size > SCRIPT_FS_MAX_BYTES) {
-    throw fail(ctx, "readText", loggedPath, "FileTooLarge", `${loggedPath}: ${stat.size} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`, {
-      sizeBytes: stat.size,
-      maxBytes: SCRIPT_FS_MAX_BYTES
-    });
-  }
 
-  let bytes: Uint8Array;
-  try {
-    bytes = await vscode.workspace.fs.readFile(uri);
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
-  }
-  // Braces: some FileSystemProviders report a stale/zero `size` from stat,
-  // and `readFile` has no size limit of its own — this is the only thing
-  // standing between a lying remote provider and an unbounded read (see the
-  // module-level comment on `boundedReadFile` for why `file:` doesn't have
-  // this problem).
-  if (bytes.byteLength > SCRIPT_FS_MAX_BYTES) {
-    throw fail(
-      ctx,
-      "readText",
-      loggedPath,
-      "FileTooLarge",
-      `${loggedPath}: ${bytes.byteLength} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
-      { sizeBytes: bytes.byteLength, maxBytes: SCRIPT_FS_MAX_BYTES }
-    );
-  }
+    const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
 
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw fail(ctx, "readText", loggedPath, "NotUtf8", `${loggedPath}: not valid UTF-8`);
-  }
+    // Non-`file` schemes: `vscode.workspace.fs` is the only API surface a
+    // FileSystemProvider exposes, and it has no bounded-read variant — there is
+    // no syscall-level equivalent of `boundedReadFile` to drop down to for a
+    // remote target. The size cap here is therefore BEST-EFFORT: it protects
+    // *correctness* (a script never sees more than SCRIPT_FS_MAX_BYTES of
+    // content) but not *peak extension-host memory* — a misbehaving remote
+    // provider that lies about `stat.size` can still make `readFile` allocate
+    // its true (oversized) body before the post-read check below rejects it.
+    let stat: vscode.FileStat;
+    try {
+      stat = await vscode.workspace.fs.stat(uri);
+    } catch (err) {
+      // Only a genuine "nothing is there" failure maps to FileNotFound; anything
+      // else (permissions, an unavailable provider, ...) is ReadFailed — the
+      // path resolved fine, the read itself is what didn't work.
+      if (isNotFoundStatError(err)) {
+        throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: not found`);
+      }
+      const detail = err instanceof Error ? err.message : String(err);
+      throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
+    }
+    // Bitmask test, not `===` — same discipline as scriptScanner.ts, so a
+    // symlinked directory is caught too.
+    if ((stat.type & vscode.FileType.Directory) !== 0) {
+      throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: is a directory`);
+    }
+    // Checked BEFORE reading so an honestly-reported multi-GB file is never
+    // pulled into memory in the common case — belt, not braces, here: see the
+    // post-read check below for the braces.
+    if (stat.size > SCRIPT_FS_MAX_BYTES) {
+      throw fail(ctx, "readText", loggedPath, "FileTooLarge", `${loggedPath}: ${stat.size} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`, {
+        sizeBytes: stat.size,
+        maxBytes: SCRIPT_FS_MAX_BYTES
+      });
+    }
 
-  ctx.log(`fs.readText ${loggedPath} (${bytes.byteLength} bytes)`);
-  return text;
+    let bytes: Uint8Array;
+    try {
+      bytes = await vscode.workspace.fs.readFile(uri);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
+    }
+    // Braces: some FileSystemProviders report a stale/zero `size` from stat,
+    // and `readFile` has no size limit of its own — this is the only thing
+    // standing between a lying remote provider and an unbounded read (see the
+    // module-level comment on `boundedReadFile` for why `file:` doesn't have
+    // this problem).
+    if (bytes.byteLength > SCRIPT_FS_MAX_BYTES) {
+      throw fail(
+        ctx,
+        "readText",
+        loggedPath,
+        "FileTooLarge",
+        `${loggedPath}: ${bytes.byteLength} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
+        { sizeBytes: bytes.byteLength, maxBytes: SCRIPT_FS_MAX_BYTES }
+      );
+    }
+
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw fail(ctx, "readText", loggedPath, "NotUtf8", `${loggedPath}: not valid UTF-8`);
+    }
+
+    ctx.log(`fs.readText ${loggedPath} (${bytes.byteLength} bytes)`);
+    return text;
+  } finally {
+    readSemaphore.release();
+  }
 }
 
 /**

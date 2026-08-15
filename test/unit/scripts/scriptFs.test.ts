@@ -33,9 +33,13 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     // test's read path work unchanged. Only tests that explicitly
     // `mockImplementationOnce` see different behavior, and only for that one
     // call. `open` is wrapped too (still real) purely so tests can assert it
-    // was never CALLED — the early-reject-before-opening test needs that.
+    // was never CALLED — the early-reject-before-opening test needs that —
+    // and so the concurrency-gate test can install a slow-but-still-real
+    // `mockImplementation` (via `__realOpen`, the un-wrapped original) that
+    // tracks how many opens are in flight at once.
     stat: vi.fn(actual.stat),
-    open: vi.fn(actual.open)
+    open: vi.fn(actual.open),
+    __realOpen: actual.open
   };
 });
 
@@ -138,6 +142,8 @@ import {
   buildScriptFsScope,
   boundedReadFile,
   initialReadCapacity,
+  createSemaphore,
+  SCRIPT_FS_MAX_CONCURRENT_READS,
   type ScriptFsContext
 } from "../../../src/services/scripts/scriptFs";
 
@@ -149,6 +155,8 @@ const remoteUri = (vscode as unknown as { __remoteUri: (authority: string, p: st
 const nodeStatSpy = fsp.stat as unknown as ReturnType<typeof vi.fn>;
 /** `node:fs/promises`'s `open`, wrapped (not replaced) — see the vi.mock above. */
 const nodeOpenSpy = fsp.open as unknown as ReturnType<typeof vi.fn>;
+/** The real (un-wrapped) `open`, for tests that need to stay on real disk while still overriding the spy's `mockImplementation`. */
+const realNodeOpen = (fsp as unknown as { __realOpen: typeof fsp.open }).__realOpen;
 
 // -----------------------------------------------------------------------------
 // Fixture harness
@@ -423,6 +431,130 @@ describe("boundedReadFile — direct unit coverage (P1)", () => {
     const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024, 4); // hint claims 4 bytes
     expect(bytes.byteLength).toBe(4 * 1024 * 1024 + 1);
   });
+});
+
+describe("createSemaphore — direct unit coverage (P1: host-side FIFO concurrency gate)", () => {
+  it("runs at most `limit` tasks concurrently, all `limit`-plus tasks eventually complete, and admits waiters in FIFO submission order", async () => {
+    // ⊘ an ungated (or badly-gated) implementation — e.g. one that increments
+    // `available` on release without handing the slot to a waiter, letting a
+    // fresh acquire() race ahead of one already queued — would let `peak`
+    // exceed the limit and/or scramble the admission order.
+    const limit = 4;
+    const sem = createSemaphore(limit);
+    let concurrent = 0;
+    let peak = 0;
+    const startedOrder: number[] = [];
+
+    async function task(id: number): Promise<number> {
+      await sem.acquire();
+      try {
+        concurrent++;
+        peak = Math.max(peak, concurrent);
+        startedOrder.push(id);
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        return id;
+      } finally {
+        concurrent--;
+        sem.release();
+      }
+    }
+
+    const results = await Promise.all(Array.from({ length: 10 }, (_, i) => task(i)));
+
+    expect(peak).toBeLessThanOrEqual(limit);
+    expect(peak).toBeGreaterThan(0);
+    expect(results).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]); // all 10 completed
+    // FIFO fairness: submitted 0..9 in order; the first `limit` acquire
+    // synchronously (before any of them can finish), so admission order for
+    // the rest tracks release order, which tracks submission order here.
+    expect(startedOrder).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  it("acquire() resolves immediately (no queueing) while slots remain", async () => {
+    const sem = createSemaphore(2);
+    let resolved = false;
+    sem.acquire().then(() => {
+      resolved = true;
+    });
+    // A real microtask tick is enough for an unqueued acquire() to settle;
+    // ⊘ an implementation that always queues (even with slots free) would
+    // need an explicit release() first, which never happens here.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolved).toBe(true);
+  });
+});
+
+describe("scriptFsReadText — release-on-error, no deadlock across the concurrency gate (P1)", () => {
+  it("readSemaphore releases its slot even when the gated read throws — subsequent reads never deadlock behind a failing batch", async () => {
+    // ⊘ releasing the semaphore only on the success path (e.g. no `finally`,
+    // or a `release()` call placed only after `return text`) — every one of
+    // the SCRIPT_FS_MAX_CONCURRENT_READS failing calls below would leak its
+    // permit, and the read that follows would then wait forever for a slot
+    // that never frees (this test's own timeout is what would catch that).
+    const { ctx, scriptDir } = await makeCtx();
+    const failing = await Promise.all(
+      Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
+        scriptFsReadText(`missing-${i}.txt`, ctx).catch((e: unknown) => e)
+      )
+    );
+    for (const err of failing) {
+      expect(err).toMatchObject({ code: "FileNotFound" });
+    }
+
+    await fsp.writeFile(path.join(scriptDir, "ok.txt"), "hi");
+    const text = await scriptFsReadText("ok.txt", ctx);
+    expect(text).toBe("hi");
+  });
+});
+
+describe("scriptFsReadText — global concurrency gate (P1: bounds host-side transient allocation)", () => {
+  it("10 concurrent readText calls over small real files all succeed — no deadlock through the gate", async () => {
+    const { ctx, scriptDir } = await makeCtx();
+    const n = 10;
+    for (let i = 0; i < n; i++) {
+      await fsp.writeFile(path.join(scriptDir, `f${i}.txt`), `content-${i}`);
+    }
+
+    const results = await Promise.all(Array.from({ length: n }, (_, i) => scriptFsReadText(`f${i}.txt`, ctx)));
+    results.forEach((text, i) => expect(text).toBe(`content-${i}`));
+  });
+
+  it("caps concurrent file opens at SCRIPT_FS_MAX_CONCURRENT_READS — a 5th-and-beyond call waits for a slot instead of opening immediately", async () => {
+    // ⊘ an ungated scriptFsReadText — every one of the 10 concurrent calls
+    // below would call `open` immediately, so peak concurrent opens would
+    // equal however many calls were issued at once (10), not the configured
+    // limit (4).
+    const { ctx, scriptDir } = await makeCtx();
+    const n = 10;
+    for (let i = 0; i < n; i++) {
+      await fsp.writeFile(path.join(scriptDir, `slow${i}.txt`), `content-${i}`);
+    }
+
+    let inFlight = 0;
+    let peakInFlight = 0;
+    nodeOpenSpy.mockImplementation(async (...args: Parameters<typeof realNodeOpen>) => {
+      inFlight++;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise<void>((resolve) => setTimeout(resolve, 15));
+      try {
+        return await realNodeOpen(...args);
+      } finally {
+        inFlight--;
+      }
+    });
+
+    try {
+      const results = await Promise.all(Array.from({ length: n }, (_, i) => scriptFsReadText(`slow${i}.txt`, ctx)));
+      results.forEach((text, i) => expect(text).toBe(`content-${i}`));
+      expect(peakInFlight).toBeGreaterThan(0);
+      expect(peakInFlight).toBeLessThanOrEqual(SCRIPT_FS_MAX_CONCURRENT_READS);
+    } finally {
+      // Restore the wrapped-but-real default so every OTHER test keeps
+      // hitting the real filesystem unchanged.
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+    }
+  }, 10_000);
 });
 
 describe("scriptFsReadText — non-regular files are rejected before ANY read (file: scheme, P1)", () => {
