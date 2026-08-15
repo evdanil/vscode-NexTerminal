@@ -2377,6 +2377,60 @@ describe("scriptFsExists — the probe pool (P2: a stalled provider must not lea
     }
   }, 20_000);
 
+  it("probes that expire in the QUEUE leave nothing linked in the pool — the next live probe is not queued behind their corpses", async () => {
+    // The retention half of the bound above, on the real probe pool. Once the
+    // pool is fully degraded (orphan budget spent, every remaining permit held
+    // by a stat that never answers) EVERY later call expires in the queue, and
+    // a wait that cannot be abandoned leaves its resolver, its slot label and
+    // its captured ctx linked in the FIFO forever — one per call, for as long
+    // as the host lives, with a permit that eventually reopens having to be
+    // forwarded through all of them before it reaches anybody.
+    //
+    // ⊘ an `acquire()` with no cancellation path (the shipped implementation
+    // before this fix): `queued` reads 8 below instead of 0, and 9 instead of
+    // 1 once a live probe joins. Caller-visible behaviour is identical either
+    // way — every one of these calls is rejected at its deadline regardless —
+    // so the retained queue is the only thing that separates the two.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "e.txt"), "x");
+    const cap = SCRIPT_FS_MAX_CONCURRENT_STATS + SCRIPT_FS_MAX_ORPHANED_STATS; // 24
+    const stranded = 8; // more than the pool can ever admit ⇒ these die in the queue
+
+    const gate = hangAllStats();
+    vi.useFakeTimers();
+    try {
+      const settled = Promise.allSettled(Array.from({ length: cap + stranded }, () => scriptFsExists("e.txt", ctx)));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      for (const r of await settled) expect(r.status).toBe("rejected");
+
+      // The pool is at its bound and fully degraded: nothing can free a permit
+      // except one of the hung stats finally answering.
+      expect(statSpy.mock.calls.length).toBe(cap);
+      expect(statSlots.snapshot()).toMatchObject({
+        permitsInUse: SCRIPT_FS_MAX_CONCURRENT_STATS,
+        orphaned: SCRIPT_FS_MAX_ORPHANED_STATS,
+        queued: 0
+      });
+      // The read pool never had anything to do with any of it.
+      expect(readSlots.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [], queued: 0 });
+
+      // A live probe arrives after the wreckage: it is the ONLY thing owed a
+      // permit, so the first one to reopen reaches it directly.
+      const live = scriptFsExists("e.txt", ctx);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(statSlots.snapshot().queued).toBe(1);
+
+      vi.useRealTimers();
+      gate.resolve();
+      await expect(live).resolves.toBe(true);
+      expect(statSlots.snapshot().queued).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
   it("probes beyond the pool QUEUE rather than fire immediately: with SCRIPT_FS_MAX_CONCURRENT_STATS stats hung, the next ones never reach the provider", async () => {
     // ⊘ an ungated (or unbounded-concurrency) exists(): all
     // SCRIPT_FS_MAX_CONCURRENT_STATS + 3 probes below would call `stat`

@@ -2,16 +2,28 @@
  * Direct coverage of the read-slot state machine (readSlotScheduler.ts).
  *
  * These tests drive the scheduler with plain resolver-controlled promises and
- * a short real-timer deadline — no filesystem, no fake timers, no spy-count
- * inference. Every state the machine can be in is observable through
- * `snapshot()`, so each transition is asserted directly rather than deduced
- * from which caller happened to unblock.
+ * a short real-timer deadline — no filesystem, no spy-count inference. Every
+ * state the machine can be in is observable through `snapshot()`, so each
+ * transition is asserted directly rather than deduced from which caller
+ * happened to unblock.
+ *
+ * The one exception is the same-tick race between a grant and an expiry (the
+ * last block): real timers cannot express it, because Node drains microtasks
+ * between two timer callbacks, so the grant a first deadline releases is always
+ * consumed before a second deadline can fire. That block — and only that block
+ * — installs fake timers, whose synchronous `advanceTimersByTime` runs both due
+ * callbacks in one stack and therefore reproduces the window exactly.
  *
  * House rule (CLAUDE.md): every test must fail against the specific wrong
  * implementation it prevents. Each block below names its target-wrong-impl (⊘).
  */
 import { describe, expect, it, vi } from "vitest";
-import { ReadSlotScheduler, type GatedWork } from "../../../src/services/scripts/readSlotScheduler";
+import {
+  createSemaphore,
+  ReadSlotScheduler,
+  type GatedWork,
+  type PermitOutcome
+} from "../../../src/services/scripts/readSlotScheduler";
 
 /** Short enough to keep the suite fast, long enough that a healthy op wins the race comfortably. */
 const DEADLINE_MS = 60;
@@ -74,6 +86,16 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 /** Lets the microtask queue drain plus one macrotask turn. */
 async function tick(ms = 5): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Drains the microtask queue WITHOUT letting a macrotask (or a fake-timer
+ * advance) run. `rounds` is generous: one admission walks several `await` hops
+ * — the semaphore grant, `claimPermit`, the `Promise.race` in `runGated` — and
+ * this must outlast the longest of those chains.
+ */
+async function flushMicrotasks(rounds = 30): Promise<void> {
+  for (let i = 0; i < rounds; i++) await Promise.resolve();
 }
 
 // -----------------------------------------------------------------------------
@@ -674,5 +696,269 @@ describe("ReadSlotScheduler — instances are independent", () => {
     await expect(freshCall).resolves.toBe("through");
     gate.resolve("late");
     await tick();
+  });
+});
+
+describe("ReadSlotScheduler — a call that expires in the queue leaves NOTHING behind", () => {
+  /**
+   * Wide enough that retention is an order-of-magnitude difference rather than
+   * an off-by-one, small enough that the suite stays fast. Stands in for the
+   * real shape: a script fanning `nexus.fs` calls out at a dead provider, every
+   * 30 seconds, for as long as the run lasts.
+   */
+  const FANOUT = 20;
+
+  /**
+   * Drives the pool to FULL degradation: one operation times out with no
+   * detachment capacity, so it is `held` — its permit is withheld and can only
+   * come back when its own (never-settling) work is finally gated open. Until
+   * then the pool has zero free permits and no mechanism that could make one,
+   * which is precisely the state every later call queues into and expires in.
+   */
+  async function degradePool(scheduler: ReadSlotScheduler): Promise<ReturnType<typeof stalledWork>> {
+    const hog = stalledWork("hog");
+    await expect(scheduler.runGated(hog.work)).rejects.toBe(TIMED_OUT);
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, orphaned: 0, held: ["hog"], queued: 0 });
+    return hog;
+  }
+
+  it("a fan-out that all expires in the queue retains no waiters at all", async () => {
+    // ⊘ an `acquire()` with no cancellation path (the shipped implementation
+    // before this fix): each expired call's RESOLVER stays linked in the FIFO
+    // forever, so a degraded pool accumulates one dead promise, one slot label
+    // and one closure per call, without bound, for as long as the host lives.
+    // The caller-visible behaviour is identical either way — every call below
+    // is rejected at its deadline regardless — so the retained queue is the
+    // only thing that can tell the two implementations apart, and it reads 20
+    // against the unfixed code and 0 against the fixed one.
+    const scheduler = makeScheduler({ maxConcurrent: 1, maxOrphaned: 0 });
+    const hog = await degradePool(scheduler);
+
+    const stranded = Array.from({ length: FANOUT }, (_, i) => stalledWork(`stranded-${i}`));
+    const results = await Promise.all(stranded.map((s) => scheduler.runGated(s.work).catch((e: unknown) => e)));
+
+    expect(results).toEqual(Array.from({ length: FANOUT }, () => TIMED_OUT));
+    // None of them ever ran: they died waiting for a permit.
+    expect(stranded.map((s) => s.runs())).toEqual(Array.from({ length: FANOUT }, () => 0));
+    // The machine is charged EXACTLY what it was before the fan-out — and the
+    // fan-out is not still sitting in the FIFO waiting for a permit nobody
+    // will ever use.
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, orphaned: 0, held: ["hog"], queued: 0 });
+
+    hog.gate.resolve("late");
+    await waitFor(() => scheduler.snapshot().permitsInUse === 0);
+  });
+
+  it("after a mass expiry the freed permit goes STRAIGHT to a live waiter, and the pool is still exactly maxConcurrent", async () => {
+    // ⊘ two mutations at once. (a) No unlink: the live waiter below queues
+    // BEHIND 20 dead ones, so the queue reads 21 instead of 1 and the permit
+    // has to be forwarded through every corpse before it reaches anybody —
+    // the assertion on `queued` fails long before any timing does. (b) Unlink
+    // that ALSO forwards (cancel unlinks and `claimPermit` still hands a
+    // permit back for the cancelled grant): each expiry quietly ADDS a permit,
+    // so the final drain check starts both members of a two-deep batch at once
+    // instead of one.
+    const scheduler = makeScheduler({ maxConcurrent: 1, maxOrphaned: 0 });
+    const hog = await degradePool(scheduler);
+
+    const stranded = Array.from({ length: FANOUT }, (_, i) => stalledWork(`stranded-${i}`));
+    await Promise.all(stranded.map((s) => scheduler.runGated(s.work).catch(() => undefined)));
+
+    // A live caller arrives after the wreckage. It is the ONLY thing owed a
+    // permit — the expired calls took their claims with them.
+    const fresh = stalledWork("fresh");
+    const freshCall = scheduler.runGated(fresh.work);
+    await tick(1);
+    expect(fresh.runs()).toBe(0);
+    expect(scheduler.snapshot().queued).toBe(1);
+
+    // One permit reopens: it reaches the live waiter with no forward hops.
+    hog.gate.resolve("late");
+    await waitFor(() => fresh.runs() === 1);
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, orphaned: 0, held: [], queued: 0 });
+
+    fresh.gate.resolve("through");
+    await expect(freshCall).resolves.toBe("through");
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [], queued: 0 });
+
+    // Full-drain check: the 20 expiries neither shrank nor grew the pool —
+    // capacity is EXACTLY maxConcurrent, so one of these two starts and the
+    // other waits.
+    const a = stalledWork("a");
+    const b = stalledWork("b");
+    const aCall = scheduler.runGated(a.work);
+    const bCall = scheduler.runGated(b.work);
+    await tick(1);
+    expect([a.runs(), b.runs()]).toEqual([1, 0]);
+
+    a.gate.resolve("a");
+    await waitFor(() => b.runs() === 1);
+    b.gate.resolve("b");
+    await expect(Promise.all([aCall, bCall])).resolves.toEqual(["a", "b"]);
+    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [], queued: 0 });
+  });
+});
+
+describe("createSemaphore — a cancelled wait unlinks, and cancel-vs-grant settles exactly once", () => {
+  /** Every outcome the request promise ever produces, in order — one entry means "settled exactly once". */
+  function record(request: { promise: Promise<PermitOutcome> }): PermitOutcome[] {
+    const seen: PermitOutcome[] = [];
+    void request.promise.then((outcome) => seen.push(outcome));
+    return seen;
+  }
+
+  /**
+   * How many permits the pool hands out without a single release — i.e. its
+   * TRUE capacity right now. Probing with more requests than the limit is the
+   * point: the surplus must stay queued, which is exactly what a pool that has
+   * silently grown would fail to do. Leaves the pool exactly as it found it —
+   * what was granted is handed back, what is still waiting is unlinked (the
+   * surplus is unlinked FIRST, so the restoring releases cannot be intercepted
+   * by this probe's own leftovers).
+   */
+  async function freeCapacity(sem: ReturnType<typeof createSemaphore>, probes: number): Promise<number> {
+    const requests = Array.from({ length: probes }, () => sem.acquireCancellable());
+    const outcomes: PermitOutcome[] = [];
+    for (const request of requests) void request.promise.then((outcome) => outcomes.push(outcome));
+    await flushMicrotasks();
+    const granted = outcomes.filter((outcome) => outcome === "granted").length;
+    const unlinked = requests.filter((request) => request.cancel()).length;
+    expect(probes - unlinked).toBe(granted);
+    for (let i = 0; i < granted; i++) sem.release();
+    return granted;
+  }
+
+  it("cancel() unlinks a still-queued waiter, settles it as cancelled, and leaves the pool untouched", async () => {
+    // ⊘ a `cancel()` that only marks a tombstone (or does nothing at all): the
+    // entry stays linked, `queued()` never returns to 0, and a pool that is
+    // degraded for a long time accumulates one entry per abandoned wait.
+    const sem = createSemaphore(1);
+    await sem.acquire();
+    const request = sem.acquireCancellable();
+    const outcomes = record(request);
+    expect(sem.queued()).toBe(1);
+
+    expect(request.cancel()).toBe(true);
+    await flushMicrotasks();
+    expect(outcomes).toEqual(["cancelled"]);
+    expect(sem.queued()).toBe(0);
+    // Cancelling took nothing from the pool: the one outstanding permit is
+    // still the one this test acquired, and releasing it frees exactly one.
+    sem.release();
+    expect(await freeCapacity(sem, 3)).toBe(1);
+  });
+
+  it("cancel() after the grant is a no-op: the waiter is granted exactly once and owes a release", async () => {
+    // ⊘ a `cancel()` that reports success regardless (or, worse, splices at
+    // index -1 and evicts an unrelated waiter): the caller would believe the
+    // permit was never granted, drop it, and the pool would shrink by one for
+    // every such race — the deadlock this whole seam exists to prevent.
+    const sem = createSemaphore(1);
+    await sem.acquire();
+    const request = sem.acquireCancellable();
+    const outcomes = record(request);
+
+    // The same tick, in the order the race produces: the grant lands first,
+    // the deadline's cancel arrives behind it.
+    sem.release();
+    expect(request.cancel()).toBe(false);
+
+    await flushMicrotasks();
+    expect(outcomes).toEqual(["granted"]);
+    expect(sem.queued()).toBe(0);
+    // The permit is genuinely this waiter's — the pool has none free until it
+    // hands it back, and then exactly one.
+    expect(await freeCapacity(sem, 3)).toBe(0);
+    sem.release();
+    expect(await freeCapacity(sem, 3)).toBe(1);
+  });
+
+  it("a cancelled waiter never intercepts a later release — the permit reaches the next live waiter", async () => {
+    // ⊘ a cancel that unlinks the wrong entry, or leaves a dead resolver the
+    // next release would hand the permit to: `live` would never start.
+    const sem = createSemaphore(1);
+    await sem.acquire();
+    const dead = sem.acquireCancellable();
+    const live = sem.acquireCancellable();
+    const liveOutcomes = record(live);
+    expect(dead.cancel()).toBe(true);
+    expect(sem.queued()).toBe(1);
+
+    sem.release();
+    await flushMicrotasks();
+    expect(liveOutcomes).toEqual(["granted"]);
+    expect(sem.queued()).toBe(0);
+  });
+});
+
+describe("ReadSlotScheduler — the grant that lands on an already-expired slot (the surviving race)", () => {
+  /**
+   * The race the unlink CANNOT close, reproduced deterministically. Two calls
+   * share a deadline instant: the first is running (its timeout detaches it and
+   * hands its permit back), the second is still queued (its timeout expires it).
+   * When both fire in the same tick, the release happens BEFORE the expiry, so
+   * the queued slot has already been handed the permit — `cancel()` finds
+   * nothing to unlink and `claimPermit`'s forwarding is the only thing that can
+   * return the permit to the pool.
+   *
+   * Fake timers are what make "the same tick" expressible: `advanceTimersByTime`
+   * runs both due callbacks on one stack, with no microtask drain in between.
+   * Under real timers Node drains microtasks between timer callbacks, so the
+   * grant is always consumed before the second deadline can fire.
+   */
+  it("forwards the permit instead of losing or duplicating it, and the pool ends exactly at maxConcurrent", async () => {
+    // ⊘ deleting the forwarding branch now that expiry unlinks: the branch is
+    // rare, not dead, and without it this grant is dropped on the floor — the
+    // pool below would come back with ZERO free permits and the next caller
+    // would hang forever. ⊘ its opposite, forwarding AND keeping the grant:
+    // the pool would come back with two.
+    vi.useFakeTimers();
+    try {
+      const scheduler = new ReadSlotScheduler({ maxConcurrent: 1, deadlineMs: 1_000, maxOrphaned: 1 });
+      const running = stalledWork("running");
+      const runningCall = scheduler.runGated(running.work).catch((e: unknown) => e);
+      await flushMicrotasks();
+      expect(running.runs()).toBe(1);
+
+      // Queued behind it, and — because no virtual time has passed — its
+      // deadline is armed for the very same instant.
+      const queued = stalledWork("queued");
+      const queuedCall = scheduler.runGated(queued.work).catch((e: unknown) => e);
+      await flushMicrotasks();
+      expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, queued: 1 });
+
+      // Both deadlines fire on one stack: the first detaches and releases,
+      // which grants the permit to the second — which then expires.
+      vi.advanceTimersByTime(1_000);
+      await flushMicrotasks();
+
+      expect(await runningCall).toBe(TIMED_OUT);
+      expect(await queuedCall).toBe(TIMED_OUT);
+      expect(queued.runs()).toBe(0);
+      // The forwarded permit came back to the pool: nothing held, nothing
+      // queued, one detached slot for the still-running work.
+      expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 1, held: [], queued: 0 });
+
+      // Capacity is EXACTLY one: a fresh caller is admitted straight away and
+      // a second one has to wait for it.
+      const first = stalledWork("first");
+      const second = stalledWork("second");
+      const firstCall = scheduler.runGated(first.work).catch((e: unknown) => e);
+      const secondCall = scheduler.runGated(second.work).catch((e: unknown) => e);
+      await flushMicrotasks();
+      expect([first.runs(), second.runs()]).toEqual([1, 0]);
+
+      first.gate.resolve("first");
+      await flushMicrotasks();
+      expect(second.runs()).toBe(1);
+      second.gate.resolve("second");
+      running.gate.resolve("late");
+      await flushMicrotasks();
+      expect(await firstCall).toBe("first");
+      expect(await secondCall).toBe("second");
+      expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [], queued: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
