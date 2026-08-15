@@ -280,7 +280,7 @@ describe("nexus.fs — end-to-end integration", () => {
     }
   }, 10_000);
 
-  it("(e) a BigInt / cyclic-object argument still crosses the real structured-clone RPC boundary and revives as a typed InvalidPath error, with a refusal logged", async () => {
+  it("(e) a BigInt / cyclic-object / Symbol / function argument all cross the real worker RPC boundary and revive as a typed InvalidPath error, with a refusal logged", async () => {
     // ⊘ formatting the offending value with a bare JSON.stringify inside
     // scriptFsScope.ts / scriptFs.ts: a BigInt and a cyclic object are both
     // structured-cloneable, so `postMessage` genuinely delivers them to the
@@ -291,6 +291,21 @@ describe("nexus.fs — end-to-end integration", () => {
     // fixture's own catch block checks for, AND no refusal is logged — the
     // fixture would throw its own assertion error either way, ending the run
     // `failed` instead of `completed`.
+    //
+    // ⊘ scriptWorker.ts's rpc()/sanitizeFsPath NOT existing at all: a Symbol
+    // and a function are NOT structured-cloneable (unlike a cyclic object,
+    // which the structured-clone algorithm handles natively — only
+    // JSON.stringify chokes on that one, which is what the BigInt/cyclic half
+    // above actually pins). `parentPort.postMessage` throws SYNCHRONOUSLY for
+    // these two — confirmed empirically: without the fix, the promise rejects
+    // with a DOMException whose `.name` is "DataCloneError" and whose legacy
+    // `.code` is the NUMBER 25 (the DOM spec's DATA_CLONE_ERR constant), not
+    // the string "InvalidPath" the fixture's own catch checks for — so the
+    // fixture throws its OWN assertion error ("got 25"), ending the run
+    // `failed` on the very first non-cloneable case, before the function()
+    // case ever runs at all. The `rpc()` try/catch additionally stops the
+    // `pending` map entry from leaking on that path (unobservable from here;
+    // see the comment on `rpc()` itself).
     const { manager, scriptUri, outputLines } = runtimeFixture("fs-read-invalid-value.js");
     const events: string[] = [];
     manager.onDidChangeRun((e) => events.push(e.kind + (e.kind === "ended" ? `:${e.finalState}` : "")));
@@ -300,5 +315,9 @@ describe("nexus.fs — end-to-end integration", () => {
 
     expect(events).toContain("ended:completed");
     expect(outputLines.some((l) => l.includes("fs.readText") && l.includes("InvalidPath"))).toBe(true);
+    // Specifically the Symbol/function stand-in path: sanitizeFsPath()'s
+    // `{ __nonCloneable: ... }` object is what actually got logged — proves
+    // the refusal wasn't silently dropped for the two non-cloneable cases.
+    expect(outputLines.some((l) => l.includes("__nonCloneable"))).toBe(true);
   }, 10_000);
 });
