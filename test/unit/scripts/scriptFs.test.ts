@@ -1,10 +1,18 @@
 /*
  * Handler tests for the nexus.fs main-thread implementation (scriptFs.ts).
  *
- * `vscode.workspace.fs.stat` / `.readFile` delegate to node:fs/promises against
- * a per-test tmp directory, same style as the existing runtime-manager
- * integration mock — real filesystem behavior (including real symlinks),
- * without spinning up a Worker.
+ * Two schemes, two mocking strategies:
+ *  - `file:` reads go through `node:fs/promises` directly now (P1 — bounded
+ *    native read, see scriptFs.ts's `boundedReadFile`), so `node:fs/promises`
+ *    is PARTIALLY mocked below: every export passes through to the real
+ *    implementation except `stat`, which is wrapped in a `vi.fn` (still
+ *    delegating to the real `stat` by default) so individual tests can
+ *    `mockImplementationOnce` a lying stat for the "stat lies" cases. Setup
+ *    calls (`writeFile`, `mkdir`, `symlink`, ...) all still hit the real disk.
+ *  - Non-`file` reads keep going through `vscode.workspace.fs.stat` /
+ *    `.readFile`, mocked below the same way as before (real disk for `file:`
+ *    Uris passed to it — only `exists()` still uses this for `file:` — and a
+ *    synthetic `.path`-addressed store for remote Uris).
  *
  * House rule (CLAUDE.md): every test must fail against the specific wrong
  * implementation it prevents. Each block below names its target-wrong-impl (⊘).
@@ -15,6 +23,19 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const FileType = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 } as const;
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    // Wrapped, not replaced — defaults to the real implementation so every
+    // OTHER test's fixture setup (writeFile/mkdir/symlink/...) and every OTHER
+    // test's read path work unchanged. Only tests that explicitly
+    // `mockImplementationOnce` see different behavior, and only for that one
+    // call.
+    stat: vi.fn(actual.stat)
+  };
+});
 
 vi.mock("vscode", () => {
   const FileTypeEnum = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 };
@@ -109,12 +130,14 @@ vi.mock("vscode", () => {
 });
 
 import * as vscode from "vscode";
-import { scriptFsExists, scriptFsReadText, buildScriptFsScope, type ScriptFsContext } from "../../../src/services/scripts/scriptFs";
+import { scriptFsExists, scriptFsReadText, buildScriptFsScope, boundedReadFile, type ScriptFsContext } from "../../../src/services/scripts/scriptFs";
 
 const statSpy = vscode.workspace.fs.stat as unknown as ReturnType<typeof vi.fn>;
 const readFileSpy = vscode.workspace.fs.readFile as unknown as ReturnType<typeof vi.fn>;
 const remoteFiles = (vscode as unknown as { __remoteFiles: Map<string, { content: Uint8Array; isDir?: boolean }> }).__remoteFiles;
 const remoteUri = (vscode as unknown as { __remoteUri: (authority: string, p: string) => vscode.Uri }).__remoteUri;
+/** `node:fs/promises`'s `stat`, wrapped (not replaced) — see the vi.mock above. */
+const nodeStatSpy = fsp.stat as unknown as ReturnType<typeof vi.fn>;
 
 // -----------------------------------------------------------------------------
 // Fixture harness
@@ -156,7 +179,7 @@ async function makeCtx(overrides?: Partial<ScriptFsContext>): Promise<{ ctx: Scr
 // Tests
 // -----------------------------------------------------------------------------
 
-describe("scriptFsReadText — size cap", () => {
+describe("scriptFsReadText — size cap (file: scheme, bounded native read — P1)", () => {
   it("reads a file exactly at the 4 MiB boundary", async () => {
     const { ctx, scriptDir } = await makeCtx();
     const exact = Buffer.alloc(4 * 1024 * 1024, "a");
@@ -166,8 +189,8 @@ describe("scriptFsReadText — size cap", () => {
     expect(text.length).toBe(4 * 1024 * 1024);
   });
 
-  it("refuses a file one byte over the 4 MiB boundary with FileTooLarge, and never reads its body", async () => {
-    // ⊘ a >= / off-by-one in either direction, and ⊘ read-then-check ordering.
+  it("refuses a file one byte over the 4 MiB boundary with FileTooLarge", async () => {
+    // ⊘ a >= / off-by-one in either direction.
     const { ctx, scriptDir } = await makeCtx();
     const over = Buffer.alloc(4 * 1024 * 1024 + 1, "a");
     await fsp.writeFile(path.join(scriptDir, "over.bin"), over);
@@ -176,28 +199,145 @@ describe("scriptFsReadText — size cap", () => {
     // the docs and the d.ts promise (`err.sizeBytes`), and what
     // scriptRuntimeManager.ts's extraFieldsOf/reviveError round-trip expects
     // to find as plain own properties on the error. ⊘ makeFsError nesting
-    // these fields under a property literally named "extra".
+    // these fields under a property literally named "extra". (This file is
+    // exactly maxBytes + 1, so it can't tell apart "reported the true size"
+    // from "reported the maxBytes+1 floor" — see the next test for that.)
     await expect(scriptFsReadText("over.bin", ctx)).rejects.toMatchObject({
       code: "FileTooLarge",
       sizeBytes: 4 * 1024 * 1024 + 1,
       maxBytes: 4 * 1024 * 1024
     });
-    // The cap-ordering assertion: stat rejected it before readFile was ever called.
-    expect(readFileSpy).not.toHaveBeenCalled();
   });
 
-  it("catches a lying stat (size: 0) via the post-read byteLength check", async () => {
-    // ⊘ trusting `stat.size` alone and skipping the post-read check.
+  it("reports the TRUE size (not the maxBytes+1 floor) when an honest stat already knows the file is well over the cap", async () => {
+    // ⊘ always reporting `maxBytes + 1` regardless of what stat says — for a
+    // file whose real size is 5 MiB (stat correctly reports 5 MiB, not the
+    // 4 MiB + 1 the boundedReadFile floor would give), a script catching this
+    // error and logging `err.sizeBytes` deserves the true, more informative
+    // number when it's available and trustworthy. Deliberately a DIFFERENT
+    // file size than the "one byte over" test above, so the two numbers
+    // (5 MiB vs. 4 MiB + 1) can't be confused with each other.
     const { ctx, scriptDir } = await makeCtx();
-    const big = Buffer.alloc(5 * 1024 * 1024, "a");
-    await fsp.writeFile(path.join(scriptDir, "lies.bin"), big);
+    await fsp.writeFile(path.join(scriptDir, "wayover.bin"), Buffer.alloc(5 * 1024 * 1024, "a"));
+
+    await expect(scriptFsReadText("wayover.bin", ctx)).rejects.toMatchObject({
+      code: "FileTooLarge",
+      sizeBytes: 5 * 1024 * 1024,
+      maxBytes: 4 * 1024 * 1024
+    });
+  });
+
+  it("caps memory via a bounded native read: a lying node fs.stat (small reported size) does NOT defeat the post-read cap on a real oversized file", async () => {
+    // ⊘ P1 — trusting `node:fs`'s stat.size (or, before this fix,
+    // vscode.workspace.fs.readFile's unbounded result) instead of what
+    // boundedReadFile actually reads off disk. This is the exact hazard: a
+    // lying provider, or a file that grew between stat and read, must not let
+    // an oversized file's FULL body reach the extension host.
+    const { ctx, scriptDir } = await makeCtx();
+    const filePath = path.join(scriptDir, "lies.bin");
+    await fsp.writeFile(filePath, Buffer.alloc(5 * 1024 * 1024, "a")); // really 5 MiB
+    nodeStatSpy.mockImplementationOnce(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 10 }) as unknown as import("node:fs").Stats
+    );
+
+    await expect(scriptFsReadText("lies.bin", ctx)).rejects.toMatchObject({
+      code: "FileTooLarge",
+      // stat's claimed 10 bytes is untrustworthy (it disagrees with what was
+      // actually read) — the floor estimate boundedReadFile itself guarantees
+      // is reported instead of repeating the lie.
+      sizeBytes: 4 * 1024 * 1024 + 1,
+      maxBytes: 4 * 1024 * 1024
+    });
+  });
+});
+
+describe("scriptFsReadText — size cap (non-file scheme, best-effort — P1)", () => {
+  it("catches a lying vscode.workspace.fs.stat (size: 0) via the post-read byteLength check — the only enforcement available for a remote FileSystemProvider", async () => {
+    // ⊘ trusting `stat.size` alone and skipping the post-read check. Unlike
+    // the file: scheme (bounded native read above), there is no bounded-read
+    // API on vscode.workspace.fs — this check protects CORRECTNESS (the
+    // script never sees more than the cap) but is best-effort for peak
+    // extension-host memory: readFile itself is still unbounded here.
+    const authority = "wsl+ubuntu";
+    const scriptDirPath = "/home/u/scripts/cisco";
+    const big = new Uint8Array(5 * 1024 * 1024).fill(97); // really 5 MiB
+    remoteFiles.set(`${scriptDirPath}/lies.bin`, { content: big });
     statSpy.mockImplementationOnce(async () => ({ type: FileType.File, ctime: 0, mtime: 0, size: 0 }));
 
+    const ctx: ScriptFsContext = {
+      scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
+      scriptDirUri: remoteUri(authority, scriptDirPath),
+      scriptsRootUri: undefined,
+      log: vi.fn()
+    };
+
     await expect(scriptFsReadText("lies.bin", ctx)).rejects.toMatchObject({ code: "FileTooLarge" });
-    // Unlike the ordering test above, the body WAS read here — that's the point:
-    // stat lied, so only the post-read check catches it.
+    // Unlike the file: scheme's pre-open regular-file/size checks, the body
+    // WAS read here — that's the point: stat lied, so only the post-read
+    // check (the only one available for this scheme) catches it.
     expect(readFileSpy).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("boundedReadFile — direct unit coverage (P1)", () => {
+  it("returns exactly maxBytes for a file exactly at the boundary", async () => {
+    const { scriptDir } = await makeCtx();
+    const filePath = path.join(scriptDir, "exact.bin");
+    await fsp.writeFile(filePath, Buffer.alloc(4 * 1024 * 1024, "a"));
+
+    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024);
+    expect(bytes.byteLength).toBe(4 * 1024 * 1024);
+  });
+
+  it("never returns more than maxBytes + 1 bytes, even for a file well over the cap", async () => {
+    // ⊘ a helper that reads the whole file (e.g. via fs.readFile) and slices
+    // the result afterward — that would still allocate the FULL body before
+    // truncating, defeating the entire point. The only way to reliably
+    // produce exactly maxBytes + 1 here, for a 6 MiB file, is to actually cap
+    // the read itself.
+    const { scriptDir } = await makeCtx();
+    const filePath = path.join(scriptDir, "huge.bin");
+    await fsp.writeFile(filePath, Buffer.alloc(6 * 1024 * 1024, "b")); // well over the cap
+
+    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024);
+    expect(bytes.byteLength).toBe(4 * 1024 * 1024 + 1);
+  });
+
+  it("returns the whole (short) file when it's under the cap, including empty files", async () => {
+    const { scriptDir } = await makeCtx();
+    const short = path.join(scriptDir, "short.txt");
+    await fsp.writeFile(short, "hello");
+    expect((await boundedReadFile(short, 4 * 1024 * 1024)).toString("utf8")).toBe("hello");
+
+    const empty = path.join(scriptDir, "empty.txt");
+    await fsp.writeFile(empty, "");
+    expect((await boundedReadFile(empty, 4 * 1024 * 1024)).byteLength).toBe(0);
+  });
+});
+
+describe("scriptFsReadText — non-regular files are rejected before ANY read (file: scheme, P1)", () => {
+  it.skipIf(process.platform === "win32")(
+    "rejects a FIFO (named pipe) as not-a-regular-file, quickly and without ever opening it — opening a FIFO with no writer would hang forever",
+    async () => {
+      // ⊘ removing (or narrowing) the regular-file check — the read path
+      // would then reach `boundedReadFile`'s `nodeFs.open(fifoPath, "r")`,
+      // which blocks until a writer connects. Nothing in this test ever
+      // writes to the FIFO, so a reintroduced bug here would hang the test
+      // until the surrounding timeout fires, not just fail an assertion.
+      const { ctx, scriptDir } = await makeCtx();
+      const fifoPath = path.join(scriptDir, "afifo");
+      const { execFileSync } = await import("node:child_process");
+      execFileSync("mkfifo", [fifoPath]);
+
+      const startedAt = Date.now();
+      await expect(scriptFsReadText("afifo", ctx)).rejects.toMatchObject({
+        code: "FileNotFound",
+        message: expect.stringContaining("not a regular file")
+      });
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+    },
+    5_000
+  );
 });
 
 describe("scriptFsReadText — decoding", () => {
@@ -225,19 +365,24 @@ describe("scriptFsReadText — FileNotFound", () => {
   });
 
   it("throws FileNotFound (not a crash) when the target is a real directory", async () => {
-    // ⊘ `stat.type === vscode.FileType.Directory` equality instead of a bitmask test.
+    // ⊘ using `lstat` (or otherwise not following the symlink) and/or missing
+    // the `isDirectory()` check entirely, so a directory falls through to the
+    // "not a regular file" branch or a decode attempt instead.
     const { ctx, scriptDir } = await makeCtx();
     await fsp.mkdir(path.join(scriptDir, "adir"));
     await expect(scriptFsReadText("adir", ctx)).rejects.toMatchObject({ code: "FileNotFound" });
   });
 
   it.skipIf(process.platform === "win32")(
-    "throws FileNotFound for a SYMLINKED directory too (bitmask test, not equality)",
+    "throws FileNotFound for a SYMLINKED directory too",
     async () => {
-      // ⊘ `stat.type === vscode.FileType.Directory`: a symlinked dir reports
-      // BOTH the Directory bit and the SymbolicLink bit, so a strict equality
-      // test would never match it and would fall through to trying to decode
-      // it as a file.
+      // ⊘ using `lstat` instead of `stat` for the file: scheme's directory
+      // check — `lstat` reports the LINK itself (not a directory), which
+      // would let a symlinked directory fall through to the "not a regular
+      // file" branch instead of being caught here. `node:fs`'s `stat` follows
+      // the link and reports the TARGET's type directly — no bitmask
+      // reasoning needed here the way `vscode.FileType` (used on the
+      // non-file scheme) requires; see `scriptScanner.ts` for that discipline.
       const { ctx, scriptDir, root } = await makeCtx();
       const real = path.join(root, "realdir");
       await fsp.mkdir(real);
@@ -248,16 +393,17 @@ describe("scriptFsReadText — FileNotFound", () => {
 });
 
 describe("scriptFsReadText — stat-failure mapping (FileNotFound vs. ReadFailed)", () => {
-  it("maps a permission-denied stat failure to ReadFailed, not FileNotFound — the path resolved fine, the read itself is what didn't work", async () => {
+  it("maps a permission-denied node fs.stat failure to ReadFailed, not FileNotFound — the path resolved fine, the read itself is what didn't work", async () => {
     // ⊘ a stat catch-block that maps EVERY failure to FileNotFound regardless
     // of cause, which contradicts ReadFailed's documented meaning ("stat ok
     // but read failed (permissions, provider error)") — a permission error IS
     // exactly that documented case, just surfacing one step earlier (at stat
-    // rather than readFile).
+    // rather than readFile). file: scheme now stats via node:fs, not
+    // vscode.workspace.fs — mocking THAT is what actually exercises this path.
     const { ctx, scriptDir } = await makeCtx();
     await fsp.writeFile(path.join(scriptDir, "secret.txt"), "shh");
-    statSpy.mockImplementationOnce(async () => {
-      throw Object.assign(new Error("EACCES: permission denied"), { code: "NoPermissions" });
+    nodeStatSpy.mockImplementationOnce(async () => {
+      throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
     });
 
     await expect(scriptFsReadText("secret.txt", ctx)).rejects.toMatchObject({ code: "ReadFailed" });
@@ -346,6 +492,41 @@ describe("logging (decision 8)", () => {
     await fsp.writeFile(path.join(scriptDir, "a.txt"), "hi");
     await scriptFsExists("a.txt", ctx);
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.exists .*a\.txt → true$/));
+  });
+});
+
+describe("audit log names the RESOLVED path once resolution succeeded, not the raw request (P2)", () => {
+  it("a failure log line for an in-scope-but-missing '../shared/config.json' contains the RESOLVED absolute path", async () => {
+    // ⊘ logging String(requested) unconditionally, for every failure,
+    // regardless of whether resolution succeeded. For a relative traversal
+    // like "../shared/config.json" that raw string tells an operator almost
+    // nothing about what was actually checked on disk — the resolved
+    // absolute path is what they need to go find (or explain the absence of)
+    // the file.
+    const { ctx, root, log } = await makeCtx();
+    // scriptDir = <root>/cisco, so "../shared/config.json" resolves to
+    // <root>/shared/config.json — inside scriptsRoot (in scope), but nothing
+    // is there.
+    const requested = "../shared/config.json";
+    const expectedResolved = path.join(root, "shared", "config.json");
+
+    await expect(scriptFsReadText(requested, ctx)).rejects.toMatchObject({ code: "FileNotFound" });
+
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(expectedResolved));
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining(requested));
+  });
+
+  it("a PRE-resolution failure (PathOutsideScope) still logs the raw requested value — there is no resolved path to name", async () => {
+    // Pins the other half of P2's rule: only POST-resolution failures switch
+    // to the resolved path. A path that never resolved at all (it's outside
+    // scope) has no resolved path to report, so the raw request is still the
+    // only thing worth logging here.
+    const { ctx, log } = await makeCtx();
+    const requested = "../../../etc/passwd";
+
+    await expect(scriptFsReadText(requested, ctx)).rejects.toMatchObject({ code: "PathOutsideScope" });
+
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(requested));
   });
 });
 

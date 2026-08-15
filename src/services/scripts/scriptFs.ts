@@ -1,3 +1,4 @@
+import * as nodeFs from "node:fs/promises";
 import * as vscode from "vscode";
 import { resolveScriptFsPath, type ScriptFsScope } from "./scriptFsScope";
 import type { ScriptFsErrorCode } from "./scriptTypes";
@@ -78,13 +79,49 @@ function hasBackslashOnNonFileScheme(requested: unknown, scheme: string): boolea
   return scheme !== "file" && typeof requested === "string" && requested.includes("\\");
 }
 
+/**
+ * Read at most `maxBytes + 1` bytes of `fsPath` into a single preallocated
+ * buffer, regardless of the file's real size. Exported for direct unit tests.
+ *
+ * WHY NOT `vscode.workspace.fs.readFile`: that API has no bounded-read
+ * variant — it always materializes the entire file body in the extension
+ * host before we get a chance to look at its length. If `stat` under-reports
+ * (a lying FileSystemProvider, a file growing between `stat` and `read`, or —
+ * pre-empted separately by the regular-file check below — a symlink inside
+ * scope pointing at an endless source like `/dev/zero`), that "check the size
+ * after reading" pattern has already done the unbounded read it was supposed
+ * to prevent. Reading with `node:fs/promises` at the syscall level lets us
+ * cap the read itself: the returned buffer can never exceed `maxBytes + 1`
+ * bytes no matter how large — or endless — the underlying file turns out to
+ * be. The `+ 1` (rather than exactly `maxBytes`) is what lets the caller
+ * distinguish "the file is exactly at the cap" (`maxBytes` bytes back, legal)
+ * from "the file is at least one byte over" (`maxBytes + 1` bytes back,
+ * `FileTooLarge`) without a second syscall.
+ */
+export async function boundedReadFile(fsPath: string, maxBytes: number): Promise<Buffer> {
+  const capacity = maxBytes + 1;
+  const buffer = Buffer.allocUnsafe(capacity);
+  const handle = await nodeFs.open(fsPath, "r");
+  try {
+    let total = 0;
+    while (total < capacity) {
+      const { bytesRead } = await handle.read(buffer, total, capacity - total, null);
+      if (bytesRead === 0) break; // EOF
+      total += bytesRead;
+    }
+    return buffer.subarray(0, total);
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext): Promise<string> {
   const scope = buildScriptFsScope(ctx);
   if ("code" in scope) {
     throw fail(
       ctx,
       "readText",
-      requested,
+      String(requested),
       "NoScriptDir",
       "This script has no folder on disk (untitled editor). Save it first — nexus.fs paths resolve against the script's own directory."
     );
@@ -93,7 +130,7 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
     throw fail(
       ctx,
       "readText",
-      requested,
+      String(requested),
       "InvalidPath",
       `backslash is not a valid path separator for a remote script location: ${JSON.stringify(requested)}`
     );
@@ -101,11 +138,29 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
 
   const resolution = resolveScriptFsPath(requested as string, scope);
   if (!resolution.ok) {
-    throw fail(ctx, "readText", requested, resolution.code, describeResolutionFailure(resolution, scope));
+    // Pre-resolution failure — no resolved path exists yet, so the log (and
+    // the thrown message) name the raw requested value.
+    throw fail(ctx, "readText", String(requested), resolution.code, describeResolutionFailure(resolution, scope));
+  }
+  // From here on, resolution succeeded — every failure log names the
+  // RESOLVED absolute path, not the (possibly relative, possibly confusing
+  // once several scripts are involved) raw requested value.
+  const loggedPath = resolution.resolvedPath;
+
+  if (ctx.scriptUri.scheme === "file") {
+    return readLocalFileBounded(resolution.resolvedPath, loggedPath, ctx);
   }
 
   const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
 
+  // Non-`file` schemes: `vscode.workspace.fs` is the only API surface a
+  // FileSystemProvider exposes, and it has no bounded-read variant — there is
+  // no syscall-level equivalent of `boundedReadFile` to drop down to for a
+  // remote target. The size cap here is therefore BEST-EFFORT: it protects
+  // *correctness* (a script never sees more than SCRIPT_FS_MAX_BYTES of
+  // content) but not *peak extension-host memory* — a misbehaving remote
+  // provider that lies about `stat.size` can still make `readFile` allocate
+  // its true (oversized) body before the post-read check below rejects it.
   let stat: vscode.FileStat;
   try {
     stat = await vscode.workspace.fs.stat(uri);
@@ -114,26 +169,24 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
     // else (permissions, an unavailable provider, ...) is ReadFailed — the
     // path resolved fine, the read itself is what didn't work.
     if (isNotFoundStatError(err)) {
-      throw fail(ctx, "readText", requested, "FileNotFound", `${resolution.resolvedPath}: not found`);
+      throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: not found`);
     }
     const detail = err instanceof Error ? err.message : String(err);
-    throw fail(ctx, "readText", requested, "ReadFailed", `${resolution.resolvedPath}: ${detail}`);
+    throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
   }
   // Bitmask test, not `===` — same discipline as scriptScanner.ts, so a
   // symlinked directory is caught too.
   if ((stat.type & vscode.FileType.Directory) !== 0) {
-    throw fail(ctx, "readText", requested, "FileNotFound", `${resolution.resolvedPath}: is a directory`);
+    throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: is a directory`);
   }
-  // Checked BEFORE reading so a multi-GB file is never pulled into memory.
+  // Checked BEFORE reading so an honestly-reported multi-GB file is never
+  // pulled into memory in the common case — belt, not braces, here: see the
+  // post-read check below for the braces.
   if (stat.size > SCRIPT_FS_MAX_BYTES) {
-    throw fail(
-      ctx,
-      "readText",
-      requested,
-      "FileTooLarge",
-      `${resolution.resolvedPath}: ${stat.size} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
-      { sizeBytes: stat.size, maxBytes: SCRIPT_FS_MAX_BYTES }
-    );
+    throw fail(ctx, "readText", loggedPath, "FileTooLarge", `${loggedPath}: ${stat.size} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`, {
+      sizeBytes: stat.size,
+      maxBytes: SCRIPT_FS_MAX_BYTES
+    });
   }
 
   let bytes: Uint8Array;
@@ -141,17 +194,20 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
     bytes = await vscode.workspace.fs.readFile(uri);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    throw fail(ctx, "readText", requested, "ReadFailed", `${resolution.resolvedPath}: ${detail}`);
+    throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
   }
-  // Belt-and-braces: some FileSystemProviders report a stale/zero `size` from
-  // stat, and `readFile` has no size limit of its own.
+  // Braces: some FileSystemProviders report a stale/zero `size` from stat,
+  // and `readFile` has no size limit of its own — this is the only thing
+  // standing between a lying remote provider and an unbounded read (see the
+  // module-level comment on `boundedReadFile` for why `file:` doesn't have
+  // this problem).
   if (bytes.byteLength > SCRIPT_FS_MAX_BYTES) {
     throw fail(
       ctx,
       "readText",
-      requested,
+      loggedPath,
       "FileTooLarge",
-      `${resolution.resolvedPath}: ${bytes.byteLength} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
+      `${loggedPath}: ${bytes.byteLength} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
       { sizeBytes: bytes.byteLength, maxBytes: SCRIPT_FS_MAX_BYTES }
     );
   }
@@ -160,10 +216,77 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    throw fail(ctx, "readText", requested, "NotUtf8", `${resolution.resolvedPath}: not valid UTF-8`);
+    throw fail(ctx, "readText", loggedPath, "NotUtf8", `${loggedPath}: not valid UTF-8`);
   }
 
-  ctx.log(`fs.readText ${resolution.resolvedPath} (${bytes.byteLength} bytes)`);
+  ctx.log(`fs.readText ${loggedPath} (${bytes.byteLength} bytes)`);
+  return text;
+}
+
+/**
+ * `file:` scheme read path — native `node:fs/promises`, bounded at the
+ * syscall level. See `boundedReadFile`'s doc comment for why this bypasses
+ * `vscode.workspace.fs` entirely rather than following the module's usual
+ * "everything through `vscode.workspace.fs`" convention: that API cannot
+ * bound a read, and an unbounded read into the extension host is exactly the
+ * hazard this function exists to close.
+ */
+async function readLocalFileBounded(fsPath: string, loggedPath: string, ctx: ScriptFsContext): Promise<string> {
+  let stat: import("node:fs").Stats;
+  try {
+    stat = await nodeFs.stat(fsPath); // follows symlinks, matching decision 3's lexical-containment policy
+  } catch (err) {
+    if (isNotFoundStatError(err)) {
+      throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: not found`);
+    }
+    const detail = err instanceof Error ? err.message : String(err);
+    throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
+  }
+  if (stat.isDirectory()) {
+    throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: is a directory`);
+  }
+  // Rejects FIFOs, sockets, and character/block devices — e.g. a symlink
+  // inside scope pointing at `/dev/zero`, which would otherwise hand
+  // `boundedReadFile` an endless byte stream. Caught here, before ANY read is
+  // attempted — `node:fs`'s `Stats.isFile()` reports the RESOLVED target's
+  // type (this call is `stat`, not `lstat`), so a symlink to a device is
+  // caught exactly like a direct reference to one would be.
+  if (!stat.isFile()) {
+    throw fail(ctx, "readText", loggedPath, "FileNotFound", `${loggedPath}: is not a regular file`);
+  }
+
+  let bytes: Buffer;
+  try {
+    bytes = await boundedReadFile(fsPath, SCRIPT_FS_MAX_BYTES);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
+  }
+  if (bytes.byteLength > SCRIPT_FS_MAX_BYTES) {
+    // `stat.size` is only trustworthy here when it AGREES that the file is
+    // oversized — i.e. it wasn't the thing that lied. When it under-reported
+    // (the exact "stat lies" / racing-growth hazard this function defends
+    // against), `maxBytes + 1` — the one number `boundedReadFile` itself
+    // guarantees — is reported instead of repeating the untrustworthy value.
+    const sizeBytes = stat.size > SCRIPT_FS_MAX_BYTES ? stat.size : SCRIPT_FS_MAX_BYTES + 1;
+    throw fail(
+      ctx,
+      "readText",
+      loggedPath,
+      "FileTooLarge",
+      `${loggedPath}: exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
+      { sizeBytes, maxBytes: SCRIPT_FS_MAX_BYTES }
+    );
+  }
+
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw fail(ctx, "readText", loggedPath, "NotUtf8", `${loggedPath}: not valid UTF-8`);
+  }
+
+  ctx.log(`fs.readText ${loggedPath} (${bytes.byteLength} bytes)`);
   return text;
 }
 
@@ -173,7 +296,7 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
     throw fail(
       ctx,
       "exists",
-      requested,
+      String(requested),
       "NoScriptDir",
       "This script has no folder on disk (untitled editor). Save it first — nexus.fs paths resolve against the script's own directory."
     );
@@ -182,7 +305,7 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
     throw fail(
       ctx,
       "exists",
-      requested,
+      String(requested),
       "InvalidPath",
       `backslash is not a valid path separator for a remote script location: ${JSON.stringify(requested)}`
     );
@@ -190,9 +313,11 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
 
   const resolution = resolveScriptFsPath(requested as string, scope);
   if (!resolution.ok) {
-    throw fail(ctx, "exists", requested, resolution.code, describeResolutionFailure(resolution, scope));
+    throw fail(ctx, "exists", String(requested), resolution.code, describeResolutionFailure(resolution, scope));
   }
 
+  // No read hazard here — this is a plain existence probe, so `vscode.workspace.fs.stat`
+  // (uniformly, for every scheme) is fine: no body is ever pulled into memory.
   const uri = uriOf(resolution.resolvedPath, ctx.scriptUri);
   let found: boolean;
   try {
@@ -217,12 +342,14 @@ function describeResolutionFailure(
 }
 
 /**
- * `vscode.workspace.fs.stat` codes (real `FileSystemError.code`, and the raw
- * Node `fs` codes some FileSystemProviders — and this repo's own test mocks —
- * let through unwrapped) that mean "nothing is there", as opposed to "it's
- * there but couldn't be read" (permissions, an unavailable provider, ...).
- * Only these map to `FileNotFound`; everything else maps to `ReadFailed`,
- * matching `ReadFailed`'s documented meaning ("stat ok but read failed").
+ * `vscode.workspace.fs.stat` / `node:fs` codes (real `FileSystemError.code`,
+ * and the raw Node `fs` codes some FileSystemProviders — and this repo's own
+ * test mocks — let through unwrapped) that mean "nothing is there", as
+ * opposed to "it's there but couldn't be read" (permissions, an unavailable
+ * provider, ...). Only these map to `FileNotFound`; everything else maps to
+ * `ReadFailed`, matching `ReadFailed`'s documented meaning ("stat ok but read
+ * failed"). Shared by both the `file:` (`node:fs`) and non-`file:`
+ * (`vscode.workspace.fs`) stat call sites.
  */
 const NOT_FOUND_STAT_CODES = new Set(["FileNotFound", "FileNotADirectory", "ENOENT", "ENOTDIR"]);
 
@@ -254,11 +381,11 @@ function makeFsError(code: ScriptFsErrorCode, message: string, extra?: Record<st
 function fail(
   ctx: ScriptFsContext,
   method: "readText" | "exists",
-  requested: unknown,
+  loggedPath: string,
   code: ScriptFsErrorCode,
   message: string,
   extra?: Record<string, unknown>
 ): Error {
-  ctx.log(`fs.${method} ${String(requested)} → ${code}`);
+  ctx.log(`fs.${method} ${loggedPath} → ${code}`);
   return makeFsError(code, message, extra);
 }
