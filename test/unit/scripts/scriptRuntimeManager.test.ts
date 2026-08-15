@@ -8,7 +8,7 @@
  */
 
 import * as path from "node:path";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("vscode", async () => {
   const pathMod = await import("node:path");
@@ -33,22 +33,38 @@ vi.mock("vscode", async () => {
       }
     },
     Uri: {
-      file: (p: string) => ({ fsPath: p, scheme: "file", path: p, toString: () => p }),
+      file: (p: string) => ({ fsPath: p, scheme: "file", authority: "", path: p, toString: () => p }),
       joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
         fsPath: pathMod.join(base.fsPath, ...parts),
         scheme: "file",
+        authority: "",
         path: pathMod.join(base.fsPath, ...parts),
         toString: () => pathMod.join(base.fsPath, ...parts)
       })
     },
+    FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
     workspace: {
       fs: {
         readFile: vi.fn(async (uri: { fsPath: string }) => {
           const fs = await import("node:fs/promises");
           const buf = await fs.readFile(uri.fsPath);
           return new Uint8Array(buf);
+        }),
+        stat: vi.fn(async (uri: { fsPath: string }) => {
+          const fs = await import("node:fs/promises");
+          const st = await fs.stat(uri.fsPath);
+          return {
+            type: st.isDirectory() ? 2 : 1,
+            ctime: st.ctimeMs,
+            mtime: st.mtimeMs,
+            size: st.size
+          };
         })
       },
+      // Real VS Code always supplies a boolean here; left undefined so the
+      // trust-gate `=== false` check (not `!isTrusted`) is exercised the same
+      // way every OTHER test in this file already exercises it implicitly.
+      isTrusted: undefined as boolean | undefined,
       workspaceFolders: [],
       getConfiguration: vi.fn(() => ({
         get: vi.fn((_k: string, d?: unknown) => d)
@@ -60,6 +76,9 @@ vi.mock("vscode", async () => {
       showWarningMessage: vi.fn(),
       showInputBox: vi.fn(),
       showQuickPick: vi.fn()
+    },
+    commands: {
+      executeCommand: vi.fn()
     }
   };
 });
@@ -230,7 +249,7 @@ async function createHarness(scriptSource: string): Promise<Harness> {
   const os = await import("node:os");
   const fixture = path.join(os.tmpdir(), `nexus-runtime-unit-${Date.now()}-${Math.random()}.js`);
   await fs.writeFile(fixture, scriptSource, "utf8");
-  const scriptUri = { fsPath: fixture, scheme: "file", path: fixture, toString: () => fixture };
+  const scriptUri = { fsPath: fixture, scheme: "file", authority: "", path: fixture, toString: () => fixture };
 
   const events: Array<{ kind: string; data?: unknown }> = [];
   manager.onDidChangeRun((e) => events.push({ kind: e.kind, data: e }));
@@ -272,7 +291,7 @@ async function createLocalHarness(scriptSource: string): Promise<Harness> {
   const os = await import("node:os");
   const fixture = path.join(os.tmpdir(), `nexus-runtime-local-unit-${Date.now()}-${Math.random()}.js`);
   await fs.writeFile(fixture, scriptSource, "utf8");
-  const scriptUri = { fsPath: fixture, scheme: "file", path: fixture, toString: () => fixture };
+  const scriptUri = { fsPath: fixture, scheme: "file", authority: "", path: fixture, toString: () => fixture };
 
   const events: Array<{ kind: string; data?: unknown }> = [];
   manager.onDidChangeRun((e) => events.push({ kind: e.kind, data: e }));
@@ -611,5 +630,339 @@ describe("ScriptRuntimeManager — unit fakes", () => {
     expect(startLine).toMatch(/FromEditor@/);
 
     (vscode.workspace as unknown as { textDocuments: unknown[] }).textDocuments = [];
+  });
+});
+
+// -----------------------------------------------------------------------------
+// nexus.fs plumbing — RPC wiring, decision 6 (root snapshot), decision 7
+// (EXPECTED_ERROR_CODES unchanged), and record fields (scriptUri/scriptDirUri).
+// Handler behavior itself (containment, size cap, decoding, ...) is covered in
+// test/unit/scripts/scriptFs.test.ts; these tests are about the manager's
+// wiring around scriptFs.ts, not the handlers.
+// -----------------------------------------------------------------------------
+
+describe("ScriptRuntimeManager — nexus.fs plumbing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("fs.readText dispatches through invokeMethod and a PathOutsideScope refusal surfaces as an ok:false rpc-result (not swallowed into UnknownError)", async () => {
+    // ⊘ an invokeMethod switch that doesn't add fs.readText/fs.exists cases at
+    // all (dispatchRpc's catch-all would report "Unknown script RPC method"
+    // instead of the fs handler's own PathOutsideScope code), and ⊘ any
+    // handler that throws something dispatchRpc can't shape into {code,message}.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: ["/etc/passwd"] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 1));
+    const result = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 1
+    ) as { kind: "rpc-result"; ok: boolean; error?: { code: string } };
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("PathOutsideScope");
+  });
+
+  it("fsContextFor's isAborted() tracks record.cleanedUp end to end: false while running, true for any fs call arriving after stopScript", async () => {
+    // ⊘ fsContextFor not wiring `isAborted` to `cleanedUp` (or wiring it to
+    // something that never flips) — a late RPC after stopScript would still
+    // succeed instead of surfacing the typed Stopped refusal scriptFs.ts's
+    // abort checks depend on.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    // While running: reads the script's own fixture file (always in its own
+    // scope), resolves normally.
+    h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: [h.scriptUri.fsPath] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 1));
+    const beforeStop = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 1
+    ) as { ok: boolean };
+    expect(beforeStop.ok).toBe(true);
+
+    await h.manager.stopScript("test-session");
+
+    // A late RPC "arriving" right after cleanup (the worker's message
+    // listener still holds its captured `record` reference even though the
+    // manager has already deregistered the run) sees isAborted() === true.
+    h.worker.emit({ kind: "rpc", id: 2, method: "fs.readText", args: [h.scriptUri.fsPath] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 2));
+    const afterStop = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 2
+    ) as { ok: boolean; error?: { code: string } };
+    expect(afterStop.ok).toBe(false);
+    expect(afterStop.error?.code).toBe("Stopped");
+  });
+
+  it("fsContextFor's isAborted() also flips the instant a stop is REQUESTED — before cleanedUp — closing the ≤100ms stopScript grace-race window (P2, round 10)", async () => {
+    // ⊘ isAborted wired to `record.cleanedUp` alone (dropping the
+    // `|| record.stopReason !== undefined` half added in round 10): in
+    // stopScript, `record.stopReason` is set SYNCHRONOUSLY at the very top,
+    // well before the up-to-100ms `worker.terminate()` grace race resolves
+    // and cleanupRun flips `cleanedUp`. An RPC arriving in that window would
+    // see isAborted() === false under the cleanedUp-only predicate and
+    // wrongly be allowed to proceed with I/O for a run that already asked to
+    // stop.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    // Make the grace race hang indefinitely: record.stopReason gets set, but
+    // cleanupRun (and cleanedUp) can't run until the grace timer eventually
+    // fires (~100ms real time) — a comfortably wide, deterministic window
+    // where stopReason is set but cleanedUp is still false.
+    h.worker.terminate = () => new Promise<number>(() => {});
+
+    const stopPromise = h.manager.stopScript("test-session");
+
+    // Emitted well within the (≥100ms) grace window — must already see
+    // isAborted() === true.
+    h.worker.emit({ kind: "rpc", id: 5, method: "fs.readText", args: [h.scriptUri.fsPath] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 5));
+    const duringWindow = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 5
+    ) as { ok: boolean; error?: { code: string } };
+    expect(duringWindow.ok).toBe(false);
+    expect(duringWindow.error?.code).toBe("Stopped");
+
+    await stopPromise; // let the grace timer fire and cleanup finish before the test ends
+  }, 2_000);
+
+  it("fs.readText on a BigInt or a cyclic-object argument surfaces a typed InvalidPath rpc-result — not UnknownError — and logs the refusal", async () => {
+    // ⊘ formatting the offending value with a bare JSON.stringify inside
+    // scriptFsScope.ts / scriptFs.ts (instead of the non-throwing
+    // safeStringify): both a BigInt and a cyclic object are
+    // structured-cloneable, so a script's worker can genuinely send either as
+    // an RPC arg. A throwing formatter means resolveScriptFsPath (or the
+    // backslash guard) never returns at all — the throw escapes scriptFs.ts
+    // entirely, dispatchRpc's catch reshapes THAT exception generically
+    // instead of the typed InvalidPath one, and no `fail()` call ever runs —
+    // so no refusal is ever logged either.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: [10n] });
+    h.worker.emit({ kind: "rpc", id: 2, method: "fs.readText", args: [(() => {
+      const cyclic: Record<string, unknown> = { name: "probe" };
+      cyclic.self = cyclic;
+      return cyclic;
+    })()] });
+    await waitFor(() =>
+      h.worker.posted.filter((m) => m.kind === "rpc-result").length >= 2
+    );
+
+    for (const id of [1, 2]) {
+      const result = h.worker.posted.find(
+        (m) => m.kind === "rpc-result" && (m as { id: number }).id === id
+      ) as { kind: "rpc-result"; ok: boolean; error?: { code: string } };
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("InvalidPath");
+    }
+    // The refusal audit-log line was written (not silently dropped by a throw
+    // inside the formatter, which would have skipped the fail()/ctx.log call
+    // entirely).
+    expect(h.output.some((l) => l.includes("fs.readText") && l.includes("InvalidPath"))).toBe(true);
+  });
+
+  it("F6/decision 7: an uncaught nexus.fs error classifies as 'script-error', not 'expected' — EXPECTED_ERROR_CODES is unchanged", async () => {
+    // ⊘ someone adding fs codes to EXPECTED_ERROR_CODES. This is the test that
+    // pins decision 7's NO: an uncaught PathOutsideScope must toast, exactly
+    // like a ReferenceError would.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    const endedEvents: Array<{ finalState?: string; failureReason?: string }> = [];
+    h.manager.onDidChangeRun((e) => {
+      if (e.kind === "ended") endedEvents.push({ finalState: e.finalState, failureReason: e.failureReason });
+    });
+    h.worker.emit({
+      kind: "failed",
+      error: { message: "outside scope", code: "PathOutsideScope" }
+    });
+    await waitFor(() => endedEvents.length > 0);
+    expect(endedEvents[0].finalState).toBe("failed");
+    expect(endedEvents[0].failureReason).toBe("script-error");
+  });
+
+  it("decision 6: the scripts-root snapshot taken at run start survives a config/workspace-folder change mid-run", async () => {
+    // ⊘ re-resolving resolveScriptsDir() on every fs call instead of once at
+    // run start — a wrong implementation would follow the workspace-folder
+    // flip below and refuse (or 404) the read from the ORIGINAL root A.
+    const vscode = await import("vscode");
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+
+    const wsA = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-snapshot-a-"));
+    const wsB = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-snapshot-b-"));
+    const scriptsRootA = path.join(wsA, ".nexus", "scripts");
+    await fs.mkdir(scriptsRootA, { recursive: true });
+    await fs.writeFile(path.join(scriptsRootA, "marker.txt"), "root-A-content", "utf8");
+
+    (vscode.workspace as unknown as { workspaceFolders: Array<{ uri: { fsPath: string } } > }).workspaceFolders = [
+      { uri: vscode.Uri.file(wsA) as unknown as { fsPath: string } }
+    ];
+
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    // Flip the "config" AFTER the run has already snapshotted its root.
+    (vscode.workspace as unknown as { workspaceFolders: Array<{ uri: { fsPath: string } } > }).workspaceFolders = [
+      { uri: vscode.Uri.file(wsB) as unknown as { fsPath: string } }
+    ];
+
+    h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: [path.join(scriptsRootA, "marker.txt")] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 1));
+    const result = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 1
+    ) as { kind: "rpc-result"; ok: boolean; value?: string; error?: { code: string } };
+
+    expect(result.ok).toBe(true);
+    expect(result.value).toBe("root-A-content");
+
+    (vscode.workspace as unknown as { workspaceFolders: unknown[] }).workspaceFolders = [];
+    await fs.rm(wsA, { recursive: true, force: true });
+    await fs.rm(wsB, { recursive: true, force: true });
+  });
+
+  it("record fields: nexus.fs resolves against the exact scriptUri a run was launched with, even for a script outside any scripts root", async () => {
+    // ⊘ a record that doesn't actually capture the launching Uri (e.g. always
+    // deriving scriptDirUri from some other, stale, or default location) —
+    // this would make a sibling-file read fail even though decision 4 says
+    // "own-folder scope survives" for a script run from anywhere.
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const scriptDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-recordfields-"));
+    await fs.writeFile(path.join(scriptDir, "sibling.txt"), "sibling-content", "utf8");
+    const scriptFile = path.join(scriptDir, "probe.js");
+    await fs.writeFile(scriptFile, `/**\n * @nexus-script\n */\n`, "utf8");
+    const scriptUri = { fsPath: scriptFile, scheme: "file", authority: "", path: scriptFile, toString: () => scriptFile };
+
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(scriptUri as never, "test-session");
+
+    h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: ["sibling.txt"] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 1));
+    const result = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 1
+    ) as { kind: "rpc-result"; ok: boolean; value?: string };
+
+    expect(result.ok).toBe(true);
+    expect(result.value).toBe("sibling-content");
+
+    await fs.rm(scriptDir, { recursive: true, force: true });
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Workspace Trust gate (Step 4) — hard refuse before any Worker is created.
+// -----------------------------------------------------------------------------
+
+describe("ScriptRuntimeManager — Workspace Trust gate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(async () => {
+    const vscode = await import("vscode");
+    (vscode.workspace as unknown as { isTrusted?: boolean }).isTrusted = undefined;
+  });
+
+  async function trustHarness(scriptSource: string): Promise<{
+    manager: ScriptRuntimeManager;
+    worker: FakeWorker;
+    createWorkerSpy: ReturnType<typeof vi.fn>;
+    scriptUri: { fsPath: string; scheme: string; path: string; toString: () => string };
+  }> {
+    const pty = makeTestPty();
+    const session: ActiveSession = {
+      id: "trust-session",
+      serverId: "srv1",
+      terminalName: "trust-terminal",
+      startedAt: Date.now(),
+      pty
+    };
+    const core = makeMockCore(session);
+    const worker = makeFakeWorker();
+    const createWorkerSpy = vi.fn(() => worker);
+    const manager = new ScriptRuntimeManager({
+      core,
+      macroAutoTrigger: {
+        pushFilter: () => ({ dispose: () => {} }),
+        bindObserverToSession: () => {}
+      } as never,
+      outputChannel: { appendLine: vi.fn(), append: vi.fn(), show: vi.fn(), dispose: vi.fn() } as never,
+      workerPath: "/fake/worker.js",
+      createWorker: createWorkerSpy
+    });
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const fixture = path.join(os.tmpdir(), `nexus-trust-unit-${Date.now()}-${Math.random()}.js`);
+    await fs.writeFile(fixture, scriptSource, "utf8");
+    const scriptUri = { fsPath: fixture, scheme: "file", authority: "", path: fixture, toString: () => fixture };
+    return { manager, worker, createWorkerSpy, scriptUri };
+  }
+
+  it("hard-refuses when isTrusted === false, and never creates a Worker", async () => {
+    // ⊘ a gate that warns but still runs (i.e. logs/toasts but doesn't return early).
+    const vscode = await import("vscode");
+    (vscode.workspace as unknown as { isTrusted?: boolean }).isTrusted = false;
+    const h = await trustHarness(`/**\n * @nexus-script\n */\n`);
+
+    const runId = await h.manager.runScript(h.scriptUri as never, "trust-session");
+
+    expect(runId).toBeUndefined();
+    expect(h.manager.getRuns()).toHaveLength(0);
+    expect(h.createWorkerSpy).not.toHaveBeenCalled();
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Restricted Mode"),
+      "Manage Workspace Trust"
+    );
+  });
+
+  it("proceeds normally when isTrusted === true", async () => {
+    const vscode = await import("vscode");
+    (vscode.workspace as unknown as { isTrusted?: boolean }).isTrusted = true;
+    const h = await trustHarness(`/**\n * @nexus-script\n */\n`);
+
+    const runId = await h.manager.runScript(h.scriptUri as never, "trust-session");
+
+    expect(runId).toBeDefined();
+    expect(h.createWorkerSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("proceeds normally when isTrusted is undefined (every pre-existing mock in this file, and VS Code's own transient state)", async () => {
+    // ⊘ `!vscode.workspace.isTrusted` instead of `=== false` — would break
+    // every other test in this file (none of which set isTrusted) and any
+    // real session where VS Code hasn't resolved a trust value yet.
+    const vscode = await import("vscode");
+    (vscode.workspace as unknown as { isTrusted?: boolean }).isTrusted = undefined;
+    const h = await trustHarness(`/**\n * @nexus-script\n */\n`);
+
+    const runId = await h.manager.runScript(h.scriptUri as never, "trust-session");
+
+    expect(runId).toBeDefined();
+    expect(h.createWorkerSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("the 'Manage Workspace Trust' button opens VS Code's trust management UI", async () => {
+    const vscode = await import("vscode");
+    (vscode.workspace as unknown as { isTrusted?: boolean }).isTrusted = false;
+    (vscode.window.showErrorMessage as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      "Manage Workspace Trust"
+    );
+    const h = await trustHarness(`/**\n * @nexus-script\n */\n`);
+
+    await h.manager.runScript(h.scriptUri as never, "trust-session");
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("workbench.trust.manage");
+  });
+
+  it("dismissing the message (no button picked) still refuses without opening the trust UI", async () => {
+    const vscode = await import("vscode");
+    (vscode.workspace as unknown as { isTrusted?: boolean }).isTrusted = false;
+    (vscode.window.showErrorMessage as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
+    const h = await trustHarness(`/**\n * @nexus-script\n */\n`);
+
+    await h.manager.runScript(h.scriptUri as never, "trust-session");
+
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
   });
 });

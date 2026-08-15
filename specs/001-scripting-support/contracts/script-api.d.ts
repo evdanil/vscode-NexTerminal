@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v3
+// Nexus Scripts API types — v5
 /**
  * Nexus Terminal — Scripts API
  *
@@ -261,4 +261,105 @@ declare global {
   interface CancelledError extends Error {
     code: "Cancelled";
   }
+
+  /**
+   * Thrown by `nexus.fs` calls. Catch with `if (e.code === "FileNotFound") ...`.
+   *
+   * `ReadFailed` covers both "the path resolved but the read/probe itself
+   * failed" (permissions, a misbehaving filesystem provider) and "the call hit
+   * the fixed 30-second deadline every `nexus.fs` call is bounded by" — the
+   * latter's message ends in `timed out after 30s`. Neither a timeout nor a
+   * failed probe is ever reported as a missing file, an empty read, or (for
+   * `exists`) a `false`.
+   *
+   * `FileTooLarge` additionally carries `sizeBytes` / `maxBytes` (see
+   * `ScriptFsFileTooLargeError` below) — declared here too, optionally, so
+   * `e.sizeBytes` type-checks straight off a plain `ScriptFsError`-typed
+   * catch without narrowing to the subtype first.
+   */
+  interface ScriptFsError extends Error {
+    code: "FileNotFound" | "PathOutsideScope" | "FileTooLarge" | "NotUtf8"
+        | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
+    /**
+     * Present when `code === "FileTooLarge"`. The file's size in bytes as
+     * observed at read time — a LOWER BOUND when the true size could not be
+     * determined (a file that grew past the cap mid-read, or a provider that
+     * under-reported its size, reports the cap + 1).
+     */
+    sizeBytes?: number;
+    /** Present when `code === "FileTooLarge"`. Always 4 MiB (4 * 1024 * 1024). */
+    maxBytes?: number;
+  }
+
+  /**
+   * `ScriptFsError` narrowed to the `"FileTooLarge"` case, with `sizeBytes` /
+   * `maxBytes` required instead of optional. Narrow a `ScriptFsError` (or
+   * `ScriptFsError | ScriptFsFileTooLargeError`) down to this shape the usual
+   * discriminated-union way:
+   * ```js
+   * try {
+   *   await nexus.fs.readText(path);
+   * } catch (e) {
+   *   if (e.code === "FileTooLarge") {
+   *     log.warn(`${path}: ${e.sizeBytes} bytes exceeds the ${e.maxBytes}-byte limit`);
+   *   }
+   * }
+   * ```
+   */
+  interface ScriptFsFileTooLargeError extends ScriptFsError {
+    code: "FileTooLarge";
+    sizeBytes: number;
+    maxBytes: number;
+  }
+
+  // ---------------------------------------------------------------------------
+  // nexus.fs — read-only, scoped, logged file access
+  // ---------------------------------------------------------------------------
+
+  interface NexusFileSystem {
+    /**
+     * Read a UTF-8 text file. Relative paths resolve against THIS SCRIPT'S own
+     * directory; the target must stay inside the Nexus scripts folder or the
+     * script's own folder subtree. Max 4 MiB. Every read is logged to the
+     * "Nexus Scripts" Output Channel.
+     *
+     * Never blocks longer than 30 seconds, measured over the WHOLE call —
+     * including any wait for a read slot when several reads are in flight at
+     * once. A filesystem that hasn't answered by then (or a slot that never
+     * came free) throws `ReadFailed` ("timed out after 30s") instead of
+     * hanging the run.
+     */
+    readText(path: string): Promise<string>;
+    /**
+     * readText + JSON.parse. Parse failures throw SyntaxError with code
+     * "InvalidJson". Defaults to `Promise<any>` so `.property` access on the
+     * result type-checks without a cast; pass `T` for a typed result, e.g.
+     * `await nexus.fs.readJson<{ devices: string[] }>("./config.json")`.
+     */
+    readJson<T = any>(path: string): Promise<T>;
+    /**
+     * True if an entry (file or directory) exists at the scoped path.
+     * Out-of-scope paths throw rather than answering `false`.
+     *
+     * Bounded by the same 30-second deadline as `readText`, whole call
+     * included: probes are throttled on their own pool — separate from
+     * `readText`'s, so a slow read never delays a probe or vice versa — and a
+     * wait for a probe slot counts against the deadline exactly like a wait
+     * for the filesystem. A probe the filesystem hasn't answered by then
+     * throws `ReadFailed` ("timed out after 30s"). A probe that FAILED — no
+     * permission to look, an erroring or unavailable filesystem provider —
+     * throws `ReadFailed` too; only a genuine "nothing is there" answers
+     * `false`. "I couldn't tell" is deliberately never collapsed into
+     * `false`.
+     */
+    exists(path: string): Promise<boolean>;
+  }
+
+  interface NexusApi {
+    /** Read-only, scoped, logged file access. */
+    fs: NexusFileSystem;
+  }
+
+  /** Nexus host API namespace. */
+  const nexus: NexusApi;
 }

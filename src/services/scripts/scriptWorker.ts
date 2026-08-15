@@ -43,7 +43,22 @@ function rpc<T = unknown>(method: string, args: unknown[]): Promise<T> {
       resolve: resolve as (value: unknown) => void,
       reject
     });
-    post({ kind: "rpc", id, method, args });
+    try {
+      post({ kind: "rpc", id, method, args });
+    } catch (err) {
+      // `postMessage` structured-clones `args` and throws SYNCHRONOUSLY
+      // (DataCloneError) for a non-cloneable value (a Symbol, a function,
+      // ...) — before any `rpc-result` was ever going to arrive. Without this
+      // catch, the `pending.set(id, ...)` entry above leaks forever (nothing
+      // will ever call its resolve/reject) and the caller sees a raw
+      // DataCloneError instead of whichever typed error the RPC method would
+      // have produced. Generic — protects every `rpc()` caller, not just
+      // `nexus.fs` (which additionally sanitizes its own argument before
+      // reaching here; see `sanitizeFsPath` below — this is the backstop for
+      // every method that doesn't).
+      pending.delete(id);
+      reject(err);
+    }
   });
 }
 
@@ -154,6 +169,85 @@ globals.macros = {
 // session metadata — populated by the main thread via the "load" message
 // before user code executes. See handler above.
 globals.session = undefined;
+
+// nexus.fs — read-only file access, scoped + logged on the main thread.
+// readJson is deliberately worker-side JSON.parse over the readText RPC so a
+// parse failure carries a stack local to the script's own execution context.
+//
+// The worker does NOT receive the script directory, and the `load` message
+// above is unchanged: (a) resolution must live where enforcement lives — a
+// worker-side resolve would make the RPC carry a pre-resolved absolute path,
+// turning the main-thread check into re-validation of attacker-influencable
+// input for zero gain; (b) user code shares the worker's global scope with
+// the API surface and can overwrite any global — worker-held scope data is
+// untrusted by construction; (c) main-thread-only resolution means one
+// containment implementation, one test matrix, one audit point.
+/**
+ * `nexus.fs.*` accepts `path: unknown` — a script can pass a Symbol or a
+ * function just as easily as a string. Those aren't structured-cloneable, so
+ * posting one as an RPC arg would hit the DataCloneError guard in `rpc()`
+ * above: a generic Error, no typed `InvalidPath` code, and no refusal ever
+ * reaches the main-thread audit log (nothing there ever received the call).
+ * Sanitize BEFORE posting:
+ *  - a string passes through untouched (the overwhelmingly common case, zero
+ *    overhead);
+ *  - any other cloneable value (e.g. a BigInt — main-thread validation
+ *    already types those as InvalidPath, see scriptFsScope.ts's
+ *    `resolveScriptFsPath`) passes through too, unchanged, probed via
+ *    `structuredClone` (a Node global, same algorithm `postMessage` itself
+ *    uses — if THIS throws, `postMessage` would have thrown identically);
+ *  - a genuinely non-cloneable value is replaced with a plain, cloneable
+ *    stand-in object carrying a best-effort description. The stand-in is
+ *    deliberately NOT a string — a Symbol must never masquerade as a
+ *    legitimate filename — so the main thread's existing
+ *    `typeof requested !== "string"` check rejects it with InvalidPath
+ *    through the ordinary path: typed error AND audit line, both restored.
+ */
+function sanitizeFsPath(p: unknown): unknown {
+  if (typeof p === "string") return p;
+  try {
+    structuredClone(p);
+    return p;
+  } catch {
+    return { __nonCloneable: describeNonCloneable(p) };
+  }
+}
+
+function describeNonCloneable(p: unknown): string {
+  try {
+    return String(p);
+  } catch {
+    // A hostile custom toString()/valueOf()/[Symbol.toPrimitive] can throw.
+    try {
+      return Object.prototype.toString.call(p);
+    } catch {
+      // ...and so can THIS, for a Proxy whose `get` trap throws — reading
+      // Symbol.toStringTag goes through the trap. The description chain must
+      // never throw (a throw here escapes as the trap's error instead of the
+      // typed InvalidPath), so the last resort is a constant.
+      return "[unrepresentable value]";
+    }
+  }
+}
+
+globals.nexus = {
+  fs: {
+    readText: (p: unknown) => rpc<string>("fs.readText", [sanitizeFsPath(p)]),
+    readJson: async (p: unknown) => {
+      const text = await rpc<string>("fs.readText", [sanitizeFsPath(p)]);
+      try {
+        return JSON.parse(text) as unknown;
+      } catch (err) {
+        const e = new SyntaxError(
+          `nexus.fs.readJson(${JSON.stringify(String(p))}): ${(err as Error).message}`
+        );
+        Object.assign(e, { code: "InvalidJson" });
+        throw e;
+      }
+    },
+    exists: (p: unknown) => rpc<boolean>("fs.exists", [sanitizeFsPath(p)])
+  }
+};
 
 // Tell the main thread we're ready to accept a `load` message.
 post({ kind: "ready" });

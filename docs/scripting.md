@@ -13,6 +13,7 @@ Nexus Scripts let you automate multi-step terminal procedures in plain JavaScrip
   - [Polling](#polling)
   - [Interacting with the user](#interacting-with-the-user)
   - [Utility](#utility)
+  - [Reading files — nexus.fs](#reading-files--nexusfs)
   - [Macro coordination](#macro-coordination)
   - [Session metadata](#session-metadata)
 - [Error handling](#error-handling)
@@ -344,6 +345,70 @@ log.error("auth failed for", session.name);
 
 `log` is not async — it doesn't block the script. Password values entered through `prompt(msg, { password: true })` are excluded from log events; any other values you pass to `log.*` are written verbatim — don't log secrets.
 
+### Reading files — nexus.fs
+
+`nexus.fs` is the supported way for a script to read files: read-only, scoped, size-capped, and every access is logged. It's the alternative to the unsupported `await import("node:fs")` path described in [Security and trust](#security-and-trust).
+
+#### `nexus.fs.readText(path)` → `Promise<string>`
+
+Read a UTF-8 text file. Throws on failure — see the error table below.
+
+```js
+const banner = await nexus.fs.readText("./banner.txt");
+log.info(banner);
+```
+
+#### `nexus.fs.readJson<T>(path)` → `Promise<T>`
+
+`readText` + `JSON.parse`. A malformed file throws a `SyntaxError` with `code: "InvalidJson"` whose message names the requested path. Defaults to `Promise<any>`, so property access on the result type-checks without a cast; pass a type argument for a typed result.
+
+```js
+const config = await nexus.fs.readJson("./devices.json");
+for (const device of config.devices) {
+  // ...
+}
+```
+
+#### `nexus.fs.exists(path)` → `Promise<boolean>`
+
+`true` for any entry at the scoped path — file or directory. An out-of-scope path **throws** rather than returning `false`: there's no existence oracle outside the scope, so `exists` and `readText` fail the same way for a path you shouldn't be probing. A probe the filesystem never answers throws too (see **Deadline** below), and so does one it *refuses* — no permission to look, an erroring or unavailable filesystem provider — which throws `ReadFailed`. Only a genuine "nothing is there" answers `false`, so `false` always means "checked, nothing there", never "couldn't tell".
+
+```js
+if (await nexus.fs.exists("./credentials.json")) {
+  const creds = await nexus.fs.readJson("./credentials.json");
+}
+```
+
+**Path resolution.** A relative path resolves against **this script's own directory** — not the current working directory, not the workspace root. A resolved path is legal if it lands inside either of two roots:
+
+- the script's own directory (and its subtree), or
+- the configured Nexus scripts folder (`nexus.scripts.path`, default `.nexus/scripts`) and its subtree — whether or not the script itself lives there.
+
+Both `..` traversal and absolute paths are accepted, as long as the *result* lands inside one of those two roots — `nexus.fs.readText("../shared/vars.json")` is fine if `../shared` is still under the scripts folder. A script run from outside the scripts folder entirely (e.g. the editor CodeLens on an arbitrary `.js` file) can still read its own folder subtree and the scripts folder — just nothing else. An `untitled:` script (unsaved editor buffer) has no on-disk folder, so every `nexus.fs` call throws `NoScriptDir` until you save it.
+
+**Limits.** Files over 4 MiB throw `FileTooLarge` — normally without the file being read at all, since the size is checked first. A FileSystemProvider that misreports a file's size is still caught, just one step later, by a second check against the actual bytes read. Non-UTF-8 content throws `NotUtf8`.
+
+**Deadline.** A `nexus.fs` call never blocks longer than **30 seconds**. The limit is fixed (not configurable) and covers the **whole call**, measured from the moment your script makes it: both `readText` (its stat + read) and `exists` (its stat), *and* any time spent waiting for a slot when several `nexus.fs` calls are in flight at once. Reads and existence probes are each throttled and bounded the same way, on separate pools — a fan-out of `exists()` calls never waits behind slow reads, and never consumes the reads' capacity either. A call that never gets a slot is bounded exactly like one whose provider never answers. When the limit expires — a hung remote filesystem provider, a `file:` path on a dead network mount; neither offers any way to cancel an in-flight call — the call throws `ReadFailed` with a message ending in `timed out after 30s`. A timeout is never reported as a missing file, an empty read, or a `false` from `exists()`: "I couldn't tell" and "it's definitely not there" justify opposite actions in a script, so they get different outcomes.
+
+**Logging.** Every call — success or refusal — writes a line to the **Nexus Scripts** Output Channel with the resolved path (successes also include the byte count). The one exception is a call whose 30-second deadline fires *after* its run was already stopped — that run's log has ended, so the timeout isn't appended to it.
+
+**Error codes:**
+
+| `err.code` | Thrown by | When |
+|---|---|---|
+| `"NoScriptDir"` | any `nexus.fs.*` call | The script is an unsaved `untitled:` buffer with no folder on disk. |
+| `"InvalidPath"` | any `nexus.fs.*` call | The path is empty, not a string, contains a NUL byte, or (Windows) is drive-relative (`"C:file.txt"`). |
+| `"PathOutsideScope"` | any `nexus.fs.*` call | The resolved path lands outside both allowed roots. |
+| `"FileNotFound"` | `readText` | Nothing exists at the path, or it's a directory. |
+| `"FileTooLarge"` | `readText` | The file is bigger than 4 MiB. `err.sizeBytes` / `err.maxBytes` carry the numbers — `sizeBytes` is a lower bound when the true size could not be determined (a file that grew mid-read, or a provider that under-reported it, reports the cap + 1). |
+| `"NotUtf8"` | `readText` | The bytes aren't valid UTF-8. |
+| `"ReadFailed"` | `readText`, `exists` | The path resolved and passed the size check, but the read (or `exists`'s probe) itself failed — permissions, a misbehaving remote filesystem provider — or the operation timed out (30 seconds; see **Deadline** above). A failed `exists` probe throws this rather than answering `false`. |
+| `"InvalidJson"` | `readJson` | The file read fine but isn't valid JSON. A `SyntaxError`, not a plain `Error`. |
+
+`exists()` throws `NoScriptDir` / `InvalidPath` / `PathOutsideScope` under the same conditions as `readText`, plus `ReadFailed` when its probe fails outright (permissions, a provider error) or exceeds the 30-second deadline. It returns a plain boolean only when the filesystem actually answered.
+
+An uncaught `nexus.fs` error is **not** one of the [expected error codes](#error-handling) — it toasts, the same as a syntax error would. If your script wants to branch on "this file might not be there", use `exists()` or wrap the call in `try/catch`.
+
 ### Macro coordination
 
 By default, all macros on the script's bound session are **suspended** for the duration of the run. Macros on unrelated sessions keep firing. You can override this four ways:
@@ -395,6 +460,7 @@ Every script runs inside an async function, so normal `try / catch / finally` ap
 | `"Timeout"` | `expect`, `waitAny`, `poll` | The pattern didn't appear within the wait budget. |
 | `"ConnectionLost"` | any in-flight `expect` / `send` / `poll` / `prompt` | The bound session disconnected mid-wait. |
 | `"InvalidKey"` | `sendKey` | An unknown control-key name was passed. |
+| `"NoScriptDir"` / `"InvalidPath"` / `"PathOutsideScope"` / `"FileNotFound"` / `"FileTooLarge"` / `"NotUtf8"` / `"ReadFailed"` / `"InvalidJson"` | `nexus.fs.*` | See [Reading files — nexus.fs](#reading-files--nexusfs) for the full table. These are **not** silent expected codes — uncaught, they toast just like any other bug. |
 
 A typical error-handler:
 
@@ -709,9 +775,10 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 **Scripts run with the same privileges as the Nexus Terminal extension.** Treat a `.js` file you're about to run the same way you'd treat a shell script or a PowerShell script someone sent you — open it and read it first.
 
-- Scripts execute as local Node code inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import `vscode`, read your workspace files, or spawn subprocesses — those capabilities are deliberately omitted from the global surface (see **Limitations**). But that isolation is a *convenience* for correctness and cheap termination, not a security boundary against hostile code.
+- Scripts execute as local Node code inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import the `vscode` API. **Everything else a Node process can do, a script can do**: `await import("node:fs")` and `await import("node:child_process")` work, so a script can read or write any file your user account can and spawn processes. The worker is a cheap-termination mechanism, not a sandbox — only run scripts you have read and trust. `nexus.fs` is the *supported* way to read files: it is read-only, scoped to the scripts folder and the script's own directory, capped at 4 MiB, and every access is logged to the Nexus Scripts Output Channel. Direct Node imports are possible but unsupported — no compatibility promises, and stopping a script (`worker.terminate()`) does **not** kill child processes the script spawned.
 - Secret prompts (`prompt(msg, { password: true })`) are masked in the input box and the returned value is never written to the Output Channel by the runtime. Anything the script explicitly logs — via `log.info(value)`, for example — is written verbatim, so don't hand-log the result of a password prompt.
-- The runtime never reads your workspace outside the configured `nexus.scripts.path` directory (default `.nexus/scripts`). It does re-write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` on first run and after version bumps. If you customise those files in place, your edits are preserved only until the bundled version string changes — then they're overwritten. Keep local customisations in separate files.
+- On a script's behalf, the runtime reads files only through `nexus.fs`, which refuses paths outside the scripts folder / the script's own folder and logs every read. It does re-write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` on first run and after version bumps. If you customise those files in place, your edits are preserved only until the bundled version string changes — then they're overwritten. Keep local customisations in separate files.
+- **Scripts refuse to start in Restricted Mode.** Nexus Terminal declares `capabilities.untrustedWorkspaces.supported: false` and additionally hard-refuses every script-start command when `vscode.workspace.isTrusted === false`, with a **Manage Workspace Trust** button in the error message. Trust the workspace first.
 
 Bottom line: author your own scripts, or review scripts from others the same way you'd review a Bash script before running it.
 
@@ -722,8 +789,7 @@ Bottom line: author your own scripts, or review scripts from others the same way
 - **Manual-only launch.** Scripts can't be auto-triggered from terminal output today — that's tracked for a future version because the target use cases (firmware changes, config pushes) are deliberately destructive and deserve human intent.
 - **One script per session at a time.** Starting a second script on a busy session prompts you to stop the running one first. Running scripts on different sessions in parallel works fine.
 - **Desktop only.** The web variant of Nexus Terminal shows a friendly "not available in browser" message instead of registering the commands.
-- **No module imports.** Scripts are plain JavaScript executed in a Worker; `import` / `require` don't work. All API primitives are pre-injected as globals.
-- **No process spawning.** The Worker sandbox doesn't expose `child_process` or other Node capabilities. If you need to run something locally before your procedure, do it in a separate terminal or a pre-step script.
-- **No file I/O.** Use `prompt` / `confirm` / `alert` for human input; scripts can't read or write workspace files directly.
+- **No static `import` declarations.** The script body runs as an async function body; a top-level `import`/`require` statement doesn't work. Dynamic `await import(...)` of Node builtins technically works but is unsupported — see [Security and trust](#security-and-trust).
+- **File access.** `nexus.fs` provides supported, read-only, scoped, logged reads; there is no write API. Anything beyond that runs with your full user permissions and is on you.
 
-These constraints are intentional — they keep the surface small, the mental model simple, and the runtime safely killable. If you have a use case the current API can't express cleanly, open a GitHub issue with the procedure description.
+If you have a use case the current API can't express cleanly, open a GitHub issue with the procedure description.

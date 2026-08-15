@@ -1,5 +1,9 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { isLexicallyWithin } from "./scriptFsScope";
+
+/** `process.platform`, injected as `isLexicallyWithin`'s platform argument. */
+const HOST_PLATFORM = process.platform === "win32" ? "win32" : "posix";
 
 /**
  * What a drop did.
@@ -14,29 +18,6 @@ export type ScriptMoveResult =
   | { readonly kind: "moved" }
   | { readonly kind: "unchanged" }
   | { readonly kind: "refused"; readonly message: string };
-
-/**
- * Lexical containment: is `child` at or below `parent` as a PATH?
- *
- * Deliberately lexical, and the distinction is worth stating because the
- * scanner follows symlinks. `scripts/shared -> /elsewhere/shared` is walked, so
- * `scripts/shared/probe.js` renders in the tree with a URI built by
- * `Uri.joinPath` — which is under the scripts root as a string while the bytes
- * live somewhere else entirely. This check therefore guarantees "the path the
- * tree drew is under the root", not "the file is inside the root directory",
- * and moving such a script really does move it out of the link's target. That
- * is the right behaviour: the row the user dragged is in the Scripts view, and
- * a link they put there themselves is theirs to reorganise.
- *
- * What it is for is the case the tree never drew: a URI naming a path this view
- * never rendered. See `handleDrop` in `scriptTreeProvider.ts` for why that
- * cannot normally happen, and why it is checked anyway.
- */
-export function isPathInside(child: string, parent: string): boolean {
-  const rel = path.relative(path.resolve(parent), path.resolve(child));
-  if (rel === "") return true;
-  return !rel.startsWith("..") && !path.isAbsolute(rel);
-}
 
 function sameDirectory(a: string, b: string): boolean {
   return path.relative(path.resolve(a), path.resolve(b)) === "";
@@ -65,7 +46,21 @@ function sameDirectory(a: string, b: string): boolean {
  *    wrote; silently replacing one with another of the same name is
  *    unrecoverable, and `renameFile`'s own `overwrite: false` would fail with a
  *    message that does not name the folder.
- *  * **Outside the scripts root** — see `isPathInside`.
+ *  * **Outside the scripts root** — lexical containment, via `isLexicallyWithin`
+ *    (`scriptFsScope.ts`, the single containment implementation shared with
+ *    `nexus.fs`). Deliberately lexical, and the distinction is worth stating
+ *    because the scanner follows symlinks. `scripts/shared -> /elsewhere/shared`
+ *    is walked, so `scripts/shared/probe.js` renders in the tree with a URI
+ *    built by `Uri.joinPath` — which is under the scripts root as a string
+ *    while the bytes live somewhere else entirely. This check therefore
+ *    guarantees "the path the tree drew is under the root", not "the file is
+ *    inside the root directory", and moving such a script really does move it
+ *    out of the link's target. That is the right behaviour: the row the user
+ *    dragged is in the Scripts view, and a link they put there themselves is
+ *    theirs to reorganise. What it is for is the case the tree never drew: a
+ *    URI naming a path this view never rendered. See `handleDrop` in
+ *    `scriptTreeProvider.ts` for why that cannot normally happen, and why it
+ *    is checked anyway.
  */
 export async function moveScriptIntoFolder(
   source: vscode.Uri,
@@ -75,7 +70,7 @@ export async function moveScriptIntoFolder(
 ): Promise<ScriptMoveResult> {
   const name = path.basename(source.fsPath);
 
-  if (!isPathInside(source.fsPath, scriptsRoot.fsPath)) {
+  if (!isLexicallyWithin(source.fsPath, scriptsRoot.fsPath, HOST_PLATFORM)) {
     return refused(`Could not move "${name}" — it is not inside the Nexus scripts folder.`);
   }
   if (runningPaths.has(source.fsPath)) {

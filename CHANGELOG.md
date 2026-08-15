@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.8.183] — 2026-08-15
+
+### Added
+
+- **Scripts can now read files, through a supported, read-only, scoped API: `nexus.fs`.** `nexus.fs.readText(path)`, `nexus.fs.readJson(path)`, and `nexus.fs.exists(path)` resolve relative paths against the running script's own directory, and refuse anything outside that folder or the configured Nexus scripts folder — traversal, absolute paths, and sibling-directory tricks are all caught by the same lexical containment check. Reads are capped at 4 MiB and must be valid UTF-8; every access — success or refusal — is logged to the "Nexus Scripts" Output Channel with the resolved path. `readJson` throws a `SyntaxError` (`code: "InvalidJson"`) on malformed input, naming the file in the message. IntelliSense picks this up automatically: the bundled type definitions are now v5, and every workspace still seeded with an older copy is rewritten on the next script command.
+- **A `nexus.fs` call never blocks a script for more than 30 seconds, and a broken filesystem cannot take the extension host down with it.** A hung remote filesystem or a dead network mount produces reads and probes that would otherwise never return; every call now settles within 30 seconds — the wait for a slot included — throwing `ReadFailed` with a "timed out" message when the filesystem never answered. `exists()` makes the same distinction everywhere it matters: a file that is genuinely absent returns `false`, while a probe the filesystem failed to answer (permissions, an unavailable provider, a timeout) throws `ReadFailed` — a script never mistakes "I couldn't tell" for "definitely not there". Behind the scenes, parallel reads and probes are throttled through small host-side pools with hard bounds on memory (~48 MiB worst case however many files a script fans out over) and on the operations a stalled provider can leave behind; a degraded pool recovers by itself the moment the stall clears, oldest waiter first, and cleaning up after a mass timeout is instant rather than proportional to the pile.
+- **Scripts now refuse to start in a Restricted Mode (untrusted) workspace.** A script runs arbitrary JavaScript with your full user permissions, so every script-start command — the palette, the CodeLens, the tree's quick-run, and "Connect/Open and Run Script…" for SSH, Serial, and Local Shell — now hard-refuses with an explanatory message and a **Manage Workspace Trust** button when the workspace isn't trusted. The extension also now explicitly declares `capabilities.untrustedWorkspaces.supported: false` in its manifest, making previously-implicit VS Code behavior an audited, intentional statement.
+
+### Fixed
+
+- **An absolute `nexus.scripts.path` now works in Remote-SSH workspaces.** Configuring the scripts folder as an absolute remote path produced a local-disk location internally, so the folder resolved to the wrong machine; the path now stays on the remote host (Windows-style drive paths included), and scripts there can read files across the configured folder as documented.
+
+### Changed
+
+- **`docs/scripting.md`'s security section no longer claims scripts can't read files or spawn processes.** They always could — `await import("node:fs")` and `await import("node:child_process")` work inside the Worker, same as any other Node code — the docs just didn't say so. The rewrite states the real boundary (no `vscode` import, nothing else), documents `nexus.fs` as the supported/audited path for file reads, and calls out that `worker.terminate()` (used to stop a script) does not kill child processes the script spawned. Direct Node module imports remain possible but unsupported.
+
 ## [2.8.182] — 2026-08-14
 
 ### Added

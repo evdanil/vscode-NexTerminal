@@ -93,6 +93,23 @@ export interface ScriptSessionMetadata {
   targetId: string;
 }
 
+/**
+ * Error codes thrown by the `nexus.fs` API. Deliberately NOT in
+ * `EXPECTED_ERROR_CODES` (`scriptRuntimeManager.ts`) — an uncaught one means the
+ * script's assumptions about its environment are wrong (missing fixture, bad
+ * path literal, wrong encoding), the same "bug in the script" class that
+ * classification set exists to toast.
+ */
+export type ScriptFsErrorCode =
+  | "FileNotFound" // stat failed, or target is a directory
+  | "PathOutsideScope" // lexical containment refused
+  | "FileTooLarge" // > 4 MiB (extra: { sizeBytes, maxBytes })
+  | "NotUtf8" // bytes are not valid UTF-8
+  | "NoScriptDir" // untitled: script — no on-disk location
+  | "InvalidPath" // empty / non-string / NUL / drive-relative
+  | "ReadFailed" // stat ok but read failed (permissions, provider error)
+  | "InvalidJson"; // worker-side readJson parse failure (never crosses the RPC wire)
+
 /** IPC frame sent from main → worker. */
 export type WorkerInbound =
   | { kind: "load"; source: string; session: ScriptSessionMetadata }
