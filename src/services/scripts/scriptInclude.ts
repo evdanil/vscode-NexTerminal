@@ -188,12 +188,24 @@ export function createScriptIncludeState(ctx: ScriptFsContext): ScriptIncludeSta
 
 /**
  * The identity of a file for caching and cycle detection: its resolved path,
- * case-folded exactly where the filesystem folds it. win32 is case-insensitive,
+ * case-folded exactly where the PLATFORM folds it. win32 is case-insensitive,
  * so `./Lib.js` and `./lib.js` are one module there and two on posix — matching
- * the disk, and matching `isLexicallyWithin`'s own win32 folding. Non-`file:`
- * schemes are forced to posix by `buildScriptFsScope` (a Uri carries no way to
- * know the far host's OS), so on a remote-Windows host two case-differing
- * specifiers are two modules and the body runs twice — stated in the docs.
+ * `isLexicallyWithin`'s own win32 folding. Identity is LEXICAL, deliberately:
+ * the whole containment layer works on paths and never consults the disk
+ * (`scriptFsScope.ts`), and the cache/cycle steps of the include ladder are
+ * I/O-free on purpose. The honest cost, stated in the docs, is that two
+ * spellings the DISK considers one file can be two modules here — the body
+ * runs twice, exports are two objects. Three ways to get there: a
+ * case-insensitive posix volume (macOS APFS's default — posix folding keeps
+ * them distinct); a remote-Windows host (non-`file:` schemes are forced to
+ * posix by `buildScriptFsScope`, a Uri carries no way to know the far host's
+ * OS); two symlinked paths to one file (symlinks are followed, never
+ * resolved). A stat/realpath-based canonical identity would collapse all
+ * three, but it would put I/O (and a TOCTOU window) inside the identity
+ * check, and inode identity does not exist on non-`file:` providers at all —
+ * the double-evaluation is self-harm-only (containment, budgets and the
+ * per-file cap all still hold, and both spellings still count against the
+ * module and byte limits), so lexical stays. Write one spelling per file.
  */
 export function includeCacheKeyFor(resolvedPath: string, platform: ScriptFsPlatform): string {
   return platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
