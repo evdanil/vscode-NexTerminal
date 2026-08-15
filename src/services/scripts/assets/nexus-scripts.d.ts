@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v6
+// Nexus Scripts API types — v7
 /**
  * Nexus Terminal — Scripts API
  *
@@ -316,6 +316,42 @@ declare global {
     maxBytes: number;
   }
 
+  /**
+   * Thrown by `nexus.include()` when a module cannot be loaded. Catch with
+   * `if (e.code === "CircularInclude") ...`.
+   *
+   * A module body that throws does NOT produce one of these: its own error
+   * propagates unwrapped, so the stack keeps pointing at the line that threw.
+   * Path failures (`InvalidPath`, `PathOutsideScope`, `FileNotFound`,
+   * `FileTooLarge`, `NotUtf8`, `NoScriptDir`, `ReadFailed`) come through as
+   * `ScriptFsError` — an include IS a scoped file read.
+   */
+  interface ScriptIncludeError extends Error {
+    code:
+      /** The module is already on the chain that is including it. `cycle` spells the loop out. */
+      | "CircularInclude"
+      /** More than 16 levels of nesting. */
+      | "IncludeDepthExceeded"
+      /** This run has already loaded 64 distinct modules. */
+      | "IncludeLimitExceeded"
+      /** The module's source did not compile. Names the file; V8 gives no line for this. */
+      | "IncludeSyntaxError"
+      /** The target carries an `@nexus-script` marker — it is a script, not a library. */
+      | "IncludeIsScript"
+      /** Protocol violation inside the runtime — please file an issue. */
+      | "IncludeInternal";
+    /** `CircularInclude`: the loop, entry script first, e.g. `["main.js", "lib/a.js", "lib/a.js"]`. */
+    cycle?: string[];
+    /** `IncludeDepthExceeded`: the depth that was refused, and the limit. */
+    depth?: number;
+    maxDepth?: number;
+    /** `IncludeLimitExceeded`: modules already loaded, and the limit. */
+    count?: number;
+    maxModules?: number;
+    /** `IncludeIsScript` / `IncludeSyntaxError`: the module's display name. */
+    module?: string;
+  }
+
   // ---------------------------------------------------------------------------
   // nexus.fs — read-only, scoped, logged file access
   // ---------------------------------------------------------------------------
@@ -362,8 +398,79 @@ declare global {
   interface NexusApi {
     /** Read-only, scoped, logged file access. */
     fs: NexusFileSystem;
+    /**
+     * Load another `.js` file as a module and resolve to its exports —
+     * CommonJS-flavoured, and the supported way to split a long script into
+     * files.
+     *
+     * ```js
+     * // lib/helpers.js  (a plain .js file, NO @nexus-script marker)
+     * exports.login = async (user) => { await sendLine(user); };
+     *
+     * // main.js
+     * const helpers = await nexus.include("./lib/helpers.js");
+     * await helpers.login("admin");
+     * ```
+     *
+     * - **Relative paths resolve against the file they are written in**, at any
+     *   depth — `nexus.fs` inside an included file does too. Containment is
+     *   unchanged: the target must still land inside the scripts folder or the
+     *   entry script's own folder.
+     * - The specifier must be an explicit path ending in `.js`. No implicit
+     *   extension, no `index.js`, no `node_modules`, no bare specifiers. Data
+     *   files go through `nexus.fs.readText` / `nexus.fs.readJson`.
+     * - **An included file must not carry `@nexus-script`** — that marker means
+     *   "entry point" (`IncludeIsScript`), and header directives in an included
+     *   file are never honoured.
+     * - Exports precedence: a reassigned `module.exports` wins; otherwise
+     *   anything put on `exports` wins; otherwise the body's own `return` value
+     *   is used.
+     * - Each module whose source was delivered is loaded **at most once per
+     *   run** — later includes get the same exports object, and a module whose
+     *   compile or body threw keeps throwing the same error. Refusals are
+     *   re-evaluated on every call.
+     * - Cycles throw `CircularInclude` with the loop spelled out. Max 16 levels
+     *   deep, max 64 distinct modules per run.
+     * - Reads share `nexus.fs`'s cap, UTF-8 requirement, 30-second deadline and
+     *   read pool, and every load is logged to the "Nexus Scripts" Output
+     *   Channel.
+     *
+     * Defaults to `Promise<any>` so property access on the result type-checks
+     * without a cast; pass `T` (e.g. `typeof import("./lib/helpers.js")`) for a
+     * typed result.
+     */
+    include<T = any>(path: string): Promise<T>;
   }
 
   /** Nexus host API namespace. */
   const nexus: NexusApi;
+
+  // ---------------------------------------------------------------------------
+  // Available INSIDE AN INCLUDED FILE only
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The module record of an included file. Whatever `module.exports` holds when
+   * the file finishes is what `nexus.include()` resolves to.
+   */
+  interface NexusScriptModule {
+    exports: any;
+  }
+
+  /**
+   * Present inside a file loaded with `nexus.include()`. Assigning
+   * `module.exports = ...` replaces the whole exports object.
+   *
+   * NOT available in an entry script (a file with `@nexus-script`) — referencing
+   * it there throws `ReferenceError` at runtime. Entry scripts are run, not
+   * imported; move the reusable part into an included file.
+   */
+  const module: NexusScriptModule;
+
+  /**
+   * Present inside a file loaded with `nexus.include()`, and initially the same
+   * object as `module.exports`. Same caveat as `module`: referencing it in an
+   * entry script throws `ReferenceError`.
+   */
+  var exports: any;
 }

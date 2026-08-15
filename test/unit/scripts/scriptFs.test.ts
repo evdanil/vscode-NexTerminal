@@ -144,6 +144,8 @@ import {
   boundedReadFile,
   initialReadCapacity,
   resetScriptFsSchedulers,
+  resolveScriptFsTarget,
+  scriptFsReadSource,
   SCRIPT_FS_MAX_CONCURRENT_READS,
   SCRIPT_FS_READ_TIMEOUT_MS,
   SCRIPT_FS_MAX_ORPHANED_READS,
@@ -3017,5 +3019,155 @@ describe("scriptFsReadText — end-to-end with a correctly-rebased remote script
 
     const text = await scriptFsReadText("../shared/vars.json", ctx);
     expect(text).toBe('{"ok":true}');
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Phase 2 (nexus.include) — the include reader.
+//
+// `scriptFsReadSource` is the source-text read behind `nexus.include()`, and
+// `resolveScriptFsTarget` is the containment half it (and a module's own
+// `nexus.fs`) resolves through. Both live here, on purpose: an include IS a
+// file read, and it must inherit this module's cap, encoding, deadline and —
+// above all — its read-slot pool.
+// -----------------------------------------------------------------------------
+
+describe("scriptFsReadSource — shares readSlots with nexus.fs.readText (P1: one host-side read-buffer budget, not two)", () => {
+  it("queues behind 4 stalled readText calls instead of starting a 5th read immediately", async () => {
+    // ⊘ an include reader gated on its OWN ReadSlotScheduler instance (or on
+    // no scheduler at all). The documented host-side bound is
+    // (4 concurrent + 8 orphaned) × cap; a second pool would silently double
+    // it while every existing test still passed. The discriminator is the
+    // shared machine's own state: with the pool saturated, the include read
+    // must be VISIBLY QUEUED on it (`queued === 1`) and must not have opened
+    // a file (`open` call count still exactly 4).
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `stall${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "lib.js"), "exports.v = 1;\n");
+
+    const gates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+    const stalled = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
+      scriptFsReadText(`stall${i}.txt`, ctx)
+    );
+    await waitFor(() => readSlots.snapshot().permitsInUse === SCRIPT_FS_MAX_CONCURRENT_READS);
+    expect(nodeOpenSpy).toHaveBeenCalledTimes(SCRIPT_FS_MAX_CONCURRENT_READS);
+
+    const included = scriptFsReadSource(path.join(scriptDir, "lib.js"), ctx);
+    await waitFor(() => readSlots.snapshot().queued === 1);
+    // Still no fifth open: the include read is waiting for a permit from the
+    // SAME pool, not running on one of its own.
+    expect(nodeOpenSpy).toHaveBeenCalledTimes(SCRIPT_FS_MAX_CONCURRENT_READS);
+
+    gates.forEach((gate) => gate.resolve());
+    await Promise.all(stalled);
+    const source = await included;
+    expect(source.text).toBe("exports.v = 1;\n");
+    expect(source.byteLength).toBe(15);
+  }, 10_000);
+});
+
+describe("scriptFsReadSource — inherits the run's cap, encoding, abort and audit vocabulary", () => {
+  it("refuses a source file over the run's EFFECTIVE cap, quoting that cap (not the 4 MiB default)", async () => {
+    // ⊘ an include reader with its own size budget, or one left on the old
+    // fixed constant: the 3 MiB module below is legal at the default cap and
+    // must be refused at this run's 2 MiB one.
+    const MiB = 1024 * 1024;
+    const { ctx, scriptDir } = await makeCtx({ maxBytes: 2 * MiB });
+    const big = path.join(scriptDir, "big.js");
+    await fsp.writeFile(big, Buffer.alloc(3 * MiB, "a"));
+
+    await expect(scriptFsReadSource(big, ctx)).rejects.toMatchObject({
+      code: "FileTooLarge",
+      maxBytes: 2 * MiB
+    });
+  });
+
+  it("refuses non-UTF-8 source with NotUtf8, and a missing file with FileNotFound", async () => {
+    const { ctx, scriptDir } = await makeCtx();
+    const binary = path.join(scriptDir, "binary.js");
+    await fsp.writeFile(binary, Buffer.from([0xff, 0xfe, 0x00]));
+
+    await expect(scriptFsReadSource(binary, ctx)).rejects.toMatchObject({ code: "NotUtf8" });
+    await expect(scriptFsReadSource(path.join(scriptDir, "nope.js"), ctx)).rejects.toMatchObject({
+      code: "FileNotFound"
+    });
+  });
+
+  it("logs every refusal under the `include` verb — never `fs.readText`", async () => {
+    // ⊘ reusing readText's audit verb for include reads: the Output Channel
+    // would then attribute a module load to an API call the script never made.
+    const { ctx, scriptDir, log } = await makeCtx();
+    await expect(scriptFsReadSource(path.join(scriptDir, "nope.js"), ctx)).rejects.toMatchObject({
+      code: "FileNotFound"
+    });
+    const lines = log.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.startsWith("include ") && l.endsWith("→ FileNotFound"))).toBe(true);
+    expect(lines.some((l) => l.includes("fs.readText"))).toBe(false);
+  });
+
+  it("writes no success line of its own — the include audit line (request → display name) is the loader's to write", async () => {
+    // ⊘ an include read that logs `fs.readText <path> (N bytes)` on the way
+    // through: the run's log would carry two lines per module, one of them
+    // naming an API the script never called.
+    const { ctx, scriptDir, log } = await makeCtx();
+    const lib = path.join(scriptDir, "lib.js");
+    await fsp.writeFile(lib, "exports.a = 1;");
+    await scriptFsReadSource(lib, ctx);
+    expect(log.mock.calls.map((c) => String(c[0]))).toEqual([]);
+  });
+
+  it("an aborted run skips the read entirely (Stopped, no open)", async () => {
+    // ⊘ an include reader that doesn't inherit the abort early-out: a stopped
+    // run's pending includes would still read files and charge the shared pool.
+    const { ctx, scriptDir } = await makeCtx({ isAborted: () => true });
+    const lib = path.join(scriptDir, "lib.js");
+    await fsp.writeFile(lib, "exports.a = 1;");
+
+    await expect(scriptFsReadSource(lib, ctx)).rejects.toMatchObject({ code: "Stopped" });
+    expect(nodeOpenSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveScriptFsTarget — containment for an include, resolved from the including file's own directory", () => {
+  it("resolves a relative specifier against the supplied base, and still enforces the run's two-root union", async () => {
+    // ⊘ resolving against the entry script's directory (both candidate files
+    // below are real, so the wrong implementation returns the OTHER one), and
+    // ⊘ treating the base as a third containment root.
+    const { ctx, root, scriptDir } = await makeCtx();
+    const libDir = path.join(root, "lib");
+    await fsp.mkdir(libDir, { recursive: true });
+    await fsp.writeFile(path.join(libDir, "b.js"), "// lib copy");
+    await fsp.writeFile(path.join(scriptDir, "b.js"), "// entry copy");
+
+    expect(resolveScriptFsTarget("./b.js", ctx, libDir)).toBe(path.join(libDir, "b.js"));
+    expect(resolveScriptFsTarget("./b.js", ctx, scriptDir)).toBe(path.join(scriptDir, "b.js"));
+    expect(() => resolveScriptFsTarget("../../outside.js", ctx, libDir)).toThrow(
+      expect.objectContaining({ code: "PathOutsideScope" })
+    );
+  });
+
+  it("an untitled: script has no folder, so an include refuses with NoScriptDir before the base is even consulted", async () => {
+    const { ctx } = await makeCtx({ scriptDirUri: undefined });
+    expect(() => resolveScriptFsTarget("./lib.js", ctx, undefined)).toThrow(
+      expect.objectContaining({ code: "NoScriptDir" })
+    );
+  });
+});
+
+describe("scriptFsReadText — optional module-relative base (a module's own nexus.fs)", () => {
+  it("resolves a relative read against the module's directory when a base is supplied, and against the entry script's when it is not", async () => {
+    // ⊘ `fs.readText` ignoring the base argument: both template files below
+    // exist, so the wrong implementation silently reads the entry script's
+    // copy — a different successful outcome, not a failure.
+    const { ctx, root, scriptDir } = await makeCtx();
+    const libDir = path.join(root, "lib");
+    await fsp.mkdir(libDir, { recursive: true });
+    await fsp.writeFile(path.join(libDir, "template.txt"), "library-copy");
+    await fsp.writeFile(path.join(scriptDir, "template.txt"), "entry-copy");
+
+    expect(await scriptFsReadText("./template.txt", ctx, libDir)).toBe("library-copy");
+    expect(await scriptFsReadText("./template.txt", ctx)).toBe("entry-copy");
   });
 });

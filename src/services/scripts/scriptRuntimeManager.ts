@@ -13,6 +13,14 @@ import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGen
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
 import { scriptFsExists, scriptFsReadText, type ScriptFsContext } from "./scriptFs";
+import {
+  createScriptIncludeState,
+  includeModuleDirOf,
+  includeModuleDisplayNameOf,
+  scriptIncludeLoad,
+  type ScriptIncludeState
+} from "./scriptInclude";
+import { SCRIPT_INCLUDE_ROOT_ID } from "./scriptTypes";
 import type {
   FailureReason,
   FinalState,
@@ -98,6 +106,14 @@ interface RunningScriptRecord {
    * already reading files against the cap it started with.
    */
   maxReadBytes: number;
+  /**
+   * This run's `nexus.include()` bookkeeping — module ids, resolved paths and
+   * display names. PER RUN, deliberately: the edit → run loop must pick up a
+   * library edit between runs, and a host-lived cache would serve stale module
+   * source for the rest of the session. Seeded with the entry script as
+   * `#root` at run start.
+   */
+  includeState: ScriptIncludeState;
   worker: WorkerLike;
   pendingRpcs: Map<number, PendingRpc>;
   observerSubscription?: vscode.Disposable;
@@ -235,6 +251,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       outputBuffer: new ScriptOutputBuffer(),
       defaultTimeoutMs,
       maxReadBytes,
+      // Replaced immediately below, once `fsContextFor(record)` can close over
+      // the finished record.
+      includeState: undefined as unknown as ScriptIncludeState,
       worker: this.createWorker(),
       pendingRpcs: new Map(),
       inputLockHeld: false,
@@ -243,6 +262,12 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       cleanedUp: false,
       writeBack: (data: string) => pty.writeProgrammatic(data)
     };
+
+    // Seeded here (not lazily on the first include) so `#root`'s resolved path,
+    // directory and display name are snapshotted from the same launch Uri
+    // everything else about the run is, and so the `load` message below can
+    // name the entry script.
+    record.includeState = createScriptIncludeState(this.fsContextFor(record));
 
     record.observerSubscription = pty.addOutputObserver({
       onOutput: (text) => record.outputBuffer.append(text),
@@ -293,6 +318,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     record.worker.postMessage({
       kind: "load",
       source,
+      // The entry script's own `//# sourceURL`, so its stack frames name the
+      // file and its true lines instead of `<anonymous>` at +2.
+      displayName: includeModuleDisplayNameOf(record.includeState, SCRIPT_INCLUDE_ROOT_ID),
       session: {
         id: target.session.id,
         type: target.type,
@@ -429,6 +457,20 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       // `stopScript`, before the race — checking it here closes that window.
       isAborted: () => record.cleanedUp || record.stopReason !== undefined
     };
+  }
+
+  /**
+   * The directory a `nexus.fs` call resolves relative paths against: the entry
+   * script's own (`undefined` — the unchanged Phase-1 path) when the call came
+   * from the entry script, or the including module's when `args[1]` names one.
+   *
+   * An id this run never minted throws `IncludeInternal` rather than falling
+   * back to the entry script: the worker is untrusted, so a stale or forged id
+   * is a protocol violation to report, not a default to guess at.
+   */
+  private includeBaseDirFor(record: RunningScriptRecord, moduleId: unknown): string | undefined {
+    if (moduleId === undefined) return undefined;
+    return includeModuleDirOf(record.includeState, moduleId);
   }
 
   private basenameWithoutExt(fsPath: string): string {
@@ -634,9 +676,11 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         return undefined;
       }
       case "fs.readText":
-        return scriptFsReadText(args[0], this.fsContextFor(record));
+        return scriptFsReadText(args[0], this.fsContextFor(record), this.includeBaseDirFor(record, args[1]));
       case "fs.exists":
-        return scriptFsExists(args[0], this.fsContextFor(record));
+        return scriptFsExists(args[0], this.fsContextFor(record), this.includeBaseDirFor(record, args[1]));
+      case "include.load":
+        return scriptIncludeLoad(args[0], args[1], this.fsContextFor(record), record.includeState);
       default:
         throw makeError("UnknownMethod", `Unknown script RPC method: ${method}`);
     }

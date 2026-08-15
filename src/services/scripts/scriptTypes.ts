@@ -110,9 +110,75 @@ export type ScriptFsErrorCode =
   | "ReadFailed" // stat ok but read failed (permissions, provider error)
   | "InvalidJson"; // worker-side readJson parse failure (never crosses the RPC wire)
 
+/**
+ * Error codes thrown by `nexus.include()`. Like `ScriptFsErrorCode`, these are
+ * deliberately NOT in `EXPECTED_ERROR_CODES` (`scriptRuntimeManager.ts`): a
+ * refused include means the script's assumptions about its own file layout are
+ * wrong (a typo'd specifier, a library that grew an `@nexus-script` marker, a
+ * cycle someone just introduced) — the "bug in the script" class the crash
+ * toast exists for, not cooperative control flow.
+ *
+ * A module body that THROWS is not in this list on purpose: its own error
+ * propagates unwrapped, so the stack keeps pointing at the line that threw
+ * (there is deliberately no `IncludeFailed` wrapper).
+ */
+export type ScriptIncludeErrorCode =
+  /** The requested module is already on the current include chain (extra: `cycle: string[]`). */
+  | "CircularInclude"
+  /** The chain is longer than `SCRIPT_INCLUDE_MAX_DEPTH` (extra: `depth`, `maxDepth`). */
+  | "IncludeDepthExceeded"
+  /** This run already loaded `SCRIPT_INCLUDE_MAX_MODULES` distinct modules (extra: `count`, `maxModules`). */
+  | "IncludeLimitExceeded"
+  /** The module's source did not compile (worker-side; extra: `module`). */
+  | "IncludeSyntaxError"
+  /** The target carries an `@nexus-script` marker — it is an entry point, not a library (extra: `module`). */
+  | "IncludeIsScript"
+  /** Protocol violation between worker and main — "should never happen". */
+  | "IncludeInternal";
+
+/**
+ * The entry script's own module id. Opaque to the worker except for this one
+ * value, which it needs so a root-level `nexus.fs` call stays byte-identical on
+ * the wire to Phase 1's (no module-id argument at all).
+ *
+ * Lives here rather than in `scriptInclude.ts` because that module imports
+ * `scriptFs.ts` and therefore `vscode` — off-limits to the worker bundle.
+ */
+export const SCRIPT_INCLUDE_ROOT_ID = "#root";
+
+/**
+ * Main's answer to an `include.load` RPC: everything the worker needs to
+ * evaluate a module, and nothing it needs to be trusted with (it never sees a
+ * resolved path — resolution and containment stay where enforcement is).
+ */
+export interface IncludeLoadResult {
+  /** Opaque, main-assigned, per-run. The worker keys its evaluated modules by this. */
+  moduleId: string;
+  /** Human label for `//# sourceURL` and audit lines, e.g. `lib/helpers.js`. */
+  displayName: string;
+  /**
+   * OMITTED when `cached === true`. Main delivers a module's source exactly
+   * once per run, so a diamond never re-clones up to a full cap's worth of text
+   * across the worker boundary.
+   */
+  source?: string;
+  /**
+   * True when main has already delivered this module's source in this run — in
+   * which case the worker is guaranteed to hold an entry for `moduleId`, and
+   * treats "cached but no entry" as `IncludeInternal`.
+   */
+  cached: boolean;
+}
+
 /** IPC frame sent from main → worker. */
 export type WorkerInbound =
-  | { kind: "load"; source: string; session: ScriptSessionMetadata }
+  | {
+      kind: "load";
+      source: string;
+      /** The entry script's own display name — its `//# sourceURL`, so its stack frames name the file. */
+      displayName: string;
+      session: ScriptSessionMetadata;
+    }
   | { kind: "rpc-result"; id: number; ok: true; value: unknown }
   | { kind: "rpc-result"; id: number; ok: false; error: { code: string; message: string; extra?: Record<string, unknown> } };
 
