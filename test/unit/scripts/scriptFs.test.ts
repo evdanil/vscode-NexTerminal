@@ -132,7 +132,14 @@ vi.mock("vscode", () => {
 });
 
 import * as vscode from "vscode";
-import { scriptFsExists, scriptFsReadText, buildScriptFsScope, boundedReadFile, type ScriptFsContext } from "../../../src/services/scripts/scriptFs";
+import {
+  scriptFsExists,
+  scriptFsReadText,
+  buildScriptFsScope,
+  boundedReadFile,
+  initialReadCapacity,
+  type ScriptFsContext
+} from "../../../src/services/scripts/scriptFs";
 
 const statSpy = vscode.workspace.fs.stat as unknown as ReturnType<typeof vi.fn>;
 const readFileSpy = vscode.workspace.fs.readFile as unknown as ReturnType<typeof vi.fn>;
@@ -311,17 +318,41 @@ describe("scriptFsReadText — size cap (non-file scheme, best-effort — P1)", 
   });
 });
 
+describe("initialReadCapacity — pure boundary matrix (P1: size-hint-driven allocation)", () => {
+  const MAX = 4 * 1024 * 1024;
+
+  it("clamps to [0, maxBytes] before adding 1, for the full boundary matrix", () => {
+    // ⊘ an implementation that always returns maxBytes + 1 regardless of the
+    // hint — every row below except the "at/over the cap" ones would then
+    // return the SAME (4 MiB + 1) value, which this table-driven assertion
+    // would catch immediately.
+    const cases: Array<[hint: number, expected: number]> = [
+      [0, 1], // empty file
+      [200, 201], // tiny honest file — the whole point of this fix
+      [MAX - 1, MAX], // just under the cap
+      [MAX, MAX + 1], // exactly at the cap
+      [MAX + 1, MAX + 1], // an honest stat already over the cap — clamped, not MAX+2
+      [MAX * 10, MAX + 1], // wildly over — still clamped to the cap, never more
+      [-1, 1], // a negative/hostile hint never allocates less than 1 byte
+      [-1000, 1]
+    ];
+    for (const [hint, expected] of cases) {
+      expect(initialReadCapacity(hint, MAX)).toBe(expected);
+    }
+  });
+});
+
 describe("boundedReadFile — direct unit coverage (P1)", () => {
-  it("returns exactly maxBytes for a file exactly at the boundary", async () => {
+  it("returns exactly maxBytes for a file exactly at the boundary (honest hint)", async () => {
     const { scriptDir } = await makeCtx();
     const filePath = path.join(scriptDir, "exact.bin");
     await fsp.writeFile(filePath, Buffer.alloc(4 * 1024 * 1024, "a"));
 
-    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024);
+    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024, 4 * 1024 * 1024);
     expect(bytes.byteLength).toBe(4 * 1024 * 1024);
   });
 
-  it("never returns more than maxBytes + 1 bytes, even for a file well over the cap", async () => {
+  it("never returns more than maxBytes + 1 bytes, even for a file well over the cap (honest hint)", async () => {
     // ⊘ a helper that reads the whole file (e.g. via fs.readFile) and slices
     // the result afterward — that would still allocate the FULL body before
     // truncating, defeating the entire point. The only way to reliably
@@ -331,19 +362,66 @@ describe("boundedReadFile — direct unit coverage (P1)", () => {
     const filePath = path.join(scriptDir, "huge.bin");
     await fsp.writeFile(filePath, Buffer.alloc(6 * 1024 * 1024, "b")); // well over the cap
 
-    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024);
+    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024, 6 * 1024 * 1024);
     expect(bytes.byteLength).toBe(4 * 1024 * 1024 + 1);
   });
 
-  it("returns the whole (short) file when it's under the cap, including empty files", async () => {
+  it("returns the whole (short) file when it's under the cap, including empty files (honest hints)", async () => {
     const { scriptDir } = await makeCtx();
     const short = path.join(scriptDir, "short.txt");
     await fsp.writeFile(short, "hello");
-    expect((await boundedReadFile(short, 4 * 1024 * 1024)).toString("utf8")).toBe("hello");
+    expect((await boundedReadFile(short, 4 * 1024 * 1024, 5)).toString("utf8")).toBe("hello");
 
     const empty = path.join(scriptDir, "empty.txt");
     await fsp.writeFile(empty, "");
-    expect((await boundedReadFile(empty, 4 * 1024 * 1024)).byteLength).toBe(0);
+    expect((await boundedReadFile(empty, 4 * 1024 * 1024, 0)).byteLength).toBe(0);
+  });
+
+  it("allocates from the size hint for a small honest file — NOT always the full 4 MiB cap", async () => {
+    // ⊘ preallocating maxBytes + 1 for every call regardless of the hint —
+    // `Promise.all(paths.map(nexus.fs.readText))` over a few hundred tiny
+    // files would then transiently allocate gigabytes.
+    const { scriptDir } = await makeCtx();
+    const filePath = path.join(scriptDir, "tiny.bin");
+    const content = Buffer.alloc(200, "x");
+    await fsp.writeFile(filePath, content);
+
+    const allocSpy = vi.spyOn(Buffer, "allocUnsafe");
+    try {
+      const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024, 200);
+      expect(bytes.byteLength).toBe(200);
+      expect(bytes.equals(content)).toBe(true);
+      expect(allocSpy).toHaveBeenCalledWith(201);
+      expect(allocSpy).not.toHaveBeenCalledWith(4 * 1024 * 1024 + 1);
+    } finally {
+      allocSpy.mockRestore();
+    }
+  });
+
+  it("grows ONCE when the hint under-reports an under-cap file — full content still returned, not truncated at the (wrong) hint", async () => {
+    // ⊘ a no-growth implementation, which would silently TRUNCATE the return
+    // value at the too-small hint instead of recovering — a script would get
+    // 4 bytes of a 10 KiB file back with no error at all.
+    const { scriptDir } = await makeCtx();
+    const filePath = path.join(scriptDir, "undercap-lied.bin");
+    const content = Buffer.alloc(10 * 1024, "y"); // 10 KiB, well under the 4 MiB cap
+    await fsp.writeFile(filePath, content);
+
+    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024, 4); // hint claims 4 bytes
+    expect(bytes.byteLength).toBe(10 * 1024);
+    expect(bytes.equals(content)).toBe(true);
+  });
+
+  it("grows ONCE when the hint under-reports an over-cap file — still correctly yields cap+1 bytes (the stat-lies/growth defense, untouched)", async () => {
+    // ⊘ a no-growth implementation, which would return only the (wrong,
+    // small) hint's worth of bytes — under the cap — and the caller would
+    // never see FileTooLarge at all for a file that genuinely exceeds it.
+    const { scriptDir } = await makeCtx();
+    const filePath = path.join(scriptDir, "overcap-lied.bin");
+    await fsp.writeFile(filePath, Buffer.alloc(6 * 1024 * 1024, "z")); // 6 MiB, over the cap
+
+    const bytes = await boundedReadFile(filePath, 4 * 1024 * 1024, 4); // hint claims 4 bytes
+    expect(bytes.byteLength).toBe(4 * 1024 * 1024 + 1);
   });
 });
 

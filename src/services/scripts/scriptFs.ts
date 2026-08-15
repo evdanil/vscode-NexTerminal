@@ -80,8 +80,25 @@ function hasBackslashOnNonFileScheme(requested: unknown, scheme: string): boolea
 }
 
 /**
- * Read at most `maxBytes + 1` bytes of `fsPath` into a single preallocated
- * buffer, regardless of the file's real size. Exported for direct unit tests.
+ * The buffer size `boundedReadFile` allocates up front, given a size hint
+ * (normally `stat.size`, but callers don't have to trust it) and the cap.
+ * Pure, exported for direct unit tests.
+ *
+ * Clamped to `[0, maxBytes]` before the `+ 1`: a negative or NaN hint (a
+ * hostile/buggy stat implementation) never allocates less than 1 byte, and a
+ * hint already over the cap (an HONEST large-file stat — the common shape
+ * once `readLocalFileBounded`'s own pre-read `stat.size > SCRIPT_FS_MAX_BYTES`
+ * check has already rejected anything bigger) still allocates only the cap
+ * itself, never more.
+ */
+export function initialReadCapacity(sizeHintBytes: number, maxBytes: number): number {
+  return Math.min(Math.max(sizeHintBytes, 0), maxBytes) + 1;
+}
+
+/**
+ * Read at most `maxBytes + 1` bytes of `fsPath`, allocating from `sizeHintBytes`
+ * (normally `stat.size`) rather than always preallocating the full cap.
+ * Exported for direct unit tests.
  *
  * WHY NOT `vscode.workspace.fs.readFile`: that API has no bounded-read
  * variant — it always materializes the entire file body in the extension
@@ -97,19 +114,45 @@ function hasBackslashOnNonFileScheme(requested: unknown, scheme: string): boolea
  * distinguish "the file is exactly at the cap" (`maxBytes` bytes back, legal)
  * from "the file is at least one byte over" (`maxBytes + 1` bytes back,
  * `FileTooLarge`) without a second syscall.
+ *
+ * WHY A SIZE HINT: always preallocating `maxBytes + 1` (4 MiB) regardless of
+ * the real file's size meant `Promise.all(paths.map(nexus.fs.readText))` over
+ * a few hundred tiny files transiently allocated gigabytes in the extension
+ * host — the exact hazard bounded reads exist to avoid, just moved from "one
+ * huge read" to "many small reads that add up huge". Sizing the INITIAL
+ * buffer from the hint keeps the common case (an honest, typically small,
+ * file) cheap. If the hint under-reported — the buffer fills completely
+ * without hitting EOF — that's the stat-lies/growth signal the post-read
+ * check exists for: grow ONCE to the full `maxBytes + 1` and keep reading, so
+ * the over-cap detection property is never lost. Total allocation across both
+ * buffers in that (rare) case is at most ~2× the cap, and only when the hint
+ * was wrong.
  */
-export async function boundedReadFile(fsPath: string, maxBytes: number): Promise<Buffer> {
-  const capacity = maxBytes + 1;
-  const buffer = Buffer.allocUnsafe(capacity);
+export async function boundedReadFile(fsPath: string, maxBytes: number, sizeHintBytes: number): Promise<Buffer> {
+  let capacity = initialReadCapacity(sizeHintBytes, maxBytes);
+  let buffer = Buffer.allocUnsafe(capacity);
   const handle = await nodeFs.open(fsPath, "r");
   try {
     let total = 0;
-    while (total < capacity) {
-      const { bytesRead } = await handle.read(buffer, total, capacity - total, null);
-      if (bytesRead === 0) break; // EOF
-      total += bytesRead;
+    let grownOnce = false;
+    for (;;) {
+      while (total < capacity) {
+        const { bytesRead } = await handle.read(buffer, total, capacity - total, null);
+        if (bytesRead === 0) return buffer.subarray(0, total); // EOF
+        total += bytesRead;
+      }
+      // Buffer filled completely without hitting EOF. If we're already at the
+      // full cap (or already grew once — never grow twice), that's the
+      // authoritative "at least maxBytes + 1 bytes" signal — stop here.
+      if (grownOnce || capacity >= maxBytes + 1) {
+        return buffer.subarray(0, total);
+      }
+      const grown = Buffer.allocUnsafe(maxBytes + 1);
+      buffer.copy(grown, 0, 0, total);
+      buffer = grown;
+      capacity = maxBytes + 1;
+      grownOnce = true;
     }
-    return buffer.subarray(0, total);
   } finally {
     await handle.close();
   }
@@ -280,7 +323,7 @@ async function readLocalFileBounded(fsPath: string, loggedPath: string, ctx: Scr
 
   let bytes: Buffer;
   try {
-    bytes = await boundedReadFile(fsPath, SCRIPT_FS_MAX_BYTES);
+    bytes = await boundedReadFile(fsPath, SCRIPT_FS_MAX_BYTES, stat.size);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
