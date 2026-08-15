@@ -109,9 +109,9 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
     expect(fsState.files.has("/globalStorage/scripts/types/nexus-scripts.d.ts")).toBe(true);
   });
 
-  it("v4 → v5 (nexus.fs 30s deadline): a workspace holding the OLD real v4 header is rewritten to the new bundled content on the next run", async () => {
-    // ⊘ shipping new d.ts content (adding nexus.fs / NexusApi in v4, then
-    // documenting the fixed 30-second nexus.fs deadline in v5) without bumping
+  it("v5 → v6 (configurable nexus.fs read cap): a workspace holding the OLD real v5 header is rewritten to the new bundled content on the next run", async () => {
+    // ⊘ shipping new d.ts content (adding nexus.fs / NexusApi in v4, the fixed
+    // 30-second deadline in v5, then the configurable read cap in v6) without bumping
     // BUNDLED_DTS_VERSION_HEADER to match — existing users' seeded copies
     // would keep comparing equal to the (un-bumped) constant and never get
     // rewritten, so the new content would silently never reach their
@@ -124,16 +124,16 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
     fsState.files.set(
       "/workspace/.nexus/scripts/types/nexus-scripts.d.ts",
       new TextEncoder().encode(
-        "// Nexus Scripts API types — v4\ndeclare function expect(x: unknown): Promise<unknown>;\n"
+        "// Nexus Scripts API types — v5\ndeclare function expect(x: unknown): Promise<unknown>;\n"
       )
     );
     fsState.files.set("/workspace/.nexus/scripts/jsconfig.json", new TextEncoder().encode(BUNDLED_JSCONFIG));
 
-    expect(BUNDLED_DTS_VERSION_HEADER).toBe("// Nexus Scripts API types — v5");
+    expect(BUNDLED_DTS_VERSION_HEADER).toBe("// Nexus Scripts API types — v6");
     await ensureWorkspaceScriptTypes(scriptsDir("/workspace/.nexus/scripts"), getAssets);
 
     const dts = new TextDecoder().decode(fsState.files.get("/workspace/.nexus/scripts/types/nexus-scripts.d.ts")!);
     expect(dts).toBe(BUNDLED_DTS);
-    expect(dts.startsWith("// Nexus Scripts API types — v5")).toBe(true);
+    expect(dts.startsWith("// Nexus Scripts API types — v6")).toBe(true);
   });
 });

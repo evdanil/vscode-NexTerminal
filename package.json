@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.183",
+  "version": "2.8.184",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -3760,6 +3760,14 @@
           "maximum": 2147483647,
           "order": 24,
           "markdownDescription": "Legacy maximum total runtime for a script in milliseconds. Prefer `nexus.scripts.maxRuntimeSeconds`. 0 disables the cap."
+        },
+        "nexus.scripts.maxReadSizeMb": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 16,
+          "order": 25,
+          "markdownDescription": "Maximum size in MiB of a file a script may read through `nexus.fs.readText` / `nexus.fs.readJson`. Larger files are refused with `FileTooLarge`. Fractional values (e.g. `2.5`) are accepted via `settings.json`. The value is snapshotted when a script run starts — changing it does not affect scripts that are already running."
         },
         "nexus.settingsGuard.enabled": {
           "type": "boolean",

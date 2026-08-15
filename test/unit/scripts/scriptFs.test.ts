@@ -152,6 +152,7 @@ import {
   type ScriptFsContext
 } from "../../../src/services/scripts/scriptFs";
 import { createSemaphore, type ReadSlotScheduler } from "../../../src/services/scripts/readSlotScheduler";
+import { SCRIPT_FS_DEFAULT_MAX_BYTES } from "../../../src/services/scripts/maxReadSize";
 
 const statSpy = vscode.workspace.fs.stat as unknown as ReturnType<typeof vi.fn>;
 const readFileSpy = vscode.workspace.fs.readFile as unknown as ReturnType<typeof vi.fn>;
@@ -215,7 +216,16 @@ function fileUri(p: string): vscode.Uri {
   return vscode.Uri.file(p) as vscode.Uri;
 }
 
-/** Standard scope: scriptDir = <root>/cisco, one level under scriptsRoot = <root>. */
+/**
+ * Standard scope: scriptDir = <root>/cisco, one level under scriptsRoot = <root>.
+ *
+ * `maxBytes` defaults to `SCRIPT_FS_DEFAULT_MAX_BYTES` so every pre-existing
+ * test keeps asserting against exactly the cap it was written for; tests that
+ * care about a NON-default cap pass `{ maxBytes }` through `overrides` (which
+ * is also the only way a context can be built — the field is REQUIRED on
+ * `ScriptFsContext`, so no call site can inherit `undefined` and end up
+ * comparing file sizes against NaN).
+ */
 async function makeCtx(overrides?: Partial<ScriptFsContext>): Promise<{ ctx: ScriptFsContext; root: string; scriptDir: string; log: ReturnType<typeof vi.fn> }> {
   const root = tmpRoot;
   const scriptDir = path.join(root, "cisco");
@@ -226,6 +236,7 @@ async function makeCtx(overrides?: Partial<ScriptFsContext>): Promise<{ ctx: Scr
     scriptDirUri: fileUri(scriptDir),
     scriptsRootUri: fileUri(root),
     log,
+    maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
     isAborted: () => false,
     ...overrides
   };
@@ -425,6 +436,7 @@ describe("scriptFsReadText — size cap (non-file scheme, best-effort — P1)", 
       scriptDirUri: remoteUri(authority, scriptDirPath),
       scriptsRootUri: undefined,
       log: vi.fn(),
+      maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
       isAborted: () => false
     };
 
@@ -433,6 +445,146 @@ describe("scriptFsReadText — size cap (non-file scheme, best-effort — P1)", 
     // WAS read here — that's the point: stat lied, so only the post-read
     // check (the only one available for this scheme) catches it.
     expect(readFileSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The cap is now the RUN'S (`ctx.maxBytes`, snapshotted from
+ * `nexus.scripts.maxReadSizeMb` when the script started), not a module
+ * constant. Every one of these uses a cap that is deliberately NOT 4 MiB, so
+ * any use site left on the old constant shows up as a behavior difference —
+ * a read that should succeed rejecting, a read that should reject succeeding,
+ * a wrong number in the error payload, or a silently truncated body.
+ */
+describe("scriptFsReadText — the cap comes from ctx.maxBytes", () => {
+  const MiB = 1024 * 1024;
+
+  it("reads a 5 MiB file when the run's cap is 8 MiB — a file the old fixed 4 MiB cap would have refused", async () => {
+    // ⊘ the pre-read `stat.size >` check left on the 4 MiB constant: this
+    // read would then be refused with FileTooLarge.
+    const { ctx, scriptDir } = await makeCtx({ maxBytes: 8 * MiB });
+    await fsp.writeFile(path.join(scriptDir, "five.bin"), Buffer.alloc(5 * MiB, "a"));
+
+    const text = await scriptFsReadText("five.bin", ctx);
+    expect(text.length).toBe(5 * MiB);
+  });
+
+  it("refuses a 9 MiB file at an 8 MiB cap, quoting the EFFECTIVE cap in both the payload and the message", async () => {
+    // ⊘ a hardcoded 4 MiB in the FileTooLarge message or in its `maxBytes`
+    // extra: a script that catches this error and reports `err.maxBytes` (the
+    // documented, d.ts-declared field) would tell the user to shrink a file
+    // below a limit that is not the one being enforced.
+    const { ctx, scriptDir } = await makeCtx({ maxBytes: 8 * MiB });
+    await fsp.writeFile(path.join(scriptDir, "nine.bin"), Buffer.alloc(9 * MiB, "a"));
+
+    const err = await scriptFsReadText("nine.bin", ctx).then(
+      () => undefined,
+      (e: Error & { code?: string; sizeBytes?: number; maxBytes?: number }) => e
+    );
+    expect(err).toMatchObject({ code: "FileTooLarge", sizeBytes: 9 * MiB, maxBytes: 8 * MiB });
+    expect(err?.message).toContain(`${8 * MiB}-byte limit`);
+    expect(err?.message).not.toContain(`${4 * MiB}-byte limit`);
+  });
+
+  it("refuses a 3 MiB file at a 2 MiB cap — a cap SMALLER than the old constant is enforced too, before any open()", async () => {
+    // ⊘ the pre-read `stat.size >` check left on the 4 MiB constant: a 3 MiB
+    // file is under 4 MiB, so the read would succeed and hand the script a
+    // body larger than its run was configured to allow.
+    const { ctx, scriptDir } = await makeCtx({ maxBytes: 2 * MiB });
+    await fsp.writeFile(path.join(scriptDir, "three.bin"), Buffer.alloc(3 * MiB, "a"));
+
+    await expect(scriptFsReadText("three.bin", ctx)).rejects.toMatchObject({
+      code: "FileTooLarge",
+      sizeBytes: 3 * MiB,
+      maxBytes: 2 * MiB
+    });
+    expect(nodeOpenSpy).not.toHaveBeenCalled();
+  });
+
+  it("reports the over-cap sentinel as EFFECTIVE cap + 1 when stat lied, not the default cap + 1", async () => {
+    // ⊘ the post-read floor computed from the 4 MiB default
+    // (a leftover `4 * 1024 * 1024 + 1`): a script reading `err.sizeBytes` would be
+    // told the file is at least 4 MiB + 1 when all that was established is
+    // that it exceeds the run's own 2 MiB cap.
+    const { ctx, scriptDir } = await makeCtx({ maxBytes: 2 * MiB });
+    const filePath = path.join(scriptDir, "lies-small.bin");
+    await fsp.writeFile(filePath, Buffer.alloc(3 * MiB, "a")); // really 3 MiB
+    nodeStatSpy.mockImplementationOnce(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 10 }) as unknown as import("node:fs").Stats
+    );
+
+    await expect(scriptFsReadText("lies-small.bin", ctx)).rejects.toMatchObject({
+      code: "FileTooLarge",
+      sizeBytes: 2 * MiB + 1,
+      maxBytes: 2 * MiB
+    });
+  });
+
+  it("grows the read buffer to the EFFECTIVE cap, so a lying stat under a LARGER cap does not silently truncate", async () => {
+    // ⊘ `boundedReadFile(..., 4 * 1024 * 1024, ...)` — the grow step left
+    // on the 4 MiB default while the checks use ctx.maxBytes. The one-shot
+    // grow would stop at 4 MiB + 1 bytes, and 4 MiB + 1 is UNDER this run's
+    // 8 MiB cap, so the post-read check would pass and the script would
+    // silently receive a truncated 4 MiB prefix of a 5 MiB file with no error
+    // at all. (The "reject at 2 MiB" test above cannot catch this: both the
+    // right and the wrong grow target end up rejecting there.)
+    const { ctx, scriptDir } = await makeCtx({ maxBytes: 8 * MiB });
+    const filePath = path.join(scriptDir, "lies-big.bin");
+    await fsp.writeFile(filePath, Buffer.alloc(5 * MiB, "a")); // really 5 MiB
+    nodeStatSpy.mockImplementationOnce(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 10 }) as unknown as import("node:fs").Stats
+    );
+
+    const text = await scriptFsReadText("lies-big.bin", ctx);
+    expect(text.length).toBe(5 * MiB);
+  });
+
+  it("remote scheme: the PRE-read stat check uses the run's cap (3 MiB refused at a 2 MiB cap, body never fetched)", async () => {
+    // ⊘ the remote pre-read check left on the 4 MiB constant — the 3 MiB body
+    // would be pulled into the extension host and handed to the script.
+    const authority = "wsl+ubuntu";
+    const scriptDirPath = "/home/u/scripts/cisco";
+    remoteFiles.set(`${scriptDirPath}/three.bin`, { content: new Uint8Array(3 * MiB).fill(97) });
+
+    const ctx: ScriptFsContext = {
+      scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
+      scriptDirUri: remoteUri(authority, scriptDirPath),
+      scriptsRootUri: undefined,
+      log: vi.fn(),
+      maxBytes: 2 * MiB,
+      isAborted: () => false
+    };
+
+    await expect(scriptFsReadText("three.bin", ctx)).rejects.toMatchObject({
+      code: "FileTooLarge",
+      sizeBytes: 3 * MiB,
+      maxBytes: 2 * MiB
+    });
+    expect(readFileSpy).not.toHaveBeenCalled();
+  });
+
+  it("remote scheme: the POST-read length check uses the run's cap (a lying stat over a 5 MiB body succeeds at an 8 MiB cap)", async () => {
+    // ⊘ the remote post-read `bytes.byteLength >` check left on the 4 MiB
+    // constant: the body is legal for this run (5 MiB ≤ 8 MiB) and would be
+    // rejected as FileTooLarge anyway.
+    const authority = "wsl+ubuntu";
+    const scriptDirPath = "/home/u/scripts/cisco";
+    remoteFiles.set(`${scriptDirPath}/lies.bin`, { content: new Uint8Array(5 * MiB).fill(97) });
+    // Stat under-reports, so the pre-read check cannot be what admits this —
+    // only the post-read check decides, which is exactly the site under test.
+    statSpy.mockImplementationOnce(async () => ({ type: FileType.File, ctime: 0, mtime: 0, size: 0 }));
+
+    const ctx: ScriptFsContext = {
+      scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
+      scriptDirUri: remoteUri(authority, scriptDirPath),
+      scriptsRootUri: undefined,
+      log: vi.fn(),
+      maxBytes: 8 * MiB,
+      isAborted: () => false
+    };
+
+    const text = await scriptFsReadText("lies.bin", ctx);
+    expect(text.length).toBe(5 * MiB);
   });
 });
 
@@ -965,6 +1117,7 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
       scriptDirUri: remoteUri(authority, scriptDirPath),
       scriptsRootUri: undefined,
       log: vi.fn(),
+      maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
       isAborted: () => false
     };
 
@@ -2017,6 +2170,7 @@ describe("scriptFsReadText — real symlink follow (decision 3)", () => {
         scriptDirUri: fileUri(scriptDir),
         scriptsRootUri: fileUri(path.join(root, "scripts")),
         log: vi.fn(),
+        maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
         isAborted: () => false
       };
 
@@ -2740,6 +2894,7 @@ describe("remote (non-file) scheme — backslash traversal guard", () => {
       scriptDirUri: remoteUri("wsl+ubuntu", "/home/u/scripts/cisco"),
       scriptsRootUri: undefined,
       log: vi.fn(),
+      maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
       isAborted: () => false
     };
 
@@ -2777,6 +2932,7 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
       scriptDirUri: remoteUri(authority, scriptDirPath),
       scriptsRootUri: undefined,
       log: vi.fn(),
+      maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
       isAborted: () => false
     };
 
@@ -2794,6 +2950,7 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
       scriptDirUri: remoteUri(authority, scriptDirPath),
       scriptsRootUri: undefined,
       log: vi.fn(),
+      maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
       isAborted: () => false
     };
 
@@ -2854,6 +3011,7 @@ describe("scriptFsReadText — end-to-end with a correctly-rebased remote script
       // share one remote host), rebased onto the configured absolute path.
       scriptsRootUri: remoteUri(authority, scriptsRootPath),
       log: vi.fn(),
+      maxBytes: SCRIPT_FS_DEFAULT_MAX_BYTES,
       isAborted: () => false
     };
 

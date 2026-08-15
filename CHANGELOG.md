@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.184] — 2026-08-15
+
+### Added
+
+- **The `nexus.fs` read limit is now a setting: `nexus.scripts.maxReadSizeMb`.** Reads through `nexus.fs.readText` / `nexus.fs.readJson` were capped at a fixed 4 MiB; that is now the default of a setting you can move anywhere between 1 and 16 MiB. The value is snapshotted when a script run starts, so changing it never moves the limit under a script that is already running, an out-of-range value is clamped to the nearest bound, and a non-numeric, zero, or negative value falls back to 4 MiB rather than leaving reads uncapped or capped at zero. `FileTooLarge` errors now report the cap that was actually enforced — `err.maxBytes` and the error message quote the run's own effective cap, not a hardcoded 4 MiB. Bundled IntelliSense type definitions are now v6; workspaces still holding a v5 copy are rewritten on the next script command.
+
 ## [2.8.183] — 2026-08-15
 
 ### Added
