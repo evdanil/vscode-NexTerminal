@@ -240,13 +240,30 @@ export async function scriptIncludeLoad(
   const known = state.byKey.get(cacheKey);
   if (known) return cachedResult(ctx, label, known);
   const inFlight = state.pending.get(cacheKey);
-  if (inFlight) return cachedResult(ctx, label, await inFlight);
+  if (inFlight) {
+    try {
+      return cachedResult(ctx, label, await inFlight);
+    } catch (err) {
+      // The starter's ladder logged the refusal for ITS request; this joiner's
+      // request is a distinct call and the invariant above ("every refusal
+      // writes its audit line before it throws") owes it a line of its own.
+      ctx.log(`include ${label} → ${(err as { code?: string })?.code ?? "Error"}`);
+      throw err;
+    }
+  }
 
-  // 8. Distinct-module cap, checked BEFORE the read.
-  if (state.byKey.size - 1 >= SCRIPT_INCLUDE_MAX_MODULES) {
+  // 8. Distinct-module cap, checked BEFORE the read. Counts COMMITTED modules:
+  //    registered ones (byKey, minus #root) plus loads still in flight
+  //    (pending — each is a reservation that will register on success and is
+  //    deleted in the starter's `finally` on refusal). Counting only byKey
+  //    would let a single-tick `Promise.all` fan-out pass this check 80 times
+  //    while byKey is still empty — steps 1-8 are synchronous, registration
+  //    happens after the async read — and load every one of them.
+  const committed = state.byKey.size - 1 + state.pending.size;
+  if (committed >= SCRIPT_INCLUDE_MAX_MODULES) {
     throw failInclude(ctx, label, "IncludeLimitExceeded", `${SCRIPT_INCLUDE_MAX_MODULES} modules`, {
       message: `This run has already loaded ${SCRIPT_INCLUDE_MAX_MODULES} modules, the maximum.`,
-      extra: { count: SCRIPT_INCLUDE_MAX_MODULES, maxModules: SCRIPT_INCLUDE_MAX_MODULES }
+      extra: { count: committed, maxModules: SCRIPT_INCLUDE_MAX_MODULES }
     });
   }
 
@@ -399,7 +416,13 @@ function baseNameOf(p: string, platform: ScriptFsPlatform): string {
  * propagating an `undefined` into `path.resolve` — a Uri-like object that
  * populated only one of the two (every test double in this repo, and any host
  * that hands us a plain object) must not be able to make run start throw. The
- * empty string degrades exactly one thing: the entry script's display label.
+ * empty string degrades two things: the entry script's display label, and —
+ * because `#root.cacheKey` derives from it — cycle detection for a module that
+ * resolves back to the entry script itself (it would load as a second module
+ * instead of raising `CircularInclude`). Both are unreachable with a real
+ * `vscode.Uri`, which always populates `.path` AND `.fsPath`; only degenerate
+ * Uri-likes land here, and for those there is no path to resolve against
+ * anyway.
  */
 function pathOfUri(uri: ScriptFsContext["scriptUri"]): string {
   const primary = uri.scheme === "file" ? uri.fsPath : uri.path;

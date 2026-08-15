@@ -391,6 +391,38 @@ describe("scriptIncludeLoad — distinct-module cap", () => {
     expect(nodeOpenSpy.mock.calls.length).toBe(opensBefore);
     expect(lines()).toContain(`include ./lib/m64.js → IncludeLimitExceeded (64 modules)`);
   });
+
+  it("the cap holds against a concurrent fan-out: one Promise.allSettled of 80 distinct includes commits exactly 64 modules", async () => {
+    // ⊘ a cap counted only against REGISTERED modules (state.byKey). Steps 1-8
+    // of the ladder are synchronous while registration happens after the async
+    // read — so every include fired in one tick sees byKey.size === 1 and
+    // passes, and `Promise.all(files.map(f => nexus.include(f)))` (an ordinary
+    // thing an automation author writes) loads all 80. The check must count
+    // in-flight loads (state.pending) as committed too.
+    const { ctx, state, root } = await makeFixture();
+    const total = SCRIPT_INCLUDE_MAX_MODULES + 16;
+    for (let i = 0; i < total; i++) {
+      await fsp.writeFile(path.join(root, "lib", `c${i}.js`), `exports.m = ${i};`);
+    }
+
+    const settled = await Promise.allSettled(
+      Array.from({ length: total }, (_, i) =>
+        scriptIncludeLoad(`./lib/c${i}.js`, [SCRIPT_INCLUDE_ROOT_ID], ctx, state)
+      )
+    );
+
+    const fulfilled = settled.filter((s) => s.status === "fulfilled").length;
+    const refused = settled.filter(
+      (s): s is PromiseRejectedResult => s.status === "rejected"
+    );
+    expect(fulfilled).toBe(SCRIPT_INCLUDE_MAX_MODULES);
+    expect(refused.length).toBe(total - SCRIPT_INCLUDE_MAX_MODULES);
+    for (const r of refused) {
+      expect((r.reason as { code?: string }).code).toBe("IncludeLimitExceeded");
+    }
+    // The ledger agrees: exactly 64 modules minted (byId also holds #root).
+    expect(state.byId.size - 1).toBe(SCRIPT_INCLUDE_MAX_MODULES);
+  });
 });
 
 describe("scriptIncludeLoad — what may be included", () => {
@@ -449,6 +481,24 @@ describe("scriptIncludeLoad — what may be included", () => {
     expect(second.code).toBe("IncludeIsScript");
     expect(nodeOpenSpy.mock.calls.length).toBeGreaterThan(opensAfterFirst);
     expect(state.byId.size).toBe(1); // #root only
+  });
+
+  it("a concurrent caller that joins a load which is then refused logs its own refusal line", async () => {
+    // ⊘ rethrowing the starter's error from the join path without logging.
+    // The file's invariant is "EVERY refusal writes its audit line before it
+    // throws" — a joiner's request is a distinct call and the Output Channel
+    // must record both, even though only the starter ran the ladder.
+    const { ctx, state, root, lines } = await makeFixture();
+    await fsp.writeFile(path.join(root, "lib", "script.js"), "/**\n * @nexus-script\n */\n");
+
+    const [first, second] = await Promise.allSettled([
+      scriptIncludeLoad("./lib/script.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state),
+      scriptIncludeLoad("./lib/script.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state)
+    ]);
+    expect(first.status).toBe("rejected");
+    expect(second.status).toBe("rejected");
+    const refusalLines = lines().filter((l) => l.includes("include ./lib/script.js → IncludeIsScript"));
+    expect(refusalLines.length).toBe(2);
   });
 });
 
@@ -525,10 +575,14 @@ describe("scriptIncludeLoad — inherited nexus.fs behaviour", () => {
     expect(err.code).toBe("NotUtf8");
   });
 
-  it("a missing module throws FileNotFound", async () => {
-    const { ctx, state } = await makeFixture();
+  it("a missing module throws FileNotFound, filed under the include verb", async () => {
+    const { ctx, state, lines } = await makeFixture();
     const err = await expectRejection(scriptIncludeLoad("./lib/gone.js", [SCRIPT_INCLUDE_ROOT_ID], ctx, state));
     expect(err.code).toBe("FileNotFound");
+    // ⊘ the inherited post-resolution refusal path regressing to the
+    // `fs.readText` verb — the author wrote nexus.include, not nexus.fs.
+    expect(lines().some((l) => l.startsWith("include ") && l.includes("FileNotFound"))).toBe(true);
+    expect(lines().some((l) => l.includes("fs.readText"))).toBe(false);
   });
 });
 
