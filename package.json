@@ -3767,7 +3767,7 @@
           "minimum": 1,
           "maximum": 16,
           "order": 25,
-          "markdownDescription": "Maximum size in MiB of a file a script may read through `nexus.fs.readText` / `nexus.fs.readJson` (and the target `nexus.fs.exists` probes). Larger files are refused with `FileTooLarge`. The value is snapshotted when a script run starts — changing it does not affect scripts that are already running."
+          "markdownDescription": "Maximum size in MiB of a file a script may read through `nexus.fs.readText` / `nexus.fs.readJson`. Larger files are refused with `FileTooLarge`. Fractional values (e.g. `2.5`) are accepted via `settings.json`. The value is snapshotted when a script run starts — changing it does not affect scripts that are already running."
         },
         "nexus.settingsGuard.enabled": {
           "type": "boolean",

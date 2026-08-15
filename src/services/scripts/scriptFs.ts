@@ -7,9 +7,12 @@ import type { ScriptFsErrorCode } from "./scriptTypes";
 /**
  * How many `nexus.fs.readText` calls may have a file body in memory at once,
  * across every running script. Bounds the HOST-side (extension-host) transient
- * allocation at ~`SCRIPT_FS_MAX_CONCURRENT_READS × ctx.maxBytes` (~64 MiB at
- * the `SCRIPT_FS_MAX_BYTES_CEILING` a run may be configured with, ~16 MiB at
- * the default cap) no matter how many scripts are running or how many
+ * allocation at ~`SCRIPT_FS_MAX_CONCURRENT_READS × SCRIPT_FS_MAX_BYTES_CEILING`
+ * (64 MiB; 16 MiB at the default 4 MiB cap). Quoted against the CEILING, not
+ * `ctx.maxBytes`: the cap is snapshotted per run while this pool is
+ * host-global, so the only figure that holds across a mix of runs with
+ * different snapshots is the ceiling (see `maxReadSize.ts`). Holds no matter
+ * how many scripts are running or how many
  * `Promise.all(paths.map(nexus.fs.readText))` calls they issue: the size hint
  * `initialReadCapacity` derives only bounds the allocation of a SINGLE read —
  * concurrent reads of files whose honest sizes are each near the cap still

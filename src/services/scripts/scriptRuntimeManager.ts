@@ -212,13 +212,12 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     }
     const pty = target.session.pty;
 
-    const defaultTimeoutMs =
-      header.defaultTimeoutMs ??
-      resolveScriptDefaultTimeoutMs(vscode.workspace.getConfiguration("nexus.scripts"));
+    const scriptsConfig = vscode.workspace.getConfiguration("nexus.scripts");
+    const defaultTimeoutMs = header.defaultTimeoutMs ?? resolveScriptDefaultTimeoutMs(scriptsConfig);
     // Snapshotted here, exactly once, for the reason `defaultTimeoutMs` and
     // `scriptsRootUri` are (decision 6): every nexus.fs call this run makes is
     // measured against the cap that was configured when it started.
-    const maxReadBytes = resolveScriptMaxReadBytes(vscode.workspace.getConfiguration("nexus.scripts"));
+    const maxReadBytes = resolveScriptMaxReadBytes(scriptsConfig);
 
     const record: RunningScriptRecord = {
       id: randomUUID(),

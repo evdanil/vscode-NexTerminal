@@ -12,12 +12,17 @@ export const SCRIPT_FS_MAX_BYTES_FLOOR = 1 * 1024 * 1024; // 1 MiB
  *
  * WHY 16 MiB AND NOT MORE: the `nexus.fs` read pools bound host-side transient
  * read buffers at `SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS`
- * (4 concurrent + 8 orphaned = 12) buffers of up to one cap each — so the
- * extension-host worst case is 12 × cap. At this ceiling that is 192 MiB,
- * deliberately equal to the script worker's own `maxOldGenerationSizeMb: 192`
+ * (4 concurrent + 8 orphaned = 12) buffers of up to one cap each in steady
+ * state — 12 × cap, which at this ceiling is 192 MiB, deliberately equal to
+ * the script worker's own `maxOldGenerationSizeMb: 192`
  * (`scriptRuntimeManager.ts`): the host is not asked to risk more transient
  * memory for a script's reads than the script's own isolate is allowed to hold
- * in total.
+ * in total. Two honest caveats on that anchor (it is an anchor, not a
+ * guarantee): a read whose stat hint under-reported holds ~2× its cap
+ * transiently while it grows once (see `boundedReadFile`), so the true peak
+ * can briefly exceed 12 × cap; and every delivered read additionally lands in
+ * the worker as a UTF-16 string (~2× its byte size), inside — and counted
+ * against — the worker's own 192 MiB heap.
  *
  * WHY THE BOUND IS QUOTED AGAINST THE RANGE MAXIMUM RATHER THAN THE EFFECTIVE
  * CAP: both read pools are HOST-GLOBAL — one instance shared by every running
