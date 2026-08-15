@@ -144,6 +144,7 @@ import {
   initialReadCapacity,
   createSemaphore,
   SCRIPT_FS_MAX_CONCURRENT_READS,
+  SCRIPT_FS_READ_TIMEOUT_MS,
   type ScriptFsContext
 } from "../../../src/services/scripts/scriptFs";
 
@@ -694,6 +695,221 @@ describe("scriptFsReadText — aborting the run drains its queued reads off the 
     statSpy.mockClear();
     await expect(scriptFsExists("already-dead.txt", deadCtx)).rejects.toMatchObject({ code: "Stopped" });
     expect(statSpy).not.toHaveBeenCalled();
+  });
+
+  it("the OR'd predicate (round 10, P2 — the stopScript grace-race window): a queued read granted a permit while ONLY a stop has been requested (cleanedUp still false) is rejected Stopped and never opens the file", async () => {
+    // ⊘ `isAborted` wired to `record.cleanedUp` ALONE (dropping the
+    // `|| record.stopReason !== undefined` half added in round 10). In the
+    // real `stopScript`, `record.stopReason` is set SYNCHRONOUSLY at the very
+    // top — before the up-to-100ms `worker.terminate()` grace race — while
+    // `record.cleanedUp` only flips once `cleanupRun` runs, AFTER that race
+    // settles. A read that was already queued on the semaphore and gets
+    // GRANTED a permit during that window would, under the cleanedUp-only
+    // predicate, see isAborted() === false (cleanedUp hasn't flipped yet) and
+    // wrongly proceed to open() and succeed — exactly the starvation-adjacent
+    // hazard this fix closes. `cleanedUp` and `stopRequested` here stand in
+    // for the two real record fields, OR'd exactly as fsContextFor OR's them.
+    const { ctx, scriptDir } = await makeCtx();
+    const n = SCRIPT_FS_MAX_CONCURRENT_READS + 1; // exactly one call ends up genuinely queued
+    for (let i = 0; i < n; i++) {
+      await fsp.writeFile(path.join(scriptDir, `w${i}.txt`), `content-${i}`);
+    }
+
+    let cleanedUp = false;
+    let stopRequested = false;
+    const windowCtx: ScriptFsContext = { ...ctx, isAborted: () => cleanedUp || stopRequested };
+
+    const openWaiters: Array<() => void> = [];
+    nodeOpenSpy.mockImplementation(async (...args: Parameters<typeof realNodeOpen>) => {
+      await new Promise<void>((resolve) => openWaiters.push(resolve));
+      return realNodeOpen(...args);
+    });
+
+    try {
+      const promises = Array.from({ length: n }, (_, i) => scriptFsReadText(`w${i}.txt`, windowCtx));
+
+      // Fill the pool — the (n)th call is the one genuinely queued on the semaphore.
+      await waitFor(() => nodeOpenSpy.mock.calls.length >= SCRIPT_FS_MAX_CONCURRENT_READS);
+      expect(nodeOpenSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
+      expect(openWaiters).toHaveLength(SCRIPT_FS_MAX_CONCURRENT_READS);
+
+      // Simulate the P2 window: a stop has been REQUESTED, but cleanup hasn't
+      // run — `cleanedUp` is still false.
+      stopRequested = true;
+      expect(cleanedUp).toBe(false);
+
+      // Let the in-flight opens finish. As soon as the first one releases its
+      // slot, the queued (n)th read is admitted — DURING the window, with
+      // `cleanedUp` still false.
+      openWaiters.forEach((resolve) => resolve());
+
+      const results = await Promise.all(promises.map((p) => p.catch((e: unknown) => e)));
+      const succeeded = results.filter((r) => typeof r === "string");
+      const stopped = results.filter((r): r is Error & { code?: string } => r instanceof Error);
+      expect(succeeded).toHaveLength(SCRIPT_FS_MAX_CONCURRENT_READS);
+      expect(stopped).toHaveLength(1);
+      expect(stopped[0].code).toBe("Stopped");
+
+      // The discriminator: open() was never called for the queued read — the
+      // count stays exactly at SCRIPT_FS_MAX_CONCURRENT_READS, never reaching n.
+      expect(nodeOpenSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+    }
+  }, 10_000);
+});
+
+describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call must not pin its semaphore slot forever)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("file: branch — a stalled open() call times out after SCRIPT_FS_READ_TIMEOUT_MS and releases its permit: with the pool fully saturated by stalls, a queued fresh read is admitted only once the deadline fires", async () => {
+    // ⊘ no deadline race at all (scriptFsReadText just `await`s the read
+    // directly) — none of the SCRIPT_FS_MAX_CONCURRENT_READS stalled calls
+    // below would ever settle, their `finally` would never run, their
+    // permits would never release, and the queued fresh read would then wait
+    // forever too — this test would time out entirely rather than pass.
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `stall${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "healthy.txt"), "ok");
+
+    vi.useFakeTimers();
+    try {
+      // Chained `mockImplementationOnce` (self-cleaning — never touches the
+      // shared default) rather than a persistent `mockImplementation`: stat
+      // stays fully in-memory here (real disk stat, under fake timers, isn't
+      // guaranteed to settle within a single microtask flush — this keeps the
+      // test's timing entirely deterministic), and open() hangs for exactly
+      // the SCRIPT_FS_MAX_CONCURRENT_READS stalled calls.
+      const fakeStat = async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats;
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS + 1; i++) {
+        nodeStatSpy.mockImplementationOnce(fakeStat);
+      }
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+        nodeOpenSpy.mockImplementationOnce(() => new Promise(() => {}));
+      }
+
+      const stalledPromises = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
+        scriptFsReadText(`stall${i}.txt`, ctx)
+      );
+      // Attach rejection handlers immediately — before any timer advances —
+      // so the eventual timeout rejections are never briefly "unhandled".
+      const stalledSettled = Promise.allSettled(stalledPromises);
+
+      // Flush microtasks (stat resolves, each reaches the hung open() call and
+      // registers its own deadline timer) without advancing virtual time.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
+
+      // The pool is now fully saturated by stalls — this read queues on the
+      // semaphore. Once admitted (after a stall's deadline frees a slot), it
+      // should use the REAL open() and succeed quickly.
+      nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
+      const freshPromise = scriptFsReadText("healthy.txt", ctx);
+
+      // Advance to the deadline: all SCRIPT_FS_MAX_CONCURRENT_READS stalled
+      // reads time out and release their permits.
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      const results = await stalledSettled;
+      for (const r of results) {
+        expect(r.status).toBe("rejected");
+        expect((r as PromiseRejectedResult).reason).toMatchObject({
+          code: "ReadFailed",
+          message: expect.stringContaining("timed out")
+        });
+      }
+
+      // Pool-exhaustion discriminator: with a permit freed, the queued fresh
+      // read is admitted and completes — it was never stuck behind the
+      // orphaned (still "running" but detached) stalled I/O.
+      await expect(freshPromise).resolves.toBe("ok");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
+  it("non-file (remote) branch — a stalled workspace.fs.readFile call times out after SCRIPT_FS_READ_TIMEOUT_MS and releases its permit: a subsequent healthy read is not stuck behind it", async () => {
+    // ⊘ same as above, on the non-file branch specifically — proves the race
+    // wraps BOTH branches' I/O, not just the file: one.
+    const authority = "wsl+ubuntu";
+    const scriptDirPath = "/home/u/scripts/cisco";
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      remoteFiles.set(`${scriptDirPath}/stall${i}.txt`, { content: new TextEncoder().encode("x") });
+    }
+    remoteFiles.set(`${scriptDirPath}/healthy.txt`, { content: new TextEncoder().encode("ok") });
+
+    const ctx: ScriptFsContext = {
+      scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
+      scriptDirUri: remoteUri(authority, scriptDirPath),
+      scriptsRootUri: undefined,
+      log: vi.fn(),
+      isAborted: () => false
+    };
+
+    vi.useFakeTimers();
+    try {
+      // Chained `mockImplementationOnce` — self-cleaning, never touches the
+      // shared default readFile implementation other tests depend on.
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+        readFileSpy.mockImplementationOnce(() => new Promise(() => {}));
+      }
+
+      const stalledPromises = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
+        scriptFsReadText(`stall${i}.txt`, ctx)
+      );
+      const stalledSettled = Promise.allSettled(stalledPromises);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readFileSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
+
+      readFileSpy.mockImplementationOnce(async (uri: { path: string }) => {
+        const entry = remoteFiles.get(uri.path);
+        return entry!.content;
+      });
+      const freshPromise = scriptFsReadText("healthy.txt", ctx);
+
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      const results = await stalledSettled;
+      for (const r of results) {
+        expect(r.status).toBe("rejected");
+        expect((r as PromiseRejectedResult).reason).toMatchObject({
+          code: "ReadFailed",
+          message: expect.stringContaining("timed out")
+        });
+      }
+      await expect(freshPromise).resolves.toBe("ok");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
+  it("fast path — a normal (non-timed-out) read does not leak its deadline timer: setTimeout is cleared in the same tick the read settles", async () => {
+    // ⊘ dropping the `clearTimeout` from `withReadDeadline`'s `finally` (or
+    // putting it only on the timeout branch) — the fast, common-case read
+    // below would still succeed (this alone wouldn't fail), but the timer it
+    // registered would never be cleared: `clearTimeoutSpy` would stay at 0
+    // calls instead of 1, exactly the "leaks a timer on the fast path" this
+    // guards against.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "quick.txt"), "hello");
+
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    const clearTimeoutSpy = vi.spyOn(global, "clearTimeout");
+    try {
+      const text = await scriptFsReadText("quick.txt", ctx);
+      expect(text).toBe("hello");
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
+      expect(clearTimeoutSpy.mock.calls[0][0]).toBe(setTimeoutSpy.mock.results[0].value);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }
   });
 });
 

@@ -694,6 +694,39 @@ describe("ScriptRuntimeManager — nexus.fs plumbing", () => {
     expect(afterStop.error?.code).toBe("Stopped");
   });
 
+  it("fsContextFor's isAborted() also flips the instant a stop is REQUESTED — before cleanedUp — closing the ≤100ms stopScript grace-race window (P2, round 10)", async () => {
+    // ⊘ isAborted wired to `record.cleanedUp` alone (dropping the
+    // `|| record.stopReason !== undefined` half added in round 10): in
+    // stopScript, `record.stopReason` is set SYNCHRONOUSLY at the very top,
+    // well before the up-to-100ms `worker.terminate()` grace race resolves
+    // and cleanupRun flips `cleanedUp`. An RPC arriving in that window would
+    // see isAborted() === false under the cleanedUp-only predicate and
+    // wrongly be allowed to proceed with I/O for a run that already asked to
+    // stop.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    // Make the grace race hang indefinitely: record.stopReason gets set, but
+    // cleanupRun (and cleanedUp) can't run until the grace timer eventually
+    // fires (~100ms real time) — a comfortably wide, deterministic window
+    // where stopReason is set but cleanedUp is still false.
+    h.worker.terminate = () => new Promise<number>(() => {});
+
+    const stopPromise = h.manager.stopScript("test-session");
+
+    // Emitted well within the (≥100ms) grace window — must already see
+    // isAborted() === true.
+    h.worker.emit({ kind: "rpc", id: 5, method: "fs.readText", args: [h.scriptUri.fsPath] });
+    await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 5));
+    const duringWindow = h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === 5
+    ) as { ok: boolean; error?: { code: string } };
+    expect(duringWindow.ok).toBe(false);
+    expect(duringWindow.error?.code).toBe("Stopped");
+
+    await stopPromise; // let the grace timer fire and cleanup finish before the test ends
+  }, 2_000);
+
   it("fs.readText on a BigInt or a cyclic-object argument surfaces a typed InvalidPath rpc-result — not UnknownError — and logs the refusal", async () => {
     // ⊘ formatting the offending value with a bare JSON.stringify inside
     // scriptFsScope.ts / scriptFs.ts (instead of the non-throwing

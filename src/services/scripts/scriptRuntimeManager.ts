@@ -406,8 +406,15 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       // very top, before anything else about the run's teardown happens — so
       // reusing it here (rather than a parallel flag) means nexus.fs sees
       // "this run is over" at exactly the moment the manager itself would say
-      // so, with nothing new to keep in sync.
-      isAborted: () => record.cleanedUp
+      // so, with nothing new to keep in sync. But `cleanedUp` alone misses a
+      // window: `stopScript` sets `record.stopReason` FIRST, then awaits an
+      // up-to-100ms grace race on `worker.terminate()`, and only calls
+      // `cleanupRun` (which flips `cleanedUp`) after that race settles. A read
+      // that gets granted its semaphore permit during that window would see
+      // `cleanedUp === false` and proceed with I/O for a run that's already
+      // been asked to stop. `stopReason` is set synchronously at the top of
+      // `stopScript`, before the race — checking it here closes that window.
+      isAborted: () => record.cleanedUp || record.stopReason !== undefined
     };
   }
 
