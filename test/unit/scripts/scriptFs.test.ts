@@ -1226,6 +1226,241 @@ describe("scriptFsReadText — read deadline (P1, round 10: a stalled I/O call m
   }, 20_000);
 });
 
+describe("scriptFsReadText — orphan-pool recovery via promotion (P2, round 13: a permit-holding read is promoted into an orphan once orphan capacity reopens)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Drives the pool into the fully-degraded state round 13 exists to
+   * recover from: SCRIPT_FS_MAX_ORPHANED_READS orphans (two waves, permits
+   * already released) plus SCRIPT_FS_MAX_CONCURRENT_READS MORE reads that
+   * time out while the orphan pool is already full (a third wave — these
+   * hold their permits instead of releasing). Assumes fixture files
+   * `orphan0..N-1.txt` and `held0..M-1.txt` already exist in `scriptDir`,
+   * and that `nodeStatSpy` is already mocked fast/in-memory. Returns each
+   * wave's gates so the caller controls exactly when each settles.
+   */
+  async function degradePool(
+    ctx: ScriptFsContext,
+    scriptDir: string
+  ): Promise<{ orphanGates: Array<{ resolve: () => void }>; heldGates: Array<{ resolve: () => void }> }> {
+    void scriptDir; // fixtures are written by the caller — kept as a param for readability at call sites
+    const orphanGates: Array<{ resolve: () => void }> = [];
+    for (let wave = 0; wave < SCRIPT_FS_MAX_ORPHANED_READS / SCRIPT_FS_MAX_CONCURRENT_READS; wave++) {
+      const gates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+      orphanGates.push(...gates);
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+        void scriptFsReadText(`orphan${wave * SCRIPT_FS_MAX_CONCURRENT_READS + i}.txt`, ctx).catch(() => {});
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+    }
+
+    const heldGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      void scriptFsReadText(`held${i}.txt`, ctx).catch(() => {});
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+    return { orphanGates, heldGates };
+  }
+
+  it("recovery discriminator: settling the original orphans WITHOUT touching the held reads promotes them — the queued probe is admitted", async () => {
+    // ⊘ the pre-round-13 implementation (no heldReads / promoteHeldReads at
+    // all): the probe below would stay queued FOREVER — nothing ever
+    // notices that orphan capacity reopened once the 8 originals settle, so
+    // none of the 4 permit-holding reads ever hand their slot back, even
+    // though `orphanedReads` has dropped to 0. `waitFor`'s own timeout (well
+    // under this test's 20s limit) turns that "forever" into a clean,
+    // reasonably fast test failure rather than an actual hang.
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_ORPHANED_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `orphan${i}.txt`), "x");
+    }
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `held${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "probe.txt"), "p");
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      const { orphanGates, heldGates } = await degradePool(ctx, scriptDir);
+
+      // Pool fully degraded — 0 free permits. Confirm the probe genuinely
+      // queues (real-time margin so this isn't a false pass from
+      // insufficient microtask flushing).
+      nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
+      const probePromise = scriptFsReadText("probe.txt", ctx);
+      let probeSettled = false;
+      probePromise.then(
+        () => {
+          probeSettled = true;
+        },
+        () => {
+          probeSettled = true;
+        }
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(probeSettled).toBe(false);
+
+      // Settle the ORIGINAL 8 orphans — deliberately NOT the 4 held reads.
+      orphanGates.forEach((g) => g.resolve());
+      await waitFor(() => probeSettled, 2_000);
+      await expect(probePromise).resolves.toBe("p");
+
+      // Clean up the (now-promoted) held reads too.
+      heldGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("exactly-once after promotion: a promoted read's own eventual settle does NOT release a permit a second time", async () => {
+    // ⊘ a promotion that doesn't guard the entry's own eventual settle
+    // against a SECOND release (e.g. `work.finally` unconditionally calling
+    // `release()` regardless of `promoted`) — the semaphore's internal slot
+    // count would be inflated by SCRIPT_FS_MAX_CONCURRENT_READS once the 4
+    // promoted reads settle below, letting the discriminating `extra.txt`
+    // read in immediately instead of it staying queued.
+    //
+    // Design note: this test deliberately does NOT resolve `heldGates`
+    // together with `orphanGates` in one step — doing so would settle the
+    // held reads' real I/O regardless of whether promotion exists at all
+    // (their own `work.finally(release)` still fires on an unmodified
+    // implementation too), which would make the test pass under BOTH the
+    // fixed and the pre-round-13 implementation. Instead: promote first
+    // (settle ONLY the originals), fully RE-OCCUPY the pool with the 4
+    // permits promotion freed, and only THEN settle the promoted reads —
+    // so a double-release has something concrete (an already-occupied slot)
+    // to wrongly inflate.
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_ORPHANED_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `orphan${i}.txt`), "x");
+    }
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `held${i}.txt`), "x");
+      await fsp.writeFile(path.join(scriptDir, `probe${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "extra.txt"), "x");
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      const { orphanGates, heldGates } = await degradePool(ctx, scriptDir);
+
+      // Settle ONLY the 8 originals — promotes all 4 held reads, freeing
+      // their 4 permits.
+      vi.useRealTimers();
+      orphanGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      vi.useFakeTimers();
+
+      // Re-occupy the ENTIRE pool with SCRIPT_FS_MAX_CONCURRENT_READS fresh,
+      // gated probes — using up exactly the permits promotion just freed.
+      const probeGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+        void scriptFsReadText(`probe${i}.txt`, ctx).catch(() => {});
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy.mock.calls.length).toBe(
+        SCRIPT_FS_MAX_ORPHANED_READS + SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_CONCURRENT_READS
+      ); // 8 + 4 + 4 = all 4 probes admitted, confirming promotion freed exactly 4
+
+      // NOW settle the 4 originally-held (already-promoted) reads — must
+      // NOT release a permit a second time; the pool is fully occupied by
+      // the 4 probes above, which are still gated (not settled).
+      vi.useRealTimers();
+      heldGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      vi.useFakeTimers();
+
+      // Discriminator: with the pool still fully (and correctly) occupied,
+      // one more read must queue — real-time margin so "still queued" isn't
+      // a false pass from insufficient microtask flushing.
+      const extraPromise = scriptFsReadText("extra.txt", ctx);
+      let extraSettled = false;
+      extraPromise.then(
+        () => {
+          extraSettled = true;
+        },
+        () => {
+          extraSettled = true;
+        }
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(extraSettled).toBe(false);
+      expect(nodeOpenSpy.mock.calls.length).toBe(
+        SCRIPT_FS_MAX_ORPHANED_READS + SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_CONCURRENT_READS
+      ); // unchanged — extra.txt never reached open()
+
+      // Clean up: free the probes, letting the (now genuinely queued) extra
+      // read in.
+      probeGates.forEach((g) => g.resolve());
+      await waitFor(() => extraSettled, 2_000);
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("total-bound: promotion converts a held slot into an orphan slot WITHOUT ever opening a new handle — the high-water mark across the whole recovery stays at SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS", async () => {
+    // Promotion only flips a flag and calls `release()` — it never touches
+    // `open()` — so the open-handle high-water mark reached while degrading
+    // the pool must not climb any further during recovery.
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_ORPHANED_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `orphan${i}.txt`), "x");
+    }
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `held${i}.txt`), "x");
+    }
+    const cap = SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS;
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      const { orphanGates, heldGates } = await degradePool(ctx, scriptDir);
+      expect(nodeOpenSpy.mock.calls.length).toBe(cap);
+
+      vi.useRealTimers();
+      orphanGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(nodeOpenSpy.mock.calls.length).toBe(cap);
+
+      heldGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(nodeOpenSpy.mock.calls.length).toBe(cap);
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
+});
+
 describe("scriptFsReadText — audit suppression for a detached read that settles AFTER its own deadline (P2, round 12: only the branch that wins the race may log)", () => {
   afterEach(() => {
     vi.useRealTimers();

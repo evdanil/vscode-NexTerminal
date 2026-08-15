@@ -59,8 +59,15 @@ export const SCRIPT_FS_READ_TIMEOUT_MS = 30_000;
  * current constants, ~48 MiB worst case at `SCRIPT_FS_MAX_BYTES`), while
  * liveness (a fresh, healthy read is never stuck behind a stall) survives up
  * to `SCRIPT_FS_MAX_ORPHANED_READS` simultaneous stalls — beyond that, the
- * pool degrades (a new caller queues, same as before round 10 existed) rather
- * than the detached-operation count growing without bound.
+ * pool DEGRADES TEMPORARILY (a new caller queues, same as before round 10
+ * existed) rather than the detached-operation count growing without bound.
+ * "Temporarily" — round 13: a permit-holding read that timed out while the
+ * orphan pool was full doesn't just sit there forever even after orphan
+ * capacity reopens; see `heldReads` / `promoteHeldReads()` below. The
+ * invariant itself (bounded at `SCRIPT_FS_MAX_CONCURRENT_READS +
+ * SCRIPT_FS_MAX_ORPHANED_READS` total detached operations) is unchanged by
+ * promotion — it only ever converts a HELD slot into an ORPHAN slot, never
+ * adds a new one.
  */
 export const SCRIPT_FS_MAX_ORPHANED_READS = 8;
 
@@ -70,6 +77,45 @@ export const SCRIPT_FS_MAX_ORPHANED_READS = 8;
  * host-memory budget is per-host, not per-run.
  */
 let orphanedReads = 0;
+
+/**
+ * FIFO of reads that timed out while the orphan pool was already full (the
+ * "beyond capacity" branch in `withReadDeadline`) and are therefore still
+ * HOLDING their semaphore permit, bound to their own hung `work`. Round 13:
+ * without this list, once the ORIGINAL orphans that filled the pool
+ * eventually settle — freeing orphan capacity — these permit-holding reads
+ * have no way to notice; they'd sit on their held permit until their OWN
+ * (possibly never-settling) work finishes, leaving the pool fully degraded
+ * (every new call queues) even though `orphanedReads` has dropped back to 0.
+ * `promoteHeldReads()` drains this list, oldest-first, whenever room opens
+ * up — converting a HELD permit into an ORPHAN (permit handed back to the
+ * pool, the read's own hung work now counted against
+ * `SCRIPT_FS_MAX_ORPHANED_READS` instead), never adding a new detached slot.
+ */
+const heldReads: Array<{ promoted: boolean; release: () => void }> = [];
+
+/**
+ * Promotes as many `heldReads` entries into orphans as there's currently
+ * room for — called everywhere `orphanedReads` is decremented, since a
+ * decrement is the only thing that can ever open up room. Each promotion:
+ * removes the entry from `heldReads` and flips `promoted` to `true` (this,
+ * plus the fact the entry's own `work.finally` handler in `withReadDeadline`
+ * reads that flag exactly once when `work` finally settles, is what keeps
+ * the eventual release/decrement exactly-once despite the flag being
+ * flipped from OUTSIDE that handler — no separate "already handled" guard
+ * needed), increments `orphanedReads`, and calls the entry's own `release`
+ * — handing the permit back to the pool immediately, exactly as if this read
+ * had taken the "under capacity" branch directly instead of having to wait
+ * behind a full orphan pool first.
+ */
+function promoteHeldReads(): void {
+  while (orphanedReads < SCRIPT_FS_MAX_ORPHANED_READS && heldReads.length > 0) {
+    const entry = heldReads.shift()!;
+    entry.promoted = true;
+    orphanedReads++;
+    entry.release();
+  }
+}
 
 /**
  * Tiny FIFO async semaphore — the classic promise-queue pattern, no deps.
@@ -394,11 +440,20 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
  *    below, so `work` proper is never unhandled, only the NEW promise
  *    `work.finally(...)` returns needs this).
  *  - Pathological case (`SCRIPT_FS_MAX_ORPHANED_READS` orphans already in
- *    flight): the permit is NOT released now — it stays held until THIS
- *    read's own `work` eventually settles, at which point `release` runs
- *    instead of the orphan-counter decrement. The pool degrades (new callers
- *    queue, same as pre-round-10 behavior) rather than the detached-operation
- *    count growing without bound.
+ *    flight): the permit is NOT released now — it goes on the `heldReads`
+ *    FIFO instead. From there, ONE of two things eventually happens: either
+ *    THIS read's own `work` settles first (unchanged from round 11 — release
+ *    runs, exactly once, and the entry removes itself from `heldReads`), or
+ *    — round 13 — orphan capacity reopens first (an earlier orphan settles)
+ *    and `promoteHeldReads()` promotes this entry: the permit is released
+ *    RIGHT THEN (recovering liveness) while this read's still-hung `work`
+ *    now occupies an orphan slot instead, so when `work` finally does settle
+ *    it decrements the orphan counter rather than releasing a permit a
+ *    second time. Either way the pool degrades only as long as it has to
+ *    (new callers queue, same as pre-round-10 behavior, while ALL
+ *    `SCRIPT_FS_MAX_ORPHANED_READS + SCRIPT_FS_MAX_CONCURRENT_READS` slots
+ *    are genuinely occupied) rather than the detached-operation count
+ *    growing without bound OR the pool staying degraded longer than that.
  *
  * `work` itself is still never cancelled — neither `node:fs/promises` nor
  * `vscode.workspace.fs` offers a way to abort an in-flight call — so the
@@ -458,15 +513,43 @@ async function withReadDeadline<T>(
         work
           .finally(() => {
             orphanedReads--;
+            // A decrement is the only thing that can ever open up room to
+            // promote a permit-holding read off `heldReads` — see round 13.
+            promoteHeldReads();
           })
           .catch(() => {
             /* swallow — see doc comment above */
           });
         release();
       } else {
-        work.finally(release).catch(() => {
-          /* swallow — see doc comment above */
-        });
+        // Beyond capacity — hold the permit, but make it PROMOTABLE: if
+        // orphan capacity reopens before this read's own `work` settles,
+        // `promoteHeldReads()` flips `promoted` and releases on our behalf,
+        // instead of this read having to wait on its own (possibly
+        // never-settling) `work`.
+        const heldEntry: { promoted: boolean; release: () => void } = { promoted: false, release };
+        heldReads.push(heldEntry);
+        work
+          .finally(() => {
+            if (heldEntry.promoted) {
+              // Already promoted — the permit was released back at
+              // promotion time; `work` settling now just retires the orphan
+              // slot it was given instead, exactly like a direct ("under
+              // capacity") orphan's own decrement does.
+              orphanedReads--;
+              promoteHeldReads();
+            } else {
+              // Settled before any promotion — still sitting in `heldReads`;
+              // remove itself (nothing left to promote there) and release
+              // the permit exactly once, unchanged from round 11.
+              const idx = heldReads.indexOf(heldEntry);
+              if (idx !== -1) heldReads.splice(idx, 1);
+              release();
+            }
+          })
+          .catch(() => {
+            /* swallow — see doc comment above */
+          });
       }
       reject(
         fail(
