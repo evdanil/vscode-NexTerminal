@@ -398,7 +398,7 @@ Both `..` traversal and absolute paths are accepted, as long as the *result* lan
 | `"InvalidPath"` | any `nexus.fs.*` call | The path is empty, not a string, contains a NUL byte, or (Windows) is drive-relative (`"C:file.txt"`). |
 | `"PathOutsideScope"` | any `nexus.fs.*` call | The resolved path lands outside both allowed roots. |
 | `"FileNotFound"` | `readText` | Nothing exists at the path, or it's a directory. |
-| `"FileTooLarge"` | `readText` | The file is bigger than 4 MiB. `err.sizeBytes` / `err.maxBytes` carry the numbers. |
+| `"FileTooLarge"` | `readText` | The file is bigger than 4 MiB. `err.sizeBytes` / `err.maxBytes` carry the numbers — `sizeBytes` is a lower bound when the true size could not be determined (a file that grew mid-read, or a provider that under-reported it, reports the cap + 1). |
 | `"NotUtf8"` | `readText` | The bytes aren't valid UTF-8. |
 | `"ReadFailed"` | `readText` | The path resolved and passed the size check, but the read itself failed (permissions, a misbehaving remote filesystem provider). |
 | `"InvalidJson"` | `readJson` | The file read fine but isn't valid JSON. A `SyntaxError`, not a plain `Error`. |

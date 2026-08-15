@@ -273,7 +273,12 @@ declare global {
   interface ScriptFsError extends Error {
     code: "FileNotFound" | "PathOutsideScope" | "FileTooLarge" | "NotUtf8"
         | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
-    /** Present when `code === "FileTooLarge"`. The file's actual size in bytes. */
+    /**
+     * Present when `code === "FileTooLarge"`. The file's size in bytes as
+     * observed at read time — a LOWER BOUND when the true size could not be
+     * determined (a file that grew past the cap mid-read, or a provider that
+     * under-reported its size, reports the cap + 1).
+     */
     sizeBytes?: number;
     /** Present when `code === "FileTooLarge"`. Always 4 MiB (4 * 1024 * 1024). */
     maxBytes?: number;
