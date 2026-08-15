@@ -155,5 +155,36 @@ globals.macros = {
 // before user code executes. See handler above.
 globals.session = undefined;
 
+// nexus.fs — read-only file access, scoped + logged on the main thread.
+// readJson is deliberately worker-side JSON.parse over the readText RPC so a
+// parse failure carries a stack local to the script's own execution context.
+//
+// The worker does NOT receive the script directory, and the `load` message
+// above is unchanged: (a) resolution must live where enforcement lives — a
+// worker-side resolve would make the RPC carry a pre-resolved absolute path,
+// turning the main-thread check into re-validation of attacker-influencable
+// input for zero gain; (b) user code shares the worker's global scope with
+// the API surface and can overwrite any global — worker-held scope data is
+// untrusted by construction; (c) main-thread-only resolution means one
+// containment implementation, one test matrix, one audit point.
+globals.nexus = {
+  fs: {
+    readText: (p: unknown) => rpc<string>("fs.readText", [p]),
+    readJson: async (p: unknown) => {
+      const text = await rpc<string>("fs.readText", [p]);
+      try {
+        return JSON.parse(text) as unknown;
+      } catch (err) {
+        const e = new SyntaxError(
+          `nexus.fs.readJson(${JSON.stringify(String(p))}): ${(err as Error).message}`
+        );
+        Object.assign(e, { code: "InvalidJson" });
+        throw e;
+      }
+    },
+    exists: (p: unknown) => rpc<boolean>("fs.exists", [p])
+  }
+};
+
 // Tell the main thread we're ready to accept a `load` message.
 post({ kind: "ready" });

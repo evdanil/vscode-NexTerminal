@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.8.183] — 2026-08-15
+
+### Added
+
+- **Scripts can now read files, through a supported, read-only, scoped API: `nexus.fs`.** `nexus.fs.readText(path)`, `nexus.fs.readJson(path)`, and `nexus.fs.exists(path)` resolve relative paths against the running script's own directory, and refuse anything outside that folder or the configured Nexus scripts folder — traversal, absolute paths, and sibling-directory tricks are all caught by the same lexical containment check. Reads are capped at 4 MiB and must be valid UTF-8; every access — success or refusal — is logged to the "Nexus Scripts" Output Channel with the resolved path. `readJson` throws a `SyntaxError` (`code: "InvalidJson"`) on malformed input, naming the file in the message. IntelliSense picks this up automatically: the bundled type definitions are now v4, and every workspace still seeded with the v3 copy is rewritten on the next script command.
+- **Scripts now refuse to start in a Restricted Mode (untrusted) workspace.** A script runs arbitrary JavaScript with your full user permissions, so every script-start command — the palette, the CodeLens, the tree's quick-run, and "Connect/Open and Run Script…" for SSH, Serial, and Local Shell — now hard-refuses with an explanatory message and a **Manage Workspace Trust** button when the workspace isn't trusted. The extension also now explicitly declares `capabilities.untrustedWorkspaces.supported: false` in its manifest, making previously-implicit VS Code behavior an audited, intentional statement.
+
+### Changed
+
+- **`docs/scripting.md`'s security section no longer claims scripts can't read files or spawn processes.** They always could — `await import("node:fs")` and `await import("node:child_process")` work inside the Worker, same as any other Node code — the docs just didn't say so. The rewrite states the real boundary (no `vscode` import, nothing else), documents `nexus.fs` as the supported/audited path for file reads, and calls out that `worker.terminate()` (used to stop a script) does not kill child processes the script spawned. Direct Node module imports remain possible but unsupported.
+
 ## [2.8.182] — 2026-08-14
 
 ### Added

@@ -11,6 +11,7 @@ import { resolveScriptDefaultTimeoutMs } from "./defaultTimeout";
 import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGenerator";
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
+import { scriptFsExists, scriptFsReadText, type ScriptFsContext } from "./scriptFs";
 import type {
   FailureReason,
   FinalState,
@@ -28,6 +29,16 @@ import type {
  * Error `code` values produced by well-behaved user scripts via the documented
  * runtime contract. These are *expected* errors and should not trigger a crash
  * toast in the UI — they're the mechanism by which scripts signal failure.
+ *
+ * `nexus.fs` error codes (`FileNotFound`, `PathOutsideScope`, `NotUtf8`, etc.)
+ * are deliberately NOT added here. `Timeout`/`ConnectionLost`/`Stopped`/
+ * `Cancelled` are cooperative control flow — the documented way well-behaved
+ * scripts end. An uncaught `nexus.fs` error means the script's assumptions
+ * about its environment are wrong (missing fixture, bad path literal, wrong
+ * encoding) — exactly the "bug in the script" class the toast exists for. A
+ * script that wants to branch on absence uses `exists()` or `try/catch`; a
+ * *caught* error never reaches the toast path, so the toast costs
+ * well-behaved scripts nothing.
  */
 const EXPECTED_ERROR_CODES = new Set(["Timeout", "ConnectionLost", "Stopped", "Cancelled"]);
 
@@ -65,6 +76,12 @@ interface RunningScriptRecord {
   id: string;
   scriptName: string;
   scriptPath: string;
+  /** The exact Uri the script was launched from — nexus.fs resolves against this. */
+  scriptUri: vscode.Uri;
+  /** undefined for `untitled:` scripts — every nexus.fs call throws NoScriptDir. */
+  scriptDirUri: vscode.Uri | undefined;
+  /** resolveScriptsDir() snapshotted at run start — decision 6: config changes never touch in-flight runs. */
+  scriptsRootUri: vscode.Uri | undefined;
   sessionId: string;
   sessionName: string;
   sessionType: ScriptTargetType;
@@ -121,6 +138,26 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   }
 
   public async runScript(uri: vscode.Uri, sessionId?: string): Promise<string | undefined> {
+    // Workspace Trust gate — the single choke point all five script-start entry
+    // points funnel through. Hard refuse, not a requestWorkspaceTrust() prompt:
+    // a trust prompt raised at the moment of running a script invites
+    // click-through on exactly the artifact (a workspace-supplied .js file)
+    // trust exists to protect against. `=== false` (not `!isTrusted`) keeps
+    // every existing unit/integration mock — none of which define `isTrusted`
+    // — behaving as trusted; real VS Code always supplies a boolean. Gated
+    // before maybeSeedWorkspaceTypes, which also writes to the workspace and
+    // must not run untrusted either.
+    if (vscode.workspace.isTrusted === false) {
+      const pick = await vscode.window.showErrorMessage(
+        "Nexus scripts are disabled in Restricted Mode — a script runs arbitrary JavaScript with your user permissions. Trust this workspace to run scripts.",
+        "Manage Workspace Trust"
+      );
+      if (pick === "Manage Workspace Trust") {
+        void vscode.commands.executeCommand("workbench.trust.manage");
+      }
+      return undefined;
+    }
+
     // US3: ensure IntelliSense scaffolding is in place in the workspace.
     await this.maybeSeedWorkspaceTypes();
 
@@ -175,6 +212,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       id: randomUUID(),
       scriptName: displayName,
       scriptPath: uri.fsPath,
+      scriptUri: uri,
+      scriptDirUri: uri.scheme === "untitled" ? undefined : vscode.Uri.joinPath(uri, ".."),
+      scriptsRootUri: this.safeResolveScriptsRoot(),
       sessionId: target.session.id,
       sessionName: target.session.terminalName,
       sessionType: target.type,
@@ -341,6 +381,28 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       const message = err instanceof Error ? err.message : String(err);
       this.deps.outputChannel.appendLine(`[warn] failed to seed workspace script types: ${message}`);
     }
+  }
+
+  /**
+   * `resolveScriptsDir` can touch config/workspace state, and a throwing
+   * config must not kill run start — a run with `scriptsRootUri: undefined`
+   * still has its own-dir nexus.fs scope (decision 4).
+   */
+  private safeResolveScriptsRoot(): vscode.Uri | undefined {
+    try {
+      return resolveScriptsDir(this.deps.globalStoragePath);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private fsContextFor(record: RunningScriptRecord): ScriptFsContext {
+    return {
+      scriptUri: record.scriptUri,
+      scriptDirUri: record.scriptDirUri,
+      scriptsRootUri: record.scriptsRootUri,
+      log: (text: string) => this.logEvent(record, text)
+    };
   }
 
   private basenameWithoutExt(fsPath: string): string {
@@ -545,6 +607,10 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         for (const n of record.macroFilterInitial.denyList) record.macroFilter.deny(n);
         return undefined;
       }
+      case "fs.readText":
+        return scriptFsReadText(args[0], this.fsContextFor(record));
+      case "fs.exists":
+        return scriptFsExists(args[0], this.fsContextFor(record));
       default:
         throw makeError("UnknownMethod", `Unknown script RPC method: ${method}`);
     }

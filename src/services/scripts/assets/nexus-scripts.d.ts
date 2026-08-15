@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v3
+// Nexus Scripts API types — v4
 /**
  * Nexus Terminal — Scripts API
  *
@@ -261,4 +261,43 @@ declare global {
   interface CancelledError extends Error {
     code: "Cancelled";
   }
+
+  /**
+   * Thrown by `nexus.fs` calls. Catch with `if (e.code === "FileNotFound") ...`.
+   */
+  interface ScriptFsError extends Error {
+    code: "FileNotFound" | "PathOutsideScope" | "FileTooLarge" | "NotUtf8"
+        | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
+  }
+
+  // ---------------------------------------------------------------------------
+  // nexus.fs — read-only, scoped, logged file access
+  // ---------------------------------------------------------------------------
+
+  interface NexusFileSystem {
+    /**
+     * Read a UTF-8 text file. Relative paths resolve against THIS SCRIPT'S own
+     * directory; the target must stay inside the Nexus scripts folder or the
+     * script's own folder subtree. Max 4 MiB. Every read is logged to the
+     * "Nexus Scripts" Output Channel.
+     */
+    readText(path: string): Promise<string>;
+    /**
+     * readText + JSON.parse. Parse failures throw SyntaxError with code
+     * "InvalidJson". Defaults to `Promise<any>` so `.property` access on the
+     * result type-checks without a cast; pass `T` for a typed result, e.g.
+     * `await nexus.fs.readJson<{ devices: string[] }>("./config.json")`.
+     */
+    readJson<T = any>(path: string): Promise<T>;
+    /** True if an entry (file or directory) exists at the scoped path. Out-of-scope paths throw. */
+    exists(path: string): Promise<boolean>;
+  }
+
+  interface NexusApi {
+    /** Read-only, scoped, logged file access. */
+    fs: NexusFileSystem;
+  }
+
+  /** Nexus host API namespace. */
+  const nexus: NexusApi;
 }
