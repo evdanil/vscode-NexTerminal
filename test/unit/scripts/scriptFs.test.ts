@@ -1708,6 +1708,236 @@ describe("scriptFsExists", () => {
   });
 });
 
+describe("scriptFsExists — stat deadline (P1, round 15: a stalled stat must not hang the script, and must never answer `false`)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Hangs the next `n` `vscode.workspace.fs.stat` calls behind their own
+   * `deferred()` gate, answering "it's a file" once released — the stalled
+   * remote FileSystemProvider this round exists to survive.
+   *
+   * `scriptFsExists` routes EVERY scheme through `vscode.workspace.fs.stat`
+   * (a bare existence probe pulls no body into memory, so it has no reason to
+   * take `readText`'s bounded native `file:` path), so gating this one spy
+   * covers the local fixtures used below AND keeps them entirely in-memory —
+   * real disk I/O isn't guaranteed to settle inside a single fake-timer
+   * microtask flush, exactly as the round-10 tests above note.
+   *
+   * Same self-cleaning `mockImplementationOnce` discipline as `gateOpens`:
+   * callers MUST arrange for exactly `n` `exists()` calls to consume these,
+   * and MUST eventually resolve every gate (see `deferred`'s doc comment).
+   */
+  function gateStats(n: number): Array<{ resolve: () => void }> {
+    const gates = Array.from({ length: n }, () => deferred<void>());
+    gates.forEach((gate) => {
+      statSpy.mockImplementationOnce(async () => {
+        await gate.promise;
+        return { type: FileType.File, ctime: 0, mtime: 0, size: 1 };
+      });
+    });
+    return gates;
+  }
+
+  it("a hung stat rejects with ReadFailed at SCRIPT_FS_READ_TIMEOUT_MS rather than hanging the script forever — and never answers a silently-wrong `false`", async () => {
+    // ⊘ the pre-fix implementation: `scriptFsExists` awaited
+    // `vscode.workspace.fs.stat` with NO deadline at all, so against a
+    // stalled provider the promise it returned simply never settled —
+    // `settled` below stays false past the deadline and this test fails
+    // there. ⊘ ALSO the tempting "treat an undeterminable existence as
+    // false" shortcut: the outcome asserted below is a THROW, not `false`;
+    // a script must be able to tell "definitely not there" from "couldn't
+    // tell", since the two justify opposite actions.
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "hung.txt"), "x");
+
+    vi.useFakeTimers();
+    try {
+      const [gate] = gateStats(1);
+      let settled = false;
+      const outcome = scriptFsExists("hung.txt", ctx).then(
+        (value) => {
+          settled = true;
+          return { ok: true as const, value };
+        },
+        (error: unknown) => {
+          settled = true;
+          return { ok: false as const, error };
+        }
+      );
+
+      // The stat is genuinely in flight, and the call has NOT settled yet —
+      // this half also discriminates against a deadline that fires
+      // immediately (which would "pass" the timeout assertion below while
+      // breaking every healthy probe).
+      await vi.advanceTimersByTimeAsync(0);
+      expect(statSpy).toHaveBeenCalledTimes(1);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      expect(settled).toBe(true);
+
+      const result = await outcome;
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          code: "ReadFailed",
+          message: expect.stringContaining(`timed out after ${SCRIPT_FS_READ_TIMEOUT_MS / 1000}s`)
+        }
+      });
+
+      // Exactly the deadline's own audit line so far — `fail()`'s format is
+      // `fs.exists <path> → <code>`, logged under the `exists` verb (⊘
+      // reusing `readText` as the logged method for an exists() call, which
+      // would misattribute the line in the audit trail).
+      expect(log.mock.calls).toEqual([[expect.stringContaining("fs.exists ")]]);
+      expect(log.mock.calls).toEqual([[expect.stringContaining("→ ReadFailed")]]);
+      const callCountAtTimeout = log.mock.calls.length;
+
+      // Let the detached stat finally answer for real.
+      vi.useRealTimers();
+      gate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // ⊘ handing the RAW ctx (rather than the guarded one the deadline race
+      // builds) to the detached stat: it would now write a contradictory
+      // `fs.exists <path> → true` line for a call that already threw
+      // ReadFailed — the round-12 audit-suppression rule applies to this
+      // work exactly as it does to readText's.
+      expect(log.mock.calls.length).toBe(callCountAtTimeout);
+      expect(log).not.toHaveBeenCalledWith(expect.stringMatching(/→ (true|false)$/));
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
+  it("fast path (found) — logs exactly one line and does not leak its deadline timer", async () => {
+    // ⊘ dropping the `clearTimeout` from the race's `finally` (or attaching
+    // it only to the timeout branch): the healthy probe below still answers
+    // `true`, but the 30s timer it registered would never be cleared —
+    // `clearTimeoutSpy` stays at 0 instead of 1, and every exists() call
+    // would pin a live timer for half a minute. Pre-fix, `setTimeoutSpy`
+    // stays at 0 too (no deadline is registered at all).
+    const { ctx, scriptDir, log } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "quick.txt"), "x");
+
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    const clearTimeoutSpy = vi.spyOn(global, "clearTimeout");
+    try {
+      const found = await scriptFsExists("quick.txt", ctx);
+      expect(found).toBe(true);
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
+      expect(clearTimeoutSpy.mock.calls[0][0]).toBe(setTimeoutSpy.mock.results[0].value);
+      // Unchanged from before the deadline existed: one audit line, not two.
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.exists .*quick\.txt → true$/));
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+
+  it("fast path (missing) — the `false` answer also pairs its timer and logs exactly one line", async () => {
+    // The `false` answer comes out of the probe's own `catch`, a different
+    // path out of the race than the `true` answer above. ⊘ a `clearTimeout`
+    // reachable only on the fulfilled path.
+    const { ctx, log } = await makeCtx();
+
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    const clearTimeoutSpy = vi.spyOn(global, "clearTimeout");
+    try {
+      const found = await scriptFsExists("nope.txt", ctx);
+      expect(found).toBe(false);
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
+      expect(clearTimeoutSpy.mock.calls[0][0]).toBe(setTimeoutSpy.mock.results[0].value);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^fs\.exists .*nope\.txt → false$/));
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+
+  it("orphan-pool isolation: timed-out exists() stats consume NO orphan slots — a readText wave timing out afterwards still finds room and releases its permits", async () => {
+    // ⊘ routing exists() through readText's FULL orphan machinery (letting a
+    // timed-out stat increment `orphanedReads` / land on `heldReads`).
+    // `SCRIPT_FS_MAX_ORPHANED_READS` is a budget for host-side READ BUFFERS
+    // (see its doc comment); a bare stat allocates none and holds no permit,
+    // so counting it there would steal capacity from genuine reads and
+    // degrade the pool for a memory cost that was never incurred.
+    //
+    // The discriminator: SCRIPT_FS_MAX_ORPHANED_READS hung exists() probes
+    // are timed out FIRST. Under the wrong implementation they fill the
+    // orphan pool exactly, so the readText wave that follows takes
+    // `withReadDeadline`'s "beyond capacity" branch, HOLDS its permits, and
+    // the probe read below stays queued — never reaching open(). Under the
+    // correct implementation the pool is still empty, the wave orphans
+    // normally, its four permits come back, and the probe is admitted.
+    const { ctx, scriptDir } = await makeCtx();
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `stall${i}.txt`), "x");
+    }
+    await fsp.writeFile(path.join(scriptDir, "probe.txt"), "p");
+    await fsp.writeFile(path.join(scriptDir, "e.txt"), "x");
+
+    const originalStatImpl = nodeStatSpy.getMockImplementation();
+    nodeStatSpy.mockImplementation(
+      async () => ({ isFile: () => true, isDirectory: () => false, size: 1 }) as unknown as import("node:fs").Stats
+    );
+
+    vi.useFakeTimers();
+    try {
+      // SCRIPT_FS_MAX_ORPHANED_READS hung exists() probes — ungated by the
+      // read semaphore, so all of them are in flight at once — timed out.
+      const existsGates = gateStats(SCRIPT_FS_MAX_ORPHANED_READS);
+      const existsSettled = Promise.allSettled(
+        Array.from({ length: SCRIPT_FS_MAX_ORPHANED_READS }, () => scriptFsExists("e.txt", ctx))
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(statSpy).toHaveBeenCalledTimes(SCRIPT_FS_MAX_ORPHANED_READS);
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      for (const r of await existsSettled) {
+        expect(r.status).toBe("rejected");
+      }
+      // Their gates stay HUNG on purpose until the very end: resolving them
+      // here would let the WRONG implementation's orphan counter drain back
+      // to 0 and erase the exact condition this test discriminates on.
+
+      // A full wave of readText stalls, timed out. With an uncontaminated
+      // orphan pool these become orphans and hand their permits straight back.
+      const readGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+      for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+        void scriptFsReadText(`stall${i}.txt`, ctx).catch(() => {});
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy).toHaveBeenCalledTimes(SCRIPT_FS_MAX_CONCURRENT_READS);
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+
+      // Discriminator: the probe is ADMITTED — it reaches open(). Gated (not
+      // a real quick read) for the same reason the round-11 tests gate
+      // theirs: admission must be observable directly, not inferable from a
+      // completion that could have cascaded from something else.
+      const probeGates = gateOpens(1);
+      void scriptFsReadText("probe.txt", ctx).catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nodeOpenSpy).toHaveBeenCalledTimes(SCRIPT_FS_MAX_CONCURRENT_READS + 1);
+
+      vi.useRealTimers();
+      existsGates.forEach((g) => g.resolve());
+      readGates.forEach((g) => g.resolve());
+      probeGates.forEach((g) => g.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      nodeOpenSpy.mockImplementation(realNodeOpen as never);
+      nodeStatSpy.mockImplementation(originalStatImpl as never);
+      vi.useRealTimers();
+    }
+  }, 20_000);
+});
+
 describe("NoScriptDir — untitled scripts", () => {
   it("both readText and exists throw NoScriptDir even for a path that would otherwise be in-scope", async () => {
     // ⊘ falling back to root-only (or any) scope for an untitled script.
