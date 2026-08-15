@@ -1,5 +1,6 @@
 import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
 import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config";
+import type { LocalServerConfig } from "../models/localServer";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -1070,10 +1071,106 @@ export function localShellFormDefinition(
   };
 }
 
-export type UnifiedProfileAddMode = "profile" | "ssh" | "serial" | "localShell";
+function localServerVisibleWhen(vw: VisibleWhen | undefined, field: string, value: string): VisibleWhen {
+  const inner: VisibleWhenCondition = { field, value };
+  if (!vw) return inner;
+  return [...(Array.isArray(vw) ? vw : [vw]), inner];
+}
+
+function localServerFields(
+  seed?: Partial<LocalServerConfig>,
+  vw?: VisibleWhen
+): FormFieldDescriptor[] {
+  const envTextarea = seed?.env
+    ? Object.entries(seed.env)
+        .map(([k, v]) => (v === null ? `${k}=null` : v === undefined ? `${k}=undefined` : `${k}=${v}`))
+        .join("\n")
+    : undefined;
+  const inheritVw = vw ? { visibleWhen: vw } : {};
+  return [
+    {
+      type: "text",
+      key: "executable",
+      label: "Executable",
+      required: true,
+      placeholder: "e.g. node, python, ./bin/server, C:\\Tools\\myapp.exe",
+      value: seed?.executable,
+      hint: "Absolute path, workspace-relative path, or bare command name looked up on PATH. Supports ~ and ${workspaceFolder}/${env:NAME}.",
+      ...inheritVw
+    },
+    {
+      type: "textarea",
+      key: "args",
+      label: "Arguments",
+      placeholder: "One argument per line\ne.g.\n--port\n8080\n--host\n0.0.0.0",
+      value: seed?.args ? seed.args.join("\n") : undefined,
+      hint: "Each line becomes one argv entry. Blank lines and leading/trailing whitespace are ignored.",
+      ...inheritVw
+    },
+    {
+      type: "text",
+      key: "cwd",
+      label: "Working Directory",
+      placeholder: "${workspaceFolder}/apps/server",
+      value: seed?.cwd,
+      hint: "Optional. Relative paths are resolved against the first workspace root.",
+      ...inheritVw
+    },
+    {
+      type: "textarea",
+      key: "env",
+      label: "Environment Variables",
+      placeholder: "PORT=8080\nNODE_ENV=production\n# set key to null to unset\nDEBUG=",
+      value: envTextarea,
+      hint: "One KEY=VALUE per line. Setting KEY=null unsets, KEY= passes an empty string. ${workspaceFolder}/${env:NAME} are expanded.",
+      ...inheritVw
+    },
+    {
+      type: "checkbox",
+      key: "autoRestart",
+      label: "Auto-restart on unexpected exit",
+      value: seed?.autoRestart ?? false,
+      ...inheritVw
+    },
+    {
+      type: "number",
+      key: "maxAutoRestarts",
+      label: "Maximum auto-restart attempts",
+      placeholder: "5 (default)",
+      value: seed?.maxAutoRestarts,
+      hint: "Only applies when auto-restart is enabled. Uses exponential backoff up to 30s.",
+      ...inheritVw
+    },
+    {
+      type: "textarea",
+      key: "description",
+      label: "Description",
+      placeholder: "Optional notes shown in hover tooltip",
+      value: seed?.description,
+      ...inheritVw
+    }
+  ];
+}
+
+export function localServerFormDefinition(
+  seed?: Partial<LocalServerConfig>,
+  existingGroups?: string[]
+): FormDefinition {
+  const isEdit = Boolean(seed?.id);
+  return {
+    title: isEdit ? "Edit Local Server" : "Add Local Server",
+    fields: [
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "e.g. Backend Dev Server", value: seed?.name },
+      ...localServerFields(seed),
+      ...sharedTrailingFields(seed, existingGroups, false).filter((field) => !("key" in field) || field.key !== "logSession")
+    ]
+  };
+}
+
+export type UnifiedProfileAddMode = "profile" | "ssh" | "serial" | "localShell" | "localServer";
 
 export interface UnifiedProfileSeed {
-  profileType?: "ssh" | "serial" | "localShell";
+  profileType?: "ssh" | "serial" | "localShell" | "localServer";
   group?: string;
   addMode?: UnifiedProfileAddMode;
 }
@@ -1090,6 +1187,8 @@ export function unifiedProfileFormId(seed?: UnifiedProfileSeed): string {
       return "serial-add";
     case "localShell":
       return "local-shell-add";
+    case "localServer":
+      return "local-server-add";
     case "profile":
       return "profile-add";
   }
@@ -1103,18 +1202,21 @@ function unifiedProfileFormTitle(seed?: UnifiedProfileSeed): string {
       return "Add Serial Profile";
     case "localShell":
       return "Add Local Shell Profile";
+    case "localServer":
+      return "Add Local Server";
     case "profile":
       return "Add Profile";
   }
 }
 
-function unifiedProfileTypeValue(seed?: UnifiedProfileSeed): "ssh" | "serial" | "localShell" {
+function unifiedProfileTypeValue(seed?: UnifiedProfileSeed): "ssh" | "serial" | "localShell" | "localServer" {
   if (seed?.profileType) {
     return seed.profileType;
   }
   const mode = normalizedUnifiedProfileMode(seed);
   if (mode === "serial") return "serial";
   if (mode === "localShell") return "localShell";
+  if (mode === "localServer") return "localServer";
   return "ssh";
 }
 
@@ -1130,7 +1232,8 @@ function unifiedProfileTypeField(seed?: UnifiedProfileSeed): FormFieldDescriptor
     options: [
       { label: "SSH Server Profile", value: "ssh" },
       { label: "Serial Profile", value: "serial" },
-      { label: "Local Shell Profile", value: "localShell" }
+      { label: "Local Shell Profile", value: "localShell" },
+      { label: "Local Server", value: "localServer" }
     ],
     value
   };
@@ -1147,8 +1250,9 @@ export function unifiedProfileFormDefinition(
   const sshVw: VisibleWhenCondition = { field: "profileType", value: "ssh" };
   const serialVw: VisibleWhenCondition = { field: "profileType", value: "serial" };
   const localShellVw: VisibleWhenCondition = { field: "profileType", value: "localShell" };
+  const localServerVw: VisibleWhenCondition = { field: "profileType", value: "localServer" };
   const mode = normalizedUnifiedProfileMode(seed);
-  const sharedFields = mode === "localShell"
+  const sharedFields = mode === "localShell" || mode === "localServer"
     ? sharedTrailingFields({ group: seed?.group }, existingGroups, defaultLogSession)
       .filter((field) => !("key" in field) || field.key !== "logSession")
     : sharedTrailingFields(
@@ -1169,6 +1273,7 @@ export function unifiedProfileFormDefinition(
       openFileExplorerOnFirstConnectField(undefined, sshVw),
       ...serialFields(undefined, serialVw),
       ...localShellFields(undefined, localShellVw, localShellOptions),
+      ...localServerFields(undefined, localServerVw),
       ...sharedFields
     ]
   };

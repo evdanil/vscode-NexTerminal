@@ -11,6 +11,7 @@ import type {
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
+import type { LocalServerConfig } from "../models/localServer";
 import { normalizeFolderPath } from "./folderPaths";
 
 function isNonEmptyString(value: unknown): value is string {
@@ -617,6 +618,40 @@ export function validateLocalShellProfile(item: unknown): item is LocalShellProf
     isOptionalNonEmptyString(obj.group) &&
     isOptionalNonEmptyString(obj.cwd) &&
     isOptionalNonEmptyString(obj.startupCommand)
+  );
+}
+
+function validateLocalServerEnv(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  return Object.values(value).every((item) => item === null || item === undefined || typeof item === "string");
+}
+
+export function validateLocalServerConfig(item: unknown): item is LocalServerConfig {
+  if (typeof item !== "object" || item === null) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  if (!(isNonEmptyString(obj.id) && isNonEmptyString(obj.name) && isNonEmptyString(obj.executable))) {
+    return false;
+  }
+  if (
+    (obj.autoRestart !== undefined && typeof obj.autoRestart !== "boolean") ||
+    (obj.maxAutoRestarts !== undefined &&
+      !(typeof obj.maxAutoRestarts === "number" && Number.isInteger(obj.maxAutoRestarts) && obj.maxAutoRestarts >= 0))
+  ) {
+    return false;
+  }
+  return (
+    validateStringArray(obj.args) &&
+    validateLocalServerEnv(obj.env) &&
+    isOptionalNonEmptyString(obj.group) &&
+    isOptionalNonEmptyString(obj.cwd) &&
+    isOptionalNonEmptyString(obj.description)
   );
 }
 

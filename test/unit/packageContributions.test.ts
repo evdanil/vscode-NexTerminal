@@ -16,6 +16,13 @@ const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
     viewsWelcome?: Array<{ view: string; contents: string }>;
     keybindings?: Array<{ command: string; key: string; mac?: string; when?: string }>;
   };
+  capabilities?: {
+    untrustedWorkspaces?: {
+      supported?: string;
+      restrictedConfigurations?: string[];
+      description?: string;
+    };
+  };
 };
 const readme = readFileSync(readmePath, "utf8");
 const functionalDocs = readFileSync(functionalDocsPath, "utf8");
@@ -790,6 +797,131 @@ describe("package contributions", () => {
       expect(byCmd("nexus.files.followTerminal")?.when).toBe("!nexus.files.followingTerminal");
       expect(byCmd("nexus.files.unfollowTerminal")?.when).toBe("nexus.files.followingTerminal && !nexus.files.followPaused");
       expect(byCmd("nexus.files.resumeFollowTerminal")?.when).toBe("nexus.files.followPaused");
+    });
+  });
+
+  describe("Local Servers contributions (first-class native)", () => {
+    const localServerCommandIds = [
+      "nexus.localServer.add",
+      "nexus.localServer.start",
+      "nexus.localServer.stop",
+      "nexus.localServer.restart",
+      "nexus.localServer.inspectLogs",
+      "nexus.localServer.edit",
+      "nexus.localServer.remove",
+      "nexus.localServer.rename",
+      "nexus.localServer.duplicate",
+      "nexus.localServer.copyInfo",
+      "nexus.localServer.moveToFolder",
+      "nexus.localServer.moveToRoot"
+    ];
+
+    it("declares activationEvents for add and start (primary EAGER entrypoints)", () => {
+      expect(packageJson.activationEvents).toContain("onCommand:nexus.localServer.add");
+      expect(packageJson.activationEvents).toContain("onCommand:nexus.localServer.start");
+    });
+
+    it("declares capabilities.untrustedWorkspaces as 'limited' (restricted mode refuses spawning binaries)", () => {
+      const caps = packageJson.capabilities?.untrustedWorkspaces;
+      expect(caps).toBeDefined();
+      expect(caps!.supported).toBe("limited");
+      expect(caps!.restrictedConfigurations).toEqual([]);
+      expect(caps!.description).toBeTruthy();
+    });
+
+    it("contributes all 12 Local Server commands under a dedicated category", () => {
+      const commands = packageJson.contributes.commands;
+      for (const id of localServerCommandIds) {
+        const cmd = commands.find((c) => c.command === id);
+        expect(cmd, `missing command ${id}`).toBeDefined();
+        expect(cmd!.category, `wrong category for ${id}`).toBe("Nexus Local Server");
+      }
+    });
+
+    it("uses the expected icons for primary Local Server actions", () => {
+      const commands = packageJson.contributes.commands;
+      const byId = (id: string) => commands.find((c) => c.command === id)!;
+      expect(byId("nexus.localServer.add").icon).toBe("$(server-environment)");
+      expect(byId("nexus.localServer.start").icon).toBe("$(debug-start)");
+      expect(byId("nexus.localServer.stop").icon).toBe("$(debug-stop)");
+      expect(byId("nexus.localServer.restart").icon).toBe("$(sync)");
+      expect(byId("nexus.localServer.inspectLogs").icon).toBe("$(list-flat)");
+    });
+
+    it("links Add Local Server Profile from the empty Command Center welcome view", () => {
+      const welcome = packageJson.contributes.viewsWelcome ?? [];
+      const hub = welcome.find((w) => w.view === "nexusCommandCenter");
+      expect(hub?.contents).toContain("command:nexus.localServer.add");
+      expect(hub?.contents).toMatch(/Add Local Server/i);
+    });
+
+    it("gates start/restart commandPalette on workspace.isTrusted (hard refusal in restricted mode)", () => {
+      const palette = packageJson.contributes.menus.commandPalette ?? [];
+      const start = palette.find((m) => m.command === "nexus.localServer.start");
+      const restart = palette.find((m) => m.command === "nexus.localServer.restart");
+      expect(start?.when).toBe("workspace.isTrusted");
+      expect(restart?.when).toBe("workspace.isTrusted");
+    });
+
+    it("hides tree-only folder movement commands from the command palette", () => {
+      const palette = packageJson.contributes.menus.commandPalette ?? [];
+      for (const id of ["nexus.localServer.moveToFolder", "nexus.localServer.moveToRoot"]) {
+        const entry = palette.find((m) => m.command === id);
+        expect(entry, `palette entry for ${id}`).toBeDefined();
+        expect(entry!.when).toBe("false");
+      }
+    });
+
+    it("binds inline start for idle configs and stop/restart for running configs / session nodes", () => {
+      const ctx = packageJson.contributes.menus["view/item/context"] ?? [];
+      const inlineStartCfg = ctx.find(
+        (m) =>
+          m.command === "nexus.localServer.start" &&
+          m.when === "view == nexusCommandCenter && viewItem == nexus.localServer" &&
+          m.group === "inline@1"
+      );
+      const inlineStopRunning = ctx.find(
+        (m) =>
+          m.command === "nexus.localServer.stop" &&
+          m.when === "view == nexusCommandCenter && viewItem == nexus.localServerRunning" &&
+          m.group === "inline@1"
+      );
+      const inlineStopSession = ctx.find(
+        (m) =>
+          m.command === "nexus.localServer.stop" &&
+          m.when === "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode" &&
+          m.group === "inline@1"
+      );
+      const inlineRestartSession = ctx.find(
+        (m) =>
+          m.command === "nexus.localServer.restart" &&
+          m.when === "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode" &&
+          m.group === "inline@2"
+      );
+      expect(inlineStartCfg).toBeDefined();
+      expect(inlineStopRunning).toBeDefined();
+      expect(inlineStopSession).toBeDefined();
+      expect(inlineRestartSession).toBeDefined();
+    });
+
+    it("contributes the five nexus.localServers.* configuration keys with distinct order values (31-35)", () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      const keys = [
+        "nexus.localServers.defaultMaxAutoRestarts",
+        "nexus.localServers.stableRuntimeMs",
+        "nexus.localServers.initialBackoffMs",
+        "nexus.localServers.maxBackoffMs",
+        "nexus.localServers.restrictToWorkspaceRoots"
+      ];
+      const orders: number[] = [];
+      for (const k of keys) {
+        expect(props[k], `missing config ${k}`).toBeDefined();
+        orders.push(props[k].order);
+      }
+      expect(new Set(orders).size).toBe(5);
+      expect(orders.every((o) => o >= 31 && o <= 35)).toBe(true);
+      expect(props["nexus.localServers.defaultMaxAutoRestarts"].type).toBe("number");
+      expect(props["nexus.localServers.restrictToWorkspaceRoots"].type).toBe("boolean");
     });
   });
 });

@@ -3,6 +3,7 @@ import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, Tunne
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
+import type { LocalServerConfig } from "../models/localServer";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
@@ -12,6 +13,7 @@ export class InMemoryConfigRepository implements ConfigRepository {
     private groups: string[] = [],
     private authProfiles: AuthProfile[] = [],
     private localShellProfiles: LocalShellProfile[] = [],
+    private localServers: LocalServerConfig[] = [],
     private inventorySources: InventorySourceConfig[] = [],
     private deviceTemplates: DeviceTemplateProfile[] = [],
     private savedFilters: SavedFilterDefinition[] = []
@@ -47,6 +49,14 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveLocalShellProfiles(profiles: LocalShellProfile[]): Promise<void> {
     this.localShellProfiles = [...profiles];
+  }
+
+  public async getLocalServers(): Promise<LocalServerConfig[]> {
+    return [...this.localServers];
+  }
+
+  public async saveLocalServers(servers: LocalServerConfig[]): Promise<void> {
+    this.localServers = [...servers];
   }
 
   public async getGroups(): Promise<string[]> {

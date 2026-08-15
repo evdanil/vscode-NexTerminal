@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
 import type { RegistryEntry, TerminalRegistry } from "../services/terminal/terminalRegistry";
-import type { LocalShellTerminalMap, SessionTerminalMap, SerialTerminalMap } from "./types";
+import type { LocalShellTerminalMap, LocalServerTerminalMap, SessionTerminalMap, SerialTerminalMap } from "./types";
 
 export interface TerminalTabCommandsDeps {
   registry: TerminalRegistry;
   sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
   localShellTerminals?: LocalShellTerminalMap;
+  localServerTerminals?: LocalServerTerminalMap;
 }
 
 /**
@@ -41,6 +42,8 @@ function resolveTerminal(
     if (serial) return serial.terminal;
     const localShell = deps.localShellTerminals?.get(sessionId);
     if (localShell) return localShell.terminal;
+    const localServer = deps.localServerTerminals?.get(sessionId);
+    if (localServer) return localServer.terminal;
   }
   if (asAny?.profile && typeof (asAny.profile as Record<string, unknown>).id === "string") {
     const profileId = (asAny.profile as { id: string }).id;
@@ -49,6 +52,12 @@ function resolveTerminal(
     }
     for (const entry of deps.localShellTerminals?.values() ?? []) {
       if (entry.profileId === profileId) return entry.terminal;
+    }
+  }
+  if (asAny && typeof asAny === "object" && typeof (asAny as Record<string, unknown>).configId === "string") {
+    const configId = (asAny as { configId: string }).configId;
+    for (const entry of deps.localServerTerminals?.values() ?? []) {
+      if (entry.configId === configId) return entry.terminal;
     }
   }
   return vscode.window.activeTerminal ?? undefined;

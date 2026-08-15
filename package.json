@@ -72,6 +72,8 @@
     "onCommand:nexus.localShell.add",
     "onCommand:nexus.localShell.connect",
     "onCommand:nexus.localShell.runWithScript",
+    "onCommand:nexus.localServer.add",
+    "onCommand:nexus.localServer.start",
     "onCommand:nexus.profile.add",
     "onFileSystem:nexterm",
     "onUri"
@@ -121,7 +123,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT…)](command:nexus.config.import)\n[Add Inventory Source (NetBox)](command:nexus.inventory.addSource)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT…)](command:nexus.config.import)\n[Add Inventory Source (NetBox)](command:nexus.inventory.addSource)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Add Local Server Profile](command:nexus.localServer.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -444,6 +446,78 @@
         "command": "nexus.localShell.rename",
         "title": "Rename",
         "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.localServer.add",
+        "title": "Add Local Server Profile",
+        "category": "Nexus Local Server",
+        "icon": "$(server-environment)"
+      },
+      {
+        "command": "nexus.localServer.start",
+        "title": "Start Server",
+        "category": "Nexus Local Server",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "nexus.localServer.stop",
+        "title": "Stop Server",
+        "category": "Nexus Local Server",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "nexus.localServer.restart",
+        "title": "Restart Server",
+        "category": "Nexus Local Server",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "nexus.localServer.inspectLogs",
+        "title": "Inspect Logs Terminal",
+        "category": "Nexus Local Server",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "nexus.localServer.edit",
+        "title": "Edit",
+        "category": "Nexus Local Server",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.localServer.remove",
+        "title": "Remove",
+        "category": "Nexus Local Server",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "nexus.localServer.rename",
+        "title": "Rename",
+        "category": "Nexus Local Server",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.localServer.duplicate",
+        "title": "Duplicate",
+        "category": "Nexus Local Server",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "nexus.localServer.copyInfo",
+        "title": "Copy Command Line",
+        "category": "Nexus Local Server",
+        "icon": "$(clippy)"
+      },
+      {
+        "command": "nexus.localServer.moveToFolder",
+        "title": "Move to Folder…",
+        "category": "Nexus Local Server",
+        "icon": "$(folders)"
+      },
+      {
+        "command": "nexus.localServer.moveToRoot",
+        "title": "Move to Root",
+        "category": "Nexus Local Server",
+        "icon": "$(remove-folder)"
       },
       {
         "command": "nexus.group.connect",
@@ -1398,6 +1472,101 @@
           "group": "3_destructive"
         },
         {
+          "command": "nexus.localServer.start",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServer",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.localServer.stop",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.localServer.restart",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning",
+          "group": "inline@2"
+        },
+        {
+          "command": "nexus.localServer.stop",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.localServer.restart",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode",
+          "group": "inline@2"
+        },
+        {
+          "command": "nexus.localServer.inspectLogs",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode",
+          "group": "inline@3"
+        },
+        {
+          "command": "nexus.localServer.start",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "group": "0_connect@1"
+        },
+        {
+          "command": "nexus.localServer.stop",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "group": "0_connect@2"
+        },
+        {
+          "command": "nexus.localServer.restart",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "group": "0_connect@3"
+        },
+        {
+          "command": "nexus.localServer.inspectLogs",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "group": "1_terminal@1"
+        },
+        {
+          "command": "nexus.terminal.reset",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "group": "1_terminal@2"
+        },
+        {
+          "command": "nexus.terminal.clearScrollback",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "group": "1_terminal@3"
+        },
+        {
+          "command": "nexus.localServer.edit",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.localServer.rename",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "group": "1_manage@2"
+        },
+        {
+          "command": "nexus.localServer.duplicate",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "group": "1_manage@3"
+        },
+        {
+          "command": "nexus.localServer.moveToFolder",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "group": "1_manage@4"
+        },
+        {
+          "command": "nexus.localServer.moveToRoot",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && viewItemFolder != null",
+          "group": "1_manage@5"
+        },
+        {
+          "command": "nexus.localServer.copyInfo",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "group": "2_clipboard"
+        },
+        {
+          "command": "nexus.localServer.remove",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "group": "3_destructive"
+        },
+        {
           "command": "nexus.tunnel.start",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "inline"
@@ -1860,6 +2029,54 @@
         {
           "command": "nexus.localShell.rename",
           "when": "true"
+        },
+        {
+          "command": "nexus.localServer.add",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.start",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.localServer.stop",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.restart",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.localServer.inspectLogs",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.edit",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.remove",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.rename",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.duplicate",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.copyInfo",
+          "when": "true"
+        },
+        {
+          "command": "nexus.localServer.moveToFolder",
+          "when": "false"
+        },
+        {
+          "command": "nexus.localServer.moveToRoot",
+          "when": "false"
         },
         {
           "command": "nexus.profile.add",
@@ -3759,8 +3976,53 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Automatically restore `terminal.integrated.commandsToSkipShell` entries when an external program (e.g. a corporate DLP/endpoint agent) strips them from `settings.json`. Restores are rate-limited and every restore shows an Undo notification. Forensic logging (see *Nexus: Show Settings Guard Report*) stays active even when this is disabled."
+        },
+        "nexus.localServers.defaultMaxAutoRestarts": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "maximum": 100,
+          "order": 31,
+          "markdownDescription": "Default maximum number of automatic restarts per local server when `autoRestart` is enabled and no explicit `maxAutoRestarts` is set on the profile. 0 disables auto-restart globally. Auto-restart uses exponential backoff and stops counting attempts after 10 seconds of stable runtime."
+        },
+        "nexus.localServers.stableRuntimeMs": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "maximum": 600000,
+          "order": 32,
+          "markdownDescription": "Milliseconds of continuous runtime after which a local server is considered 'stable' and its auto-restart attempt counter is reset. Must be long enough to distinguish a real crash from a graceful exit triggered just after startup."
+        },
+        "nexus.localServers.initialBackoffMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 50,
+          "maximum": 60000,
+          "order": 33,
+          "markdownDescription": "Initial exponential-backoff delay in milliseconds before the first auto-restart. Each subsequent attempt doubles this value up to `nexus.localServers.maxBackoffMs`."
+        },
+        "nexus.localServers.maxBackoffMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 100,
+          "maximum": 600000,
+          "order": 34,
+          "markdownDescription": "Maximum backoff delay in milliseconds between auto-restart attempts (exponential backoff ceiling)."
+        },
+        "nexus.localServers.restrictToWorkspaceRoots": {
+          "type": "boolean",
+          "default": true,
+          "order": 35,
+          "markdownDescription": "Refuse to start a local server whose working directory resolves outside the currently-open workspace roots when a workspace is open. Disabling this allows any absolute path, including system directories, as cwd — enable only if you trust every profile in storage."
         }
       }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "restrictedConfigurations": [],
+      "description": "In Restricted Mode, Local Server Start/Restart commands are disabled and no arbitrary binaries are spawned. Viewing, editing, duplicating, renaming, and inspecting stopped profiles still work."
     }
   },
   "configurationDefaults": {
