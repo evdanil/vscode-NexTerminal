@@ -264,10 +264,40 @@ declare global {
 
   /**
    * Thrown by `nexus.fs` calls. Catch with `if (e.code === "FileNotFound") ...`.
+   *
+   * `FileTooLarge` additionally carries `sizeBytes` / `maxBytes` (see
+   * `ScriptFsFileTooLargeError` below) — declared here too, optionally, so
+   * `e.sizeBytes` type-checks straight off a plain `ScriptFsError`-typed
+   * catch without narrowing to the subtype first.
    */
   interface ScriptFsError extends Error {
     code: "FileNotFound" | "PathOutsideScope" | "FileTooLarge" | "NotUtf8"
         | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
+    /** Present when `code === "FileTooLarge"`. The file's actual size in bytes. */
+    sizeBytes?: number;
+    /** Present when `code === "FileTooLarge"`. Always 4 MiB (4 * 1024 * 1024). */
+    maxBytes?: number;
+  }
+
+  /**
+   * `ScriptFsError` narrowed to the `"FileTooLarge"` case, with `sizeBytes` /
+   * `maxBytes` required instead of optional. Narrow a `ScriptFsError` (or
+   * `ScriptFsError | ScriptFsFileTooLargeError`) down to this shape the usual
+   * discriminated-union way:
+   * ```js
+   * try {
+   *   await nexus.fs.readText(path);
+   * } catch (e) {
+   *   if (e.code === "FileTooLarge") {
+   *     log.warn(`${path}: ${e.sizeBytes} bytes exceeds the ${e.maxBytes}-byte limit`);
+   *   }
+   * }
+   * ```
+   */
+  interface ScriptFsFileTooLargeError extends ScriptFsError {
+    code: "FileTooLarge";
+    sizeBytes: number;
+    maxBytes: number;
   }
 
   // ---------------------------------------------------------------------------

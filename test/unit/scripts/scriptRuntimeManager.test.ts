@@ -663,6 +663,42 @@ describe("ScriptRuntimeManager — nexus.fs plumbing", () => {
     expect(result.error?.code).toBe("PathOutsideScope");
   });
 
+  it("fs.readText on a BigInt or a cyclic-object argument surfaces a typed InvalidPath rpc-result — not UnknownError — and logs the refusal", async () => {
+    // ⊘ formatting the offending value with a bare JSON.stringify inside
+    // scriptFsScope.ts / scriptFs.ts (instead of the non-throwing
+    // safeStringify): both a BigInt and a cyclic object are
+    // structured-cloneable, so a script's worker can genuinely send either as
+    // an RPC arg. A throwing formatter means resolveScriptFsPath (or the
+    // backslash guard) never returns at all — the throw escapes scriptFs.ts
+    // entirely, dispatchRpc's catch reshapes THAT exception generically
+    // instead of the typed InvalidPath one, and no `fail()` call ever runs —
+    // so no refusal is ever logged either.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: [10n] });
+    h.worker.emit({ kind: "rpc", id: 2, method: "fs.readText", args: [(() => {
+      const cyclic: Record<string, unknown> = { name: "probe" };
+      cyclic.self = cyclic;
+      return cyclic;
+    })()] });
+    await waitFor(() =>
+      h.worker.posted.filter((m) => m.kind === "rpc-result").length >= 2
+    );
+
+    for (const id of [1, 2]) {
+      const result = h.worker.posted.find(
+        (m) => m.kind === "rpc-result" && (m as { id: number }).id === id
+      ) as { kind: "rpc-result"; ok: boolean; error?: { code: string } };
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("InvalidPath");
+    }
+    // The refusal audit-log line was written (not silently dropped by a throw
+    // inside the formatter, which would have skipped the fail()/ctx.log call
+    // entirely).
+    expect(h.output.some((l) => l.includes("fs.readText") && l.includes("InvalidPath"))).toBe(true);
+  });
+
   it("F6/decision 7: an uncaught nexus.fs error classifies as 'script-error', not 'expected' — EXPECTED_ERROR_CODES is unchanged", async () => {
     // ⊘ someone adding fs codes to EXPECTED_ERROR_CODES. This is the test that
     // pins decision 7's NO: an uncaught PathOutsideScope must toast, exactly

@@ -1,6 +1,6 @@
 import * as nodeFs from "node:fs/promises";
 import * as vscode from "vscode";
-import { resolveScriptFsPath, type ScriptFsScope } from "./scriptFsScope";
+import { resolveScriptFsPath, safeStringify, type ScriptFsScope } from "./scriptFsScope";
 import type { ScriptFsErrorCode } from "./scriptTypes";
 
 /** Decision 7 — not configurable. */
@@ -121,7 +121,7 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
     throw fail(
       ctx,
       "readText",
-      String(requested),
+      safeStringify(requested),
       "NoScriptDir",
       "This script has no folder on disk (untitled editor). Save it first — nexus.fs paths resolve against the script's own directory."
     );
@@ -130,9 +130,9 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
     throw fail(
       ctx,
       "readText",
-      String(requested),
+      safeStringify(requested),
       "InvalidPath",
-      `backslash is not a valid path separator for a remote script location: ${JSON.stringify(requested)}`
+      `backslash is not a valid path separator for a remote script location: ${safeStringify(requested)}`
     );
   }
 
@@ -140,7 +140,13 @@ export async function scriptFsReadText(requested: unknown, ctx: ScriptFsContext)
   if (!resolution.ok) {
     // Pre-resolution failure — no resolved path exists yet, so the log (and
     // the thrown message) name the raw requested value.
-    throw fail(ctx, "readText", String(requested), resolution.code, describeResolutionFailure(resolution, scope));
+    throw fail(
+      ctx,
+      "readText",
+      safeStringify(requested),
+      resolution.code,
+      describeResolutionFailure(resolution, scope)
+    );
   }
   // From here on, resolution succeeded — every failure log names the
   // RESOLVED absolute path, not the (possibly relative, possibly confusing
@@ -296,7 +302,7 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
     throw fail(
       ctx,
       "exists",
-      String(requested),
+      safeStringify(requested),
       "NoScriptDir",
       "This script has no folder on disk (untitled editor). Save it first — nexus.fs paths resolve against the script's own directory."
     );
@@ -305,15 +311,21 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
     throw fail(
       ctx,
       "exists",
-      String(requested),
+      safeStringify(requested),
       "InvalidPath",
-      `backslash is not a valid path separator for a remote script location: ${JSON.stringify(requested)}`
+      `backslash is not a valid path separator for a remote script location: ${safeStringify(requested)}`
     );
   }
 
   const resolution = resolveScriptFsPath(requested as string, scope);
   if (!resolution.ok) {
-    throw fail(ctx, "exists", String(requested), resolution.code, describeResolutionFailure(resolution, scope));
+    throw fail(
+      ctx,
+      "exists",
+      safeStringify(requested),
+      resolution.code,
+      describeResolutionFailure(resolution, scope)
+    );
   }
 
   // No read hazard here — this is a plain existence probe, so `vscode.workspace.fs.stat`

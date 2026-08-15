@@ -279,4 +279,26 @@ describe("nexus.fs — end-to-end integration", () => {
       await fs.unlink(bigFixturePath).catch(() => {});
     }
   }, 10_000);
+
+  it("(e) a BigInt / cyclic-object argument still crosses the real structured-clone RPC boundary and revives as a typed InvalidPath error, with a refusal logged", async () => {
+    // ⊘ formatting the offending value with a bare JSON.stringify inside
+    // scriptFsScope.ts / scriptFs.ts: a BigInt and a cyclic object are both
+    // structured-cloneable, so `postMessage` genuinely delivers them to the
+    // main thread unchanged — this is the REAL RPC boundary, not a
+    // hand-rolled substitute. A throwing formatter there means the whole call
+    // never reaches `fail()`, so dispatchRpc's catch reshapes a generic
+    // exception into UnknownError instead of the typed InvalidPath the
+    // fixture's own catch block checks for, AND no refusal is logged — the
+    // fixture would throw its own assertion error either way, ending the run
+    // `failed` instead of `completed`.
+    const { manager, scriptUri, outputLines } = runtimeFixture("fs-read-invalid-value.js");
+    const events: string[] = [];
+    manager.onDidChangeRun((e) => events.push(e.kind + (e.kind === "ended" ? `:${e.finalState}` : "")));
+
+    await manager.runScript(scriptUri as never, "test-session");
+    await waitFor(() => events.includes("ended:completed"), 5_000);
+
+    expect(events).toContain("ended:completed");
+    expect(outputLines.some((l) => l.includes("fs.readText") && l.includes("InvalidPath"))).toBe(true);
+  }, 10_000);
 });

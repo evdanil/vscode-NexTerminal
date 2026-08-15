@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   isLexicallyWithin,
   resolveScriptFsPath,
+  safeStringify,
   type ScriptFsPlatform,
   type ScriptFsScope
 } from "../../../src/services/scripts/scriptFsScope";
@@ -84,6 +85,25 @@ describe.each(PLATFORMS)("resolveScriptFsPath — platform-agnostic rows (%s)", 
     const nonString = resolveScriptFsPath(42 as unknown as string, scopeOf(platform));
     expect(nonString.ok).toBe(false);
     if (!nonString.ok) expect(nonString.code).toBe("InvalidPath");
+  });
+
+  it("row 7b: a BigInt or a cyclic object is still InvalidPath — resolveScriptFsPath itself never throws building the detail message", () => {
+    // ⊘ formatting the offending value with a bare `JSON.stringify(requested)`
+    // — that throws for a BigInt ("Do not know how to serialize a BigInt")
+    // and for a cyclic object ("Converting circular structure to JSON"), both
+    // structured-cloneable values a script's worker can genuinely send over
+    // the RPC boundary. A thrown error HERE means resolveScriptFsPath itself
+    // never returns — no InvalidPath result to hand back, and (traced up the
+    // call stack) no typed code and no refusal log line either.
+    const bigIntResult = resolveScriptFsPath(10n as unknown as string, scopeOf(platform));
+    expect(bigIntResult.ok).toBe(false);
+    if (!bigIntResult.ok) expect(bigIntResult.code).toBe("InvalidPath");
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const cyclicResult = resolveScriptFsPath(cyclic as unknown as string, scopeOf(platform));
+    expect(cyclicResult.ok).toBe(false);
+    if (!cyclicResult.ok) expect(cyclicResult.code).toBe("InvalidPath");
   });
 
   it("row 8: '.' resolves to the script directory itself (containment doesn't know file types)", () => {
@@ -280,5 +300,69 @@ describe("isLexicallyWithin — direct unit coverage (used by moveScripts.ts too
     // Running this on a posix CI host and getting a win32-correct answer IS the
     // regression test for "platform not injectable".
     expect(isLexicallyWithin("C:\\ws\\scripts\\..foo\\a.js", "C:\\ws\\scripts", "win32")).toBe(true);
+  });
+});
+
+describe("safeStringify — non-throwing formatting for arbitrary RPC-supplied values", () => {
+  it("formats ordinary values exactly like JSON.stringify does", () => {
+    expect(safeStringify("hi")).toBe('"hi"');
+    expect(safeStringify(42)).toBe("42");
+    expect(safeStringify(null)).toBe("null");
+    expect(safeStringify(["a", 1])).toBe('["a",1]');
+  });
+
+  it("never throws for a BigInt — ⊘ a bare JSON.stringify(value), which throws 'Do not know how to serialize a BigInt'", () => {
+    expect(() => safeStringify(10n)).not.toThrow();
+    expect(safeStringify(10n)).toBe("10"); // JSON.stringify throws; falls back to String(10n)
+  });
+
+  it("never throws for a cyclic object — ⊘ a bare JSON.stringify(value), which throws 'Converting circular structure to JSON'", () => {
+    const cyclic: Record<string, unknown> = { name: "probe" };
+    cyclic.self = cyclic;
+    expect(() => safeStringify(cyclic)).not.toThrow();
+    expect(typeof safeStringify(cyclic)).toBe("string");
+    expect(safeStringify(cyclic).length).toBeGreaterThan(0);
+  });
+
+  it("falls all the way back to Object.prototype.toString.call when BOTH JSON.stringify AND String() throw", () => {
+    // JSON.stringify throws via a throwing getter on an enumerable property
+    // (a plain custom toString alone does NOT make JSON.stringify throw — it
+    // only affects String()/template-literal coercion, and JSON.stringify
+    // ignores toString entirely unless the property is itself unserializable
+    // — hence the getter). String()/template coercion throws via
+    // Symbol.toPrimitive (checked before toString/valueOf). Together these
+    // force safeStringify all the way down to its last, unconditionally-safe
+    // fallback.
+    const hostile: Record<PropertyKey, unknown> = {
+      [Symbol.toPrimitive]() {
+        throw new Error("nope");
+      },
+      toString() {
+        throw new Error("nope");
+      },
+      valueOf() {
+        throw new Error("nope");
+      }
+    };
+    Object.defineProperty(hostile, "boom", {
+      enumerable: true,
+      get(): never {
+        throw new Error("nope");
+      }
+    });
+    expect(() => JSON.stringify(hostile)).toThrow();
+    expect(() => String(hostile)).toThrow();
+
+    expect(() => safeStringify(hostile)).not.toThrow();
+    expect(safeStringify(hostile)).toBe(Object.prototype.toString.call(hostile));
+  });
+
+  it("undefined and functions (JSON.stringify returns the JS value undefined, not a string) fall back to String()", () => {
+    // ⊘ returning JSON.stringify's result unchecked — for these inputs it is
+    // the VALUE `undefined`, not the string "undefined", which would make a
+    // template literal render the string "undefined" by accident anyway, but
+    // silently skips the intended fallback chain.
+    expect(safeStringify(undefined)).toBe("undefined");
+    expect(safeStringify(() => {})).toBe(String(() => {}));
   });
 });

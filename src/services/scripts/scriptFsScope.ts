@@ -66,6 +66,38 @@ export type ScriptFsResolution =
 // script. There is no sane meaning for them here (row 13).
 const WIN32_DRIVE_RELATIVE_RE = /^[A-Za-z]:(?![\\/])/;
 
+/**
+ * Render an arbitrary (possibly not-actually-a-string, since `requested`
+ * arrives over the worker RPC boundary as `unknown`) value into an error
+ * detail / log line WITHOUT ever throwing.
+ *
+ * `JSON.stringify` is not safe for this: it throws on a `BigInt` ("Do not
+ * know how to serialize a BigInt") and on a cyclic object ("Converting
+ * circular structure to JSON") — both structured-cloneable, so both are
+ * values a script's worker can genuinely send as `nexus.fs.readText(x)`.
+ * Letting that throw escape here means the InvalidPath refusal never gets
+ * built at all: the whole call falls through to dispatchRpc's generic catch,
+ * the typed `InvalidPath` code is lost, and the refusal never reaches the
+ * audit log (`ctx.log`) either — exactly the call this function's caller
+ * exists to explain. Exported so `scriptFs.ts` uses the same fallback chain
+ * for the identical hazard in its backslash-guard message.
+ */
+export function safeStringify(value: unknown): string {
+  try {
+    const json = JSON.stringify(value);
+    if (json !== undefined) return json;
+  } catch {
+    // fall through
+  }
+  try {
+    return String(value);
+  } catch {
+    // A custom toString()/valueOf()/[Symbol.toPrimitive] can throw too —
+    // this never does.
+    return Object.prototype.toString.call(value);
+  }
+}
+
 function platformPath(platform: ScriptFsPlatform): path.PlatformPath {
   return platform === "win32" ? path.win32 : path.posix;
 }
@@ -79,7 +111,7 @@ export function resolveScriptFsPath(requested: string, scope: ScriptFsScope): Sc
     return {
       ok: false,
       code: "InvalidPath",
-      detail: `path must be a non-empty string (got ${JSON.stringify(requested)})`
+      detail: `path must be a non-empty string (got ${safeStringify(requested)})`
     };
   }
   // NUL truncation is the classic bypass for downstream native calls.
@@ -87,14 +119,14 @@ export function resolveScriptFsPath(requested: string, scope: ScriptFsScope): Sc
     return {
       ok: false,
       code: "InvalidPath",
-      detail: `path must not contain a NUL byte: ${JSON.stringify(requested)}`
+      detail: `path must not contain a NUL byte: ${safeStringify(requested)}`
     };
   }
   if (scope.platform === "win32" && WIN32_DRIVE_RELATIVE_RE.test(requested)) {
     return {
       ok: false,
       code: "InvalidPath",
-      detail: `drive-relative paths are not supported: ${JSON.stringify(requested)}`
+      detail: `drive-relative paths are not supported: ${safeStringify(requested)}`
     };
   }
 
