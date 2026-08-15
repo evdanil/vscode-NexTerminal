@@ -52,6 +52,20 @@ describe("SETTINGS_META", () => {
     expect(runtime?.default).toBe(1800);
   });
 
+  it("mirrors the nexus.fs read-size cap into the Nexus settings page, with the same bounds package.json declares", () => {
+    // ⊘ registering the setting in package.json only: it would be invisible in
+    // the in-extension Settings page (and absent from SETTINGS_KEYS, which is
+    // derived from this list — so config export/import would silently drop it).
+    const meta = SETTINGS_META.find((item) => item.section === "nexus.scripts" && item.key === "maxReadSizeMb");
+    expect(meta).toBeDefined();
+    expect(meta?.category).toBe("scripts");
+    expect(meta?.type).toBe("number");
+    expect(meta?.min).toBe(1);
+    expect(meta?.max).toBe(16);
+    expect(meta?.unit).toBe("MB");
+    expect(meta?.default).toBe(4);
+  });
+
   it("recommends editor tabs for terminal open location to match the package default", () => {
     const openLocation = SETTINGS_META.find((item) => item.section === "nexus.terminal" && item.key === "openLocation");
     expect(openLocation?.enumOptions?.find((option) => option.value === "editor")?.recommended).toBe(true);

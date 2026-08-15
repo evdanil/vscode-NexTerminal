@@ -8,6 +8,7 @@ import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
 import { resolveScriptsDir } from "./resolveScriptsDir";
 import { resolveScriptDefaultTimeoutMs } from "./defaultTimeout";
+import { resolveScriptMaxReadBytes } from "./maxReadSize";
 import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGenerator";
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
@@ -90,6 +91,13 @@ interface RunningScriptRecord {
   currentOperation: ScriptRunOperation | null;
   outputBuffer: ScriptOutputBuffer;
   defaultTimeoutMs: number;
+  /**
+   * `nexus.scripts.maxReadSizeMb` resolved to bytes and snapshotted at run
+   * start — decision 6, same rule as `scriptsRootUri`/`defaultTimeoutMs`: a
+   * setting changed mid-run never moves the goalposts under a script that is
+   * already reading files against the cap it started with.
+   */
+  maxReadBytes: number;
   worker: WorkerLike;
   pendingRpcs: Map<number, PendingRpc>;
   observerSubscription?: vscode.Disposable;
@@ -207,6 +215,10 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const defaultTimeoutMs =
       header.defaultTimeoutMs ??
       resolveScriptDefaultTimeoutMs(vscode.workspace.getConfiguration("nexus.scripts"));
+    // Snapshotted here, exactly once, for the reason `defaultTimeoutMs` and
+    // `scriptsRootUri` are (decision 6): every nexus.fs call this run makes is
+    // measured against the cap that was configured when it started.
+    const maxReadBytes = resolveScriptMaxReadBytes(vscode.workspace.getConfiguration("nexus.scripts"));
 
     const record: RunningScriptRecord = {
       id: randomUUID(),
@@ -223,6 +235,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       currentOperation: null,
       outputBuffer: new ScriptOutputBuffer(),
       defaultTimeoutMs,
+      maxReadBytes,
       worker: this.createWorker(),
       pendingRpcs: new Map(),
       inputLockHeld: false,
@@ -401,6 +414,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       scriptUri: record.scriptUri,
       scriptDirUri: record.scriptDirUri,
       scriptsRootUri: record.scriptsRootUri,
+      maxBytes: record.maxReadBytes,
       log: (text: string) => this.logEvent(record, text),
       // `cleanedUp` is cleanupRun's own idempotency guard — flipped at the
       // very top, before anything else about the run's teardown happens — so

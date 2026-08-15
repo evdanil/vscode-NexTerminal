@@ -485,6 +485,19 @@ export const SETTINGS_META: SettingMeta[] = [
     default: 1800
   },
   {
+    key: "maxReadSizeMb",
+    section: "nexus.scripts",
+    label: "Max File Read Size",
+    type: "number",
+    category: "scripts",
+    description:
+      "Largest file nexus.fs.readText / readJson will read for a script. Bigger files are refused with FileTooLarge. Snapshotted when a run starts — a change does not affect scripts already running.",
+    min: 1,
+    max: 16,
+    unit: "MB",
+    default: 4
+  },
+  {
     key: "macroPolicy",
     section: "nexus.scripts",
     label: "Macro Behaviour During Runs",

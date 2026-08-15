@@ -103,7 +103,7 @@ export interface ScriptSessionMetadata {
 export type ScriptFsErrorCode =
   | "FileNotFound" // stat failed, or target is a directory
   | "PathOutsideScope" // lexical containment refused
-  | "FileTooLarge" // > 4 MiB (extra: { sizeBytes, maxBytes })
+  | "FileTooLarge" // over the run's effective cap — nexus.scripts.maxReadSizeMb (extra: { sizeBytes, maxBytes })
   | "NotUtf8" // bytes are not valid UTF-8
   | "NoScriptDir" // untitled: script — no on-disk location
   | "InvalidPath" // empty / non-string / NUL / drive-relative

@@ -9677,6 +9677,17 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.maxRuntimeSeconds"></span>
 </div>
   <div class="form-group">
+  <label for="setting-nexus-scripts-maxReadSizeMb">Max File Read Size</label>
+  <div class="setting-desc">Largest file nexus.fs.readText / readJson will read for a script. Bigger files are refused with FileTooLarge. Snapshotted when a run starts — a change does not affect scripts already running.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-scripts-maxReadSizeMb" data-section="nexus.scripts" data-key="maxReadSizeMb" value="1" min="1" max="16" />
+    <span class="unit-suffix">MB</span>
+    <span class="range-hint">(1–16, default: 4)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.scripts.maxReadSizeMb"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.maxReadSizeMb"></span>
+</div>
+  <div class="form-group">
   <label id="setting-nexus-scripts-macroPolicy-label">Macro Behaviour During Runs</label>
   <div class="setting-desc">How macro auto-triggers on the bound session behave while a script is running. Applies to new runs only — in-flight scripts keep the policy they started with.</div>
   <div class="custom-select" data-section="nexus.scripts" data-key="macroPolicy">

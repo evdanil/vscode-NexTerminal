@@ -4,14 +4,12 @@ import { ReadSlotScheduler } from "./readSlotScheduler";
 import { resolveScriptFsPath, safeStringify, type ScriptFsScope } from "./scriptFsScope";
 import type { ScriptFsErrorCode } from "./scriptTypes";
 
-/** Decision 7 — not configurable. */
-export const SCRIPT_FS_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
-
 /**
  * How many `nexus.fs.readText` calls may have a file body in memory at once,
  * across every running script. Bounds the HOST-side (extension-host) transient
- * allocation at ~`SCRIPT_FS_MAX_CONCURRENT_READS × SCRIPT_FS_MAX_BYTES` (~16 MiB
- * at the current cap) no matter how many scripts are running or how many
+ * allocation at ~`SCRIPT_FS_MAX_CONCURRENT_READS × ctx.maxBytes` (~64 MiB at
+ * the `SCRIPT_FS_MAX_BYTES_CEILING` a run may be configured with, ~16 MiB at
+ * the default cap) no matter how many scripts are running or how many
  * `Promise.all(paths.map(nexus.fs.readText))` calls they issue: the size hint
  * `initialReadCapacity` derives only bounds the allocation of a SINGLE read —
  * concurrent reads of files whose honest sizes are each near the cap still
@@ -72,10 +70,15 @@ export const SCRIPT_FS_READ_TIMEOUT_MS = 30_000;
  * capacity reopens.
  *
  * Net bound: host-side in-flight read buffers never exceed
- * `SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS` (12 here,
- * ~48 MiB worst case at `SCRIPT_FS_MAX_BYTES`), while liveness survives up to
- * `SCRIPT_FS_MAX_ORPHANED_READS` simultaneous stalls. See
- * `readSlotScheduler.ts` for how both halves are enforced.
+ * `SCRIPT_FS_MAX_CONCURRENT_READS + SCRIPT_FS_MAX_ORPHANED_READS` (12 here) ×
+ * the configured maximum — 192 MiB at the 16 MiB `SCRIPT_FS_MAX_BYTES_CEILING`;
+ * at the default 4 MiB cap the worst case is 48 MiB. The bound is quoted
+ * against the RANGE MAXIMUM rather than any one run's effective cap because
+ * both pools are host-global while the cap is snapshotted per run (see
+ * `maxReadSize.ts`), so concurrent runs can hold buffers sized by different
+ * snapshots at once. Liveness survives up to `SCRIPT_FS_MAX_ORPHANED_READS`
+ * simultaneous stalls. See `readSlotScheduler.ts` for how both halves are
+ * enforced.
  */
 export const SCRIPT_FS_MAX_ORPHANED_READS = 8;
 
@@ -164,6 +167,17 @@ export interface ScriptFsContext {
   scriptDirUri: vscode.Uri | undefined;
   /** Snapshotted at run start — config changes never touch an in-flight run. */
   scriptsRootUri: vscode.Uri | undefined;
+  /**
+   * The effective read cap in bytes for THIS run — `resolveScriptMaxReadBytes`
+   * over `nexus.scripts.maxReadSizeMb`, snapshotted at run start exactly like
+   * `scriptsRootUri` (config changes never touch an in-flight run).
+   *
+   * REQUIRED, deliberately not optional: an optional field would let a future
+   * call site inherit `undefined` and compare every file size against `NaN` —
+   * which is silently false for `>`, i.e. an unbounded read, the one outcome
+   * the cap exists to prevent. Every construction site must state a number.
+   */
+  maxBytes: number;
   /** Record-bound `logEvent` closure — lines get the usual `[hh:mm:ss.sss] Script@Session` prefix. */
   log: (text: string) => void;
   /**
@@ -260,7 +274,7 @@ function hasBackslashOnNonFileScheme(requested: unknown, scheme: string): boolea
  * Clamped to `[0, maxBytes]` before the `+ 1`: a negative or NaN hint (a
  * hostile/buggy stat implementation) never allocates less than 1 byte, and a
  * hint already over the cap (an HONEST large-file stat — the common shape
- * once `readLocalFileBounded`'s own pre-read `stat.size > SCRIPT_FS_MAX_BYTES`
+ * once `readLocalFileBounded`'s own pre-read `stat.size > ctx.maxBytes`
  * check has already rejected anything bigger) still allocates only the cap
  * itself, never more.
  */
@@ -288,8 +302,9 @@ export function initialReadCapacity(sizeHintBytes: number, maxBytes: number): nu
  * from "the file is at least one byte over" (`maxBytes + 1` bytes back,
  * `FileTooLarge`) without a second syscall.
  *
- * WHY A SIZE HINT: always preallocating `maxBytes + 1` (4 MiB) regardless of
- * the real file's size meant `Promise.all(paths.map(nexus.fs.readText))` over
+ * WHY A SIZE HINT: always preallocating `maxBytes + 1` (the run's whole cap —
+ * 4 MiB by default, up to 16 MiB) regardless of the real file's size meant
+ * `Promise.all(paths.map(nexus.fs.readText))` over
  * a few hundred tiny files transiently allocated gigabytes in the extension
  * host — the exact hazard bounded reads exist to avoid, just moved from "one
  * huge read" to "many small reads that add up huge". Sizing the INITIAL
@@ -449,10 +464,11 @@ function readDeadlineError(ctx: ScriptFsContext, method: "readText" | "exists", 
  * a FileSystemProvider exposes, and it has no bounded-read variant — there is
  * no syscall-level equivalent of `boundedReadFile` to drop down to for a
  * remote target. The size cap here is therefore BEST-EFFORT: it protects
- * *correctness* (a script never sees more than SCRIPT_FS_MAX_BYTES of
- * content) but not *peak extension-host memory* — a misbehaving remote
- * provider that lies about `stat.size` can still make `readFile` allocate its
- * true (oversized) body before the post-read check below rejects it.
+ * *correctness* (a script never sees more than the run's effective cap,
+ * `ctx.maxBytes`, of content) but not *peak extension-host memory* — a
+ * misbehaving remote provider that lies about `stat.size` can still make
+ * `readFile` allocate its true (oversized) body before the post-read check
+ * below rejects it.
  */
 async function readRemoteFileBounded(uri: vscode.Uri, loggedPath: string, ctx: ScriptFsContext): Promise<string> {
   let stat: vscode.FileStat;
@@ -476,10 +492,10 @@ async function readRemoteFileBounded(uri: vscode.Uri, loggedPath: string, ctx: S
   // Checked BEFORE reading so an honestly-reported multi-GB file is never
   // pulled into memory in the common case — belt, not braces, here: see the
   // post-read check below for the braces.
-  if (stat.size > SCRIPT_FS_MAX_BYTES) {
-    throw fail(ctx, "readText", loggedPath, "FileTooLarge", `${loggedPath}: ${stat.size} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`, {
+  if (stat.size > ctx.maxBytes) {
+    throw fail(ctx, "readText", loggedPath, "FileTooLarge", `${loggedPath}: ${stat.size} bytes exceeds the ${ctx.maxBytes}-byte limit`, {
       sizeBytes: stat.size,
-      maxBytes: SCRIPT_FS_MAX_BYTES
+      maxBytes: ctx.maxBytes
     });
   }
 
@@ -495,14 +511,14 @@ async function readRemoteFileBounded(uri: vscode.Uri, loggedPath: string, ctx: S
   // standing between a lying remote provider and an unbounded read (see the
   // module-level comment on `boundedReadFile` for why `file:` doesn't have
   // this problem).
-  if (bytes.byteLength > SCRIPT_FS_MAX_BYTES) {
+  if (bytes.byteLength > ctx.maxBytes) {
     throw fail(
       ctx,
       "readText",
       loggedPath,
       "FileTooLarge",
-      `${loggedPath}: ${bytes.byteLength} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
-      { sizeBytes: bytes.byteLength, maxBytes: SCRIPT_FS_MAX_BYTES }
+      `${loggedPath}: ${bytes.byteLength} bytes exceeds the ${ctx.maxBytes}-byte limit`,
+      { sizeBytes: bytes.byteLength, maxBytes: ctx.maxBytes }
     );
   }
 
@@ -555,38 +571,38 @@ async function readLocalFileBounded(fsPath: string, loggedPath: string, ctx: Scr
   // contradict it; the bounded read below (and its own post-read check) stays
   // as the belt-and-braces layer for the case stat DIDN'T catch: a lying
   // provider, or a file that grows between this stat and the read.
-  if (stat.size > SCRIPT_FS_MAX_BYTES) {
+  if (stat.size > ctx.maxBytes) {
     throw fail(
       ctx,
       "readText",
       loggedPath,
       "FileTooLarge",
-      `${loggedPath}: ${stat.size} bytes exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
-      { sizeBytes: stat.size, maxBytes: SCRIPT_FS_MAX_BYTES }
+      `${loggedPath}: ${stat.size} bytes exceeds the ${ctx.maxBytes}-byte limit`,
+      { sizeBytes: stat.size, maxBytes: ctx.maxBytes }
     );
   }
 
   let bytes: Buffer;
   try {
-    bytes = await boundedReadFile(fsPath, SCRIPT_FS_MAX_BYTES, stat.size);
+    bytes = await boundedReadFile(fsPath, ctx.maxBytes, stat.size);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw fail(ctx, "readText", loggedPath, "ReadFailed", `${loggedPath}: ${detail}`);
   }
-  if (bytes.byteLength > SCRIPT_FS_MAX_BYTES) {
+  if (bytes.byteLength > ctx.maxBytes) {
     // `stat.size` is only trustworthy here when it AGREES that the file is
     // oversized — i.e. it wasn't the thing that lied. When it under-reported
     // (the exact "stat lies" / racing-growth hazard this function defends
     // against), `maxBytes + 1` — the one number `boundedReadFile` itself
     // guarantees — is reported instead of repeating the untrustworthy value.
-    const sizeBytes = stat.size > SCRIPT_FS_MAX_BYTES ? stat.size : SCRIPT_FS_MAX_BYTES + 1;
+    const sizeBytes = stat.size > ctx.maxBytes ? stat.size : ctx.maxBytes + 1;
     throw fail(
       ctx,
       "readText",
       loggedPath,
       "FileTooLarge",
-      `${loggedPath}: exceeds the ${SCRIPT_FS_MAX_BYTES}-byte limit`,
-      { sizeBytes, maxBytes: SCRIPT_FS_MAX_BYTES }
+      `${loggedPath}: exceeds the ${ctx.maxBytes}-byte limit`,
+      { sizeBytes, maxBytes: ctx.maxBytes }
     );
   }
 

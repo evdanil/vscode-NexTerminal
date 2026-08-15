@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v5
+// Nexus Scripts API types — v6
 /**
  * Nexus Terminal — Scripts API
  *
@@ -287,7 +287,11 @@ declare global {
      * under-reported its size, reports the cap + 1).
      */
     sizeBytes?: number;
-    /** Present when `code === "FileTooLarge"`. Always 4 MiB (4 * 1024 * 1024). */
+    /**
+     * Present when `code === "FileTooLarge"`. The effective cap for this run —
+     * `nexus.scripts.maxReadSizeMb` (default 4 MiB, range 1–16 MiB),
+     * snapshotted when the script started.
+     */
     maxBytes?: number;
   }
 
@@ -320,8 +324,8 @@ declare global {
     /**
      * Read a UTF-8 text file. Relative paths resolve against THIS SCRIPT'S own
      * directory; the target must stay inside the Nexus scripts folder or the
-     * script's own folder subtree. Max 4 MiB. Every read is logged to the
-     * "Nexus Scripts" Output Channel.
+     * script's own folder subtree. Max `nexus.scripts.maxReadSizeMb` (default
+     * 4 MiB). Every read is logged to the "Nexus Scripts" Output Channel.
      *
      * Never blocks longer than 30 seconds, measured over the WHOLE call —
      * including any wait for a read slot when several reads are in flight at

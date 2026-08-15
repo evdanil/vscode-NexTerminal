@@ -455,6 +455,24 @@ describe("package contributions", () => {
       expect(packageJson.contributes.configuration?.properties?.["nexus.scripts.defaultTimeout"]).toBeUndefined();
     });
 
+    it("contributes the configurable nexus.fs read cap with its documented bounds", () => {
+      // ⊘ registering the setting with no bounds (or the wrong ones): VS Code's
+      // settings UI would then offer values the resolver silently clamps away,
+      // and the two would disagree about what is configurable.
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxReadSizeMb"];
+      expect(prop).toBeDefined();
+      expect(prop?.type).toBe("number");
+      expect(prop?.default).toBe(4);
+      expect(prop?.minimum).toBe(1);
+      expect(prop?.maximum).toBe(16);
+      const description = prop?.markdownDescription || prop?.description || "";
+      expect(description).toMatch(/nexus\.fs\.readText/);
+      expect(description).toMatch(/MiB|MB/);
+      // The snapshot-at-run-start semantics are load-bearing for users: a
+      // change made while a script is running does not apply to it.
+      expect(description).toMatch(/start/i);
+    });
+
     it("keeps legacy maxRuntimeMs compatible and allows 0", () => {
       const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxRuntimeMs"];
       expect(prop).toBeDefined();

@@ -849,6 +849,58 @@ describe("ScriptRuntimeManager — nexus.fs plumbing", () => {
 
     await fs.rm(scriptDir, { recursive: true, force: true });
   });
+
+  it("decision 6: the nexus.fs read cap is snapshotted at run start — changing nexus.scripts.maxReadSizeMb mid-run does not affect the in-flight run", async () => {
+    // ⊘ `fsContextFor` reading `nexus.scripts.maxReadSizeMb` live on every fs
+    // call instead of using the value captured once at run start: the read
+    // below would then be admitted under the WIDENED (8 MiB) cap the user
+    // switched to mid-run, and the same wrong implementation would equally
+    // let a NARROWED cap start failing reads a running script had every
+    // reason to expect to work. Also ⊘ a record that never captures the
+    // setting at all (leaving the old fixed 4 MiB default in place), which
+    // would likewise admit this 2 MiB read.
+    const vscode = await import("vscode");
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const MiB = 1024 * 1024;
+
+    const scriptDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-readcap-"));
+    await fs.writeFile(path.join(scriptDir, "two-mib.bin"), Buffer.alloc(2 * MiB, "a"));
+    const scriptFile = path.join(scriptDir, "probe.js");
+    await fs.writeFile(scriptFile, `/**\n * @nexus-script\n */\n`, "utf8");
+    const scriptUri = { fsPath: scriptFile, scheme: "file", authority: "", path: scriptFile, toString: () => scriptFile };
+
+    const settings: Record<string, unknown> = { maxReadSizeMb: 1 };
+    const getConfiguration = vscode.workspace.getConfiguration as unknown as ReturnType<typeof vi.fn>;
+    const restore = () =>
+      getConfiguration.mockImplementation(() => ({ get: vi.fn((_k: string, d?: unknown) => d) }));
+    getConfiguration.mockImplementation(() => ({
+      get: (key: string, fallback?: unknown) => (key in settings ? settings[key] : fallback)
+    }));
+
+    try {
+      const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+      await h.manager.runScript(scriptUri as never, "test-session");
+
+      // Widen the cap AFTER the run has already snapshotted it.
+      settings.maxReadSizeMb = 8;
+
+      h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: ["two-mib.bin"] });
+      await waitFor(() => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === 1));
+      const result = h.worker.posted.find(
+        (m) => m.kind === "rpc-result" && (m as { id: number }).id === 1
+      ) as { kind: "rpc-result"; ok: boolean; error?: { code: string; extra?: Record<string, unknown> } };
+
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe("FileTooLarge");
+      // The run's OWN snapshot (1 MiB), not the widened live value (8 MiB)
+      // and not the 4 MiB default.
+      expect(result.error?.extra?.maxBytes).toBe(1 * MiB);
+    } finally {
+      restore();
+      await fs.rm(scriptDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // -----------------------------------------------------------------------------
