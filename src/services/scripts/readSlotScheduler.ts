@@ -1,8 +1,10 @@
 /**
- * The concurrency, deadline and detachment state machine behind `nexus.fs`'s
- * read pipeline. Deliberately free of any `vscode` import: it is pure
- * scheduling policy over caller-supplied work, so it stays usable (and
- * directly testable) outside the extension host.
+ * The concurrency, deadline and detachment state machine behind `nexus.fs`.
+ * One instance per pool of like work — `scriptFs.ts` runs two, a read pool and
+ * a probe pool, so neither kind of stall can consume the other's capacity.
+ * Deliberately free of any `vscode` import: it is pure scheduling policy over
+ * caller-supplied work, so it stays usable (and directly testable) outside the
+ * extension host.
  *
  * WHY A STATE MACHINE RATHER THAN COOPERATING COUNTERS: the pipeline has to
  * hold five things true at once — a concurrency cap, a deadline that bounds
@@ -21,7 +23,7 @@
  * otherwise once an earlier waiter's slot is `release()`d, in queue order).
  * The caller MUST `release()` exactly once per `acquire()`; inside this module
  * that obligation belongs to `transition()` alone, with the single carve-out
- * of invariant 7's forwarded grant (`claimPermit`) — the one `acquire()` whose
+ * of invariant 6's forwarded grant (`claimPermit`) — the one `acquire()` whose
  * slot never enters a permit-holding state, so `transition()` has no state
  * exit to pair the release with.
  */
@@ -53,7 +55,7 @@ export function createSemaphore(limit: number): Semaphore {
 }
 
 /**
- * The lifecycle of one scheduled operation. Each read is in EXACTLY ONE of
+ * The lifecycle of one scheduled operation. Each one is in EXACTLY ONE of
  * these at any instant, and every arrow below is an entry in `LEGAL_NEXT`:
  *
  *   queued ──permit──> admitted ──start──> running ──work wins──────> settled
@@ -68,17 +70,19 @@ export function createSemaphore(limit: number): Semaphore {
  *     └─deadline─────────> expired
  *
  * INVARIANTS — all of them enforced inside `transition()` (bar the one
- * explicitly carved out in 2 and 7), so no call site has to re-establish any
+ * explicitly carved out in 2 and 6), so no call site has to re-establish any
  * of them:
  *
- *  1. BOUNDED HOST MEMORY. A slot holds a caller buffer while it is in any
- *     state other than the terminals. At most `maxConcurrent` slots hold
- *     a permit and at most `maxOrphaned` are charged to the detached pool, so
- *     at most `maxConcurrent + maxOrphaned` buffers can exist at once no matter
- *     how many callers pile in or how many providers stall. Promotion cannot
- *     widen that: it converts a held slot into an orphan slot, never adds one.
- *     `expired` costs nothing on either budget — the work of a slot that died
- *     in the queue was never started, so there is no buffer to bound.
+ *  1. BOUNDED LIVE WORK. A slot holds whatever its operation costs the host —
+ *     a read's buffer and open handle, a probe's pending provider request,
+ *     and in both cases the caller context the work captured — while it is in
+ *     any state other than the terminals. At most `maxConcurrent` slots hold a
+ *     permit and at most `maxOrphaned` are charged to the detached pool, so at
+ *     most `maxConcurrent + maxOrphaned` operations can be alive at once no
+ *     matter how many callers pile in or how many providers stall. Promotion
+ *     cannot widen that: it converts a held slot into an orphan slot, never
+ *     adds one. `expired` costs nothing on either budget — the work of a slot
+ *     that died in the queue was never started, so there is nothing to bound.
  *
  *  2. EXACTLY-ONCE PERMIT RELEASE. `admitted`, `running` and `held` are the
  *     permit-holding states (`PERMIT_HOLDING`); `transition()` releases the
@@ -87,11 +91,11 @@ export function createSemaphore(limit: number): Semaphore {
  *     all the same one line. A slot can leave a given state only once (the
  *     transition overwrites it, and no edge leads back in), so a second
  *     release is not expressible rather than being guarded against. The single
- *     release NOT written that way is the forwarded grant of invariant 7,
+ *     release NOT written that way is the forwarded grant of invariant 6,
  *     which pairs with an `acquire()` whose slot never entered the set at all —
  *     there is no state exit for `transition()` to hang it off.
  *
- *  3. LIVENESS. A timed-out read hands its permit back immediately while
+ *  3. LIVENESS. A timed-out operation hands its permit back immediately while
  *     detachment capacity remains, so healthy callers are never stuck behind a
  *     stalled provider. Past that capacity the pool degrades on purpose —
  *     memory is the scarcer budget — but only for as long as it must: every
@@ -115,12 +119,7 @@ export function createSemaphore(limit: number): Semaphore {
  *     and the caller uses it to suppress the audit line of a settlement that
  *     was already discarded.
  *
- *  6. UNGATED WORK COSTS NOTHING. `runUngated` takes the deadline and the log
- *     guard without a permit or a detached slot: an operation that allocates no
- *     buffer has nothing for either budget to bound, and charging it would
- *     steal capacity from the reads those budgets exist for.
- *
- *  7. THE DEADLINE BOUNDS THE WHOLE CALL, QUEUEING INCLUDED. `deadlineMs` is a
+ *  6. THE DEADLINE BOUNDS THE WHOLE CALL, QUEUEING INCLUDED. `deadlineMs` is a
  *     promise made to the CALLER ("a `nexus.fs` call never blocks longer than
  *     30 seconds"), and a caller cannot tell the wait for a slot apart from
  *     the wait for a provider — so the wait for a slot has to be inside the
@@ -216,7 +215,7 @@ export interface GatedWork<T> extends DeadlineWork<T> {
  * the call needs from it — the audit guard (invariant 5) and a way to publish
  * the operation once it starts, so the fire handler can tell "still queueing"
  * (`started === undefined`) from "running" without a second flag to keep in
- * sync. See invariant 7 for why there is exactly one of these per call rather
+ * sync. See invariant 6 for why there is exactly one of these per call rather
  * than one per phase.
  */
 interface CallDeadline<T> {
@@ -276,29 +275,11 @@ export class ReadSlotScheduler {
   }
 
   /**
-   * Runs `work` under the deadline and the log guard ONLY — no permit, no
-   * detached-slot accounting (invariant 6). A timed-out operation is simply
-   * abandoned: it keeps running, its eventual result is discarded, and nothing
-   * here waits for it. Nothing queues, so the deadline has only the one phase
-   * to cover here.
-   */
-  public async runUngated<T>(work: DeadlineWork<T>): Promise<T> {
-    const deadline = this.armDeadline(work, () => {
-      /* nothing to hand back and nothing to charge — see invariant 6 */
-    });
-    try {
-      return await this.raceWork(work, deadline);
-    } finally {
-      deadline.clear();
-    }
-  }
-
-  /**
    * Queues for a permit, runs `work` under the deadline, and owns the permit
    * for every way out: settle, decline at admission, expiry while still
    * queued, timeout with detachment capacity, timeout without it, and
    * promotion afterwards. The deadline armed here spans BOTH phases — the wait
-   * for a permit and the work itself (invariant 7).
+   * for a permit and the work itself (invariant 6).
    */
   public async runGated<T>(work: GatedWork<T>): Promise<T> {
     const slot: ReadSlot = { state: "queued", label: work.label };
@@ -310,7 +291,7 @@ export class ReadSlotScheduler {
         // everything between admission and `run()` below is a single
         // microtask chain, and a timer callback is a macrotask, so the
         // deadline cannot land in between.) The permit this call is still
-        // owed is handled by `claimPermit` — invariant 7.
+        // owed is handled by `claimPermit` — invariant 6.
         this.transition(slot, "expired");
         return;
       }
@@ -369,7 +350,7 @@ export class ReadSlotScheduler {
   /**
    * Waits for this slot's turn in the semaphore's FIFO and takes the permit —
    * unless the deadline already expired the slot while it waited, in which
-   * case the grant belongs to whoever is behind it (invariant 7). The
+   * case the grant belongs to whoever is behind it (invariant 6). The
    * already-settled `expiry` is adopted as this branch's own outcome rather
    * than a fresh sentinel: the caller has been rejected with it either way, so
    * there is exactly one rejection value in play no matter which promise the
@@ -440,7 +421,7 @@ export class ReadSlotScheduler {
   }
 
   /**
-   * Arms the call's one and only deadline (invariant 7) and hands back the
+   * Arms the call's one and only deadline (invariant 6) and hands back the
    * handle the phases share. `onFire` runs BEFORE the rejection is built, and
    * receives the started operation — or `undefined` if the call had not got
    * that far — so a single handler can account for whichever phase the

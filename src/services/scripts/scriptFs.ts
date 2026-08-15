@@ -27,7 +27,7 @@ export const SCRIPT_FS_MAX_CONCURRENT_READS = 4;
 
 /**
  * Fixed (not configurable) deadline on every `nexus.fs` call — the WHOLE call,
- * not just its I/O (see `readSlotScheduler.ts`'s invariant 7): the wait for a
+ * not just its I/O (see `readSlotScheduler.ts`'s invariant 6): the wait for a
  * read slot is inside the bound too, because the documented guarantee is made
  * to the SCRIPT ("a nexus.fs call never blocks longer than 30 seconds") and a
  * script cannot tell the two waits apart.
@@ -46,11 +46,12 @@ export const SCRIPT_FS_MAX_CONCURRENT_READS = 4;
  *    back (`SCRIPT_FS_MAX_ORPHANED_READS`), so a fully degraded pool has no
  *    free permit and no prospect of one — a newcomer would wait forever on a
  *    queue that is bounded by nothing else.
- *  - `scriptFsExists`'s `stat` holds no permit and never queues (see its own
- *    comment), but the SCRIPT is what hangs: `await nexus.fs.exists(...)`
- *    would never return, stalling the run until its max-runtime kill, while
- *    every concurrent probe piles up another pending provider operation
- *    nothing will retire.
+ *  - `scriptFsExists`'s `stat` runs on its own pool (see
+ *    `SCRIPT_FS_MAX_CONCURRENT_STATS`), so it needs the deadline twice over:
+ *    the SCRIPT is what hangs first — `await nexus.fs.exists(...)` would
+ *    never return, stalling the run until its max-runtime kill — and a
+ *    degraded probe pool would then queue newcomers behind permits held by
+ *    stats nothing will ever retire, exactly as a degraded read pool does.
  */
 export const SCRIPT_FS_READ_TIMEOUT_MS = 30_000;
 
@@ -78,6 +79,50 @@ export const SCRIPT_FS_READ_TIMEOUT_MS = 30_000;
  */
 export const SCRIPT_FS_MAX_ORPHANED_READS = 8;
 
+/**
+ * How many `nexus.fs.exists` probes may have a `stat` in flight at once,
+ * across every running script — the read pool's counterpart for the OTHER
+ * `nexus.fs` entry point, on its own scheduler instance.
+ *
+ * WHY A SECOND POOL RATHER THAN SHARING THE READ ONE: the read budgets exist
+ * to bound host-side read BUFFERS, and a bare `stat` allocates none. Charging
+ * probes to `SCRIPT_FS_MAX_CONCURRENT_READS` / `SCRIPT_FS_MAX_ORPHANED_READS`
+ * would degrade the read pool to pay for memory nobody allocated, and would
+ * make an existence check queue behind slow reads for no reason. Keeping the
+ * two pools disjoint is the point: neither can starve the other.
+ *
+ * WHY A CAP AT ALL, given there is no buffer to bound: a stalled provider's
+ * `stat()` never settles, and `SCRIPT_FS_READ_TIMEOUT_MS` bounds the promise
+ * the CALLER waits on, not the probe behind it. Each detached probe keeps a
+ * provider request pending and pins its call's captured `ScriptFsContext`
+ * until it settles — which, against a hung provider, is never. Ungated, a
+ * script running `Promise.all(paths.map(nexus.fs.exists))` would leave one
+ * such probe per call alive after its 30-second rejection, with nothing
+ * bounding the pile.
+ *
+ * Set well above the read pool's 4 because a probe is cheap: a healthy stat
+ * takes milliseconds, so even a fan-out of hundreds only queues briefly — and
+ * the deadline covers the queue too (see `SCRIPT_FS_READ_TIMEOUT_MS`), so a
+ * probe that never gets a slot is bounded exactly like one whose provider
+ * never answers.
+ */
+export const SCRIPT_FS_MAX_CONCURRENT_STATS = 8;
+
+/**
+ * Cap on DETACHED probes: `SCRIPT_FS_MAX_ORPHANED_READS`'s counterpart for the
+ * probe pool, and it buys the same thing — handing a timed-out probe's permit
+ * straight back keeps a handful of stalls from starving healthy `exists()`
+ * calls, but on its own it would let a script fanning out probes every 30
+ * seconds accumulate detached stats without limit. Past this cap the scheduler
+ * withholds a newly timed-out probe's permit instead, and restores it as soon
+ * as detachment capacity reopens (the same held/promotion recovery reads get).
+ *
+ * Net bound: at most `SCRIPT_FS_MAX_CONCURRENT_STATS +
+ * SCRIPT_FS_MAX_ORPHANED_STATS` (24) provider `stat` requests are alive at
+ * once, however many probes a script issues and however dead the provider is.
+ */
+export const SCRIPT_FS_MAX_ORPHANED_STATS = 16;
+
 function createReadSlotScheduler(): ReadSlotScheduler {
   return new ReadSlotScheduler({
     maxConcurrent: SCRIPT_FS_MAX_CONCURRENT_READS,
@@ -86,18 +131,31 @@ function createReadSlotScheduler(): ReadSlotScheduler {
   });
 }
 
+function createStatSlotScheduler(): ReadSlotScheduler {
+  return new ReadSlotScheduler({
+    maxConcurrent: SCRIPT_FS_MAX_CONCURRENT_STATS,
+    deadlineMs: SCRIPT_FS_READ_TIMEOUT_MS,
+    maxOrphaned: SCRIPT_FS_MAX_ORPHANED_STATS
+  });
+}
+
 /** One per host, for the reason `SCRIPT_FS_MAX_CONCURRENT_READS` is global. */
 let readSlots = createReadSlotScheduler();
+/** The probe pool — same machine, own budgets. See `SCRIPT_FS_MAX_CONCURRENT_STATS`. */
+let statSlots = createStatSlotScheduler();
 
 /**
- * Installs a fresh scheduler and hands it back. Exists so a test can start
- * from a known-empty machine and inspect it directly: detached work outlives
- * the call that started it by design, so without this a read left in flight by
- * one test would charge its capacity against every test after it.
+ * Installs a fresh scheduler for BOTH pools and hands them back. Exists so a
+ * test can start from a known-empty machine and inspect it directly: detached
+ * work outlives the call that started it by design, so without this a read (or
+ * a probe) left in flight by one test would charge its capacity against every
+ * test after it. Both are reset together because both are module-global and
+ * both can be left charged by a single test.
  */
-export function resetReadSlotScheduler(): ReadSlotScheduler {
+export function resetScriptFsSchedulers(): { readSlots: ReadSlotScheduler; statSlots: ReadSlotScheduler } {
   readSlots = createReadSlotScheduler();
-  return readSlots;
+  statSlots = createStatSlotScheduler();
+  return { readSlots, statSlots };
 }
 
 export interface ScriptFsContext {
@@ -546,8 +604,9 @@ async function readLocalFileBounded(fsPath: string, loggedPath: string, ctx: Scr
 export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): Promise<boolean> {
   const resolvedPath = validateAndResolve(requested, ctx, "exists");
 
-  // Not gated (no read hazard — see below), but cheap enough to skip anyway:
-  // no reason to stat and log on behalf of a run that's already ended.
+  // Cheap early-out, exactly as in `scriptFsReadText`: the run already ended
+  // (this call hasn't queued for a probe permit yet) — no reason to stat and
+  // log on behalf of a session nobody's watching anymore.
   if (ctx.isAborted()) {
     throw makeAbortedError(ctx, "exists", resolvedPath);
   }
@@ -563,18 +622,33 @@ export async function scriptFsExists(requested: unknown, ctx: ScriptFsContext): 
   // conflating them is the same class of bug as the out-of-scope-probe-
   // returns-false one guarded above.
   //
-  // WHY UNGATED, and why that must not be "tidied up" later into the gated
-  // path: a `stat` allocates no buffer, so there is nothing for the
-  // concurrency gate to bound and no reason to make an existence probe queue
-  // behind slow reads — and `SCRIPT_FS_MAX_ORPHANED_READS` budgets host-side
-  // READ BUFFERS, which a bufferless `stat` never spends. Charging detached
-  // stats to it would steal capacity from the genuine buffer-holding reads it
-  // exists to cap, degrading the pool to pay for memory nobody allocated. (A
-  // detached stat does still pin this call's captured `ctx` until it settles,
-  // exactly as a detached read does; that residue is not what the detached
-  // slots are counting.)
+  // WHY ITS OWN POOL, and why probes must never be moved onto `readSlots`:
+  // `SCRIPT_FS_MAX_CONCURRENT_READS` / `SCRIPT_FS_MAX_ORPHANED_READS` budget
+  // host-side READ BUFFERS, which a bufferless `stat` never spends. Charging
+  // probes there would steal capacity from the genuine buffer-holding reads
+  // those caps exist for, and would make an existence check queue behind slow
+  // reads for no reason at all. Keeping the two instances disjoint is what
+  // makes "a stalled probe cannot starve reads, and vice versa" structural.
+  //
+  // WHY GATED AT ALL, given there is no buffer to bound: the deadline bounds
+  // the promise the CALLER waits on, not the probe behind it — nothing can
+  // cancel an in-flight `stat`. A detached probe keeps a provider request
+  // pending and pins this call's captured `ctx` until it settles, which
+  // against a hung provider is never; ungated, a script fanning out probes
+  // would leave one such residue per call, with nothing bounding the pile.
+  // So probes get their OWN budget and degrade exactly like reads do —
+  // bounded at `SCRIPT_FS_MAX_CONCURRENT_STATS + SCRIPT_FS_MAX_ORPHANED_STATS`
+  // live stats, with the same held/promotion recovery once capacity reopens.
   const uri = uriOf(resolvedPath, ctx.scriptUri);
-  return await readSlots.runUngated({
+  return await statSlots.runGated({
+    label: resolvedPath,
+    // The case the early-out above cannot catch: the run was alive when this
+    // probe queued and died while it sat in the FIFO. Refusing in the same
+    // tick the permit is granted, before any I/O, keeps a dead run's backlog
+    // from draining through slots other sessions are waiting for.
+    onAdmitted: () => {
+      if (ctx.isAborted()) throw makeAbortedError(ctx, "exists", resolvedPath);
+    },
     run: (logAllowed) => statExists(uri, resolvedPath, withGuardedLog(ctx, logAllowed)),
     timeoutError: () => readDeadlineError(ctx, "exists", resolvedPath)
   });

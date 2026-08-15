@@ -143,10 +143,12 @@ import {
   buildScriptFsScope,
   boundedReadFile,
   initialReadCapacity,
-  resetReadSlotScheduler,
+  resetScriptFsSchedulers,
   SCRIPT_FS_MAX_CONCURRENT_READS,
   SCRIPT_FS_READ_TIMEOUT_MS,
   SCRIPT_FS_MAX_ORPHANED_READS,
+  SCRIPT_FS_MAX_CONCURRENT_STATS,
+  SCRIPT_FS_MAX_ORPHANED_STATS,
   type ScriptFsContext
 } from "../../../src/services/scripts/scriptFs";
 import { createSemaphore, type ReadSlotScheduler } from "../../../src/services/scripts/readSlotScheduler";
@@ -170,11 +172,12 @@ const realNodeStat = (fsp as unknown as { __realStat: typeof fsp.stat }).__realS
 
 let tmpRoot: string;
 /**
- * The scheduler `scriptFsReadText` / `scriptFsExists` are running against for
- * the current test — replaced per test so no detached read can carry its
- * permit or its detached-slot charge into the next one.
+ * The two schedulers `scriptFsReadText` / `scriptFsExists` are running against
+ * for the current test — replaced per test so no detached read (or probe) can
+ * carry its permit or its detached-slot charge into the next one.
  */
 let readSlots: ReadSlotScheduler;
+let statSlots: ReadSlotScheduler;
 /**
  * Every gate handed out by `gateOpens` / `gateStats` this test. Released
  * unconditionally in `afterEach` so a FAILING assertion can't strand a real
@@ -185,7 +188,7 @@ const pendingGates: Array<{ resolve: () => void }> = [];
 beforeEach(async () => {
   vi.clearAllMocks();
   remoteFiles.clear();
-  readSlots = resetReadSlotScheduler();
+  ({ readSlots, statSlots } = resetScriptFsSchedulers());
   tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "nexus-scriptfs-"));
 });
 
@@ -910,7 +913,7 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
       // semaphore. Once admitted (after a stall's deadline frees a slot), it
       // should use the REAL open() and succeed quickly. Issued one virtual
       // millisecond short of the stalls' deadline rather than alongside them:
-      // the deadline bounds the whole call, queueing included (invariant 7),
+      // the deadline bounds the whole call, queueing included (invariant 6),
       // so a read issued back at t=0 would reach its OWN deadline in the same
       // instant the stalls reach theirs. Issued here it has a full window of
       // slack, which leaves admission the only thing this test observes.
@@ -1200,7 +1203,7 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
       // only NOW, after wave 3's deadline window has closed: what this test
       // asks is whether a permit is ever freed, and a probe issued earlier
       // would share that window and hit its OWN queueing deadline inside it
-      // (bounding the queue is invariant 7's job, pinned by its own test
+      // (bounding the queue is invariant 6's job, pinned by its own test
       // above — here it would just mask the permit question).
       nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
       const probePromise = scriptFsReadText("probe.txt", ctx);
@@ -1857,11 +1860,11 @@ describe("nexus.fs — a deadline that fires for an ALREADY-DEAD run writes no a
     expect(log).not.toHaveBeenCalled();
   }, 10_000);
 
-  it("exists: same rule on the ungated probe path — an aborted run's timed-out stat writes no audit line either", async () => {
-    // ⊘ guarding only the gated read's call site instead of the shared
-    // deadline race — `exists()` reaches the deadline directly (no permit, no orphan
-    // slot), so a fix applied one level too high would leave this path still
-    // logging for a dead run.
+  it("exists: same rule on the probe path — an aborted run's timed-out stat writes no audit line either", async () => {
+    // ⊘ guarding only `readText`'s call site instead of the shared deadline
+    // race — `exists()` runs on its OWN scheduler instance (the probe pool),
+    // so a fix applied to one pool's call site rather than to the machine both
+    // share would leave this path still logging for a dead run.
     const { ctx, scriptDir, log } = await makeCtx();
     await fsp.writeFile(path.join(scriptDir, "hung.txt"), "x");
 
@@ -2234,12 +2237,14 @@ describe("scriptFsExists — stat deadline (P1: a stalled stat must not hang the
   });
 
   it("orphan-pool isolation: timed-out exists() stats consume NO orphan slots — a readText wave timing out afterwards still finds room and releases its permits", async () => {
-    // ⊘ routing exists() through readText's FULL orphan machinery (letting a
-    // timed-out stat take an orphan slot / land on the held queue).
+    // ⊘ routing exists() through the READ scheduler (letting a timed-out stat
+    // take a READ orphan slot / land on the read pool's held queue).
     // `SCRIPT_FS_MAX_ORPHANED_READS` is a budget for host-side READ BUFFERS
-    // (see its doc comment); a bare stat allocates none and holds no permit,
-    // so counting it there would steal capacity from genuine reads and
-    // degrade the pool for a memory cost that was never incurred.
+    // (see its doc comment); a bare stat allocates none, so charging it there
+    // would steal capacity from genuine reads and degrade the read pool for a
+    // memory cost that was never incurred. Probes are bounded too — on their
+    // own instance, by `SCRIPT_FS_MAX_ORPHANED_STATS` — which is exactly the
+    // separation this asserts.
     //
     // The discriminator: SCRIPT_FS_MAX_ORPHANED_READS hung exists() probes
     // are timed out FIRST. Under the wrong implementation they fill the
@@ -2262,8 +2267,12 @@ describe("scriptFsExists — stat deadline (P1: a stalled stat must not hang the
 
     vi.useFakeTimers();
     try {
-      // SCRIPT_FS_MAX_ORPHANED_READS hung exists() probes — ungated by the
-      // read semaphore, so all of them are in flight at once — timed out.
+      // Enough hung exists() probes to fill the READ orphan pool exactly, IF
+      // they were (wrongly) charged to it. The probe pool admits all of them
+      // at once — asserted below, and guarded here so a future change to
+      // either constant fails loudly instead of quietly turning this into a
+      // test of something else.
+      expect(SCRIPT_FS_MAX_ORPHANED_READS).toBeLessThanOrEqual(SCRIPT_FS_MAX_CONCURRENT_STATS);
       const existsGates = gateStats(SCRIPT_FS_MAX_ORPHANED_READS);
       const existsSettled = Promise.allSettled(
         Array.from({ length: SCRIPT_FS_MAX_ORPHANED_READS }, () => scriptFsExists("e.txt", ctx))
@@ -2308,6 +2317,208 @@ describe("scriptFsExists — stat deadline (P1: a stalled stat must not hang the
       vi.useRealTimers();
     }
   }, 20_000);
+});
+
+describe("scriptFsExists — the probe pool (P2: a stalled provider must not leave unbounded detached stats behind)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Hangs EVERY `vscode.workspace.fs.stat` behind one shared gate, released by the caller (and by `afterEach`). */
+  function hangAllStats(): { resolve: () => void } {
+    const gate = deferred<void>();
+    pendingGates.push(gate);
+    statSpy.mockImplementation(async () => {
+      await gate.promise;
+      return { type: FileType.File, ctime: 0, mtime: 0, size: 1 };
+    });
+    return gate;
+  }
+
+  it("bounded detached probes: 30 concurrent exists() against a provider that never answers leave at most SCRIPT_FS_MAX_CONCURRENT_STATS + SCRIPT_FS_MAX_ORPHANED_STATS stats alive, not one per call", async () => {
+    // ⊘ the pre-fix `scriptFsExists`, which ran its probe UNGATED: the
+    // deadline bounds the promise the CALLER waits on, not the probe behind
+    // it, so all 30 stats below fire at once and all 30 are still pinned
+    // (each holding a provider request and its call's captured ctx) after
+    // their rejections — `statSpy` reads 30 instead of plateauing at 24.
+    // The discriminator is the count AFTER every caller has been rejected:
+    // that is precisely when an ungated pool has nothing left bounding it.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "e.txt"), "x");
+    const cap = SCRIPT_FS_MAX_CONCURRENT_STATS + SCRIPT_FS_MAX_ORPHANED_STATS; // 24
+    const attempted = 30; // deliberately more than can ever be in flight at once
+
+    const gate = hangAllStats();
+    vi.useFakeTimers();
+    try {
+      const settled = Promise.allSettled(Array.from({ length: attempted }, () => scriptFsExists("e.txt", ctx)));
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Every caller's deadline fires here. Permits handed back by the
+      // timing-out probes cascade into admitting queued ones (that is the
+      // liveness half), so this advance is also what drives the pool to its
+      // high-water mark — the orphan cap is the only thing that stops it.
+      await vi.advanceTimersByTimeAsync(SCRIPT_FS_READ_TIMEOUT_MS);
+      for (const r of await settled) {
+        expect(r.status).toBe("rejected");
+        expect((r as PromiseRejectedResult).reason).toMatchObject({ code: "ReadFailed" });
+      }
+
+      expect(statSpy.mock.calls.length).toBeLessThanOrEqual(cap);
+      // Not merely "bounded": the pool genuinely reached its bound, so the
+      // assertion above can't pass for the trivial reason that nothing ran.
+      expect(statSpy.mock.calls.length).toBe(cap);
+
+      vi.useRealTimers();
+      gate.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("probes beyond the pool QUEUE rather than fire immediately: with SCRIPT_FS_MAX_CONCURRENT_STATS stats hung, the next ones never reach the provider", async () => {
+    // ⊘ an ungated (or unbounded-concurrency) exists(): all
+    // SCRIPT_FS_MAX_CONCURRENT_STATS + 3 probes below would call `stat`
+    // straight away, so the count would be 11 rather than the pool's 8.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "e.txt"), "x");
+    const extra = 3;
+
+    const gate = hangAllStats();
+    const probes = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_STATS + extra }, () =>
+      scriptFsExists("e.txt", ctx).catch((e: unknown) => e)
+    );
+
+    await waitFor(() => statSpy.mock.calls.length >= SCRIPT_FS_MAX_CONCURRENT_STATS);
+    // Real-time margin so "still queued" is a genuine observation rather than
+    // insufficient microtask flushing.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(statSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_STATS);
+
+    // The queued ones are not lost: as permits free up they run normally.
+    gate.resolve();
+    const results = await Promise.all(probes);
+    expect(results).toEqual(Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_STATS + extra }, () => true));
+    expect(statSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_STATS + extra);
+  }, 10_000);
+
+  it("pool separation: a saturated PROBE pool leaves readText untouched — a read admits and completes immediately", async () => {
+    // ⊘ routing exists() through `readSlots` (one shared pool): the probes
+    // below would eat every read permit, and the readText would sit in the
+    // FIFO until a 30-second deadline instead of answering — the race sentinel
+    // is what it would resolve to.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "read-me.txt"), "hi");
+
+    const gate = hangAllStats();
+    const probes = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_STATS + 4 }, () =>
+      scriptFsExists("read-me.txt", ctx).catch((e: unknown) => e)
+    );
+    // `>=`, not `===`: how many probes are in flight is the OTHER tests'
+    // subject. All this one needs is a probe pool under load — the
+    // discriminating observation is what that does to a READ.
+    await waitFor(() => statSpy.mock.calls.length >= SCRIPT_FS_MAX_CONCURRENT_STATS);
+    // The read pool must be untouched by any of that.
+    expect(readSlots.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
+
+    const outcome = await Promise.race([
+      scriptFsReadText("read-me.txt", ctx),
+      new Promise<string>((resolve) => setTimeout(() => resolve("STILL-QUEUED"), 500))
+    ]);
+    expect(outcome).toBe("hi");
+
+    gate.resolve();
+    await Promise.all(probes);
+  }, 10_000);
+
+  it("pool separation, the other direction: a saturated READ pool leaves exists() untouched — a probe admits and answers immediately", async () => {
+    // ⊘ the same shared-pool mutation seen from the other side: with every
+    // read permit held by a stalled open(), an exists() sharing that pool
+    // would queue behind them instead of answering.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "probe-me.txt"), "x");
+    for (let i = 0; i < SCRIPT_FS_MAX_CONCURRENT_READS; i++) {
+      await fsp.writeFile(path.join(scriptDir, `stall${i}.txt`), "x");
+    }
+
+    const readGates = gateOpens(SCRIPT_FS_MAX_CONCURRENT_READS);
+    const stalled = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
+      scriptFsReadText(`stall${i}.txt`, ctx).catch((e: unknown) => e)
+    );
+    await waitFor(() => nodeOpenSpy.mock.calls.length === SCRIPT_FS_MAX_CONCURRENT_READS);
+    expect(readSlots.snapshot().permitsInUse).toBe(SCRIPT_FS_MAX_CONCURRENT_READS);
+    expect(statSlots.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
+
+    const outcome = await Promise.race([
+      scriptFsExists("probe-me.txt", ctx),
+      new Promise<string>((resolve) => setTimeout(() => resolve("STILL-QUEUED"), 500))
+    ]);
+    expect(outcome).toBe(true);
+
+    readGates.forEach((g) => g.resolve());
+    await Promise.all(stalled);
+  }, 10_000);
+
+  it("a probe granted a permit only after its run ended is refused at admission and never reaches the provider", async () => {
+    // ⊘ dropping `onAdmitted` from the probe's gated call (keeping only the
+    // cheap pre-queue early-out): the queued probe below was alive when it
+    // joined the FIFO and dead by the time a permit freed, so the pre-check
+    // cannot catch it — it would stat and log on behalf of a run nobody is
+    // watching, and `statSpy` would climb to SCRIPT_FS_MAX_CONCURRENT_STATS
+    // + 1. Exactly the check `scriptFsReadText` already makes on its own pool.
+    const { ctx, scriptDir } = await makeCtx();
+    await fsp.writeFile(path.join(scriptDir, "e.txt"), "x");
+
+    let aborted = false;
+    const abortableCtx: ScriptFsContext = { ...ctx, isAborted: () => aborted };
+
+    const gate = hangAllStats();
+    const busy = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_STATS }, () =>
+      scriptFsExists("e.txt", ctx).catch((e: unknown) => e)
+    );
+    await waitFor(() => statSpy.mock.calls.length === SCRIPT_FS_MAX_CONCURRENT_STATS);
+
+    // Issued while the run is still alive, so it genuinely queues.
+    const queued = scriptFsExists("e.txt", abortableCtx).catch((e: unknown) => e);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(statSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_STATS);
+
+    // The run ends, THEN the pool frees up and the queued probe is admitted.
+    aborted = true;
+    gate.resolve();
+
+    await expect(queued).resolves.toMatchObject({ code: "Stopped" });
+    expect(statSpy.mock.calls.length).toBe(SCRIPT_FS_MAX_CONCURRENT_STATS);
+    await Promise.all(busy);
+    // Its permit went straight back — nothing left charged to the probe pool.
+    expect(statSlots.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
+  }, 10_000);
+
+  it("healthy fan-out at scale: 100 parallel exists() against an instant provider all resolve, with the right answers, in bounded time", async () => {
+    // The cost of bounding the pool is that probes past the cap queue — this
+    // pins that the queue drains (no deadlock, no lost probe, no answer
+    // swapped between callers) for a fan-out an order of magnitude past it.
+    // ⊘ a permit leaked on either the `true` or the `false` path: after
+    // SCRIPT_FS_MAX_CONCURRENT_STATS such calls the pool would wedge and the
+    // rest would only settle at their 30-second deadline, well past this
+    // test's own timeout.
+    const { ctx } = await makeCtx();
+    const n = 100;
+    statSpy.mockImplementation(async (uri: { fsPath: string }) => {
+      const index = Number(/p(\d+)\.txt$/.exec(uri.fsPath)?.[1]);
+      if (index % 2 !== 0) throw Object.assign(new Error(`ENOENT: p${index}.txt`), { code: "FileNotFound" });
+      return { type: FileType.File, ctime: 0, mtime: 0, size: 1 };
+    });
+
+    const startedAt = Date.now();
+    const results = await Promise.all(Array.from({ length: n }, (_, i) => scriptFsExists(`p${i}.txt`, ctx)));
+    expect(results).toEqual(Array.from({ length: n }, (_, i) => i % 2 === 0));
+    expect(statSpy.mock.calls.length).toBe(n);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    // Everything handed back: no permit, and no detached charge, left behind.
+    expect(statSlots.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
+  }, 10_000);
 });
 
 describe("NoScriptDir — untitled scripts", () => {

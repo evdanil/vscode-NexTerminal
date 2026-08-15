@@ -624,74 +624,17 @@ describe("ReadSlotScheduler — the audit guard belongs to whoever wins the race
   });
 });
 
-describe("ReadSlotScheduler — ungated work takes the deadline and nothing else", () => {
-  it("never queues behind reads: a probe starts immediately with every permit occupied, and consumes none", async () => {
-    // ⊘ routing an ungated probe through the gated path — with the pool
-    // saturated it would sit in the FIFO instead of answering, which is what
-    // makes a bufferless existence check cost a read's worth of capacity.
-    const scheduler = makeScheduler({ maxConcurrent: 1, maxOrphaned: 1, deadlineMs: 5_000 });
-    const readGate = deferred<string>();
-    const read = scheduler.runGated({ label: "read", run: () => readGate.promise, timeoutError: () => TIMED_OUT });
-    await tick(1);
-    expect(scheduler.snapshot().permitsInUse).toBe(1);
-
-    let probeStarted = false;
-    const probe = scheduler.runUngated({
-      run: () => {
-        probeStarted = true;
-        return Promise.resolve(true);
-      },
-      timeoutError: () => TIMED_OUT
-    });
-    await expect(probe).resolves.toBe(true);
-    expect(probeStarted).toBe(true);
-    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 1, orphaned: 0, held: [] });
-
-    readGate.resolve("ok");
-    await expect(read).resolves.toBe("ok");
-    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
-  });
-
-  it("a timed-out probe charges no detached slot — that budget belongs to buffer-holding reads", async () => {
-    // ⊘ letting an ungated timeout increment the detached count: it would
-    // steal capacity from the reads the cap exists to bound, degrading the
-    // pool to pay for memory nobody allocated. The discriminator is the
-    // snapshot right after the probe's deadline, while its work is still
-    // genuinely in flight.
-    const scheduler = makeScheduler({ maxConcurrent: 1, maxOrphaned: 1 });
-    const probeGate = deferred<boolean>();
-    const probe = scheduler.runUngated({ run: () => probeGate.promise, timeoutError: () => TIMED_OUT });
-
-    await expect(probe).rejects.toBe(TIMED_OUT);
-    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
-
-    // With the pool uncontaminated, a read that times out afterwards still
-    // finds room to detach and hands its permit straight back.
-    const { work, gate } = stalledWork("read");
-    await expect(scheduler.runGated(work)).rejects.toBe(TIMED_OUT);
-    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 1, held: [] });
-
-    probeGate.resolve(true);
-    gate.resolve("late");
-    await tick();
-    expect(scheduler.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
-  });
-
-  it("returns a healthy result without waiting on the deadline", async () => {
-    const scheduler = makeScheduler();
-    await expect(
-      scheduler.runUngated({ run: () => Promise.resolve(false), timeoutError: () => TIMED_OUT })
-    ).resolves.toBe(false);
-  });
-
-  it("clears its deadline timer on the fast path", async () => {
+describe("ReadSlotScheduler — the deadline timer on the fast path", () => {
+  it("a healthy call arms exactly one timer and clears it when it settles", async () => {
     // ⊘ a `clearTimeout` reachable only from the timeout branch — every
-    // healthy probe would pin a live timer for the whole deadline window.
+    // healthy call would pin a live timer for the whole deadline window.
+    // (The queue-then-run case is covered by "one timer per call" above; this
+    // is the same property for the simplest path there is.)
     const scheduler = makeScheduler();
     const setTimeoutSpy = vi.spyOn(global, "setTimeout");
     const clearTimeoutSpy = vi.spyOn(global, "clearTimeout");
     try {
-      await scheduler.runUngated({ run: () => Promise.resolve(true), timeoutError: () => TIMED_OUT });
+      await scheduler.runGated({ label: "quick", run: () => Promise.resolve(true), timeoutError: () => TIMED_OUT });
       expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
       expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
       expect(clearTimeoutSpy.mock.calls[0][0]).toBe(setTimeoutSpy.mock.results[0].value);
@@ -703,10 +646,13 @@ describe("ReadSlotScheduler — ungated work takes the deadline and nothing else
 });
 
 describe("ReadSlotScheduler — instances are independent", () => {
-  it("a stalled read on one scheduler charges nothing to another", async () => {
+  it("a stalled operation on one scheduler charges nothing to another", async () => {
     // This is what lets a test start from a known-empty machine: detached work
     // outlives the call that started it, so per-instance state is the only
-    // thing that keeps one test's stall out of the next test's budget.
+    // thing that keeps one test's stall out of the next test's budget. It is
+    // also what `scriptFs.ts` leans on to keep its read pool and its probe
+    // pool from consuming each other's capacity — same machine, two instances,
+    // no shared state between them.
     const first = makeScheduler({ maxConcurrent: 1, maxOrphaned: 1 });
     const second = makeScheduler({ maxConcurrent: 1, maxOrphaned: 1 });
     const { work, gate } = stalledWork("stall");
@@ -715,6 +661,17 @@ describe("ReadSlotScheduler — instances are independent", () => {
     expect(first.snapshot().orphaned).toBe(1);
     expect(second.snapshot()).toMatchObject({ permitsInUse: 0, orphaned: 0, held: [] });
 
+    // The second instance's own capacity is genuinely intact, not merely
+    // reported as such: a call on it is admitted and runs while the first is
+    // still fully occupied by its detached stall.
+    const fresh = stalledWork("fresh");
+    const freshCall = second.runGated(fresh.work);
+    await tick(1);
+    expect(fresh.runs()).toBe(1);
+    expect(second.snapshot().permitsInUse).toBe(1);
+
+    fresh.gate.resolve("through");
+    await expect(freshCall).resolves.toBe("through");
     gate.resolve("late");
     await tick();
   });
