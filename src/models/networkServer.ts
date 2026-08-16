@@ -70,6 +70,32 @@ export interface NetworkServerTransferSummary {
   readonly speedBps: number;
 }
 
+/**
+ * One TFTP transfer that has already finished, as kept in the sidebar's
+ * History list.
+ *
+ * Deliberately **not** a {@link NetworkServerTransferSummary}: a finished
+ * transfer has no progress, no speed and no live identity to act on, and
+ * carrying those fields around as permanently-stale numbers would invite a UI
+ * to render them. What is left is what a user asks after the fact — what file,
+ * from whom, and when.
+ *
+ * Transient by design: the list lives in memory in `NetworkServerManager` and
+ * is never written through `ConfigRepository`. It is a record of what this
+ * session of this service did, not a persistent audit log — and it is cleared
+ * on every start/stop/restart precisely so it can never be read as one.
+ */
+export interface NetworkServerTransferHistoryEntry {
+  /** The transfer's `address:port` TID — unique only among *live* transfers. */
+  readonly id: string;
+  /** Filename, when the emitting adapter reported one. */
+  readonly filename?: string;
+  /** Client as shown to the operator: `"hostname (ip)"`, or the bare IP. */
+  readonly client: string;
+  /** Epoch ms the transfer completed (host clock, i.e. when the event landed). */
+  readonly timestamp: number;
+}
+
 /** One active DHCP lease, as rendered in the tree. */
 export interface NetworkServerLeaseSummary {
   readonly mac: string;
@@ -119,4 +145,14 @@ export interface ActiveNetworkServerSession {
   /** Epoch ms of the last successful transition into `running`. */
   readonly startedAt?: number;
   readonly detail?: NetworkServerRuntimeDetail;
+  /**
+   * Transfers that finished during the current run, newest first — TFTP only.
+   *
+   * A sibling of `detail` rather than a field inside it: `detail` is replaced
+   * wholesale by every daemon runtime refresh, and history is accumulated
+   * host-side across those refreshes. Keeping it outside is what lets
+   * {@link NexusCore.setNetworkServerRuntimeSnapshot} overwrite the runtime
+   * without touching the history.
+   */
+  readonly transferHistory?: readonly NetworkServerTransferHistoryEntry[];
 }

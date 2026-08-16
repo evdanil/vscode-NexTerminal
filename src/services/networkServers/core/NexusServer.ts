@@ -65,6 +65,25 @@ export interface ServerConnectionEvent {
   readonly detail?: string;
   /** Machine-readable classification of the failure, when one is available. */
   readonly code?: string;
+
+  // --- Structured companions to `summary` -----------------------------------
+  //
+  // `summary` stays the thing a consumer *shows*; these are the same facts in a
+  // form a consumer can *store*. A transfer-history list needs a filename and a
+  // client on their own — parsing them back out of a sentence assembled for a
+  // human would break the moment that sentence is reworded. All three are
+  // optional because an adapter emits only the ones its protocol has (TFTP
+  // fills all three; DHCP lease edges carry none of them today).
+
+  /** Stable id of the subject — for TFTP, the transfer's `address:port` TID. */
+  readonly id?: string;
+  /** What the event is about: the TFTP filename. */
+  readonly resource?: string;
+  /**
+   * Client as shown to the operator: `"hostname (ip)"` when reverse DNS
+   * resolved, otherwise the bare IP — the exact string `summary` embeds.
+   */
+  readonly client?: string;
 }
 
 /**

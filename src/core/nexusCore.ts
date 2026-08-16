@@ -29,7 +29,8 @@ import type {
   ActiveNetworkServerSession,
   NetworkServerKind,
   NetworkServerRuntimeDetail,
-  NetworkServerStatus
+  NetworkServerStatus,
+  NetworkServerTransferHistoryEntry
 } from "../models/networkServer";
 import {
   cloneDhcpProfile,
@@ -2449,6 +2450,31 @@ export class NexusCore {
       detail,
       boundPort: boundPort !== undefined ? boundPort : existing.boundPort
     });
+    this.emitChanged();
+  }
+
+  /**
+   * Replaces the completed-transfer history for a service.
+   *
+   * Separate from {@link setNetworkServerRuntimeSnapshot} because the two have
+   * different owners and different lifetimes: the runtime detail is whatever
+   * the daemon reports right now, while the history is accumulated host-side by
+   * `NetworkServerManager` across the whole run. The manager owns the list and
+   * pushes the current value; this method only mirrors it into the snapshot so
+   * the tree can render it, and no-ops when the service is not registered.
+   *
+   * Transient by construction — nothing here reaches `ConfigRepository`.
+   *
+   * @param kind Which service the history belongs to (TFTP today).
+   * @param entries Newest-first history, already capped by the manager.
+   */
+  public setNetworkServerTransferHistory(
+    kind: NetworkServerKind,
+    entries: readonly NetworkServerTransferHistoryEntry[]
+  ): void {
+    const existing = this.activeNetworkServerSessions.get(kind);
+    if (!existing) return;
+    this.activeNetworkServerSessions.set(kind, { ...existing, transferHistory: entries });
     this.emitChanged();
   }
 

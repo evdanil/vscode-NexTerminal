@@ -384,6 +384,9 @@ export class TftpAdapter extends BaseNexusServer {
       this.emitConnection({
         phase: 'started',
         summary: `${describeDirection(info.direction)} started from ${this.describeClient(info.peer.address)} · ${info.filename}`,
+        id: info.id,
+        resource: info.filename,
+        client: this.describeClient(info.peer.address),
       });
       this.emit('runtimeUpdate');
     });
@@ -413,6 +416,9 @@ export class TftpAdapter extends BaseNexusServer {
       this.emitConnection({
         phase: 'completed',
         summary: `${describeDirection(info.direction)} finished from ${this.describeClient(info.peer.address)} · ${info.filename} (${info.bytes} B in ${total})`,
+        id: info.id,
+        resource: info.filename,
+        client: this.describeClient(info.peer.address),
       });
       this.emit('runtimeUpdate', true);
     });
@@ -421,6 +427,9 @@ export class TftpAdapter extends BaseNexusServer {
       this.emitConnection({
         phase: 'failed',
         summary: `${describeDirection(info.direction)} failed from ${this.describeClient(info.peer.address)} · ${info.filename}`,
+        id: info.id,
+        resource: info.filename,
+        client: this.describeClient(info.peer.address),
         detail: err.message,
         // `ProtocolError` and friends carry their classification in `name`;
         // a plain `Error` would only contribute the useless literal "Error".
