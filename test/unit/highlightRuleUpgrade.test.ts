@@ -42,10 +42,11 @@ describe("DEFAULT_HIGHLIGHT_RULE_CATALOG", () => {
         pattern: rule.pattern,
         label: rule.label,
         description: rule.description,
-        // Styling is carried so the description backfill can tell whether the
-        // shipped text still describes the rule the user is looking at; it
-        // skews just as easily as the text, so it is pinned the same way.
+        // Styling and flags are carried so the backfill gates can tell whether
+        // the shipped text still describes the rule the user is looking at;
+        // they skew just as easily as the text, so they are pinned the same way.
         color: rule.color,
+        flags: rule.flags,
         bold: rule.bold,
         underline: rule.underline
       }))
@@ -169,6 +170,79 @@ describe("upgradeHighlightRules", () => {
 
       expect(result.rules[0].label).toBe("URLs");
       expect(result.rules[0].description).toBeUndefined();
+    });
+  });
+
+  /**
+   * Flags change what a rule MATCHES, and two shipped labels state it outright:
+   * "Down / inactive (case-sensitive)" / "Up / active (case-sensitive)" exist
+   * precisely because their `g` (no `i`) flags keep lowercase prose words out.
+   * A user who flipped one to `gi` no longer has that rule — backfilling the
+   * shipped text onto it would be false metadata, permanently written to
+   * settings by the activation migration. So label AND description are only
+   * backfilled while the rule still matches the way the default does; the
+   * pattern rewrite is exempt (the old IPv6 pattern is broken under any flags).
+   */
+  describe("metadata backfill is gated on flags still matching the default", () => {
+    const DOWN_PATTERN = "\\bDOWN\\b|\\bINACTIVE\\b|\\bDISABLED\\b|\\bOFFLINE\\b|\\bDEAD\\b";
+
+    // ⊘ Discriminator against a flags-blind gate (the shipped code before this
+    // test): label claims case-sensitivity the rule no longer has.
+    it("backfills NOTHING onto a case-sensitive default the user made insensitive", () => {
+      const mine: HighlightRule = { pattern: DOWN_PATTERN, color: "red", flags: "gi" };
+      const result = upgradeHighlightRules([mine]);
+
+      expect(result.changed).toBe(false);
+      expect(result.rules[0]).toBe(mine);
+      expect(result.rules[0].label).toBeUndefined();
+      expect(result.rules[0].description).toBeUndefined();
+    });
+
+    it("still backfills when the flags match the shipped ones", () => {
+      const result = upgradeHighlightRules([{ pattern: DOWN_PATTERN, color: "red", flags: "g" }]);
+
+      expect(result.changed).toBe(true);
+      expect(result.rules[0].label).toBe("Down / inactive (case-sensitive)");
+      expect(result.rules[0].description).toContain("case-sensitive");
+    });
+
+    // ⊘ Fails against a raw string comparison of flags: absent flags run as
+    // "gi" (compileRule's default), so they ARE the shipped "gi".
+    it("treats absent flags as the runtime default \"gi\"", () => {
+      const result = upgradeHighlightRules([
+        { pattern: "\\bERR(?:OR)?\\b", color: "red", bold: true }
+      ]);
+
+      expect(result.rules[0].label).toBe("Errors");
+    });
+
+    it("compares flags order-insensitively (\"ig\" equals \"gi\")", () => {
+      const result = upgradeHighlightRules([
+        { pattern: "\\bERR(?:OR)?\\b", color: "red", flags: "ig", bold: true }
+      ]);
+
+      expect(result.rules[0].label).toBe("Errors");
+      expect(result.rules[0].description).toBe("ERR / ERROR — general error keyword, bold red.");
+    });
+
+    it("backfills nothing onto a default the user made case-sensitive", () => {
+      const mine: HighlightRule = { pattern: "\\bERR(?:OR)?\\b", color: "red", flags: "g", bold: true };
+      const result = upgradeHighlightRules([mine]);
+
+      expect(result.changed).toBe(false);
+      expect(result.rules[0]).toBe(mine);
+    });
+
+    // ⊘ Discriminator against gating the PATTERN rewrite on flags: the
+    // truncation bug is flags-independent, so the fix must land regardless.
+    it("still rewrites a former IPv6 pattern when the flags were changed, without backfilling text", () => {
+      const result = upgradeHighlightRules([{ pattern: IPV6_V1, color: "magenta", flags: "gi" }]);
+
+      expect(result.changed).toBe(true);
+      expect(result.rules[0].pattern).toBe(CURRENT_IPV6.pattern);
+      expect(result.rules[0].label).toBeUndefined();
+      expect(result.rules[0].description).toBeUndefined();
+      expect(result.rules[0].flags).toBe("gi");
     });
   });
 
