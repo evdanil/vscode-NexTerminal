@@ -228,6 +228,11 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
       })
     ];
 
+    const boot = this.bootOptionsRow(config);
+    if (boot) {
+      rows.push(boot);
+    }
+
     if (detail) {
       rows.push(this.leasesGroup(detail.leases ?? []));
     } else {
@@ -249,6 +254,46 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
     // out is the failure the user is least likely to guess at from the symptom.
     const warning = pct > 85 ? " · ⚠ pool nearly exhausted" : "";
     return `${base} · ${String(active)}/${String(detail.poolSize)} used (${pct.toFixed(1)}%)${warning}`;
+  }
+
+  /**
+   * What a ZTP client will actually be told to boot, or nothing at all.
+   *
+   * The row is omitted when no boot option is configured — most labs hand out
+   * addresses and no more, and an always-present "not configured" row is noise.
+   * The addresses come from `readDhcpConfig`, so an auto-linked TFTP interface
+   * shows the address that will really be advertised rather than the blank
+   * setting behind it, and a vendor-class filter is called out because it is
+   * the reason a correctly-configured boot server reaches nothing.
+   */
+  private bootOptionsRow(config: ReturnType<typeof readDhcpConfig>): NetworkServerDetailTreeItem | undefined {
+    const server = config.nextServer ?? config.tftpServerAddresses?.[0];
+    if (!config.bootFileName && !server) {
+      return undefined;
+    }
+    const description = config.bootFileName
+      ? server
+        ? `${config.bootFileName} via ${server}`
+        : `${config.bootFileName} · no boot server set`
+      : `${server ?? ""} · no boot file set`;
+    const tooltip = [
+      `Boot file (option 67): ${config.bootFileName ?? "not set"}`,
+      `Boot server (option 66): ${config.nextServer ?? "not set"}`,
+      `TFTP servers (option 150): ${config.tftpServerAddresses?.join(", ") ?? "not set"}`,
+      `Vendor class filter (option 60): ${config.vendorClassId ?? "all clients"}`
+    ];
+    if (config.vendorSpecificOptions && config.vendorSpecificOptions.length > 0) {
+      tooltip.push(
+        `Vendor-specific (option 43): ${config.vendorSpecificOptions
+          .map((entry) => `${String(entry.subOption)}=${entry.value}`)
+          .join(", ")}`
+      );
+    }
+    return new NetworkServerDetailTreeItem("networkServer:dhcp:boot", "Boot / ZTP", {
+      description: config.vendorClassId ? `${description} · only "${config.vendorClassId}"` : description,
+      icon: "rocket",
+      tooltip: tooltip.join("\n")
+    });
   }
 
   private noLiveDataRow(kind: NetworkServerKind): NetworkServerDetailTreeItem {

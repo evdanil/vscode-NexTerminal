@@ -1745,8 +1745,52 @@ export function inventorySourceFormDefinition(
  * exactly what a start would use — blanks included, which is how VS Code spells
  * "fall back to the adapter default".
  */
-function tftpServerFields(current: TftpAdapterConfig): FormFieldDescriptor[] {
+export interface NetworkServerFormOptions {
+  /**
+   * The machine's bindable IPv4 addresses, enumerated at open time by
+   * `networkInterfaceBindOptions()`. Omitted (tests, defensive callers) leaves
+   * the picker offering the all-interfaces choice plus whatever the setting
+   * already holds, so no configured address is ever silently dropped.
+   */
+  interfaceOptions?: Array<{ label: string; value: string }>;
+}
+
+const ALL_INTERFACES_OPTION = { label: "All interfaces (0.0.0.0)", value: "" };
+
+/**
+ * The bind-address picker, shared by both services.
+ *
+ * `0.0.0.0` and blank are the same instruction, so both land on the
+ * all-interfaces option; saving it clears the setting rather than writing the
+ * literal address back. An address the setting holds but this machine no longer
+ * has — a NIC that has gone away, or a value typed into the native Settings UI
+ * — is appended and flagged, because a select silently renders its first option
+ * for an unknown value, and Save would then rebind the service to every
+ * interface without the user asking for it.
+ */
+function bindInterfaceField(
+  configured: string | undefined,
+  options: NetworkServerFormOptions | undefined,
+  hint: string
+): FormFieldDescriptor {
+  const trimmed = (configured ?? "").trim();
+  const value = trimmed === "0.0.0.0" ? "" : trimmed;
+  const known = [ALL_INTERFACES_OPTION, ...(options?.interfaceOptions ?? []).filter((option) => option.value !== "")];
+  return {
+    type: "select",
+    key: "interface",
+    label: "Interface",
+    options: known.some((option) => option.value === value)
+      ? known
+      : [...known, { label: `${value} — not currently available`, value }],
+    value,
+    hint
+  };
+}
+
+function tftpServerFields(current: TftpAdapterConfig, options?: NetworkServerFormOptions): FormFieldDescriptor[] {
   return [
+    { type: "section", label: "Network" },
     {
       type: "text",
       key: "root",
@@ -1755,6 +1799,11 @@ function tftpServerFields(current: TftpAdapterConfig): FormFieldDescriptor[] {
       value: current.root,
       hint: "Every file beneath this directory is readable by any host that can reach the port. Point it at a staging directory, not a source tree."
     },
+    bindInterfaceField(
+      current.interface,
+      options,
+      "Which NIC serves TFTP. Pick the lab-facing address on a multi-homed machine; all interfaces also exposes the root over the corporate LAN or VPN."
+    ),
     {
       type: "number",
       key: "port",
@@ -1765,20 +1814,13 @@ function tftpServerFields(current: TftpAdapterConfig): FormFieldDescriptor[] {
       value: current.port,
       hint: "UDP 69 is privileged; if binding is denied the service falls back to 1069 and logs a warning."
     },
+    { type: "section", label: "Access" },
     {
       type: "checkbox",
       key: "allowWrite",
       label: "Allow write requests (WRQ)",
       value: current.allowWrite ?? false,
       hint: "TFTP has no authentication — anything that can reach the port could overwrite files."
-    },
-    {
-      type: "text",
-      key: "interface",
-      label: "Interface",
-      placeholder: "0.0.0.0 (all interfaces)",
-      value: current.interface,
-      hint: "Local IPv4 address to bind to. Set this to the lab-facing NIC on a multi-homed machine."
     }
   ];
 }
@@ -1794,7 +1836,7 @@ export interface DhcpServerFormSeed extends DhcpAdapterConfig {
   readonly autoLinkTftp?: boolean;
 }
 
-function dhcpServerFields(current: DhcpServerFormSeed): FormFieldDescriptor[] {
+function dhcpServerFields(current: DhcpServerFormSeed, options?: NetworkServerFormOptions): FormFieldDescriptor[] {
   const staticTextarea = current.static
     ? Object.entries(current.static)
         .map(([mac, ip]) => `${mac}=${ip}`)
@@ -1804,6 +1846,13 @@ function dhcpServerFields(current: DhcpServerFormSeed): FormFieldDescriptor[] {
     ? current.vendorSpecificOptions.map((entry) => `${entry.subOption}=${entry.value}`).join("\n")
     : undefined;
   return [
+    { type: "section", label: "Network" },
+    bindInterfaceField(
+      current.bindAddress,
+      options,
+      "Which NIC serves DHCP. This is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The port is always UDP 67."
+    ),
+    { type: "section", label: "Address Pool" },
     {
       type: "text",
       key: "rangeStart",
@@ -1868,22 +1917,7 @@ function dhcpServerFields(current: DhcpServerFormSeed): FormFieldDescriptor[] {
       value: current.broadcast,
       hint: "Optional. Handed to clients as option 28."
     },
-    {
-      type: "text",
-      key: "interface",
-      label: "Interface",
-      placeholder: "0.0.0.0 (all interfaces)",
-      value: current.bindAddress,
-      hint: "Local IPv4 address to bind to. This is what stops a lab DHCP server from answering DISCOVERs on the corporate LAN."
-    },
-    {
-      type: "textarea",
-      key: "static",
-      label: "Static Leases",
-      placeholder: "aa:bb:cc:dd:ee:ff=192.168.2.50\n11:22:33:44:55:66=192.168.2.51",
-      value: staticTextarea,
-      hint: "One MAC=IP reservation per line. Reserved addresses are handed to the matching client regardless of the dynamic pool."
-    },
+    { type: "section", label: "Boot / ZTP" },
     {
       type: "text",
       key: "bootFileName",
@@ -1909,6 +1943,13 @@ function dhcpServerFields(current: DhcpServerFormSeed): FormFieldDescriptor[] {
       hint: "Option 150 — comma-separated IPv4 addresses. Cisco phones and IOS ZTP ask for this instead of option 66."
     },
     {
+      type: "checkbox",
+      key: "autoLinkTftp",
+      label: "Auto-link TFTP service",
+      value: current.autoLinkTftp ?? true,
+      hint: "Fill options 66 and 150 from the TFTP service's interface when both are left empty. Ignored when TFTP binds all interfaces."
+    },
+    {
       type: "text",
       key: "vendorClassId",
       label: "Vendor Class Filter",
@@ -1924,21 +1965,24 @@ function dhcpServerFields(current: DhcpServerFormSeed): FormFieldDescriptor[] {
       value: vendorOptionsTextarea,
       hint: "Option 43, one sub-option per line as CODE=VALUE. A 0x-prefixed value is sent as raw bytes, anything else as text."
     },
+    { type: "section", label: "Reservations" },
     {
-      type: "checkbox",
-      key: "autoLinkTftp",
-      label: "Auto-link TFTP service",
-      value: current.autoLinkTftp ?? true,
-      hint: "Fill options 66 and 150 from the TFTP service's interface when both are left empty. Ignored when TFTP binds all interfaces."
+      type: "textarea",
+      key: "static",
+      label: "Static Leases",
+      placeholder: "aa:bb:cc:dd:ee:ff=192.168.2.50\n11:22:33:44:55:66=192.168.2.51",
+      value: staticTextarea,
+      hint: "One MAC=IP reservation per line. Reserved addresses are handed to the matching client regardless of the dynamic pool."
     }
   ];
 }
 
 export function networkServerFormDefinition(
   kind: NetworkServerKind,
-  current: TftpAdapterConfig | DhcpServerFormSeed
+  current: TftpAdapterConfig | DhcpServerFormSeed,
+  options?: NetworkServerFormOptions
 ): FormDefinition {
   return kind === "tftp"
-    ? { title: "TFTP Service Settings", fields: tftpServerFields(current as TftpAdapterConfig) }
-    : { title: "DHCP Service Settings", fields: dhcpServerFields(current as DhcpServerFormSeed) };
+    ? { title: "TFTP Service Settings", fields: tftpServerFields(current as TftpAdapterConfig, options) }
+    : { title: "DHCP Service Settings", fields: dhcpServerFields(current as DhcpServerFormSeed, options) };
 }

@@ -4121,51 +4121,57 @@
           "type": "string",
           "default": "",
           "order": 36,
-          "markdownDescription": "Directory served by the embedded TFTP service. Leave empty to use `~/Nexus/tftp-root`, which is created on first start (falling back to the system temp directory if it cannot be created). **Every file beneath this directory is readable by any host that can reach the bound port** — point it at a staging directory, not at a source tree or a home directory."
+          "markdownDescription": "**TFTP — Network.** Directory served by the embedded TFTP service. Leave empty to use `~/Nexus/tftp-root`, which is created on first start (falling back to the system temp directory if it cannot be created). **Every file beneath this directory is readable by any host that can reach the bound port** — point it at a staging directory, not at a source tree or a home directory."
+        },
+        "nexus.networkServers.tftp.interface": {
+          "type": "string",
+          "default": "",
+          "order": 37,
+          "markdownDescription": "**TFTP — Network.** Local IPv4 address to bind the TFTP socket to, i.e. which network interface serves TFTP. Leave empty for `0.0.0.0` (all interfaces). On a multi-homed machine, set this to the lab-facing NIC (e.g. `192.168.2.1`) so the service is not also reachable over the corporate LAN or VPN. This address is also what `#nexus.networkServers.dhcp.autoLinkTftp#` advertises to DHCP clients, so binding all interfaces leaves the DHCP boot options unset. *Edit Settings on the TFTP service offers this machine's addresses as a list.*"
         },
         "nexus.networkServers.tftp.port": {
           "type": "number",
           "default": 69,
           "minimum": 1,
           "maximum": 65535,
-          "order": 37,
-          "markdownDescription": "UDP port for the embedded TFTP service. The IANA port 69 is privileged: if binding it is denied (no root/Administrator), the service automatically falls back to **1069** and logs a warning instead of failing. Clients must then be pointed at the fallback port — the port actually in use is shown next to the service."
+          "order": 38,
+          "markdownDescription": "**TFTP — Network.** UDP port for the embedded TFTP service. The IANA port 69 is privileged: if binding it is denied (no root/Administrator), the service automatically falls back to **1069** and logs a warning instead of failing. Clients must then be pointed at the fallback port — the port actually in use is shown next to the service."
         },
         "nexus.networkServers.tftp.allowWrite": {
           "type": "boolean",
           "default": false,
-          "order": 38,
-          "markdownDescription": "Accept TFTP write requests (`WRQ`), letting remote clients upload files into the served root. TFTP has no authentication whatsoever, so anything that can reach the port can overwrite files. Leave disabled unless a device genuinely needs to push configs or crash dumps back."
+          "order": 39,
+          "markdownDescription": "**TFTP — Access.** Accept TFTP write requests (`WRQ`), letting remote clients upload files into `#nexus.networkServers.tftp.root#`. TFTP has no authentication whatsoever, so anything that can reach the port can overwrite files. Leave disabled unless a device genuinely needs to push configs or crash dumps back."
         },
-        "nexus.networkServers.tftp.interface": {
+        "nexus.networkServers.dhcp.interface": {
           "type": "string",
           "default": "",
-          "order": 39,
-          "markdownDescription": "Local IPv4 address to bind the TFTP socket to, i.e. which network interface serves TFTP. Leave empty for `0.0.0.0` (all interfaces). On a multi-homed machine, set this to the lab-facing NIC (e.g. `192.168.2.1`) so the service is not also reachable over the corporate LAN or VPN."
+          "order": 40,
+          "markdownDescription": "**DHCP — Network.** Local IPv4 address to bind the DHCP socket to, i.e. which network interface serves DHCP. Leave empty for `0.0.0.0` (all interfaces) — on a multi-homed machine this is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The service always uses the IANA port 67; if binding it is denied (no root/Administrator), it automatically falls back to **1067** and logs a warning, which normal DHCP clients will not reach. *Edit Settings on the DHCP service offers this machine's addresses as a list.*"
         },
         "nexus.networkServers.dhcp.rangeStart": {
           "type": "string",
           "default": "",
-          "order": 40,
-          "markdownDescription": "First address of the DHCP dynamic pool. Leave empty for `192.168.2.10`."
+          "order": 41,
+          "markdownDescription": "**DHCP — Address Pool.** First address of the dynamic pool. Leave empty for `192.168.2.10`. Must not be higher than `#nexus.networkServers.dhcp.rangeEnd#`; addresses reserved in `#nexus.networkServers.dhcp.static#` are handed out regardless of this range."
         },
         "nexus.networkServers.dhcp.rangeEnd": {
           "type": "string",
           "default": "",
-          "order": 41,
-          "markdownDescription": "Last address of the DHCP dynamic pool. Leave empty for `192.168.2.199`."
+          "order": 42,
+          "markdownDescription": "**DHCP — Address Pool.** Last address of the dynamic pool. Leave empty for `192.168.2.199`. The pool size this implies drives the utilization figure shown beside the running service."
         },
         "nexus.networkServers.dhcp.subnet": {
           "type": "string",
           "default": "",
-          "order": 42,
-          "markdownDescription": "Subnet mask handed to DHCP clients (option 1). Leave empty for `255.255.255.0`."
+          "order": 43,
+          "markdownDescription": "**DHCP — Address Pool.** Subnet mask handed to clients (option 1). Leave empty for `255.255.255.0`. Its set bits must be contiguous (`255.255.254.0` is a mask, `255.0.255.0` is not); together with `#nexus.networkServers.dhcp.gateway#` it also derives `#nexus.networkServers.dhcp.broadcast#` when that is left empty."
         },
         "nexus.networkServers.dhcp.gateway": {
           "type": "string",
           "default": "",
-          "order": 43,
-          "markdownDescription": "Default gateway handed to DHCP clients (option 3). Leave empty for `192.168.2.1`."
+          "order": 44,
+          "markdownDescription": "**DHCP — Address Pool.** Default gateway handed to clients (option 3). Leave empty for `192.168.2.1`."
         },
         "nexus.networkServers.dhcp.dns": {
           "type": "array",
@@ -4173,55 +4179,40 @@
             "type": "string"
           },
           "default": [],
-          "order": 44,
-          "markdownDescription": "DNS servers handed to DHCP clients (option 6), in preference order. Leave empty for `8.8.8.8` and `8.8.4.4`."
+          "order": 45,
+          "markdownDescription": "**DHCP — Address Pool.** DNS servers handed to clients (option 6), in preference order. Leave empty for `8.8.8.8` and `8.8.4.4`."
         },
         "nexus.networkServers.dhcp.leaseTimeSec": {
           "type": "number",
           "default": 86400,
           "minimum": 60,
           "maximum": 604800,
-          "order": 45,
-          "markdownDescription": "Lease duration in seconds (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum."
+          "order": 46,
+          "markdownDescription": "**DHCP — Address Pool.** Lease duration in seconds (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum."
         },
         "nexus.networkServers.dhcp.serverId": {
           "type": "string",
           "default": "",
-          "order": 46,
-          "markdownDescription": "Server identifier advertised to clients (option 54). Leave empty for `192.168.2.1`. This should be the address clients see this machine on, otherwise renewals are sent to the wrong host."
+          "order": 47,
+          "markdownDescription": "**DHCP — Address Pool.** Server identifier advertised to clients (option 54). Leave empty for `192.168.2.1`. This should be the address clients see this machine on, otherwise renewals are sent to the wrong host. It is also the value carried in the BOOTP `siaddr` header field, which devices that ignore option 66 boot from."
         },
         "nexus.networkServers.dhcp.broadcast": {
           "type": "string",
           "default": "",
-          "order": 47,
-          "markdownDescription": "Broadcast address handed to DHCP clients (option 28). Leave empty for `192.168.2.255`."
-        },
-        "nexus.networkServers.dhcp.static": {
-          "type": "object",
-          "default": {},
-          "additionalProperties": {
-            "type": "string"
-          },
           "order": 48,
-          "markdownDescription": "Static reservations as a **MAC address → IP address** map, for example `{ \"aa:bb:cc:dd:ee:ff\": \"192.168.2.50\" }`. Reserved addresses are handed to the matching client regardless of the dynamic pool. Entries whose value is not a string are ignored, so one malformed line does not discard the rest of the map."
-        },
-        "nexus.networkServers.dhcp.interface": {
-          "type": "string",
-          "default": "",
-          "order": 49,
-          "markdownDescription": "Local IPv4 address to bind the DHCP socket to, i.e. which network interface serves DHCP. Leave empty for `0.0.0.0` (all interfaces) — on a multi-homed machine this is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The service always uses the IANA port 67; if binding it is denied (no root/Administrator), it automatically falls back to **1067** and logs a warning, which normal DHCP clients will not reach."
+          "markdownDescription": "**DHCP — Address Pool.** Broadcast address handed to clients (option 28). Leave empty to derive it from `#nexus.networkServers.dhcp.gateway#` and `#nexus.networkServers.dhcp.subnet#`."
         },
         "nexus.networkServers.dhcp.bootFileName": {
           "type": "string",
           "default": "",
-          "order": 50,
-          "markdownDescription": "**DHCP Option 67** (bootfile-name) — the file a PXE or ZTP client fetches from the boot server once it has an address, for example `ios-image.bin`, `pxelinux.0` or `ztp.py`. Leave empty to send no bootfile, in which case a device gets an address and nothing to boot from."
+          "order": 49,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 67** (bootfile-name) — the file a PXE or ZTP client fetches from the boot server once it has an address, for example `ios-image.bin`, `pxelinux.0` or `ztp.py`. The boot server itself is `#nexus.networkServers.dhcp.nextServer#`. Leave empty to send no bootfile, in which case a device gets an address and nothing to boot from."
         },
         "nexus.networkServers.dhcp.nextServer": {
           "type": "string",
           "default": "",
-          "order": 51,
-          "markdownDescription": "**DHCP Option 66** (tftp-server-name) — the boot server clients fetch `#nexus.networkServers.dhcp.bootFileName#` from, as a dotted-quad address (e.g. `192.168.2.1`) or a hostname. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills it in from the embedded TFTP service's own interface. Note that the BOOTP `siaddr` header field is **not** configurable — it always carries this machine's server identifier (option 54) — so devices that read `siaddr` instead of option 66 follow that address."
+          "order": 50,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 66** (tftp-server-name) — the boot server clients fetch `#nexus.networkServers.dhcp.bootFileName#` from, as a dotted-quad address (e.g. `192.168.2.1`) or a hostname. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills it in from the embedded TFTP service's own interface. Note that the BOOTP `siaddr` header field is **not** configurable — it always carries `#nexus.networkServers.dhcp.serverId#` — so devices that read `siaddr` instead of option 66 follow that address."
         },
         "nexus.networkServers.dhcp.tftpServerAddresses": {
           "type": "array",
@@ -4229,14 +4220,20 @@
             "type": "string"
           },
           "default": [],
+          "order": 51,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 150** (Cisco TFTP server address list) — one or more IPv4 addresses, in preference order. Cisco IP phones and IOS ZTP request option 150 rather than `#nexus.networkServers.dhcp.nextServer#` (option 66); hardware from other vendors generally ignores it, so setting both is normal. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills in the embedded TFTP service's own interface."
+        },
+        "nexus.networkServers.dhcp.autoLinkTftp": {
+          "type": "boolean",
+          "default": true,
           "order": 52,
-          "markdownDescription": "**DHCP Option 150** (Cisco TFTP server address list) — one or more IPv4 addresses, in preference order. Cisco IP phones and IOS ZTP request option 150 rather than option 66; hardware from other vendors generally ignores it, so setting both is normal. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills in the embedded TFTP service's own interface."
+          "markdownDescription": "**DHCP — Boot / ZTP.** Point DHCP clients at this machine's own TFTP service. When `#nexus.networkServers.dhcp.nextServer#` and `#nexus.networkServers.dhcp.tftpServerAddresses#` are both empty, options 66 and 150 are filled in from `#nexus.networkServers.tftp.interface#` so ZTP works without typing the same address twice. Setting either one by hand turns the link off for both — quietly advertising a second, different boot server under the other option number is how a device boots from the wrong host. If the TFTP service is bound to `0.0.0.0` (all interfaces) there is no single address to advertise, and both options are left unset rather than guessed."
         },
         "nexus.networkServers.dhcp.vendorClassId": {
           "type": "string",
           "default": "",
           "order": 53,
-          "markdownDescription": "**DHCP Option 60** (vendor class identifier) to match on. When set, the boot options (66, 67, 150 and 43) are served **only** to clients whose DISCOVER carries this exact identifier — everyone else still gets an address, just no boot information. Aruba, FortiGate and Huawei gear all key their provisioning off option 60. The match is case-insensitive but otherwise exact, so `Cisco` will not match `Cisco Systems, Inc.`; the value each client actually sends is logged (`vendor-class=\"…\"`) in the *Nexus Network Servers* channel at debug level. Leave empty to serve the boot options to every client."
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 60** (vendor class identifier) to match on. When set, the boot options (66, 67, 150 and 43) are served **only** to clients whose DISCOVER carries this exact identifier — everyone else still gets an address from the pool, just no boot information. Aruba, FortiGate and Huawei gear all key their provisioning off option 60. The match is case-insensitive but otherwise exact, so `Cisco` will not match `Cisco Systems, Inc.`; the value each client actually sends is logged (`vendor-class=\"…\"`) in the *Nexus Network Servers* channel at debug level. Leave empty to serve the boot options to every client."
         },
         "nexus.networkServers.dhcp.vendorSpecificOptions": {
           "type": "array",
@@ -4262,13 +4259,16 @@
           },
           "default": [],
           "order": 54,
-          "markdownDescription": "**DHCP Option 43** (vendor-specific information) as a list of sub-options, TLV-encoded onto the wire as `[code][length][value]` per RFC 2132 §8.4. Each vendor defines its own sub-option layout — Aruba APs read the controller address from sub-option 43/1, Cisco APs from 241, and so on — so the codes come from the vendor's documentation. A `value` starting with `0x` is written as raw bytes (`:` `-` `_` separators are ignored), anything else is written as text. The whole option is capped at 255 bytes; an entry that cannot be encoded is logged and skipped rather than blocking the service."
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 43** (vendor-specific information) as a list of sub-options, TLV-encoded onto the wire as `[code][length][value]` per RFC 2132 §8.4. Each vendor defines its own sub-option layout — Aruba APs read the controller address from sub-option 43/1, Cisco APs from 241, and so on — so the codes come from the vendor's documentation. A `value` starting with `0x` is written as raw bytes (`:` `-` `_` separators are ignored), anything else is written as text. Like the other boot options this is gated by `#nexus.networkServers.dhcp.vendorClassId#` when that is set. The whole option is capped at 255 bytes; an entry that cannot be encoded is logged and skipped rather than blocking the service."
         },
-        "nexus.networkServers.dhcp.autoLinkTftp": {
-          "type": "boolean",
-          "default": true,
+        "nexus.networkServers.dhcp.static": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
           "order": 55,
-          "markdownDescription": "Point DHCP clients at this machine's own TFTP service. When `#nexus.networkServers.dhcp.nextServer#` and `#nexus.networkServers.dhcp.tftpServerAddresses#` are both empty, options 66 and 150 are filled in from `#nexus.networkServers.tftp.interface#` so ZTP works without typing the same address twice. If the TFTP service is bound to `0.0.0.0` (all interfaces) there is no single address to advertise, and both options are left unset rather than guessed — a wrong boot server is worse than none."
+          "markdownDescription": "**DHCP — Reservations.** Static reservations as a **MAC address → IP address** map, for example `{ \"aa:bb:cc:dd:ee:ff\": \"192.168.2.50\" }`. Reserved addresses are handed to the matching client regardless of the dynamic pool, so they may sit inside or outside `#nexus.networkServers.dhcp.rangeStart#`…`#nexus.networkServers.dhcp.rangeEnd#`. Entries whose value is not a string are ignored, so one malformed line does not discard the rest of the map."
         }
       }
     }

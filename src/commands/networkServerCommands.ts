@@ -28,6 +28,7 @@ import { isValidSubOptionCode } from "../services/networkServers/dhcp/engine/dhc
 import { networkServerFormDefinition, type DhcpServerFormSeed } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
 import type { CommandContext } from "./types";
 
 /** `serviceKind`, not `kind` — `QuickPickItem.kind` is taken by VS Code. */
@@ -196,6 +197,60 @@ function networkServerSettingUpdates(kind: NetworkServerKind, values: FormValues
   ];
 }
 
+const DOTTED_QUAD = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
+
+function compareIpv4(left: string, right: string): number {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let i = 0; i < 4; i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+/** A mask is usable only if its set bits are contiguous from the top — `255.0.255.0` is not a subnet. */
+function isContiguousMask(mask: string): boolean {
+  const value = mask.split(".").reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
+  const inverted = ~value >>> 0;
+  return ((inverted + 1) & inverted) === 0;
+}
+
+/**
+ * Sanity checks run before any setting is written, returning the first problem
+ * as a message.
+ *
+ * `WebviewFormPanel` has no field-level validation hook a caller can drive (the
+ * webview understands a `validationError` message, but nothing exposes a way to
+ * send one), so this rides the mechanism that does exist: throwing out of
+ * `onSubmit` reports the reason and leaves the panel open with the user's input
+ * intact. Only non-blank values are checked — blank means "clear the key and
+ * use the packaged default", which is always valid.
+ */
+function validateDhcpValues(values: FormValues): string | undefined {
+  const rangeStart = readSettingString(values.rangeStart);
+  const rangeEnd = readSettingString(values.rangeEnd);
+  const subnet = readSettingString(values.subnet);
+  for (const [label, value] of [
+    ["Pool Start", rangeStart],
+    ["Pool End", rangeEnd],
+    ["Subnet Mask", subnet],
+    ["Gateway", readSettingString(values.gateway)],
+    ["Server Identifier", readSettingString(values.serverId)],
+    ["Broadcast Address", readSettingString(values.broadcast)]
+  ] as const) {
+    if (value && !DOTTED_QUAD.test(value)) {
+      return `${label} must be a dotted-quad IPv4 address (got "${value}").`;
+    }
+  }
+  if (subnet && !isContiguousMask(subnet)) {
+    return `Subnet Mask "${subnet}" is not a valid netmask — its set bits must be contiguous (e.g. 255.255.255.0).`;
+  }
+  if (rangeStart && rangeEnd && compareIpv4(rangeStart, rangeEnd) > 0) {
+    return `Pool Start (${rangeStart}) must not be higher than Pool End (${rangeEnd}).`;
+  }
+  return undefined;
+}
+
 function errorMessageFor(error: unknown, prefix: string): string {
   if (error instanceof NetworkServerError) {
     return `${prefix}: ${error.message} (${error.code})`;
@@ -246,8 +301,17 @@ export function registerNetworkServerCommands(
       const service = kind.toUpperCase();
       const seed =
         kind === "dhcp" ? dhcpFormSeed(manager.readConfig(kind) as DhcpAdapterConfig) : manager.readConfig(kind);
-      WebviewFormPanel.open(`network-server-edit-${kind}`, networkServerFormDefinition(kind, seed), {
+      // Enumerated per open, never cached: a VPN coming up or a dock being
+      // unplugged changes the answer between one Edit and the next.
+      const form = networkServerFormDefinition(kind, seed, { interfaceOptions: networkInterfaceBindOptions() });
+      WebviewFormPanel.open(`network-server-edit-${kind}`, form, {
         onSubmit: async (values) => {
+          const problem = kind === "dhcp" ? validateDhcpValues(values) : undefined;
+          if (problem) {
+            // Thrown, not reported here: WebviewFormPanel turns this into a
+            // "Save failed" message and leaves the panel open with the input.
+            throw new Error(problem);
+          }
           const section = vscode.workspace.getConfiguration(`nexus.networkServers.${kind}`);
           // Global target only: these services are machine-level (they bind
           // ports on this host), so scoping them to whichever folder happens to
