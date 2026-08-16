@@ -30,10 +30,14 @@ permissions:
   contents: write
   actions: write
 
-# One decision at a time: two rapid merges must not race the tag-exists check.
-concurrency:
-  group: auto-release
-  cancel-in-progress: false
+# DELIBERATELY NO concurrency group. GitHub keeps at most ONE pending run per
+# group, so a version-bump run queued behind an active release could be
+# replaced (canceled) by a later docs-only push — and because the decision
+# below compares each push against its own base, the replaced push's version
+# would then never release. Correctness here relies on every push run being
+# allowed to complete. Races between simultaneous runs are serialized by the
+# tag push itself instead: a git ref creation is atomic server-side, so the
+# loser sees the tag exist and skips the release jobs (see the tag job).
 
 jobs:
   decide:
@@ -100,10 +104,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      created: ${{ steps.tag.outputs.created }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Create and push the release tag
+        id: tag
         env:
           TAG: ${{ needs.decide.outputs.tag }}
         run: |
@@ -111,11 +118,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Release $TAG" "$GITHUB_SHA"
-          git push origin "refs/tags/$TAG"
+          # The serialization point: ref creation is atomic, so exactly one
+          # concurrent run can win. A loser is not an error — someone else
+          # released this version — it just must not run the release jobs.
+          if git push origin "refs/tags/$TAG"; then
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — another run won the race; skipping release."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag push failed and $TAG does not exist — real failure." >&2
+            exit 1
+          fi
 
   release:
     needs: [decide, tag]
-    if: needs.decide.outputs.release == 'true'
+    if: needs.tag.outputs.created == 'true'
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.decide.outputs.tag }}
@@ -123,7 +141,7 @@ jobs:
 
   openvsx:
     needs: [decide, tag]
-    if: needs.decide.outputs.release == 'true'
+    if: needs.tag.outputs.created == 'true'
     uses: ./.github/workflows/publish-openvsx.yml
     with:
       tag: ${{ needs.decide.outputs.tag }}
