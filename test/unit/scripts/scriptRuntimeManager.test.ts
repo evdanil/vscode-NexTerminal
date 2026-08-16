@@ -1018,3 +1018,180 @@ describe("ScriptRuntimeManager — Workspace Trust gate", () => {
     expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
   });
 });
+
+// -----------------------------------------------------------------------------
+// nexus.include plumbing (Phase 2). Policy itself is unit-tested in
+// scriptInclude.test.ts; these pin the MANAGER's wiring around it — the RPC
+// case, the per-run state, the module-id argument on fs.*, and the display name
+// the worker needs for stack attribution.
+// -----------------------------------------------------------------------------
+
+describe("ScriptRuntimeManager — nexus.include plumbing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function includeHarness(): Promise<{
+    h: Harness;
+    scriptDir: string;
+    cleanup: () => Promise<void>;
+  }> {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const scriptDir = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-include-mgr-"));
+    await fs.mkdir(path.join(scriptDir, "lib"), { recursive: true });
+    await fs.writeFile(path.join(scriptDir, "lib", "a.js"), "exports.a = 1;", "utf8");
+    await fs.writeFile(path.join(scriptDir, "lib", "template.txt"), "lib-copy", "utf8");
+    await fs.writeFile(path.join(scriptDir, "template.txt"), "entry-copy", "utf8");
+    const scriptFile = path.join(scriptDir, "main.js");
+    await fs.writeFile(scriptFile, `/**\n * @nexus-script\n */\n`, "utf8");
+
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    h.scriptUri.fsPath = scriptFile;
+    (h.scriptUri as { path: string }).path = scriptFile;
+    h.scriptUri.toString = () => scriptFile;
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    return { h, scriptDir, cleanup: () => fs.rm(scriptDir, { recursive: true, force: true }) };
+  }
+
+  function resultFor(h: Harness, id: number): { ok: boolean; value?: unknown; error?: { code: string; message: string; extra?: Record<string, unknown> } } {
+    return h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === id
+    ) as { ok: boolean; value?: unknown; error?: { code: string; message: string; extra?: Record<string, unknown> } };
+  }
+
+  it("the `load` message carries the entry script's display name — without it the worker has no sourceURL and every frame reports <anonymous>", async () => {
+    // ⊘ leaving `load` at its Phase-1 shape: stack attribution for the ENTRY
+    // script (the common case — most scripts include nothing) silently stays
+    // broken even though every module gets a proper name.
+    const { h, cleanup } = await includeHarness();
+    try {
+      const load = h.worker.posted.find((m) => m.kind === "load") as { displayName?: string };
+      expect(load.displayName).toBe("main.js");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("include.load dispatches through invokeMethod and returns the module id, display name and source", async () => {
+    // ⊘ an invokeMethod switch with no include.load case: dispatchRpc's
+    // catch-all would answer "Unknown script RPC method", so every
+    // nexus.include() in every script would fail identically.
+    const { h, cleanup } = await includeHarness();
+    try {
+      h.worker.emit({ kind: "rpc", id: 1, method: "include.load", args: ["./lib/a.js", ["#root"]] });
+      await waitFor(() => resultFor(h, 1) !== undefined);
+      const result = resultFor(h, 1);
+      expect(result.ok).toBe(true);
+      expect(result.value).toMatchObject({
+        displayName: "lib/a.js",
+        source: "exports.a = 1;",
+        cached: false
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("a CircularInclude's `cycle` array arrives as a TOP-LEVEL extra field, ready for reviveError to spread onto err.cycle", async () => {
+    // ⊘ building include errors with a nested `{ extra: {...} }` property (the
+    // manager's own local `makeError` shape): extraFieldsOf would then collect
+    // a single key literally named "extra", and the worker's reviveError would
+    // spread THAT — so a script's `err.cycle` would be undefined and
+    // `err.extra.cycle` would hold the array the docs promise directly.
+    const { h, cleanup } = await includeHarness();
+    try {
+      h.worker.emit({ kind: "rpc", id: 1, method: "include.load", args: ["./lib/a.js", ["#root"]] });
+      await waitFor(() => resultFor(h, 1) !== undefined);
+      const moduleId = (resultFor(h, 1).value as { moduleId: string }).moduleId;
+
+      h.worker.emit({ kind: "rpc", id: 2, method: "include.load", args: ["./a.js", ["#root", moduleId]] });
+      await waitFor(() => resultFor(h, 2) !== undefined);
+      const refusal = resultFor(h, 2);
+
+      expect(refusal.ok).toBe(false);
+      expect(refusal.error?.code).toBe("CircularInclude");
+      expect(refusal.error?.extra?.cycle).toEqual(["main.js", "lib/a.js", "lib/a.js"]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("fs.readText from inside a module resolves against THAT module's directory", async () => {
+    // ⊘ ignoring args[1]: both template.txt files exist, so the wrong
+    // implementation returns the entry script's copy — a different successful
+    // answer, not an error. This is the module-relative half of "a relative
+    // path resolves against the file it is written in".
+    const { h, cleanup } = await includeHarness();
+    try {
+      h.worker.emit({ kind: "rpc", id: 1, method: "include.load", args: ["./lib/a.js", ["#root"]] });
+      await waitFor(() => resultFor(h, 1) !== undefined);
+      const moduleId = (resultFor(h, 1).value as { moduleId: string }).moduleId;
+
+      h.worker.emit({ kind: "rpc", id: 2, method: "fs.readText", args: ["./template.txt", moduleId] });
+      h.worker.emit({ kind: "rpc", id: 3, method: "fs.readText", args: ["./template.txt"] });
+      await waitFor(() => resultFor(h, 2) !== undefined && resultFor(h, 3) !== undefined);
+
+      expect(resultFor(h, 2).value).toBe("lib-copy");
+      expect(resultFor(h, 3).value).toBe("entry-copy");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("an unknown module id on fs.readText or include.load is IncludeInternal — never a silent fallback to the entry script", async () => {
+    // ⊘ `state.byId.get(id) ?? rootRecord`: a forged or stale id would read
+    // from the wrong directory and report success, which is precisely the
+    // "worker input is untrusted" property the main-side map exists to keep.
+    const { h, cleanup } = await includeHarness();
+    try {
+      h.worker.emit({ kind: "rpc", id: 1, method: "fs.readText", args: ["./template.txt", "m-forged"] });
+      h.worker.emit({ kind: "rpc", id: 2, method: "include.load", args: ["./lib/a.js", ["#root", "m-forged"]] });
+      await waitFor(() => resultFor(h, 1) !== undefined && resultFor(h, 2) !== undefined);
+
+      expect(resultFor(h, 1).ok).toBe(false);
+      expect(resultFor(h, 1).error?.code).toBe("IncludeInternal");
+      expect(resultFor(h, 2).ok).toBe(false);
+      expect(resultFor(h, 2).error?.code).toBe("IncludeInternal");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("include state is per run: a second run of the same script starts with an empty module table", async () => {
+    // ⊘ a module cache hung off the manager (or a module-level singleton)
+    // rather than the run record — the edit → run loop would then serve the
+    // previous run's source for the rest of the session, which is the single
+    // most annoying bug this feature could have.
+    const { h, scriptDir, cleanup } = await includeHarness();
+    const fs = await import("node:fs/promises");
+    try {
+      h.worker.emit({ kind: "rpc", id: 1, method: "include.load", args: ["./lib/a.js", ["#root"]] });
+      await waitFor(() => resultFor(h, 1) !== undefined);
+      expect((resultFor(h, 1).value as { source?: string }).source).toBe("exports.a = 1;");
+
+      await h.manager.stopScript("test-session");
+      await fs.writeFile(path.join(scriptDir, "lib", "a.js"), "exports.a = 2;", "utf8");
+      await h.manager.runScript(h.scriptUri as never, "test-session");
+
+      // Both runs' message listeners are attached to this one fake worker, so
+      // the stale run answers too (with Stopped). What matters is that the
+      // LIVE run delivers the file's NEW contents, uncached.
+      const answersFor9 = (): Array<{ ok: boolean; value?: { source?: string; cached?: boolean } }> =>
+        h.worker.posted.filter(
+          (m) => m.kind === "rpc-result" && (m as { id: number }).id === 9
+        ) as Array<{ ok: boolean; value?: { source?: string; cached?: boolean } }>;
+      h.worker.emit({ kind: "rpc", id: 9, method: "include.load", args: ["./lib/a.js", ["#root"]] });
+      await waitFor(() => answersFor9().length >= 2);
+      // The stale run answers from ITS OWN (already-populated) table, so the
+      // discriminating assertion is that SOME answer is a fresh, uncached
+      // delivery of the file's new contents. A cache shared across runs would
+      // make every answer `cached: true` with no source at all.
+      expect(
+        answersFor9().some((r) => r.ok && r.value?.cached === false && r.value?.source === "exports.a = 2;")
+      ).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+});

@@ -37,6 +37,9 @@
  * | 20 | `"linked/x.json"` where `D/linked` is a symlink out of R | — | ok (lexical!) | decision 3 — no realpath; consistent with scanner |
  * | 21 | any input | `scriptsRootPath === undefined` | only D-subtree passes | scheme-mismatch / untrusted-root fallback |
  * | 22 | script outside R (CodeLens on arbitrary file), `"x.json"` | `D=/home/u/proj` | ok → `D/x.json` | decision 4: own-folder scope survives |
+ * | 23 | `"./b.js"` resolved from base `R/lib` (a module's own dir) | `D=R/cisco` | ok → `R/lib/b.js` | Phase 2: the RESOLUTION base is per-file |
+ * | 24 | `"x.js"` resolved from a base outside both roots | — | PathOutsideScope | Phase 2: a base is NOT a third root — the containment union is unchanged |
+ * | 25 | `""`, non-string, NUL, `"C:x"` from any base | — | InvalidPath | Phase 2: pre-resolution refusals happen before the base is consulted |
  */
 
 import * as path from "node:path";
@@ -105,8 +108,38 @@ function platformPath(platform: ScriptFsPlatform): path.PlatformPath {
 /**
  * Resolve a script-supplied path against its scope, applying the two-root
  * union containment check. See the decision table above for the full matrix.
+ *
+ * Relative requests resolve against the running script's own directory — which
+ * is exactly `resolveScriptFsPathFrom` with the entry script's directory as the
+ * base, and is defined that way so the 22-row matrix above cannot drift from
+ * the base-aware implementation underneath it.
  */
 export function resolveScriptFsPath(requested: string, scope: ScriptFsScope): ScriptFsResolution {
+  return resolveScriptFsPathFrom(requested, scope.scriptDirPath, scope);
+}
+
+/**
+ * `resolveScriptFsPath` with the RESOLUTION base stated explicitly — the entry
+ * point `nexus.include()` (and a module's own `nexus.fs`) uses so that a
+ * relative path always resolves against the file it is written in, however deep
+ * in an include chain that file sits.
+ *
+ * THE BASE IS NOT A ROOT. It only decides what a relative request is relative
+ * to; whether the RESULT is legal is still decided by the unchanged two-root
+ * union (the entry script's own directory ∪ the scripts root, rows 1-22 above).
+ * Containment is a property of the run, not of the file doing the asking — one
+ * containment implementation, one test matrix, one audit point (row 24). Every
+ * module's directory is, by induction, already inside that union, so an honest
+ * base never widens anything; a base that somehow isn't (a forged module id on
+ * the RPC wire — see `scriptInclude.ts`'s trust model) can therefore only
+ * change WHICH of the run's own already-resolved directories a relative path
+ * is measured from, and never what the result is allowed to be.
+ */
+export function resolveScriptFsPathFrom(
+  requested: string,
+  baseDirPath: string,
+  scope: ScriptFsScope
+): ScriptFsResolution {
   if (typeof requested !== "string" || requested.trim() === "") {
     return {
       ok: false,
@@ -132,10 +165,10 @@ export function resolveScriptFsPath(requested: string, scope: ScriptFsScope): Sc
 
   const p = platformPath(scope.platform);
   // The single normalization step: collapses `.`/`..`/duplicate separators,
-  // accepts both `/` and `\` on win32, makes relative paths script-dir-relative,
+  // accepts both `/` and `\` on win32, makes relative paths base-dir-relative,
   // passes absolutes through, and resolves win32 rootless absolutes onto the
-  // script dir's drive — after which containment decides.
-  const candidate = p.resolve(scope.scriptDirPath, requested);
+  // base dir's drive — after which containment decides.
+  const candidate = p.resolve(baseDirPath, requested);
 
   const inside =
     isLexicallyWithin(candidate, scope.scriptDirPath, scope.platform) ||
@@ -145,6 +178,22 @@ export function resolveScriptFsPath(requested: string, scope: ScriptFsScope): Sc
     return { ok: false, code: "PathOutsideScope", detail: candidate };
   }
   return { ok: true, resolvedPath: candidate };
+}
+
+/**
+ * The directory containing `filePath`, under the SCOPE'S platform semantics
+ * rather than the host's — `path.dirname` is bound to whichever platform the
+ * extension host happens to run on, so a win32 path handed to it on a Linux
+ * host (a `file:` script on Windows, or this repo's win32 test matrix) comes
+ * back as `"."` and every module under it would resolve its siblings against
+ * the process CWD. Injected platform, same reason `isLexicallyWithin` takes
+ * one.
+ *
+ * Used to derive each included module's own resolution base (see
+ * `resolveScriptFsPathFrom`) from its resolved absolute path.
+ */
+export function scriptFsDirname(filePath: string, platform: ScriptFsPlatform): string {
+  return platformPath(platform).dirname(filePath);
 }
 
 /**

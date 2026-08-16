@@ -12,7 +12,9 @@ import { describe, expect, it } from "vitest";
 import {
   isLexicallyWithin,
   resolveScriptFsPath,
+  resolveScriptFsPathFrom,
   safeStringify,
+  scriptFsDirname,
   type ScriptFsPlatform,
   type ScriptFsScope
 } from "../../../src/services/scripts/scriptFsScope";
@@ -364,5 +366,92 @@ describe("safeStringify — non-throwing formatting for arbitrary RPC-supplied v
     // silently skips the intended fallback chain.
     expect(safeStringify(undefined)).toBe("undefined");
     expect(safeStringify(() => {})).toBe(String(() => {}));
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Phase 2 (nexus.include): the RESOLUTION base becomes per-module while the
+// CONTAINMENT union stays the run's two roots. Rows 23-25 of the decision table.
+// -----------------------------------------------------------------------------
+
+describe.each(PLATFORMS)("resolveScriptFsPathFrom — per-module resolution base (%s)", (platform) => {
+  const f = fixture(platform);
+  /** A module's own directory: R/lib, a sibling of the entry script's R/cisco. */
+  const libDir = f.join(f.root, "lib");
+
+  it("row 23: a relative path resolves against the BASE directory it was written in, not the entry script's directory", () => {
+    // ⊘ resolving every module's relative specifier against scope.scriptDirPath
+    // (the entry script's own folder). Both candidates are real, plausible
+    // targets — R/cisco/b.js and R/lib/b.js — so the wrong implementation does
+    // not fail loudly, it silently loads THE OTHER FILE. Asserting the exact
+    // resolved path is the only thing that separates them.
+    const fromLib = resolveScriptFsPathFrom("./b.js", libDir, scopeOf(platform));
+    expect(fromLib).toEqual({ ok: true, resolvedPath: f.join(libDir, "b.js") });
+
+    // Same scope, same request, entry-script base — the other real file.
+    const fromEntry = resolveScriptFsPathFrom("./b.js", f.scriptDir, scopeOf(platform));
+    expect(fromEntry).toEqual({ ok: true, resolvedPath: f.join(f.scriptDir, "b.js") });
+  });
+
+  it("row 24: containment is still the run's two-root union — a base directory is NOT a third root", () => {
+    // ⊘ adding baseDirPath to the containment union. The base here is outside
+    // both roots, and a plain "x.js" against it resolves INSIDE the base — so
+    // a union that included the base would happily return ok:true. Containment
+    // is a property of the run, not of the file doing the asking.
+    const outsideBase = platform === "posix" ? "/tmp/evil" : "C:\\tmp\\evil";
+    const r = resolveScriptFsPathFrom("x.js", outsideBase, scopeOf(platform));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("PathOutsideScope");
+  });
+
+  it("row 24b: a module inside the scripts root still cannot climb out of the union", () => {
+    // The plan's own row: a module under R/lib asking for ../../outside.js
+    // lands outside R and outside D, and is refused exactly as the entry
+    // script's own request would be.
+    const r = resolveScriptFsPathFrom("../../outside.js", libDir, scopeOf(platform));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("PathOutsideScope");
+  });
+
+  it("row 25: every pre-resolution refusal is unchanged — the base never gets a chance to matter", () => {
+    // ⊘ a base-aware overload that forgets the InvalidPath guards (empty,
+    // non-string, NUL, win32 drive-relative) it inherited.
+    for (const bad of ["", "   ", "a\0b"]) {
+      const r = resolveScriptFsPathFrom(bad, libDir, scopeOf(platform));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe("InvalidPath");
+    }
+    const nonString = resolveScriptFsPathFrom(42 as unknown as string, libDir, scopeOf(platform));
+    expect(nonString.ok).toBe(false);
+    if (!nonString.ok) expect(nonString.code).toBe("InvalidPath");
+  });
+
+  it("resolveScriptFsPath is exactly resolveScriptFsPathFrom(scope.scriptDirPath) — the 22-row matrix above is unchanged by construction", () => {
+    // ⊘ a refactor that changes the single-argument entry point's behaviour
+    // (its own matrix runs above; this pins the delegation itself).
+    for (const request of ["data.json", "./x.json", "../shared/x.json", "../../secrets.txt"]) {
+      expect(resolveScriptFsPath(request, scopeOf(platform))).toEqual(
+        resolveScriptFsPathFrom(request, f.scriptDir, scopeOf(platform))
+      );
+    }
+  });
+});
+
+describe("scriptFsDirname — platform-injected dirname (the include resolver's base for a module)", () => {
+  it("returns the containing directory for both platforms, on any host OS", () => {
+    // ⊘ using node:path's host-bound `dirname`: on a Linux CI host
+    // path.dirname("C:\\ws\\lib\\a.js") is ".", so every win32 module would
+    // resolve its siblings against the process CWD.
+    expect(scriptFsDirname("/ws/.nexus/scripts/lib/a.js", "posix")).toBe("/ws/.nexus/scripts/lib");
+    expect(scriptFsDirname("C:\\ws\\.nexus\\scripts\\lib\\a.js", "win32")).toBe("C:\\ws\\.nexus\\scripts\\lib");
+  });
+
+  it("a file directly under a root reports the root itself, separator-free", () => {
+    expect(scriptFsDirname("/a.js", "posix")).toBe("/");
+    expect(scriptFsDirname("C:\\a.js", "win32")).toBe("C:\\");
+  });
+
+  it("win32 accepts forward slashes too", () => {
+    expect(scriptFsDirname("C:/ws/lib/a.js", "win32")).toBe("C:/ws/lib");
   });
 });
