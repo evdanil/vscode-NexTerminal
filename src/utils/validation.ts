@@ -12,6 +12,7 @@ import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { LocalServerConfig } from "../models/localServer";
+import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import { normalizeFolderPath } from "./folderPaths";
 
 function isNonEmptyString(value: unknown): value is string {
@@ -652,6 +653,109 @@ export function validateLocalServerConfig(item: unknown): item is LocalServerCon
     isOptionalNonEmptyString(obj.group) &&
     isOptionalNonEmptyString(obj.cwd) &&
     isOptionalNonEmptyString(obj.description)
+  );
+}
+
+/**
+ * Fields every network-server profile carries, checked once for both kinds.
+ * Returns the profile's `config` object so the per-kind guards can go straight
+ * to their own fields.
+ */
+function networkServerProfileBody(item: unknown, kind: "tftp" | "dhcp"): Record<string, unknown> | undefined {
+  if (typeof item !== "object" || item === null) {
+    return undefined;
+  }
+  const obj = item as Record<string, unknown>;
+  if (!(isNonEmptyString(obj.id) && isNonEmptyString(obj.name) && obj.kind === kind)) {
+    return undefined;
+  }
+  if (!isOptionalNonEmptyString(obj.description)) {
+    return undefined;
+  }
+  const config = obj.config;
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    return undefined;
+  }
+  return config as Record<string, unknown>;
+}
+
+/** `undefined`, or a flat string→string map — the shape of a DHCP reservation table. */
+function validateStringMap(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  return Object.values(value as Record<string, unknown>).every((entry) => typeof entry === "string");
+}
+
+function validateVendorSpecificOptions(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  return value.every((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return false;
+    }
+    const { subOption, value: optionValue } = entry as { subOption?: unknown; value?: unknown };
+    return typeof subOption === "number" && Number.isInteger(subOption) && typeof optionValue === "string";
+  });
+}
+
+export function validateTftpConfigProfile(item: unknown): item is TftpConfigProfile {
+  const config = networkServerProfileBody(item, "tftp");
+  if (!config) {
+    return false;
+  }
+  return (
+    isOptionalNonEmptyString(config.root) &&
+    (config.port === undefined || isValidPort(config.port)) &&
+    (config.allowWrite === undefined || typeof config.allowWrite === "boolean") &&
+    isOptionalNonEmptyString(config.interface)
+  );
+}
+
+export function validateDhcpConfigProfile(item: unknown): item is DhcpConfigProfile {
+  const config = networkServerProfileBody(item, "dhcp");
+  if (!config) {
+    return false;
+  }
+  const obj = item as Record<string, unknown>;
+  if (obj.autoLinkTftp !== undefined && typeof obj.autoLinkTftp !== "boolean") {
+    return false;
+  }
+  if (
+    config.leaseTimeSec !== undefined &&
+    !(typeof config.leaseTimeSec === "number" && Number.isInteger(config.leaseTimeSec) && config.leaseTimeSec > 0)
+  ) {
+    return false;
+  }
+  for (const key of [
+    "rangeStart",
+    "rangeEnd",
+    "subnet",
+    "gateway",
+    "serverId",
+    "broadcast",
+    "bindAddress",
+    "leaseStorePath",
+    "bootFileName",
+    "nextServer",
+    "vendorClassId"
+  ]) {
+    if (!isOptionalNonEmptyString(config[key])) {
+      return false;
+    }
+  }
+  return (
+    validateStringArray(config.dns) &&
+    validateStringArray(config.tftpServerAddresses) &&
+    validateStringMap(config.static) &&
+    validateVendorSpecificOptions(config.vendorSpecificOptions)
   );
 }
 

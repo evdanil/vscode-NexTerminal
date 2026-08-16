@@ -563,6 +563,36 @@
         "icon": "$(list-flat)"
       },
       {
+        "command": "nexus.networkServer.profile.saveCurrent",
+        "title": "Save Current Settings as Profile",
+        "category": "Nexus Network Server",
+        "icon": "$(save)"
+      },
+      {
+        "command": "nexus.networkServer.profile.apply",
+        "title": "Load Profile",
+        "category": "Nexus Network Server",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "nexus.networkServer.profile.rename",
+        "title": "Rename Profile",
+        "category": "Nexus Network Server",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.networkServer.profile.duplicate",
+        "title": "Duplicate Profile",
+        "category": "Nexus Network Server",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "nexus.networkServer.profile.remove",
+        "title": "Remove Profile",
+        "category": "Nexus Network Server",
+        "icon": "$(trash)"
+      },
+      {
         "command": "nexus.group.connect",
         "title": "Connect Folder Servers",
         "icon": "$(plug)"
@@ -2198,6 +2228,26 @@
         },
         {
           "command": "nexus.networkServer.inspectLogs",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.saveCurrent",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.apply",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.rename",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.duplicate",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.remove",
           "when": "true"
         },
         {

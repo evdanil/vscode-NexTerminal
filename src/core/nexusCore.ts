@@ -31,6 +31,12 @@ import type {
   NetworkServerRuntimeDetail,
   NetworkServerStatus
 } from "../models/networkServer";
+import {
+  cloneDhcpProfile,
+  cloneTftpProfile,
+  type DhcpConfigProfile,
+  type TftpConfigProfile
+} from "../models/networkServerProfile";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -122,6 +128,11 @@ export class NexusCore {
   // singletons, so the kind IS the identity. Runtime-only — nothing here is
   // persisted, because their configuration lives in VS Code settings.
   private readonly activeNetworkServerSessions = new Map<NetworkServerKind, ActiveNetworkServerSession>();
+  // Persisted, unlike the sessions above: these are named snapshots of the two
+  // services' settings, kept in separate maps because TFTP and DHCP presets
+  // are independent of each other and share no fields.
+  private readonly tftpProfiles = new Map<string, TftpConfigProfile>();
+  private readonly dhcpProfiles = new Map<string, DhcpConfigProfile>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
   private focusedSessionId: string | undefined = undefined;
@@ -149,7 +160,7 @@ export class NexusCore {
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, localShellProfiles, localServers, groups, authProfiles, inventorySources, deviceTemplates, savedFilters] =
+    const [servers, tunnels, serialProfiles, localShellProfiles, localServers, groups, authProfiles, inventorySources, deviceTemplates, savedFilters, tftpProfiles, dhcpProfiles] =
       await Promise.all([
         this.repository.getServers(),
         this.repository.getTunnels(),
@@ -160,7 +171,9 @@ export class NexusCore {
         this.repository.getAuthProfiles(),
         this.repository.getInventorySources(),
         this.repository.getDeviceTemplates(),
-        this.repository.getSavedFilters()
+        this.repository.getSavedFilters(),
+        this.repository.getTftpProfiles(),
+        this.repository.getDhcpProfiles()
       ]);
     this.servers.clear();
     this.tunnels.clear();
@@ -172,6 +185,8 @@ export class NexusCore {
     this.inventorySources.clear();
     this.deviceTemplates.clear();
     this.savedFilters.clear();
+    this.tftpProfiles.clear();
+    this.dhcpProfiles.clear();
     const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
     for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
@@ -203,6 +218,12 @@ export class NexusCore {
     for (const filter of savedFilters) {
       this.savedFilters.set(filter.id, filter);
     }
+    for (const profile of tftpProfiles) {
+      this.tftpProfiles.set(profile.id, profile);
+    }
+    for (const profile of dhcpProfiles) {
+      this.dhcpProfiles.set(profile.id, profile);
+    }
     if (normalizedServers.changed) {
       await this.repository.saveServers(normalizedServers.servers);
     }
@@ -221,6 +242,8 @@ export class NexusCore {
       activeLocalShellSessions: [...this.activeLocalShellSessions.values()],
       activeLocalServerSessions: [...this.activeLocalServerSessions.values()],
       activeNetworkServerSessions: [...this.activeNetworkServerSessions.values()],
+      tftpProfiles: [...this.tftpProfiles.values()],
+      dhcpProfiles: [...this.dhcpProfiles.values()],
       activeTunnels: [...this.activeTunnels.values()],
       remoteTunnels: [...this.remoteTunnels],
       explicitGroups: [...this.explicitGroups],
@@ -256,6 +279,14 @@ export class NexusCore {
 
   public getLocalServer(id: string): LocalServerConfig | undefined {
     return this.localServers.get(id);
+  }
+
+  public getTftpProfile(id: string): TftpConfigProfile | undefined {
+    return this.tftpProfiles.get(id);
+  }
+
+  public getDhcpProfile(id: string): DhcpConfigProfile | undefined {
+    return this.dhcpProfiles.get(id);
   }
 
   public getAuthProfile(id: string): AuthProfile | undefined {
@@ -2205,6 +2236,32 @@ export class NexusCore {
   public async addOrUpdateLocalServerConfig(config: LocalServerConfig): Promise<void> {
     this.localServers.set(config.id, cloneLocalServerConfig(config));
     await this.repository.saveLocalServers([...this.localServers.values()]);
+    this.emitChanged();
+  }
+
+  public async addOrUpdateTftpProfile(profile: TftpConfigProfile): Promise<void> {
+    this.tftpProfiles.set(profile.id, cloneTftpProfile(profile));
+    await this.repository.saveTftpProfiles([...this.tftpProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async addOrUpdateDhcpProfile(profile: DhcpConfigProfile): Promise<void> {
+    this.dhcpProfiles.set(profile.id, cloneDhcpProfile(profile));
+    await this.repository.saveDhcpProfiles([...this.dhcpProfiles.values()]);
+    this.emitChanged();
+  }
+
+  // No session teardown counterpart to removeLocalServerConfig: a profile owns
+  // no runtime state, so removing one never touches a live service.
+  public async removeTftpProfile(profileId: string): Promise<void> {
+    this.tftpProfiles.delete(profileId);
+    await this.repository.saveTftpProfiles([...this.tftpProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async removeDhcpProfile(profileId: string): Promise<void> {
+    this.dhcpProfiles.delete(profileId);
+    await this.repository.saveDhcpProfiles([...this.dhcpProfiles.values()]);
     this.emitChanged();
   }
 

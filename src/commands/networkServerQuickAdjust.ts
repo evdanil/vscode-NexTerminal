@@ -19,6 +19,7 @@ import type { NetworkServerKind } from "../models/networkServer";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
 import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
 import {
+  NETWORK_SERVER_LABELS,
   currentPoolCount,
   dhcpPoolProblem,
   dhcpRangeEndForCount,
@@ -31,6 +32,16 @@ export interface NetworkServerQuickAdjustDeps {
   readonly restart: () => Promise<void>;
   /** Escape hatch to the full `WebviewFormPanel` form for this service. */
   readonly openFullForm: () => void;
+  /** Stores the settings currently in effect under a name. */
+  readonly saveProfile: () => Promise<void>;
+  /**
+   * Applies a saved profile, resolving `true` when one was actually written.
+   *
+   * Injected rather than invoked as a command so the restart prompt stays where
+   * the rest of this editor's edits already put it — at the end of the session,
+   * once — instead of firing a second time from inside the apply.
+   */
+  readonly loadProfile: () => Promise<boolean>;
 }
 
 /** `edited` is the only outcome that can leave a running service out of date. */
@@ -40,7 +51,10 @@ interface QuickAdjustItem extends vscode.QuickPickItem {
   readonly run: () => Promise<QuickAdjustOutcome>;
 }
 
-const SERVICE_LABELS: Record<NetworkServerKind, string> = { tftp: "TFTP", dhcp: "DHCP" };
+/** Separators carry no `run`, so a picked row has to be narrowed before use. */
+type QuickAdjustRow = QuickAdjustItem | vscode.QuickPickItem;
+
+const SERVICE_LABELS = NETWORK_SERVER_LABELS;
 
 function settingsSection(kind: NetworkServerKind): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration(`nexus.networkServers.${kind}`);
@@ -361,6 +375,30 @@ function dhcpQuickItems(): QuickAdjustItem[] {
   ];
 }
 
+/**
+ * The trailing actions section: the whole configuration in and out of a named
+ * preset, kept apart from the field rows above it because these two do not edit
+ * one setting — they replace or capture the lot.
+ */
+function profileRows(kind: NetworkServerKind, deps: NetworkServerQuickAdjustDeps): QuickAdjustRow[] {
+  return [
+    { label: "", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(save) Save current as profile…",
+      description: `Store these ${SERVICE_LABELS[kind]} settings under a name`,
+      run: async (): Promise<QuickAdjustOutcome> => {
+        await deps.saveProfile();
+        return "unchanged";
+      }
+    },
+    {
+      label: "$(archive) Load profile…",
+      description: "Replace these settings with a saved profile",
+      run: async (): Promise<QuickAdjustOutcome> => ((await deps.loadProfile()) ? "edited" : "unchanged")
+    }
+  ];
+}
+
 function fullFormItem(kind: NetworkServerKind): QuickAdjustItem {
   return {
     label:
@@ -387,11 +425,15 @@ export async function openNetworkServerQuickAdjust(
   let edited = false;
   for (;;) {
     const items = kind === "tftp" ? tftpQuickItems() : dhcpQuickItems();
-    const pick = await vscode.window.showQuickPick<QuickAdjustItem>([...items, fullFormItem(kind)], {
-      title: `${service} — Quick Settings`,
-      placeHolder: "Pick a setting to change, or press Escape when you are done"
-    });
+    const pick = await vscode.window.showQuickPick<QuickAdjustRow>(
+      [...items, ...profileRows(kind, deps), fullFormItem(kind)],
+      {
+        title: `${service} — Quick Settings`,
+        placeHolder: "Pick a setting to change, or press Escape when you are done"
+      }
+    );
     if (!pick) break;
+    if (!("run" in pick)) continue;
     const outcome = await pick.run();
     if (outcome === "edited") edited = true;
     if (outcome !== "full") continue;

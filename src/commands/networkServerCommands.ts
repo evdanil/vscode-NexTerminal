@@ -31,6 +31,7 @@ import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
 import { openNetworkServerQuickAdjust } from "./networkServerQuickAdjust";
+import { loadNetworkServerProfile, saveCurrentNetworkServerProfile } from "./networkServerProfileCommands";
 import {
   dhcpRangeEndForCount,
   readSettingBoolean,
@@ -277,7 +278,9 @@ export function registerNetworkServerCommands(
         restart: () => restartQuietly(kind),
         openFullForm: () => {
           openFullForm(kind);
-        }
+        },
+        saveProfile: () => saveCurrentNetworkServerProfile(ctx.core, kind),
+        loadProfile: async () => (await loadNetworkServerProfile(ctx.core, kind)) !== undefined
       });
     }),
 

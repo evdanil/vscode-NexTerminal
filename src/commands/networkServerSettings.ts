@@ -16,7 +16,11 @@ import {
 } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
 import type { DhcpVendorSpecificEntry } from "../services/networkServers/core/index";
+import type { NetworkServerKind } from "../models/networkServer";
+import type { NetworkServerConfigProfile } from "../models/networkServerProfile";
 import type { FormValues } from "../ui/formTypes";
+
+export const NETWORK_SERVER_LABELS: Record<NetworkServerKind, string> = { tftp: "TFTP", dhcp: "DHCP" };
 
 /** Value accepted by `WorkspaceConfiguration.update`; `undefined` clears the key. */
 export type SettingValue =
@@ -129,6 +133,55 @@ export function dhcpPoolProblem(
   const usable = computePoolSize(start, broadcast) - 1;
   const advice = usable >= 1 ? ` The most ${mask} allows from that start is ${String(usable)}.` : "";
   return `A pool of ${String(count)} addresses starting at ${start} ends at ${end}, at or past the subnet broadcast ${broadcast}.${advice}`;
+}
+
+/**
+ * A saved profile expressed as the setting writes that restore it — the third
+ * caller of the same `nexus.networkServers.<kind>.*` keys the form and the
+ * quick pick write, so it belongs beside them rather than in the command file.
+ *
+ * Every configurable key is listed, including the ones the profile left unset:
+ * an omitted entry would leave whatever the live settings happen to hold, so a
+ * profile with no gateway would silently inherit the previous lab's. Writing
+ * `undefined` clears the key and hands it back to the packaged default, which
+ * is what "this profile does not set a gateway" has to mean.
+ *
+ * Two keys are deliberately absent. `leaseStorePath` is a machine-local path
+ * derived from global storage, never a setting. And the adapter's
+ * `bindAddress` is written to `interface`, which is what the setting has always
+ * been called.
+ */
+export function networkServerProfileSettingUpdates(
+  profile: NetworkServerConfigProfile
+): Array<[string, SettingValue]> {
+  if (profile.kind === "tftp") {
+    const config = profile.config;
+    return [
+      ["root", config.root],
+      ["port", config.port],
+      ["allowWrite", config.allowWrite === true],
+      ["interface", config.interface]
+    ];
+  }
+  const config = profile.config;
+  return [
+    ["rangeStart", config.rangeStart],
+    ["rangeEnd", config.rangeEnd],
+    ["subnet", config.subnet],
+    ["gateway", config.gateway],
+    ["dns", config.dns ? [...config.dns] : undefined],
+    ["leaseTimeSec", config.leaseTimeSec],
+    ["serverId", config.serverId],
+    ["broadcast", config.broadcast],
+    ["interface", config.bindAddress],
+    ["static", config.static ? { ...config.static } : undefined],
+    ["bootFileName", config.bootFileName],
+    ["nextServer", config.nextServer],
+    ["tftpServerAddresses", config.tftpServerAddresses ? [...config.tftpServerAddresses] : undefined],
+    ["vendorClassId", config.vendorClassId],
+    ["vendorSpecificOptions", config.vendorSpecificOptions ? [...config.vendorSpecificOptions] : undefined],
+    ["autoLinkTftp", profile.autoLinkTftp === true]
+  ];
 }
 
 /**

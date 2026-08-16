@@ -7,6 +7,7 @@ import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerLocalServerCommands } from "./commands/localServerCommands";
 import { registerNetworkServerCommands } from "./commands/networkServerCommands";
+import { registerNetworkServerProfileCommands } from "./commands/networkServerProfileCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
@@ -1336,6 +1337,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const localServerCtx = { ...ctx, localServerManager } as const;
   const localServerDisposables = registerLocalServerCommands(localServerCtx);
   const networkServerDisposables = registerNetworkServerCommands({ ...ctx, networkServerManager });
+  const networkServerProfileDisposables = registerNetworkServerProfileCommands({ ...ctx, networkServerManager });
   registerTerminalTabCommands(context, {
     registry: terminalRegistry,
     sessionTerminals: ctx.sessionTerminals,
@@ -1440,6 +1442,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     localServerCloseListener,
     ...localServerDisposables,
     ...networkServerDisposables,
+    ...networkServerProfileDisposables,
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,

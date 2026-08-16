@@ -294,6 +294,8 @@ export class NexusTreeProvider
     activeLocalShellSessions: [],
     activeLocalServerSessions: [],
     activeNetworkServerSessions: [],
+    tftpProfiles: [],
+    dhcpProfiles: [],
     activeTunnels: [],
     remoteTunnels: [],
     explicitGroups: [],

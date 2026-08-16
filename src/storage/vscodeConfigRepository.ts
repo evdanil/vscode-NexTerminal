@@ -4,6 +4,7 @@ import { ensureInventorySourceRevision, type InventorySourceConfig } from "../mo
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { LocalServerConfig } from "../models/localServer";
+import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { ConfigRepository } from "../core/contracts";
 import {
   validateServerConfig,
@@ -12,6 +13,8 @@ import {
   validateAuthProfile,
   validateLocalShellProfile,
   validateLocalServerConfig,
+  validateTftpConfigProfile,
+  validateDhcpConfigProfile,
   validateInventorySource,
   validateDeviceTemplate,
   validateSavedFilter,
@@ -25,6 +28,12 @@ const TUNNELS_KEY = "nexus.tunnels";
 const SERIAL_PROFILES_KEY = "nexus.serialProfiles";
 const LOCAL_SHELL_PROFILES_KEY = "nexus.localShellProfiles";
 const LOCAL_SERVERS_KEY = "nexus.localServers";
+// globalState, not `contributes.configuration`: a profile is a structured
+// record with an id, a name and a whole nested config object, which is not what
+// a settings.json scalar is for. The *live* service configuration stays in
+// settings; only these snapshots of it live here.
+const TFTP_PROFILES_KEY = "nexus.networkServers.tftpProfiles";
+const DHCP_PROFILES_KEY = "nexus.networkServers.dhcpProfiles";
 const GROUPS_KEY = "nexus.groups";
 const AUTH_PROFILES_KEY = "nexus.authProfiles";
 const INVENTORY_SOURCES_KEY = "nexus.inventorySources";
@@ -158,6 +167,36 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveLocalServers(servers: LocalServerConfig[]): Promise<void> {
     await this.context.globalState.update(LOCAL_SERVERS_KEY, servers);
+  }
+
+  public async getTftpProfiles(): Promise<TftpConfigProfile[]> {
+    const raw = asArray<TftpConfigProfile>(this.context.globalState.get(TFTP_PROFILES_KEY, []));
+    return raw.filter((item) => {
+      if (validateTftpConfigProfile(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid TFTP profile entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveTftpProfiles(profiles: TftpConfigProfile[]): Promise<void> {
+    await this.context.globalState.update(TFTP_PROFILES_KEY, profiles);
+  }
+
+  public async getDhcpProfiles(): Promise<DhcpConfigProfile[]> {
+    const raw = asArray<DhcpConfigProfile>(this.context.globalState.get(DHCP_PROFILES_KEY, []));
+    return raw.filter((item) => {
+      if (validateDhcpConfigProfile(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid DHCP profile entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveDhcpProfiles(profiles: DhcpConfigProfile[]): Promise<void> {
+    await this.context.globalState.update(DHCP_PROFILES_KEY, profiles);
   }
 
   public async getGroups(): Promise<string[]> {
