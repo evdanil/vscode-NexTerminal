@@ -2,7 +2,7 @@
 
 import { EventEmitter } from 'node:events';
 import { ServerRegistry, type NexusServerFactory } from './ServerRegistry';
-import type { NexusServer } from './NexusServer';
+import type { NexusServer, ServerConnectionEvent } from './NexusServer';
 import type { ServerSnapshot, ServerStatusChangeEvent } from './ServerStatus';
 import { ServerStatus } from './ServerStatus';
 
@@ -38,6 +38,14 @@ export interface ServerManagerEvents {
    * `final` forwards the originating server's terminal-change marker.
    */
   runtimeUpdate: [id: string, final?: boolean];
+  /**
+   * Emitted WHENEVER ANY server reaches an edge of a client connection
+   * lifecycle (TFTP transfer opened/finished/failed, DHCP lease granted or
+   * declined). One emission is meant to become at most one user-visible
+   * message, so this is emitted at lifecycle edges only — progress belongs to
+   * `runtimeUpdate`.
+   */
+  connection: [id: string, event: ServerConnectionEvent];
 }
 
 /**
@@ -383,6 +391,9 @@ export class ServerManager extends EventEmitter {
     });
     server.on('runtimeUpdate', (final) => {
       this.emit('runtimeUpdate' as keyof ServerManagerEvents, id, final);
+    });
+    server.on('connection', (event) => {
+      this.emit('connection' as keyof ServerManagerEvents, id, event);
     });
 
     return server;

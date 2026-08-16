@@ -300,6 +300,14 @@ export class DhcpAdapter extends BaseNexusServer {
         'info',
         `LEASE BOUND MAC ${lease.mac} → IP ${lease.ip} (type=${lease.leaseType}, duration=${formatDuration(lease.leaseSec)}${hostPart}).`,
       );
+      // The whole DORA exchange has completed by the time a lease binds, so
+      // this is both the start of the client's connection and its outcome —
+      // hence one event here and none on renewal, which would otherwise repeat
+      // for the life of every device on the bench.
+      this.emitConnection({
+        phase: 'started',
+        summary: `lease granted ${lease.ip} to ${lease.mac}${lease.hostname ? ` (${lease.hostname})` : ''}`,
+      });
       this.emit('runtimeUpdate');
     });
     engine.on('lease:renewed', (lease) => {
@@ -311,6 +319,24 @@ export class DhcpAdapter extends BaseNexusServer {
     });
     engine.on('lease:released', (info) => {
       this.log('info', `LEASE RELEASED MAC ${info.mac}${info.ip ? ` (old IP ${info.ip})` : ''}.`);
+      this.emit('runtimeUpdate', true);
+    });
+    // DHCPDECLINE is the only per-client failure this server can observe: the
+    // engine sees received packets, so a DHCPNAK (which travels server →
+    // client) never comes back through here, and a client that simply never
+    // answers an OFFER produces no packet at all.
+    engine.on('message:dhcp', (msgType, req) => {
+      if (msgType !== 'DHCPDECLINE') return;
+      const { mac, address } = describeDecline(req);
+      this.log('warn', `LEASE DECLINED by MAC ${mac}${address ? ` (offered IP ${address})` : ''}.`);
+      this.emitConnection({
+        phase: 'failed',
+        summary: `lease declined by ${mac}`,
+        detail: address
+          ? `Client refused ${address} — usually another host is already answering on that address.`
+          : 'Client refused the offered address — usually another host is already answering on it.',
+        code: 'DHCPDECLINE',
+      });
       this.emit('runtimeUpdate', true);
     });
   }
@@ -366,6 +392,33 @@ export class DhcpAdapter extends BaseNexusServer {
       `Technical detail: ${raw}`
     );
   }
+}
+
+/** Option 50 (requested IP address) — the address a DHCPDECLINE is refusing. */
+const DHCP_OPTION_REQUESTED_IP = 50;
+
+/**
+ * Pulls the client identity and the refused address out of a raw DHCPDECLINE.
+ *
+ * The packet arrives as the `dhcp` library's loosely-typed object, so every
+ * field is treated as absent until proven to be a string — a decline whose
+ * `chaddr` did not survive parsing is still worth reporting, just anonymously.
+ *
+ * @param req Raw request object as the library handed it over.
+ * @returns The client MAC (or a placeholder) and the declined address if the
+ *   packet carried one.
+ */
+function describeDecline(req: unknown): { mac: string; address?: string } {
+  const packet = (req ?? {}) as { chaddr?: unknown; ciaddr?: unknown; options?: Record<number, unknown> };
+  const mac = typeof packet.chaddr === 'string' && packet.chaddr.length > 0 ? packet.chaddr : '??:??:??:??:??:??';
+  const requested = packet.options?.[DHCP_OPTION_REQUESTED_IP];
+  const address =
+    typeof requested === 'string' && requested.length > 0
+      ? requested
+      : typeof packet.ciaddr === 'string' && packet.ciaddr.length > 0 && packet.ciaddr !== '0.0.0.0'
+        ? packet.ciaddr
+        : undefined;
+  return { mac, address };
 }
 
 /** Converts IPv4 → int to calculate pool size (copy from engine to avoid circular import). */

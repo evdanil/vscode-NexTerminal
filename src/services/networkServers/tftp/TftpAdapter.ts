@@ -315,6 +315,10 @@ export class TftpAdapter extends BaseNexusServer {
       const verb = info.direction === 'rrq' ? 'Download started' : 'Upload started';
       const opt = `blksize=${info.blockSize}, window=${info.windowSize}`;
       this.log('info', `${verb}: ${info.filename} (${info.peer.address}:${info.peer.port}) · ${opt}`);
+      this.emitConnection({
+        phase: 'started',
+        summary: `${describeDirection(info.direction)} started from ${info.peer.address} · ${info.filename}`,
+      });
       this.emit('runtimeUpdate');
     });
     engine.on('transfer:progress', (info) => {
@@ -340,13 +344,37 @@ export class TftpAdapter extends BaseNexusServer {
         'info',
         `${verb} ${info.filename}: ${info.bytes}/${info.totalBytes ?? info.bytes} B · ${speed} · took ${total}`,
       );
+      this.emitConnection({
+        phase: 'completed',
+        summary: `${describeDirection(info.direction)} finished from ${info.peer.address} · ${info.filename} (${info.bytes} B in ${total})`,
+      });
       this.emit('runtimeUpdate', true);
     });
     engine.on('transfer:error', (info, err) => {
       this.log('warn', `${info.direction.toUpperCase()} failed ${info.filename}: ${err.message}`);
+      this.emitConnection({
+        phase: 'failed',
+        summary: `${describeDirection(info.direction)} failed from ${info.peer.address} · ${info.filename}`,
+        detail: err.message,
+        // `ProtocolError` and friends carry their classification in `name`;
+        // a plain `Error` would only contribute the useless literal "Error".
+        code: err.name && err.name !== 'Error' ? err.name : undefined,
+      });
       this.emit('runtimeUpdate', true);
     });
   }
+}
+
+/**
+ * Names a transfer direction from the *client's* point of view, which is the
+ * one an operator watching a device boot is thinking in: `rrq` means the client
+ * is pulling a file off this server, `wrq` that it is pushing one back.
+ *
+ * @param direction Wire-level request type.
+ * @returns `"Download"` or `"Upload"`.
+ */
+function describeDirection(direction: 'rrq' | 'wrq'): string {
+  return direction === 'rrq' ? 'Download' : 'Upload';
 }
 
 /**

@@ -36,6 +36,7 @@ import { normalizeBoundedNumber } from "../../utils/helpers";
 import type {
   DhcpAdapterConfig,
   NetworkServerConfigs,
+  ServerConnectionEvent,
   ServerSnapshot,
   ServerStatusChangeEvent,
   TftpAdapterConfig
@@ -57,15 +58,24 @@ type JsonRpcResponse = JsonRpcResult | JsonRpcError;
  * - `statusChange`: a service moved between stopped/starting/running/error.
  * - `log`: a log line to surface in the output channel.
  * - `runtimeUpdate`: mutable runtime changed (TFTP transfers / DHCP leases).
+ * - `connection`: a client connection lifecycle edge — a TFTP transfer opened,
+ *   finished or failed, a DHCP lease was granted or declined. One push per
+ *   edge, never per progress tick, so a consumer may surface each one directly
+ *   to the user without any throttling of its own.
  */
 type JsonRpcEvent =
   | { readonly event: "ready"; readonly data: null }
   | { readonly event: "statusChange"; readonly data: ServerStatusChangeEvent }
   | { readonly event: "log"; readonly data: { readonly id: string; readonly level: string; readonly message: string } }
-  | { readonly event: "runtimeUpdate"; readonly data: { readonly id: string } };
+  | { readonly event: "runtimeUpdate"; readonly data: { readonly id: string } }
+  | {
+      readonly event: "connection";
+      readonly data: { readonly id: string; readonly connection: ServerConnectionEvent };
+    };
 
 type StatusChangeListener = (event: ServerStatusChangeEvent) => void;
 type RuntimeUpdateListener = (id: string) => void;
+type ConnectionListener = (id: string, event: ServerConnectionEvent) => void;
 type LogListener = (id: string, level: string, message: string) => void;
 type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void;
 
@@ -143,6 +153,7 @@ export class NetworkServerDaemonHost {
   private readonly pending = new Map<number, PendingRequest>();
   private readonly statusChangeListeners = new Set<StatusChangeListener>();
   private readonly runtimeUpdateListeners = new Set<RuntimeUpdateListener>();
+  private readonly connectionListeners = new Set<ConnectionListener>();
   private readonly logListeners = new Set<LogListener>();
   private readonly exitListeners = new Set<ExitListener>();
   /** Resolved once the daemon pushes `ready`; rejected if it dies first. */
@@ -182,6 +193,17 @@ export class NetworkServerDaemonHost {
   public onDidUpdateRuntime(listener: RuntimeUpdateListener): () => void {
     this.runtimeUpdateListeners.add(listener);
     return () => this.runtimeUpdateListeners.delete(listener);
+  }
+
+  /**
+   * Subscribes to client connection lifecycle edges.
+   *
+   * Emitted at most once per transfer/lease edge, so a listener may act on
+   * every call — including showing a notification — without debouncing.
+   */
+  public onDidConnection(listener: ConnectionListener): () => void {
+    this.connectionListeners.add(listener);
+    return () => this.connectionListeners.delete(listener);
   }
 
   public onDidLog(listener: LogListener): () => void {
@@ -313,6 +335,7 @@ export class NetworkServerDaemonHost {
     this.rejectAllReadyWaiters(new Error("Network servers daemon host disposed"));
     this.statusChangeListeners.clear();
     this.runtimeUpdateListeners.clear();
+    this.connectionListeners.clear();
     this.logListeners.clear();
     this.exitListeners.clear();
   }
@@ -468,6 +491,12 @@ export class NetworkServerDaemonHost {
       case "runtimeUpdate": {
         for (const listener of this.runtimeUpdateListeners) {
           listener(notification.data.id);
+        }
+        return;
+      }
+      case "connection": {
+        for (const listener of this.connectionListeners) {
+          listener(notification.data.id, notification.data.connection);
         }
         return;
       }

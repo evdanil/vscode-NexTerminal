@@ -51,7 +51,7 @@
  * - Error:  `{id, error: {code, message}}`
  * - Event:  `{event, data}` (no `id`; async push from the daemon)
  *
- * Emitted events: `ready`, `statusChange`, `log`.
+ * Emitted events: `ready`, `statusChange`, `log`, `runtimeUpdate`, `connection`.
  *
  * @see {@link JsonRpcRequest}   format of requests received by the daemon
  * @see {@link JsonLine}         format of lines written to stdout
@@ -68,6 +68,7 @@ import {
   createDefaultRegistry,
   type DhcpAdapterConfig,
   type NetworkServerConfigs,
+  type ServerConnectionEvent,
   type ServerSnapshot,
   type ServerStatusChangeEvent,
   type TftpAdapterConfig,
@@ -146,12 +147,19 @@ type JsonRpcError = {
  * - `runtimeUpdate`— mutable runtime changed (TFTP transfers / DHCP leases).
  *                    Coalesced per id before it reaches stdout — see
  *                    {@link createRuntimeUpdateThrottle}.
+ * - `connection`   — a client connection lifecycle edge (TFTP transfer
+ *                    opened/finished/failed, DHCP lease granted/declined).
+ *                    Deliberately **not** coalesced: unlike `runtimeUpdate`,
+ *                    these already fire only at edges, and folding two of them
+ *                    together would drop an event the host is expected to
+ *                    surface one-for-one.
  */
 type JsonRpcEvent =
   | { readonly event: 'statusChange'; readonly data: ServerStatusChangeEvent }
   | { readonly event: 'log'; readonly data: { readonly id: string; readonly level: string; readonly message: string } }
   | { readonly event: 'ready'; readonly data: null }
-  | { readonly event: 'runtimeUpdate'; readonly data: { readonly id: string } };
+  | { readonly event: 'runtimeUpdate'; readonly data: { readonly id: string } }
+  | { readonly event: 'connection'; readonly data: { readonly id: string; readonly connection: ServerConnectionEvent } };
 
 /**
  * Union of all message types the daemon writes to stdout.
@@ -319,6 +327,10 @@ async function run(): Promise<void> {
 
   manager.on('runtimeUpdate', (id: string, final?: boolean) => {
     runtimeUpdates.push(id, final);
+  });
+
+  manager.on('connection', (id: string, connection: ServerConnectionEvent) => {
+    writeLine({ event: 'connection', data: { id, connection } });
   });
 
   /**

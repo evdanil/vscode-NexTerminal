@@ -27,6 +27,44 @@ export interface NexusServerEvents {
    *  must deliver this one instead of folding it into a later window.
    */
   runtimeUpdate: [final?: boolean];
+  /** Emitted once per client-facing connection lifecycle event. See
+   *  {@link ServerConnectionEvent} for what does and does not qualify. */
+  connection: [event: ServerConnectionEvent];
+}
+
+/**
+ * Where a connection sits in its lifecycle.
+ *
+ * - `started`   — a client just began something: a TFTP transfer opened, a
+ *                 DORA exchange produced a lease.
+ * - `completed` — that same something finished successfully.
+ * - `failed`    — it ended badly, and {@link ServerConnectionEvent.detail}
+ *                 says why.
+ */
+export type ServerConnectionPhase = 'started' | 'completed' | 'failed';
+
+/**
+ * A single client-facing connection lifecycle event — one TFTP transfer or one
+ * DHCP lease, at one of the three points in {@link ServerConnectionPhase}.
+ *
+ * **Deliberately not a progress feed.** `runtimeUpdate` already fires on every
+ * TFTP progress tick, which is what a tree view wants and what a notification
+ * emphatically does not: consumers of this event are expected to surface one
+ * user-visible message per emission, so an adapter must emit only at the edges
+ * of a lifecycle, never per packet or per block.
+ *
+ * `summary` is pre-formatted by the adapter because only the adapter knows the
+ * protocol's vocabulary (filenames and peers for TFTP, MACs and leases for
+ * DHCP); the consumer prefixes the service name and decides where it is shown.
+ */
+export interface ServerConnectionEvent {
+  readonly phase: ServerConnectionPhase;
+  /** One-line human summary, e.g. `"lease granted 192.168.2.10 to aa:bb:…"`. */
+  readonly summary: string;
+  /** Failure cause, when `phase === 'failed'`. */
+  readonly detail?: string;
+  /** Machine-readable classification of the failure, when one is available. */
+  readonly code?: string;
 }
 
 /**

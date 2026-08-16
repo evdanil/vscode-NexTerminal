@@ -2,7 +2,12 @@
 
 import { EventEmitter } from 'node:events';
 import { ServerStatus } from './ServerStatus';
-import type { NexusServer, NexusServerEvents, ServerLogLevel } from './NexusServer';
+import type {
+  NexusServer,
+  NexusServerEvents,
+  ServerConnectionEvent,
+  ServerLogLevel,
+} from './NexusServer';
 
 /**
  * **Base abstract Adapter** that implements most of the `NexusServer` contract,
@@ -195,5 +200,21 @@ export abstract class BaseNexusServer extends EventEmitter implements NexusServe
    */
   protected log(level: ServerLogLevel, message: string): void {
     this.emit('log' as keyof NexusServerEvents, level, `[${this.name}] ${message}`);
+  }
+
+  /**
+   * Emits a client-facing connection lifecycle event.
+   *
+   * Unlike {@link log}, the summary is **not** prefixed with the server name:
+   * consumers already know which service spoke (the `ServerManager` re-emits
+   * with the id attached) and prefix it themselves in whatever form their
+   * surface calls for.
+   *
+   * @param event - The lifecycle edge that was just reached.
+   *
+   * **Side effect:** Emits the `connection` event.
+   */
+  protected emitConnection(event: ServerConnectionEvent): void {
+    this.emit('connection' as keyof NexusServerEvents, event);
   }
 }

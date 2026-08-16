@@ -4339,6 +4339,12 @@
           },
           "order": 55,
           "markdownDescription": "**DHCP — Reservations.** Static reservations as a **MAC address → IP address** map, for example `{ \"aa:bb:cc:dd:ee:ff\": \"192.168.2.50\" }`. Reserved addresses are handed to the matching client regardless of the dynamic pool, so they may sit inside or outside `#nexus.networkServers.dhcp.rangeStart#`…`#nexus.networkServers.dhcp.rangeEnd#`. Entries whose value is not a string are ignored, so one malformed line does not discard the rest of the map."
+        },
+        "nexus.networkServers.verboseMode": {
+          "type": "boolean",
+          "default": false,
+          "order": 56,
+          "markdownDescription": "**Network Servers — Notifications.** Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the *Nexus Network Servers* output channel records everything either way."
         }
       }
     }

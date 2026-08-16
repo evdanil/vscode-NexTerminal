@@ -35,6 +35,7 @@ import type {
   DhcpAdapterConfig,
   DhcpVendorSpecificEntry,
   NetworkServerConfigs,
+  ServerConnectionEvent,
   TftpAdapterConfig
 } from "./core/index";
 import { isValidSubOptionCode } from "./dhcp/engine/dhcpBootOptions";
@@ -47,6 +48,23 @@ import {
 } from "./daemonHost";
 
 export const NETWORK_SERVER_KINDS: readonly NetworkServerKind[] = ["tftp", "dhcp"];
+
+/** Service names as they appear at the head of a notification. */
+const SERVICE_LABELS: Record<NetworkServerKind, string> = { tftp: "TFTP", dhcp: "DHCP" };
+
+/**
+ * Whether Verbose Mode is enabled *right now*.
+ *
+ * Read fresh at every notification site rather than captured in a field: a
+ * toggle then takes effect on the very next event with no `onDidChangeConfiguration`
+ * subscription to keep in sync, and there is no window in which a user who has
+ * just switched it off keeps being notified. The read is a cached lookup in
+ * VS Code's configuration model, so doing it per event costs nothing worth
+ * saving.
+ */
+export function isNetworkServerVerboseMode(): boolean {
+  return vscode.workspace.getConfiguration("nexus.networkServers").get<boolean>("verboseMode", false) === true;
+}
 
 /**
  * How long runtime refreshes are coalesced.
@@ -256,6 +274,7 @@ export class NetworkServerManager implements vscode.Disposable {
     this.subscriptions.push(
       this.host.onDidChangeStatus((event) => this.handleStatusChange(event.id, event.status, event.error)),
       this.host.onDidUpdateRuntime((id) => this.scheduleRuntimeRefresh(id)),
+      this.host.onDidConnection((id, event) => this.handleConnectionEvent(id, event)),
       this.host.onDidLog((id, level, message) => this.log(level, `[${id}] ${message}`)),
       this.host.onDidExit((code, signal) => this.handleDaemonExit(code, signal))
     );
@@ -291,6 +310,7 @@ export class NetworkServerManager implements vscode.Disposable {
       throw this.toNetworkServerError(kind, error);
     }
     await this.refreshRuntime(kind);
+    this.notifyLifecycle(kind, "started");
   }
 
   /** Gracefully stops a service. */
@@ -305,6 +325,7 @@ export class NetworkServerManager implements vscode.Disposable {
       throw this.toNetworkServerError(kind, error);
     }
     this.core.updateNetworkServerSessionStatus(kind, "stopped", { boundPort: null });
+    this.notifyLifecycle(kind, "stopped");
   }
 
   /** Restarts a service, re-reading settings so edits take effect. */
@@ -321,6 +342,7 @@ export class NetworkServerManager implements vscode.Disposable {
       throw this.toNetworkServerError(kind, error);
     }
     await this.refreshRuntime(kind);
+    this.notifyLifecycle(kind, "restarted");
   }
 
   /**
@@ -411,6 +433,44 @@ export class NetworkServerManager implements vscode.Disposable {
       if (!this.core.getNetworkServerSession(kind)) continue;
       this.core.updateNetworkServerSessionStatus(kind, "stopped", { boundPort: null });
     }
+  }
+
+  /**
+   * Announces a completed lifecycle transition the user asked for.
+   *
+   * Success only. A *failed* start/stop/restart is reported by the command
+   * layer regardless of Verbose Mode: the user pressed a button and is owed an
+   * answer, and reporting it here as well would show the same failure twice.
+   */
+  private notifyLifecycle(kind: NetworkServerKind, verb: "started" | "stopped" | "restarted"): void {
+    if (this.disposed || !isNetworkServerVerboseMode()) return;
+    const boundPort = verb === "stopped" ? null : this.core.getNetworkServerSession(kind)?.boundPort;
+    const where = boundPort ? ` on UDP port ${boundPort}` : "";
+    void vscode.window.showInformationMessage(`${SERVICE_LABELS[kind]} service ${verb}${where}.`);
+  }
+
+  /**
+   * Surfaces one client connection lifecycle edge as a toast.
+   *
+   * Gated on Verbose Mode and default-off for a reason: a device booting over
+   * ZTP opens a transfer per file, and a bench full of hardware renews leases
+   * all day. The daemon already emits these only at lifecycle edges, so no
+   * throttling is applied here — suppressing a *second* transfer because a
+   * first one was just announced would be worse than showing both.
+   *
+   * The output channel keeps its own record either way; this only decides
+   * whether the event also interrupts the user.
+   */
+  private handleConnectionEvent(id: string, event: ServerConnectionEvent): void {
+    if (this.disposed || !isNetworkServerKind(id) || !isNetworkServerVerboseMode()) return;
+    const headline = `${SERVICE_LABELS[id]}: ${event.summary}`;
+    if (event.phase !== "failed") {
+      void vscode.window.showInformationMessage(headline);
+      return;
+    }
+    const detail = event.detail ? ` — ${event.detail}` : "";
+    const code = event.code ? ` (${event.code})` : "";
+    void vscode.window.showErrorMessage(`${headline}${detail}${code}`);
   }
 
   private scheduleRuntimeRefresh(id: string): void {

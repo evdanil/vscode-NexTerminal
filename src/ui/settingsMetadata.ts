@@ -14,6 +14,7 @@ export interface SettingMeta {
     | "serial"
     | "scripts"
     | "localServers"
+    | "networkServers"
     | "tftpServer"
     | "dhcpServer";
   description?: string;
@@ -596,6 +597,18 @@ export const SETTINGS_META: SettingMeta[] = [
     badge: "Safety limit",
     badgeClass: "setting-badge-safety"
   },
+  // --- Network Servers (shared by TFTP and DHCP) ---
+  {
+    key: "verboseMode",
+    section: "nexus.networkServers",
+    label: "Verbose Mode",
+    type: "boolean",
+    category: "networkServers",
+    subgroup: "Notifications",
+    description:
+      "Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the Nexus Network Servers output channel records everything either way.",
+    default: false
+  },
   // --- TFTP Server ---
   {
     key: "tftp.root",
@@ -779,6 +792,7 @@ export const CATEGORY_ORDER = [
   "serial",
   "scripts",
   "localServers",
+  "networkServers",
   "tftpServer",
   "dhcpServer"
 ] as const;
@@ -794,6 +808,7 @@ export const CATEGORY_LABELS: Record<string, string> = {
   serial: "Serial",
   scripts: "Scripts",
   localServers: "Local Servers",
+  networkServers: "Network Servers",
   tftpServer: "TFTP Server",
   dhcpServer: "DHCP Server"
 };
@@ -809,6 +824,7 @@ export const CATEGORY_ICONS: Record<string, string> = {
   serial: "circuit-board",
   scripts: "play",
   localServers: "server-process",
+  networkServers: "bell",
   tftpServer: "radio-tower",
   dhcpServer: "broadcast"
 };
@@ -824,6 +840,8 @@ export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   serial: "Set serial command timeout behavior.",
   scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs.",
   localServers: "Tune auto-restart limits, backoff timing, and working-directory safety for local server processes.",
+  networkServers:
+    "Behaviour shared by both embedded network services — how much of what TFTP and DHCP are doing is surfaced as notifications.",
   tftpServer:
     "Configure the embedded TFTP service — served directory, bind interface, port, and upload access.",
   dhcpServer:
