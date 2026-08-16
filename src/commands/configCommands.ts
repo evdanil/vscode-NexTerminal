@@ -69,6 +69,7 @@ import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidation";
+import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
 import { MAX_SCRIPT_WAIT_TIMEOUT_MS, MAX_SCRIPT_WAIT_TIMEOUT_SECONDS } from "../services/scripts/defaultTimeout";
@@ -169,8 +170,15 @@ function validBoundedNumber(value: unknown, min: number, max: number): boolean {
 // Keeping them in a lookup map keeps the apply loop flat (no special-case if/else ladder).
 const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingValidation> = {
   "nexus.terminal.highlighting.rules": (value) => {
+    // Upgrade as well as validate. Import is the one path that carries a rule
+    // array in from ANOTHER machine — usually an older install, which is
+    // exactly where the pre-2.8.187 truncating IPv6 pattern and the
+    // pre-2.8.182 nameless rules live. The one-shot activation migration has
+    // already run by now, so importing the raw payload would re-pollute global
+    // settings with the stale snapshot this release exists to heal, with no
+    // second chance to fix it until the next restart.
     const rules = validateAndSanitizeHighlightRules(value);
-    return rules ? { ok: true, value: rules } : { ok: false };
+    return rules ? { ok: true, value: upgradeHighlightRules(rules).rules } : { ok: false };
   },
   "nexus.scripts.maxRuntimeMs": (value) =>
     validBoundedNumber(value, 0, MAX_SCRIPT_RUNTIME_MS) ? { ok: true, value } : { ok: false },

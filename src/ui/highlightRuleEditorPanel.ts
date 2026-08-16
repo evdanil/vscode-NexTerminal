@@ -6,6 +6,7 @@ import {
   validateAndSanitizeHighlightRulesWithError,
   type HighlightRule
 } from "../utils/highlightRuleValidation";
+import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 
 export class HighlightRuleEditorPanel {
@@ -53,7 +54,12 @@ export class HighlightRuleEditorPanel {
 
   private readRules(): HighlightRule[] {
     const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
-    return validateAndSanitizeHighlightRules(config.get<unknown>("rules", [])) ?? [];
+    const validated = validateAndSanitizeHighlightRules(config.get<unknown>("rules", [])) ?? [];
+    // Upgrade at READ time, not just at the activation migration: the array may
+    // come from a workspace/folder scope the migration deliberately leaves
+    // alone, and the editor should still show the rule's shipped name and the
+    // fixed pattern. A subsequent Save then persists the upgraded form.
+    return upgradeHighlightRules(validated).rules;
   }
 
   private pushRulesUpdate(): void {

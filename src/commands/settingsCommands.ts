@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { SettingsPanel } from "../ui/settingsPanel";
 import { HighlightRuleEditorPanel } from "../ui/highlightRuleEditorPanel";
 import { SETTINGS_META } from "../ui/settingsMetadata";
-import { resetSettings } from "../ui/settingsReset";
+import { resetAllExtraKeys, resetSettings } from "../ui/settingsReset";
 
 export function registerSettingsCommands(
   resolveLogDir: () => string
@@ -34,7 +34,7 @@ export function registerSettingsCommands(
         "Reset"
       );
       if (confirm === "Reset") {
-        await resetSettings(SETTINGS_META);
+        await resetSettings(SETTINGS_META, resetAllExtraKeys());
         void vscode.window.showInformationMessage("All settings have been reset to defaults.");
       }
     })
