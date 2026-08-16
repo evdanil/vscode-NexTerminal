@@ -88,19 +88,31 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 13 root items", () => {
+    it("returns 15 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(13);
+      expect(roots).toHaveLength(15);
     });
 
-    it("has 9 category items first with Security & Data after SSH", () => {
+    it("has 11 category items first with Security & Data after SSH", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(9);
+      expect(categories).toHaveLength(11);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
-        .toEqual(["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
+        .toEqual([
+          "logging",
+          "ssh",
+          "securityData",
+          "tunnels",
+          "terminal",
+          "ui",
+          "sftp",
+          "serial",
+          "scripts",
+          "localServers",
+          "networkServers"
+        ]);
     });
 
     it("has 4 root link items for Macros, Auth Profiles, Device Templates, and Inventory Sources", () => {

@@ -139,11 +139,27 @@ const EXTRA_IMPORT_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.scripts", key: "maxRuntimeMs" }
 ];
 
+// Contributed settings whose value is an array or an object, which SettingMeta's scalar type
+// system cannot describe. They are edited in the Network Servers settings form (a
+// WebviewFormPanel that parses them out of textareas), exactly as
+// `nexus.terminal.highlighting.rules` is edited in the highlight rule editor rather than the
+// Settings panel. Backup/export must still carry them, so they join SETTINGS_KEYS here and
+// each gets a shape validator in SPECIAL_SETTING_VALIDATORS below — without one,
+// validateSettingUpdate would reject them on import as "Unknown Nexus setting".
+const FORM_EDITED_SETTING_KEYS: Array<{ section: string; key: string }> = [
+  { section: "nexus.networkServers", key: "dhcp.dns" },
+  { section: "nexus.networkServers", key: "dhcp.tftpServerAddresses" },
+  { section: "nexus.networkServers", key: "dhcp.vendorSpecificOptions" },
+  { section: "nexus.networkServers", key: "dhcp.static" }
+];
+
 // Derived from SETTINGS_META (single source of truth for contributed settings) plus the
-// import-compat extras above, so adding a setting only requires editing settingsMetadata.ts.
+// form-edited and import-compat extras above, so adding a setting only requires editing
+// settingsMetadata.ts. EXTRA_IMPORT_KEYS stays last so the legacy-timeout ordering above holds.
 // The SETTINGS_KEYS ⊇ SETTINGS_META invariant is asserted in configImportExport.test.ts.
 export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
   ...SETTINGS_META.map((m) => ({ section: m.section, key: m.key })),
+  ...FORM_EDITED_SETTING_KEYS,
   ...EXTRA_IMPORT_KEYS
 ];
 
@@ -165,6 +181,37 @@ function validBoundedNumber(value: unknown, min: number, max: number): boolean {
   return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max;
 }
 
+function validStringArray(value: unknown): boolean {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/**
+ * Shape check for `nexus.networkServers.dhcp.vendorSpecificOptions`, mirroring the
+ * contributed JSON schema: a list of `{ subOption, value }` pairs whose codes are in
+ * 1–254 (0 is PAD and 255 is END, so neither can carry a value). The encoder
+ * (`encodeVendorSpecificInfo`) still skips individual entries it cannot fit on the wire,
+ * so this only has to keep a structurally wrong value out of settings.json.
+ */
+function validVendorSpecificOptions(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every((entry) => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const record = entry as Record<string, unknown>;
+      return validBoundedNumber(record.subOption, 1, 254) && typeof record.value === "string";
+    })
+  );
+}
+
+function validStaticReservations(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value as Record<string, unknown>).every((ip) => typeof ip === "string")
+  );
+}
+
 // Per-key validators applied before the generic validateSettingUpdate fallback in applySettings.
 // Keeping them in a lookup map keeps the apply loop flat (no special-case if/else ladder).
 const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingValidation> = {
@@ -175,7 +222,13 @@ const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingVali
   "nexus.scripts.maxRuntimeMs": (value) =>
     validBoundedNumber(value, 0, MAX_SCRIPT_RUNTIME_MS) ? { ok: true, value } : { ok: false },
   "nexus.scripts.defaultTimeout": (value) =>
-    validBoundedNumber(value, 100, MAX_SCRIPT_WAIT_TIMEOUT_MS) ? { ok: true, value } : { ok: false }
+    validBoundedNumber(value, 100, MAX_SCRIPT_WAIT_TIMEOUT_MS) ? { ok: true, value } : { ok: false },
+  "nexus.networkServers.dhcp.dns": (value) => (validStringArray(value) ? { ok: true, value } : { ok: false }),
+  "nexus.networkServers.dhcp.tftpServerAddresses": (value) =>
+    validStringArray(value) ? { ok: true, value } : { ok: false },
+  "nexus.networkServers.dhcp.vendorSpecificOptions": (value) =>
+    validVendorSpecificOptions(value) ? { ok: true, value } : { ok: false },
+  "nexus.networkServers.dhcp.static": (value) => (validStaticReservations(value) ? { ok: true, value } : { ok: false })
 };
 
 function readSettings(): Record<string, unknown> {
