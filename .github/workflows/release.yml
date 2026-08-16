@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  # Called by auto-release.yml: tags it creates with GITHUB_TOKEN cannot
+  # trigger the push event above (GitHub's recursion safeguard), so it invokes
+  # this workflow directly and names the tag.
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (vX.Y.Z) the calling workflow created"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       publish_marketplace:
@@ -80,6 +89,10 @@ jobs:
   build:
     needs: build-local-pty
     runs-on: ubuntu-latest
+    env:
+      # The release tag, however this run started: workflow_call input, or the
+      # pushed tag ref. Empty for workflow_dispatch (build-only runs).
+      RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -95,9 +108,9 @@ jobs:
           cache: npm
 
       - name: Set version from tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE_TAG != ''
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          VERSION="${RELEASE_TAG#v}"
           echo "Setting version to $VERSION"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
@@ -141,16 +154,39 @@ jobs:
           name: vsix
           path: "*.vsix"
 
+      - name: Decide whether this release becomes Latest
+        if: env.RELEASE_TAG != ''
+        id: latest
+        run: |
+          set -euo pipefail
+          # Two releases of DIFFERENT versions can run concurrently (the atomic
+          # tag push only arbitrates same-version races), and an older build
+          # finishing after a newer one must not re-mark itself as the repo's
+          # Latest release. Latest = highest semver among all v* tags plus the
+          # one being released, not "most recently published".
+          max=$( { git ls-remote --tags origin 'refs/tags/v*' \
+              | awk '{print $2}' | sed 's#refs/tags/##' | grep -v '\^{}' || true; \
+              echo "$RELEASE_TAG"; } \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          if [ "$max" = "$RELEASE_TAG" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Releasing $RELEASE_TAG; highest known tag: $max"
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE_TAG != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          make_latest: ${{ steps.latest.outputs.make_latest }}
           files: "*.vsix"
           generate_release_notes: true
 
       - name: Publish to VS Code Marketplace
         if: >-
-          startsWith(github.ref, 'refs/tags/v')
+          env.RELEASE_TAG != ''
           || inputs.publish_marketplace
         run: npx @vscode/vsce publish --packagePath *.vsix --pat "$VSCE_PAT"
         env:

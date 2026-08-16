@@ -102,6 +102,7 @@ Graceful degradation — registers stub commands showing "not available in brows
 - Every commit that will be tagged and deployed **must** bump the patch version in `package.json` (e.g. 2.7.5 → 2.7.6). The VS Code Marketplace rejects re-publishing the same version.
 - Never move or re-use an existing version tag. If a fix lands after tagging, bump the patch and create a new tag.
 - Tags follow `v{major}.{minor}.{patch}` format (e.g. `v2.7.6`).
+- **Releases are automatic on merge** (`.github/workflows/auto-release.yml`): when a push to `main` changes `package.json`'s version, the workflow creates the `v{version}` tag and runs the full release pipeline (VSIX build, GitHub Release, Marketplace, Open VSX). Escape hatches, in order of preference: merge without a version bump (docs/CI-only changes release nothing); put `[skip release]` in the merge commit message (version lands, no tag, no release — push the tag manually later to release); a manually pushed tag still triggers the release workflows directly and the automation then no-ops on that version.
 
 ## Development Workflow
 
