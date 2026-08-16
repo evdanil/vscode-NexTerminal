@@ -43,7 +43,7 @@ import type {
 } from "./core/index";
 import type { DhcpLeaseInfo } from "./dhcp/DhcpAdapter";
 import type { DhcpPacketCounters, DhcpPoolInfo } from "./dhcp/engine/DhcpEngine";
-import type { TftpTransferInfo } from "./tftp/TftpAdapter";
+import type { TftpTransferView } from "./tftp/TftpAdapter";
 
 /** Successful JSON-RPC response (id + result). */
 type JsonRpcResult = { readonly id: number; readonly result: unknown };
@@ -89,7 +89,7 @@ interface PendingRequest {
 /** `getServiceRuntime` reply for the TFTP service. */
 export interface TftpRuntimeSnapshot {
   readonly snapshot: ServerSnapshot;
-  readonly transfers: readonly TftpTransferInfo[];
+  readonly transfers: readonly TftpTransferView[];
   readonly root: string;
   readonly allowWrite: boolean;
   readonly boundPort: number | null;
@@ -262,6 +262,20 @@ export class NetworkServerDaemonHost {
   /** Stops then starts a service, optionally applying new configuration between the two. */
   public async restartServer(id: string, config?: NetworkServerAdapterConfig): Promise<void> {
     await this.request("restart", config ? { id, config } : { id });
+  }
+
+  /**
+   * Aborts one in-flight TFTP transfer.
+   *
+   * @param id         Service id — only `"tftp"` has cancellable transfers.
+   * @param transferId `address:port` id from {@link TftpTransferView.id}.
+   * @returns `true` when the daemon aborted a live transfer, `false` when it
+   *          had already finished on its own (a race the caller reports as
+   *          "already finished", not as an error).
+   */
+  public async cancelTransfer(id: string, transferId: string): Promise<boolean> {
+    const result = await this.request("cancelTransfer", { id, transferId });
+    return (result as { ok?: boolean } | undefined)?.ok === true;
   }
 
   /**

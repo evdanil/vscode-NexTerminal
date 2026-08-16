@@ -8,6 +8,7 @@ import { registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerLocalServerCommands } from "./commands/localServerCommands";
 import { registerNetworkServerCommands } from "./commands/networkServerCommands";
 import { registerNetworkServerProfileCommands } from "./commands/networkServerProfileCommands";
+import { registerNetworkServerTransferCommands } from "./commands/networkServerTransferCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
@@ -1338,6 +1339,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const localServerDisposables = registerLocalServerCommands(localServerCtx);
   const networkServerDisposables = registerNetworkServerCommands({ ...ctx, networkServerManager });
   const networkServerProfileDisposables = registerNetworkServerProfileCommands({ ...ctx, networkServerManager });
+  const networkServerTransferDisposables = registerNetworkServerTransferCommands({ ...ctx, networkServerManager });
   registerTerminalTabCommands(context, {
     registry: terminalRegistry,
     sessionTerminals: ctx.sessionTerminals,
@@ -1443,6 +1445,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     ...localServerDisposables,
     ...networkServerDisposables,
     ...networkServerProfileDisposables,
+    ...networkServerTransferDisposables,
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,

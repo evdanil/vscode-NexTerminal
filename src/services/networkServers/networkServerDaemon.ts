@@ -60,7 +60,7 @@
 import { createInterface } from 'node:readline';
 import { env, stdin, stdout } from 'node:process';
 import { DhcpAdapter, type DhcpLeaseInfo } from './dhcp/DhcpAdapter';
-import { TftpAdapter, type TftpTransferInfo } from './tftp/TftpAdapter';
+import { TftpAdapter, type TftpTransferView } from './tftp/TftpAdapter';
 import { createRuntimeUpdateThrottle } from './runtimeUpdateThrottle';
 import {
   ServerManager,
@@ -111,7 +111,15 @@ const CONFIG_ENV_VAR = 'NEXUS_NETWORK_SERVERS_CONFIG';
  */
 type JsonRpcRequest = {
   readonly id: number;
-  readonly method: 'list' | 'start' | 'stop' | 'restart' | 'getStatus' | 'getServiceRuntime' | 'configure';
+  readonly method:
+    | 'list'
+    | 'start'
+    | 'stop'
+    | 'restart'
+    | 'getStatus'
+    | 'getServiceRuntime'
+    | 'configure'
+    | 'cancelTransfer';
   readonly params?: Record<string, unknown>;
 };
 
@@ -442,6 +450,24 @@ async function run(): Promise<void> {
           await manager.start(id);
           return { id: req.id, result: { ok: true, id } };
         }
+        case 'cancelTransfer': {
+          const id = String(req.params?.['id'] ?? '');
+          const transferId = String(req.params?.['transferId'] ?? '');
+          if (id !== 'tftp') {
+            return {
+              id: req.id,
+              error: { code: 'NOT_FOUND', message: `Service '${id}' has no cancellable transfers.` },
+            };
+          }
+          // Deliberately `getInstance`, not `ensureInstance`: cancelling on a
+          // service that was never started must not bring one into existence.
+          const instance = manager.getInstance(id);
+          if (!(instance instanceof TftpAdapter)) {
+            return { id: req.id, result: { ok: false, id, transferId } };
+          }
+          const cancelled = await instance.cancelTransfer(transferId);
+          return { id: req.id, result: { ok: cancelled, id, transferId } };
+        }
         case 'getServiceRuntime': {
           const id = String(req.params?.['id'] ?? '');
           try {
@@ -458,7 +484,7 @@ async function run(): Promise<void> {
             }
             if (id === 'tftp') {
               const tftp = instance as TftpAdapter;
-              const transfers: readonly TftpTransferInfo[] = tftp.activeTransfers();
+              const transfers: readonly TftpTransferView[] = tftp.activeTransfers();
               const root = tftp.root;
               const allowWrite = tftp.allowWrite;
               const boundPort = tftp.boundPort ?? tftp.port;

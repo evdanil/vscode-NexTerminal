@@ -563,6 +563,12 @@
         "icon": "$(list-flat)"
       },
       {
+        "command": "nexus.networkServer.tftp.cancelTransfer",
+        "title": "Cancel Transfer",
+        "category": "Nexus Network Server",
+        "icon": "$(circle-slash)"
+      },
+      {
         "command": "nexus.networkServer.profile.saveCurrent",
         "title": "Save Current Settings as Profile",
         "category": "Nexus Network Server",
@@ -1695,6 +1701,16 @@
           "group": "1_manage@2"
         },
         {
+          "command": "nexus.networkServer.tftp.cancelTransfer",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerTransfer.active",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.tftp.cancelTransfer",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerTransfer.active",
+          "group": "0_connect@1"
+        },
+        {
           "command": "nexus.tunnel.start",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "inline"
@@ -2229,6 +2245,10 @@
         {
           "command": "nexus.networkServer.inspectLogs",
           "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.tftp.cancelTransfer",
+          "when": "workspace.isTrusted"
         },
         {
           "command": "nexus.networkServer.profile.saveCurrent",

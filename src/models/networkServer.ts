@@ -46,10 +46,24 @@ export class NetworkServerError extends Error {
 
 /** One in-flight TFTP transfer, as rendered in the tree. */
 export interface NetworkServerTransferSummary {
+  /**
+   * Stable identity of the transfer — the client's `address:port` (its TFTP
+   * TID). This is what "Cancel Transfer" sends back down to the daemon.
+   */
+  readonly id: string;
   readonly filename: string;
   /** `rrq` = client is downloading, `wrq` = client is uploading. */
   readonly direction: "rrq" | "wrq";
+  /**
+   * Client as shown to the operator: `"hostname (ip)"` when reverse DNS
+   * resolved, otherwise the bare IP. Rendered daemon-side so the tree, the logs
+   * and the connection toasts never disagree about a client's name.
+   */
   readonly peer: string;
+  /** Raw client IPv4, always present even when `peer` carries a hostname. */
+  readonly clientAddress: string;
+  /** Reverse-DNS name, when one was resolved in time. */
+  readonly clientHostname?: string;
   readonly bytes: number;
   /** Total size when known (`tsize` negotiated), otherwise `null`. */
   readonly totalBytes: number | null;

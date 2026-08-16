@@ -346,6 +346,35 @@ export class NetworkServerManager implements vscode.Disposable {
   }
 
   /**
+   * Aborts one in-flight TFTP transfer at the operator's request.
+   *
+   * The daemon sends the client a TFTP ERROR packet and tears the session down,
+   * which comes back as a `connection` event and refreshes the sidebar. The
+   * runtime is refreshed here as well so the row disappears even in the corner
+   * case where the event is lost.
+   *
+   * @param transferId `address:port` id of the transfer to abort.
+   * @returns `true` if a live transfer was cancelled, `false` if it had already
+   *          finished by the time the request landed.
+   * @throws {NetworkServerError} If the daemon call itself fails.
+   */
+  public async cancelTftpTransfer(transferId: string): Promise<boolean> {
+    this.assertTrusted();
+    if (!this.host.isRunning) return false;
+    let cancelled: boolean;
+    try {
+      cancelled = await this.host.cancelTransfer("tftp", transferId);
+    } catch (error) {
+      throw this.toNetworkServerError("tftp", error);
+    }
+    if (cancelled) {
+      this.log("info", `[tftp] Transfer ${transferId} cancelled by user.`);
+    }
+    this.refreshRuntimeNow("tftp");
+    return cancelled;
+  }
+
+  /**
    * Pushes current settings to the daemon without starting anything.
    *
    * Useful on a settings-change event: stopped services are then rebuilt
@@ -462,7 +491,17 @@ export class NetworkServerManager implements vscode.Disposable {
    * whether the event also interrupts the user.
    */
   private handleConnectionEvent(id: string, event: ServerConnectionEvent): void {
-    if (this.disposed || !isNetworkServerKind(id) || !isNetworkServerVerboseMode()) return;
+    if (this.disposed || !isNetworkServerKind(id)) return;
+    // A terminal edge means a row just disappeared daemon-side — a transfer
+    // that finished, timed out, was aborted by the client's ERROR packet, or
+    // was cancelled from the UI. Refreshing out of band (rather than through
+    // the coalescing `scheduleRuntimeRefresh`) is what stops the sidebar from
+    // showing a "ghost" transfer that no longer exists. This runs regardless of
+    // Verbose Mode: the toast is optional, the sidebar being correct is not.
+    if (event.phase !== "started") {
+      this.refreshRuntimeNow(id);
+    }
+    if (!isNetworkServerVerboseMode()) return;
     const headline = `${SERVICE_LABELS[id]}: ${event.summary}`;
     if (event.phase !== "failed") {
       void vscode.window.showInformationMessage(headline);
@@ -471,6 +510,21 @@ export class NetworkServerManager implements vscode.Disposable {
     const detail = event.detail ? ` — ${event.detail}` : "";
     const code = event.code ? ` (${event.code})` : "";
     void vscode.window.showErrorMessage(`${headline}${detail}${code}`);
+  }
+
+  /**
+   * Refreshes runtime immediately, cancelling any pending debounced refresh.
+   *
+   * The 150 ms debounce exists to absorb the progress-event storm of a fast
+   * transfer; it must not delay the removal of a transfer that has ended.
+   */
+  private refreshRuntimeNow(kind: NetworkServerKind): void {
+    const pending = this.refreshTimers.get(kind);
+    if (pending) {
+      clearTimeout(pending);
+      this.refreshTimers.delete(kind);
+    }
+    void this.refreshRuntime(kind);
   }
 
   private scheduleRuntimeRefresh(id: string): void {
@@ -566,9 +620,16 @@ function toRuntimeDetail(kind: NetworkServerKind, runtime: NetworkServerRuntimeS
 
   const tftp = runtime as TftpRuntimeSnapshot;
   const transfers: NetworkServerTransferSummary[] = (tftp.transfers ?? []).map((transfer) => ({
+    id: transfer.id,
     filename: transfer.filename,
     direction: transfer.direction,
-    peer: `${transfer.peer.address}:${transfer.peer.port}`,
+    // `client` is rendered daemon-side (`"hostname (ip)"`, or the bare IP when
+    // reverse DNS found nothing) so the tree, the log and the connection toasts
+    // all name a client identically. The port is dropped: it is the transfer's
+    // ephemeral TID, meaningless to an operator, and `id` already carries it.
+    peer: transfer.client,
+    clientAddress: transfer.peer.address,
+    clientHostname: transfer.clientHostname ?? undefined,
     bytes: transfer.bytes,
     totalBytes: transfer.totalBytes,
     speedBps: transfer.speedBps

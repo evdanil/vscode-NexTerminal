@@ -32,6 +32,7 @@ import {
   type TftpTransferInfo,
 } from './engine/TftpEngine';
 import type { ServerLogLevel } from '../core/NexusServer';
+import { ReverseDnsCache, formatTftpClient } from './clientIdentity';
 
 /** Official IANA TFTP port (requires root/Administrator on Windows/Linux). */
 const DEFAULT_PORT = 69;
@@ -58,6 +59,21 @@ export interface TftpAdapterConfig {
 }
 
 export type { TftpTransferInfo } from './engine/TftpEngine';
+
+/**
+ * A transfer as published outside the daemon: the engine's own view plus the
+ * client's reverse-DNS identity, which only the adapter knows about.
+ *
+ * `client` is pre-rendered here on purpose — the host side must show the exact
+ * same string as the logs and connection toasts, and formatting it in one place
+ * is what guarantees that.
+ */
+export interface TftpTransferView extends TftpTransferInfo {
+  /** Reverse-DNS name for `peer.address`, or `null` when unresolved. */
+  readonly clientHostname: string | null;
+  /** Display form: `"hostname (ip)"`, or just `"ip"` when unresolved. */
+  readonly client: string;
+}
 
 /**
  * Resolves the default root directory: `${homedir}/Nexus/tftp-root`.
@@ -96,6 +112,12 @@ function resolveDefaultRoot(): string {
 export class TftpAdapter extends BaseNexusServer {
   /** Underlying engine (null when the service is stopped). */
   private engine: TftpEngine | null = null;
+  /**
+   * Reverse-DNS answers for client IPs, so a lab device shows up by name.
+   * Lives on the adapter (not the engine) because it is presentation, not
+   * protocol: the engine must never wait on a name server.
+   */
+  private readonly hostnames = new ReverseDnsCache();
   /** Effective configuration (with defaults applied in the constructor). */
   private config: TftpAdapterConfig;
 
@@ -154,8 +176,48 @@ export class TftpAdapter extends BaseNexusServer {
    *
    * @returns Always an array; empty if the engine is stopped.
    */
-  public activeTransfers(): readonly TftpTransferInfo[] {
-    return this.engine?.activeTransfers() ?? [];
+  public activeTransfers(): readonly TftpTransferView[] {
+    return (this.engine?.activeTransfers() ?? []).map((info) => this.withClientIdentity(info));
+  }
+
+  /**
+   * Aborts an in-flight transfer on operator request (sidebar "Cancel
+   * Transfer" / command palette).
+   *
+   * @param transferId `${address}:${port}` id from {@link TftpTransferInfo.id}.
+   * @returns `true` when a live transfer was aborted, `false` when no transfer
+   *          with that id is running any more.
+   * @sideeffect Delegates to {@link TftpEngine.cancelTransfer}: ERROR packet to
+   *             the peer + `transfer:error`, which refreshes the UI.
+   */
+  public async cancelTransfer(transferId: string): Promise<boolean> {
+    const engine = this.engine;
+    if (!engine) return false;
+    return engine.cancelTransfer(transferId);
+  }
+
+  /**
+   * Decorates an engine transfer with the client's cached reverse-DNS identity.
+   *
+   * Read-only against the cache: the lookup itself is kicked off once per
+   * transfer in {@link bindEngineEvents}, so a snapshot never blocks on DNS.
+   *
+   * @param info Engine-level transfer info.
+   * @returns The same transfer plus `clientHostname` / `client`.
+   */
+  private withClientIdentity(info: TftpTransferInfo): TftpTransferView {
+    const clientHostname = this.hostnames.getCached(info.peer.address);
+    return { ...info, clientHostname, client: formatTftpClient(info.peer.address, clientHostname) };
+  }
+
+  /**
+   * Renders a peer for operator-facing text (logs, connection toasts).
+   *
+   * @param address Peer IPv4.
+   * @returns `"hostname (ip)"` when already resolved, otherwise `"ip"`.
+   */
+  private describeClient(address: string): string {
+    return formatTftpClient(address, this.hostnames.getCached(address));
   }
 
   /**
@@ -270,6 +332,9 @@ export class TftpAdapter extends BaseNexusServer {
     this.log('info', 'Stopping...');
     const engine = this.engine;
     this.engine = null;
+    // Names are only meaningful while the bench they describe is being served;
+    // a restart should re-observe the network rather than trust stale PTRs.
+    this.hostnames.clear();
     if (engine) {
       try {
         engine.removeAllListeners();
@@ -312,12 +377,13 @@ export class TftpAdapter extends BaseNexusServer {
    */
   private bindEngineEvents(engine: TftpEngine): void {
     engine.on('transfer:start', (info) => {
+      this.resolveClientHostname(info.peer.address);
       const verb = info.direction === 'rrq' ? 'Download started' : 'Upload started';
       const opt = `blksize=${info.blockSize}, window=${info.windowSize}`;
       this.log('info', `${verb}: ${info.filename} (${info.peer.address}:${info.peer.port}) · ${opt}`);
       this.emitConnection({
         phase: 'started',
-        summary: `${describeDirection(info.direction)} started from ${info.peer.address} · ${info.filename}`,
+        summary: `${describeDirection(info.direction)} started from ${this.describeClient(info.peer.address)} · ${info.filename}`,
       });
       this.emit('runtimeUpdate');
     });
@@ -346,7 +412,7 @@ export class TftpAdapter extends BaseNexusServer {
       );
       this.emitConnection({
         phase: 'completed',
-        summary: `${describeDirection(info.direction)} finished from ${info.peer.address} · ${info.filename} (${info.bytes} B in ${total})`,
+        summary: `${describeDirection(info.direction)} finished from ${this.describeClient(info.peer.address)} · ${info.filename} (${info.bytes} B in ${total})`,
       });
       this.emit('runtimeUpdate', true);
     });
@@ -354,13 +420,33 @@ export class TftpAdapter extends BaseNexusServer {
       this.log('warn', `${info.direction.toUpperCase()} failed ${info.filename}: ${err.message}`);
       this.emitConnection({
         phase: 'failed',
-        summary: `${describeDirection(info.direction)} failed from ${info.peer.address} · ${info.filename}`,
+        summary: `${describeDirection(info.direction)} failed from ${this.describeClient(info.peer.address)} · ${info.filename}`,
         detail: err.message,
         // `ProtocolError` and friends carry their classification in `name`;
         // a plain `Error` would only contribute the useless literal "Error".
         code: err.name && err.name !== 'Error' ? err.name : undefined,
       });
       this.emit('runtimeUpdate', true);
+    });
+  }
+
+  /**
+   * Fire-and-forget reverse lookup for a client that just started a transfer.
+   *
+   * Nothing waits on this. When a name does come back, a plain `runtimeUpdate`
+   * is emitted so the already-rendered row picks the hostname up on the next
+   * snapshot — a second of "192.168.1.50" before "boot-sw01 (192.168.1.50)" is
+   * an acceptable trade for never blocking a transfer on DNS.
+   *
+   * @param address Peer IPv4.
+   * @sideeffect May emit `runtimeUpdate` once the lookup resolves.
+   */
+  private resolveClientHostname(address: string): void {
+    if (this.hostnames.getCached(address) !== null) return;
+    void this.hostnames.resolve(address).then((hostname) => {
+      if (hostname === null || this.engine === null) return;
+      this.log('debug', `client ${address} resolves to ${hostname}`);
+      this.emit('runtimeUpdate');
     });
   }
 }

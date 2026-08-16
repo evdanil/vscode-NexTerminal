@@ -169,6 +169,16 @@ export class TftpEngine extends EventEmitter {
   private gcTimer: ReturnType<typeof setInterval> | null = null;
   /** Open handles for WRQ (indexed by transferId). */
   private writeHandles = new Map<string, fsPromises.FileHandle>();
+  /**
+   * Sessions whose finalization is in flight.
+   *
+   * `cleanupDone` / `cleanupErroneous` are async and only remove the session
+   * from `transfers` after an `await`, so the GC tick (or a second inbound
+   * packet) can observe a session that is already being finalized. Without this
+   * guard the same transfer would emit `transfer:complete` / `transfer:error`
+   * twice, which reaches the UI as duplicate toasts.
+   */
+  private readonly finalizing = new Set<string>();
 
   /**
    * Constructs a new TFTP engine. Does not start listening — use {@link start}.
@@ -205,6 +215,43 @@ export class TftpEngine extends EventEmitter {
    */
   public activeTransfers(): readonly TftpTransferInfo[] {
     return Array.from(this.transfers.values()).map((t) => this.infoOf(t));
+  }
+
+  /**
+   * Aborts an in-flight transfer on operator request.
+   *
+   * RFC 1350 §2 gives the server exactly one way to tear a connection down
+   * mid-flight: send an ERROR packet, which the client must not acknowledge.
+   * There is no "aborted by server" error code in the RFC 1350 §5 table, so
+   * {@link ErrorCode.NotDefined} (0) carries a human-readable reason instead.
+   *
+   * Teardown itself is *not* re-implemented here: the session is put into the
+   * Error phase through the same {@link TransferSession.setError} used by the
+   * timeout / disk-failure paths, and the resource release plus the
+   * `transfer:error` event go through {@link cleanupErroneous}. That is what
+   * makes the sidebar drop the row immediately.
+   *
+   * @param transferId `${address}:${port}` id, as published on
+   *                   {@link TftpTransferInfo.id}.
+   * @returns `true` if a matching session existed and was aborted, `false` if
+   *          the transfer had already finished (a benign race — the operator
+   *          clicked Cancel just as the last block landed).
+   * @sideeffect Sends 1 ERROR packet to the peer + `cleanupErroneous`.
+   */
+  public async cancelTransfer(transferId: string): Promise<boolean> {
+    const t = this.transfers.get(transferId);
+    if (!t || this.finalizing.has(transferId)) return false;
+    const reason = 'Transfer cancelled by server';
+    t.setError(ErrorCode.NotDefined, reason);
+    this.log('info', `transfer ${transferId} cancelled by operator (${t.filename})`);
+    try {
+      this.sendRaw({ address: t.peer.address, port: t.peer.port }, t.makeErrorPacket());
+    } catch (err) {
+      // A dead socket must not prevent the server-side teardown below.
+      this.log('warn', `cancel ${transferId}: ERROR packet not sent: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    await this.cleanupErroneous(t, new Error(reason));
+    return true;
   }
 
   /**
@@ -289,6 +336,7 @@ export class TftpEngine extends EventEmitter {
       }
     }
     this.transfers.clear();
+    this.finalizing.clear();
     for (const h of this.writeHandles.values()) {
       try {
         await h.close();
@@ -333,13 +381,17 @@ export class TftpEngine extends EventEmitter {
    *             clear Done or Error sessions.
    */
   private gcTick(): void {
+    const onGcError = (err: unknown) => {
+      try {
+        this.log('warn', 'gc cleanup: ' + (err instanceof Error ? err.message : String(err)));
+      } catch {}
+    };
     for (const [key, t] of this.transfers.entries()) {
       if (t.phase === TransferPhase.Done) {
-        void this.cleanup(key).catch((err) => {
-          try {
-            this.log('warn', 'gc cleanup: ' + (err instanceof Error ? err.message : String(err)));
-          } catch {}
-        });
+        // Straggler that finished but was not reaped by the packet path. It
+        // must still be announced: a silent `cleanup()` here leaves the row
+        // sitting in the sidebar because no `runtimeUpdate` ever follows.
+        void this.cleanupDone(t).catch(onGcError);
         continue;
       }
       if (t.phase !== TransferPhase.Error && t.timeForRetransmission()) {
@@ -352,11 +404,7 @@ export class TftpEngine extends EventEmitter {
           void this.cleanupErroneous(
             t,
             new Error(t.errorMessage ?? `Max retries exceeded (${t.retries})`),
-          ).catch((err) => {
-            try {
-              this.log('warn', 'gc cleanup: ' + (err instanceof Error ? err.message : String(err)));
-            } catch {}
-          });
+          ).catch(onGcError);
           continue;
         }
         this.log(
@@ -367,11 +415,15 @@ export class TftpEngine extends EventEmitter {
       }
       if (t.isTimedOut()) {
         this.log('warn', `transfer ${key} timed out, phase=${t.phase}`);
-        void this.cleanup(key).catch((err) => {
-          try {
-            this.log('warn', 'gc cleanup: ' + (err instanceof Error ? err.message : String(err)));
-          } catch {}
-        });
+        // A client that simply stops answering is the second way a transfer
+        // dies. Route it through `cleanupErroneous` so it emits `transfer:error`
+        // like every other failure — the silent `cleanup()` this replaced was
+        // the cause of "ghost" transfers stuck in the sidebar forever (the peer
+        // is gone, so no later event would ever refresh the row away).
+        void this.cleanupErroneous(
+          t,
+          new Error(`Transfer timed out after ${String(this.opts.timeoutMs)} ms with no response from the client`),
+        ).catch(onGcError);
       }
     }
   }
@@ -770,8 +822,14 @@ export class TftpEngine extends EventEmitter {
    * @sideeffect Emits `transfer:complete` + cleanup.
    */
   private async cleanupDone(t: TransferSession): Promise<void> {
+    if (this.finalizing.has(t.transferId)) return;
+    this.finalizing.add(t.transferId);
     const info = this.infoOf(t);
-    await this.cleanup(t.transferId);
+    try {
+      await this.cleanup(t.transferId);
+    } finally {
+      this.finalizing.delete(t.transferId);
+    }
     this.emit('transfer:complete', info);
     this.log(
       'info',
@@ -787,8 +845,14 @@ export class TftpEngine extends EventEmitter {
    * @sideeffect Emits `transfer:error` + cleanup.
    */
   private async cleanupErroneous(t: TransferSession, err: Error): Promise<void> {
+    if (this.finalizing.has(t.transferId)) return;
+    this.finalizing.add(t.transferId);
     const info = this.infoOf(t);
-    await this.cleanup(t.transferId);
+    try {
+      await this.cleanup(t.transferId);
+    } finally {
+      this.finalizing.delete(t.transferId);
+    }
     this.emit('transfer:error', info, err);
     this.log('warn', `transfer error ${info.filename}: ${err.message}`);
   }

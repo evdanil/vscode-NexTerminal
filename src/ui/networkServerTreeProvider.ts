@@ -115,8 +115,23 @@ export class NetworkServerRootTreeItem extends vscode.TreeItem {
   }
 }
 
+/**
+ * `contextValue` marking a row as a live TFTP transfer, which is what the
+ * "Cancel Transfer" menu entry gates on in package.json.
+ *
+ * Intentionally outside the `nexus.networkServer.` prefix: the service-level
+ * menu entries match that prefix with a regex, and reusing it here would put
+ * Start / Stop / Quick Settings on a transfer row.
+ */
+export const NETWORK_SERVER_TRANSFER_CONTEXT = "nexus.networkServerTransfer.active";
+
 export class NetworkServerDetailTreeItem extends vscode.TreeItem {
   public readonly children: readonly NetworkServerDetailTreeItem[];
+  /**
+   * TFTP transfer id (`address:port`) when this row *is* a transfer — the
+   * handle "Cancel Transfer" needs. Undefined on every other detail row.
+   */
+  public readonly transferId?: string;
 
   public constructor(
     id: string,
@@ -126,6 +141,14 @@ export class NetworkServerDetailTreeItem extends vscode.TreeItem {
       tooltip?: string;
       icon?: string;
       children?: readonly NetworkServerDetailTreeItem[];
+      /**
+       * Overrides the default detail `contextValue`. Kept out of the
+       * `nexus.networkServer.` namespace by callers, because the service-level
+       * menu entries match that prefix and would otherwise offer Start/Stop on
+       * a detail row.
+       */
+      contextValue?: string;
+      transferId?: string;
     }
   ) {
     const children = options?.children ?? [];
@@ -135,7 +158,8 @@ export class NetworkServerDetailTreeItem extends vscode.TreeItem {
     );
     this.id = id;
     this.children = children;
-    this.contextValue = "nexus.networkServerDetail";
+    this.transferId = options?.transferId;
+    this.contextValue = options?.contextValue ?? "nexus.networkServerDetail";
     this.description = options?.description;
     this.tooltip = options?.tooltip ?? options?.description;
     if (options?.icon) {
@@ -335,17 +359,22 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
         ? `${String(Math.round((transfer.bytes / transfer.totalBytes) * 100))}% · ${formatBytes(transfer.bytes)}/${formatBytes(transfer.totalBytes)}`
         : formatBytes(transfer.bytes);
     const speed = transfer.speedBps > 0 ? ` · ${formatBytes(Math.round(transfer.speedBps))}/s` : "";
+    // `transfer.peer` already arrives in the one display format the whole
+    // feature uses — `"hostname (ip)"` when reverse DNS resolved, bare IP
+    // otherwise — so nothing is reformatted here.
     return new NetworkServerDetailTreeItem(
-      `networkServer:tftp:transfer:${String(index)}:${transfer.peer}`,
+      `networkServer:tftp:transfer:${String(index)}:${transfer.id}`,
       transfer.filename,
       {
         description: `${transfer.peer} · ${progress}${speed}`,
         icon: transfer.direction === "wrq" ? "arrow-up" : "arrow-down",
         tooltip: [
           `${transfer.direction === "wrq" ? "Upload (WRQ)" : "Download (RRQ)"} — ${transfer.filename}`,
-          `Peer: ${transfer.peer}`,
+          `Client: ${transfer.peer}`,
           `Transferred: ${progress}`
-        ].join("\n")
+        ].join("\n"),
+        contextValue: NETWORK_SERVER_TRANSFER_CONTEXT,
+        transferId: transfer.id
       }
     );
   }
