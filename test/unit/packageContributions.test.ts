@@ -924,6 +924,167 @@ describe("package contributions", () => {
       expect(props["nexus.localServers.restrictToWorkspaceRoots"].type).toBe("boolean");
     });
   });
+
+  describe("Embedded Network Servers contributions (TFTP + DHCP)", () => {
+    const networkServerCommandIds = [
+      "nexus.networkServer.start",
+      "nexus.networkServer.stop",
+      "nexus.networkServer.restart",
+      "nexus.networkServer.edit",
+      "nexus.networkServer.inspectLogs"
+    ];
+
+    it("declares an activationEvent for start (the primary eager entrypoint)", () => {
+      expect(packageJson.activationEvents).toContain("onCommand:nexus.networkServer.start");
+    });
+
+    it("contributes exactly the five singleton-service commands, with no add/remove CRUD surface", () => {
+      const commands = packageJson.contributes.commands.map((item) => item.command);
+      for (const id of networkServerCommandIds) {
+        expect(commands, `missing command ${id}`).toContain(id);
+      }
+      // TFTP and DHCP are fixed services configured through settings, not
+      // user-created profiles — a CRUD command here would be a design break.
+      for (const absent of [
+        "nexus.networkServer.add",
+        "nexus.networkServer.remove",
+        "nexus.networkServer.rename",
+        "nexus.networkServer.duplicate",
+        "nexus.networkServer.moveToFolder"
+      ]) {
+        expect(commands).not.toContain(absent);
+      }
+    });
+
+    it("puts every Network Server command under its own dedicated category", () => {
+      for (const id of networkServerCommandIds) {
+        const cmd = packageJson.contributes.commands.find((c) => c.command === id)!;
+        expect(cmd.category, `wrong category for ${id}`).toBe("Nexus Network Server");
+        expect(cmd.title).toBeTruthy();
+      }
+    });
+
+    it("uses the expected icons for primary Network Server actions", () => {
+      const byId = (id: string) => packageJson.contributes.commands.find((c) => c.command === id)!;
+      expect(byId("nexus.networkServer.start").icon).toBe("$(debug-start)");
+      expect(byId("nexus.networkServer.stop").icon).toBe("$(debug-stop)");
+      expect(byId("nexus.networkServer.restart").icon).toBe("$(sync)");
+      expect(byId("nexus.networkServer.edit").icon).toBe("$(edit)");
+      expect(byId("nexus.networkServer.inspectLogs").icon).toBe("$(list-flat)");
+    });
+
+    it("registers a dedicated nexusNetworkServers view inside the existing nexus container", () => {
+      const views = (packageJson as unknown as { contributes: { views: Record<string, Array<{ id: string; name: string }>> } })
+        .contributes.views;
+      const nexusViews = views.nexus ?? [];
+      const entry = nexusViews.find((v) => v.id === "nexusNetworkServers");
+      expect(entry).toBeDefined();
+      expect(entry?.name).toBe("Network Servers");
+    });
+
+    it("gates start/restart on workspace.isTrusted and leaves the read-only commands ungated", () => {
+      const palette = packageJson.contributes.menus.commandPalette ?? [];
+      const byCmd = (id: string) => palette.find((m) => m.command === id);
+      expect(byCmd("nexus.networkServer.start")?.when).toBe("workspace.isTrusted");
+      expect(byCmd("nexus.networkServer.restart")?.when).toBe("workspace.isTrusted");
+      expect(byCmd("nexus.networkServer.stop")?.when).toBe("true");
+      expect(byCmd("nexus.networkServer.edit")?.when).toBe("true");
+      expect(byCmd("nexus.networkServer.inspectLogs")?.when).toBe("true");
+    });
+
+    it("extends the untrusted-workspace disclosure to cover the network services", () => {
+      const description = packageJson.capabilities?.untrustedWorkspaces?.description ?? "";
+      expect(description).toMatch(/Network Servers/i);
+      expect(description).toMatch(/TFTP/);
+      expect(description).toMatch(/DHCP/);
+    });
+
+    it("binds inline start on stopped/errored rows and stop/restart on live rows", () => {
+      const ctx = packageJson.contributes.menus["view/item/context"] ?? [];
+      const inline = (id: string, group: string) =>
+        ctx.find((m) => m.command === id && m.group === group && m.when?.startsWith("view == nexusNetworkServers"));
+
+      expect(inline("nexus.networkServer.start", "inline@1")?.when).toBe(
+        "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(stopped|error)$/"
+      );
+      expect(inline("nexus.networkServer.stop", "inline@1")?.when).toBe(
+        "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(running|starting)$/"
+      );
+      expect(inline("nexus.networkServer.restart", "inline@2")?.when).toBe(
+        "view == nexusNetworkServers && viewItem == nexus.networkServer.running"
+      );
+      expect(inline("nexus.networkServer.edit", "inline@3")).toBeDefined();
+      expect(ctx.some((m) => m.command === "nexus.networkServer.inspectLogs" && m.when?.includes("nexusNetworkServers"))).toBe(
+        true
+      );
+    });
+
+    it("contributes the four nexus.networkServers.tftp.* keys with the documented types and defaults", () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      expect(props["nexus.networkServers.tftp.root"]).toMatchObject({ type: "string", default: "" });
+      expect(props["nexus.networkServers.tftp.port"]).toMatchObject({ type: "number", default: 69 });
+      expect(props["nexus.networkServers.tftp.allowWrite"]).toMatchObject({ type: "boolean", default: false });
+      expect(props["nexus.networkServers.tftp.interface"]).toMatchObject({ type: "string", default: "" });
+    });
+
+    it("contributes the ten nexus.networkServers.dhcp.* keys, including the new static + interface ones", () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      expect(props["nexus.networkServers.dhcp.rangeStart"]).toMatchObject({ type: "string" });
+      expect(props["nexus.networkServers.dhcp.rangeEnd"]).toMatchObject({ type: "string" });
+      expect(props["nexus.networkServers.dhcp.subnet"]).toMatchObject({ type: "string" });
+      expect(props["nexus.networkServers.dhcp.gateway"]).toMatchObject({ type: "string" });
+      expect(props["nexus.networkServers.dhcp.dns"]).toMatchObject({ type: "array", default: [] });
+      expect(props["nexus.networkServers.dhcp.leaseTimeSec"]).toMatchObject({ type: "number", default: 86400 });
+      expect(props["nexus.networkServers.dhcp.serverId"]).toMatchObject({ type: "string" });
+      expect(props["nexus.networkServers.dhcp.broadcast"]).toMatchObject({ type: "string" });
+      // The two gaps this port closed: MAC→IP reservations and NIC selection.
+      expect(props["nexus.networkServers.dhcp.static"]).toMatchObject({ type: "object", default: {} });
+      expect(props["nexus.networkServers.dhcp.interface"]).toMatchObject({ type: "string", default: "" });
+    });
+
+    it("declares the ZTP boot options, with option 43 carrying a typed sub-option schema", () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      expect(props["nexus.networkServers.dhcp.bootFileName"]).toMatchObject({ type: "string", default: "" });
+      expect(props["nexus.networkServers.dhcp.nextServer"]).toMatchObject({ type: "string", default: "" });
+      expect(props["nexus.networkServers.dhcp.tftpServerAddresses"]).toMatchObject({
+        type: "array",
+        items: { type: "string" },
+        default: []
+      });
+      expect(props["nexus.networkServers.dhcp.vendorClassId"]).toMatchObject({ type: "string", default: "" });
+      // A bare `array` here would let any JSON through into the TLV encoder.
+      expect(props["nexus.networkServers.dhcp.vendorSpecificOptions"]).toMatchObject({
+        type: "array",
+        default: [],
+        items: {
+          type: "object",
+          required: ["subOption", "value"],
+          properties: {
+            subOption: { type: "number", minimum: 1, maximum: 254 },
+            value: { type: "string" }
+          }
+        }
+      });
+      expect(props["nexus.networkServers.dhcp.autoLinkTftp"]).toMatchObject({ type: "boolean", default: true });
+    });
+
+    it("gives all 20 network-server settings distinct order values after the localServers block, each documented", () => {
+      const props = packageJson.contributes.configuration?.properties ?? {};
+      const keys = Object.keys(props).filter((k) => k.startsWith("nexus.networkServers."));
+      expect(keys).toHaveLength(20);
+      const orders = keys.map((k) => props[k].order);
+      expect(new Set(orders).size).toBe(20);
+      // Local Servers occupies 31-35; these must sort after it in the Settings UI.
+      expect(orders.every((o) => typeof o === "number" && o > 35)).toBe(true);
+      for (const k of keys) {
+        expect(props[k].markdownDescription || props[k].description, `no description for ${k}`).toBeTruthy();
+      }
+    });
+
+    it("declares the pure-JS dhcp runtime dependency the daemon bundles", () => {
+      expect(packageJson.dependencies.dhcp).toBeDefined();
+    });
+  });
 });
 
 describe("terminal output performance defaults", () => {

@@ -64,6 +64,18 @@ await esbuild.build({
   external: ["vscode"],
 });
 
+// Network servers daemon — runs as a child process managed by NetworkServerManager.
+// Hosts the TFTP + DHCP adapters out-of-process so they can bind privileged UDP
+// ports and crash without taking the extension host down. MUST NOT import `vscode`:
+// it is spawned as a bare Node script, and receives all configuration over RPC/env.
+// `dhcp` is pure JS, so it bundles in with no external needed.
+await esbuild.build({
+  ...common,
+  entryPoints: ["src/services/networkServers/networkServerDaemon.ts"],
+  outfile: "dist/services/networkServers/networkServerDaemon.js",
+  external: ["vscode"],
+});
+
 // Ship the IntelliSense .d.ts + jsconfig template alongside the worker so the
 // runtime can copy them into user workspaces on first script invocation.
 await mkdir("dist/services/scripts/assets", { recursive: true });

@@ -25,6 +25,12 @@ import {
   type LocalServerConfig,
   type LocalServerStatus
 } from "../models/localServer";
+import type {
+  ActiveNetworkServerSession,
+  NetworkServerKind,
+  NetworkServerRuntimeDetail,
+  NetworkServerStatus
+} from "../models/networkServer";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -112,6 +118,10 @@ export class NexusCore {
   private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
   private readonly activeLocalShellSessions = new Map<string, ActiveLocalShellSession>();
   private readonly activeLocalServerSessions = new Map<string, ActiveLocalServerSession>();
+  // Keyed by kind, not by a generated session id: TFTP and DHCP are fixed
+  // singletons, so the kind IS the identity. Runtime-only — nothing here is
+  // persisted, because their configuration lives in VS Code settings.
+  private readonly activeNetworkServerSessions = new Map<NetworkServerKind, ActiveNetworkServerSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
   private focusedSessionId: string | undefined = undefined;
@@ -210,6 +220,7 @@ export class NexusCore {
       activeSerialSessions: [...this.activeSerialSessions.values()],
       activeLocalShellSessions: [...this.activeLocalShellSessions.values()],
       activeLocalServerSessions: [...this.activeLocalServerSessions.values()],
+      activeNetworkServerSessions: [...this.activeNetworkServerSessions.values()],
       activeTunnels: [...this.activeTunnels.values()],
       remoteTunnels: [...this.remoteTunnels],
       explicitGroups: [...this.explicitGroups],
@@ -2308,6 +2319,84 @@ export class NexusCore {
     }
     this.activeSerialSessions.delete(sessionId);
     this.activitySessionIds.delete(sessionId);
+    this.emitChanged();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Embedded network servers (TFTP / DHCP) — runtime state only.
+  //
+  // There is deliberately NO config half here (no addOrUpdate/remove/rename):
+  // these are two fixed singleton services whose settings live in VS Code's own
+  // configuration store, so there is nothing for ConfigRepository to persist.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Registers (or replaces) the runtime record for a network service.
+   * Keyed by kind, so starting `tftp` twice updates one record rather than
+   * accumulating sessions.
+   */
+  public registerNetworkServerSession(session: ActiveNetworkServerSession): void {
+    this.activeNetworkServerSessions.set(session.kind, session);
+    this.emitChanged();
+  }
+
+  public getNetworkServerSession(kind: NetworkServerKind): ActiveNetworkServerSession | undefined {
+    return this.activeNetworkServerSessions.get(kind);
+  }
+
+  /**
+   * Applies a lifecycle transition reported by the daemon.
+   *
+   * `boundPort` is threaded through here rather than inferred because the
+   * adapters fall back to unprivileged ports (69 → 1069, 67 → 1067) when they
+   * cannot bind the IANA port — the configured port is frequently NOT the port
+   * that ended up serving traffic, and the UI must show the real one.
+   *
+   * Stamps `startedAt` on the first transition into `running`, and clears the
+   * stale `errorMessage` on any non-error transition so a recovered service
+   * does not keep rendering a previous failure.
+   */
+  public updateNetworkServerSessionStatus(
+    kind: NetworkServerKind,
+    status: NetworkServerStatus,
+    options?: { boundPort?: number | null; errorMessage?: string }
+  ): void {
+    const existing = this.activeNetworkServerSessions.get(kind);
+    const base: ActiveNetworkServerSession = existing ?? { kind, status, boundPort: null };
+    const next: ActiveNetworkServerSession = {
+      ...base,
+      status,
+      boundPort: options?.boundPort !== undefined ? options.boundPort : base.boundPort,
+      errorMessage: status === "error" ? (options?.errorMessage ?? base.errorMessage) : undefined,
+      startedAt: status === "running" ? (base.status === "running" ? base.startedAt : Date.now()) : base.startedAt
+    };
+    this.activeNetworkServerSessions.set(kind, next);
+    this.emitChanged();
+  }
+
+  /**
+   * Replaces the live detail (transfers / leases / counters) for a service.
+   *
+   * Called on every `runtimeUpdate` push, so it must stay cheap: it swaps the
+   * detail object wholesale instead of merging field by field.
+   */
+  public setNetworkServerRuntimeSnapshot(
+    kind: NetworkServerKind,
+    detail: NetworkServerRuntimeDetail,
+    boundPort?: number | null
+  ): void {
+    const existing = this.activeNetworkServerSessions.get(kind);
+    if (!existing) return;
+    this.activeNetworkServerSessions.set(kind, {
+      ...existing,
+      detail,
+      boundPort: boundPort !== undefined ? boundPort : existing.boundPort
+    });
+    this.emitChanged();
+  }
+
+  public unregisterNetworkServerSession(kind: NetworkServerKind): void {
+    if (!this.activeNetworkServerSessions.delete(kind)) return;
     this.emitChanged();
   }
 

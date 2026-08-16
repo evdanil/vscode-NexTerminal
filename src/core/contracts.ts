@@ -14,6 +14,7 @@ import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ActiveLocalServerSession, LocalServerConfig } from "../models/localServer";
+import type { ActiveNetworkServerSession } from "../models/networkServer";
 
 export interface ConfigRepository {
   getServers(): Promise<ServerConfig[]>;
@@ -48,6 +49,15 @@ export interface SessionSnapshot {
   activeSerialSessions: ActiveSerialSession[];
   activeLocalShellSessions: ActiveLocalShellSession[];
   activeLocalServerSessions: ActiveLocalServerSession[];
+  /**
+   * Runtime state of the two fixed embedded network services (TFTP / DHCP).
+   *
+   * Runtime-only by design: there is no matching `networkServers` config array
+   * because these services are configured entirely through native VS Code
+   * settings (`nexus.networkServers.*`), which VS Code persists itself. Empty
+   * until a service is first started.
+   */
+  activeNetworkServerSessions: ActiveNetworkServerSession[];
   activeTunnels: ActiveTunnel[];
   remoteTunnels: TunnelRegistryEntry[];
   explicitGroups: string[];

@@ -10,6 +10,7 @@ import type { TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import type { FileExplorerTreeProvider } from "../ui/fileExplorerTreeProvider";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
+import type { NetworkServerManager } from "../services/networkServers/networkServerManager";
 import type { TerminalRegistry } from "../services/terminal/terminalRegistry";
 import type { ElevationBroker, NexusFileSystemProvider } from "../services/sftp/nexusFileSystemProvider";
 import type { CwdTracker } from "../services/terminal/cwdTracker";
@@ -68,8 +69,11 @@ export interface CommandContext {
   focusedTerminal?: vscode.Terminal;
   activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;
   scriptRuntimeManager?: ScriptRuntimeManager;
+  networkServerManager?: NetworkServerManager;
   terminalRegistry?: TerminalRegistry;
   localShellOutputChannel?: vscode.OutputChannel;
+  /** Shared diagnostics channel for the embedded TFTP/DHCP services. */
+  networkServerOutputChannel?: vscode.OutputChannel;
   globalStoragePath: string;
   extensionPath: string;
   globalState: vscode.Memento;

@@ -61,6 +61,7 @@ export class TunnelTreeProvider
     activeSerialSessions: [],
     activeLocalShellSessions: [],
     activeLocalServerSessions: [],
+    activeNetworkServerSessions: [],
     activeTunnels: [],
     remoteTunnels: [],
     explicitGroups: [],

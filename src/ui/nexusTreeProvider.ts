@@ -293,6 +293,7 @@ export class NexusTreeProvider
     activeSerialSessions: [],
     activeLocalShellSessions: [],
     activeLocalServerSessions: [],
+    activeNetworkServerSessions: [],
     activeTunnels: [],
     remoteTunnels: [],
     explicitGroups: [],

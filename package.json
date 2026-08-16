@@ -65,6 +65,7 @@
     "onStartupFinished",
     "onView:nexusCommandCenter",
     "onView:nexusTunnels",
+    "onView:nexusNetworkServers",
     "onCommand:nexus.server.add",
     "onCommand:nexus.server.connect",
     "onCommand:nexus.serial.add",
@@ -74,6 +75,7 @@
     "onCommand:nexus.localShell.runWithScript",
     "onCommand:nexus.localServer.add",
     "onCommand:nexus.localServer.start",
+    "onCommand:nexus.networkServer.start",
     "onCommand:nexus.profile.add",
     "onFileSystem:nexterm",
     "onUri"
@@ -97,6 +99,11 @@
         {
           "id": "nexusTunnels",
           "name": "Port Forwarding"
+        },
+        {
+          "id": "nexusNetworkServers",
+          "name": "Network Servers",
+          "visibility": "collapsed"
         },
         {
           "id": "nexusFileExplorer",
@@ -518,6 +525,36 @@
         "title": "Move to Root",
         "category": "Nexus Local Server",
         "icon": "$(remove-folder)"
+      },
+      {
+        "command": "nexus.networkServer.start",
+        "title": "Start Service",
+        "category": "Nexus Network Server",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "nexus.networkServer.stop",
+        "title": "Stop Service",
+        "category": "Nexus Network Server",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "nexus.networkServer.restart",
+        "title": "Restart Service",
+        "category": "Nexus Network Server",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "nexus.networkServer.edit",
+        "title": "Edit Settings",
+        "category": "Nexus Network Server",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.networkServer.inspectLogs",
+        "title": "Inspect Logs",
+        "category": "Nexus Network Server",
+        "icon": "$(list-flat)"
       },
       {
         "command": "nexus.group.connect",
@@ -1567,6 +1604,51 @@
           "group": "3_destructive"
         },
         {
+          "command": "nexus.networkServer.start",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(stopped|error)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.stop",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(running|starting)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.restart",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServer.running",
+          "group": "inline@2"
+        },
+        {
+          "command": "nexus.networkServer.edit",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "inline@3"
+        },
+        {
+          "command": "nexus.networkServer.start",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(stopped|error)$/",
+          "group": "0_connect@1"
+        },
+        {
+          "command": "nexus.networkServer.stop",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(running|starting)$/",
+          "group": "0_connect@2"
+        },
+        {
+          "command": "nexus.networkServer.restart",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServer.running",
+          "group": "0_connect@3"
+        },
+        {
+          "command": "nexus.networkServer.inspectLogs",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "1_terminal@1"
+        },
+        {
+          "command": "nexus.networkServer.edit",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "1_manage@1"
+        },
+        {
           "command": "nexus.tunnel.start",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "inline"
@@ -2077,6 +2159,26 @@
         {
           "command": "nexus.localServer.moveToRoot",
           "when": "false"
+        },
+        {
+          "command": "nexus.networkServer.start",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.stop",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.restart",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.edit",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.inspectLogs",
+          "when": "true"
         },
         {
           "command": "nexus.profile.add",
@@ -4014,6 +4116,159 @@
           "default": true,
           "order": 35,
           "markdownDescription": "Refuse to start a local server whose working directory resolves outside the currently-open workspace roots when a workspace is open. Disabling this allows any absolute path, including system directories, as cwd — enable only if you trust every profile in storage."
+        },
+        "nexus.networkServers.tftp.root": {
+          "type": "string",
+          "default": "",
+          "order": 36,
+          "markdownDescription": "Directory served by the embedded TFTP service. Leave empty to use `~/Nexus/tftp-root`, which is created on first start (falling back to the system temp directory if it cannot be created). **Every file beneath this directory is readable by any host that can reach the bound port** — point it at a staging directory, not at a source tree or a home directory."
+        },
+        "nexus.networkServers.tftp.port": {
+          "type": "number",
+          "default": 69,
+          "minimum": 1,
+          "maximum": 65535,
+          "order": 37,
+          "markdownDescription": "UDP port for the embedded TFTP service. The IANA port 69 is privileged: if binding it is denied (no root/Administrator), the service automatically falls back to **1069** and logs a warning instead of failing. Clients must then be pointed at the fallback port — the port actually in use is shown next to the service."
+        },
+        "nexus.networkServers.tftp.allowWrite": {
+          "type": "boolean",
+          "default": false,
+          "order": 38,
+          "markdownDescription": "Accept TFTP write requests (`WRQ`), letting remote clients upload files into the served root. TFTP has no authentication whatsoever, so anything that can reach the port can overwrite files. Leave disabled unless a device genuinely needs to push configs or crash dumps back."
+        },
+        "nexus.networkServers.tftp.interface": {
+          "type": "string",
+          "default": "",
+          "order": 39,
+          "markdownDescription": "Local IPv4 address to bind the TFTP socket to, i.e. which network interface serves TFTP. Leave empty for `0.0.0.0` (all interfaces). On a multi-homed machine, set this to the lab-facing NIC (e.g. `192.168.2.1`) so the service is not also reachable over the corporate LAN or VPN."
+        },
+        "nexus.networkServers.dhcp.rangeStart": {
+          "type": "string",
+          "default": "",
+          "order": 40,
+          "markdownDescription": "First address of the DHCP dynamic pool. Leave empty for `192.168.2.10`."
+        },
+        "nexus.networkServers.dhcp.rangeEnd": {
+          "type": "string",
+          "default": "",
+          "order": 41,
+          "markdownDescription": "Last address of the DHCP dynamic pool. Leave empty for `192.168.2.199`."
+        },
+        "nexus.networkServers.dhcp.subnet": {
+          "type": "string",
+          "default": "",
+          "order": 42,
+          "markdownDescription": "Subnet mask handed to DHCP clients (option 1). Leave empty for `255.255.255.0`."
+        },
+        "nexus.networkServers.dhcp.gateway": {
+          "type": "string",
+          "default": "",
+          "order": 43,
+          "markdownDescription": "Default gateway handed to DHCP clients (option 3). Leave empty for `192.168.2.1`."
+        },
+        "nexus.networkServers.dhcp.dns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "order": 44,
+          "markdownDescription": "DNS servers handed to DHCP clients (option 6), in preference order. Leave empty for `8.8.8.8` and `8.8.4.4`."
+        },
+        "nexus.networkServers.dhcp.leaseTimeSec": {
+          "type": "number",
+          "default": 86400,
+          "minimum": 60,
+          "maximum": 604800,
+          "order": 45,
+          "markdownDescription": "Lease duration in seconds (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum."
+        },
+        "nexus.networkServers.dhcp.serverId": {
+          "type": "string",
+          "default": "",
+          "order": 46,
+          "markdownDescription": "Server identifier advertised to clients (option 54). Leave empty for `192.168.2.1`. This should be the address clients see this machine on, otherwise renewals are sent to the wrong host."
+        },
+        "nexus.networkServers.dhcp.broadcast": {
+          "type": "string",
+          "default": "",
+          "order": 47,
+          "markdownDescription": "Broadcast address handed to DHCP clients (option 28). Leave empty for `192.168.2.255`."
+        },
+        "nexus.networkServers.dhcp.static": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "order": 48,
+          "markdownDescription": "Static reservations as a **MAC address → IP address** map, for example `{ \"aa:bb:cc:dd:ee:ff\": \"192.168.2.50\" }`. Reserved addresses are handed to the matching client regardless of the dynamic pool. Entries whose value is not a string are ignored, so one malformed line does not discard the rest of the map."
+        },
+        "nexus.networkServers.dhcp.interface": {
+          "type": "string",
+          "default": "",
+          "order": 49,
+          "markdownDescription": "Local IPv4 address to bind the DHCP socket to, i.e. which network interface serves DHCP. Leave empty for `0.0.0.0` (all interfaces) — on a multi-homed machine this is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The service always uses the IANA port 67; if binding it is denied (no root/Administrator), it automatically falls back to **1067** and logs a warning, which normal DHCP clients will not reach."
+        },
+        "nexus.networkServers.dhcp.bootFileName": {
+          "type": "string",
+          "default": "",
+          "order": 50,
+          "markdownDescription": "**DHCP Option 67** (bootfile-name) — the file a PXE or ZTP client fetches from the boot server once it has an address, for example `ios-image.bin`, `pxelinux.0` or `ztp.py`. Leave empty to send no bootfile, in which case a device gets an address and nothing to boot from."
+        },
+        "nexus.networkServers.dhcp.nextServer": {
+          "type": "string",
+          "default": "",
+          "order": 51,
+          "markdownDescription": "**DHCP Option 66** (tftp-server-name) — the boot server clients fetch `#nexus.networkServers.dhcp.bootFileName#` from, as a dotted-quad address (e.g. `192.168.2.1`) or a hostname. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills it in from the embedded TFTP service's own interface. Note that the BOOTP `siaddr` header field is **not** configurable — it always carries this machine's server identifier (option 54) — so devices that read `siaddr` instead of option 66 follow that address."
+        },
+        "nexus.networkServers.dhcp.tftpServerAddresses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "order": 52,
+          "markdownDescription": "**DHCP Option 150** (Cisco TFTP server address list) — one or more IPv4 addresses, in preference order. Cisco IP phones and IOS ZTP request option 150 rather than option 66; hardware from other vendors generally ignores it, so setting both is normal. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills in the embedded TFTP service's own interface."
+        },
+        "nexus.networkServers.dhcp.vendorClassId": {
+          "type": "string",
+          "default": "",
+          "order": 53,
+          "markdownDescription": "**DHCP Option 60** (vendor class identifier) to match on. When set, the boot options (66, 67, 150 and 43) are served **only** to clients whose DISCOVER carries this exact identifier — everyone else still gets an address, just no boot information. Aruba, FortiGate and Huawei gear all key their provisioning off option 60. The match is case-insensitive but otherwise exact, so `Cisco` will not match `Cisco Systems, Inc.`; the value each client actually sends is logged (`vendor-class=\"…\"`) in the *Nexus Network Servers* channel at debug level. Leave empty to serve the boot options to every client."
+        },
+        "nexus.networkServers.dhcp.vendorSpecificOptions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "subOption",
+              "value"
+            ],
+            "properties": {
+              "subOption": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 254,
+                "description": "Sub-option code (1-254). 0 is PAD and 255 is END, so neither can carry a value."
+              },
+              "value": {
+                "type": "string",
+                "description": "Plain text, or a 0x-prefixed hex literal (e.g. 0x0A0B0C) for raw bytes."
+              }
+            },
+            "additionalProperties": false
+          },
+          "default": [],
+          "order": 54,
+          "markdownDescription": "**DHCP Option 43** (vendor-specific information) as a list of sub-options, TLV-encoded onto the wire as `[code][length][value]` per RFC 2132 §8.4. Each vendor defines its own sub-option layout — Aruba APs read the controller address from sub-option 43/1, Cisco APs from 241, and so on — so the codes come from the vendor's documentation. A `value` starting with `0x` is written as raw bytes (`:` `-` `_` separators are ignored), anything else is written as text. The whole option is capped at 255 bytes; an entry that cannot be encoded is logged and skipped rather than blocking the service."
+        },
+        "nexus.networkServers.dhcp.autoLinkTftp": {
+          "type": "boolean",
+          "default": true,
+          "order": 55,
+          "markdownDescription": "Point DHCP clients at this machine's own TFTP service. When `#nexus.networkServers.dhcp.nextServer#` and `#nexus.networkServers.dhcp.tftpServerAddresses#` are both empty, options 66 and 150 are filled in from `#nexus.networkServers.tftp.interface#` so ZTP works without typing the same address twice. If the TFTP service is bound to `0.0.0.0` (all interfaces) there is no single address to advertise, and both options are left unset rather than guessed — a wrong boot server is worse than none."
         }
       }
     }
@@ -4022,7 +4277,7 @@
     "untrustedWorkspaces": {
       "supported": "limited",
       "restrictedConfigurations": [],
-      "description": "In Restricted Mode, Local Server Start/Restart commands are disabled and no arbitrary binaries are spawned. Viewing, editing, duplicating, renaming, and inspecting stopped profiles still work."
+      "description": "In Restricted Mode, Local Server Start/Restart commands are disabled and no arbitrary binaries are spawned. The embedded Network Servers (TFTP and DHCP) are disabled too: no privileged UDP ports are bound and no directory is served over the network. Viewing, editing, duplicating, renaming, and inspecting stopped profiles still work."
     }
   },
   "configurationDefaults": {
@@ -4051,6 +4306,7 @@
     "generate:keybindings": "node scripts/generateKeybindings.mjs"
   },
   "dependencies": {
+    "dhcp": "^0.2.20",
     "fast-xml-parser": "^5.10.1",
     "jsonc-parser": "^3.3.1",
     "serialport": "^13.0.0",
