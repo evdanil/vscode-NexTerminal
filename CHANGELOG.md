@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.186] — 2026-08-16
+
+### Changed
+
+- **Releases are now automatic.** Merging a version-bumped change to `main` creates the release tag and runs the full pipeline — GitHub Release with the VSIX attached, VS Code Marketplace, and Open VSX — with no manual tag push. Putting `[skip release]` in the merge commit message defers a release (push the tag later to publish it), merges that don't bump the version release nothing, and a manually pushed tag still releases exactly as before. The repository's **Latest** release badge now follows version order rather than publish order, so re-publishing or backfilling an older version can never displace the newest one. This release ships the `nexus.scripts.maxReadSizeMb` setting (2.8.184) and `nexus.include()` (2.8.185) to the marketplaces — see those entries below.
+
 ## [2.8.185] — 2026-08-15
 
 ### Added
