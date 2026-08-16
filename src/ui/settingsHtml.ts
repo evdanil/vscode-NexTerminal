@@ -214,12 +214,24 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
   }
 
   let sectionsHtml = "";
-  const terminalActionsHtml = `
+  // Categories whose scalar settings are only part of the story: the row links
+  // out to the dedicated editor that owns the structured rest of the feature.
+  const categoryActionsHtml: Record<string, string> = {
+    terminal: `
   <div class="terminal-actions button-row">
     <button type="button" class="btn-secondary" id="open-appearance-btn">Terminal Appearance\u2026</button>
     <button type="button" class="btn-secondary" id="open-highlight-editor-btn">Highlighting Rules\u2026</button>
     <button type="button" class="btn-secondary" id="open-macros-btn">Macros\u2026</button>
-  </div>`;
+  </div>`,
+    tftpServer: `
+  <div class="button-row">
+    <button type="button" class="btn-secondary" id="open-tftp-settings-btn">Open TFTP Settings\u2026</button>
+  </div>`,
+    dhcpServer: `
+  <div class="button-row">
+    <button type="button" class="btn-secondary" id="open-dhcp-settings-btn">Open DHCP Settings\u2026</button>
+  </div>`
+  };
 
   if (categoryFilter) {
     const categoryLabel = CATEGORY_LABELS[categoryFilter] ?? categoryFilter;
@@ -250,10 +262,7 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       }
     }
 
-    // Show highlighting rule editor button for terminal category
-    if (categoryFilter === "terminal") {
-      sectionsHtml += terminalActionsHtml;
-    }
+    sectionsHtml += categoryActionsHtml[categoryFilter] ?? "";
 
     if (categoryFilter === "securityData") {
       sectionsHtml += renderFocusedDataManagementControls();
@@ -279,9 +288,7 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
         }
         sectionsHtml += `  ${renderSetting(meta, values)}\n`;
       }
-      if (cat === "terminal") {
-        sectionsHtml += terminalActionsHtml;
-      }
+      sectionsHtml += categoryActionsHtml[cat] ?? "";
     }
 
     // Import / Export section
@@ -625,6 +632,12 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
       });
       bindClick("open-highlight-editor-btn", function() {
         vscode.postMessage({ type: "openHighlightRuleEditor" });
+      });
+      bindClick("open-tftp-settings-btn", function() {
+        vscode.postMessage({ type: "openTftpSettings" });
+      });
+      bindClick("open-dhcp-settings-btn", function() {
+        vscode.postMessage({ type: "openDhcpSettings" });
       });
       bindClick("open-all-settings-btn", function() {
         vscode.postMessage({ type: "openAllSettings" });

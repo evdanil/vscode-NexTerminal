@@ -280,6 +280,12 @@ export class SettingsPanel {
       case "openHighlightRuleEditor":
         void vscode.commands.executeCommand("nexus.openHighlightRuleEditor");
         break;
+      case "openTftpSettings":
+        void vscode.commands.executeCommand("nexus.networkServer.edit", { kind: "tftp" });
+        break;
+      case "openDhcpSettings":
+        void vscode.commands.executeCommand("nexus.networkServer.edit", { kind: "dhcp" });
+        break;
       case "openAllSettings":
         this.switchCategory(undefined);
         break;

@@ -14,7 +14,8 @@ export interface SettingMeta {
     | "serial"
     | "scripts"
     | "localServers"
-    | "networkServers";
+    | "tftpServer"
+    | "dhcpServer";
   description?: string;
   badge?: string;
   badgeClass?: string;
@@ -595,14 +596,14 @@ export const SETTINGS_META: SettingMeta[] = [
     badge: "Safety limit",
     badgeClass: "setting-badge-safety"
   },
-  // --- Network Servers > TFTP ---
+  // --- TFTP Server ---
   {
     key: "tftp.root",
     section: "nexus.networkServers",
     label: "TFTP Root Directory",
     type: "directory",
-    category: "networkServers",
-    subgroup: "TFTP — Network",
+    category: "tftpServer",
+    subgroup: "Network",
     description:
       "Directory served by the embedded TFTP service. Leave empty to use ~/Nexus/tftp-root, which is created on first start (falling back to the system temp directory if it cannot be created). Every file beneath this directory is readable by any host that can reach the bound port — point it at a staging directory, not at a source tree or a home directory."
   },
@@ -611,8 +612,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "TFTP Bind Interface",
     type: "string",
-    category: "networkServers",
-    subgroup: "TFTP — Network",
+    category: "tftpServer",
+    subgroup: "Network",
     description:
       "Local IPv4 address to bind the TFTP socket to, i.e. which network interface serves TFTP. Leave empty for 0.0.0.0 (all interfaces). On a multi-homed machine, set this to the lab-facing NIC so the service is not also reachable over the corporate LAN or VPN. This address is also what Auto-Link TFTP advertises to DHCP clients, so binding all interfaces leaves the DHCP boot options unset."
   },
@@ -621,8 +622,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "TFTP Port",
     type: "number",
-    category: "networkServers",
-    subgroup: "TFTP — Network",
+    category: "tftpServer",
+    subgroup: "Network",
     description:
       "UDP port for the embedded TFTP service. The IANA port 69 is privileged: if binding it is denied (no root/Administrator), the service automatically falls back to 1069 and logs a warning instead of failing. Clients must then be pointed at the fallback port — the port actually in use is shown next to the service.",
     min: 1,
@@ -634,20 +635,20 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Allow TFTP Uploads",
     type: "boolean",
-    category: "networkServers",
-    subgroup: "TFTP — Access",
+    category: "tftpServer",
+    subgroup: "Access",
     description:
       "Accept TFTP write requests (WRQ), letting remote clients upload files into the TFTP root. TFTP has no authentication whatsoever, so anything that can reach the port can overwrite files. Leave disabled unless a device genuinely needs to push configs or crash dumps back.",
     default: false
   },
-  // --- Network Servers > DHCP ---
+  // --- DHCP Server ---
   {
     key: "dhcp.interface",
     section: "nexus.networkServers",
     label: "DHCP Bind Interface",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Network",
+    category: "dhcpServer",
+    subgroup: "Network",
     description:
       "Local IPv4 address to bind the DHCP socket to, i.e. which network interface serves DHCP. Leave empty for 0.0.0.0 (all interfaces) — on a multi-homed machine this is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The service always uses the IANA port 67; if binding it is denied, it falls back to 1067 and logs a warning, which normal DHCP clients will not reach."
   },
@@ -656,8 +657,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Pool Start Address",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Address Pool",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
     description:
       "First address of the dynamic pool. Leave empty for 192.168.2.10. Must not be higher than the pool end address; static reservations are handed out regardless of this range."
   },
@@ -666,8 +667,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Pool End Address",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Address Pool",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
     description:
       "Last address of the dynamic pool. Leave empty for 192.168.2.199. The pool size this implies drives the utilization figure shown beside the running service."
   },
@@ -676,8 +677,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Subnet Mask",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Address Pool",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
     description:
       "Subnet mask handed to clients (option 1). Leave empty for 255.255.255.0. Its set bits must be contiguous (255.255.254.0 is a mask, 255.0.255.0 is not); together with the gateway it also derives the broadcast address when that is left empty."
   },
@@ -686,8 +687,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Default Gateway",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Address Pool",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
     description: "Default gateway handed to clients (option 3). Leave empty for 192.168.2.1."
   },
   {
@@ -695,8 +696,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Lease Time",
     type: "number",
-    category: "networkServers",
-    subgroup: "DHCP — Address Pool",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
     description:
       "Lease duration handed to clients (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum.",
     min: 60,
@@ -709,8 +710,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Server Identifier",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Address Pool",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
     description:
       "Server identifier advertised to clients (option 54). Leave empty for 192.168.2.1. This should be the address clients see this machine on, otherwise renewals are sent to the wrong host. It is also the value carried in the BOOTP siaddr header field, which devices that ignore option 66 boot from."
   },
@@ -719,8 +720,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Broadcast Address",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Address Pool",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
     description:
       "Broadcast address handed to clients (option 28). Leave empty to derive it from the gateway and the subnet mask."
   },
@@ -729,8 +730,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Boot File Name",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Boot / ZTP",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
     description:
       "Option 67 (bootfile-name) — the file a PXE or ZTP client fetches from the boot server once it has an address, for example ios-image.bin, pxelinux.0 or ztp.py. Leave empty to send no bootfile, in which case a device gets an address and nothing to boot from."
   },
@@ -739,8 +740,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Boot Server (TFTP)",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Boot / ZTP",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
     description:
       "Option 66 (tftp-server-name) — the boot server clients fetch the boot file from, as a dotted-quad address or a hostname. Leave empty and Auto-Link TFTP fills it in from the embedded TFTP service's own interface. The BOOTP siaddr header field is not configurable — it always carries the server identifier — so devices that read siaddr instead of option 66 follow that address."
   },
@@ -749,8 +750,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Auto-Link TFTP",
     type: "boolean",
-    category: "networkServers",
-    subgroup: "DHCP — Boot / ZTP",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
     description:
       "Point DHCP clients at this machine's own TFTP service. When the boot server and the option 150 address list are both empty, options 66 and 150 are filled in from the TFTP bind interface so ZTP works without typing the same address twice. Setting either one by hand turns the link off for both — quietly advertising a second, different boot server under the other option number is how a device boots from the wrong host. If TFTP is bound to all interfaces there is no single address to advertise, and both options are left unset rather than guessed.",
     default: true
@@ -760,8 +761,8 @@ export const SETTINGS_META: SettingMeta[] = [
     section: "nexus.networkServers",
     label: "Vendor Class Identifier Filter",
     type: "string",
-    category: "networkServers",
-    subgroup: "DHCP — Boot / ZTP",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
     description:
       "Option 60 (vendor class identifier) to match on. When set, the boot options (66, 67, 150 and 43) are served only to clients whose DISCOVER carries this exact identifier — everyone else still gets an address from the pool, just no boot information. The match is case-insensitive but otherwise exact, so Cisco will not match Cisco Systems, Inc.; the value each client actually sends is logged in the Nexus Network Servers channel at debug level. Leave empty to serve the boot options to every client."
   }
@@ -778,7 +779,8 @@ export const CATEGORY_ORDER = [
   "serial",
   "scripts",
   "localServers",
-  "networkServers"
+  "tftpServer",
+  "dhcpServer"
 ] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
@@ -792,7 +794,8 @@ export const CATEGORY_LABELS: Record<string, string> = {
   serial: "Serial",
   scripts: "Scripts",
   localServers: "Local Servers",
-  networkServers: "Network Servers"
+  tftpServer: "TFTP Server",
+  dhcpServer: "DHCP Server"
 };
 
 export const CATEGORY_ICONS: Record<string, string> = {
@@ -806,7 +809,8 @@ export const CATEGORY_ICONS: Record<string, string> = {
   serial: "circuit-board",
   scripts: "play",
   localServers: "server-process",
-  networkServers: "radio-tower"
+  tftpServer: "radio-tower",
+  dhcpServer: "broadcast"
 };
 
 export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
@@ -820,8 +824,10 @@ export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   serial: "Set serial command timeout behavior.",
   scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs.",
   localServers: "Tune auto-restart limits, backoff timing, and working-directory safety for local server processes.",
-  networkServers:
-    "Configure the embedded TFTP and DHCP services — bind interfaces, ports, address pool, boot/ZTP options, and write access."
+  tftpServer:
+    "Configure the embedded TFTP service — served directory, bind interface, port, and upload access.",
+  dhcpServer:
+    "Configure the embedded DHCP service — bind interface, address pool, lease timing, and boot/ZTP options."
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {
