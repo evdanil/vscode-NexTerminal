@@ -17,14 +17,17 @@
 import * as vscode from "vscode";
 import type { NetworkServerKind } from "../models/networkServer";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
-import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
+import { networkInterfaceBindOptions, networkInterfaceNameForAddress } from "./networkInterfaceOptions";
 import {
   NETWORK_SERVER_LABELS,
   currentPoolCount,
+  dhcpDerivedAddresses,
   dhcpPoolProblem,
   dhcpRangeEndForCount,
+  isContiguousMask,
   isValidIpv4
 } from "./networkServerSettings";
+import type { SettingValue } from "./networkServerSettings";
 
 export interface NetworkServerQuickAdjustDeps {
   /** Whether the service is currently serving, i.e. whether a restart is needed to apply. */
@@ -73,7 +76,7 @@ function rawString(section: vscode.WorkspaceConfiguration, key: string): string 
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-async function writeSetting(kind: NetworkServerKind, key: string, value: string | number | boolean | undefined): Promise<void> {
+async function writeSetting(kind: NetworkServerKind, key: string, value: SettingValue): Promise<void> {
   // Global target only: these services bind ports on this machine, so scoping
   // them to whichever folder happens to be open would make the same lab setup
   // vanish in the next window.
@@ -157,6 +160,25 @@ interface BindPick extends vscode.QuickPickItem {
 
 function describeInterface(configured: string | undefined): string {
   return configured && configured !== "0.0.0.0" ? configured : "all interfaces (0.0.0.0)";
+}
+
+/**
+ * The NIC behind the configured bind address, resolved on every open.
+ *
+ * The setting stores an address, not an interface name, so the row alone cannot
+ * say whether that address is still on this machine — a dock unplugged or a VPN
+ * dropped since it was set leaves a value that looks fine and binds nothing.
+ * Naming the interface it currently belongs to answers both questions at once,
+ * and an address no NIC holds is called out rather than silently formatted.
+ */
+function describeInterfaceDetail(configured: string | undefined): string {
+  if (!configured || configured === "0.0.0.0") {
+    return "Every IPv4 address on this machine — no single NIC, so no current IP to show.";
+  }
+  const name = networkInterfaceNameForAddress(configured);
+  return name
+    ? `${name} — current IP ${configured}`
+    : `No interface on this machine currently holds ${configured} — current IP unknown.`;
 }
 
 /**
@@ -260,6 +282,99 @@ function tftpQuickItems(): QuickAdjustItem[] {
   ];
 }
 
+interface ConfirmPick extends vscode.QuickPickItem {
+  readonly confirmed: boolean;
+}
+
+/**
+ * Whether a setting may be recomputed from a new pool start.
+ *
+ * Blank is the codebase's existing "no opinion" signal — an unset key means the
+ * packaged default applies — so a blank value is always fair game. Beyond that,
+ * only a value this auto-fill would itself have written for the *previous* pool
+ * start is replaced: that is a stale suggestion, not a decision, and leaving it
+ * behind is how a move from one lab subnet to another ends up advertising the
+ * old subnet's gateway. Anything else the user typed is left exactly as typed.
+ */
+function isAutoFillable(current: string | undefined, previousDerived: string | undefined): boolean {
+  return current === undefined || (previousDerived !== undefined && current === previousDerived);
+}
+
+function isDnsAutoFillable(current: readonly string[], previousDerived: readonly string[] | undefined): boolean {
+  if (current.length === 0) return true;
+  if (previousDerived === undefined) return false;
+  return current.length === previousDerived.length && current.every((value, index) => value === previousDerived[index]);
+}
+
+const AUTO_FILL_LABELS: Readonly<Record<string, string>> = {
+  gateway: "Gateway",
+  broadcast: "Broadcast",
+  dns: "DNS"
+};
+
+/**
+ * Offers the addresses a new pool start implies — gateway, broadcast, DNS.
+ *
+ * The pool's own end address is not part of the offer: {@link editPoolStart}
+ * already recomputes it unconditionally to preserve the pool size, and asking
+ * about something that has already happened would misreport what the answer
+ * changes.
+ *
+ * The netmask in force is respected rather than assumed: an explicit `subnet`
+ * of, say, `255.255.254.0` derives a `.255`-crossing broadcast and the gateway
+ * below it, and only an unset mask falls back to /24.
+ *
+ * Confirmation is asked for rather than assumed. Nothing in the settings marks
+ * a value as machine-suggested, so silence would be indistinguishable from the
+ * editor overwriting fields the user never opened — and the prompt is skipped
+ * entirely when every candidate is already a deliberate value, which is the
+ * case that would have been annoying.
+ */
+async function offerPoolAutoFill(
+  rangeStart: string,
+  previousStart: string | undefined,
+  subnet: string | undefined
+): Promise<void> {
+  const derived = dhcpDerivedAddresses(rangeStart, subnet);
+  if (!derived) return;
+  const previous = previousStart ? dhcpDerivedAddresses(previousStart, subnet) : undefined;
+
+  const section = settingsSection("dhcp");
+  const dns = section
+    .get<string[]>("dns", [])
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter((entry) => entry.length > 0);
+
+  const writes: Array<[string, string | string[]]> = [];
+  if (isAutoFillable(rawString(section, "gateway"), previous?.gateway)) writes.push(["gateway", derived.gateway]);
+  if (isAutoFillable(rawString(section, "broadcast"), previous?.broadcast)) writes.push(["broadcast", derived.broadcast]);
+  if (isDnsAutoFillable(dns, previous?.dns)) writes.push(["dns", [...derived.dns]]);
+  if (writes.length === 0) return;
+
+  const summary = writes
+    .map(([key, value]) => `${AUTO_FILL_LABELS[key]} ${Array.isArray(value) ? value.join(", ") : value}`)
+    .join("  ·  ");
+  const pick = await vscode.window.showQuickPick<ConfirmPick>(
+    [
+      { label: "$(check) Yes, auto-fill", detail: summary, confirmed: true },
+      {
+        label: "$(close) No, I'll set them manually",
+        detail: "Leave the other addresses exactly as they are.",
+        confirmed: false
+      }
+    ],
+    {
+      title: "DHCP — Auto-Fill",
+      placeHolder: `Fill in the addresses that follow from ${rangeStart}?`,
+      ignoreFocusOut: true
+    }
+  );
+  if (!pick?.confirmed) return;
+  for (const [key, value] of writes) {
+    await writeSetting("dhcp", key, value);
+  }
+}
+
 /**
  * Moving the pool start keeps the pool the same size.
  *
@@ -293,6 +408,9 @@ async function editPoolStart(
   const rangeStart = trimmed.length > 0 ? trimmed : undefined;
   await writeSetting("dhcp", "rangeStart", rangeStart);
   await writeSetting("dhcp", "rangeEnd", dhcpRangeEndForCount(rangeStart, count));
+  // Only a concrete start is worth deriving from: clearing the field hands the
+  // whole pool back to the packaged defaults, which are already consistent.
+  if (rangeStart) await offerPoolAutoFill(rangeStart, current, subnet);
   return "edited";
 }
 
@@ -337,12 +455,14 @@ function dhcpQuickItems(): QuickAdjustItem[] {
   const rangeStart = rawString(section, "rangeStart");
   const rangeEnd = rawString(section, "rangeEnd");
   const subnet = rawString(section, "subnet");
+  const gateway = rawString(section, "gateway");
   const leaseTimeSec = section.get<number>("leaseTimeSec", DEFAULTS.leaseTimeSec);
   const count = currentPoolCount(rangeStart, rangeEnd);
   return [
     {
       label: "$(plug) Interface",
       description: describeInterface(bindAddress),
+      detail: describeInterfaceDetail(bindAddress),
       run: () => editInterface("dhcp", bindAddress)
     },
     {
@@ -356,6 +476,44 @@ function dhcpQuickItems(): QuickAdjustItem[] {
       // otherwise a count-only row hides what a peer reading settings.json sees.
       description: count > 0 ? `${String(count)} addresses → ${rangeEnd ?? DEFAULTS.rangeEnd}` : "pool range is invalid",
       run: () => editPoolCount(rangeStart, count, subnet)
+    },
+    {
+      label: "$(circuit-board) Subnet Mask",
+      description: subnet ?? `${DEFAULTS.subnet} (default)`,
+      run: () =>
+        editString({
+          kind: "dhcp",
+          key: "subnet",
+          title: "DHCP — Subnet Mask",
+          prompt:
+            "Netmask handed to clients (option 1). It also derives the broadcast address while that is left empty. Leave empty for the default.",
+          placeholder: `${DEFAULTS.subnet} (default)`,
+          current: subnet,
+          validate: (value) => {
+            if (!isValidIpv4(value)) return `Subnet Mask must be a dotted-quad IPv4 address (got "${value}").`;
+            if (!isContiguousMask(value)) {
+              return `Subnet Mask "${value}" is not a valid netmask — its set bits must be contiguous (e.g. 255.255.255.0).`;
+            }
+            // A narrower mask can put the existing pool past the new broadcast,
+            // so the pool is re-checked here rather than only where it is edited.
+            return dhcpPoolProblem(rangeStart, count, value);
+          }
+        })
+    },
+    {
+      label: "$(arrow-right) Default Gateway",
+      description: gateway ?? `${DEFAULTS.gateway} (default)`,
+      run: () =>
+        editString({
+          kind: "dhcp",
+          key: "gateway",
+          title: "DHCP — Default Gateway",
+          prompt: "Default route handed to clients (option 3). Leave empty for the default.",
+          placeholder: `${DEFAULTS.gateway} (default)`,
+          current: gateway,
+          validate: (value) =>
+            isValidIpv4(value) ? undefined : `Default Gateway must be a dotted-quad IPv4 address (got "${value}").`
+        })
     },
     {
       label: "$(clock) Lease Time",

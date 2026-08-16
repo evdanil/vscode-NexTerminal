@@ -12,7 +12,9 @@
 import {
   computeBroadcastAddress,
   computePoolSize,
-  computeRangeEnd
+  computeRangeEnd,
+  intToIp,
+  ipToInt
 } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
 import type { DhcpVendorSpecificEntry } from "../services/networkServers/core/index";
@@ -133,6 +135,56 @@ export function dhcpPoolProblem(
   const usable = computePoolSize(start, broadcast) - 1;
   const advice = usable >= 1 ? ` The most ${mask} allows from that start is ${String(usable)}.` : "";
   return `A pool of ${String(count)} addresses starting at ${start} ends at ${end}, at or past the subnet broadcast ${broadcast}.${advice}`;
+}
+
+/**
+ * The addresses that follow from a pool start, for the editors that offer to
+ * fill them in rather than making the user work the subnet out by hand.
+ */
+export interface DhcpDerivedAddresses {
+  /** Option 3 — the last usable address of the subnet, one below the broadcast. */
+  readonly gateway: string;
+  /** Option 28. */
+  readonly broadcast: string;
+  /** Option 6. */
+  readonly dns: readonly string[];
+}
+
+/**
+ * What a pool starting at `rangeStart` implies for gateway, broadcast and DNS.
+ *
+ * The netmask is whatever is configured, falling back to the packaged
+ * `255.255.255.0` — the quick editor never asks for a CIDR, so a subnet the
+ * user has not set is the /24 the rest of the defaults assume. The gateway is
+ * the top usable address rather than the bottom one because that is where the
+ * appliances these labs plug into put it, and it keeps the gateway clear of a
+ * pool that counts up from its start.
+ *
+ * DNS mirrors the gateway rather than the packaged `8.8.8.8`/`8.8.4.4` pair:
+ * leaving the key unset already yields those two, so writing them out would be
+ * a no-op with a settings-file entry attached, whereas router-as-resolver is
+ * the setup an isolated lab subnet actually needs.
+ *
+ * @returns `undefined` when the start or the mask does not parse, or when the
+ *   mask is too narrow to leave a gateway inside the subnet (/31, /32) — there
+ *   is nothing to suggest in those cases and a wrong suggestion is worse than
+ *   none.
+ */
+export function dhcpDerivedAddresses(
+  rangeStart: string,
+  subnet: string | undefined
+): DhcpDerivedAddresses | undefined {
+  const mask = subnet ?? DEFAULTS.subnet;
+  if (!isValidIpv4(rangeStart) || !isValidIpv4(mask) || !isContiguousMask(mask)) return undefined;
+  const broadcast = computeBroadcastAddress(rangeStart, mask);
+  if (!isValidIpv4(broadcast)) return undefined;
+  const gateway = intToIp((ipToInt(broadcast) - 1) >>> 0);
+  const maskInt = ipToInt(mask);
+  // A gateway that fell out of the subnet (or onto its network address) would
+  // be handed to clients as an unreachable next hop.
+  if ((ipToInt(gateway) & maskInt) !== (ipToInt(rangeStart) & maskInt)) return undefined;
+  if (gateway === intToIp(ipToInt(rangeStart) & maskInt)) return undefined;
+  return { gateway, broadcast, dns: [gateway] };
 }
 
 /**

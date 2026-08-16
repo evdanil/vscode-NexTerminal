@@ -58,3 +58,26 @@ export function networkInterfaceBindOptions(): NetworkInterfaceOption[] {
   const external = ipv4Options(false);
   return [ALL_INTERFACES_OPTION, ...(external.length > 0 ? external : ipv4Options(true))];
 }
+
+/**
+ * The NIC currently holding `address`, for annotating an address a setting
+ * already stores with the interface it actually belongs to.
+ *
+ * Internal addresses are searched too, unlike {@link networkInterfaceBindOptions}:
+ * this answers "what is this configured address" rather than "what should be
+ * offered", and hiding the answer for a loopback binding would report a real
+ * address as missing.
+ *
+ * @returns The interface name, or `undefined` when this machine has no IPv4
+ *   interface on that address — including for the all-interfaces value, which
+ *   is not one NIC and so has no name to give.
+ */
+export function networkInterfaceNameForAddress(address: string): string | undefined {
+  if (address.length === 0 || address === "0.0.0.0") return undefined;
+  for (const [name, addresses] of Object.entries(os.networkInterfaces())) {
+    for (const entry of addresses ?? []) {
+      if (entry.family === "IPv4" && entry.address === address) return name;
+    }
+  }
+  return undefined;
+}
