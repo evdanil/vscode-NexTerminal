@@ -7,6 +7,15 @@ on:
   push:
     tags:
       - "v*"
+  # Called by auto-release.yml: tags it creates with GITHUB_TOKEN cannot
+  # trigger the push event above (GitHub's recursion safeguard), so it invokes
+  # this workflow directly and names the tag.
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (vX.Y.Z) the calling workflow created"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -75,6 +84,10 @@ jobs:
   build-and-publish-openvsx:
     needs: build-local-pty
     runs-on: ubuntu-latest
+    env:
+      # The release tag, however this run started: workflow_call input, or the
+      # pushed tag ref.
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -91,7 +104,7 @@ jobs:
 
       - name: Set version from tag
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          VERSION="${RELEASE_TAG#v}"
           echo "Setting version to $VERSION"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
