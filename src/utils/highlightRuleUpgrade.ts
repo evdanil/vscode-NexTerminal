@@ -1,4 +1,4 @@
-import type { HighlightRule } from "./highlightRuleValidation";
+import { VALID_FLAGS_RE, type HighlightRule } from "./highlightRuleValidation";
 
 /**
  * Known-default upgrade for user-saved highlighting rule snapshots.
@@ -269,13 +269,17 @@ function isBlank(value: string | undefined): boolean {
  *
  * Typed `unknown`, not `string | undefined`: the activation migration hands
  * the upgrade the RAW stored array (deliberately — see
- * highlightRuleMigration.ts), and validation TOLERATES a non-string flags
- * value rather than failing the array. compileRule runs such a rule with
- * "gi", so it is compared as "gi" here too; spreading it would throw, and in
- * the migration that throw lands in a catch that silently skips healing.
+ * highlightRuleMigration.ts), and validation TOLERATES two shapes rather than
+ * failing the array — a non-string value, and an invalid string such as "gm".
+ * compileRule runs BOTH as "gi" (`VALID_FLAGS_RE` fallback), so both are
+ * compared as "gi" here too; a valid empty string stays itself — it compiles
+ * and genuinely matches differently. Spreading a non-string would throw, and
+ * in the migration that throw lands in a catch that silently skips healing.
  */
 function normalizeFlags(flags: unknown): string {
-  return typeof flags === "string" ? [...flags].sort().join("") : "gi";
+  const raw = typeof flags === "string" ? flags : "gi";
+  const effective = VALID_FLAGS_RE.test(raw) ? raw : "gi";
+  return [...effective].sort().join("");
 }
 
 /**

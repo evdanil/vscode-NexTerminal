@@ -162,6 +162,24 @@ describe("migrateHighlightRulesGlobalSetting", () => {
     expect(written[0].flags).toBe(42);
   });
 
+  // ⊘ Codex P2 (#79 round 3): same tolerance class as the non-string case,
+  // via a REJECTED STRING — "gm" fails VALID_FLAGS_RE, so the sanitizer drops
+  // it and compileRule runs the rule as "gi". Compared literally it blocks the
+  // backfill, and with the pattern unchanged the migration then reports no
+  // change at all — stale nameless snapshot never healed.
+  it("heals a rule whose hand-edited flags string is invalid (runs as the default)", async () => {
+    state.inspected = {
+      globalValue: [{ pattern: "\\bERR(?:OR)?\\b", color: "red", bold: true, flags: "gm" }]
+    };
+
+    const migrated = await migrateHighlightRulesGlobalSetting();
+
+    expect(migrated).toBe(true);
+    const written = (updateMock.mock.calls[0] as [string, Array<Record<string, unknown>>, number])[1];
+    expect(written[0].label).toBe("Errors");
+    expect(written[0].flags).toBe("gm");
+  });
+
   it("does nothing when there is no global override", async () => {
     state.inspected = { globalValue: undefined };
 

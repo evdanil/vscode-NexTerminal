@@ -247,6 +247,33 @@ describe("upgradeHighlightRules", () => {
       expect((result.rules[0] as unknown as { flags: number }).flags).toBe(42);
     });
 
+    // ⊘ Codex P2 (#79 round 3): validation also tolerates INVALID STRING
+    // flags — "gm" fails VALID_FLAGS_RE, the sanitizer drops the key, and
+    // compileRule runs the rule as "gi". Comparing the literal string reads
+    // "gm" as a user customisation and skips healing a rule that actually
+    // RUNS exactly like the default.
+    it("reads an invalid string flags value as the runtime default, like compileRule does", () => {
+      const result = upgradeHighlightRules([
+        { pattern: "\\bERR(?:OR)?\\b", color: "red", bold: true, flags: "gm" }
+      ]);
+
+      expect(result.changed).toBe(true);
+      expect(result.rules[0].label).toBe("Errors");
+      expect(result.rules[0].description).toBe("ERR / ERROR — general error keyword, bold red.");
+      expect(result.rules[0].flags).toBe("gm");
+    });
+
+    // An empty string is VALID flags ("" passes ^[gi]*$ and compiles as a
+    // case-sensitive single-match rule) — genuinely different behaviour, so it
+    // must stay unequal to "gi" and block the backfill.
+    it("keeps a valid empty-string flags value distinct from the default", () => {
+      const mine: HighlightRule = { pattern: "\\bERR(?:OR)?\\b", color: "red", bold: true, flags: "" };
+      const result = upgradeHighlightRules([mine]);
+
+      expect(result.changed).toBe(false);
+      expect(result.rules[0]).toBe(mine);
+    });
+
     // ⊘ Discriminator against gating the PATTERN rewrite on flags: the
     // truncation bug is flags-independent, so the fix must land regardless.
     it("still rewrites a former IPv6 pattern when the flags were changed, without backfilling text", () => {
