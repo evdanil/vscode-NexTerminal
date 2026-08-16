@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { validateAndSanitizeHighlightRules, type HighlightRule } from "../utils/highlightRuleValidation";
+import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
 
 const MAX_INPUT_LENGTH = 65536;
 // Upper bound on how long a fragment with no line boundary may sit in the
@@ -367,7 +368,15 @@ export class TerminalHighlighter {
     this.enabled = config.get<boolean>("enabled", true);
     const rawRules = config.get<unknown>("rules", []);
     const rawRulesArray = Array.isArray(rawRules) ? rawRules : [];
-    const rules = rawRulesArray.flatMap((rule) => validateAndSanitizeHighlightRules([rule]) ?? []);
+    const validated = rawRulesArray.flatMap((rule) => validateAndSanitizeHighlightRules([rule]) ?? []);
+    // Upgrade BEFORE compiling. A user who saved rules from the editor has a
+    // frozen snapshot in global settings that shadows the shipped defaults
+    // entirely (VS Code never merges array settings), so a fixed default
+    // pattern would otherwise never run for them — the one-shot activation
+    // migration heals settings.json, but this is what makes the fix apply
+    // even when that write never happens (workspace-scope override, read-only
+    // settings.json, sync conflict).
+    const rules = upgradeHighlightRules(validated).rules;
     this.rules = [];
     for (const rule of rules) {
       if (!rule.pattern || !rule.color) { continue; }

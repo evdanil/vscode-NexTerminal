@@ -15,6 +15,7 @@ import { CwdTracker } from "./services/terminal/cwdTracker";
 import { CwdSyncCoordinator } from "./services/sftp/cwdSyncCoordinator";
 import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
+import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
@@ -318,6 +319,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         : `Nexus: ${orphans.count} sessions disconnected after an extension reload or restart. The tabs are frozen on their last output — close them manually when you are done reviewing. Reconnect from the Connectivity Hub when ready.`;
     void vscode.window.showInformationMessage(message);
   }
+
+  // Heal a stale user snapshot of nexus.terminal.highlighting.rules in global
+  // settings (label-less rules from before v2.8.182, the truncating IPv6
+  // pattern from before v2.8.187). Fire-and-forget and non-fatal: the read-time
+  // upgrade in TerminalHighlighter/HighlightRuleEditorPanel already makes
+  // behaviour correct, so this only tidies settings.json and future exports and
+  // must never delay or break activation.
+  void migrateHighlightRulesGlobalSetting();
 
   const repository = new VscodeConfigRepository(context);
   const core = new NexusCore(repository);

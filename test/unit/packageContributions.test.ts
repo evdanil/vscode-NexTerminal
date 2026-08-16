@@ -869,8 +869,12 @@ describe("terminal output performance defaults", () => {
     }
 
     it("ships the IPv6 and UUID rules disabled by default — the two most expensive patterns", () => {
-      const ipv6Rule = defaultRules.find((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"));
-      const uuidRule = defaultRules.find((rule) => rule.pattern.includes("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}"));
+      // Located by label, not by a fragment of the regex: the IPv6 pattern was
+      // rewritten in v2.8.187 to stop truncating compressed addresses, and a
+      // structural finder silently returned undefined (making every assertion
+      // below vacuous) rather than failing loudly.
+      const ipv6Rule = defaultRules.find((rule) => rule.label === "IPv6 addresses");
+      const uuidRule = defaultRules.find((rule) => rule.label === "UUIDs");
       expect(ipv6Rule).toBeDefined();
       expect(uuidRule).toBeDefined();
       expect(ipv6Rule?.enabled).toBe(false);
@@ -887,7 +891,7 @@ describe("terminal output performance defaults", () => {
     });
 
     describe("IPv6 pattern coverage (trailing compression, PR #72)", () => {
-      const ipv6Rule = defaultRules.find((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"))!;
+      const ipv6Rule = defaultRules.find((rule) => rule.label === "IPv6 addresses")!;
 
       it("is defined", () => {
         expect(ipv6Rule).toBeDefined();
@@ -904,14 +908,22 @@ describe("terminal output performance defaults", () => {
       });
 
       it("matches a mixed compressed+trailing address (2001:db8::1) in full, not truncated at the ::", () => {
-        // The new trailing-compression alternative is appended LAST in the
-        // alternation, so a complete form like "2001:db8::1" must still be
-        // consumed whole by an earlier alternative rather than stopping short
-        // at "2001:db8::" via the new one.
+        // The trailing-compression alternative is LAST in the alternation, so a
+        // complete form like "2001:db8::1" must still be consumed whole by an
+        // earlier alternative rather than stopping short at "2001:db8::".
         const re = new RegExp(ipv6Rule.pattern, ipv6Rule.flags ?? "g");
         const match = re.exec("2001:db8::1");
         expect(match).not.toBeNull();
         expect(match![0]).toBe("2001:db8::1");
+      });
+
+      it("matches multi-hextet compressed addresses whole (v2.8.187 truncation fix)", () => {
+        // Both historical patterns allowed exactly ONE hextet after "::", so
+        // this address highlighted as "fe80::b3ff". The full matrix lives in
+        // highlightIpv6Default.test.ts; this row keeps the defaults suite
+        // honest about the bug the pattern was rewritten for.
+        const re = new RegExp(ipv6Rule.pattern, ipv6Rule.flags ?? "g");
+        expect(re.exec("fe80::b3ff:fe1e:8329")?.[0]).toBe("fe80::b3ff:fe1e:8329");
       });
 
       it("does NOT match the bare all-zeros :: (a C++/Ruby scope operator in real terminal output) or std::map", () => {

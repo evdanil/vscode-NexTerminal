@@ -765,6 +765,44 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  // ⊘ Discriminator against a validate-only import path. Import is the third
+  // way a rule array reaches global settings (after the editor's Save and the
+  // activation migration), and it is the one that carries a snapshot from
+  // ANOTHER machine — typically an older install, which is exactly where the
+  // truncating IPv6 pattern and the label-less rules live. Writing that
+  // payload through unchanged re-pollutes settings with the stale form the
+  // rest of this release exists to heal, and does it AFTER the one-shot
+  // migration has already run.
+  it("upgrades known-default rules on import instead of re-polluting settings with a stale snapshot", async () => {
+    mockShowWarningMessage.mockClear();
+    const shippedIpv6 = (
+      JSON.parse(readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf8")).contributes
+        .configuration.properties["nexus.terminal.highlighting.rules"].default as Array<Record<string, unknown>>
+    ).find((rule) => rule.label === "IPv6 addresses")!;
+    const IPV6_V1 =
+      "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b";
+
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.highlighting.rules": [
+          { pattern: IPV6_V1, color: "magenta", flags: "g", enabled: false },
+          { pattern: "\\bERR(?:OR)?\\b", color: "red", flags: "gi", bold: true }
+        ]
+      }
+    });
+    await runImport(exportData);
+
+    const written = configStore.get("nexus.terminal.highlighting.rules") as Array<Record<string, unknown>>;
+    expect(written[0].pattern).toBe(shippedIpv6.pattern);
+    expect(written[0].label).toBe("IPv6 addresses");
+    expect(written[0].enabled).toBe(false);
+    expect(written[1].label).toBe("Errors");
+    expect(written[1].description).toBe("ERR / ERROR — general error keyword, bold red.");
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
   it("generates IDs for items with missing IDs", async () => {
     const exportData = makeExportData({
       servers: [{ ...makeServer(), id: "" }],
