@@ -143,6 +143,25 @@ describe("migrateHighlightRulesGlobalSetting", () => {
     });
   });
 
+  // ⊘ Codex P2 (#79 round 2): validation TOLERATES a non-string `flags` (it
+  // reads it as absent rather than failing the array), so the raw array
+  // reaches the upgrade with `flags: 42` intact. An upgrade that assumes flags
+  // is a string crashes on it, and the migration's outer catch turns that
+  // crash into "silently skipped forever" — stale pattern never healed.
+  it("heals a rule whose hand-edited flags value is a tolerated non-string", async () => {
+    state.inspected = {
+      globalValue: [{ pattern: IPV6_V1, color: "magenta", flags: 42, enabled: false }]
+    };
+
+    const migrated = await migrateHighlightRulesGlobalSetting();
+
+    expect(migrated).toBe(true);
+    const written = (updateMock.mock.calls[0] as [string, Array<Record<string, unknown>>, number])[1];
+    expect(written[0].pattern).not.toBe(IPV6_V1);
+    // The raw value is preserved in what is persisted — tolerated, not rewritten.
+    expect(written[0].flags).toBe(42);
+  });
+
   it("does nothing when there is no global override", async () => {
     state.inspected = { globalValue: undefined };
 

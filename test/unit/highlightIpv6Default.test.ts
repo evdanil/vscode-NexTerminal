@@ -107,6 +107,33 @@ describe("shipped IPv6 highlighting default", () => {
     expect(matchesIn(input)).toEqual([]);
   });
 
+  /**
+   * Hextet-count discipline (Codex P2, #79 round 2). `::` must replace at
+   * least one group, so a valid compressed address carries at most SEVEN
+   * explicit hextets — each side of the middle compression at most six.
+   *
+   * ⊘ The first row discriminates against independent `{1,7}` repetitions on
+   * both sides of the `::` (up to fourteen hextets accepted): a 14-group run
+   * must not be swallowed whole. Exact sum-bounding (left + right ≤ 7) needs a
+   * seven-way alternation expansion that busts the 500-char pattern safety cap
+   * and multiplies per-character work on the already-most-expensive rule, so
+   * runs of EIGHT explicit hextets around a `::` remain over-accepted — the
+   * second row pins that residual deliberately. The pre-2.8.187 pattern
+   * coloured the same invalid runs partially (`1:2:3:4::5` out of
+   * `1:2:3:4::5:6:7:8`), so the residual is not a regression, and a
+   * highlighting rule that never truncates a REAL address is worth more than
+   * one that polices invalid ones.
+   */
+  it("does not swallow a 14-hextet run whole", () => {
+    expect(matchesIn("1:2:3:4:5:6:7::8:9:a:b:c:d:e")).not.toContain(
+      "1:2:3:4:5:6:7::8:9:a:b:c:d:e"
+    );
+  });
+
+  it("still over-accepts an 8-hextet compressed run (documented residual)", () => {
+    expect(matchesIn("1:2:3:4::5:6:7:8")).toEqual(["1:2:3:4::5:6:7:8"]);
+  });
+
   it("stays linear on a pathological colon storm", () => {
     const storm = ":".repeat(10_000) + "z";
     const regex = new RegExp(ipv6Rule.pattern, ipv6Rule.flags ?? "g");

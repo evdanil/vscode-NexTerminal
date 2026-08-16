@@ -188,7 +188,7 @@ export const DEFAULT_HIGHLIGHT_RULE_CATALOG: readonly DefaultHighlightRuleInfo[]
     flags: "g"
   },
   {
-    pattern: "\\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){6}(?:\\d{1,3}\\.){3}\\d{1,3}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){0,4}:(?:\\d{1,3}\\.){3}\\d{1,3}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}(?::[0-9a-fA-F]{1,4}){1,7}\\b|::(?:[0-9a-fA-F]{1,4}:){0,5}(?:\\d{1,3}\\.){3}\\d{1,3}\\b|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:(?!:)",
+    pattern: "\\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){6}(?:\\d{1,3}\\.){3}\\d{1,3}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){0,4}:(?:\\d{1,3}\\.){3}\\d{1,3}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,6}(?::[0-9a-fA-F]{1,4}){1,6}\\b|::(?:[0-9a-fA-F]{1,4}:){0,5}(?:\\d{1,3}\\.){3}\\d{1,3}\\b|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:(?!:)",
     label: "IPv6 addresses",
     description: "IPv6 addresses, full and compressed (including trailing-compressed forms like fe80:: or 2001:db8::), except the bare all-zeros \"::\" — a lone :: in terminal output is overwhelmingly a C++/Ruby scope operator. Disabled by default — this is one of the two most expensive built-in patterns, since it has to be tried at nearly every character. Enable it from the Highlighting Rules editor if you want it.",
     color: "magenta",
@@ -266,9 +266,16 @@ function isBlank(value: string | undefined): boolean {
  * Flags normalised for comparison: absent means "gi" (exactly what
  * `compileRule` runs a flagless rule with), and character order is
  * insignificant ("ig" is "gi").
+ *
+ * Typed `unknown`, not `string | undefined`: the activation migration hands
+ * the upgrade the RAW stored array (deliberately — see
+ * highlightRuleMigration.ts), and validation TOLERATES a non-string flags
+ * value rather than failing the array. compileRule runs such a rule with
+ * "gi", so it is compared as "gi" here too; spreading it would throw, and in
+ * the migration that throw lands in a catch that silently skips healing.
  */
-function normalizeFlags(flags: string | undefined): string {
-  return [...(flags ?? "gi")].sort().join("");
+function normalizeFlags(flags: unknown): string {
+  return typeof flags === "string" ? [...flags].sort().join("") : "gi";
 }
 
 /**

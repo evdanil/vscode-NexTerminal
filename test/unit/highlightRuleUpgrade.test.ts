@@ -233,6 +233,20 @@ describe("upgradeHighlightRules", () => {
       expect(result.rules[0]).toBe(mine);
     });
 
+    // ⊘ The migration hands the upgrade the RAW stored array, and validation
+    // tolerates a non-string flags value instead of failing the array — so the
+    // upgrade must tolerate it too, the same way compileRule does at runtime
+    // (a non-string runs as "gi"). An implementation that spreads flags
+    // unchecked throws here.
+    it("tolerates a raw non-string flags value, reading it as the runtime default", () => {
+      const mine = { pattern: "\\bERR(?:OR)?\\b", color: "red", bold: true, flags: 42 };
+      const result = upgradeHighlightRules([mine as unknown as HighlightRule]);
+
+      expect(result.changed).toBe(true);
+      expect(result.rules[0].label).toBe("Errors");
+      expect((result.rules[0] as unknown as { flags: number }).flags).toBe(42);
+    });
+
     // ⊘ Discriminator against gating the PATTERN rewrite on flags: the
     // truncation bug is flags-independent, so the fix must land regardless.
     it("still rewrites a former IPv6 pattern when the flags were changed, without backfilling text", () => {
