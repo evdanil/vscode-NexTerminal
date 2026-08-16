@@ -5,7 +5,8 @@
  *   nexus.networkServer.stop        — gracefully stop a running service
  *   nexus.networkServer.restart     — stop then start, re-reading settings so
  *                                     edits made while running take effect
- *   nexus.networkServer.edit        — open the service's configuration surface
+ *   nexus.networkServer.quickAdjust — quick pick over the settings that move
+ *   nexus.networkServer.edit        — the full form, every setting
  *   nexus.networkServer.inspectLogs — reveal the shared diagnostics channel
  *
  * There is no CRUD surface here: TFTP and DHCP are fixed singletons identified
@@ -29,6 +30,15 @@ import { networkServerFormDefinition, type DhcpServerFormSeed } from "../ui/form
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
+import { openNetworkServerQuickAdjust } from "./networkServerQuickAdjust";
+import {
+  dhcpRangeEndForCount,
+  readSettingBoolean,
+  readSettingNumber,
+  readSettingString,
+  validateDhcpValues,
+  type SettingValue
+} from "./networkServerSettings";
 import type { CommandContext } from "./types";
 
 /** `serviceKind`, not `kind` — `QuickPickItem.kind` is taken by VS Code. */
@@ -65,37 +75,6 @@ function toNetworkServerKindFromArg(arg: unknown): NetworkServerKind | undefined
 async function pickNetworkServerKind(title: string): Promise<NetworkServerKind | undefined> {
   const pick = await vscode.window.showQuickPick<NetworkServerPick>(NETWORK_SERVER_PICKS, { title });
   return pick?.serviceKind;
-}
-
-/** Value accepted by `WorkspaceConfiguration.update`; `undefined` clears the key. */
-type SettingValue =
-  | string
-  | number
-  | boolean
-  | string[]
-  | Record<string, string>
-  | DhcpVendorSpecificEntry[]
-  | undefined;
-
-/** Blank collapses to `undefined` so the key is removed and the default applies. */
-function readSettingString(value: FormValues[string]): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function readSettingNumber(value: FormValues[string]): number | undefined {
-  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-/** Checkboxes arrive as `"on"` from the webview, or as a boolean under test. */
-function readSettingBoolean(value: FormValues[string]): boolean {
-  return value === true || value === "on" || value === "true";
 }
 
 function parseCommaList(value: FormValues[string]): string[] | undefined {
@@ -177,9 +156,12 @@ function networkServerSettingUpdates(kind: NetworkServerKind, values: FormValues
       ["interface", readSettingString(values.interface)]
     ];
   }
+  const rangeStart = readSettingString(values.rangeStart);
   return [
-    ["rangeStart", readSettingString(values.rangeStart)],
-    ["rangeEnd", readSettingString(values.rangeEnd)],
+    ["rangeStart", rangeStart],
+    // The form asks for a pool *size*; the setting stays the end address, so
+    // nothing changes for anyone editing settings.json by hand.
+    ["rangeEnd", dhcpRangeEndForCount(rangeStart, readSettingNumber(values.poolCount))],
     ["subnet", readSettingString(values.subnet)],
     ["gateway", readSettingString(values.gateway)],
     ["dns", parseCommaList(values.dns)],
@@ -197,60 +179,6 @@ function networkServerSettingUpdates(kind: NetworkServerKind, values: FormValues
   ];
 }
 
-const DOTTED_QUAD = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
-
-function compareIpv4(left: string, right: string): number {
-  const a = left.split(".").map(Number);
-  const b = right.split(".").map(Number);
-  for (let i = 0; i < 4; i += 1) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return 0;
-}
-
-/** A mask is usable only if its set bits are contiguous from the top — `255.0.255.0` is not a subnet. */
-function isContiguousMask(mask: string): boolean {
-  const value = mask.split(".").reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
-  const inverted = ~value >>> 0;
-  return ((inverted + 1) & inverted) === 0;
-}
-
-/**
- * Sanity checks run before any setting is written, returning the first problem
- * as a message.
- *
- * `WebviewFormPanel` has no field-level validation hook a caller can drive (the
- * webview understands a `validationError` message, but nothing exposes a way to
- * send one), so this rides the mechanism that does exist: throwing out of
- * `onSubmit` reports the reason and leaves the panel open with the user's input
- * intact. Only non-blank values are checked — blank means "clear the key and
- * use the packaged default", which is always valid.
- */
-function validateDhcpValues(values: FormValues): string | undefined {
-  const rangeStart = readSettingString(values.rangeStart);
-  const rangeEnd = readSettingString(values.rangeEnd);
-  const subnet = readSettingString(values.subnet);
-  for (const [label, value] of [
-    ["Pool Start", rangeStart],
-    ["Pool End", rangeEnd],
-    ["Subnet Mask", subnet],
-    ["Gateway", readSettingString(values.gateway)],
-    ["Server Identifier", readSettingString(values.serverId)],
-    ["Broadcast Address", readSettingString(values.broadcast)]
-  ] as const) {
-    if (value && !DOTTED_QUAD.test(value)) {
-      return `${label} must be a dotted-quad IPv4 address (got "${value}").`;
-    }
-  }
-  if (subnet && !isContiguousMask(subnet)) {
-    return `Subnet Mask "${subnet}" is not a valid netmask — its set bits must be contiguous (e.g. 255.255.255.0).`;
-  }
-  if (rangeStart && rangeEnd && compareIpv4(rangeStart, rangeEnd) > 0) {
-    return `Pool Start (${rangeStart}) must not be higher than Pool End (${rangeEnd}).`;
-  }
-  return undefined;
-}
-
 function errorMessageFor(error: unknown, prefix: string): string {
   if (error instanceof NetworkServerError) {
     return `${prefix}: ${error.message} (${error.code})`;
@@ -263,6 +191,49 @@ export function registerNetworkServerCommands(
   ctx: CommandContext & { networkServerManager: NetworkServerManager }
 ): vscode.Disposable[] {
   const manager = ctx.networkServerManager;
+
+  const restartQuietly = async (kind: NetworkServerKind): Promise<void> => {
+    try {
+      await manager.restart(kind);
+    } catch (error) {
+      void vscode.window.showErrorMessage(errorMessageFor(error, "Failed to restart network server"));
+    }
+  };
+
+  const openFullForm = (kind: NetworkServerKind): void => {
+    const service = kind.toUpperCase();
+    const seed =
+      kind === "dhcp" ? dhcpFormSeed(manager.readConfig(kind) as DhcpAdapterConfig) : manager.readConfig(kind);
+    // Enumerated per open, never cached: a VPN coming up or a dock being
+    // unplugged changes the answer between one Edit and the next.
+    const form = networkServerFormDefinition(kind, seed, { interfaceOptions: networkInterfaceBindOptions() });
+    WebviewFormPanel.open(`network-server-edit-${kind}`, form, {
+      onSubmit: async (values) => {
+        const problem = kind === "dhcp" ? validateDhcpValues(values) : undefined;
+        if (problem) {
+          // Thrown, not reported here: WebviewFormPanel turns this into a
+          // "Save failed" message and leaves the panel open with the input.
+          throw new Error(problem);
+        }
+        const section = vscode.workspace.getConfiguration(`nexus.networkServers.${kind}`);
+        // Global target only: these services are machine-level (they bind
+        // ports on this host), so scoping them to whichever folder happens to
+        // be open would make the same lab setup vanish in the next window.
+        for (const [key, value] of networkServerSettingUpdates(kind, values)) {
+          await section.update(key, value, vscode.ConfigurationTarget.Global);
+        }
+        // Adapters read their configuration in the constructor, so a live
+        // service keeps serving the settings it started with until restarted.
+        if (ctx.core.getNetworkServerSession(kind)?.status !== "running") return;
+        const choice = await vscode.window.showInformationMessage(
+          `Restart ${service} to apply the new settings?`,
+          "Restart"
+        );
+        if (choice !== "Restart") return;
+        await restartQuietly(kind);
+      }
+    });
+  };
 
   return [
     vscode.commands.registerCommand("nexus.networkServer.start", async (arg?: unknown) => {
@@ -295,45 +266,26 @@ export function registerNetworkServerCommands(
       }
     }),
 
+    // The per-item gear and a click on the service row. Fast path: the handful
+    // of settings that change between one lab and the next, with the full form
+    // one item away for everything structured.
+    vscode.commands.registerCommand("nexus.networkServer.quickAdjust", async (arg?: unknown) => {
+      const kind = toNetworkServerKindFromArg(arg) ?? (await pickNetworkServerKind("Quick Settings"));
+      if (!kind) return;
+      await openNetworkServerQuickAdjust(kind, {
+        isRunning: () => ctx.core.getNetworkServerSession(kind)?.status === "running",
+        restart: () => restartQuietly(kind),
+        openFullForm: () => {
+          openFullForm(kind);
+        }
+      });
+    }),
+
+    // The view-title gear, which carries no tree item, hence the kind pick.
     vscode.commands.registerCommand("nexus.networkServer.edit", async (arg?: unknown) => {
       const kind = toNetworkServerKindFromArg(arg) ?? (await pickNetworkServerKind("Edit Network Server"));
       if (!kind) return;
-      const service = kind.toUpperCase();
-      const seed =
-        kind === "dhcp" ? dhcpFormSeed(manager.readConfig(kind) as DhcpAdapterConfig) : manager.readConfig(kind);
-      // Enumerated per open, never cached: a VPN coming up or a dock being
-      // unplugged changes the answer between one Edit and the next.
-      const form = networkServerFormDefinition(kind, seed, { interfaceOptions: networkInterfaceBindOptions() });
-      WebviewFormPanel.open(`network-server-edit-${kind}`, form, {
-        onSubmit: async (values) => {
-          const problem = kind === "dhcp" ? validateDhcpValues(values) : undefined;
-          if (problem) {
-            // Thrown, not reported here: WebviewFormPanel turns this into a
-            // "Save failed" message and leaves the panel open with the input.
-            throw new Error(problem);
-          }
-          const section = vscode.workspace.getConfiguration(`nexus.networkServers.${kind}`);
-          // Global target only: these services are machine-level (they bind
-          // ports on this host), so scoping them to whichever folder happens to
-          // be open would make the same lab setup vanish in the next window.
-          for (const [key, value] of networkServerSettingUpdates(kind, values)) {
-            await section.update(key, value, vscode.ConfigurationTarget.Global);
-          }
-          // Adapters read their configuration in the constructor, so a live
-          // service keeps serving the settings it started with until restarted.
-          if (ctx.core.getNetworkServerSession(kind)?.status !== "running") return;
-          const choice = await vscode.window.showInformationMessage(
-            `Restart ${service} to apply the new settings?`,
-            "Restart"
-          );
-          if (choice !== "Restart") return;
-          try {
-            await manager.restart(kind);
-          } catch (error) {
-            void vscode.window.showErrorMessage(errorMessageFor(error, "Failed to restart network server"));
-          }
-        }
-      });
+      openFullForm(kind);
     }),
 
     vscode.commands.registerCommand("nexus.networkServer.inspectLogs", () => {

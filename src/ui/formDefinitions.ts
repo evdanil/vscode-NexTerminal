@@ -3,6 +3,8 @@ import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config
 import type { LocalServerConfig } from "../models/localServer";
 import type { NetworkServerKind } from "../models/networkServer";
 import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
+import { DEFAULTS as DHCP_DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
+import { computePoolSize } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -1836,6 +1838,17 @@ export interface DhcpServerFormSeed extends DhcpAdapterConfig {
   readonly autoLinkTftp?: boolean;
 }
 
+/** The pool's current size, or nothing at all when neither end of it is configured. */
+function dhcpPoolCountSeed(current: DhcpServerFormSeed): number | undefined {
+  if (current.rangeStart === undefined && current.rangeEnd === undefined) return undefined;
+  return (
+    computePoolSize(
+      current.rangeStart ?? DHCP_DEFAULTS.rangeStart,
+      current.rangeEnd ?? DHCP_DEFAULTS.rangeEnd
+    ) || undefined
+  );
+}
+
 function dhcpServerFields(current: DhcpServerFormSeed, options?: NetworkServerFormOptions): FormFieldDescriptor[] {
   const staticTextarea = current.static
     ? Object.entries(current.static)
@@ -1861,11 +1874,17 @@ function dhcpServerFields(current: DhcpServerFormSeed, options?: NetworkServerFo
       value: current.rangeStart
     },
     {
-      type: "text",
-      key: "rangeEnd",
-      label: "Pool End",
-      placeholder: "192.168.2.199 (default)",
-      value: current.rangeEnd
+      type: "number",
+      key: "poolCount",
+      label: "Pool Count",
+      min: 1,
+      placeholder: "190 (default)",
+      // Presentation only: the saved setting stays `rangeEnd`, computed on
+      // submit, so settings.json keeps the start/end pair it always had. An
+      // untouched pool stays blank rather than seeding 190, so saving the form
+      // does not write the packaged default out as an explicit setting.
+      value: dhcpPoolCountSeed(current),
+      hint: "How many addresses the pool hands out, counting from Pool Start. Saved as the pool's end address."
     },
     {
       type: "text",

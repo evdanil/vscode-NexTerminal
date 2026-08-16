@@ -103,6 +103,15 @@ export class NetworkServerRootTreeItem extends vscode.TreeItem {
       tooltipLines.push(`Error: ${session.errorMessage}`);
     }
     this.tooltip = tooltipLines.join("\n");
+    // Clicking the row opens the quick editor (and, as VS Code always does for
+    // a collapsible item, also toggles the row). The kind is passed rather than
+    // `this`: the command only ever needs the service, and a tree item bound
+    // into `arguments` would keep a stale snapshot alive past its refresh.
+    this.command = {
+      command: "nexus.networkServer.quickAdjust",
+      title: "Quick Settings",
+      arguments: [kind]
+    };
   }
 }
 

@@ -30,6 +30,22 @@ export function computePoolSize(rangeStart: string, rangeEnd: string): number {
 }
 
 /**
+ * Last address of a pool of `count` addresses starting at `rangeStart` — the
+ * inverse of {@link computePoolSize}, used by the editors that ask for a pool
+ * size instead of an end address. The setting itself is still `rangeEnd`.
+ *
+ * @returns Dotted-quad end address, or `''` when the start does not parse, the
+ *   count is not a positive integer, or the pool runs off the IPv4 space.
+ */
+export function computeRangeEnd(rangeStart: string, count: number): string {
+  const start = ipToInt(rangeStart) >>> 0;
+  if (start === 0 || !Number.isInteger(count) || count < 1) return '';
+  const end = start + count - 1;
+  if (end > 0xffffffff) return '';
+  return intToIp(end);
+}
+
+/**
  * Calculates the broadcast address from the gateway and netmask
  * (`broadcast = (gateway & mask) | ~mask`).
  *

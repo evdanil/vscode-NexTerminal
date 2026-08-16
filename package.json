@@ -530,7 +530,7 @@
         "command": "nexus.networkServer.start",
         "title": "Start Service",
         "category": "Nexus Network Server",
-        "icon": "$(debug-start)"
+        "icon": "$(play)"
       },
       {
         "command": "nexus.networkServer.stop",
@@ -545,10 +545,16 @@
         "icon": "$(sync)"
       },
       {
-        "command": "nexus.networkServer.edit",
-        "title": "Edit Settings",
+        "command": "nexus.networkServer.quickAdjust",
+        "title": "Quick Settings",
         "category": "Nexus Network Server",
-        "icon": "$(edit)"
+        "icon": "$(gear)"
+      },
+      {
+        "command": "nexus.networkServer.edit",
+        "title": "Open Full Settings",
+        "category": "Nexus Network Server",
+        "icon": "$(gear)"
       },
       {
         "command": "nexus.networkServer.inspectLogs",
@@ -1060,6 +1066,11 @@
           "command": "nexus.inventory.syncNow",
           "when": "view == nexusCommandCenter",
           "group": "1_manage@4"
+        },
+        {
+          "command": "nexus.networkServer.edit",
+          "when": "view == nexusNetworkServers",
+          "group": "navigation@1"
         },
         {
           "command": "nexus.tunnel.add",
@@ -1619,7 +1630,7 @@
           "group": "inline@2"
         },
         {
-          "command": "nexus.networkServer.edit",
+          "command": "nexus.networkServer.quickAdjust",
           "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
           "group": "inline@3"
         },
@@ -1644,9 +1655,14 @@
           "group": "1_terminal@1"
         },
         {
-          "command": "nexus.networkServer.edit",
+          "command": "nexus.networkServer.quickAdjust",
           "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
           "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.networkServer.edit",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "1_manage@2"
         },
         {
           "command": "nexus.tunnel.start",
@@ -2171,6 +2187,10 @@
         {
           "command": "nexus.networkServer.restart",
           "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.quickAdjust",
+          "when": "true"
         },
         {
           "command": "nexus.networkServer.edit",
