@@ -222,6 +222,34 @@ export interface ServerOrigin {
    */
   syncedAltHost?: string;
   /**
+   * TELNET (Phase 0) — the transport the sync itself last WROTE into
+   * `ServerConfig.protocol`: `"telnet"` when this device's primary endpoint was
+   * a telnet one as of that write, and `undefined` when it was SSH (which is
+   * also what `protocol` itself stores for SSH — the stamp mirrors the value,
+   * exactly as `syncedAltHost` mirrors `altHost`).
+   *
+   * A FAITHFUL TWIN of `syncedAltHost` above, with ONE difference that follows
+   * from the field being a two-valued enum rather than a free address: absent
+   * here is NOT "hands off". Both the stamp and the field are compared through
+   * their RESOLVED value (absent ≡ `"ssh"`), so a record synced by a build from
+   * before this stamp existed reads as "the sync wrote ssh" — which is exactly
+   * what happened, since no earlier build could map anything but an ssh
+   * endpoint. That is the one asymmetry against `syncedIpmiHost`, and it exists
+   * because there IS a meaningful default to fall back to here and there is no
+   * such thing as a legacy hand-typed protocol.
+   *
+   * The write rule and its matrix are `syncOwnsProtocol` in the sync engine.
+   * What it buys: a user who switches a synced dual-stack device to telnet by
+   * hand keeps that choice forever, and a device that genuinely loses its SSH
+   * endpoint still follows.
+   *
+   * Written ONLY where the sync writes `protocol` — the add path always
+   * (`undefined` included), the update path only when the write rule fires —
+   * and never inferred from the record's current value, which would launder a
+   * hand-flip into "as stamped" one sync later.
+   */
+  syncedProtocol?: ServerProtocol;
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — per-field record of what the sync's
    * TEMPLATE APPLICATION last wrote onto this server, one member per
    * non-auth templatable field. Same `syncedUsername`/`syncedAuthProfileId`
@@ -438,6 +466,19 @@ export interface DetachedServerOrigin {
    * when something else is deleted.
    */
   syncedAltHost?: string;
+  /**
+   * TELNET (Phase 0) — the transport the REMOVED SOURCE'S SYNC had last written
+   * into `protocol` on this server, copied verbatim from the server's own
+   * `ServerOrigin.syncedProtocol` at detach time, and `undefined` when that sync
+   * had written SSH (which is what the field stores for SSH).
+   *
+   * NOT a matching input, exactly like the two receipts above it: it decides
+   * nothing about adoption. It is preserved so an adopted server's protocol
+   * arrives with its provenance intact — dropped, a sync-written `"telnet"`
+   * would look hand-flipped after a Remove Source → Keep Servers → re-add →
+   * Adopt round trip, and no later sync could move it again.
+   */
+  syncedProtocol?: ServerProtocol;
   /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — the per-field record of what the
    * REMOVED SOURCE'S TEMPLATE APPLICATION last wrote onto this server's
@@ -826,6 +867,12 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // permanently stampless, read as a hand entry by every later sync and never
     // updated when the second address changes.
     a.syncedAltHost === b.syncedAltHost &&
+    // TELNET (Phase 0) — the protocol stamp joins for the same reason the two
+    // above it do, and AUTH 3a's shape reaches it identically: a legacy owned
+    // server whose protocol already equals the device's computes this stamp for
+    // the first time and changes nothing else, and an `after` discarded as
+    // "unchanged" there would throw the new stamp away.
+    a.syncedProtocol === b.syncedProtocol &&
     // DEVICE TEMPLATES (PR-T1) — the per-field template stamps join for the
     // same reason: a template application whose value already equals the
     // record must still land in `updates` to persist the stamp (AUTH 3a's
@@ -905,6 +952,12 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // adopted server's second address would be back to looking hand-typed, which
     // no later sync can repair.
     a.syncedAltHost === b.syncedAltHost &&
+    // TELNET (Phase 0) — compared one field down for the identical reason: a
+    // rollback that called two markers equal while one remembers the transport
+    // the removed source wrote and the other does not would restore the
+    // forgetful one, and the adopted server's protocol would be back to looking
+    // hand-flipped, which no later sync can repair.
+    a.syncedProtocol === b.syncedProtocol &&
     // DEVICE TEMPLATES (issue #48 PR-T1) — the template receipt joins for the
     // identical reason `syncedAuthProfileId` and `syncedIpmiHost` above it did:
     // a rollback that called two markers equal while one remembers the non-auth

@@ -1,6 +1,6 @@
-import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin } from "../../models/config";
+import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin, ServerProtocol } from "../../models/config";
 import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual, templatedHasAnyStamp } from "../../models/config";
-import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../models/inventory";
+import type { InventoryDevice, InventoryEndpoint, InventorySourceConfig, InventoryTree } from "../../models/inventory";
 import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
@@ -292,6 +292,73 @@ function selectAltEndpoint(device: InventoryDevice) {
  * `host:port` suffix, but only as a HAND-ENTERED shape — nothing on this path
  * ever produces one.)
  */
+/**
+ * TELNET (Phase 0) — selects the endpoint the sync maps to a server's TELNET
+ * address: the FIRST endpoint with kind "telnet" and a non-empty host.
+ */
+function selectTelnetEndpoint(device: InventoryDevice) {
+  return device.endpoints.find((e) => e.kind === "telnet" && e.host.length > 0);
+}
+
+/**
+ * TELNET (Phase 0) — the endpoint that becomes `host`/`port`, plus the protocol
+ * that goes with it.
+ *
+ * SSH WINS, whatever order the endpoints are listed in (models/inventory.ts
+ * states the convention and why): a device offering both is mapped as SSH — the
+ * protocol with authentication, file transfer and tunnelling — and its telnet
+ * endpoint is left unused. `undefined` when the device offers neither, which is
+ * the "no usable endpoint" skip.
+ *
+ * The protocol is returned in the SHAPE `ServerConfig.protocol` stores, i.e.
+ * `undefined` for SSH rather than `"ssh"`, so the value and its stamp can be
+ * written verbatim without a translation step in between.
+ */
+function selectPrimaryEndpoint(
+  device: InventoryDevice
+): { endpoint: InventoryEndpoint; protocol: ServerProtocol | undefined; defaultPort: number } | undefined {
+  const ssh = selectSshEndpoint(device);
+  if (ssh) {
+    return { endpoint: ssh, protocol: undefined, defaultPort: 22 };
+  }
+  const telnet = selectTelnetEndpoint(device);
+  if (telnet) {
+    return { endpoint: telnet, protocol: "telnet", defaultPort: 23 };
+  }
+  return undefined;
+}
+
+/**
+ * TELNET (Phase 0) — may this sync WRITE `ServerConfig.protocol` on an existing
+ * owned server? A FAITHFUL TWIN of `syncOwnsIpmiHost` / `syncOwnsAltHost`:
+ * governed by the SAME matrix documented on the first of them, read with
+ * `cur` = the record's resolved protocol, `stamp` = `origin.syncedProtocol`
+ * resolved the same way, and `dev` = the protocol this fetch's primary endpoint
+ * implies.
+ *
+ * THE ONE DEVIATION, and it is the whole reason this is a separate function
+ * rather than a call to either of those: all three values are compared through
+ * their RESOLVED form (absent ≡ `"ssh"`), because `protocol` is a two-valued
+ * enum whose absent state is a real value rather than "unset". Rows 1 and 5 of
+ * that matrix — "never configured" and "a legacy hand entry" — therefore do not
+ * exist here: there is no way to have no protocol, and no build before this one
+ * could write anything but SSH, so an absent stamp on an SSH record reads as
+ * "the sync wrote ssh", which is exactly what happened.
+ *
+ * What survives unchanged is the part that matters: row 3 (still exactly what
+ * the sync put there ⇒ follow the device), row 4 (a hand flip ⇒ leave alone,
+ * carry the stamp forward verbatim, never launder it), and row 5a (the record
+ * already agrees with the device ⇒ stamp only, no value change).
+ */
+function syncOwnsProtocol(
+  current: ServerProtocol | undefined,
+  stamp: ServerProtocol | undefined,
+  dev: ServerProtocol | undefined
+): boolean {
+  const cur = current === "telnet" ? "telnet" : "ssh";
+  return cur === (stamp === "telnet" ? "telnet" : "ssh") || cur === (dev === "telnet" ? "telnet" : "ssh");
+}
+
 function selectManagementEndpoint(device: InventoryDevice) {
   return device.endpoints.find((e) => (e.kind === "redfish" || e.kind === "ipmi-sol") && e.host.length > 0);
 }
@@ -1033,16 +1100,20 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     seenExternalIds.set(device.externalId, device.name);
 
-    const endpoint = selectSshEndpoint(device);
-    if (!endpoint) {
+    // TELNET (Phase 0) — ssh endpoint if the device has one, else its telnet
+    // endpoint (see `selectPrimaryEndpoint` for why ssh always wins).
+    const primary = selectPrimaryEndpoint(device);
+    if (!primary) {
       if (isOwned) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has no usable SSH endpoint and was skipped.`);
+        warnings.push(`Device "${device.name}" (${device.externalId}) has no usable SSH or telnet endpoint and was skipped.`);
       } else {
         noEndpointSkipped.push(device.name);
       }
       continue;
     }
-    const port = endpoint.port ?? 22;
+    const endpoint = primary.endpoint;
+    const deviceProtocol = primary.protocol;
+    const port = endpoint.port ?? primary.defaultPort;
     if (!isValidPort(port)) {
       if (isOwned) {
         warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid port ${port} and was skipped.`);
@@ -1240,6 +1311,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // rebuild. See `syncOwnsAltHost` for the write rule and the whole matrix.
       const takesAltHost =
         altHost !== undefined && syncOwnsAltHost(ownedServer.altHost, ownedServer.origin?.syncedAltHost, altHost);
+      // TELNET (Phase 0) — the twin decision for `protocol`, decided HERE for
+      // the same reason the two above it are: its stamp goes INTO the origin
+      // literal below, which the retro-apply / rollback branches rebuild. No
+      // `!== undefined` guard: unlike an address, the device ALWAYS implies a
+      // protocol (its primary endpoint is what was just selected), so matrix
+      // row 6 — "the device supplies none" — has no counterpart here.
+      const takesProtocol = syncOwnsProtocol(
+        ownedServer.protocol,
+        ownedServer.origin?.syncedProtocol,
+        deviceProtocol
+      );
       // DEVICE TEMPLATES (PR-T1) — the §4.3 matrix for the four non-auth fields.
       // `templateMatrix.templated` is the carried-forward stamp record with the
       // written fields updated (the one-line `templated:` carry-forward
@@ -1353,6 +1435,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // carry-forward is load-bearing for the reason `syncedIpmiHost`'s is: an
         // update fired for an unrelated reason rebuilds this literal from scratch.
         syncedAltHost: takesAltHost ? altHost : ownedServer.origin?.syncedAltHost,
+        // TELNET (Phase 0) — the same "records what the sync wrote" discipline
+        // one field down: refreshed exactly where this sync writes `protocol`,
+        // and otherwise carried forward VERBATIM — including as `undefined`,
+        // which is what keeps a hand-flip to telnet hand-owned. Laundering the
+        // record's current value into the stamp here would let the sync AFTER
+        // this one overwrite the user's choice.
+        syncedProtocol: takesProtocol ? deviceProtocol : ownedServer.origin?.syncedProtocol,
         // DEVICE TEMPLATES (PR-T1) — the per-field template stamps, carried
         // forward with this run's writes already folded in by the matrix above.
         // The one-line carry-forward the whole feature turns on (§5.2 / fixture
@@ -1391,6 +1480,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // spread preserves the value on the rows this must not touch.
       if (takesAltHost) {
         after.altHost = altHost;
+      }
+      // TELNET (Phase 0) — the value half of the decision stamped above, on
+      // exactly the rows `syncOwnsProtocol` answers yes for, so the record and
+      // its stamp can never disagree about who owns the field. A conditional
+      // assignment (not a member of the literal) so the `...ownedServer` spread
+      // preserves a hand-flipped protocol on the rows this must not touch.
+      if (takesProtocol) {
+        after.protocol = deviceProtocol;
       }
 
       // AUTH 2 — retro-apply. The single exception to the field-ownership rule
@@ -1719,6 +1816,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // reason `ipmiHost` does (rows 1 and 3, the plainly-visible change); the
         // stamp-only row 5a rides in on the `serverOriginStampsEqual` line below.
         ownedServer.altHost !== after.altHost ||
+        // TELNET (Phase 0) — joins the value half for the same reason `altHost`
+        // does: a device that changed transport moves this field and nothing
+        // else, and a `changed` check that skipped it would compute the write,
+        // discard the update as "unchanged", and leave the record pointing at a
+        // protocol the device no longer offers. The stamp-only row rides in on
+        // the `serverOriginStampsEqual` line below.
+        ownedServer.protocol !== after.protocol ||
         !proxyConfigsEqual(ownedServer.proxy, after.proxy) ||
         ownedServer.multiplexing !== after.multiplexing ||
         ownedServer.legacyAlgorithms !== after.legacyAlgorithms ||
@@ -2001,6 +2105,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesAltHost =
           altHost !== undefined &&
           syncOwnsAltHost(adoptee.altHost, adoptee.formerlySynced?.syncedAltHost, altHost);
+        // TELNET (Phase 0) — the twin decision on an adoptee, with the same
+        // substitution: `DetachedServerOrigin.syncedProtocol` stands in for the
+        // origin stamp on a record this sync did not create. No `!== undefined`
+        // guard — the device always implies a protocol.
+        const takesProtocol = syncOwnsProtocol(
+          adoptee.protocol,
+          adoptee.formerlySynced?.syncedProtocol,
+          deviceProtocol
+        );
         // FIX 1 (PR #61 Codex review) — APPLY THE TEMPLATE MATRIX ON ADOPTION,
         // mirroring the update path (~1071). An adopted server is OWNED from this
         // point (the same principle the `endpoint.username` and OOB writes below
@@ -2157,6 +2270,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // alternate hands-off (matrix row 5). A marker carrying none is
           // bit-identical to a server the sync never wrote a second address on.
           syncedAltHost: takesAltHost ? altHost : adoptee.formerlySynced?.syncedAltHost,
+          // TELNET (Phase 0) — the same discipline one field down: written from
+          // this fetch's protocol exactly where THIS sync writes `protocol`, and
+          // otherwise the marker's receipt RESTORED VERBATIM, which is what
+          // keeps a protocol the user flipped before the detach hand-owned.
+          syncedProtocol: takesProtocol ? deviceProtocol : adoptee.formerlySynced?.syncedProtocol,
           // FIX 1 — the per-field template stamps for the non-auth fields the
           // matrix above wrote onto this adoptee, folded into the origin literal
           // so the auth-branch rebuild (`{ ...adoptionOrigin, syncedAuthProfileId }`)
@@ -2232,6 +2350,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // spread preserves the value on the rows this must not touch.
         if (takesAltHost) {
           after.altHost = altHost;
+        }
+        // TELNET (Phase 0) — the value half of the protocol decision stamped
+        // above, on exactly the rows `syncOwnsProtocol` answers yes for.
+        if (takesProtocol) {
+          after.protocol = deviceProtocol;
         }
         // AUTH 2 on an adoptee, deliberately allowed. Blocking it for one sync
         // would only move the same disclosed switch to the next run — the server
@@ -2536,6 +2659,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // offers is the starting value, and the `syncedAltHost` stamp below records
       // it so every LATER sync has the ownership question already answered.
       altHost,
+      // TELNET (Phase 0) — the transport this fetch's primary endpoint implies
+      // (`undefined` for ssh, which is what the field stores). A fresh record
+      // has nothing to protect, so there is no matrix here: whatever the device
+      // says is what the field starts as, and the stamp below records it so
+      // every LATER sync has the ownership question already answered.
+      protocol: deviceProtocol,
       // `syncedUsername` mirrors the `username` two lines above, and
       // `syncedAuthProfileId` mirrors the `authProfileId` above it — the values
       // this sync is writing onto the record, which is what makes a later
@@ -2579,6 +2708,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // matrix row 1 (fill it in), which is the right state for a server the
         // user has never typed a second address into.
         syncedAltHost: altHost,
+        // TELNET (Phase 0) — mirrors the `protocol` written above, recorded
+        // UNCONDITIONALLY (`undefined`, i.e. ssh, included) on the same "a
+        // source whose devices change transport later must find the stamp
+        // already there" argument. A record born with value and stamp agreeing
+        // is the state the write rule can act on; one born stampless would read
+        // as ssh whatever the device said.
+        syncedProtocol: deviceProtocol,
         // DEVICE TEMPLATES (PR-T1) — the template stamps for the non-auth fields
         // written above (row 1), so every LATER sync has the ownership question
         // already answered. Absent when the template set none of them.
@@ -2783,7 +2919,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     );
   }
 
-  pushSkipSummary(warnings, "had no usable SSH endpoint", noEndpointSkipped);
+  pushSkipSummary(warnings, "had no usable SSH or telnet endpoint", noEndpointSkipped);
   pushSkipSummary(warnings, "had an empty name", emptyNameSkipped);
   pushSkipSummary(warnings, "had an invalid port", invalidPortSkipped);
 

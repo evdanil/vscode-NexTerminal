@@ -134,7 +134,12 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     // with an empty host is never selected), and the server form stores a cleared
     // alternate host as `undefined`, so an empty string could not have come from
     // either — only a hand-edited backup or a version-skewed row.
-    isOptionalNonEmptyString(obj.syncedAltHost)
+    isOptionalNonEmptyString(obj.syncedAltHost) &&
+    // TELNET (Phase 0) — the two `ServerConfig.protocol` literals, or absent.
+    // `"ssh"` is accepted even though the sync only ever writes `undefined` for
+    // it: the two are the same statement, and rejecting a record over a
+    // synonym would cost it its sync ownership for nothing.
+    (obj.syncedProtocol === undefined || obj.syncedProtocol === "ssh" || obj.syncedProtocol === "telnet")
   );
 }
 
@@ -228,6 +233,12 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
   // non-empty string — restored into a real origin at adoption where the write
   // rule compares it against the record's own field.
   if (obj.syncedAltHost !== undefined && !isNonEmptyString(obj.syncedAltHost)) {
+    return false;
+  }
+  // TELNET (Phase 0) — the same closed-enum check `isValidServerOrigin` makes of
+  // the origin stamp this receipt mirrors; restored into a real origin at
+  // adoption, where the write rule compares it against the record's own field.
+  if (obj.syncedProtocol !== undefined && obj.syncedProtocol !== "ssh" && obj.syncedProtocol !== "telnet") {
     return false;
   }
   if (obj.templated !== undefined && !isValidTemplatedStamps(obj.templated)) {

@@ -109,6 +109,20 @@ describe("isValidDetachedServerOrigin", () => {
     ).toBe(true);
   });
 
+  // TELNET (Phase 0) — the transport receipt. A CLOSED ENUM, like the field it
+  // mirrors: it is restored into a real origin at adoption, where
+  // `syncOwnsProtocol` compares it against the record's own `protocol`, and a
+  // third value there would resolve to "ssh" on one side of the comparison and
+  // to itself on the other.
+  it("accepts an absent or well-formed syncedProtocol and rejects anything else", () => {
+    expect(isValidDetachedServerOrigin(valid)).toBe(true);
+    expect(isValidDetachedServerOrigin({ ...valid, syncedProtocol: "telnet" })).toBe(true);
+    expect(isValidDetachedServerOrigin({ ...valid, syncedProtocol: "ssh" })).toBe(true);
+    expect(isValidDetachedServerOrigin({ ...valid, syncedProtocol: "TELNET" })).toBe(false);
+    expect(isValidDetachedServerOrigin({ ...valid, syncedProtocol: "" })).toBe(false);
+    expect(isValidDetachedServerOrigin({ ...valid, syncedProtocol: 1 })).toBe(false);
+  });
+
   it("does not mutate the value it is asked to check", () => {
     const subject = { ...valid };
     const snapshot = JSON.stringify(subject);

@@ -45,7 +45,7 @@ import {
   serverConfigsEqual
 } from "../../src/models/config";
 import type { ServerConfig } from "../../src/models/config";
-import { validateServerConfig } from "../../src/utils/validation";
+import { isValidServerOrigin, validateServerConfig } from "../../src/utils/validation";
 import { serverFormDefinition, unifiedProfileFormDefinition } from "../../src/ui/formDefinitions";
 import { formValuesToServer } from "../../src/commands/serverCommands";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhenCondition } from "../../src/ui/formTypes";
@@ -266,5 +266,21 @@ describe("unified add form — Protocol field", () => {
         { field: "protocol", value: "ssh" }
       ])
     );
+  });
+});
+
+describe("isValidServerOrigin — syncedProtocol stamp", () => {
+  const valid = { sourceId: "src-1", externalId: "device:1", syncedAt: 1 };
+
+  // ⊘ A guard that skipped the new member lets a hand-edited backup carry a
+  // third value into `syncOwnsProtocol`, where it resolves to "ssh" on one side
+  // of the comparison and to itself on the other.
+  it("accepts absent and both literals, rejects anything else", () => {
+    expect(isValidServerOrigin(valid)).toBe(true);
+    expect(isValidServerOrigin({ ...valid, syncedProtocol: "telnet" })).toBe(true);
+    expect(isValidServerOrigin({ ...valid, syncedProtocol: "ssh" })).toBe(true);
+    expect(isValidServerOrigin({ ...valid, syncedProtocol: "TELNET" })).toBe(false);
+    expect(isValidServerOrigin({ ...valid, syncedProtocol: "" })).toBe(false);
+    expect(isValidServerOrigin({ ...valid, syncedProtocol: 1 })).toBe(false);
   });
 });
