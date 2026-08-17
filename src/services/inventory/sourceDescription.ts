@@ -24,15 +24,47 @@ export function formatLastSync(source: Pick<InventorySourceConfig, "lastSyncAt">
 }
 
 /**
- * `{provider label} — {last sync}`. The label falls back to the RAW
- * `providerId` when the registry cannot resolve it: a source whose provider
- * extension is not installed (or has been disabled) must still be visible and
- * removable, and the id is the only honest thing left to call it.
+ * P2-1 — the ABSOLUTE last-sync stamp for a surface that does NOT re-render on
+ * a timer or on every core event. The Settings tree's refresh is gated on the
+ * source record changing (MINOR-8), so a RELATIVE label there would freeze at
+ * whatever age it first rendered ("synced just now" forever). This form is a
+ * pure function of `lastSyncAt` — it takes no `now`, so the same record renders
+ * the same string whenever the row is (re)built, and the only thing that moves
+ * it is a real sync bumping `lastSyncAt`.
+ *
+ * Local `YYYY-MM-DD HH:MM` — compact, unambiguous, and free of the "N ago"
+ * vocabulary a suppressed refresh would strand.
+ */
+export function formatLastSyncAbsolute(source: Pick<InventorySourceConfig, "lastSyncAt">): string {
+  if (!source.lastSyncAt) return "never synced";
+  const d = new Date(source.lastSyncAt);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `synced ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** The provider label, or the raw providerId when the registry cannot resolve it (extension missing/disabled — the source must stay visible and removable). */
+function providerLabelOf(providerId: string, registry: Pick<InventoryProviderRegistry, "get"> | undefined): string {
+  return registry?.get(providerId)?.label ?? providerId;
+}
+
+/**
+ * `{provider label} — {relative last sync}`, for a surface that re-renders while
+ * visible (the Manage Inventory Sources panel's `refreshWhileVisible`).
  */
 export function sourceDescription(
   source: Pick<InventorySourceConfig, "providerId" | "lastSyncAt">,
   registry: Pick<InventoryProviderRegistry, "get"> | undefined
 ): string {
-  const providerLabel = registry?.get(source.providerId)?.label ?? source.providerId;
-  return `${providerLabel} — ${formatLastSync(source)}`;
+  return `${providerLabelOf(source.providerId, registry)} — ${formatLastSync(source)}`;
+}
+
+/**
+ * `{provider label} — {absolute last sync}`, for a surface whose refresh is
+ * gated on the record changing (the Settings tree — see `formatLastSyncAbsolute`).
+ */
+export function sourceDescriptionAbsolute(
+  source: Pick<InventorySourceConfig, "providerId" | "lastSyncAt">,
+  registry: Pick<InventoryProviderRegistry, "get"> | undefined
+): string {
+  return `${providerLabelOf(source.providerId, registry)} — ${formatLastSyncAbsolute(source)}`;
 }

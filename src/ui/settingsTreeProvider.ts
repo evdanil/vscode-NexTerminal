@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
-import { sourceDescription } from "../services/inventory/sourceDescription";
+import { sourceDescriptionAbsolute } from "../services/inventory/sourceDescription";
 import {
   SETTINGS_META,
   CATEGORY_ORDER,
@@ -308,7 +308,7 @@ export class SettingsTreeProvider
   private getInventorySourceItems(): SettingsTreeItem[] {
     const sources = this.core?.getSnapshot().inventorySources ?? [];
     const items: SettingsTreeItem[] = sources.map(
-      (source) => new InventorySourceItem(source.id, source.name, sourceDescription(source, this.providerRegistry))
+      (source) => new InventorySourceItem(source.id, source.name, sourceDescriptionAbsolute(source, this.providerRegistry))
     );
     // Always last, always present — including when the list above is empty.
     items.push(

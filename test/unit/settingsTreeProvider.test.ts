@@ -395,17 +395,44 @@ describe("SettingsTreeProvider", () => {
       expect(children[0].label).toBe("Add Inventory Source\u2026");
     });
 
-    it("describes a row as \"{provider label} \u2014 {last sync}\", resolving the label through the registry", () => {
+    it("describes a row as \"{provider label} \u2014 {absolute last sync}\", resolving the label through the registry", () => {
       const children = groupChildren(
         providerWithSources([
           { id: "s1", providerId: "eve-ng", name: "Lab", lastSyncAt: Date.now() - 3 * 60 * 60_000 },
           { id: "s2", providerId: "netbox", name: "Prod" }
         ])
       );
-      expect((children[0] as InventorySourceItem).description).toBe("EVE-NG \u2014 synced 3h ago");
+      // P2-1 \u2014 the row shows an ABSOLUTE timestamp, not a relative age, so it
+      // never freezes at a stale "synced Nh ago" (MINOR-8 suppresses the
+      // core-event refresh that a relative label would need).
+      expect((children[0] as InventorySourceItem).description).toMatch(/^EVE-NG \u2014 synced \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
       // \u2298 A row that omits the never-synced case reads as a source that
       // is up to date, which is the opposite of what it is.
       expect((children[1] as InventorySourceItem).description).toBe("NetBox \u2014 never synced");
+    });
+
+    /**
+     * P2-1 \u2014 the label must NOT drift as wall-clock time advances. MINOR-8's
+     * signature-gated refresh fires only when a source record changes, so a
+     * relative "synced Nh ago" would freeze at whatever it first rendered.
+     */
+    it("keeps the last-sync label stable as the clock advances (\u2298 a relative 'synced Nh ago' reads 'just now' at render and never updates, because no refresh fires until the source next changes)", () => {
+      vi.useFakeTimers();
+      try {
+        const syncedAt = new Date("2026-08-17T04:00:00Z").getTime();
+        const sources: FakeSource[] = [{ id: "s1", providerId: "eve-ng", name: "Lab", lastSyncAt: syncedAt }];
+
+        vi.setSystemTime(syncedAt);
+        const atSync = (groupChildren(providerWithSources(sources))[0] as InventorySourceItem).description;
+
+        vi.setSystemTime(syncedAt + 10 * 60 * 60_000);
+        const tenHoursLater = (groupChildren(providerWithSources(sources))[0] as InventorySourceItem).description;
+
+        expect(atSync).toBe(tenHoursLater);
+        expect(atSync).not.toMatch(/ago|just now/);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("falls back to the raw providerId when the registry cannot resolve it \u2014 a source whose provider extension is not installed still has to be visible and removable", () => {
