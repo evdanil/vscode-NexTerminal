@@ -1327,6 +1327,71 @@ describe("createEveNgProvider — crawl deadline (task #30)", () => {
       restore();
     }
   });
+
+  // The 120s budget and the 20s per-request ceiling are module-private consts;
+  // mirror them here so the intent is legible.
+  const DEADLINE_MS = 120_000;
+  const PER_REQUEST_MS = 20_000;
+
+  it("#84 P2-2 — bounds each request's timeout by the REMAINING deadline budget (⊘ a fixed 20s per-request timeout lets a request issued near the 120s deadline still run the full 20s past it, and a 401 re-login adds another)", async () => {
+    let clock = 1_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    try {
+      // login lands 10s before the deadline, so the post-login folder request has
+      // only ~10s of budget left — less than the 20s ceiling.
+      const world: World = { folders: { "/": { labs: [] } } };
+      const { fetchImpl } = makeWorld(world);
+      const wrapped = (async (input: string, init?: RequestInit) => {
+        const path = decodeURIComponent(new URL(input).pathname);
+        if (path === "/api/auth/login") {
+          clock += DEADLINE_MS - 10_000;
+        }
+        return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+      }) as unknown as typeof fetch;
+      await createEveNgProvider(wrapped).fetchStatus!(CONFIG, SECRETS);
+      // At least one request (the post-login folder listing) was bounded BELOW the
+      // 20s ceiling — capped by the ~10s of remaining deadline budget.
+      expect(timeoutSpy.mock.calls.some(([ms]) => (ms as number) < PER_REQUEST_MS)).toBe(true);
+      // ...and none exceeded the ceiling either.
+      expect(timeoutSpy.mock.calls.every(([ms]) => (ms as number) <= PER_REQUEST_MS)).toBe(true);
+    } finally {
+      nowSpy.mockRestore();
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it("#84 P2-2 — does NOT re-login+retry on a 401 that arrives PAST the deadline (⊘ the single silent re-login adds another full request past the deadline, overrunning it)", async () => {
+    let clock = 1_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      let loginCount = 0;
+      const world: World = { folders: { "/": { labs: [] } } };
+      const { fetchImpl } = makeWorld(world);
+      const wrapped = (async (input: string, init?: RequestInit) => {
+        const path = decodeURIComponent(new URL(input).pathname);
+        if (path === "/api/auth/login") {
+          loginCount++;
+          return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+        }
+        if (path.startsWith("/api/folders")) {
+          // The request is issued before the deadline, but the server is slow: the
+          // response lands PAST the deadline, and it is a session-expiry 401.
+          clock += DEADLINE_MS + 10_000;
+          return makeResponse(401, "session expired");
+        }
+        return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+      }) as unknown as typeof fetch;
+      await createEveNgProvider(wrapped)
+        .fetchStatus!(CONFIG, SECRETS)
+        .catch(() => undefined);
+      // Only the INITIAL login — the 401 arrived past the deadline, so the silent
+      // re-login+retry is skipped rather than overrunning the budget.
+      expect(loginCount).toBe(1);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
 });
 
 describe("createEveNgProvider — error mapping", () => {

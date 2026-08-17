@@ -326,6 +326,12 @@ const NOT_FOUND = Symbol("eve-ng-not-found");
 
 class EveApiClient {
   private session?: string;
+  // WALL-CLOCK DEADLINE (task #30, #84 P2-2) — the crawl's shared deadline, set
+  // once per crawl. When present, every request's timeout is bounded by the
+  // REMAINING budget (never past it), and the silent re-login on a 401 is skipped
+  // once the deadline has passed. Absent for the non-crawl paths (testConnection),
+  // which keep their own fixed timeouts.
+  private crawlDeadline?: number;
 
   public constructor(
     private readonly fetchImpl: typeof fetch,
@@ -333,6 +339,11 @@ class EveApiClient {
     private readonly username: string,
     private readonly password: string
   ) {}
+
+  /** WALL-CLOCK DEADLINE (#84 P2-2) — arm the shared per-crawl deadline. */
+  public setCrawlDeadline(deadline: number): void {
+    this.crawlDeadline = deadline;
+  }
 
   /**
    * The host requests fall back to when EVE-NG reports a console on loopback.
@@ -368,13 +379,23 @@ class EveApiClient {
 
   private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string }> {
     let res: Response;
+    // WALL-CLOCK DEADLINE (#84 P2-2) — cap this request's timeout by the REMAINING
+    // crawl budget, so a request issued just before the deadline (or a re-login
+    // retry) can never run the full `timeoutMs` past it. The per-request
+    // `timeoutMs` stays the ceiling when the deadline is far off (or absent, for
+    // testConnection). The between-request checks trip the deadline before issuing
+    // when the budget is already spent, so a >0 floor here is the near-boundary case.
+    const effectiveTimeout =
+      this.crawlDeadline !== undefined
+        ? Math.min(timeoutMs, Math.max(0, this.crawlDeadline - Date.now()))
+        : timeoutMs;
     try {
       // MINOR-5 — `redirect: "manual"` on every request. No EVE-NG endpoint
       // legitimately redirects; the default `"follow"` would let a 3xx from the
       // lab box carry the crawl (and, on 307/308, the login POST body — the
       // password) to another origin. A 3xx surfaces below as a non-2xx protocol
       // error instead.
-      res = await this.fetchImpl(url.toString(), { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+      res = await this.fetchImpl(url.toString(), { ...init, redirect: "manual", signal: AbortSignal.timeout(effectiveTimeout) });
     } catch (err) {
       throw mapNetworkError(err, url);
     }
@@ -452,6 +473,15 @@ class EveApiClient {
 
     let { res, text } = await send();
     if (res.status === 401 || res.status === 403) {
+      // WALL-CLOCK DEADLINE (#84 P2-2) — the silent re-login is TWO more requests
+      // (login + retry). Once the crawl deadline has passed, skip it and surface
+      // the 401: retrying would run the crawl a full re-login+retry past the
+      // budget for a session that expired at the tail of an already-overlong
+      // crawl. (When the deadline is merely NEAR, the retry still runs but each of
+      // its requests is bounded by the remaining budget in `raw` above.)
+      if (this.crawlDeadline !== undefined && Date.now() >= this.crawlDeadline) {
+        return { status: res.status, text, url };
+      }
       await this.login(timeoutMs);
       ({ res, text } = await send());
     }
@@ -1054,6 +1084,7 @@ async function fetchInventoryImpl(
   // WALL-CLOCK DEADLINE (task #30) — one budget for the whole crawl, computed
   // before the folder walk and reused in the node-fetch loop below.
   const deadline = Date.now() + CRAWL_DEADLINE_MS;
+  client.setCrawlDeadline(deadline); // #84 P2-2 — bound every crawl request by the remaining budget
   await client.login(FETCH_TIMEOUT_MS);
 
   if ((await client.detectEdition(FETCH_TIMEOUT_MS)) === "pro") {
@@ -1162,6 +1193,7 @@ async function fetchStatusImpl(
   // WALL-CLOCK DEADLINE (task #30) — one budget for the whole crawl, shared with
   // the node-fetch loop below, exactly as fetchInventory does.
   const deadline = Date.now() + CRAWL_DEADLINE_MS;
+  client.setCrawlDeadline(deadline); // #84 P2-2 — bound every crawl request by the remaining budget
   await client.login(FETCH_TIMEOUT_MS);
   const walk = await client.walkFolders(root, (labPath) => !filter || labPath.toLowerCase().includes(filter), FETCH_TIMEOUT_MS, deadline);
 
