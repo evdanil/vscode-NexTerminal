@@ -1310,3 +1310,72 @@ describe("ServerTreeItem EVE node-control contextValue marker", () => {
     );
   });
 });
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — P2 review finding. The direct-constructor
+ * tests above pin the marker COMPOSITION but never exercise the SNAPSHOT WIRING
+ * that decides `isEveOrigin`: the resolution `snapshot.inventorySources` →
+ * `providerId === "eve-ng"` → constructor arg lives in `toServerItem`, and
+ * without a `getChildren`/`toServerItem` end-to-end test it is entirely
+ * unpinned. These tests drive the provider from a real snapshot so the following
+ * feature-killing mutations each DIE here:
+ *   - `isEveOrigin = false` (marker never emitted → Start/Stop dead in the UI),
+ *   - `isEveOrigin = originSource !== undefined` (any synced origin, e.g. NetBox,
+ *     lights up node control it does not support),
+ *   - the `"eve-ng"` literal typo'd (e.g. `"eveng"`) → never matches a real source,
+ *   - the `isEveOrigin` constructor arg at the ServerTreeItem call dropped
+ *     (defaults to false) → marker never reaches the item.
+ */
+describe("NexusTreeProvider EVE node-control marker — end-to-end snapshot wiring", () => {
+  function providerWith(
+    servers: ServerConfig[],
+    inventorySources: Array<{ id: string; providerId: string; name: string }>,
+    serverStatus: Map<string, "running" | "stopped">
+  ): NexusTreeProvider {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers,
+      inventorySources: inventorySources.map((s) => ({
+        ...s,
+        targetFolder: "",
+        prunePolicy: "orphan",
+        defaultUsername: "admin",
+        config: {},
+        secretFieldIds: []
+      })),
+      serverStatus
+    } as any);
+    return provider;
+  }
+
+  function serverItemById(provider: NexusTreeProvider, id: string): ServerTreeItem {
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    return children.find((c) => c instanceof ServerTreeItem && c.server.id === id) as ServerTreeItem;
+  }
+
+  it("resolves an eve-ng inventory source through origin.sourceId → providerId and stamps .eveRunning / .eveStopped from serverStatus (⊘ a broken isEveOrigin resolution, a typo'd 'eve-ng' literal, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
+    const provider = providerWith(
+      [
+        makeServer({ id: "run", name: "R1", origin: { sourceId: "eve-src", externalId: "/Lab.unl#1", syncedAt: 1 } }),
+        makeServer({ id: "stop", name: "R2", origin: { sourceId: "eve-src", externalId: "/Lab.unl#2", syncedAt: 1 } })
+      ],
+      [{ id: "eve-src", providerId: "eve-ng", name: "My EVE" }],
+      new Map<string, "running" | "stopped">([
+        ["run", "running"],
+        ["stop", "stopped"]
+      ])
+    );
+    expect(serverItemById(provider, "run").contextValue).toBe("nexus.server.eveRunning");
+    expect(serverItemById(provider, "stop").contextValue).toBe("nexus.server.eveStopped");
+  });
+
+  it("emits NO eve marker for a NON-eve-ng (e.g. netbox) source even when serverStatus carries a state (⊘ isEveOrigin = (originSource !== undefined) would light up node control on a NetBox-origin server that has no controlNode)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "nb", name: "N1", origin: { sourceId: "nb-src", externalId: "device:1", syncedAt: 1 } })],
+      [{ id: "nb-src", providerId: "netbox", name: "My NetBox" }],
+      new Map<string, "running" | "stopped">([["nb", "running"]])
+    );
+    expect(serverItemById(provider, "nb").contextValue).toBe("nexus.server");
+  });
+});
