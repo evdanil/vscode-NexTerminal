@@ -657,7 +657,21 @@ function deviceAttributes(obj: Record<string, unknown>, kind: "device" | "vm"): 
  * count-drift and negative-count guards above exist to prevent. So this
  * throws a protocol error naming the endpoint and row index instead of
  * returning `undefined`.
+ *
+ * ROUND-3 REVIEW — returns the mapped device TOGETHER WITH `hasConsoleAddress`,
+ * a fact about the ROW rather than about the device it produced. The two differ
+ * for exactly one case, and that case is why this exists: a row with a usable
+ * `primary_ip` and an EMPTY NAME is unsyncable, so it deliberately carries no
+ * ssh endpoint — but NetBox does hold a console address for it, and the
+ * no-address warning (which speaks only about addresses) must not count it. See
+ * the count in `fetchInventoryImpl`.
  */
+interface MappedEntry {
+  device: InventoryDevice;
+  /** True when the ROW itself carried a usable console address — independent of whether it also carried a name. */
+  hasConsoleAddress: boolean;
+}
+
 function mapEntry(
   raw: unknown,
   endpointPath: string,
@@ -665,7 +679,7 @@ function mapEntry(
   template: string,
   kind: "device" | "vm",
   primaryIpFamily: PrimaryIpFamily
-): InventoryDevice {
+): MappedEntry {
   if (typeof raw !== "object" || raw === null) {
     throw new InventoryProviderError(
       "protocol",
@@ -685,11 +699,18 @@ function mapEntry(
   // read. The `oob_ip` block below is UNAFFECTED: `oob_ip` is a single NetBox
   // field with no v4/v6 siblings, so no family preference can (or does) govern it.
   const address = readPrimaryAddress(obj, primaryIpFamily);
-  const usable = Boolean(name) && typeof address === "string" && address.length > 0;
   const vars = kind === "device" ? deviceVars(obj) : vmVars(obj);
   const folderPath = renderFolderTemplate(template, vars);
-  const primaryHost = usable ? stripCidr(address as string) : undefined;
-  const endpoints: InventoryDevice["endpoints"] = primaryHost !== undefined ? [{ kind: "ssh", host: primaryHost, port: 22 }] : [];
+  // TWO SEPARATE QUESTIONS, deliberately answered separately (round-3 review):
+  //   1. does this ROW carry a usable console address? — decided by the address
+  //      ALONE, below, and reported as `hasConsoleAddress`;
+  //   2. can this row become a server at all? — also needs a NAME, which is why
+  //      the endpoint list further down is gated on `name`.
+  // Folding (2) into (1) — the single `usable` flag this replaced — is what made
+  // the no-address warning count a row holding a perfectly good `primary_ip`
+  // whose only defect was an empty name, and say NetBox had no address for it.
+  const primaryHost = typeof address === "string" && address.length > 0 ? stripCidr(address) : undefined;
+  const consoleEndpoints: InventoryDevice["endpoints"] = primaryHost !== undefined ? [{ kind: "ssh", host: primaryHost, port: 22 }] : [];
   // ALTERNATE HOST (issue #48, Phase 2) — the NON-PREFERRED IP-family address is
   // emitted as a SECOND `kind: "ssh"` endpoint AFTER the primary one. THE ENDPOINT
   // CONVENTION (see models/inventory.ts): the FIRST ssh endpoint is the primary
@@ -702,9 +723,22 @@ function mapEntry(
   if (primaryHost !== undefined) {
     const altHost = readAlternateAddress(obj, primaryIpFamily, primaryHost);
     if (altHost !== undefined) {
-      endpoints.push({ kind: "ssh", host: altHost, port: 22 });
+      consoleEndpoints.push({ kind: "ssh", host: altHost, port: 22 });
     }
   }
+  // Judged with the ENGINE'S OWN rule (`hasConsoleEndpoint`, models/inventory.ts)
+  // applied to the console endpoints the address produced, so "has an address"
+  // means here exactly what it means where the sync decides an addressless
+  // placeholder: a non-empty ssh/telnet host, never `endpoints.length` (a
+  // BMC-only row has an endpoint and no console address) and never ssh-only (a
+  // telnet-only device syncs into a working telnet server).
+  const hasConsoleAddress = hasConsoleEndpoint({ endpoints: consoleEndpoints });
+  // A NAMELESS row still carries NO ssh endpoint — unchanged. It cannot become a
+  // server (the engine skips it for the missing name and says so in its own
+  // warning), so giving it an endpoint would only invite a placeholder-less
+  // half-mapped device. Decoupling the COUNT from the name does not decouple the
+  // ENDPOINTS from it.
+  const endpoints: InventoryDevice["endpoints"] = name ? [...consoleEndpoints] : [];
   // Out-of-band management address, read with the same defensive shape as
   // `primary_ip` and from the same rows the pagination already fetches (no new
   // API call, no new config field). DEVICES ONLY — NetBox VMs have no `oob_ip`,
@@ -715,9 +749,10 @@ function mapEntry(
   // sync engine selects on EITHER kind, so the choice is cosmetic and a
   // third-party provider emitting `ipmi-sol` maps identically.
   //
-  // Emitted independently of `usable`: a device with an `oob_ip` and no primary
-  // IP still carries this endpoint (and is still counted in the no-SSH warning
-  // below — see the `skippedCount` predicate).
+  // Emitted independently of the console address AND of the name: a device with
+  // an `oob_ip` and no primary IP still carries this endpoint (and is still
+  // counted in the no-console-address warning below, because `redfish` is not a
+  // console kind — see `hasConsoleAddress` above).
   if (kind === "device") {
     const oobIp = obj.oob_ip as { address?: unknown } | null | undefined;
     const oobAddress = oobIp && typeof oobIp === "object" ? oobIp.address : undefined;
@@ -725,8 +760,8 @@ function mapEntry(
       // Emptiness is checked AFTER `stripCidr`, not before: a degenerate address
       // that is nothing BUT a prefix ("/24") is non-empty going in and empty
       // coming out, and would otherwise put `{ kind: "redfish", host: "" }` onto
-      // the tree. The SSH path's `usable` gate has always tested the value it
-      // actually emits; this is the same gate on the value this one emits.
+      // the tree. (The ssh path above gates on the raw address instead, so this
+      // block checks the value IT emits rather than borrowing that gate.)
       const host = stripCidr(oobAddress);
       if (host) {
         endpoints.push({ kind: "redfish", host });
@@ -734,15 +769,18 @@ function mapEntry(
     }
   }
   return {
-    // Prefixed and coexisting on purpose: a device and a VM can share the same
-    // numeric NetBox id, and an unprefixed `String(id)` would silently merge them.
-    externalId: `${kind}:${String(obj.id)}`,
-    name,
-    folderPath: folderPath || undefined,
-    endpoints,
-    // DEVICE TEMPLATES (§2.2 A-M4) — matching metadata for template rule filters,
-    // names AND slugs, from the same rows. Absent when the device carries none.
-    attributes: deviceAttributes(obj, kind)
+    device: {
+      // Prefixed and coexisting on purpose: a device and a VM can share the same
+      // numeric NetBox id, and an unprefixed `String(id)` would silently merge them.
+      externalId: `${kind}:${String(obj.id)}`,
+      name,
+      folderPath: folderPath || undefined,
+      endpoints,
+      // DEVICE TEMPLATES (§2.2 A-M4) — matching metadata for template rule filters,
+      // names AND slugs, from the same rows. Absent when the device carries none.
+      attributes: deviceAttributes(obj, kind)
+    },
+    hasConsoleAddress
   };
 }
 
@@ -827,23 +865,31 @@ async function fetchInventoryImpl(
   // an addressless placeholder before this run appears in no engine line at all.
   // This is the only place that says NetBox holds no usable address for it.
   //
-  // Keyed on `hasConsoleEndpoint` (models/inventory.ts) — the engine's own
-  // addressless notion — NOT on "has no ssh endpoint" and NOT on
-  // `endpoints.length === 0`. Both alternatives miscount: `oob_ip` puts a
+  // Keyed on `mapEntry`'s `hasConsoleAddress` — which applies the engine's own
+  // addressless rule (`hasConsoleEndpoint`, models/inventory.ts) to the endpoints
+  // THE ADDRESS produced, so it is neither "has no ssh endpoint" nor
+  // `endpoints.length === 0`. Both of those miscount: `oob_ip` puts a
   // (console-less) endpoint on a device with no primary IP, so the length test
   // drops exactly those out of the warning, while an ssh-only test counts a
   // device whose only address is telnet, which syncs perfectly well as a telnet
   // server.
+  //
+  // ROUND-3 REVIEW — and NOT `hasConsoleEndpoint(mapped)` on the finished device,
+  // which is NAME-coupled: a row with a usable `primary_ip` and an empty name is
+  // emitted endpoint-less on purpose, so testing the device inflated this count
+  // with rows NetBox does hold an address for — a sentence that was simply false
+  // for them. Their real defect (the missing name) is the sync engine's to
+  // report, and it does: "N devices had an empty name and were skipped".
   let noAddressCount = 0;
   rawDevices.forEach((raw, index) => {
     const mapped = mapEntry(raw, "/api/dcim/devices/", index, template, "device", primaryIpFamily);
-    devices.push(mapped);
-    if (!hasConsoleEndpoint(mapped)) noAddressCount++;
+    devices.push(mapped.device);
+    if (!mapped.hasConsoleAddress) noAddressCount++;
   });
   rawVms.forEach((raw, index) => {
     const mapped = mapEntry(raw, "/api/virtualization/virtual-machines/", index, template, "vm", primaryIpFamily);
-    devices.push(mapped);
-    if (!hasConsoleEndpoint(mapped)) noAddressCount++;
+    devices.push(mapped.device);
+    if (!mapped.hasConsoleAddress) noAddressCount++;
   });
   if (noAddressCount > 0) {
     warnings.push(

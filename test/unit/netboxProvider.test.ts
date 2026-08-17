@@ -425,7 +425,37 @@ describe("createNetboxProvider", () => {
       expect(byExternalId.get("device:1")?.endpoints).toHaveLength(1);
       expect(byExternalId.get("device:2")?.endpoints).toEqual([]);
       expect(byExternalId.get("device:3")?.endpoints).toEqual([]);
-      expect(tree.warnings.some((w) => w.includes("2") && w.toLowerCase().includes("no usable ssh or telnet address"))).toBe(true);
+      // ROUND-3 CORRECTION — this pinned "2" while the count was keyed on
+      // `hasConsoleEndpoint(mapped)`, which is NAME-coupled: device:2 has a
+      // perfectly good `primary_ip` and is endpoint-less only because its name is
+      // empty, so counting it made the warning's number (and its sentence) false.
+      // Only device:3 genuinely has no address in NetBox.
+      expect(tree.warnings).toEqual(["1 device has no usable SSH or telnet address in NetBox."]);
+    });
+
+    it("(ROUND 3) a row with a valid primary IP but an EMPTY NAME is NOT counted in the no-console-address warning (kills the name-coupled count, which reports 2 here and claims NetBox holds no address for a row whose address it holds)", async () => {
+      const fetchImpl = vi.fn(async () =>
+        makeResponse(200, {
+          count: 2,
+          results: [
+            // Usable address; only the NAME is missing. The sync engine reports
+            // this row on its own ("N devices had an empty name and were
+            // skipped"), and NetBox does hold an SSH address for it — so this
+            // warning, which speaks only about addresses, must not count it.
+            { id: 1, name: "", primary_ip: { address: "10.0.0.2/24" } },
+            { id: 2, name: "genuinely-addressless", primary_ip: null }
+          ]
+        })
+      );
+      const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
+
+      const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
+
+      expect(tree.warnings).toEqual(["1 device has no usable SSH or telnet address in NetBox."]);
+      // Endpoint SUPPRESSION for the nameless row is unchanged — decoupling the
+      // COUNT from the name must not start emitting endpoints for rows the
+      // engine will skip anyway.
+      expect(tree.devices.find((d) => d.externalId === "device:1")?.endpoints).toEqual([]);
     });
 
     it("(FIX 1) a device with an id and a name but no primary IP appears in tree.devices with an empty endpoints array (kills drop-at-mapper)", async () => {
