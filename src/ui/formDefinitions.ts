@@ -328,6 +328,10 @@ function ipmiGatewaySelectField(
  */
 const SSH_PROTOCOL_ONLY: VisibleWhenCondition = { field: "protocol", value: "ssh" };
 
+/** Default listener ports per protocol — mirrored by the sync engine's endpoint mapping. */
+const SSH_DEFAULT_PORT = 22;
+const TELNET_DEFAULT_PORT = 23;
+
 /** AND one more condition onto a possibly-absent, possibly-array `visibleWhen`. */
 function andVisibleWhen(vw: VisibleWhen | undefined, extra: VisibleWhenCondition): VisibleWhen {
   if (!vw) {
@@ -360,7 +364,21 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       visibleWhen: vw
     },
     { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the server.", visibleWhen: vw },
-    { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: seed?.port ?? 22, visibleWhen: vw },
+    // TELNET (Phase 0, MINOR-3) — the default follows the Protocol select (the
+    // sync engine already maps a telnet endpoint to 23), both at render time for
+    // an existing record and live in the form via `defaultsFrom`. A port the
+    // user typed is never overwritten; only one of the two defaults is swapped.
+    {
+      type: "number",
+      key: "port",
+      label: "Port",
+      required: true,
+      min: 1,
+      max: 65535,
+      value: seed?.port ?? (seed?.protocol === "telnet" ? TELNET_DEFAULT_PORT : SSH_DEFAULT_PORT),
+      defaultsFrom: { field: "protocol", defaults: { ssh: SSH_DEFAULT_PORT, telnet: TELNET_DEFAULT_PORT } },
+      visibleWhen: vw
+    },
     { type: "text", key: "username", label: "Username", required: true, placeholder: "root", value: seed?.username, visibleWhen: sshVw },
     {
       type: "select",

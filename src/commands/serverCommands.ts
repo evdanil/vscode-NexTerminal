@@ -717,6 +717,55 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
  * prefilled from the record. The edit path rejects such a submission outright
  * (`serverAuthProfileRejection`) rather than relying on that agreement.
  */
+/**
+ * TELNET (Phase 0, MAJOR-4) — carry a server's SSH configuration through a save
+ * that switched it to Telnet.
+ *
+ * WHY IT IS NEEDED. A field hidden by `visibleWhen` is DISABLED by the webview,
+ * a disabled control submits nothing, and `formValuesToServer` maps a missing
+ * key to `undefined`. So the very act of choosing Telnet erased `username`,
+ * `keyPath`, `altHost`, `authProfileId`, `proxy`, `multiplexing`,
+ * `legacyAlgorithms` and `openFileExplorerOnFirstConnect`, and reset `authType`
+ * to `password` — the profile was destroyed by the flip, and a user who
+ * flipped back rebuilt it from memory.
+ *
+ * `preserveLinkedServerCredentials` cannot cover this: it returns `next`
+ * untouched when `!next.authProfileId`, and the auth-profile select is itself
+ * one of the hidden controls, so the flip disarms it in the same submission.
+ *
+ * THE MODEL: a telnet server keeps its SSH config DORMANT, exactly like the
+ * vault entry that survives beside it (which is also why the edit path skips the
+ * proxy-password sync on a telnet save — see its call site). Nothing reads these
+ * fields while `protocol` is `"telnet"`; they exist so flipping back is
+ * lossless.
+ *
+ * SCOPED TO THE FLIP, deliberately. It fires ONLY when the submission is telnet,
+ * i.e. only when the form could not have offered the fields. An SSH save is
+ * untouched, so clearing a key file, an alternate host or a proxy still works —
+ * a blanket "always merge from existing" would make those fields unclearable
+ * forever, which is the opposite failure.
+ */
+export function preserveDormantSshConfig(existing: ServerConfig | undefined, next: ServerConfig): ServerConfig {
+  if (!existing || resolveServerProtocol(next) !== "telnet") {
+    return next;
+  }
+  return {
+    ...next,
+    // `username` is the one that must be carried even when blank-vs-absent
+    // looks identical: the submission has no username at all for a telnet save,
+    // and `formValuesToServer` produced `""`.
+    username: existing.username,
+    authType: existing.authType,
+    keyPath: existing.keyPath,
+    altHost: existing.altHost,
+    authProfileId: existing.authProfileId,
+    proxy: existing.proxy ? { ...existing.proxy } : undefined,
+    multiplexing: existing.multiplexing,
+    legacyAlgorithms: existing.legacyAlgorithms,
+    openFileExplorerOnFirstConnect: existing.openFileExplorerOnFirstConnect
+  };
+}
+
 export function preserveLinkedServerCredentials(
   existing: ServerConfig | undefined,
   next: ServerConfig,
@@ -1583,7 +1632,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             }
             // Which submitted credentials are this user's own, and which the
             // stored record keeps — see preserveLinkedServerCredentials.
-            const linked = preserveLinkedServerCredentials(existing, candidate, linkedProfile);
+            const linked = preserveDormantSshConfig(
+              existing,
+              preserveLinkedServerCredentials(existing, candidate, linkedProfile)
+            );
             const proxySecretKey = proxyPasswordSecretKey(existing.id);
             // FINDING 1 (P2, baseline-before-vault-read review) — this
             // secret-capture await MUST run BEFORE the baseline snapshot
@@ -1677,7 +1729,18 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             const writtenSnapshot = cloneServerConfig(updated);
             await ctx.core.addOrUpdateServer(updated);
             try {
-              await syncProxyPasswordSecret(ctx, updated.id, values);
+              // TELNET (Phase 0, MAJOR-4) — the vault half of the dormant SSH
+              // config. The proxy controls are hidden on a telnet save, so the
+              // submission carries no `proxyType` and this sync would read that
+              // as "no proxy" and DELETE the stored proxy password. The record
+              // keeps its proxy (see `preserveDormantSshConfig`), so deleting
+              // the credential beside it would mean the SSH config came back on
+              // a flip-back with a password silently missing. Skipped entirely
+              // rather than passed different values: this submission expressed
+              // nothing about the proxy, so there is nothing to sync.
+              if (resolveServerProtocol(updated) !== "telnet") {
+                await syncProxyPasswordSecret(ctx, updated.id, values);
+              }
             } catch {
               // The record above just committed to the NEW generation, but
               // its proxy secret never did — left alone, the new record

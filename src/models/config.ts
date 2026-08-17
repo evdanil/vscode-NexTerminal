@@ -1450,7 +1450,18 @@ export function formOfferedServerCredentials(
 ): FormOfferedServerCredentials {
   const owned = authProfileOwnedCredentials(profile);
   return {
-    // Always rendered; only ownership can take it away.
+    // Rendered whenever the form is showing SSH controls at all; from there,
+    // only profile ownership can take it away.
+    //
+    // TELNET (Phase 0, MAJOR-4) — the "always" that used to head this line is no
+    // longer true: `protocol: "telnet"` hides every SSH credential control, so
+    // the form offers none of them. That case is NOT expressed here, and
+    // deliberately — this function answers "which credentials did the SSH form
+    // offer?", and on a telnet save there is no SSH form to answer for. The
+    // whole submission is handled one layer up instead, by
+    // `preserveDormantSshConfig` (commands/serverCommands.ts), which restores
+    // the stored SSH config wholesale rather than field by field. Teaching this
+    // function about the protocol would split one decision across two places.
     username: owned.username === undefined,
     // A closed enum is always owned, so this is `true` only where nothing
     // resolved — no link, or an id that names no profile, which is the same

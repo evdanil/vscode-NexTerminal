@@ -49,6 +49,7 @@ import { isValidServerOrigin, validateServerConfig } from "../../src/utils/valid
 import { serverFormDefinition, unifiedProfileFormDefinition } from "../../src/ui/formDefinitions";
 import { formValuesToServer } from "../../src/commands/serverCommands";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhenCondition } from "../../src/ui/formTypes";
+import { openForm } from "../helpers/formScriptHarness";
 
 function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
   return {
@@ -341,5 +342,77 @@ describe("server form — telnet servers are not selectable as SSH infrastructur
     const definition = unifiedProfileFormDefinition(undefined, undefined, true, servers);
     expect(optionValues(definition, "proxyJumpHostId")).not.toContain("srv-tel");
     expect(optionValues(definition, "ipmiGatewayServerId")).not.toContain("srv-tel");
+  });
+});
+
+/**
+ * MINOR-3 (review) — the form defaulted a telnet server to port 22 while the
+ * sync engine uses 23, so a telnet profile made by hand pointed at the SSH port.
+ */
+describe("server form — telnet port default", () => {
+  it("offers 22 for a new server (SSH is the default protocol)", () => {
+    const field = keyedField(serverFormDefinition(), "port");
+    expect(field && "value" in field ? field.value : undefined).toBe(22);
+  });
+
+  // ⊘ A seed-only default (`seed?.port ?? 22`) answers 22 here, which is the
+  // bug: a telnet profile opened with no port lands on the SSH port.
+  it("offers 23 when the seed is already a telnet server", () => {
+    const field = keyedField(serverFormDefinition({ protocol: "telnet" }), "port");
+    expect(field && "value" in field ? field.value : undefined).toBe(23);
+  });
+
+  // ⊘ Must not clobber a hand-set port — the whole reason this is a default and
+  // not a rewrite.
+  it("keeps a stored port on a telnet server untouched", () => {
+    const field = keyedField(serverFormDefinition({ protocol: "telnet", port: 2001 }), "port");
+    expect(field && "value" in field ? field.value : undefined).toBe(2001);
+  });
+
+  it("keeps a stored port on an SSH server untouched", () => {
+    const field = keyedField(serverFormDefinition({ port: 2222 }), "port");
+    expect(field && "value" in field ? field.value : undefined).toBe(2222);
+  });
+});
+
+/**
+ * MINOR-3 (review), the LIVE half. The render-time default only helps when the
+ * form is opened on a record that is already telnet; the common path is "Add
+ * server → choose Telnet", where the port control is already on screen showing
+ * 22. This drives the REAL rendered form script against the real definition.
+ */
+describe("server form script — port default follows the Protocol select", () => {
+  it("swaps 22 → 23 when the user picks Telnet", () => {
+    const form = openForm(serverFormDefinition());
+    expect(form.value("port")).toBe("22");
+
+    form.choose("protocol", "telnet");
+    expect(form.value("port")).toBe("23");
+  });
+
+  it("swaps back to 22 when the user returns to SSH", () => {
+    const form = openForm(serverFormDefinition());
+    form.choose("protocol", "telnet");
+    form.choose("protocol", "ssh");
+    expect(form.value("port")).toBe("22");
+  });
+
+  // ⊘ THE CLOBBER GUARD. A hand-set port must survive the switch — an
+  // implementation that simply assigns the new protocol's default on every
+  // change destroys a console-server port the user just typed.
+  it("never touches a port the user set by hand", () => {
+    const form = openForm(serverFormDefinition());
+    form.type("port", "2001");
+    form.choose("protocol", "telnet");
+    expect(form.value("port")).toBe("2001");
+
+    form.choose("protocol", "ssh");
+    expect(form.value("port")).toBe("2001");
+  });
+
+  it("leaves a stored non-default port alone when editing an existing server", () => {
+    const form = openForm(serverFormDefinition({ id: "s1", port: 2222 }));
+    form.choose("protocol", "telnet");
+    expect(form.value("port")).toBe("2222");
   });
 });

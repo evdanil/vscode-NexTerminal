@@ -352,6 +352,11 @@ function buildFormDom(definition: FormDefinition): FormDom {
         input.name = field.key;
         input.value = field.value === undefined ? "" : String(field.value);
         input.required = field.required === true;
+        // TELNET (MINOR-3) — mirrors `renderField`'s `data-defaults-from`, so
+        // the real script's protocol-driven port default runs here too.
+        if (field.defaultsFrom) {
+          input.dataset.defaultsFrom = JSON.stringify(field.defaultsFrom);
+        }
         register(field.key, input);
         controls.push(input);
         break;
