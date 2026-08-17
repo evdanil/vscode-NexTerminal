@@ -104,6 +104,28 @@ export interface InventoryConfigField {
    * it stores a string.
    */
   options?: { label: string; value: string }[];
+  /**
+   * EVE-NG (Phase 1) — the value a `type: "boolean"` field starts at on the ADD
+   * form, when the source has no stored value for it yet. Ignored for every
+   * other field type, and ignored on EDIT (a stored `false` is a real answer the
+   * user gave and must not be re-flipped to `true` on every visit).
+   *
+   * Exists because a provider's declared default was previously unreachable
+   * through the only UI that creates sources: the checkbox descriptor seeded
+   * from `existingConfig[field.id] === true`, so a NEW source always stored
+   * `false` no matter what the provider documented. EVE-NG's
+   * `includeStopped` defaults to TRUE — a lab's nodes are stopped most of the
+   * time, and a source that silently imported none of them would read as an
+   * empty inventory and, under a `delete` prune policy, remove the servers a
+   * previous sync created.
+   *
+   * Absent behaves exactly as before (`false`), so NetBox's `includeVms` — the
+   * only other boolean field that ships — is byte-identical. Deliberately NOT
+   * part of `computeProviderFingerprint`: changing a default changes what a
+   * FUTURE source starts at, never what an existing source is configured with,
+   * so it is not a change a user needs to re-confirm credentials over.
+   */
+  defaultValue?: boolean;
 }
 
 export type InventorySourceValues = Record<string, string | number | boolean>; // secrets NEVER here

@@ -1313,7 +1313,15 @@ function inventoryConfigFieldDescriptor(
       type: "checkbox",
       key,
       label: field.label,
-      value: existingConfig[field.id] === true,
+      // EVE-NG (Phase 1) — a STORED value always wins, including a stored
+      // `false`; only a field with nothing stored yet (the Add form, or a
+      // provider field added after this source was saved) falls back to the
+      // provider's declared `defaultValue`. `hasOwnProperty` rather than a
+      // `??`/`||` chain because `false` is a real stored answer that both of
+      // those would read as "unset" and flip back on every visit.
+      value: Object.prototype.hasOwnProperty.call(existingConfig, field.id)
+        ? existingConfig[field.id] === true
+        : field.defaultValue === true,
       hint: field.description
     };
   }

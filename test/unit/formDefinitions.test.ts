@@ -396,6 +396,52 @@ describe("inventorySourceFormDefinition", () => {
     fetchInventory: async () => ({ nodes: [] }) as never
   };
 
+  /**
+   * EVE-NG (Phase 1) — `InventoryConfigField.defaultValue` for boolean fields.
+   * A provider's documented default used to be unreachable: the checkbox was
+   * always seeded `existingConfig[field.id] === true`, so a NEW source stored
+   * `false` however the provider described the field.
+   */
+  describe("boolean field defaults", () => {
+    const boolProvider = (defaultValue?: boolean): InventoryProvider => ({
+      ...fakeProvider,
+      configFields: [{ id: "includeStopped", label: "Include Stopped", type: "boolean", defaultValue }]
+    });
+    const seedWith = (config: Record<string, string | number | boolean>) => ({
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "",
+      config,
+      secretFieldIds: []
+    });
+
+    it("starts a defaultValue:true boolean CHECKED on Add (⊘ seeding purely from the stored config leaves it unchecked, and the source silently imports none of the population the provider says it defaults to importing)", () => {
+      const field = keyedField(inventorySourceFormDefinition(boolProvider(true)), "cfg_includeStopped");
+      expect(field.type).toBe("checkbox");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(true);
+    });
+
+    it("leaves a boolean with no declared default unchecked on Add — NetBox's includeVms is byte-identical to before (⊘ defaulting every boolean to true silently turns VM import on for every new NetBox source)", () => {
+      const field = keyedField(inventorySourceFormDefinition(boolProvider(undefined)), "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(false);
+    });
+
+    it("honours a STORED false over a defaultValue:true when editing — the user unchecked it, and a default that re-checks it every visit is a setting that cannot be turned off (⊘ `existingConfig[id] || defaultValue` reads a stored `false` as absent and re-checks the box)", () => {
+      const definition = inventorySourceFormDefinition(boolProvider(true), seedWith({ includeStopped: false }));
+      const field = keyedField(definition, "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(false);
+    });
+
+    it("still shows a stored true as checked when the default is false", () => {
+      const definition = inventorySourceFormDefinition(boolProvider(false), seedWith({ includeStopped: true }));
+      const field = keyedField(definition, "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(true);
+    });
+  });
+
   it("marks a provider-declared number field with step \"any\" so fractional values pass native validation (kills the missing-step regression)", () => {
     const definition = inventorySourceFormDefinition(fakeProvider);
     const field = keyedField(definition, "cfg_pollInterval");
