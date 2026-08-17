@@ -2420,8 +2420,21 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         }
 
         const effectiveUsername = resolveEffectiveUsername(ctx.core, server);
+        // #84 P1 (Codex, serialization audit) — `server` was captured BEFORE the
+        // key deployment (a withProgress connect) and the conversion prompt, both
+        // long awaits during which a background port-heal (or any writer) can
+        // replace the live record. Serialize the conversion write under
+        // configMutationLock and build it from the RE-READ live record, so only
+        // the auth-type/key/username changes land and a concurrent heal's
+        // host/port survives. The key builders spread `...server`, so passing
+        // `live` preserves its address. Acquired AFTER the interactive prompts.
         if (conversionMode === "standalone") {
-          await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(server, effectiveUsername, privateKeyPath));
+          await configMutationLock.runExclusive(async () => {
+            const live = ctx.core.getServer(server.id);
+            if (live) {
+              await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(live, effectiveUsername, privateKeyPath));
+            }
+          });
           await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
           return;
         }
@@ -2430,9 +2443,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         if (!profile) {
           return;
         }
-        await ctx.core.addOrUpdateServer(
-          buildProfileLinkedKeyServer(server, effectiveUsername, privateKeyPath, profile.id)
-        );
+        await configMutationLock.runExclusive(async () => {
+          const live = ctx.core.getServer(server.id);
+          if (live) {
+            await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, effectiveUsername, privateKeyPath, profile.id));
+          }
+        });
         await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
       } catch (err: any) {
         void vscode.window.showErrorMessage(`Deploy failed: ${err?.message ?? err}`);

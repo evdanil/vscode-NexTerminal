@@ -1585,7 +1585,13 @@ export function registerConfigCommands(
 
     // For share exports, always merge with fresh IDs
     if (exportType === "share") {
-      await importShareData(data);
+      // #84 P1 (Codex, serialization audit) — a share import adds servers/groups/
+      // etc. through per-entity full-snapshot writes; serialize it under
+      // configMutationLock so a concurrent background port-heal (or any writer)
+      // cannot clobber it or be reverted by it. importShareData runs no blocking
+      // prompt (only fire-and-forget notifications), so holding the lock across
+      // it is safe.
+      await configMutationLock.runExclusive(() => importShareData(data));
       return;
     }
 
@@ -2976,21 +2982,27 @@ export function registerConfigCommands(
     );
     if (confirm !== "Import") return;
 
-    for (const folder of result.folders) {
-      await core.addGroup(folder);
-    }
-    for (const session of result.sessions) {
-      await core.addOrUpdateServer({
-        id: randomUUID(),
-        name: session.name,
-        host: session.host,
-        port: session.port,
-        username: session.username,
-        authType: "password",
-        isHidden: false,
-        group: session.folder || undefined
-      });
-    }
+    // #84 P1 (Codex, serialization audit) — the write phase adds folders and
+    // servers through per-entity full-snapshot writes; serialize it under
+    // configMutationLock (AFTER the confirm modal, no UI held) so a concurrent
+    // background port-heal cannot clobber it or be reverted by it.
+    await configMutationLock.runExclusive(async () => {
+      for (const folder of result.folders) {
+        await core.addGroup(folder);
+      }
+      for (const session of result.sessions) {
+        await core.addOrUpdateServer({
+          id: randomUUID(),
+          name: session.name,
+          host: session.host,
+          port: session.port,
+          username: session.username,
+          authType: "password",
+          isHidden: false,
+          group: session.folder || undefined
+        });
+      }
+    });
 
     void vscode.window.showInformationMessage(
       `Imported ${result.sessions.length} ${pluralizeNoun(noun, result.sessions.length)} from ${sourceName}.`
@@ -3242,7 +3254,11 @@ export function registerConfigCommands(
         cancellable: false
       },
       async () => {
-        await core.addServersBatch(serverConfigs, folders);
+        // #84 P1 (Codex, serialization audit) — serialize the bulk import write
+        // under configMutationLock (after the confirm modal) so a concurrent
+        // background port-heal cannot clobber it or be reverted by its
+        // full-snapshot write.
+        await configMutationLock.runExclusive(() => core.addServersBatch(serverConfigs, folders));
       }
     );
 

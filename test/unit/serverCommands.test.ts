@@ -4986,8 +4986,8 @@ describe("folder-op serialization (#84 P1)", () => {
     }
   }
 
-  function realCtx(core: NexusCore): CmdCtx {
-    return { core } as unknown as CmdCtx;
+  function realCtx(core: NexusCore, extra: Partial<CmdCtx> = {}): CmdCtx {
+    return { core, ...extra } as unknown as CmdCtx;
   }
 
   function telnetServer(id: string, group: string, port: number): ServerConfig {
@@ -5093,5 +5093,53 @@ describe("folder-op serialization (#84 P1)", () => {
     const persisted = await repo.getServers();
     expect(persisted.find((s) => s.id === "t1")).toBeUndefined(); // deleted stays deleted
     expect(persisted.find((s) => s.id === "s1")?.port).toBe(32800); // survivor's heal survives
+  });
+
+  it("nexus.server.deployKey (key conversion) does not clobber a concurrent heal of an UNRELATED telnet server, and builds from the LIVE deploy target (⊘ dropping the runExclusive+re-read lets the conversion's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // d1 is the ssh server being converted to key auth; t1 is an unrelated telnet
+    // node a background refresh heals while the deploy/prompt awaits.
+    const d1: ServerConfig = {
+      id: "d1",
+      name: "deploy-target",
+      host: "10.0.0.1",
+      port: 22,
+      username: "dev",
+      authType: "agent",
+      isHidden: false
+    };
+    await core.addServersBatch([d1, telnetServer("t1", "Keep", 32769)]);
+
+    const sshFactory = { connect: vi.fn(async () => ({ dispose: vi.fn() })) };
+    registerServerCommands(realCtx(core, { sshFactory: sshFactory as unknown as CmdCtx["sshFactory"] }));
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
+    // pickKeyForDeployment's quick pick → choose the existing key.
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // withProgress runs its callback (connect + deploy) directly.
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_opts: unknown, task: (...a: unknown[]) => unknown) => task());
+    // pickDeployConversionMode → "Use standalone key".
+    vi.mocked(vscode.window.showInformationMessage).mockResolvedValue("Use standalone key" as unknown as vscode.MessageItem);
+
+    repo.arm();
+    const deployP = registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false)) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the conversion write's saveServers is blocked
+
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("t1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([deployP, healP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "d1")?.authType).toBe("key"); // conversion stands
+    expect(persisted.find((s) => s.id === "d1")?.keyPath).toBe("/home/user/.ssh/id_ed25519");
+    expect(persisted.find((s) => s.id === "t1")?.port).toBe(32800); // unrelated heal survives
   });
 });
