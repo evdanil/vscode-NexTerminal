@@ -156,6 +156,8 @@ Telnet is a per-server **protocol** choice, not a separate profile type: one ser
 - **Silently skipped** — Directory sync (Follow Terminal Directory). If the File Explorer is rooted on a server that is later switched to Telnet, the sync stops instead of sending path text extracted from the device's own output to an SFTP call. Silent by design: this path runs on terminal output, so a notification would repeat for a state the user never asked about.
 - **Never engaged** — connection multiplexing and the SSH connection pool are only reached from the SSH connect path, which a telnet server branches away from before any of it.
 
+**Forward/backward compatibility.** `protocol` is additive and optional, so an older build round-trips a telnet record's *other* fields untouched — but it does not understand the field itself, and will connect such a server over SSH. A configuration exported here and imported by a pre-2.8.188 build therefore loses the protocol (and, with it, the meaning of a blank username). Nothing on this side can prevent that; the field does not exist in the older schema.
+
 **Inventory.** `InventoryEndpointKind` includes `"telnet"`. A device whose only usable endpoint is telnet syncs to a telnet server on port 23 by default; a device offering **both** ssh and telnet maps to SSH, whatever order the endpoints are listed in. The `ServerOrigin.syncedProtocol` stamp records what the sync wrote, so a protocol you change by hand is never overwritten by a later sync, while a device that genuinely changes transport is still followed.
 
 ### 4.5 Port Forwarding

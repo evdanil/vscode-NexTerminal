@@ -4441,3 +4441,53 @@ describe("nexus.server.edit — flipping protocol must not destroy the other pro
     expect(await ctx.secretVault!.get(secretKey)).toBe("proxy-secret");
   });
 });
+
+describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  // ⊘ A telnet server has no username, so the old template produced a leading
+  // "@" — `@10.0.0.1:23` — which is not a paste-able address in a ticket or a
+  // shell. Discriminating because the SSH control below proves the `user@`
+  // form is still emitted where there IS a user.
+  it("omits the empty username and its @ separator", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ protocol: "telnet", username: "", host: "10.0.0.1", port: 2001 })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:2001");
+  });
+
+  it("still emits user@host:port for an SSH server (control)", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "dev", host: "example.com", port: 22 })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("dev@example.com:22");
+  });
+
+  it("still carries the BMC address alongside", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ protocol: "telnet", username: "", host: "10.0.0.1", port: 23, ipmiHost: "10.9.9.9" })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:23\nIPMI/BMC: 10.9.9.9");
+  });
+});

@@ -2072,7 +2072,15 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // copying connection details to paste into a ticket or a shell wants it
       // too, and it is otherwise only visible behind the form's Advanced section.
       const ipmiHost = typeof server.ipmiHost === "string" ? server.ipmiHost.trim() : "";
-      const info = `${server.username}@${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
+      // TELNET (Phase 0, MINOR-4) — a telnet server has no username, so the
+      // `user@` prefix is dropped rather than emitted empty: `@10.0.0.1:23` is
+      // not an address anyone can paste into a ticket or a shell. Keyed on the
+      // VALUE, not the protocol, so a blank username reads the same whatever put
+      // it there.
+      const account = typeof server.username === "string" && server.username.trim() !== ""
+        ? `${server.username}@`
+        : "";
+      const info = `${account}${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
       await vscode.env.clipboard.writeText(info);
       void vscode.window.showInformationMessage(`Copied: ${info.replace(/\n/g, "  ")}`);
     }),

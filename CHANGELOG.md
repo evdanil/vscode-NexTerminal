@@ -10,6 +10,7 @@
 
 ### Changed
 
+- **Downgrade note.** A configuration exported from 2.8.188 or later and imported by an *older* build loses the protocol: the older build has no concept of one, so a telnet server arrives as an SSH server and will try to authenticate against the telnet port. There is no way to avoid this from the newer side — the field simply does not exist in the older schema — so re-set the protocol after upgrading again, or keep the export for a build that understands it. Exports move forward without loss in the usual direction.
 - **SSH-only features refuse a telnet server up front, by name.** File browsing (SFTP), port forwarding — including dragging a tunnel profile onto the server — Test Connection and Deploy SSH Key all name the feature and the server instead of reaching for an SSH connection and surfacing a raw handshake error several seconds later, against a port that is answering perfectly well.
 
 ## [2.8.187] — 2026-08-16

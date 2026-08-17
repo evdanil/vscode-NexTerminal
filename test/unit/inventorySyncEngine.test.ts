@@ -1957,6 +1957,112 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
   const profile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
 
+  /**
+   * M27/M29 (review) — THE ADOPTEE TWIN of the update path's protocol matrix.
+   * The update path had four discriminating tests and the adoption path none,
+   * so both `takesProtocol` forced true and the dropped `syncedProtocol`
+   * receipt restore survived the full suite.
+   *
+   * The substitution that makes it the same decision on a record this sync did
+   * not create: `DetachedServerOrigin.syncedProtocol` stands in for the origin
+   * stamp. Fixtures are built so the WRONG behaviour visibly changes the
+   * outcome, per CLAUDE.md's convention.
+   */
+  describe("adoption — the protocol write rule and its receipt", () => {
+    const telnetDevice = () => keptDevice({ endpoints: [{ kind: "telnet", host: "lab-sw-01" }] });
+
+    // ⊘ M27 — `takesProtocol` forced TRUE. The removed source's sync had
+    // written telnet; the user then switched the kept server back to SSH by
+    // hand. The device STILL reports telnet only, so an adoption that always
+    // takes the device's protocol flips it back — visibly, and against a choice
+    // the marker itself proves was the user's.
+    it("does NOT stomp a protocol the user changed by hand before the adoption", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: undefined,
+        formerlySynced: keptMarker({ syncedProtocol: "telnet" })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBeUndefined();
+      // ⊘ M29 — the receipt is RESTORED into the new origin, not dropped.
+      // Dropped, the next ordinary sync reads the record as "sync wrote ssh"
+      // (an absent stamp resolves to ssh), sees the device saying telnet, and
+      // row 3 flips it — the hand edit survives adoption and dies one sync later.
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    // The mirror of the test above, and the reason that one is not vacuous: on
+    // the SAME device, an adoptee whose protocol still equals what the removed
+    // source wrote DOES follow the device. Adoption eligibility corroborates
+    // host AND port, so the fixture keeps port 23 fixed and moves only the
+    // protocol — which is exactly what isolates the write rule.
+    it("DOES take the device's protocol when the kept record still carries what the removed source wrote", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: undefined,
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    it("stamps an adoptee whose protocol already agrees with the device", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: "telnet",
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    it("leaves a hand-set telnet protocol alone when the device offers SSH", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        protocol: "telnet",
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      // Not laundered into the stamp: the very next sync must still read this
+      // as the user's value, not as "what the sync wrote".
+      expect(after.origin?.syncedProtocol).toBeUndefined();
+    });
+
+    it("adopts an ordinary SSH kept server without inventing a protocol (control)", () => {
+      const source = makeSource();
+      const plan = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [makeKeptServer()],
+        now: 5000,
+        adoptionChoice: "adopt"
+      });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBeUndefined();
+      expect(after.origin?.syncedProtocol).toBeUndefined();
+    });
+  });
+
   it("(E-7) HEADLINE — a hand-made server at the device's exact address is NEVER adopted: no marker, no adoption (kills matching on address, the rejected design)", () => {
     const source = makeSource();
     // Identical to the canonical fixture in every respect EXCEPT the marker.

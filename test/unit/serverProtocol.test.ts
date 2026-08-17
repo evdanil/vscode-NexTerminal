@@ -381,6 +381,52 @@ describe("server form — telnet port default", () => {
  * server → choose Telnet", where the port control is already on screen showing
  * 22. This drives the REAL rendered form script against the real definition.
  */
+/**
+ * M33 (review) — the SSH-only gate on `username`, pinned BEHAVIOURALLY through
+ * the real rendered form script rather than by inspecting the descriptor. This
+ * is the field the whole `validateServerConfig` relaxation exists for, and it
+ * is `required`: ungated, choosing Telnet leaves a required control on screen
+ * that the user must fill with a credential telnet has no use for, and the save
+ * carries a username the connect path will never read.
+ */
+describe("server form script — SSH-only controls under a Telnet protocol", () => {
+  it("stops submitting the username once Telnet is chosen, and resumes on SSH", () => {
+    const form = openForm(serverFormDefinition({ id: "s1", username: "netadmin" }));
+    expect(form.submit().username).toBe("netadmin");
+
+    form.choose("protocol", "telnet");
+    // ⊘ A hidden group is DISABLED, and a disabled control submits nothing —
+    // which is exactly what `formValuesToServer` reads as "telnet has no
+    // username". An ungated field submits "netadmin" here.
+    expect(form.submit().username).toBeUndefined();
+
+    form.choose("protocol", "ssh");
+    expect(form.submit().username).toBe("netadmin");
+  });
+
+  it("stops submitting every other SSH-only control too", () => {
+    const form = openForm(
+      serverFormDefinition({ id: "s1", username: "netadmin", authType: "key", keyPath: "/k", altHost: "2001:db8::1" })
+    );
+    form.choose("protocol", "telnet");
+    const submitted = form.submit();
+
+    for (const key of ["username", "authType", "keyPath", "altHost", "multiplexing", "legacyAlgorithms"]) {
+      expect(submitted[key], `${key} must not be submitted for a telnet server`).toBeUndefined();
+    }
+  });
+
+  it("keeps submitting the protocol-independent controls", () => {
+    const form = openForm(serverFormDefinition({ id: "s1", name: "console", host: "10.0.0.1" }));
+    form.choose("protocol", "telnet");
+    const submitted = form.submit();
+
+    expect(submitted.name).toBe("console");
+    expect(submitted.host).toBe("10.0.0.1");
+    expect(submitted.protocol).toBe("telnet");
+  });
+});
+
 describe("server form script — port default follows the Protocol select", () => {
   it("swaps 22 → 23 when the user picks Telnet", () => {
     const form = openForm(serverFormDefinition());

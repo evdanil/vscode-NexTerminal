@@ -105,6 +105,27 @@ describe("serverConfigsEqual — formerlySynced (ADOPT 1)", () => {
     expect(serverConfigsEqual(withOob, server({ formerlySynced: { ...MARKER } }))).toBe(false);
   });
 
+  // ⊘ M20 (review) — the transport receipt was the one preserved field with no
+  // comparator test, and dropping it from `detachedOriginsEqual` survived the
+  // FULL suite. It is the same hazard as its siblings above: a rollback that
+  // called two markers equal while one remembers the transport the removed
+  // source wrote and the other does not would restore the forgetful one, and
+  // the adopted server's protocol would be back to looking hand-flipped, which
+  // no later sync can repair. Present-vs-absent must read as a DIFFERENCE too —
+  // absent means "the sync wrote ssh", which is a real statement, not "unknown".
+  it("two markers differing only in the `syncedProtocol` receipt are not equal (kills leaving the transport receipt out of the detached comparator)", () => {
+    const withTelnet = server({ formerlySynced: { ...MARKER, syncedProtocol: "telnet" } });
+    const withSsh = server({ formerlySynced: { ...MARKER, syncedProtocol: "ssh" } });
+    const withNone = server({ formerlySynced: { ...MARKER } });
+
+    expect(serverConfigsEqual(withTelnet, withSsh)).toBe(false);
+    expect(serverConfigsEqual(withTelnet, withNone)).toBe(false);
+    expect(serverConfigsEqual(withSsh, withNone)).toBe(false);
+    // Identical receipts still compare equal — the comparator must not report
+    // every unchanged kept server as changed.
+    expect(serverConfigsEqual(withTelnet, server({ formerlySynced: { ...MARKER, syncedProtocol: "telnet" } }))).toBe(true);
+  });
+
   it("two markers differing only in the `templated` receipt are not equal (kills leaving `templated` out of the detached comparator — round 2 added the member but not the comparison, so a rollback would replace a marker remembering the removed source's template-written proxy/booleans with one that does not, and call the two identical while doing it)", () => {
     // Both sides HAVE a `templated` record — the difference is in its CONTENTS,
     // not present-vs-absent (that would be the vacuous-fixture trap: a broken

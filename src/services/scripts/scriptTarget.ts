@@ -56,7 +56,18 @@ export async function pickTarget(
   // collection would put every telnet session in the `ssh` bucket and vice
   // versa, and `@target-type ssh` would fire login-expecting scripts at a
   // telnet console.
-  const sshCandidates: Array<{ session: ActiveSession; serverId: string; serverName: string; label: string; description: string }> = [];
+  const sshCandidates: Array<{
+    session: ActiveSession;
+    serverId: string;
+    serverName: string;
+    label: string;
+    description: string;
+    /** MINOR-6 (review) — the protocol is CARRIED, never re-derived from the
+     *  display copy. `description.startsWith("Telnet")` made a user-visible
+     *  string load-bearing: rewording the picker label would have silently
+     *  reclassified every telnet session as SSH. */
+    kind: ScriptTargetType;
+  }> = [];
   const telnetCandidates: typeof sshCandidates = [];
   for (const s of snapshot.activeSessions) {
     const server = snapshot.servers.find((srv) => srv.id === s.serverId);
@@ -70,7 +81,8 @@ export async function pickTarget(
       serverId: s.serverId,
       serverName,
       label: s.terminalName,
-      description: `${isTelnet ? "Telnet" : "SSH"} • ${serverName}`
+      description: `${isTelnet ? "Telnet" : "SSH"} • ${serverName}`,
+      kind: isTelnet ? "telnet" : "ssh"
     });
   }
 
@@ -137,7 +149,7 @@ export async function pickTarget(
           label: c.label,
           description: c.description,
           sessionId: c.session.id,
-          targetKind: (c.description.startsWith("Telnet") ? "telnet" : "ssh") as ScriptTargetType,
+          targetKind: c.kind,
           session: c.session
         })),
         ...serialByName.map((c) => ({
@@ -165,18 +177,11 @@ export async function pickTarget(
   }
 
   const combined: Array<SessionPickItem & { session: ScriptTargetSession }> = [
-    ...sshCandidates.map((c) => ({
+    ...[...sshCandidates, ...telnetCandidates].map((c) => ({
       label: c.label,
       description: c.description,
       sessionId: c.session.id,
-      targetKind: "ssh" as const,
-      session: c.session
-    })),
-    ...telnetCandidates.map((c) => ({
-      label: c.label,
-      description: c.description,
-      sessionId: c.session.id,
-      targetKind: "telnet" as const,
+      targetKind: c.kind,
       session: c.session
     })),
     ...serialCandidates.map((c) => ({

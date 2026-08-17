@@ -351,6 +351,43 @@ describe("pickTarget — telnet sessions", () => {
     );
   });
 
+  // ⊘ MINOR-6 (review) — the picked item's `targetKind` must come from the
+  // server's protocol, not from parsing the description string. Pinning it here
+  // is what stops a reworded picker label from silently reclassifying every
+  // telnet session as SSH.
+  it("tags each candidate with the protocol it was classified by", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor(), makeCore(snapshot));
+
+    const items = quickPickCalls[0].items as Array<{ sessionId: string; targetKind: string }>;
+    expect(items.find((i) => i.sessionId === "ssh-1")?.targetKind).toBe("ssh");
+    expect(items.find((i) => i.sessionId === "tel-1")?.targetKind).toBe("telnet");
+  });
+
+  it("tags a name-disambiguation candidate by protocol too", async () => {
+    resetPicker();
+    // Two sessions sharing a server NAME across protocols force the narrowed
+    // picker, which is the other place the kind was derived from display copy.
+    const shared: MockSnapshot = {
+      ...snapshot,
+      activeSessions: [
+        { id: "ssh-1", serverId: "srv-ssh", terminalName: "Nexus SSH: edge" },
+        { id: "tel-1", serverId: "srv-tel", terminalName: "Nexus Telnet: edge" }
+      ],
+      servers: [
+        { id: "srv-ssh", name: "edge" },
+        { id: "srv-tel", name: "edge", protocol: "telnet" }
+      ]
+    };
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor({ targetProfile: "edge" }), makeCore(shared));
+
+    const items = quickPickCalls[0].items as Array<{ sessionId: string; targetKind: string }>;
+    expect(items.find((i) => i.sessionId === "ssh-1")?.targetKind).toBe("ssh");
+    expect(items.find((i) => i.sessionId === "tel-1")?.targetKind).toBe("telnet");
+  });
+
   it("auto-picks a telnet session by server name", async () => {
     resetPicker();
     const picked = await pickTarget(
