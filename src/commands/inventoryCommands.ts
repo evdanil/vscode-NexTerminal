@@ -2200,6 +2200,14 @@ export function registerInventoryCommands(
   // one-size-fits-all "is currently syncing" this used to be.
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
+  // LIVE STATUS (Phase 2) — monotonic status-refresh generation. Each
+  // refreshStatus sweep captures the value it bumps to; before applying any
+  // report it checks it still holds the latest generation, so a slow older
+  // sweep that resolves AFTER a newer one started drops its (now stale) apply
+  // rather than clobbering the fresher state. The poll's in-flight latch stops
+  // poll ticks from stacking; this covers poll-vs-manual and any residual race.
+  let statusRefreshGeneration = 0;
+
   /**
    * Shared Test-button handler for both the Add and Edit forms. Never throws
    * out to WebviewFormPanel — a bad/incomplete field value is reported as a
@@ -4382,6 +4390,7 @@ export function registerInventoryCommands(
    *    `undefined`, and a vault read that rejects is caught here.
    */
   async function refreshStatus(sourceIdArg?: string): Promise<void> {
+    const myGeneration = ++statusRefreshGeneration;
     const targets = sourceIdArg
       ? (() => {
           const source = core.getInventorySource(sourceIdArg);
@@ -4389,6 +4398,12 @@ export function registerInventoryCommands(
         })()
       : core.getSnapshot().inventorySources;
     for (const source of targets) {
+      // A newer sweep has started while this one was awaiting — stop applying
+      // stale results (last-STARTED-wins, so an older completion never
+      // overwrites a newer apply).
+      if (myGeneration !== statusRefreshGeneration) {
+        return;
+      }
       if (inFlightSourceIds.get(source.id) !== undefined) {
         continue; // busy with a sync/edit/remove — skip, don't race it
       }
@@ -4408,7 +4423,10 @@ export function registerInventoryCommands(
         // record is never mutated) and degrades every provider failure to
         // undefined; secrets is a fresh local object, safe to pass as-is.
         const report = await fetchProviderStatus(provider, source.config, secrets);
-        if (report) {
+        // Re-check AFTER the (awaited) fetch: this is the load-bearing guard —
+        // a newer sweep may have started and applied while this fetch was in
+        // flight, and applying now would clobber it with older data.
+        if (report && myGeneration === statusRefreshGeneration) {
           core.applyInventoryStatus(source.id, report);
         }
       } catch {

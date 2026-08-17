@@ -8305,4 +8305,44 @@ describe("nexus.inventory.refreshStatus", () => {
     await registeredCommands.get("nexus.inventory.refreshStatus")!();
     expect(fetchStatus).toHaveBeenCalledTimes(1);
   });
+
+  it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let call = 0;
+    const RUNNING = { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" as const } } };
+    const STOPPED = { contractVersion: 1 as const, statuses: { "dev#1": { state: "stopped" as const } } };
+    const fetchStatus = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        // Sweep A (older): blocks until released, then returns the STALE report.
+        await firstGate;
+        return STOPPED;
+      }
+      // Sweep B (newer): resolves immediately with the FRESH report.
+      return RUNNING;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+
+    const sweepA = cmd(); // gen 1 — parks on firstGate inside fetchStatus
+    await Promise.resolve();
+    const sweepB = cmd(); // gen 2 — completes and applies the fresh (running) report
+    await sweepB;
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy.mock.calls[0][1].statuses["dev#1"].state).toBe("running");
+
+    releaseFirst(); // sweep A resumes; its apply must be dropped as stale
+    await sweepA;
+    expect(applySpy).toHaveBeenCalledTimes(1); // A did NOT apply over B
+    expect(applySpy.mock.calls.every((c) => c[1].statuses["dev#1"].state === "running")).toBe(true);
+  });
 });

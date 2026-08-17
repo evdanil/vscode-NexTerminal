@@ -1328,7 +1328,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
           listener();
         }
       }),
-    fire: () => void vscode.commands.executeCommand("nexus.inventory.refreshStatus")
+    // Return the thenable so the poll's in-flight latch can await the sweep.
+    // The `__poll` marker tells refreshStatus this is the background path, so it
+    // stays silent on total failure (the manual command warns instead).
+    fire: () => Promise.resolve(vscode.commands.executeCommand("nexus.inventory.refreshStatus", { __poll: true })).then(() => undefined)
   });
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);

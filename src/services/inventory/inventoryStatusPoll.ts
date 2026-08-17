@@ -19,18 +19,48 @@ export interface InventoryStatusPollOptions {
   getIntervalSeconds: () => number;
   /** Subscribe to changes of the interval setting; the callback re-evaluates. */
   onDidChangeInterval: (listener: () => void) => { dispose(): void };
-  /** Invoke one refresh of all sources (typically executeCommand of refreshStatus). */
-  fire: () => void;
+  /**
+   * Invoke one refresh of all sources (typically executeCommand of
+   * refreshStatus). May return a promise; when it does, the poll's in-flight
+   * latch awaits it so a slow sweep is never allowed to stack a second one.
+   */
+  fire: () => void | Promise<void>;
 }
 
 export function startInventoryStatusPoll(options: InventoryStatusPollOptions): { dispose(): void } {
   let visible = false;
   let timer: ReturnType<typeof setInterval> | undefined;
+  // Whether the poll is currently in its running state (a timer is armed). Used
+  // to fire ONCE on the not-running → running transition (P3-8) without firing
+  // again on a mere period change that keeps it running.
+  let running = false;
+  // P2-1 in-flight latch: an EVE `fetchStatus` sweep is a full folder walk with
+  // no overall deadline, and the interval can be as low as 1s. Without this a
+  // slow sweep would let every tick stack another concurrent crawl (each
+  // re-logging in). A tick is skipped while the previous sweep is still running.
+  let inFlight = false;
 
   const disarm = (): void => {
     if (timer !== undefined) {
       clearInterval(timer);
       timer = undefined;
+    }
+  };
+
+  const tick = (): void => {
+    if (inFlight) {
+      return; // a prior sweep is still running — do not stack another
+    }
+    const result = options.fire();
+    // Latch only while a real (pending) sweep is outstanding: a fire that
+    // returns a thenable (the executeCommand path / a gated test) holds the
+    // latch until it settles; a synchronous fire needs no latch at all.
+    if (result && typeof (result as Promise<void>).then === "function") {
+      inFlight = true;
+      const release = (): void => {
+        inFlight = false;
+      };
+      (result as Promise<void>).then(release, release);
     }
   };
 
@@ -42,8 +72,15 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): {
     // layer a second timer on top of it.
     disarm();
     if (shouldRun) {
-      timer = setInterval(options.fire, seconds * 1000);
+      // P3-8 — fire immediately ONLY on the arm transition (became visible /
+      // poll enabled), so a reload does not sit on an empty status map for a
+      // whole period. A period change that keeps it running does NOT re-fire.
+      if (!running) {
+        tick();
+      }
+      timer = setInterval(tick, seconds * 1000);
     }
+    running = shouldRun;
   };
 
   // Seeds `visible` from the view's CURRENT value immediately (createTreeView
