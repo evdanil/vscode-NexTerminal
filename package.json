@@ -127,7 +127,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT…)](command:nexus.config.import)\n[Add Inventory Source (NetBox)](command:nexus.inventory.addSource)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT…)](command:nexus.config.import)\n[Add Inventory Source](command:nexus.inventory.addSource)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -560,7 +560,7 @@
       },
       {
         "command": "nexus.inventory.addSource",
-        "title": "Add Inventory Source (NetBox)",
+        "title": "Add Inventory Source",
         "category": "Nexus",
         "icon": "$(add)"
       },
@@ -1262,6 +1262,26 @@
           "command": "nexus.authProfile.applyToFolder",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
           "group": "1_manage@4"
+        },
+        {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.inventory.editSource",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@2"
+        },
+        {
+          "command": "nexus.deviceTemplate.editRules",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@3"
+        },
+        {
+          "command": "nexus.inventory.removeSource",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@4"
         },
         {
           "command": "nexus.deviceTemplate.applyToFolder",

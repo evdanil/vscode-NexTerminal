@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { UnifiedProfileSeed } from "../ui/formDefinitions";
-import { unifiedProfileFormDefinition, unifiedProfileFormId } from "../ui/formDefinitions";
+import { unifiedProfileFormDefinition, unifiedProfileFormId , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -64,7 +64,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const snapshot = ctx.core.getSnapshot();
   // TELNET (Phase 0, MAJOR-3) — see serverCommands.ts: the protocol is what
   // keeps telnet servers out of the SSH-infrastructure pickers.
-  const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
+  const serverList = toSshInfrastructureServerList(snapshot.servers);
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles, {
     vscodeTerminalProfileNames: getConfiguredVscodeTerminalProfileNames()
   });

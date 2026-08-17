@@ -462,6 +462,20 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(disconnected.id).toBe(connected.id);
   });
 
+  it("ADDRESSLESS (Codex P1) — renders an addressless server with a ' (no address)' description and does not crash on the empty host (⊘ the default `user@` + empty host reads as a broken addressed server)", () => {
+    const item = new ServerTreeItem(makeServer({ id: "s1", host: "", port: 0, addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } }), false);
+    expect(item.description).toContain("(no address)");
+    // The empty host is not dangled after an "@" as though it were a real host.
+    expect(item.description).not.toMatch(/@\s*\(/);
+    expect(() => item.tooltip).not.toThrow();
+  });
+
+  it("an addressed synced server keeps its normal user@host description with no (no address) suffix", () => {
+    const item = new ServerTreeItem(makeServer({ id: "s2", host: "10.0.0.5", origin: { sourceId: "src", externalId: "e2", syncedAt: 1 } }), false);
+    expect(item.description).toContain("@10.0.0.5");
+    expect(item.description).not.toContain("(no address)");
+  });
+
   it("ServerTreeItem shows the IPMI/BMC address on its own tooltip line, only when set (issue #48)", () => {
     // Not part of the SSH connection, so it must not be folded into the
     // `user@host:port` summary — and a server with no BMC gets no line at all.

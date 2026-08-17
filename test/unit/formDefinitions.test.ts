@@ -42,6 +42,38 @@ function keyPathVisibleWhen(definition: ReturnType<typeof serverFormDefinition>)
   return keyPathField!.visibleWhen;
 }
 
+describe("serverFormDefinition — addressless (P2-a)", () => {
+  // A synced placeholder has no console address, so the Edit form must not mark
+  // Host (or the sentinel-port field) required — otherwise the user cannot open it
+  // to set OOB fields without inventing a host. ⊘ Leaving `required: true` blocks
+  // the save at the webview boundary before formValuesToServer is ever reached.
+  it("does NOT require Host or Port when the seed is addressless", () => {
+    const def = serverFormDefinition({ id: "s1", name: "stopped", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
+    expect(keyedField(def, "host").required).toBe(false);
+    expect(keyedField(def, "port").required).toBe(false);
+  });
+
+  it("STILL requires Host and Port for an ordinary (non-addressless) server", () => {
+    const def = serverFormDefinition({ id: "s1", name: "prod", host: "h", port: 22, username: "admin", authType: "agent" });
+    expect(keyedField(def, "host").required).toBe(true);
+    expect(keyedField(def, "port").required).toBe(true);
+  });
+
+  // P2-b (Codex) — the addressless Port field must seed the PROTOCOL-appropriate
+  // default (its stored value is a sentinel, so it can't seed from that). Hardcoding
+  // 22 left a telnet placeholder showing the SSH port; because `defaultsFrom` treats
+  // a value as automatic only when it equals the CURRENT protocol's default (23 for
+  // telnet), 22 was deemed user-owned and NOT corrected — so typing a host without
+  // toggling Protocol saved a telnet server on port 22. ⊘ Seeding 22 regardless of
+  // protocol reproduces that.
+  it("seeds the addressless Port from the protocol-appropriate default — 23 for a telnet placeholder, 22 for an ssh one", () => {
+    const telnet = serverFormDefinition({ id: "s1", name: "t", host: "", port: 0, username: "", authType: "agent", addressless: true, protocol: "telnet" });
+    expect(keyedField(telnet, "port").value).toBe(23);
+    const ssh = serverFormDefinition({ id: "s1", name: "s", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
+    expect(keyedField(ssh, "port").value).toBe(22);
+  });
+});
+
 describe("formDefinitions keyPath visibility", () => {
   it("shows server keyPath field only for authType=key on an SSH server", () => {
     // TELNET (Phase 0) — the key-file control now carries the SSH-only gate as
@@ -395,6 +427,62 @@ describe("inventorySourceFormDefinition", () => {
     testConnection: async () => undefined,
     fetchInventory: async () => ({ nodes: [] }) as never
   };
+
+  /**
+   * EVE-NG (Phase 1) — `InventoryConfigField.defaultValue` for boolean fields.
+   * A provider's documented default used to be unreachable: the checkbox was
+   * always seeded `existingConfig[field.id] === true`, so a NEW source stored
+   * `false` however the provider described the field.
+   */
+  describe("boolean field defaults", () => {
+    const boolProvider = (defaultValue?: boolean): InventoryProvider => ({
+      ...fakeProvider,
+      configFields: [{ id: "includeStopped", label: "Include Stopped", type: "boolean", defaultValue }]
+    });
+    const seedWith = (config: Record<string, string | number | boolean>) => ({
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "",
+      config,
+      secretFieldIds: []
+    });
+
+    it("starts a defaultValue:true boolean CHECKED on Add (⊘ seeding purely from the stored config leaves it unchecked, and the source silently imports none of the population the provider says it defaults to importing)", () => {
+      const field = keyedField(inventorySourceFormDefinition(boolProvider(true)), "cfg_includeStopped");
+      expect(field.type).toBe("checkbox");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(true);
+    });
+
+    it("leaves a boolean with no declared default unchecked on Add — NetBox's includeVms is byte-identical to before (⊘ defaulting every boolean to true silently turns VM import on for every new NetBox source)", () => {
+      const field = keyedField(inventorySourceFormDefinition(boolProvider(undefined)), "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(false);
+    });
+
+    it("honours a STORED false over a defaultValue:true when editing — the user unchecked it, and a default that re-checks it every visit is a setting that cannot be turned off (⊘ `existingConfig[id] || defaultValue` reads a stored `false` as absent and re-checks the box)", () => {
+      const definition = inventorySourceFormDefinition(boolProvider(true), seedWith({ includeStopped: false }));
+      const field = keyedField(definition, "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(false);
+    });
+
+    it("still shows a stored true as checked when the default is false", () => {
+      const definition = inventorySourceFormDefinition(boolProvider(false), seedWith({ includeStopped: true }));
+      const field = keyedField(definition, "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(true);
+    });
+  });
+
+  // EVE-NG (Phase 1) — the Target Folder placeholder is an EXAMPLE shown on
+  // every provider's source form, so it must not read as an instruction to
+  // name a folder after one specific provider.
+  it("gives Target Folder a provider-neutral example placeholder (\u2298 \"e.g. Datacenter/NetBox\" is a NetBox instruction on an EVE-NG form)", () => {
+    const field = keyedField(inventorySourceFormDefinition(fakeProvider), "targetFolder");
+    const placeholder = String((field as { placeholder?: string }).placeholder ?? "");
+    expect(placeholder).not.toMatch(/NetBox/i);
+    expect(placeholder).toContain("e.g.");
+  });
 
   it("marks a provider-declared number field with step \"any\" so fractional values pass native validation (kills the missing-step regression)", () => {
     const definition = inventorySourceFormDefinition(fakeProvider);

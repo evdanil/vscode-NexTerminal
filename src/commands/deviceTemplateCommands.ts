@@ -24,7 +24,7 @@ import {
   type CapturedProxyPasswordSecret
 } from "../services/inventory/proxySecretHygiene";
 import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
-import { deviceTemplateFormDefinition, type ServerListEntry } from "../ui/formDefinitions";
+import { deviceTemplateFormDefinition, type ServerListEntry , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { ManagementListPanel, type ManagementListDescriptor } from "../ui/managementListPanel";
@@ -33,6 +33,7 @@ import { formValuesToProxy } from "./serverCommands";
 import { isDescendantOrSelf } from "../utils/folderPaths";
 import { naturalCompare } from "../utils/naturalCompare";
 import type { CommandContext } from "./types";
+import { resolveSourceIdArg } from "./inventoryCommands";
 
 /**
  * DEVICE TEMPLATES (issue #48 PR-T1b) — the user-visible surface on top of the
@@ -126,7 +127,7 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
 }
 
 function serverListEntries(ctx: CommandContext): ServerListEntry[] {
-  return ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
+  return toSshInfrastructureServerList(ctx.core.getSnapshot().servers);
 }
 
 /** The inventory sources whose `templateRules` reference this template id. */
@@ -1001,8 +1002,11 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
 
     vscode.commands.registerCommand("nexus.deviceTemplate.manage", () => manageDeviceTemplates(ctx)),
 
+    // Same three invocation shapes the nexus.inventory.* handlers accept — see
+    // `resolveSourceIdArg`. The Settings tree's per-source rows carry this as
+    // an inline action, and VS Code hands it the TREE ITEM rather than an id.
     vscode.commands.registerCommand("nexus.deviceTemplate.editRules", (arg?: unknown) =>
-      editTemplateRules(ctx, registry, typeof arg === "string" ? arg : undefined)
+      editTemplateRules(ctx, registry, resolveSourceIdArg(arg))
     ),
 
     vscode.commands.registerCommand("nexus.deviceTemplate.applyToFolder", async (arg?: unknown) => {

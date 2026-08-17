@@ -363,7 +363,11 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       hint: "Telnet is cleartext and has no login of its own — you log in at the device's own prompt. Use it for console servers and lab gear that offer nothing else; credentials, tunnels, SFTP and jump hosts are SSH-only.",
       visibleWhen: vw
     },
-    { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the server.", visibleWhen: vw },
+    // ADDRESSLESS (Codex P2-a) — a synced placeholder has no console address, so
+    // Host is NOT required when editing one: the user opens it to set OOB fields
+    // (IPMI auth profile, BMC protocol), not to invent a host. Typing a real host
+    // gives it an address and clears the flag on save (`formValuesToServer`).
+    { type: "text", key: "host", label: "Host", required: !seed?.addressless, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the server.", visibleWhen: vw },
     // TELNET (Phase 0, MINOR-3) — the default follows the Protocol select (the
     // sync engine already maps a telnet endpoint to 23), both at render time for
     // an existing record and live in the form via `defaultsFrom`. A port the
@@ -372,10 +376,26 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       type: "number",
       key: "port",
       label: "Port",
-      required: true,
+      // ADDRESSLESS (Codex P2-a) — the placeholder's stored port is a sentinel (0)
+      // that fails the min:1 control, so Port is not required for one and its field
+      // shows a sensible default (should the user give it a host, in which case the
+      // save reads this value). While it stays addressless the save forces the
+      // sentinel regardless of what this shows.
+      //
+      // P2-b (Codex) — that default is the PROTOCOL-appropriate one (telnet→23,
+      // ssh→22), NOT a hardcoded 22. `defaultsFrom` treats a shown port as automatic
+      // only when it equals the CURRENT protocol's default, so seeding 22 on a
+      // telnet placeholder was deemed user-owned and never corrected — typing a host
+      // then saved a telnet server on the SSH port. Seeding the matching default
+      // keeps it automatic (and already correct without a Protocol toggle).
+      required: !seed?.addressless,
       min: 1,
       max: 65535,
-      value: seed?.port ?? (seed?.protocol === "telnet" ? TELNET_DEFAULT_PORT : SSH_DEFAULT_PORT),
+      value: seed?.addressless
+        ? seed?.protocol === "telnet"
+          ? TELNET_DEFAULT_PORT
+          : SSH_DEFAULT_PORT
+        : seed?.port ?? (seed?.protocol === "telnet" ? TELNET_DEFAULT_PORT : SSH_DEFAULT_PORT),
       defaultsFrom: { field: "protocol", defaults: { ssh: SSH_DEFAULT_PORT, telnet: TELNET_DEFAULT_PORT } },
       visibleWhen: vw
     },
@@ -649,6 +669,12 @@ export interface ServerListEntry {
    * caller that does not supply it keeps today's behaviour.
    */
   protocol?: ServerProtocol;
+  /**
+   * ADDRESSLESS (Codex P1 review MAJOR-1) — carried so the SSH-infrastructure
+   * pickers can leave placeholder servers with no console address out, exactly
+   * as they leave telnet servers out. Optional: absent reads as not-addressless.
+   */
+  addressless?: boolean;
 }
 
 /**
@@ -664,9 +690,28 @@ export interface ServerListEntry {
  * stored — a server can be switched to Telnet long after some other server
  * named it — and a picker cannot retract a choice already saved.
  */
+/**
+ * The single adapter every command uses to turn its `ServerConfig` snapshot into
+ * the `ServerListEntry[]` the SSH-infrastructure pickers consume. Co-located with
+ * `sshInfrastructureCandidates` (the filter) and `ServerListEntry` (the shape) on
+ * purpose: the filter can only exclude a telnet/addressless server if the flag it
+ * reads is actually carried here, and three inline `.map`s that each had to
+ * remember `protocol` and `addressless` was exactly how the flag got dropped
+ * (Codex review P2). One place to carry every field the pickers filter on.
+ */
+export function toSshInfrastructureServerList(
+  servers: ReadonlyArray<Pick<ServerConfig, "id" | "name" | "protocol" | "addressless">>
+): ServerListEntry[] {
+  return servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol, addressless: s.addressless }));
+}
+
 function sshInfrastructureCandidates(servers: ServerListEntry[] | undefined, excludeId?: string): ServerListEntry[] {
   return (servers ?? []).filter(
-    (s) => s.id !== excludeId && resolveServerProtocol(s) !== "telnet"
+    // ADDRESSLESS (Codex P1 review MAJOR-1) — a placeholder with no console
+    // address resolves ssh (host "") but is no more usable as a jump host or
+    // IPMI gateway than a telnet server: selecting it would prompt and handshake
+    // against nothing, so it is excluded here exactly as telnet is.
+    (s) => s.id !== excludeId && resolveServerProtocol(s) !== "telnet" && s.addressless !== true
   );
 }
 
@@ -1313,7 +1358,15 @@ function inventoryConfigFieldDescriptor(
       type: "checkbox",
       key,
       label: field.label,
-      value: existingConfig[field.id] === true,
+      // EVE-NG (Phase 1) — a STORED value always wins, including a stored
+      // `false`; only a field with nothing stored yet (the Add form, or a
+      // provider field added after this source was saved) falls back to the
+      // provider's declared `defaultValue`. `hasOwnProperty` rather than a
+      // `??`/`||` chain because `false` is a real stored answer that both of
+      // those would read as "unset" and flip back on every visit.
+      value: Object.prototype.hasOwnProperty.call(existingConfig, field.id)
+        ? existingConfig[field.id] === true
+        : field.defaultValue === true,
       hint: field.description
     };
   }
@@ -1651,7 +1704,7 @@ export function inventorySourceFormDefinition(
         type: "text",
         key: "targetFolder",
         label: "Target Folder",
-        placeholder: "e.g. Datacenter/NetBox — leave empty for the top level",
+        placeholder: "e.g. Datacenter/Lab — leave empty for the top level",
         value: seed?.targetFolder ?? "",
         hint: "Servers synced from this source are placed under this folder. Leave empty for the top level."
       },

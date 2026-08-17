@@ -81,11 +81,18 @@ export class ServerTreeItem extends vscode.TreeItem {
     const templateSuffix = applied.length > 0
       ? `\nTemplate-applied: ${applied.map((f) => TEMPLATE_FIELD_SHORT_LABELS[f]).join(", ")} (your edits override)`
       : "";
-    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}`;
+    // ADDRESSLESS (Codex P1) — a synced placeholder with no console address yet.
+    // Its empty host must not be dangled after an "@" as though it were a real
+    // host, in the tooltip or the description.
+    const addressless = server.addressless === true;
+    const hostSummary = addressless ? "no console address yet" : `${displayUsername}@${server.host}:${server.port}`;
+    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";
-    this.description = showDescription ? `${displayUsername}@${server.host}${authDesc}${syncedDesc}` : undefined;
+    const addresslessDesc = addressless ? " (no address)" : "";
+    const descHead = addressless ? displayUsername : `${displayUsername}@${server.host}`;
+    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}` : undefined;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
     this.iconPath = new vscode.ThemeIcon(
       connected ? "plug" : "debug-disconnect",

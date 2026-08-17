@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { telnetUnsupportedMessage } from "../../src/utils/protocolGuards";
+import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../../src/utils/protocolGuards";
 import type { ServerConfig } from "../../src/models/config";
 
 function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
@@ -34,5 +34,31 @@ describe("telnetUnsupportedMessage", () => {
   // hand-edited backup carrying "TELNET" past it and straight into the SSH path.
   it("resolves the protocol rather than trusting the stored value", () => {
     expect(telnetUnsupportedMessage({ name: "x", protocol: "TELNET" } as unknown as ServerConfig, "Tunnels")).toBeUndefined();
+  });
+});
+
+describe("addresslessUnavailableMessage", () => {
+  it("says nothing for a non-addressless server (⊘ a blanket refusal breaks every ordinary server)", () => {
+    expect(addresslessUnavailableMessage(server())).toBeUndefined();
+    expect(addresslessUnavailableMessage(server({ addressless: false }))).toBeUndefined();
+  });
+
+  it("names the server and explains the no-address state for an addressless one", () => {
+    const message = addresslessUnavailableMessage(server({ addressless: true, host: "" }));
+    expect(message).toContain("eve-r1");
+    expect(message?.toLowerCase()).toContain("no console address");
+  });
+
+  /**
+   * P2 (Codex review) — the guard is SHARED across providers and gets no
+   * provider identity, but an addressless server can come from an IP-less NetBox
+   * row (remedy: assign an address in NetBox), not only a stopped EVE-NG node.
+   * So the message must NOT prescribe an EVE-NG-specific remedy.
+   */
+  it("is provider-NEUTRAL — it does not tell the user to start something in EVE-NG (⊘ EVE-NG-specific advice is wrong for an IP-less NetBox row)", () => {
+    const message = addresslessUnavailableMessage(server({ addressless: true, host: "" }));
+    expect(message).not.toMatch(/eve-ng/i);
+    // Points at the inventory source as the general remedy.
+    expect(message?.toLowerCase()).toContain("source");
   });
 });

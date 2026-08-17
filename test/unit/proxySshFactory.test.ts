@@ -288,6 +288,23 @@ describe("ProxySshFactory", () => {
    * `SilentAuthSshFactory`: a vault read and a password prompt for a host that
    * has no SSH login, ending in a raw ssh2 handshake error against port 23.
    */
+  describe("addressless jump host", () => {
+    // ADDRESSLESS (Codex P1 review MAJOR-1) — the stale-id defense: a picker can
+    // never retract a jump-host choice already saved, and a server can go
+    // addressless (its device stopped) long after another named it. Selecting an
+    // addressless jump host must refuse BEFORE any vault read or auth attempt.
+    it("refuses an addressless jump host before any authentication is attempted (⊘ no guard reaches SilentAuthSshFactory with host \"\", prompting and handshaking against nothing)", async () => {
+      servers.set("srv-addr-jump", makeServer({ id: "srv-addr-jump", name: "stopped-node", addressless: true, host: "" }));
+      const target = makeServer({ id: "srv-target", proxy: { type: "ssh", jumpHostId: "srv-addr-jump" } });
+      servers.set(target.id, target);
+      const factory = await createFactory();
+
+      await expect(factory.connect(target)).rejects.toThrow(/stopped-node/);
+      expect(authFactory.connect).not.toHaveBeenCalled();
+      expect(vault.get).not.toHaveBeenCalled();
+    });
+  });
+
   describe("telnet jump host", () => {
     // ⊘ The assertion that matters is `authFactory.connect` NOT being called:
     // an implementation that merely lets the connection fail later still

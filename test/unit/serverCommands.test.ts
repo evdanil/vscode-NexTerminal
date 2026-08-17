@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import {
   registerServerCommands,
+  connectServer,
   authProfileCredentialMirror,
   formValuesToServer,
   formValuesToProxy,
@@ -20,6 +21,7 @@ import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPass
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
+import { validateServerConfig } from "../../src/utils/validation";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -790,6 +792,34 @@ describe("server disconnect with tunnel autoStop", () => {
     // the marker (e.g. writing it back onto `server` too) would make the
     // original unadoptable, which is the opposite failure.
     expect(ctx.core.getServer("srv-1")?.formerlySynced).toEqual(marker);
+  });
+
+  // P2-1 (Fable) — duplicating spreads the record and strips `origin`, so an
+  // addressless placeholder would become a MANUAL addressless record: an invariant
+  // violation (addressless exists only for synced placeholders), which no sync will
+  // ever upgrade (no origin) and whose connect refusal tells the user to "re-sync the
+  // source" it has no link to. ⊘ Minting the copy leaves that record in the store.
+  it("P2-1 — refuses to duplicate an addressless placeholder with a message, writing nothing", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ addressless: true, host: "", port: 0, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.duplicate")!("srv-1");
+
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("can't be duplicated"));
+  });
+
+  it("P2-1 control — still duplicates an ORDINARY addressed server (⊘ an over-broad guard would block normal duplication)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.duplicate")!("srv-1");
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(expect.objectContaining({ name: "Server 1 (copy)" }));
   });
 
   it("group disconnect applies only to direct-folder servers and skips hidden ones", async () => {
@@ -2130,6 +2160,36 @@ describe("SSH File Explorer auto-open on manual connect", () => {
 
     expect(ctx.sftpService.connect).not.toHaveBeenCalled();
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
+  });
+
+  // P3-3 (Fable) — group connect swept every node through connectServer, which pops
+  // the addressless info message per node — a popup storm on an EVE lab folder
+  // (mostly stopped, the documented common case). Skip addressless nodes and show
+  // ONE aggregate message. ⊘ Sweeping them builds no pty but fires one toast each.
+  it("P3-3 — group connect skips addressless nodes and shows one aggregate message, not one toast per stopped node", async () => {
+    const origin = { sourceId: "s", externalId: "e", syncedAt: 1 };
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({ id: "a1", name: "stopped-1", group: "Lab", addressless: true, host: "", port: 0, origin }),
+        makeServer({ id: "a2", name: "stopped-2", group: "Lab", addressless: true, host: "", port: 0, origin }),
+        makeServer({ id: "s1", name: "live", group: "Lab", host: "10.0.0.1" })
+      ]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.group.connect")!(new FolderTreeItem("Lab", "Lab"));
+    await flushPromises();
+
+    // Exactly one addressless message — the aggregate — never one per stopped node.
+    const infoMsgs = vi.mocked(vscode.window.showInformationMessage as any).mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .filter((m: string) => /no console address/i.test(m));
+    expect(infoMsgs).toHaveLength(1);
+    expect(infoMsgs[0]).toContain("2");
+    // Only the live server built a pty.
+    expect(SshPty).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the SSH session registered when automatic File Explorer browse fails", async () => {
@@ -4146,6 +4206,239 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
   });
 });
 
+/**
+ * ADDRESSLESS (Codex P1 on #82) — a synced placeholder with no console address
+ * (a stopped EVE node). Connecting must show a friendly "start it and re-sync"
+ * message and do NOTHING else — no vault read, no prompt, no transport.
+ */
+/**
+ * ADDRESSLESS (Codex review P2) — the picker-exclusion filter in
+ * `sshInfrastructureCandidates` only works if the adapters that build
+ * `ServerListEntry` carry the `addressless` flag. This exercises the REAL edit
+ * adapter (serverCommands → serverFormDefinition), not a hand-built entry, so a
+ * future adapter that forgets the flag is caught end to end.
+ */
+describe("addressless servers are not offered as SSH infrastructure (end-to-end via the real edit adapter)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  it("omits an addressless server from the Jump Host and IPMI Gateway pickers, while an ordinary SSH server still appears (⊘ the adapter drops `addressless`, so the filter never sees it and the placeholder is offered as infrastructure)", async () => {
+    const edited = makeServer({ id: "srv-1", name: "prod" });
+    const bastion = makeServer({ id: "srv-ssh", name: "bastion" });
+    const placeholder = makeServer({ id: "srv-addr", name: "stopped-node", host: "", port: 0, addressless: true, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [edited, bastion, placeholder] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    const definition = mockWebviewFormPanelOpen.mock.calls.at(-1)![1] as { fields: Array<{ key?: string; options?: { value: string }[] }> };
+    const optionValues = (key: string): string[] => {
+      const field = definition.fields.find((f) => f.key === key);
+      return field?.options?.map((o) => o.value) ?? [];
+    };
+
+    for (const key of ["proxyJumpHostId", "ipmiGatewayServerId"]) {
+      expect(optionValues(key), key).toContain("srv-ssh");
+      expect(optionValues(key), key).not.toContain("srv-addr");
+    }
+  });
+});
+
+/**
+ * ADDRESSLESS (Codex P2-a) — an addressless placeholder (host "", addressless:true)
+ * must be EDITABLE so the user can configure its OOB fields (IPMI auth profile, BMC
+ * protocol) without inventing a console host. The edit path must recognize and
+ * preserve `addressless` on save; typing a real host gives it an address and
+ * clears the flag. Measured on the PERSISTED record — the whole failure mode is
+ * the form and the save path disagreeing.
+ */
+describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  async function openEdit(ctx: CommandContext): Promise<{ onSubmit: (v: Record<string, unknown>) => Promise<void> }> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+  }
+
+  // The submission the webview composes for an addressless server: Host is left
+  // empty (the placeholder has no console address), only OOB fields differ.
+  function addresslessSubmit(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      name: "stopped-node",
+      host: "",
+      port: 0,
+      protocol: "ssh",
+      username: "admin",
+      authType: "agent",
+      ...overrides
+    };
+  }
+
+  const placeholder = () =>
+    makeServer({ id: "srv-1", name: "stopped-node", host: "", port: 0, username: "admin", authType: "agent", addressless: true, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } });
+
+  it("saves an edit to an addressless server, KEEPING addressless + empty host while applying the new IPMI auth profile (⊘ Host-required / formValuesToServer returning undefined aborts the save so the OOB fields can never be set)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: [makeAuthProfile({ id: "ap-bmc", username: "bmc" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ ipmiAuthProfileId: "ap-bmc" }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.addressless).toBe(true);
+    expect(saved.host).toBe("");
+    expect(saved.ipmiAuthProfileId).toBe("ap-bmc");
+    // The persisted record must survive its own reload.
+    expect(validateServerConfig(saved)).toBe(true);
+  });
+
+  it("CLEARS addressless when the user types a real host into an addressless profile — it becomes a normal addressed server (⊘ preserving addressless regardless of host freezes the placeholder even after the user gives it an address)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: []
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.addressless ?? false).toBe(false);
+    expect(saved.host).toBe("10.0.0.5");
+    expect(saved.port).toBe(22);
+  });
+
+  // P2-3 fallback (Fable) — there is no syncedHost ownership stamp, so the next
+  // sync of a still-consoleless device will blank a hand-typed host. Warn the user
+  // at save so the impending revert is not a silent surprise. ⊘ Saving silently
+  // lets the address vanish on the next sync with no disclosure.
+  it("P2-3 — warns that the next sync may revert a host typed into an addressless placeholder", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: []
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("next sync"));
+  });
+
+  it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host does not warn about a revert (⊘ warning on every placeholder edit is noise)", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: [makeAuthProfile({ id: "ap-bmc", username: "bmc" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ ipmiAuthProfileId: "ap-bmc" }));
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("next sync"));
+  });
+});
+
+describe("addressless connect guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("refuses to connect an addressless server with a friendly message and builds NEITHER an SshPty NOR a TelnetPty (⊘ no guard reaches SshPty with host \"\", prompting and handshaking against nothing)", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx.sshFactory as any).connect = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(SshPty).not.toHaveBeenCalled();
+    expect(TelnetPty).not.toHaveBeenCalled();
+    expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining("no console address yet")
+    );
+  });
+
+  it("refuses Test Connection against an addressless server without touching the SSH factory (⊘ an SSH-only feature slips through to a raw empty-host failure)", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx.sshFactory as any).connect = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+
+    expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+  });
+
+  // REVIEW FINDING (P2) — a watchdog wrapper (Run Macro on Server / Connect and
+  // Run Script) arms a 90s timer, then calls connectServer and waits for its
+  // onConnectFailed signal (or a session). The addressless early-return showed the
+  // friendly message but never fired that signal, so the wrapper had nothing to
+  // settle on and sat out the full watchdog before showing a MISLEADING timeout.
+  // ⊘ Drop the onConnectFailed call from the early-return and the caller is left
+  // awaiting a signal that never comes.
+  it("fires onConnectFailed when refusing an addressless server, so a watchdog wrapper settles at once instead of hanging 90s", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const onConnectFailed = vi.fn();
+
+    await connectServer(ctx, "srv-1", { onConnectFailed });
+
+    expect(onConnectFailed).toHaveBeenCalledTimes(1);
+    expect(onConnectFailed).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+  });
+
+  // The script wrapper (nexus.server.runWithScript → connectAndRunScript) does not
+  // await connectServer's result the way the macro wrapper does; it arms its own
+  // 90s timer and fires the script when a session appears. On an addressless
+  // target no session ever appears, so without an onConnectFailed hook the timer
+  // waits out the full 90s and shows "the script did not start within 90s".
+  // ⊘ Leave the wrapper's onConnectFailed unwired (or connectServer not firing it)
+  // and the misleading timeout warning fires after the watchdog elapses.
+  it("cancels the connect-and-run-script watchdog immediately on an addressless target, never the misleading 90s timeout", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    ctx.scriptRuntimeManager = { runScript: vi.fn(async () => {}) } as any;
+    registerServerCommands(ctx);
+
+    vi.useFakeTimers();
+    try {
+      await registeredCommands.get("nexus.server.runWithScript")!("srv-1");
+      // Run out the entire watchdog: a live timer would fire its warning here.
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("did not start within"));
+      expect(ctx.scriptRuntimeManager.runScript).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("telnet connect path", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -4587,5 +4880,25 @@ describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
     await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
 
     expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:23\nIPMI/BMC: 10.9.9.9");
+  });
+
+  // P3-2 (Fable) — an addressless placeholder has no console address, so Copy Info
+  // must not paste the nonsense ":0"; it heads with "(no console address)" and
+  // still carries the BMC line, which is often the only usable address. ⊘ Emitting
+  // `${host}:${port}` renders ":0".
+  it("P3-2 — renders '(no console address)' for an addressless placeholder and keeps the BMC line", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ addressless: true, host: "", port: 0, username: "admin", ipmiHost: "10.9.9.9", origin: { sourceId: "s", externalId: "e", syncedAt: 1 } })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    const copied = vi.mocked(vscode.env.clipboard.writeText).mock.calls[0][0];
+    expect(copied).toContain("(no console address)");
+    expect(copied).not.toContain(":0");
+    expect(copied).toContain("IPMI/BMC: 10.9.9.9");
   });
 });

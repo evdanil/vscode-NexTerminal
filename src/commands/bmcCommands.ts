@@ -4,6 +4,7 @@ import { resolveBmcWebProtocol } from "../models/config";
 import { resolveProfileTokens } from "../services/profileTokens";
 import { profileTokenServer, resolveIpmiTerminalEnv } from "./ipmiCredentials";
 import {
+  ipmiGatewayUnavailableMessage,
   openServerAdvancedEdit,
   reportProfileTokenError,
   resolveIpmiGatewayServer,
@@ -107,8 +108,22 @@ export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise
   // configured route. Env injection cannot cross to the gateway shell, so the
   // `-a` form is used (ipmitool prompts on the bastion) and NO credential is read
   // or prompted for here — the §3.5 no-secret invariant holds by construction.
-  const gateway = resolveIpmiGatewayServer(ctx, server);
-  if (gateway) {
+  const gatewayResolution = resolveIpmiGatewayServer(ctx, server);
+  // SAFETY (Codex P1) — a CONFIGURED gateway that is now unavailable (deleted, so
+  // its id dangles, or downgraded to addressless during inventory sync) ABORTS the
+  // command. It must NOT fall back to the local `-E` terminal: a BMC only reachable
+  // from the now-gone gateway would otherwise be dialed from this machine, where an
+  // overlapping private address can reach a DIFFERENT device — the wrong box for a
+  // chassis/power action. Distinct from `kind: "none"` (no gateway configured),
+  // where local IS the configured route and the command proceeds locally below.
+  if (gatewayResolution.kind === "unavailable") {
+    await vscode.window.showErrorMessage(
+      ipmiGatewayUnavailableMessage(server, gatewayResolution.reason, "connecting to the BMC")
+    );
+    return;
+  }
+  if (gatewayResolution.kind === "server") {
+    const gateway = gatewayResolution.server;
     const routed = resolveProfileTokens(BMC_SOL_COMMAND_GATEWAY, profileTokenServer(ctx, server), { form: "command" });
     if (!routed.ok) {
       await reportProfileTokenError(routed.error, server, { subject: "Connect BMC Serial Console", outcome: "run" });
@@ -150,18 +165,10 @@ export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise
     return;
   }
 
-  // The target NAMES an IPMI gateway that no longer resolves (deleted, or an
-  // invalid self-reference) — distinct from a server that never had one, where
-  // local IS the configured route. The macro path surfaces this via
-  // noGatewayFallbackNote; the direct command must too, or a BMC only reachable
-  // from the now-missing gateway is silently dialed from a machine that can't
-  // reach it. Non-blocking (local delivery still proceeds below).
-  if (server.ipmiGatewayServerId) {
-    void vscode.window.showWarningMessage(
-      `The IPMI gateway configured for "${server.name}" is no longer available — connecting to the BMC from this machine instead.`
-    );
-  }
-
+  // Reached only for `kind: "none"` — no gateway configured (id unset, empty, or a
+  // self-reference). Local delivery IS the configured route here; a CONFIGURED but
+  // unavailable gateway already aborted above rather than dialing the BMC from this
+  // machine.
   const resolution = resolveProfileTokens(BMC_SOL_COMMAND, profileTokenServer(ctx, server), { form: "command" });
   if (!resolution.ok) {
     // Subject-phrased: a menu click has no macro, so the refusal names the command

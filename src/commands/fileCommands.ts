@@ -15,7 +15,7 @@ import {
 } from "../utils/networkPath";
 import { offerUNCHostRemediation } from "../ui/uncRemediation";
 import { naturalCompare } from "../utils/naturalCompare";
-import { telnetUnsupportedMessage } from "../utils/protocolGuards";
+import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 import type { CommandContext } from "./types";
 
 const MAX_DOWNLOAD_DEPTH = 100;
@@ -488,6 +488,11 @@ export async function browseServerFiles(ctx: CommandContext, server: ServerConfi
   // telnet at all. Unguarded this reached `sftpService.connect`, which would try
   // an SSH handshake against the telnet port and fail several seconds later with
   // an error naming a port that is answering perfectly well.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showWarningMessage(addresslessMessage);
+    return;
+  }
   const unsupported = telnetUnsupportedMessage(server, "File browsing (SFTP)");
   if (unsupported) {
     void vscode.window.showWarningMessage(unsupported);

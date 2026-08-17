@@ -21,7 +21,7 @@ import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
-import { serverFormDefinition } from "../ui/formDefinitions";
+import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -42,7 +42,7 @@ import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { configMutationLock } from "../services/configMutationLock";
-import { telnetUnsupportedMessage } from "../utils/protocolGuards";
+import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 
 export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -56,7 +56,9 @@ export async function pickServer(core: import("../core/nexusCore").NexusCore): P
       .sort((a, b) => naturalCompare(a.name, b.name))
       .map((server) => ({
         label: server.name,
-        description: `${server.username}@${server.host}:${server.port}`,
+        // P3-2 (Fable) — an addressless placeholder has no endpoint, so show
+        // "(no address)" rather than the nonsense "user@:0".
+        description: server.addressless === true ? "(no address)" : `${server.username}@${server.host}:${server.port}`,
         server
       })),
     { title: "Select Nexus Server" }
@@ -614,7 +616,18 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
   await ctx.secretVault.delete(secretKey);
 }
 
-export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
+// ADDRESSLESS (Codex P2-a) — the sentinel port an addressless placeholder carries
+// (mirrors `ADDRESSLESS_PORT` in the sync engine, which mints these records). A
+// placeholder has no console endpoint, so the port is a placeholder too; kept in
+// sync-engine and form-save so an edited placeholder round-trips to the same shape.
+const ADDRESSLESS_PORT = 0;
+
+export function formValuesToServer(
+  values: FormValues,
+  existingId?: string,
+  preserveIsHidden = false,
+  existingAddressless = false
+): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
   const username = typeof values.username === "string" ? values.username.trim() : "";
@@ -625,10 +638,21 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
   // `bmcWebProtocol` follows below). Anything else the submission carries is not
   // a transport we implement, so it reads as the default.
   const isTelnet = values.protocol === "telnet";
+  // ADDRESSLESS (Codex P2-a) — editing a synced placeholder that has no console
+  // address. The Edit form leaves Host empty for it, and a normal record needs a
+  // host, so without this the save would abort (`return undefined`) and the user
+  // could never reach the OOB fields (IPMI auth profile, BMC protocol) the
+  // placeholder exists to hold. Preserve the addressless shape (empty host,
+  // sentinel port) instead — but ONLY when the user left Host empty. Typing a
+  // real host means "give this device an address": fall through to the normal
+  // addressed record and let the flag clear (the next sync's ownership decides).
+  const keepAddressless = existingAddressless && !host;
   // A telnet server has no protocol-level login, so the form DISABLES the
   // username control for one — a disabled control submits nothing, and the
-  // save must not reject the record over a field it never asked for.
-  if (!name || !host || (!username && !isTelnet)) {
+  // save must not reject the record over a field it never asked for. An
+  // addressless placeholder likewise never offered a Host (and may carry an
+  // empty username), so its emptiness is not a rejection either.
+  if (!name || (!keepAddressless && (!host || (!username && !isTelnet)))) {
     return undefined;
   }
   if (normalizedGroup === null) {
@@ -638,7 +662,10 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     id: existingId ?? randomUUID(),
     name,
     host,
-    port: typeof values.port === "number" ? values.port : 22,
+    port: keepAddressless ? ADDRESSLESS_PORT : typeof values.port === "number" ? values.port : 22,
+    // Preserved only while the record stays addressless; typing a host clears it
+    // (absent ≡ addressed), so a placeholder upgraded in the form saves as normal.
+    ...(keepAddressless ? { addressless: true } : {}),
     protocol: isTelnet ? "telnet" : undefined,
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
@@ -1080,6 +1107,23 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   if (!server) {
     return;
   }
+  // ADDRESSLESS (Codex P1) — refuse BEFORE any transport branch: a placeholder
+  // with no console address has nothing to connect to, so it must not reach the
+  // SSH factory (prompt + vault + handshake to an empty host) or the telnet
+  // path. This is the first thing checked, ahead of the protocol branch.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showInformationMessage(addresslessMessage);
+    // REVIEW FINDING (P2) — signal the refusal, do not just return. A watchdog
+    // wrapper (Run Macro on Server / Connect and Run Script) arms a 90s timer
+    // and then awaits `onConnectFailed` (or a new session) to know the connect
+    // is over. A silent early-return here leaves that wrapper with nothing to
+    // settle on, so it sits out the whole watchdog and then shows a MISLEADING
+    // timeout. Firing `onConnectFailed` is the same signal a real initial-connect
+    // failure raises (services/ssh/sshPty.ts), so the wrappers settle at once.
+    options.onConnectFailed?.(addresslessMessage);
+    return;
+  }
   // TELNET (Phase 0) — branch BEFORE anything auth-shaped runs. A telnet server
   // must never reach `SilentAuthSshFactory`: no password prompt, no vault read.
   if (resolveServerProtocol(server) === "telnet") {
@@ -1268,6 +1312,13 @@ async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise
   if (!server) {
     return;
   }
+  // ADDRESSLESS (Codex P1) — an SSH-only feature against a placeholder with no
+  // console address must refuse up front rather than handshake against nothing.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showWarningMessage(addresslessMessage);
+    return;
+  }
   // TELNET (Phase 0) — this opens an SSH connection and reports its handshake.
   // Against a telnet server it would report a raw ssh2 error naming a port that
   // is answering perfectly well; say the real reason instead.
@@ -1360,7 +1411,22 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
   }, timeoutMs);
 
   try {
-    await connectServer(ctx, server.id, { allowAutoFileExplorer: false });
+    await connectServer(ctx, server.id, {
+      allowAutoFileExplorer: false,
+      // REVIEW FINDING (P2) — an initial-connect failure (or an addressless
+      // refusal) never produces a session, so the change-event subscription
+      // above stays silent and, without this, the timer would sit out the full
+      // 90s before showing a MISLEADING "the script did not start" warning. Tear
+      // the watchdog down the moment the connect reports it failed — the cause
+      // has already been surfaced (SSH diagnostic, or the addressless notice),
+      // so there is nothing to add here.
+      onConnectFailed: () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        unsubscribe();
+      }
+    });
   } catch (err) {
     // connectServer can reject (auth failure, proxy error). Without this
     // the subscription + timer would leak until the 90-second watchdog.
@@ -1482,7 +1548,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const snapshot = ctx.core.getSnapshot();
       // TELNET (Phase 0, MAJOR-3) — the protocol rides along so the Jump Host
       // and IPMI Gateway pickers can leave telnet servers out of their options.
-      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
+      const serverList = toSshInfrastructureServerList(snapshot.servers);
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       // Issue #48 — a caller that is sending the user here to fill in an
       // advanced field (a `${profile.ipmiHost}` refusal) says so, and the
@@ -1512,7 +1578,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const candidate = formValuesToServer(values, existing.id, existing.isHidden);
+          const candidate = formValuesToServer(values, existing.id, existing.isHidden, existing.addressless === true);
           if (!candidate) {
             return;
           }
@@ -1958,6 +2024,16 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
             );
           }
+          // P2-3 fallback (Fable) — the user gave an addressless placeholder a host
+          // in the form (`existing` was addressless, the saved record is not). There
+          // is no host-ownership stamp yet, so the NEXT sync of a still-consoleless
+          // device will blank this hand-typed host. Warn so the revert is disclosed
+          // rather than a silent surprise.
+          if (existing.addressless === true && candidate.addressless !== true) {
+            void vscode.window.showWarningMessage(
+              `You gave "${existing.name}" a console address by hand. Its inventory source did not assign one, so the next sync will revert it to a placeholder unless the device has an address by then.`
+            );
+          }
         },
         onBrowse: browseForKey,
         onCreateInline: inlineAuthProfile.handleCreateInline,
@@ -2110,7 +2186,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const account = typeof server.username === "string" && server.username.trim() !== ""
         ? `${server.username}@`
         : "";
-      const info = `${account}${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
+      // P3-2 (Fable) — an addressless placeholder has no console address, so the
+      // `host:port` half renders the nonsense ":0". Head with "(no console address)"
+      // (and drop the `user@` prefix, which reads as an address it is not) while
+      // still carrying the BMC line below — often the only usable address.
+      const endpointLine = server.addressless === true ? "(no console address)" : `${account}${server.host}:${server.port}`;
+      const info = `${endpointLine}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
       await vscode.env.clipboard.writeText(info);
       void vscode.window.showInformationMessage(`Copied: ${info.replace(/\n/g, "  ")}`);
     }),
@@ -2118,6 +2199,19 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     vscode.commands.registerCommand("nexus.server.duplicate", async (arg?: unknown) => {
       const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
       if (!server) {
+        return;
+      }
+      // P2-1 (Fable) — refuse duplicating an addressless placeholder. A duplicate
+      // strips `origin` (see below), so the copy would be a MANUAL addressless
+      // record — an invariant violation: `addressless` exists only for synced
+      // placeholders. No sync would ever upgrade it (no origin), and its connect
+      // refusal tells the user to re-sync a source it has no link to. Stripping the
+      // flag instead would leave an empty host that fails validation, so refusing is
+      // the only coherent answer.
+      if (server.addressless === true) {
+        void vscode.window.showInformationMessage(
+          `"${server.name}" has no console address yet, so it can't be duplicated — it will get one when its inventory source next syncs.`
+        );
         return;
       }
       // F6 — a duplicate of a synced server is a manual server: keeping `origin`
@@ -2196,8 +2290,22 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const servers = ctx.core
         .getSnapshot()
         .servers.filter((s) => s.group === folderPath && !s.isHidden);
+      // P3-3 (Fable) — skip addressless placeholders in the sweep rather than let
+      // connectServer pop its "no console address" info message once PER node. An
+      // EVE lab folder is mostly stopped nodes (the documented common case), so the
+      // per-node path is a popup storm. Disclose them once, in aggregate, instead.
+      const addresslessInGroup = servers.filter((s) => s.addressless === true);
       for (const server of servers) {
+        if (server.addressless === true) {
+          continue;
+        }
         void connectServer(ctx, server.id, { allowAutoFileExplorer: false });
+      }
+      if (addresslessInGroup.length > 0) {
+        const count = addresslessInGroup.length;
+        void vscode.window.showInformationMessage(
+          `${count} ${count === 1 ? "server has" : "servers have"} no console address yet and ${count === 1 ? "was" : "were"} skipped — ${count === 1 ? "it" : "they"} will connect once the inventory source assigns an address.`
+        );
       }
     }),
 
@@ -2221,6 +2329,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       }
       // TELNET (Phase 0) — there is no authorized_keys on the far side of a
       // telnet session, and the deploy itself runs over SSH.
+      const addresslessDeploy = addresslessUnavailableMessage(server);
+      if (addresslessDeploy) {
+        void vscode.window.showWarningMessage(addresslessDeploy);
+        return;
+      }
       const unsupported = telnetUnsupportedMessage(server, "Deploy SSH Key");
       if (unsupported) {
         void vscode.window.showWarningMessage(unsupported);

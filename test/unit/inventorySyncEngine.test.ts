@@ -138,7 +138,7 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.adds[0].host).toBe("10.0.0.1");
   });
 
-  it("skips devices with empty externalId, no usable ssh endpoint, or an out-of-range port — each with a warning, no adds", () => {
+  it("ADDRESSLESS (Codex P1) — still skips an empty externalId and an out-of-range port, but the no-primary (redfish-only) device becomes an addressless placeholder rather than being dropped", () => {
     const source = makeSource();
     const tree = makeTree([
       makeDevice({ externalId: "", name: "no-external-id" }),
@@ -146,8 +146,35 @@ describe("computeSyncPlan — adds", () => {
       makeDevice({ externalId: "device:bad-port", name: "bad-port", endpoints: [{ kind: "ssh", host: "10.0.0.3", port: 70000 }] })
     ]);
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
-    expect(plan.adds).toHaveLength(0);
-    expect(plan.warnings.length).toBeGreaterThanOrEqual(3);
+    // Only the no-primary device is created — as an addressless placeholder.
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].addressless).toBe(true);
+    expect(plan.adds[0].origin?.externalId).toBe("device:redfish-only");
+    // The malformed rows are still skipped, each with its own warning.
+    expect(plan.warnings.some((w) => w.includes("no device ID"))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes("invalid port"))).toBe(true);
+  });
+
+  // P3-4 (Fable) — the OOB extraction was hoisted before the addressless branch,
+  // which also put it before the invalid-port skip. A device skipped for a bad port
+  // then still pushed an "out-of-band address cannot be used" warning it never did
+  // pre-PR. ⊘ Extracting OOB before the skip warns for a device that produces nothing.
+  it("P3-4 — a device skipped for an invalid port does NOT also push an out-of-band-address warning", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({
+          endpoints: [
+            { kind: "ssh", host: "10.0.0.1", port: 0 }, // invalid port → skipped
+            { kind: "redfish", host: "bad host with spaces" } // malformed OOB
+          ]
+        })
+      ]),
+      currentServers: [],
+      now: 5000
+    });
+    expect(plan.warnings.some((w) => /invalid port/i.test(w))).toBe(true);
+    expect(plan.warnings.every((w) => !/out-of-band address that cannot be used/i.test(w))).toBe(true);
   });
 
   it("root targetFolder (''): a device with no folder gets group undefined, not '' (kills '' + '/' + rel concatenation)", () => {
@@ -182,7 +209,7 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.warnings.some((w) => w.includes("Duplicate device ID"))).toBe(true);
   });
 
-  it("(N1) many endpoint-less devices with no owned server produce ONE aggregate warning, not one per device (kills per-device spam)", () => {
+  it("(N1 / ADDRESSLESS) many endpoint-less NEW devices become addressless adds with ONE aggregate note, not one warning per device (kills per-device spam)", () => {
     const source = makeSource();
     const devices = Array.from({ length: 5 }, (_, i) =>
       makeDevice({
@@ -193,31 +220,319 @@ describe("computeSyncPlan — adds", () => {
     );
     const tree = makeTree(devices);
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
-    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("no usable ssh or telnet endpoint"));
-    expect(endpointWarnings).toHaveLength(1);
-    expect(endpointWarnings[0]).toContain("5");
+    expect(plan.adds).toHaveLength(5);
+    expect(plan.adds.every((a) => a.addressless === true)).toBe(true);
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    expect(note).toHaveLength(1);
+    expect(note[0]).toContain("5");
   });
 
-  it("(N1) an endpoint-less device whose externalId IS owned still gets a per-device warning naming it (kills over-aggregation losing the protective signal)", () => {
+  it("(N1 / ADDRESSLESS) an endpoint-less OWNED device downgrades in place while an unowned one is added — both addressless, no per-device spam (kills losing the placeholder for the owned one)", () => {
     const source = makeSource();
     const before = makeOwnedServer(); // origin.externalId === "device:1", matches the first device below
     const tree = makeTree([
-      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] }), // externalId "device:1" — owned, no usable ssh or telnet endpoint
+      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] }), // externalId "device:1" — owned, downgrades
       makeDevice({ externalId: "device:2", name: "unowned-noendpoint", endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })
     ]);
     const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
-    // Owned device: dedicated per-device warning, naming it explicitly.
-    expect(plan.warnings.some((w) => w.includes(`Device "core-sw-1" (device:1) has no usable SSH or telnet endpoint and was skipped.`))).toBe(true);
-    // Unowned device: no dedicated per-device warning of that form — it's folded
-    // into the aggregate instead (its name may still appear as an aggregate example).
-    expect(
-      plan.warnings.some((w) => w.includes(`Device "unowned-noendpoint" (device:2) has no usable SSH or telnet endpoint and was skipped.`))
-    ).toBe(false);
-    // Aggregate warning covers exactly the one unowned skip, and names it.
-    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("had no usable ssh or telnet endpoint"));
-    expect(endpointWarnings).toHaveLength(1);
-    expect(endpointWarnings[0]).toContain("1");
-    expect(endpointWarnings[0]).toContain("unowned-noendpoint");
+    // Owned device: downgraded to addressless (an update), NOT pruned.
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.origin?.externalId).toBe("device:1");
+    // Unowned device: created addressless.
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].addressless).toBe(true);
+    // Only the NEW addressless device is named in the aggregate note (the owned
+    // one is an in-place update, not a fresh placeholder).
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    expect(note).toHaveLength(1);
+    expect(note[0]).toContain("unowned-noendpoint");
+  });
+
+  /**
+   * ADDRESSLESS (Codex P1 on #82) — a device with no usable primary endpoint (a
+   * stopped EVE node, a VNC-console node, a NetBox row with no IP) now produces
+   * a VISIBLE addressless placeholder server instead of being skipped, and
+   * upgrades/downgrades in place as the device gains/loses a console — no
+   * create/prune churn.
+   */
+  describe("addressless placeholders", () => {
+    // A device with NO usable endpoint of ANY kind — no ssh/telnet primary AND no
+    // redfish/ipmi-sol OOB. Deliberately endpoint-less rather than redfish-only:
+    // a redfish endpoint is now an OOB address the placeholder CARRIES (see the
+    // OOB (P2) tests below), so a redfish fixture here would conflate "no console"
+    // with "has a BMC address" and churn a spurious ipmiHost update.
+    const noEndpointDevice = (overrides: Partial<InventoryDevice> = {}) =>
+      makeDevice({ endpoints: [], ...overrides });
+
+    it("CREATES an addressless server for a new endpoint-less device instead of skipping it (⊘ the old skip leaves the device invisible in the tree)", () => {
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      const [added] = plan.adds;
+      expect(added.addressless).toBe(true);
+      expect(added.host).toBe("");
+      expect(added.id).toBe(deterministicServerId("source-1", "device:1"));
+      expect(added.group).toBe("NetBox");
+      expect(added.origin?.sourceId).toBe("source-1");
+      expect(added.origin?.externalId).toBe("device:1");
+      expect(added.origin?.syncedAt).toBe(5000);
+      // No console ⇒ ssh-default protocol, unset stamp.
+      expect(added.protocol).toBeUndefined();
+      expect(added.origin?.syncedProtocol).toBeUndefined();
+      // The record the sync writes must survive its own reload.
+      expect(validateServerConfig(added)).toBe(true);
+    });
+
+    it("UPGRADES an owned addressless server in place when the device gains a console — same id, host filled, flag cleared, no duplicate add (⊘ a create-only path would add a second server for the same device)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.adds).toHaveLength(0);
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.id).toBe(before.id);
+      expect(after.host).toBe("10.0.0.1");
+      expect(after.port).toBe(22);
+      expect(after.addressless ?? false).toBe(false);
+      expect(plan.prunes).toHaveLength(0);
+    });
+
+    it("DOWNGRADES an owned addressed server to addressless when the device loses its console — keeps the server (does NOT prune), flips the flag, clears the host (⊘ pruning a merely-stopped node destroys the server and its credentials)", () => {
+      const before = makeOwnedServer(); // addressed, host 10.0.0.1
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.prunes).toHaveLength(0);
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.addressless).toBe(true);
+      expect(after.host).toBe("");
+      expect(after.id).toBe(before.id);
+    });
+
+    it("re-syncing an already-addressless owned device with no change produces NO update (⊘ churning a no-op update every sync on every stopped node)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.updates).toHaveLength(0);
+      expect(plan.prunes).toHaveLength(0);
+    });
+
+    it("PRUNES an owned addressless server whose device disappears, exactly like an addressed one (⊘ special-casing addressless out of the prune phase strands deleted placeholders forever)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true });
+      const plan = computeSyncPlan({ source: makeSource({ prunePolicy: "delete" }), tree: makeTree([]), currentServers: [before], now: 5000 });
+      expect(plan.prunes.map((p) => p.server.id)).toContain(before.id);
+    });
+
+    it("P1-b — an addressless ADD does NOT clobber an existing server holding its deterministic id (a kept/restored profile), just like the addressed add path's collision guard (⊘ the addressless add unconditionally upserts the id, so applying the plan replaces the kept profile and discards its config)", () => {
+      const source = makeSource();
+      const collidingId = deterministicServerId("source-1", "device:1");
+      // A restored kept profile (no `origin`, so it is not owned by this source)
+      // that happens to hold the id this device's addressless placeholder would.
+      const kept = makeManualServer({ id: collidingId, name: "restored-kept", host: "10.0.0.7" });
+      const plan = computeSyncPlan({ source, tree: makeTree([noEndpointDevice()]), currentServers: [kept], now: 5000 });
+      // No add under the colliding id, and the kept server is left untouched.
+      expect(plan.adds.map((a) => a.id)).not.toContain(collidingId);
+      expect(plan.updates.map((u) => u.after.id)).not.toContain(collidingId);
+    });
+
+    it("clears a SYNC-OWNED telnet protocol to ssh-default on downgrade, but LEAVES a hand-flipped telnet alone (⊘ forking the protocol stamp logic would either stomp the user's hand-flip or freeze a synced telnet)", () => {
+      // Sync-owned telnet (record telnet, stamp telnet) → cleared to ssh-default.
+      const syncedTelnet = makeOwnedServer({ protocol: "telnet", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet" } });
+      const p1 = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [syncedTelnet], now: 5000 });
+      expect(p1.updates[0].after.protocol).toBeUndefined();
+      // Hand-flipped telnet (record telnet, stamp ssh/undefined) → kept.
+      const handTelnet = makeOwnedServer({ protocol: "telnet", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const p2 = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [handTelnet], now: 5000 });
+      expect(p2.updates[0].after.protocol).toBe("telnet");
+    });
+
+    it("STILL skips an endpoint-less device with an empty NAME — addressless is only for a device with no endpoint, never a swallow for the name skip (⊘ addressless creating a nameless placeholder)", () => {
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice({ name: "" })]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(0);
+    });
+
+    it("STILL skips a device whose endpoint has an INVALID PORT — malformed endpoint data is NOT an addressless placeholder (⊘ addressless swallowing the invalid-port skip)", () => {
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 0 }] })]),
+        currentServers: [],
+        now: 5000
+      });
+      expect(plan.adds).toHaveLength(0);
+    });
+
+    // OOB on ADDRESSLESS (Codex P2) — an addressless-for-CONSOLE device (no
+    // ssh/telnet primary) can still expose a BMC web-console or locally-executed
+    // IPMI, neither of which needs a primary console address. The addressless
+    // branch used to run BEFORE management-endpoint extraction, so it dropped the
+    // OOB address entirely; extraction now happens first and both the add and the
+    // downgrade/stay paths populate ipmiHost under the SAME syncOwnsIpmiHost
+    // discipline the addressed path uses.
+    it("(a) a redfish-only device becomes addressless but CARRIES its ipmiHost + syncedIpmiHost (⊘ the addressless branch runs before management extraction, so the placeholder drops the OOB address)", () => {
+      const device = makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([device]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      const [added] = plan.adds;
+      expect(added.addressless).toBe(true);
+      expect(added.host).toBe("");
+      expect(added.ipmiHost).toBe("10.9.9.9");
+      expect(added.origin?.syncedIpmiHost).toBe("10.9.9.9");
+      // An addressless (empty-host) record carrying an ipmiHost must still validate.
+      expect(validateServerConfig(added)).toBe(true);
+    });
+
+    it("(b) re-syncing an addressless server whose OOB address moved follows it per syncOwnsIpmiHost, but a HAND-EDITED ipmiHost is NEVER stomped (⊘ the addressless path forks the ipmiHost ownership rules or ignores the stamp)", () => {
+      const movedOob = makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.10" }] });
+
+      // Sync-owned (value === stamp) → follows the device's new OOB address.
+      const owned = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        ipmiHost: "10.9.9.9",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9", syncedProtocol: undefined }
+      });
+      const p1 = computeSyncPlan({ source: makeSource(), tree: makeTree([movedOob]), currentServers: [owned], now: 5000 });
+      expect(p1.updates).toHaveLength(1);
+      expect(p1.updates[0].after.ipmiHost).toBe("10.9.9.10");
+      expect(p1.updates[0].after.origin?.syncedIpmiHost).toBe("10.9.9.10");
+
+      // Hand-edited (value present, stamp absent) → left alone; the discriminator.
+      const handEdited = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        ipmiHost: "192.168.99.99",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+      });
+      const p2 = computeSyncPlan({ source: makeSource(), tree: makeTree([movedOob]), currentServers: [handEdited], now: 5000 });
+      const after2 = p2.updates[0]?.after ?? handEdited;
+      expect(after2.ipmiHost).toBe("192.168.99.99");
+      expect(after2.origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    it("(c) a device with NO endpoints at all is addressless with NO ipmiHost (⊘ an over-broad fix that stamps an ipmiHost even without an OOB endpoint)", () => {
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [] })]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      expect(plan.adds[0].addressless).toBe(true);
+      expect(plan.adds[0].ipmiHost).toBeUndefined();
+      expect(plan.adds[0].origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    // P1-A (Fable) — the addressed-update path deletes `addressless` UNCONDITIONALLY,
+    // but `selectEndpointForProtocol` returns undefined when the record's protocol is
+    // USER-OWNED (a hand-flip) and the device offers only the OTHER transport — so the
+    // host/port stay ""/0 while the flag is cleared, producing an invalid record that
+    // storage silently drops on the next reload. ⊘ Clearing the flag when no address
+    // was gained writes `{host:"",port:0}` with no addressless flag.
+    it("P1-A — a hand-flipped-telnet placeholder whose device offers only SSH stays a VALID addressless record, never {host:'',port:0} sans flag (probe: computeSyncPlan on the hand-flip × single-transport fixture)", () => {
+      // Hand-flipped: record protocol telnet, stamp ssh (syncedProtocol undefined).
+      const before = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        protocol: "telnet",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+      });
+      // Device gained an SSH-ONLY console — the other transport from the hand-flip.
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]),
+        currentServers: [before],
+        now: 5000
+      });
+      const after = plan.updates[0]?.after ?? before;
+      // The record the sync writes must survive its own reload.
+      expect(validateServerConfig(after)).toBe(true);
+      // It gained no address of its (hand-owned telnet) transport, so it stays addressless.
+      expect(after.addressless).toBe(true);
+      expect(after.host).toBe("");
+    });
+
+    // The other direction: a genuine upgrade (device offers the record's OWN transport)
+    // still clears the flag and fills the address — the fix must not freeze real upgrades.
+    it("P1-A control — an upgrade whose device offers the record's transport still clears addressless and fills the host (⊘ gating the clear on the wrong condition would freeze every upgrade addressless)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]), currentServers: [before], now: 5000 });
+      const after = plan.updates[0].after;
+      expect(after.addressless ?? false).toBe(false);
+      expect(after.host).toBe("10.0.0.1");
+      expect(validateServerConfig(after)).toBe(true);
+    });
+
+    // P1-C (Fable) — a NEW addressless placeholder from a source with a USABLE auth
+    // profile must carry the source-level auth link, exactly as the addressed ADD
+    // does. It is inert while addressless but correct on upgrade, and BMC/IPMI
+    // features may use it. ⊘ The addressless add omitting the winner leaves the
+    // placeholder link-less, so upgrading it later reads as a hand-cleared link.
+    it("P1-C — a new addressless device from an auth-profile'd source carries the source-level authProfileId + stamp", () => {
+      const usable: AuthProfile = { id: "p1", name: "Prod", username: "svc", authType: "agent" };
+      const plan = computeSyncPlan({
+        source: makeSource({ authProfileId: "p1", defaultUsername: "admin" }),
+        tree: makeTree([makeDevice({ endpoints: [] })]),
+        currentServers: [],
+        now: 5000,
+        authProfile: usable
+      });
+      expect(plan.adds).toHaveLength(1);
+      expect(plan.adds[0].addressless).toBe(true);
+      expect(plan.adds[0].authProfileId).toBe("p1");
+      expect(plan.adds[0].origin?.syncedAuthProfileId).toBe("p1");
+    });
+
+    // The other direction: a KEYLESS source profile writes no link on the placeholder
+    // (blanket per-profile refusal), exactly as the addressed add drops a keyless
+    // winner — the placeholder falls back to agent auth.
+    // P2-3 facet 1 (Fable) — a downgrade blanks a previously-addressed server's
+    // host with NO warning (the addresslessAdded aggregate covers only NEW
+    // placeholders). Disclose it, parallel to addresslessAdded.
+    it("P2-3 — downgrading a previously-addressed server emits an aggregate disclosure warning", () => {
+      const before = makeOwnedServer({ host: "10.0.0.1", port: 22 }); // addressed
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [] })]), // device lost its console
+        currentServers: [before],
+        now: 5000
+      });
+      expect(plan.updates[0].after.addressless).toBe(true);
+      expect(plan.warnings.some((w) => /lost their console address|lost its console address|downgraded/i.test(w))).toBe(true);
+    });
+
+    it("P2-3 control — a server that was ALREADY addressless does NOT emit the downgrade warning even when the sync updates it (⊘ warning every stay-addressless sync spams the log)", () => {
+      const before = makeOwnedServer({ name: "old-name", host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        // Renamed at the source so the stay-addressless server IS an update this
+        // sync — exercising the "was it previously addressed?" guard.
+        tree: makeTree([makeDevice({ name: "renamed", endpoints: [] })]),
+        currentServers: [before],
+        now: 5000
+      });
+      expect(plan.updates).toHaveLength(1);
+      expect(plan.warnings.every((w) => !/lost .*console address|downgraded/i.test(w))).toBe(true);
+    });
+
+    // P3-1 (Fable) — a stay-addressless server with no change must be counted in
+    // unchangedCount (and unchangedServerIds), like the addressed no-change branch,
+    // or preview totals don't sum to the owned count and the promotion decrement
+    // gate miscounts.
+    it("P3-1 — a stay-addressless server with no change is counted in unchangedCount", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [] })]), currentServers: [before], now: 5000 });
+      expect(plan.updates).toHaveLength(0);
+      expect(plan.unchangedCount).toBe(1);
+    });
+
+    it("P1-C — a new addressless device from a KEYLESS source profile carries NO link (⊘ writing a keyless winner stamps a link no server can satisfy)", () => {
+      const keyless: AuthProfile = { id: "p1", name: "Shared Key", username: "svc", authType: "key" };
+      const plan = computeSyncPlan({
+        source: makeSource({ authProfileId: "p1", defaultUsername: "admin" }),
+        tree: makeTree([makeDevice({ endpoints: [] })]),
+        currentServers: [],
+        now: 5000,
+        authProfile: keyless
+      });
+      expect(plan.adds[0].authProfileId).toBeUndefined();
+      expect(plan.adds[0].origin?.syncedAuthProfileId).toBeUndefined();
+    });
   });
 
   it("skips (never adopts/overwrites) a device whose deterministic id collides with an unrelated server", () => {
@@ -1374,58 +1689,62 @@ describe("computeSyncPlan — auth profile link", () => {
    * builds what is sent to the SSH server can tell a repaired record from a
    * plausible-looking one.
    */
-  it("AUTH 2b decides the rollback for an owned server whose device this run cannot map — the no-primary-IP case — so that server can open a connection again (kills running the rollback after mapping validation's skips)", async () => {
-    // "delete" rather than the fixture default, so a pass that mistook a skipped
-    // device for an absent one would DELETE this server rather than merely move it.
+  it("ADDRESSLESS (Fable P1-B) — an owned server whose device goes no-primary DOWNGRADES to addressless (not pruned), applies the source rename, AND unlinks a keyless-key profile in the same pass — parity with the post-loop rollback that covers a skipped device", async () => {
+    // "delete" rather than the fixture default, so a pass that mistook a
+    // downgraded device for an absent one would DELETE this server.
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin", prunePolicy: "delete" });
     const before = previouslyLinkedServer();
 
-    // The premise, proven rather than assumed.
-    const brokenResolved = await resolveThroughConnect(before, KEYLESS_KEY_PROFILE);
-    expect(brokenResolved.authType).toBe("key");
-    await expect(buildConnectConfig(brokenResolved)).rejects.toThrow("Missing keyPath for key auth on core-sw-1");
-
     const plan = computeSyncPlan({
       source,
-      // Exactly what the provider emits for a device with no primary IP: present,
-      // named, zero endpoints. Renamed at the source as well, so a "fix" that
-      // simply moved the validation exits below the update-building would be
-      // visible as a rename this sync has no business writing.
+      // Exactly what the provider emits for a device with no primary endpoint,
+      // renamed at the source too so the downgrade's name refresh is visible.
       tree: makeTree([makeDevice({ name: "renamed-at-source", endpoints: [] })]),
       currentServers: [before],
       now: 2000,
       authProfile: KEYLESS_KEY_PROFILE
     });
 
-    // Under the wrong implementation this plan is empty and the server stays
-    // linked, unusable, forever.
     expect(plan.updates).toHaveLength(1);
     const after = plan.updates[0].after;
+    // Downgraded, not pruned.
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.adds).toHaveLength(0);
+    expect(after.addressless).toBe(true);
+    expect(after.host).toBe("");
+    // P1-B — the keyless-key link is rolled back HERE, in the downgrade, exactly as
+    // the post-loop pass would have for a skipped device (it is not deferred).
     expect(after.authProfileId).toBeUndefined();
     expect(after.origin?.syncedAuthProfileId).toBeUndefined();
-
-    // The skip semantics are untouched. No add; no prune (FIX 1 — a device the
-    // provider could not map is not a deleted device); the per-device warning
-    // still names it; no rename, no folder move, and no claim that this sync
-    // mapped the device.
-    expect(plan.adds).toHaveLength(0);
-    expect(plan.prunes).toHaveLength(0);
-    expect(plan.warnings).toContain('Device "renamed-at-source" (device:1) has no usable SSH or telnet endpoint and was skipped.');
-    expect(after.name).toBe("core-sw-1");
-    expect(after.host).toBe("10.0.0.1");
-    expect(after.port).toBe(22);
+    // A full update: the source-side rename and folder are applied, syncedAt
+    // advances (this sync DID decide the record).
+    expect(after.name).toBe("renamed-at-source");
     expect(after.group).toBe("NetBox");
-    expect(after.username).toBe("admin");
-    expect(after.origin?.syncedAt).toBe(1000);
-    expect(after.origin?.syncedUsername).toBe("admin");
-    expect(plan.folders).toEqual(["NetBox"]);
+    expect(after.origin?.syncedAt).toBe(2000);
+  });
 
-    // THE ASSERTION THAT MATTERS — the record this plan writes connects.
+  it("ADDRESSLESS — the keyless-key unlink ALSO fires on the addressless→addressed UPGRADE, so a placeholder that still carries a keyless link (e.g. one linked by hand) is repaired when it regains an address", async () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    // The server as it sits AFTER a downgrade: addressless, still carrying the
+    // keyless-key link.
+    const addressless = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]), // device gained an ssh endpoint again
+      currentServers: [addressless],
+      now: 3000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.addressless ?? false).toBe(false);
+    expect(after.host).toBe("10.0.0.1");
+    // The mapped AUTH 2b unlink runs on the addressed upgrade path.
+    expect(after.authProfileId).toBeUndefined();
     const resolved = await resolveThroughConnect(after, KEYLESS_KEY_PROFILE);
     expect(resolved.authType).toBe("agent");
     const config = await buildConnectConfig(resolved);
     expect(config).toMatchObject({ host: "10.0.0.1", port: 22, username: "admin" });
-    expect(config.privateKey).toBeUndefined();
   });
 
   it("AUTH 2b covers the other mapping-validation skips too — an empty device name and an invalid port — without letting either device write anything else (kills a fix that special-cases only the no-endpoint skip)", () => {
@@ -1470,29 +1789,88 @@ describe("computeSyncPlan — auth profile link", () => {
     );
   });
 
-  it("AUTH 2b decides an owned server exactly once when the source reports its device twice and the first copy is itself skipped (kills deciding per device rather than per owned server)", () => {
+  it("ADDRESSLESS (Codex P1) — an owned server is decided exactly ONCE when its no-primary device is reported twice: the first copy downgrades it, the second is a duplicate (kills a double update / double placeholder)", () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    // A USABLE profile (has a key file), so the link legitimately rides forward on
+    // the downgrade — this test is about the decided-once/duplicate handling, not
+    // the keyless rollback (P1-B covers that with a keyless profile).
+    const usableKeyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
 
     const plan = computeSyncPlan({
       source,
-      // First copy: skipped for having no endpoint — and it is the copy that
-      // claims the externalId, so the second is skipped as a duplicate. Neither
-      // reaches the update path, and the owned server behind them is one server.
+      // First copy: no endpoint — claims the externalId, downgrading the owned
+      // server to addressless. The second copy is then a duplicate.
       tree: makeTree([makeDevice({ endpoints: [] }), makeDevice({ name: "core-sw-1-again" })]),
       currentServers: [previouslyLinkedServer()],
       now: 2000,
-      authProfile: KEYLESS_KEY_PROFILE
+      authProfile: usableKeyProfile
     });
 
-    // A rollback moved ABOVE the validation exits instead of into its own pass
-    // decides this server once per device: two updates for one record, and a
-    // warning claiming two servers were unlinked when there is only one.
+    // Exactly one update for the one owned record — the addressless downgrade —
+    // and the usable link rides forward.
     expect(plan.updates).toHaveLength(1);
-    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.authProfileId).toBe("p1");
     expect(plan.warnings).toContain('Duplicate device ID "device:1" — kept first ("core-sw-1").');
+  });
+
+  // P1-B (Fable) — the downgrade/stay addressless path marks the device "decided"
+  // (so the post-loop rollback pass skips it) but never ran the rollback itself, so
+  // an owned placeholder linked to a KEYLESS key profile stayed linked and unusable
+  // forever — a regression, since pre-PR a no-endpoint device fell through to the
+  // post-loop pass that unlinks exactly these. ⊘ Skipping decideSourceAuthRollback
+  // in the downgrade leaves the broken link in place with no unlink and no warning.
+  it("P1-B — a stay-addressless server linked to a KEYLESS key profile is UNLINKED in the downgrade path, exactly as the post-loop pass unlinks a skipped one", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]), // device:1 stays addressless
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.updates[0].after.origin?.syncedAuthProfileId).toBeUndefined();
     expect(plan.warnings).toContain(
       `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it is unlinked here so it can connect again; a later sync re-links it once the profile has a key file.`
     );
+  });
+
+  it("P1-B — a stay-addressless server that brings its OWN key file is RETAINED, not unlinked, exactly as the addressed/skip paths retain it (⊘ an over-broad downgrade rollback unlinks a working keyless-profile+own-key pairing)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true, authType: "key", keyPath: "/keys/own_ed25519" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    // The link is kept (own key), and the retained clause is reported.
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.authProfileId).toBe("p1");
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile.`
+    );
+  });
+
+  it("P1-B control — a USABLE profile link rides forward on downgrade (⊘ running the rollback with the wrong unusable set would unlink a working link)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const usableKeyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: usableKeyProfile
+    });
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.authProfileId).toBe("p1");
+    expect(after.origin?.syncedAuthProfileId).toBe("p1");
   });
 
   it("AUTH 2b still leaves a server whose device is GONE from the fetch to the prune policy (kills a pass over every owned server, which would rewrite the credentials of a server the same plan reports as kept in place)", () => {
@@ -1511,15 +1889,14 @@ describe("computeSyncPlan — auth profile link", () => {
     expect(plan.warnings).toContain(KEYLESS_KEY_WARNING);
   });
 
-  it("the pass over unmapped devices applies the same clauses as the mapped one — a hand-set link is left alone, and a server with its own key is retained AND reported as retained (kills an unmapped pass that unlinks whatever it finds)", () => {
+  it("ADDRESSLESS (Codex P1) — two owned servers whose devices go no-primary both DOWNGRADE to addressless, each carrying its own auth (a hand-set link and a synced-with-own-key link) forward unchanged (kills clearing a link on the downgrade)", () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
-    // Linked by hand: carries the profile but no stamp naming it. Not the sync's to clear.
+    // Linked by hand: carries the profile but no stamp naming it.
     const handLinked = makeOwnedServer({
       authProfileId: "p1",
       origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
     });
-    // The sync's own link, on a server that has since been given its own key file:
-    // the pairing still connects, so the link stays.
+    // The sync's own link, on a server since given its own key file.
     const withOwnKey = previouslyLinkedServer({
       id: deterministicServerId("source-1", "device:2"),
       name: "core-sw-2",
@@ -1531,17 +1908,23 @@ describe("computeSyncPlan — auth profile link", () => {
 
     const plan = computeSyncPlan({
       source,
-      // Both devices unmappable — the pass is the only thing that sees them.
       tree: makeTree([makeDevice({ endpoints: [] }), makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [] })]),
       currentServers: [handLinked, withOwnKey],
       now: 2000,
       authProfile: KEYLESS_KEY_PROFILE
     });
 
-    expect(plan.updates).toHaveLength(0);
-    expect(plan.warnings).toContain(
-      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile.`
-    );
+    // Both downgrade to addressless; neither is pruned; each keeps its own link.
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.updates).toHaveLength(2);
+    const byId = new Map(plan.updates.map((u) => [u.after.id, u.after] as const));
+    const a = byId.get(handLinked.id)!;
+    const b = byId.get(withOwnKey.id)!;
+    expect(a.addressless).toBe(true);
+    expect(a.authProfileId).toBe("p1");
+    expect(b.addressless).toBe(true);
+    expect(b.authProfileId).toBe("p1");
+    expect(b.keyPath).toBe("/keys/own_ed25519");
   });
 
   // Pinned verbatim in both grammatical numbers: this sentence is the finding.
@@ -1772,18 +2155,18 @@ describe("computeSyncPlan — prunes", () => {
     expect(plan.hiddenPruneCount).toBe(1);
   });
 
-  it("(FIX 1) an owned server whose device is present in the tree but skipped (no usable ssh or telnet endpoint) is NOT pruned (kills pruning skipped-but-present devices)", () => {
+  it("(FIX 1 / ADDRESSLESS) an owned server whose device is present but has no usable endpoint is NOT pruned — it downgrades to an addressless placeholder instead (kills pruning a merely-stopped device)", () => {
     const source = makeSource({ prunePolicy: "delete" });
     const before = makeOwnedServer();
-    // Same externalId as `before`'s origin, still present in the fetched tree,
-    // but unmappable (no ssh or telnet endpoint) — this must NOT read as "deleted at
-    // the source".
+    // Same externalId as `before`'s origin, still present, but unmappable — this
+    // must NOT read as "deleted at the source".
     const tree = makeTree([makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })]);
     const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
     expect(plan.prunes).toHaveLength(0);
     expect(plan.adds).toHaveLength(0);
-    expect(plan.updates).toHaveLength(0);
-    expect(plan.warnings.some((w) => w.includes("no usable SSH or telnet endpoint"))).toBe(true);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.host).toBe("");
   });
 
   it("(FIX 1) an owned server whose device is present but skipped for an empty name is NOT pruned", () => {
@@ -1956,6 +2339,41 @@ describe("computeSyncPlan — adopt-on-add", () => {
   }
 
   const profile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+
+  // P2-2 (Fable) — a kept ADDRESSLESS placeholder ("":0) cannot corroborate by
+  // address, and the addressless ADD consults only the id-collision map, never the
+  // kept markers. So (a) a still-addressless re-added device mints a SECOND
+  // placeholder while the kept copy is stranded with no warning, and (b) the
+  // moved-address refusal renders the kept record as ":0" (nonsense).
+  describe("P2-2 — kept addressless placeholders", () => {
+    it("(a) a still-addressless device with a matching kept marker WARNS instead of silently stranding the kept placeholder", () => {
+      // kept-1 holds a marker for device:1 but a NON-deterministic id, so no id
+      // collision — a fresh placeholder is minted for the deterministic id.
+      const keptAddressless = makeKeptServer({ host: "", port: 0, addressless: true });
+      const plan = planFor({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [] })]), // device:1 still addressless
+        currentServers: [keptAddressless],
+        now: 5000
+      });
+      // A placeholder is added (still no adoption-by-address possible), but the user
+      // is told a kept copy exists rather than being left to find the duplicate.
+      expect(plan.adds.some((a) => a.addressless === true)).toBe(true);
+      expect(plan.warnings.some((w) => w.includes("device:1") && /kept/i.test(w))).toBe(true);
+    });
+
+    it("(b) the moved-address refusal renders '(no address)' for an addressless kept record, never ':0'", () => {
+      const keptAddressless = makeKeptServer({ host: "", port: 0, addressless: true });
+      const plan = planFor({
+        source: makeSource(),
+        tree: makeTree([keptDevice()]), // device gained the address lab-sw-01
+        currentServers: [keptAddressless],
+        now: 5000
+      });
+      expect(plan.warnings.some((w) => w.includes("(no address)"))).toBe(true);
+      expect(plan.warnings.every((w) => !/:0\b/.test(w))).toBe(true);
+    });
+  });
 
   /**
    * M27/M29 (review) — THE ADOPTEE TWIN of the update path's protocol matrix.
@@ -4702,14 +5120,15 @@ describe("computeSyncPlan — telnet endpoints", () => {
     expect(plan.adds[0].origin?.syncedProtocol).toBeUndefined();
   });
 
-  it("still skips a device that offers neither kind, and says so", () => {
+  it("creates an addressless placeholder for a device that offers neither ssh nor telnet (a url-only console)", () => {
     const plan = computeSyncPlan({
       source: makeSource(),
       tree: makeTree([makeDevice({ endpoints: [{ kind: "url", host: "https://example" }] })]),
       currentServers: [],
       now: 1000
     });
-    expect(plan.adds).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].addressless).toBe(true);
   });
 
   it("switches an owned server to telnet when the device stops offering SSH", () => {

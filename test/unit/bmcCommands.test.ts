@@ -336,38 +336,68 @@ describe("nexus.server.connectBmcSol", () => {
     expect(status).toContain("the gateway session closed");
   });
 
-  it("keeps the local -E flow unchanged when the gateway id is dangling (names no server)", async () => {
-    // A dangling gateway resolves to "no gateway" — the command uses today's local
-    // `-E` terminal, exactly as an unset gateway does.
+  /**
+   * SAFETY (Codex P1) — when the target NAMES a gateway that is now unavailable
+   * (deleted so the id dangles, or downgraded to addressless during inventory
+   * sync), the direct BMC command must ABORT, never fall back to the local `-E`
+   * terminal. Dialing the BMC from THIS machine can reach a DIFFERENT device on
+   * an overlapping private address; for chassis/power control that is the wrong
+   * box. Distinct from a target with NO gateway configured, where local IS the
+   * configured route (see the "does NOT warn when NO gateway" case below).
+   *
+   *  ⊘ collapse unavailable→local (old warn-then-run-locally path) — a local
+   *    terminal is created, no abort error → these fail
+   *  ⊘ abort when NO gateway configured — the "no gateway ⇒ local" case fails
+   */
+  it("ABORTS — no local -E terminal — when the configured gateway is deleted (id dangles)", async () => {
     const ctx = gatewayContext({ servers: [], secrets: VAULTED });
     await connectBmcSol(ctx, { server: server({ ipmiGatewayServerId: "ghost" }) });
 
-    expect(createdTerminals).toHaveLength(1);
-    expect(createdTerminals[0].sent).toEqual([
-      " ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -E sol activate\n"
-    ]);
-    expect(createdTerminals[0].env).toEqual({ IPMITOOL_PASSWORD: "s3cr3t-bmc", IPMI_PASSWORD: "s3cr3t-bmc" });
+    // Nothing dialed from here — the unsafe local fall-back is gone.
+    expect(createdTerminals).toHaveLength(0);
+    expect(showErrorMessage).toHaveBeenCalledTimes(1);
+    const err = String(showErrorMessage.mock.calls[0][0]);
+    expect(err).toContain("Core Switch");
+    expect(err).toContain("unavailable");
   });
 
-  it("Codex round 7 P2 — warns when a CONFIGURED gateway no longer resolves (deleted), then still runs the local -E flow", async () => {
-    // The gateway server was deleted (its id dangles); the target still NAMES it.
-    // The command must surface this — a BMC only reachable from the now-missing
-    // gateway would otherwise be silently dialed from here — while still delivering
-    // the local `-E` flow (non-blocking).
-    const ctx = gatewayContext({ servers: [], secrets: VAULTED });
-    await connectBmcSol(ctx, { server: server({ ipmiGatewayServerId: "ghost" }) });
+  it("ABORTS — no telnet session touched, no local terminal — when the configured gateway is a TELNET profile", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    // Addressed, but telnet — no SSH console to route the SOL command through.
+    const gateway = server({ id: "gw-1", name: "telnet-box", host: "10.9.9.9", protocol: "telnet" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus Telnet: telnet-box", show: vi.fn(), sendText: (text: string) => gwSent.push(text) };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
 
-    // The warning fired (c1a00a1 was silent here — this is the falsifying assertion).
-    expect(showWarningMessage).toHaveBeenCalledTimes(1);
-    const warn = String(showWarningMessage.mock.calls[0][0]);
-    expect(warn).toContain("Core Switch");
-    expect(warn).toContain("no longer available");
-    // ...and the local `-E` flow still ran.
-    expect(createdTerminals).toHaveLength(1);
-    expect(createdTerminals[0].sent).toEqual([
-      " ipmitool -I lanplus -H 10.0.0.9 -U bmc-operator -E sol activate\n"
-    ]);
-    expect(createdTerminals[0].env).toEqual({ IPMITOOL_PASSWORD: "s3cr3t-bmc", IPMI_PASSWORD: "s3cr3t-bmc" });
+    await connectBmcSol(ctx, { server: target });
+
+    // Nothing sent into the telnet console, and no local -E fall-back.
+    expect(gwSent).toEqual([]);
+    expect(createdTerminals).toHaveLength(0);
+    expect(showErrorMessage).toHaveBeenCalledTimes(1);
+    const err = String(showErrorMessage.mock.calls[0][0]);
+    expect(err).toContain("Core Switch");
+    expect(err).toContain("unavailable");
+    expect(err).toContain("Telnet");
+  });
+
+  it("ABORTS — no local -E terminal — when the configured gateway is ADDRESSLESS", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "stopped-gw", host: "", addressless: true });
+    const ctx = gatewayContext({ servers: [target, gateway], secrets: VAULTED });
+
+    await connectBmcSol(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(0);
+    expect(showErrorMessage).toHaveBeenCalledTimes(1);
+    const err = String(showErrorMessage.mock.calls[0][0]);
+    expect(err).toContain("Core Switch");
+    expect(err).toContain("unavailable");
   });
 
   it("Codex round 7 P2 — does NOT warn when NO gateway is configured (local is the configured route)", async () => {

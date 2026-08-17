@@ -777,6 +777,14 @@ export function sanitizeForSharing(
     idMap.set(p.id, randomUUID());
   }
 
+  // ADDRESSLESS (Codex P1 review MINOR-1) — DROP addressless placeholders from a
+  // shared export entirely. A share strips `origin` (a synced marker is local
+  // only), which would leave an `addressless:true, host:""` record the recipient
+  // can never connect to, re-address, or upgrade — and one that violates the
+  // "addressless is written ONLY by inventory sync" invariant on their machine.
+  // They are meaningless without their source, so they do not travel.
+  servers = servers.filter((s) => s.addressless !== true);
+
   // Second pass: assign new IDs for servers
   for (const s of servers) {
     idMap.set(s.id, randomUUID());
@@ -3496,7 +3504,7 @@ export function registerConfigCommands(
       value: "hostListFile"
     },
     {
-      label: "$(sync) Inventory Source (NetBox)…",
+      label: "$(sync) Inventory Source…",
       description: "Live sync — devices stay linked to the source",
       value: "inventorySource"
     },

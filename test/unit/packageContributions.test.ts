@@ -25,6 +25,86 @@ describe("package contributions", () => {
     expect(packageJson.activationEvents).toContain("onUri");
   });
 
+  /**
+   * EVE-NG (Phase 1) — a SECOND inventory provider ships, so the entry points
+   * into the add-source flow are provider-agnostic. Naming one provider in
+   * them tells a user looking for the other that the feature is not there.
+   */
+  describe("provider-agnostic inventory entry points", () => {
+    it("titles nexus.inventory.addSource without naming a provider (\u2298 \"Add Inventory Source (NetBox)\" reads as NetBox-only to an EVE-NG user)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title;
+      expect(title).toBe("Add Inventory Source");
+    });
+
+    it("offers the same neutral wording in the Command Center welcome view", () => {
+      const welcome = packageJson.contributes.viewsWelcome?.find((w) => w.view === "nexusCommandCenter")?.contents ?? "";
+      expect(welcome).toContain("[Add Inventory Source](command:nexus.inventory.addSource)");
+      expect(welcome).not.toMatch(/NetBox/i);
+    });
+  });
+
+  /**
+   * EVE-NG (Phase 1) — the Settings tree's per-source rows. Without these
+   * entries the rows render but carry no actions, which is most of the point
+   * of showing them at all.
+   */
+  describe("inventory source row actions", () => {
+    const rowMenus = () =>
+      (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexus.inventorySource") && (m.when ?? "").includes("nexusSettings")
+      );
+
+    it("binds Sync / Edit / Template Rules / Remove inline on an inventory source row (\u2298 rows with no actions leave every operation behind the QuickPick hub they replace)", () => {
+      expect(rowMenus().map((m) => m.command).sort()).toEqual([
+        "nexus.deviceTemplate.editRules",
+        "nexus.inventory.editSource",
+        "nexus.inventory.removeSource",
+        "nexus.inventory.syncNow"
+      ]);
+    });
+
+    it("puts them in the `inline` group so they render as row buttons rather than hiding in the right-click menu", () => {
+      expect(rowMenus().every((m) => (m.group ?? "").startsWith("inline"))).toBe(true);
+    });
+
+    it("matches the row contextValue EXACTLY, so the group row and unrelated tree items never inherit these actions", () => {
+      for (const menu of rowMenus()) {
+        expect(menu.when).toContain("viewItem == nexus.inventorySource");
+      }
+      expect(rowMenus()).not.toHaveLength(0);
+    });
+  });
+
+  /**
+   * EVE-NG (Phase 1) — documentation coverage. The provider's two sharp edges
+   * (telnet-only consoles, Community-certified) are things a user hits during
+   * setup, not afterwards, so they have to be written down.
+   */
+  describe("EVE-NG documentation", () => {
+    it("documents the EVE-NG source in the functional docs, including the telnet-console requirement and the Pro stance", () => {
+      expect(functionalDocs).toContain("EVE-NG");
+      expect(functionalDocs).toMatch(/consoleHost/);
+      expect(functionalDocs).toMatch(/includeStopped/);
+      expect(functionalDocs).toMatch(/Community/);
+      expect(functionalDocs).toMatch(/preliminary/i);
+    });
+
+    it("mentions EVE-NG in the README as a second inventory source", () => {
+      expect(readme).toMatch(/EVE-NG/);
+    });
+
+    it("does not tell the reader to run a command title that no longer exists (\u2298 docs pinned to \"Add Inventory Source (NetBox)\" send an EVE-NG user looking for a NetBox-only command)", () => {
+      const staleTitle = "Add Inventory Source (NetBox)";
+      expect(readme).not.toContain(staleTitle);
+      expect(functionalDocs).not.toContain(staleTitle);
+    });
+
+    it("documents the Settings tree's per-source rows", () => {
+      expect(functionalDocs).toMatch(/Inventory Sources/);
+      expect(functionalDocs).toMatch(/nexus\.inventorySource/);
+    });
+  });
+
   it("includes serialport runtime dependency", () => {
     expect(packageJson.dependencies.serialport).toBeDefined();
   });

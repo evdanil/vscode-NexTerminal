@@ -123,6 +123,28 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(makeProvider({ instanceKey: 42 as never }))).toThrow(/instanceKey/);
   });
 
+  // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
+  // the field contract now, so a malformed one must be caught at the
+  // registration boundary rather than silently coerced when the Add form reads
+  // it as `defaultValue === true`.
+  it("rejects a non-boolean defaultValue (⊘ a string/number defaultValue reaches the form and is coerced, so a documented default of \"yes\" silently becomes unchecked)", () => {
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean", defaultValue: "yes" as never }] }))
+    ).toThrow(/"flag".*non-boolean defaultValue/i);
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean", defaultValue: 1 as never }] }))
+    ).toThrow(/"flag".*non-boolean defaultValue/i);
+  });
+
+  it("accepts a boolean field with a real boolean defaultValue, and one with none", () => {
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean", defaultValue: true }] }))
+    ).not.toThrow();
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean" }] }))
+    ).not.toThrow();
+  });
+
   // SELECT OPTIONS VALIDATION (PR #64 Codex review round 1, P2 — issue #48 PR-E).
   // `type:"select"` reached VALID_FIELD_TYPES without any check on `options`, so a
   // third-party provider could register a select with no/empty/malformed options —

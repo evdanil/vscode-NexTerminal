@@ -1145,7 +1145,7 @@ describe("import chooser (nexus.config.import)", () => {
       "add servers in bulk",
       "$(clippy) Paste Host List from Clipboard",
       "$(list-flat) Host List File…",
-      "$(sync) Inventory Source (NetBox)…",
+      "$(sync) Inventory Source…",
       "migrate from another client",
       "$(file-code) MobaXterm INI File…",
       "$(file-code) SecureCRT XML Export…",
@@ -1164,7 +1164,7 @@ describe("import chooser (nexus.config.import)", () => {
     expect(byLabel("Nexus Export File")?.description).toBe("An encrypted backup or a shared config (.json)");
   });
 
-  it("Inventory Source (NetBox)… routes straight to nexus.inventory.addSource (no host-list dialog)", async () => {
+  it("Inventory Source… routes straight to nexus.inventory.addSource (no host-list dialog)", async () => {
     mockShowQuickPick.mockResolvedValueOnce({ value: "inventorySource" });
 
     const importCmd = registeredCommands.get("nexus.config.import")!;
@@ -5400,6 +5400,14 @@ describe("sanitizeForSharing", () => {
   it("carries bmcWebProtocol verbatim — it is an ordinary scalar with nothing to remap", () => {
     const result = sanitizeForSharing([makeServer({ bmcWebProtocol: "http" })], [], [], [], {}, [], []);
     expect(result.servers[0].bmcWebProtocol).toBe("http");
+  });
+
+  it("ADDRESSLESS (Codex P1 review MINOR-1) — DROPS addressless placeholder servers from a shared export entirely (⊘ the `...s` spread ships an origin-less `addressless:true, host:\"\"` record the recipient can never connect to, re-address, or upgrade)", () => {
+    const normal = makeServer({ id: "srv-normal", name: "Prod", host: "10.0.0.1" });
+    const placeholder = makeServer({ id: "srv-addr", name: "Stopped Node", host: "", addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } });
+    const result = sanitizeForSharing([normal, placeholder], [], [], [], {}, [], []);
+    expect(result.servers.map((s) => s.name)).toEqual(["Prod"]);
+    expect(result.servers.some((s) => s.addressless)).toBe(false);
   });
 
   it("clears defaultServerId when server not in export", () => {

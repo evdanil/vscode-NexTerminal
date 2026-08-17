@@ -25,6 +25,15 @@ import {
 
 export const ORPHAN_FOLDER_NAME = "_orphaned";
 
+/**
+ * ADDRESSLESS (Codex P1 on #82) — the sentinel port an addressless placeholder
+ * carries. `ServerConfig.port` is a required `number`, so a value is needed;
+ * `0` is never a valid connect target (`isValidPort` rejects it), and
+ * `validateServerConfig` skips the port check entirely when `addressless` is
+ * true, so it never has to pass.
+ */
+const ADDRESSLESS_PORT = 0;
+
 export interface ComputeSyncPlanInput {
   source: InventorySourceConfig;
   tree: InventoryTree;
@@ -693,6 +702,15 @@ function namedExamples(names: string[]): string {
     .join(", ");
 }
 
+/**
+ * P2-2 (Fable) — how a kept/colliding server's OWN address reads in a refusal
+ * warning. An addressless placeholder carries `host: ""` / `port: 0`, which
+ * rendered as the nonsense ":0"; it has no address by design, so say so.
+ */
+function renderServerAddress(server: ServerConfig): string {
+  return server.addressless === true ? "(no address)" : `${server.host}:${server.port}`;
+}
+
 /** N1 — appends one summary warning for a category of non-owned device skips, naming up to 3 examples. No-op when the category is empty. */
 function pushSkipSummary(warnings: string[], reason: string, examples: string[]): void {
   const count = examples.length;
@@ -1089,9 +1107,42 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // other no-endpoint/empty-name/invalid-port skip is collected here and
   // reported as a single aggregate warning per category instead of drowning
   // the warnings list in one line per device.
-  const noEndpointSkipped: string[] = [];
   const emptyNameSkipped: string[] = [];
   const invalidPortSkipped: string[] = [];
+  // ADDRESSLESS (Codex P1) — devices with no usable primary endpoint that were
+  // NEWLY created as placeholders this run, for one aggregate note.
+  const addresslessAdded: string[] = [];
+  // P2-3 (Fable) — previously-ADDRESSED servers downgraded to placeholders this
+  // sync (their console address blanked). Disclosed as an aggregate parallel to
+  // `addresslessAdded`; a stay-addressless server is never added here.
+  const downgradedToAddressless: string[] = [];
+
+  // Folder → `group` resolution, shared by the addressed add/update path and the
+  // ADDRESSLESS branch (which decides earlier, before the primary-endpoint check
+  // where the inline computation used to live). Pure but for the warnings it
+  // pushes on an invalid/over-deep path — the exact behaviour the inline block
+  // had.
+  const resolveDeviceGroup = (device: InventoryDevice): string | undefined => {
+    let rel: string | undefined;
+    if (device.folderPath) {
+      const normalizedRel = normalizeFolderPath(device.folderPath);
+      if (normalizedRel === undefined) {
+        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid folder path "${device.folderPath}"; placed at the source's target folder.`);
+      } else {
+        rel = normalizedRel;
+      }
+    }
+    const joined = joinTargetAndRel(source.targetFolder, rel);
+    if (joined === undefined) {
+      return undefined;
+    }
+    const normalizedJoined = normalizeFolderPath(joined);
+    if (normalizedJoined === undefined) {
+      warnings.push(`Device "${device.name}" (${device.externalId}) folder path exceeds the maximum depth; placed at the source's target folder.`);
+      return source.targetFolder ? source.targetFolder : undefined;
+    }
+    return normalizedJoined;
+  };
 
   for (const device of tree.devices) {
     if (!device.externalId) {
@@ -1131,29 +1182,36 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // TELNET (Phase 0) — ssh endpoint if the device has one, else its telnet
     // endpoint (see `selectPrimaryEndpoint` for why ssh always wins).
     const primary = selectPrimaryEndpoint(device);
-    if (!primary) {
-      if (isOwned) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has no usable SSH or telnet endpoint and was skipped.`);
-      } else {
-        noEndpointSkipped.push(device.name);
+
+    // P3-4 (Fable) — the invalid-port skip runs BEFORE the OOB extraction below.
+    // Hoisting OOB extraction ahead of the addressless branch (Codex P2) also put
+    // it ahead of this skip, so a device destined to be skipped for a bad port
+    // first pushed an "out-of-band address cannot be used" warning it never did
+    // pre-PR. Deciding the skip first keeps a skipped device silent about fields it
+    // will never carry. Guarded on `primary`: an addressless device (no primary)
+    // has no port to validate and belongs to the branch below.
+    if (primary) {
+      const primaryPort = primary.endpoint.port ?? primary.defaultPort;
+      if (!isValidPort(primaryPort)) {
+        if (isOwned) {
+          warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid port ${primaryPort} and was skipped.`);
+        } else {
+          invalidPortSkipped.push(device.name);
+        }
+        continue;
       }
-      continue;
-    }
-    const endpoint = primary.endpoint;
-    const deviceProtocol = primary.protocol;
-    const port = endpoint.port ?? primary.defaultPort;
-    if (!isValidPort(port)) {
-      if (isOwned) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid port ${port} and was skipped.`);
-      } else {
-        invalidPortSkipped.push(device.name);
-      }
-      continue;
     }
 
     // OOB — the out-of-band management address this fetch offers for
     // `ServerConfig.ipmiHost`, or `undefined` when the device supplies none
     // (matrix row 6 in `syncOwnsIpmiHost`) or supplies one nothing can use.
+    //
+    // EXTRACTED HERE, BEFORE the addressless branch (Codex P2). A device with no
+    // ssh/telnet primary endpoint but a redfish/ipmi-sol one is addressless FOR
+    // ITS CONSOLE, yet its BMC web-console / locally-executed IPMI needs no
+    // primary console address — so the placeholder must still carry this OOB
+    // address. Deciding it before the branch lets BOTH the addressless paths and
+    // the addressed path below read the one `mgmtHost`.
     //
     // VALIDATED HERE, at sync time, even though USE time remains the real
     // chokepoint (`validateTokenValue`, services/profileTokens.ts, which refuses
@@ -1180,6 +1238,343 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
     }
 
+    if (!primary) {
+      // ADDRESSLESS (Codex P1 on #82) — a device with NO usable primary endpoint
+      // (a stopped EVE node, a VNC/HTML5-console node, a NetBox row with no IP)
+      // is no longer skipped: it becomes a VISIBLE addressless placeholder. This
+      // is reached only AFTER the empty-name (1116) and duplicate-id (1129)
+      // skips, and BEFORE the invalid-port skip below — which is deliberate:
+      // addressless is ONLY for a device with no primary endpoint AT ALL, never
+      // a swallow for malformed data (a bad name or a bad port stays skipped).
+      const ownedForAddressless = ownedByExternalId.get(device.externalId);
+      const addresslessGroup = resolveDeviceGroup(device);
+      // DEVICE TEMPLATES on ADDRESSLESS (Codex P2-a) — the per-device cascade runs
+      // for a placeholder too, so a template's OOB-oriented fields (ipmiAuthProfileId
+      // / ipmiGatewayServerId) take effect immediately and the console-inert ones
+      // (proxy/multiplexing/legacyAlgorithms/logSession) are applied under their
+      // templated stamps for when it later upgrades to addressed. Computed here (not
+      // hoisted above the branch) so the invalid-port skip below never runs it —
+      // each device runs the cascade in exactly ONE branch. The SSH auth winner
+      // (`authProfileId`) is deliberately NOT applied: it is not a templated-stamp
+      // field, it is inert without a console, and the addressed update path fills it
+      // on upgrade. Only the templated fields flow, via `applyTemplateMatrix`.
+      const addresslessCascade = selectFieldWinners(device, prepared, source.authProfileId);
+      for (const w of addresslessCascade.warnings) {
+        warnings.push(w);
+      }
+      for (const rid of addresslessCascade.matchedRuleIds) {
+        matchedRuleIds.add(rid);
+      }
+      const addresslessComposed = composeDesiredFields(
+        addresslessCascade.winners,
+        {
+          hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
+          proxyTemplateName: addresslessCascade.proxyTemplateName,
+          sourceName: source.name
+        },
+        {
+          hasAuthProfile: (pid) => resolveAuthProfileById(pid) !== undefined,
+          hasServer: (sid) => liveServerIds.has(sid),
+          ipmiAuthProfileTemplateName: addresslessCascade.provenance.ipmiAuthProfileId?.templateName,
+          ipmiGatewayServerTemplateName: addresslessCascade.provenance.ipmiGatewayServerId?.templateName,
+          sourceName: source.name
+        }
+      );
+      for (const w of addresslessComposed.warnings) {
+        pushDedupTemplateWarning(w);
+      }
+      const addresslessDesired = addresslessComposed.desired;
+      const addresslessProxyTemplateName = addresslessCascade.proxyTemplateName;
+      const addresslessGatewayTemplateName = addresslessCascade.provenance.ipmiGatewayServerId?.templateName;
+      // P1-C (Fable) — the SSH auth winner, resolved exactly as the addressed path
+      // does, so the addressless ADD can write the source-level link (`authProfileId`
+      // + `syncedAuthProfileId`). A dangling reference writes no link (and warns for a
+      // template referrer); a keyless winner is dropped by the blanket per-profile
+      // refusal, mirroring the addressed add. The link is inert while the placeholder
+      // is addressless but correct on upgrade, and BMC/IPMI features may read it.
+      const addresslessAuthWinnerField = addresslessCascade.winners.authProfileId;
+      const addresslessWinnerProfile =
+        addresslessAuthWinnerField !== undefined ? resolveAuthProfileById(addresslessAuthWinnerField.value) : undefined;
+      if (addresslessAuthWinnerField !== undefined && addresslessWinnerProfile === undefined && !addresslessCascade.authFromImplicit) {
+        pushDedupTemplateWarning(
+          `A device template rule on "${source.name}" links an auth profile that no longer exists — the auth field was skipped.`
+        );
+      }
+      const addresslessWinnerKeyless =
+        addresslessWinnerProfile !== undefined && authProfileNeedsServerKeyPath(addresslessWinnerProfile);
+      const addresslessWinnerResolvedId =
+        addresslessAuthWinnerField !== undefined && addresslessWinnerProfile !== undefined && !addresslessWinnerKeyless
+          ? addresslessAuthWinnerField.value
+          : undefined;
+      if (ownedForAddressless) {
+        // DOWNGRADE / stay-addressless. Decided here so the post-loop rollback
+        // pass does not touch this server a second time.
+        decidedOwnedExternalIds.add(device.externalId);
+        // Protocol on downgrade obeys the SAME ownership discipline the addressed
+        // path uses — passing `undefined` as the device protocol (the addressless
+        // shape is ssh-default): a sync-owned protocol is cleared to ssh, while a
+        // hand-flipped one is left alone with its stamp carried forward verbatim.
+        const takesProtocol = syncOwnsProtocol(
+          ownedForAddressless.protocol,
+          ownedForAddressless.origin?.syncedProtocol,
+          undefined
+        );
+        const afterProtocol = takesProtocol ? undefined : ownedForAddressless.protocol;
+        // OOB (Codex P2) — an addressless-for-console device can still expose a
+        // BMC address, so the downgrade/stay path decides `ipmiHost` under the
+        // SAME `syncOwnsIpmiHost` matrix the addressed path uses: it takes the new
+        // OOB address only when the sync still owns the field (row 1/3/5a), and
+        // otherwise leaves a hand-edited value alone (rows 4/5). When the device
+        // supplies NO OOB (`mgmtHost` undefined, matrix row 6) the field and its
+        // stamp are carried forward VERBATIM by the `...ownedForAddressless`
+        // spread — never touched.
+        const takesIpmiHost =
+          mgmtHost !== undefined &&
+          syncOwnsIpmiHost(ownedForAddressless.ipmiHost, ownedForAddressless.origin?.syncedIpmiHost, mgmtHost);
+        // DEVICE TEMPLATES (Codex P2-a) — the same matrix the addressed update runs,
+        // against the placeholder's own id for the §5.3 self-proxy check. Its
+        // `values` are the field writes, its `templated` the carried-forward stamp
+        // record; a hand-edited templated field is left untouched (row 4/7).
+        const templateMatrix = applyTemplateMatrix(ownedForAddressless, addresslessDesired, {
+          targetServerId: ownedForAddressless.id,
+          targetServerName: device.name,
+          proxyTemplateName: addresslessProxyTemplateName,
+          ipmiGatewayTemplateName: addresslessGatewayTemplateName
+        });
+        for (const w of templateMatrix.warnings) {
+          warnings.push(w);
+        }
+        if (templateMatrix.values.proxy !== undefined && addresslessProxyTemplateName !== undefined) {
+          proxyTemplateNameByServerId.set(ownedForAddressless.id, addresslessProxyTemplateName);
+        }
+        if (templateMatrix.values.ipmiGatewayServerId !== undefined && addresslessGatewayTemplateName !== undefined) {
+          ipmiGatewayTemplateNameByServerId.set(ownedForAddressless.id, addresslessGatewayTemplateName);
+        }
+        const afterOrigin: ServerOrigin = {
+          ...ownedForAddressless.origin,
+          sourceId: source.id,
+          externalId: device.externalId,
+          syncedAt: now,
+          syncedInstanceKey: providerInstanceKey,
+          // Username/auth/alt stamps and their values are carried forward VERBATIM
+          // by the `...ownedForAddressless` spread below. `protocol` follows its
+          // ownership decision above; `ipmiHost` follows its own, refreshed only
+          // where this sync writes the value (the `takesIpmiHost` line below) and
+          // otherwise carried forward — including as `undefined`, which keeps a hand
+          // entry hands-off (matrix row 5). `templated` is the matrix's carried
+          // stamp record (writes folded in), same as the addressed update path.
+          syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
+          syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedForAddressless.origin?.syncedIpmiHost,
+          templated: templateMatrix.templated
+        };
+        const after: ServerConfig = {
+          ...ownedForAddressless,
+          name: device.name,
+          host: "",
+          port: ADDRESSLESS_PORT,
+          addressless: true,
+          group: addresslessGroup,
+          // The template field writes (proxy/multiplexing/legacyAlgorithms/logSession
+          // /ipmiAuthProfileId/ipmiGatewayServerId) on exactly the rows the matrix
+          // owns; a field it did not write is preserved by the spread above.
+          ...templateMatrix.values,
+          origin: afterOrigin
+        };
+        if (afterProtocol === undefined) {
+          delete after.protocol;
+        } else {
+          after.protocol = afterProtocol;
+        }
+        // §5.3 REPAIR — the matrix found a template-owned self-proxy and asks for its
+        // removal (the stamp is already dropped from `templated`), so both the proxy
+        // removal and the stamp change show in the `changed` comparison below.
+        if (templateMatrix.clearProxy) {
+          delete after.proxy;
+        }
+        // The value half of the `ipmiHost` decision, on exactly the rows
+        // `syncOwnsIpmiHost` answered yes for — a conditional assignment (not a
+        // member of the literal) so the `...ownedForAddressless` spread preserves
+        // a hand-edited value on the rows this must not touch.
+        if (takesIpmiHost) {
+          after.ipmiHost = mgmtHost;
+        }
+        // AUTH 2b on DOWNGRADE (Fable P1-B) — the same keyless-profile rollback the
+        // addressed update runs (~2063) and the post-loop pass runs for skipped
+        // devices (~3123). This branch marks the device "decided", so the post-loop
+        // pass will NOT revisit it; without deciding the rollback HERE an owned
+        // placeholder linked to a keyless key profile would stay linked and
+        // unusable forever. Decided on `after` and mirroring the addressed path: a
+        // usable link rides forward (verdict "none"), a keyless one unlinks (and
+        // clears its stamp), and a server bringing its own key is retained.
+        const rolledBackProfileId = after.authProfileId;
+        const mappedRollback = decideSourceAuthRollback(after, unusableProfileIds);
+        if (mappedRollback === "unlink" && rolledBackProfileId !== undefined) {
+          after.authProfileId = undefined;
+          after.origin = { ...afterOrigin, syncedAuthProfileId: undefined };
+          bump(unlinkedByProfile, rolledBackProfileId);
+        } else if (mappedRollback === "retain-own-key" && rolledBackProfileId !== undefined) {
+          bump(retainedByProfile, rolledBackProfileId);
+        }
+        // A targeted `changed` check (NOT `serverConfigsEqual`, which compares
+        // `syncedAt` and would fire a no-op update on every sync of a stopped
+        // node). The origin STAMPS — not `syncedAt` — decide the origin half. The
+        // template value fields join the value half (the matrix can move any of
+        // them on an otherwise-unchanged placeholder); their stamps ride the
+        // `serverOriginStampsEqual` line, exactly as the addressed update path does.
+        const changed =
+          ownedForAddressless.name !== after.name ||
+          ownedForAddressless.host !== after.host ||
+          ownedForAddressless.port !== after.port ||
+          ownedForAddressless.protocol !== after.protocol ||
+          ownedForAddressless.ipmiHost !== after.ipmiHost ||
+          ownedForAddressless.group !== after.group ||
+          (ownedForAddressless.addressless ?? false) !== (after.addressless ?? false) ||
+          // AUTH 2b (Fable P1-B) — an unlink can be the ONLY change (a keyless link
+          // rolled back on a placeholder that is otherwise identical), so the
+          // authProfileId value joins the value half; its stamp rides the
+          // `serverOriginStampsEqual` line below.
+          ownedForAddressless.authProfileId !== after.authProfileId ||
+          !proxyConfigsEqual(ownedForAddressless.proxy, after.proxy) ||
+          ownedForAddressless.multiplexing !== after.multiplexing ||
+          ownedForAddressless.legacyAlgorithms !== after.legacyAlgorithms ||
+          ownedForAddressless.logSession !== after.logSession ||
+          ownedForAddressless.ipmiAuthProfileId !== after.ipmiAuthProfileId ||
+          ownedForAddressless.ipmiGatewayServerId !== after.ipmiGatewayServerId ||
+          !serverOriginStampsEqual(ownedForAddressless.origin, after.origin);
+        if (changed) {
+          updates.push({ before: ownedForAddressless, after });
+          // P2-3 (Fable) — disclose the loss of a console address, but ONLY when the
+          // server was previously ADDRESSED (a real downgrade). A stay-addressless
+          // server is unchanged in this respect and must not be named every sync.
+          if (ownedForAddressless.addressless !== true) {
+            downgradedToAddressless.push(device.name);
+          }
+          if (addresslessGroup !== undefined) {
+            folderSet.add(addresslessGroup);
+          }
+        } else {
+          // P3-1 (Fable) — the no-change twin of the addressed path (~2280): a
+          // stay-addressless server the sync left untouched still counts toward the
+          // owned total, or the preview totals do not sum and the round-4 promotion
+          // decrement gate miscounts.
+          unchangedCount++;
+          unchangedServerIds.add(ownedForAddressless.id);
+        }
+      } else {
+        // ADD — a fresh addressless placeholder. Minimal on purpose: no console
+        // means no secondary addresses or template fields to protect yet; the
+        // moment it gains a console the addressed update path fills them.
+        //
+        // P1-b (Codex review) — the SAME id-collision guard the addressed add
+        // path uses (~2142): the addressless branch is reached only when the
+        // device is NOT owned, but an UNRELATED record can still hold the
+        // deterministic id — the supported ID-preserving Keep-Servers→restore
+        // flow, or a hand-imported fragment. Applying the plan does
+        // `servers.set(id, …)`, so an unconditional add would REPLACE that
+        // record and discard its config. Skip rather than clobber; a later sync
+        // where the node gains a console reaches the addressed path, which
+        // resolves the collision (adoption) properly.
+        const addresslessId = deterministicServerId(source.id, device.externalId);
+        if (serversById.has(addresslessId)) {
+          warnings.push(
+            `Device "${device.name}" (${device.externalId}) has no console address, and its id collides with an existing server — left the existing server in place rather than replacing it with a placeholder.`
+          );
+          continue;
+        }
+        // P2-2 (Fable) — a kept placeholder for this device (a "Keep Servers" marker
+        // for the same provider deployment) cannot be adopted by address: it has none
+        // by design, and adoption corroborates by address. So a fresh placeholder is
+        // minted here rather than reclaiming the kept one. WARN so the kept copy is
+        // not stranded silently — the addressless ADD otherwise consults only the
+        // id-collision map and would leave the user to discover the duplicate.
+        const keptForAddressless = keptByExternalId.get(device.externalId) ?? [];
+        if (keptForAddressless.length > 0) {
+          const keptNames = namedExamples(keptForAddressless.map((s) => s.name));
+          warnings.push(
+            `Device "${device.name}" (${device.externalId}) has no console address and matches ${keptForAddressless.length === 1 ? "a server" : `${keptForAddressless.length} servers`} kept from a removed inventory source (${keptNames}) — a new placeholder was added because an addressless placeholder cannot be adopted by address. Once the device has a console, re-add the source and choose Adopt Existing, or delete the kept ${keptForAddressless.length === 1 ? "copy" : "copies"}.`
+          );
+        }
+        // DEVICE TEMPLATES (Codex P2-a) — the add matrix, against this fresh id for
+        // the §5.3 self-proxy check, exactly as the addressed add path runs it. A
+        // fresh record has nothing to protect, so `undefined` owned server ⇒ the
+        // template's values are written and stamped verbatim.
+        const addMatrix = applyTemplateMatrix(undefined, addresslessDesired, {
+          targetServerId: addresslessId,
+          targetServerName: device.name,
+          proxyTemplateName: addresslessProxyTemplateName,
+          ipmiGatewayTemplateName: addresslessGatewayTemplateName
+        });
+        for (const w of addMatrix.warnings) {
+          warnings.push(w);
+        }
+        if (addMatrix.values.proxy !== undefined && addresslessProxyTemplateName !== undefined) {
+          proxyTemplateNameByServerId.set(addresslessId, addresslessProxyTemplateName);
+        }
+        if (addMatrix.values.ipmiGatewayServerId !== undefined && addresslessGatewayTemplateName !== undefined) {
+          ipmiGatewayTemplateNameByServerId.set(addresslessId, addresslessGatewayTemplateName);
+        }
+        addresslessAdded.push(device.name);
+        adds.push({
+          id: addresslessId,
+          name: device.name,
+          host: "",
+          port: ADDRESSLESS_PORT,
+          addressless: true,
+          username: source.defaultUsername ?? "",
+          authType: "agent",
+          // P1-C (Fable) — the source-level auth LINK (never the profile's
+          // credentials, resolved fresh at connect time), exactly as the addressed
+          // add writes it. `authType: "agent"` above stays the inert fallback if the
+          // profile is later deleted. Undefined when the source/winner has no usable
+          // (non-keyless, resolvable) profile — the pre-feature record, field for field.
+          authProfileId: addresslessWinnerResolvedId,
+          isHidden: false,
+          group: addresslessGroup,
+          // DEVICE TEMPLATES (Codex P2-a) — the non-auth template field values this
+          // fresh placeholder starts with (ipmiAuthProfileId / ipmiGatewayServerId
+          // active now; proxy/multiplexing/legacyAlgorithms/logSession inert until it
+          // upgrades). Absent when the template sets none of them.
+          ...addMatrix.values,
+          // OOB (Codex P2) — a placeholder with no console address can still have
+          // a BMC one: a BMC web-console / locally-executed IPMI needs no primary
+          // console address. A fresh record has nothing to protect, so no matrix —
+          // whatever this fetch offers (or `undefined`) is what the field starts
+          // as, mirroring the addressed add path.
+          ipmiHost: mgmtHost,
+          origin: {
+            sourceId: source.id,
+            externalId: device.externalId,
+            syncedAt: now,
+            syncedInstanceKey: providerInstanceKey,
+            syncedUsername: source.defaultUsername,
+            // P1-C (Fable) — mirrors the `authProfileId` written above (the RESOLVED
+            // id, `undefined` for a dangling/keyless winner), recorded so a later sync
+            // knows the sync put this link here — exactly as the addressed add stamps it.
+            syncedAuthProfileId: addresslessWinnerResolvedId,
+            // Records the OOB address written above (UNCONDITIONALLY, `undefined`
+            // included) so every LATER sync has the ownership question already
+            // answered — matrix row 1, exactly as the addressed add path stamps it.
+            syncedIpmiHost: mgmtHost,
+            syncedProtocol: undefined,
+            // The template stamps for the non-auth fields written above, so every
+            // LATER sync has the ownership question already answered. Absent when
+            // the template set none of them.
+            templated: addMatrix.templated
+          }
+        });
+        if (addresslessGroup !== undefined) {
+          folderSet.add(addresslessGroup);
+        }
+      }
+      continue;
+    }
+    // P3-4 (Fable) — the port was already validated (and a bad one skipped) right
+    // after `selectPrimaryEndpoint` above, before the OOB extraction, so `port`
+    // here is known valid.
+    const endpoint = primary.endpoint;
+    const deviceProtocol = primary.protocol;
+    const port = endpoint.port ?? primary.defaultPort;
+
     // ALTERNATE HOST (issue #48, Phase 2) — the alternate SSH address this fetch
     // offers for `ServerConfig.altHost`, or `undefined` when the device supplies
     // none (matrix row 6 in `syncOwnsAltHost`). The SECOND ssh endpoint by the
@@ -1192,28 +1587,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const altHost = altEndpoint?.host;
 
     // Folder resolution: device.folderPath is relative to source.targetFolder.
-    let rel: string | undefined;
-    if (device.folderPath) {
-      const normalizedRel = normalizeFolderPath(device.folderPath);
-      if (normalizedRel === undefined) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid folder path "${device.folderPath}"; placed at the source's target folder.`);
-      } else {
-        rel = normalizedRel;
-      }
-    }
-    const joined = joinTargetAndRel(source.targetFolder, rel);
-    let group: string | undefined;
-    if (joined === undefined) {
-      group = undefined;
-    } else {
-      const normalizedJoined = normalizeFolderPath(joined);
-      if (normalizedJoined === undefined) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) folder path exceeds the maximum depth; placed at the source's target folder.`);
-        group = source.targetFolder ? source.targetFolder : undefined;
-      } else {
-        group = normalizedJoined;
-      }
-    }
+    const group = resolveDeviceGroup(device);
 
     const id = deterministicServerId(source.id, device.externalId);
 
@@ -1544,6 +1918,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       if (takesProtocol) {
         after.protocol = deviceProtocol;
       }
+      // ADDRESSLESS (Codex P1) — the UPGRADE half: an owned server that was
+      // addressless (device just gained a console) becomes addressed here,
+      // host/port/protocol already filled above. For a normal addressed server the
+      // field was absent, so the clear is a no-op.
+      //
+      // P1-A (Fable) — clear the flag ONLY when the record actually GAINED an
+      // address (`ownedEndpoint !== undefined`). This branch runs whenever the
+      // device has a usable PRIMARY endpoint, but `selectEndpointForProtocol`
+      // returns undefined when the record's protocol is user-owned (a hand-flip)
+      // and the device offers only the OTHER transport — leaving `ownedHost`/
+      // `ownedPort` at the record's carried ""/0. Clearing the flag there wrote an
+      // invalid `{host:"",port:0}` record with no addressless flag, which
+      // `validateServerConfig` rejects and storage silently drops on the next
+      // reload. When no address was gained the placeholder stays addressless.
+      if (ownedEndpoint !== undefined && after.addressless !== undefined) {
+        delete after.addressless;
+      }
 
       // AUTH 2 — retro-apply. The single exception to the field-ownership rule
       // above, and the only reason servers synced before the source had a
@@ -1865,6 +2256,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.host !== after.host ||
         ownedServer.port !== after.port ||
         ownedServer.group !== after.group ||
+        // ADDRESSLESS (Codex P1) — the UPGRADE clearing the flag can be the
+        // change (host filling always co-changes it here, but pinning the flag
+        // makes the intent explicit and covers a value-identical upgrade).
+        (ownedServer.addressless ?? false) !== (after.addressless ?? false) ||
         ownedServer.authProfileId !== after.authProfileId ||
         ownedServer.ipmiHost !== after.ipmiHost ||
         // ALTERNATE HOST (issue #48, Phase 2) — joins the value half for the same
@@ -2085,11 +2480,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         warnings.push(`Device "${device.name}" (${device.externalId}) maps to an id already used by unrelated server "${collidingServer.name}" — skipped.`);
       } else if (eligibleForAdoption.length === 0) {
         warnings.push(
-          `Device "${device.name}" (${device.externalId}) was previously synced onto server "${collidingServer.name}", which is now at ${collidingServer.host}:${collidingServer.port} while the device is at ${endpoint.host}:${port} — and it still uses the id a new server for this device would need, so the device is skipped rather than added as a new server. Point "${collidingServer.name}" back at ${endpoint.host}:${port} and sync again to reclaim it with Adopt Existing, or delete it and the next sync adds the device fresh.`
+          `Device "${device.name}" (${device.externalId}) was previously synced onto server "${collidingServer.name}", which is now at ${renderServerAddress(collidingServer)} while the device is at ${endpoint.host}:${port} — and it still uses the id a new server for this device would need, so the device is skipped rather than added as a new server. Point "${collidingServer.name}" back at ${endpoint.host}:${port} and sync again to reclaim it with Adopt Existing, or delete it and the next sync adds the device fresh.`
         );
       } else if (eligibleForAdoption.length === 1) {
         warnings.push(
-          `Device "${device.name}" (${device.externalId}) matches server "${eligibleForAdoption[0].name}" kept from a removed inventory source at ${endpoint.host}:${port}, but server "${collidingServer.name}" — kept from an earlier sync of this same device, now at ${collidingServer.host}:${collidingServer.port} — still uses the id a new server for this device would need, so the device is skipped rather than offered for adoption. Delete "${collidingServer.name}", then sync again and choose Adopt Existing to reclaim "${eligibleForAdoption[0].name}".`
+          `Device "${device.name}" (${device.externalId}) matches server "${eligibleForAdoption[0].name}" kept from a removed inventory source at ${endpoint.host}:${port}, but server "${collidingServer.name}" — kept from an earlier sync of this same device, now at ${renderServerAddress(collidingServer)} — still uses the id a new server for this device would need, so the device is skipped rather than offered for adoption. Delete "${collidingServer.name}", then sync again and choose Adopt Existing to reclaim "${eligibleForAdoption[0].name}".`
         );
       } else {
         warnings.push(
@@ -2572,7 +2967,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // its own reason and the repair is obvious (the addresses are both named).
       warnings.push(
         keptMatches.length === 1
-          ? `Device "${device.name}" was previously synced onto server "${keptMatches[0].name}", but that server is now at ${keptMatches[0].host}:${keptMatches[0].port} and the device is at ${endpoint.host}:${port} — it will be added as a new server instead.`
+          ? `Device "${device.name}" was previously synced onto server "${keptMatches[0].name}", but that server is now at ${renderServerAddress(keptMatches[0])} and the device is at ${endpoint.host}:${port} — it will be added as a new server instead.`
           : `Device "${device.name}" was previously synced onto ${keptMatches.length} servers in your list, none of which is still at ${endpoint.host}:${port} — it will be added as a new server instead.`
       );
     } else {
@@ -2981,7 +3376,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     );
   }
 
-  pushSkipSummary(warnings, "had no usable SSH or telnet endpoint", noEndpointSkipped);
+  // ADDRESSLESS (Codex P1) — replaces the old "no usable endpoint … skipped"
+  // summary: those devices are now CREATED as addressless placeholders, so the
+  // aggregate note says what happened rather than that they were dropped. One
+  // line, never per-device.
+  if (addresslessAdded.length > 0) {
+    const count = addresslessAdded.length;
+    warnings.push(
+      `${count} device${count === 1 ? "" : "s"} ${count === 1 ? "has" : "have"} no console address yet and ${count === 1 ? "was" : "were"} added without one (e.g. ${namedExamples(addresslessAdded)}).`
+    );
+  }
+  // P2-3 (Fable) — the downgrade twin of the addressless-added disclosure: name the
+  // previously-addressed servers whose console address this sync blanked.
+  if (downgradedToAddressless.length > 0) {
+    const count = downgradedToAddressless.length;
+    warnings.push(
+      `${count} previously-addressed server${count === 1 ? "" : "s"} lost ${count === 1 ? "its" : "their"} console address and ${count === 1 ? "was" : "were"} downgraded to ${count === 1 ? "a placeholder" : "placeholders"} (e.g. ${namedExamples(downgradedToAddressless)}).`
+    );
+  }
   pushSkipSummary(warnings, "had an empty name", emptyNameSkipped);
   pushSkipSummary(warnings, "had an invalid port", invalidPortSkipped);
 

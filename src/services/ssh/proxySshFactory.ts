@@ -14,7 +14,7 @@ import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
 import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
 import { configMutationLock } from "../configMutationLock";
-import { telnetUnsupportedMessage } from "../../utils/protocolGuards";
+import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../../utils/protocolGuards";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
@@ -137,6 +137,15 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     const jumpUnsupported = telnetUnsupportedMessage(jumpServer, "Use as an SSH jump host");
     if (jumpUnsupported) {
       throw new Error(jumpUnsupported);
+    }
+    // ADDRESSLESS (Codex P1 review MAJOR-1) — the same stale-id hazard: a server
+    // named as a jump host can go addressless (its device stopped) long after
+    // the choice was saved, and no picker can retract a stored id. Refused here,
+    // BEFORE `connectToJumpHost`, so no vault read or password prompt happens for
+    // a host with no address to connect to.
+    const jumpAddressless = addresslessUnavailableMessage(jumpServer);
+    if (jumpAddressless) {
+      throw new Error(jumpAddressless);
     }
 
     this.assertNoCircularProxyChain(jumpServer, nextVisited);
