@@ -303,6 +303,36 @@ describe("isValidServerOrigin — syncedProtocol stamp", () => {
   });
 });
 
+describe("isValidServerOrigin — syncedHost / syncedPort stamps (task #29)", () => {
+  const valid = { sourceId: "src-1", externalId: "device:1", syncedAt: 1 };
+
+  // ⊘ A guard that skipped `syncedHost` lets a hand-edited backup carry an empty
+  // string into `syncOwnsHost`, where an empty `cur === stamp` would spuriously
+  // read as owned. The whole origin is stripped instead (the F13 disposition).
+  it("accepts an absent or non-empty syncedHost, rejects empty or non-string", () => {
+    expect(isValidServerOrigin(valid)).toBe(true);
+    expect(isValidServerOrigin({ ...valid, syncedHost: "10.0.0.1" })).toBe(true);
+    expect(isValidServerOrigin({ ...valid, syncedHost: "" })).toBe(false);
+    expect(isValidServerOrigin({ ...valid, syncedHost: 5 })).toBe(false);
+  });
+
+  // ⊘ The FIRST numeric stamp — the string check its siblings get would reject
+  // every real value. It needs the integer/`>= 0` clause instead; dropping the
+  // clause (accept anything) lets a fractional/negative/string port through into
+  // `syncOwnsPort`, and a bad value must strip the WHOLE origin.
+  it("accepts absent or a non-negative integer syncedPort, rejects fractional / negative / string", () => {
+    expect(isValidServerOrigin(valid)).toBe(true);
+    expect(isValidServerOrigin({ ...valid, syncedPort: 32769 })).toBe(true);
+    // 0 is the ADDRESSLESS_PORT sentinel — tolerated by the `>= 0` bound (a
+    // version-skewed row could carry it) rather than rejected.
+    expect(isValidServerOrigin({ ...valid, syncedPort: 0 })).toBe(true);
+    expect(isValidServerOrigin({ ...valid, syncedPort: 32.5 })).toBe(false);
+    expect(isValidServerOrigin({ ...valid, syncedPort: -1 })).toBe(false);
+    expect(isValidServerOrigin({ ...valid, syncedPort: "32769" })).toBe(false);
+    expect(isValidServerOrigin({ ...valid, syncedPort: Number.NaN })).toBe(false);
+  });
+});
+
 /**
  * MAJOR-3 (review) — a telnet server must never be offered as an SSH jump host
  * or an IPMI gateway. Both are id references the SSH connect path dereferences

@@ -139,7 +139,22 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     // `"ssh"` is accepted even though the sync only ever writes `undefined` for
     // it: the two are the same statement, and rejecting a record over a
     // synonym would cost it its sync ownership for nothing.
-    (obj.syncedProtocol === undefined || obj.syncedProtocol === "ssh" || obj.syncedProtocol === "telnet")
+    (obj.syncedProtocol === undefined || obj.syncedProtocol === "ssh" || obj.syncedProtocol === "telnet") &&
+    // PRIMARY HOST (task #29) — the same tolerant optional-string check as
+    // `syncedAltHost`/`syncedIpmiHost` above, for the same reason: the sync writes
+    // this stamp only in the same breath as a non-empty `host` (an endpoint with an
+    // empty host is never selected), so an empty string could not have come from a
+    // sync — only a hand-edited backup or a version-skewed row.
+    isOptionalNonEmptyString(obj.syncedHost) &&
+    // PRIMARY PORT (task #29) — the FIRST numeric stamp, so a NUMERIC clause
+    // rather than the string check its siblings get: absent, or a non-negative
+    // integer (the sync only ever writes a real endpoint port `>= 1`; `0` is the
+    // `ADDRESSLESS_PORT` sentinel, which the sync stores as an absent stamp, so
+    // `>= 0` is the tolerant bound and a fractional/negative/NaN/string value can
+    // only be a hand-edited backup). A bad value strips the WHOLE origin, exactly
+    // as every clause above does.
+    (obj.syncedPort === undefined ||
+      (typeof obj.syncedPort === "number" && Number.isInteger(obj.syncedPort) && obj.syncedPort >= 0))
   );
 }
 

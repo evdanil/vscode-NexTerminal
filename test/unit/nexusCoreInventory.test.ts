@@ -4582,6 +4582,75 @@ describe("serverOriginStampsEqual / mergeServerConfigFields — origin.syncedIpm
 });
 
 /**
+ * PRIMARY HOST/PORT (task #29, the deferred #82 P2-3) — `ServerOrigin.syncedHost`
+ * / `syncedPort`, the stamps that record the console address the SYNC wrote into
+ * `ServerConfig.host`/`port`. These make `host`/`port` sync-owned-with-hand-off
+ * (the DELIBERATE BEHAVIOR CHANGE): the sync writes them only where the record
+ * still carries exactly what the stamp says, so a comparator that cannot SEE the
+ * stamp silently loses the write that created it — after which the address reads
+ * as hand-edited (never updated) or never-configured. Mirrors the syncedIpmiHost
+ * fixtures above; every fixture makes the broken implementation visibly diverge.
+ */
+describe("serverOriginStampsEqual — origin.syncedHost / syncedPort (task #29)", () => {
+  function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "s1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      ...overrides
+    };
+  }
+
+  it("counts syncedHost in both directions while still ignoring syncedAt (kills leaving the host stamp out of the `changed` check, which discards the write that gives the sync ownership of `host`)", () => {
+    const legacy = {
+      sourceId: "src-1",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedInstanceKey: "https://eve.example.com",
+      syncedUsername: "admin"
+    };
+    const stamped = { ...legacy, syncedHost: "10.0.0.1" };
+
+    // Gaining the stamp is a change (matrix row 5a — a record whose host already
+    // equals the device's gains a syncedHost). A comparator blind to it lets
+    // computeSyncPlan discard that `after`, and the server never gains ownership
+    // of its own address — read as a hand entry forever after.
+    expect(serverOriginStampsEqual(legacy, stamped)).toBe(false);
+    expect(serverOriginStampsEqual(stamped, legacy)).toBe(false);
+    // Moving to another address is a change — the console address following the device.
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedHost: "10.0.0.2" })).toBe(false);
+    // ...and an unchanged stamp is not, or every owned server reports as an update every sync.
+    expect(serverOriginStampsEqual(stamped, { ...stamped })).toBe(true);
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedAt: 9999 })).toBe(true);
+    // serverConfigsEqual inherits the term through serverOriginsEqual.
+    expect(serverConfigsEqual(server({ origin: legacy }), server({ origin: stamped }))).toBe(false);
+  });
+
+  it("counts syncedPort in both directions (kills leaving the FIRST numeric stamp out of the `changed` check)", () => {
+    const base = {
+      sourceId: "src-1",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedHost: "10.0.0.1"
+    };
+    const legacy = { ...base }; // syncedPort absent — a placeholder / legacy row
+    const stamped = { ...base, syncedPort: 32769 };
+
+    expect(serverOriginStampsEqual(legacy, stamped)).toBe(false);
+    expect(serverOriginStampsEqual(stamped, legacy)).toBe(false);
+    // A reassigned console port following at the source (the exact case the D5 heal serves).
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedPort: 32800 })).toBe(false);
+    expect(serverOriginStampsEqual(stamped, { ...stamped })).toBe(true);
+    expect(serverConfigsEqual(server({ origin: legacy }), server({ origin: stamped }))).toBe(false);
+    expect(serverConfigsEqual(server({ origin: stamped }), server({ origin: { ...stamped } }))).toBe(true);
+  });
+});
+
+/**
  * LIVE STATUS (Phase 2) — NexusCore's runtime-only serverStatus map, keyed by
  * serverId, exposed on the snapshot and never persisted. applyInventoryStatus
  * maps a provider's externalId-keyed report onto owned servers via
