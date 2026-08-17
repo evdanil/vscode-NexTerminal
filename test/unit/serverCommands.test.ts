@@ -5211,4 +5211,69 @@ describe("folder-op serialization (#84 P1)", () => {
     expect(live?.port).toBe(2222); // the concurrent edit survives
     expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
   });
+
+  it("(#84 P2-1) deployKey runs the password cleanup ONLY on a SUCCESSFUL conversion — an aborted conversion neither announces 'switched to key auth' nor deletes the stored password (⊘ running cleanup regardless of success announces a false switch and offers a still-password-auth record's password for deletion)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "password", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    const vaultGet = vi.fn(async () => "stored-pw");
+    const vaultDelete = vi.fn(async () => {});
+    deployKit(core, sshDeploy());
+    // Attach a vault so the (buggy) cleanup could act.
+    registerServerCommands(realCtx(core, {
+      sshFactory: sshDeploy() as unknown as CmdCtx["sshFactory"],
+      secretVault: { get: vaultGet, store: vi.fn(async () => {}), delete: vaultDelete } as unknown as CmdCtx["secretVault"]
+    }));
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // Mode prompt: edit d1's host (identity change → abort). The removal
+    // announcement, if the buggy cleanup ran, would return the delete action.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async (msg: string) => {
+      if (typeof msg === "string" && msg.includes("Choose how to use it")) {
+        await core.addOrUpdateServer({ ...d1, host: "10.9.9.9" });
+        return "Use standalone key";
+      }
+      return "Remove stored password";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    // Conversion aborted, so the cleanup must not have run at all.
+    expect(vi.mocked(vscode.window.showInformationMessage)).not.toHaveBeenCalledWith(
+      expect.stringContaining("switched to key authentication"),
+      expect.anything()
+    );
+    expect(vaultDelete).not.toHaveBeenCalled();
+    expect(core.getServer("d1")?.authType).toBe("password"); // never converted
+  });
+
+  it("(#84 P2-2) deployKey ABORTS when the linked profile's USERNAME changed during deploy — the stored username field is unchanged (profile-linked) but the effective account the key was authorized for moved (⊘ comparing the stored username instead of the resolved effective one converts a moved account to key auth)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // Profile-linked server: stored username blank, effective username comes from p1.
+    await core.addOrUpdateAuthProfile({ id: "p1", name: "P", username: "old-acct", authType: "password" });
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "", authType: "agent", authProfileId: "p1", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // During the mode prompt, the linked profile's username changes — the key was
+    // installed for "old-acct", the profile now resolves to "new-acct".
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateAuthProfile({ id: "p1", name: "P", username: "new-acct", authType: "password" });
+      return "Use standalone key";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.authProfileId).toBe("p1"); // still profile-linked, unchanged
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
+  });
 });
