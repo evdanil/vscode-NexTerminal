@@ -4877,6 +4877,134 @@ describe("computeSyncPlan — every telnet record it writes must validate", () =
   });
 });
 
+/**
+ * P1-C (Codex) — the protocol and the endpoint tuple must be decided TOGETHER.
+ *
+ * `takesProtocol` could answer "the user owns this protocol, leave it telnet"
+ * while `host`/`port` were taken unconditionally from the inventory-selected
+ * endpoint — which for a dual-stack device is the SSH one. The next sync then
+ * produced a telnet profile pointed at port 22: a record that cannot connect,
+ * assembled out of two individually-correct decisions.
+ */
+describe("computeSyncPlan — protocol and endpoint are decided coherently", () => {
+  const dualStack = () =>
+    makeDevice({
+      endpoints: [
+        { kind: "ssh", host: "10.0.0.1" },
+        { kind: "telnet", host: "10.0.0.5", port: 2001 }
+      ]
+    });
+
+  /** An owned server the user hand-switched to telnet (no stamp ⇒ hand-owned). */
+  const handTelnet = (overrides: Partial<ServerConfig> = {}) =>
+    makeOwnedServer({
+      protocol: "telnet",
+      host: "10.0.0.5",
+      port: 2001,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 },
+      ...overrides
+    });
+
+  // ⊘ THE FINDING. Pre-fix this produced `{ protocol: "telnet", host: "10.0.0.1",
+  // port: 22 }` — the SSH endpoint's tuple under a telnet protocol. The fixture
+  // gives the device BOTH endpoints at DIFFERENT addresses and ports, so a
+  // mismatched pick is visible in every field.
+  it("follows the telnet endpoint for a hand-telnet server on a dual-endpoint device", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([dualStack()]),
+      currentServers: [handTelnet({ host: "10.0.0.9", port: 23 })],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.protocol).toBe("telnet");
+    expect(after.host).toBe("10.0.0.5");
+    expect(after.port).toBe(2001);
+  });
+
+  // ⊘ The conservative half: the device offers no telnet endpoint at all, so
+  // there is no address to follow. Overwriting host/port from the SSH endpoint
+  // would leave a telnet profile aimed at the SSH port — the exact broken record
+  // this finding is about — so the tuple is left ALONE.
+  it("leaves a hand-telnet server's address alone when the device offers no telnet endpoint", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]),
+      currentServers: [handTelnet({ host: "10.0.0.9", port: 23 })],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after;
+    if (after) {
+      expect(after.protocol).toBe("telnet");
+      expect(after.host).toBe("10.0.0.9");
+      expect(after.port).toBe(23);
+    }
+    // Whether or not an update is emitted, the record must never end up telnet
+    // on the SSH endpoint's tuple.
+    expect(after?.host).not.toBe("10.0.0.1");
+    expect(after?.port).not.toBe(22);
+  });
+
+  it("mirrors the rule for a hand-SSH server on a telnet-only device", () => {
+    const owned = makeOwnedServer({
+      protocol: undefined,
+      host: "10.0.0.9",
+      port: 22,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet" }
+    });
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after;
+    // The user owns "ssh"; the device offers only telnet, so nothing to follow.
+    expect(after?.protocol ?? owned.protocol).toBeUndefined();
+    expect(after?.host ?? owned.host).toBe("10.0.0.9");
+    expect(after?.port ?? owned.port).toBe(22);
+  });
+
+  // CONTROL — a sync-owned server still follows the device exactly as before,
+  // so the fix is scoped to the hand-owned case and has not frozen addresses.
+  it("still moves a sync-owned server's address and protocol with the device", () => {
+    const owned = makeOwnedServer({
+      host: "10.0.0.99",
+      port: 22,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 }
+    });
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = plan.updates[0].after;
+    expect(after.protocol).toBe("telnet");
+    expect(after.host).toBe("10.0.0.5");
+    expect(after.port).toBe(23);
+  });
+
+  it("still follows the SSH endpoint for an ordinary sync-owned SSH server", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([dualStack()]),
+      currentServers: [makeOwnedServer({ host: "10.0.0.99" })],
+      now: 2000
+    });
+
+    const after = plan.updates[0].after;
+    expect(after.protocol).toBeUndefined();
+    expect(after.host).toBe("10.0.0.1");
+    expect(after.port).toBe(22);
+  });
+});
+
 describe("validateInventoryTree — telnet endpoint kind", () => {
   it("accepts a device whose only endpoint is telnet", () => {
     expect(() =>
