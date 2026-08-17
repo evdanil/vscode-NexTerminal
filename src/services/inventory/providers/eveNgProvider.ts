@@ -232,6 +232,24 @@ function isObject(value: unknown): value is Record<string, unknown> {
 // parseJsonOrThrow trio so both providers fail in the same vocabulary.
 // ---------------------------------------------------------------------------
 
+/**
+ * WALL-CLOCK DEADLINE (task #30, #84 P2) — the sentinel `raw()` throws when a
+ * request's abort was caused by the CRAWL DEADLINE expiring mid-flight (as
+ * opposed to a genuine per-request network timeout with the deadline still far
+ * off). The crawl loops CATCH it and terminate as TRUNCATED — returning the
+ * partial results collected so far plus the deadline warning — rather than
+ * letting it propagate as a `network` failure that discards the whole crawl. Not
+ * an `InventoryProviderError`, so it can never be mistaken for a real fetch error
+ * anywhere it might leak (a leak surfaces as a plain Error, loud, not a
+ * misclassified network failure).
+ */
+class CrawlDeadlineExceeded extends Error {
+  public constructor() {
+    super("EVE-NG crawl deadline exceeded");
+    this.name = "CrawlDeadlineExceeded";
+  }
+}
+
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   const host = url.host || url.toString();
   if (err instanceof Error) {
@@ -397,6 +415,23 @@ class EveApiClient {
       // error instead.
       res = await this.fetchImpl(url.toString(), { ...init, redirect: "manual", signal: AbortSignal.timeout(effectiveTimeout) });
     } catch (err) {
+      // WALL-CLOCK DEADLINE (#84 P2) — a request that STALLED until the crawl
+      // deadline aborts exactly when the budget hit zero (its effective timeout
+      // was the remaining budget). Distinguish that from a genuine per-request
+      // network timeout (deadline still far off): an abort/timeout with the
+      // deadline now passed is the crawl running out of time, not the server
+      // being unreachable. Signal it as the truncation sentinel so the loops
+      // return partial results + the deadline warning instead of failing the
+      // whole crawl. A real timeout with the deadline far off still maps to
+      // `network`.
+      if (
+        this.crawlDeadline !== undefined &&
+        Date.now() >= this.crawlDeadline &&
+        err instanceof Error &&
+        (err.name === "AbortError" || err.name === "TimeoutError")
+      ) {
+        throw new CrawlDeadlineExceeded();
+      }
       throw mapNetworkError(err, url);
     }
     let text = "";
@@ -699,7 +734,21 @@ class EveApiClient {
           break;
         }
         requests++;
-        const listing = await this.listFolder(path, timeoutMs);
+        // WALL-CLOCK DEADLINE (#84 P2) — a listing that STALLED until the deadline
+        // aborts as the truncation sentinel: stop the walk as TRUNCATED with the
+        // labs collected so far, exactly like the between-request check above,
+        // rather than failing the whole crawl. A real network error still throws.
+        let listing: Awaited<ReturnType<typeof this.listFolder>>;
+        try {
+          listing = await this.listFolder(path, timeoutMs);
+        } catch (err) {
+          if (err instanceof CrawlDeadlineExceeded) {
+            budgetHit = true;
+            deadlineHit = true;
+            break;
+          }
+          throw err;
+        }
         if (listing === NOT_FOUND) {
           // MINOR-12 — the ROOT folder being gone would yield an empty tree and
           // prune every server the source owns, so it is fatal; a child folder
@@ -1110,7 +1159,20 @@ async function fetchInventoryImpl(
       truncated = true;
       break;
     }
-    const nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    // WALL-CLOCK DEADLINE (#84 P2) — a node fetch that STALLED until the deadline
+    // aborts as the truncation sentinel: keep the devices collected so far and
+    // stop the loop as TRUNCATED, rather than failing the whole crawl.
+    let nodePairs: Awaited<ReturnType<typeof client.listNodes>>;
+    try {
+      nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof CrawlDeadlineExceeded) {
+        deadlineHit = true;
+        truncated = true;
+        break;
+      }
+      throw err;
+    }
     // MINOR-12 — the lab was deleted between the folder listing that named it
     // and this node fetch; skip it with a warning rather than aborting.
     if (nodePairs === NOT_FOUND) {
@@ -1215,7 +1277,20 @@ async function fetchStatusImpl(
       truncated = true;
       break;
     }
-    const nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    // WALL-CLOCK DEADLINE (#84 P2) — a node fetch that STALLED until the deadline
+    // aborts as the truncation sentinel: keep the statuses collected so far and
+    // stop as TRUNCATED (so applyInventoryStatus MERGES), not a failed poll.
+    let nodePairs: Awaited<ReturnType<typeof client.listNodes>>;
+    try {
+      nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof CrawlDeadlineExceeded) {
+        deadlineHit = true;
+        truncated = true;
+        break;
+      }
+      throw err;
+    }
     // MINOR-12 — the lab was deleted between the folder listing and this fetch;
     // skip it, exactly as fetchInventory does.
     if (nodePairs === NOT_FOUND) {

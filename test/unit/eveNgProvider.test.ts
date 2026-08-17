@@ -1392,6 +1392,80 @@ describe("createEveNgProvider — crawl deadline (task #30)", () => {
       nowSpy.mockRestore();
     }
   });
+
+  // A request that STALLS until the deadline: the fake clock is advanced past the
+  // deadline and the fetch rejects with a TimeoutError, exactly as
+  // AbortSignal.timeout(remaining) would when the request never answers.
+  function timeoutError(): Error {
+    const err = new Error("The operation timed out.");
+    err.name = "TimeoutError";
+    return err;
+  }
+
+  it("#84 P2 — a request that STALLS to the deadline TRUNCATES the crawl (partial results + deadline warning), it does NOT fail the whole crawl (⊘ converting the deadline-abort to a network error discards every device already collected)", async () => {
+    let clock = 1_000_000_000;
+    const deadline = clock + DEADLINE_MS; // computed the same way the crawl does
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const world: World = {
+        folders: { "/": { labs: [{ file: "L1.unl", path: "/L1.unl" }, { file: "L2.unl", path: "/L2.unl" }] } },
+        nodes: { "/L1.unl": { "1": node({ id: "1" }) }, "/L2.unl": { "2": node({ id: "2" }) } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      let nodeReq = 0;
+      const wrapped = (async (input: string, init?: RequestInit) => {
+        const path = decodeURIComponent(new URL(input).pathname);
+        if (path.startsWith("/api/labs") && path.endsWith("/nodes")) {
+          nodeReq++;
+          if (nodeReq === 2) {
+            // The second lab's node fetch stalls until the deadline and aborts.
+            clock = deadline + 5_000;
+            throw timeoutError();
+          }
+        }
+        return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+      }) as unknown as typeof fetch;
+
+      const tree = await createEveNgProvider(wrapped).fetchInventory(CONFIG, SECRETS);
+      // Truncated + partial + warned — never thrown.
+      expect(tree.truncated).toBe(true);
+      expect(tree.devices.some((d) => d.externalId.includes("/L1.unl"))).toBe(true);
+      expect(tree.devices.some((d) => d.externalId.includes("/L2.unl"))).toBe(false);
+      expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("time limit"))).toBe(true);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("#84 P2 — a genuine per-request timeout with the deadline STILL FAR OFF surfaces as a network error, not a truncation (⊘ treating every abort as a deadline trip would swallow a real dead-server timeout into a silently-partial sync)", async () => {
+    let clock = 1_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const world: World = {
+        folders: { "/": { labs: [{ file: "L1.unl", path: "/L1.unl" }] } },
+        nodes: { "/L1.unl": { "1": node({ id: "1" }) } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      const wrapped = (async (input: string, init?: RequestInit) => {
+        const path = decodeURIComponent(new URL(input).pathname);
+        if (path.startsWith("/api/labs") && path.endsWith("/nodes")) {
+          // A per-request timeout, but the deadline is nowhere near (clock barely moves).
+          clock += 20_000; // one FETCH_TIMEOUT_MS worth — well under the 120s budget
+          throw timeoutError();
+        }
+        return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+      }) as unknown as typeof fetch;
+
+      const err = await createEveNgProvider(wrapped)
+        .fetchInventory(CONFIG, SECRETS)
+        .then(() => undefined)
+        .catch((e) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("network");
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
 });
 
 describe("createEveNgProvider — error mapping", () => {
