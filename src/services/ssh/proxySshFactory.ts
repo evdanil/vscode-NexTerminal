@@ -14,6 +14,7 @@ import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
 import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
 import { configMutationLock } from "../configMutationLock";
+import { telnetUnsupportedMessage } from "../../utils/protocolGuards";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
@@ -123,6 +124,19 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     const jumpServer = this.serverLookup(jumpHostId);
     if (!jumpServer) {
       throw new Error(`Jump host server not found (id: ${jumpHostId})`);
+    }
+
+    // TELNET (Phase 0, MAJOR-3) — a jump host must speak SSH. The form no longer
+    // OFFERS a telnet server here, but the stored id outlives that: a server can
+    // be switched to Telnet long after another server named it, and no picker
+    // can retract a choice already saved. Without this the chain handed the
+    // telnet server to `SilentAuthSshFactory` — a vault read and a password
+    // prompt for a host that has no SSH login — and then failed with a raw ssh2
+    // handshake error against port 23. Refused BEFORE `connectToJumpHost`, so
+    // no credential is ever read or requested.
+    const jumpUnsupported = telnetUnsupportedMessage(jumpServer, "Use as an SSH jump host");
+    if (jumpUnsupported) {
+      throw new Error(jumpUnsupported);
     }
 
     this.assertNoCircularProxyChain(jumpServer, nextVisited);

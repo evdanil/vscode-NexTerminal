@@ -134,7 +134,12 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     // with an empty host is never selected), and the server form stores a cleared
     // alternate host as `undefined`, so an empty string could not have come from
     // either — only a hand-edited backup or a version-skewed row.
-    isOptionalNonEmptyString(obj.syncedAltHost)
+    isOptionalNonEmptyString(obj.syncedAltHost) &&
+    // TELNET (Phase 0) — the two `ServerConfig.protocol` literals, or absent.
+    // `"ssh"` is accepted even though the sync only ever writes `undefined` for
+    // it: the two are the same statement, and rejecting a record over a
+    // synonym would cost it its sync ownership for nothing.
+    (obj.syncedProtocol === undefined || obj.syncedProtocol === "ssh" || obj.syncedProtocol === "telnet")
   );
 }
 
@@ -230,6 +235,12 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
   if (obj.syncedAltHost !== undefined && !isNonEmptyString(obj.syncedAltHost)) {
     return false;
   }
+  // TELNET (Phase 0) — the same closed-enum check `isValidServerOrigin` makes of
+  // the origin stamp this receipt mirrors; restored into a real origin at
+  // adoption, where the write rule compares it against the record's own field.
+  if (obj.syncedProtocol !== undefined && obj.syncedProtocol !== "ssh" && obj.syncedProtocol !== "telnet") {
+    return false;
+  }
   if (obj.templated !== undefined && !isValidTemplatedStamps(obj.templated)) {
     return false;
   }
@@ -247,13 +258,50 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   const obj = item as Record<string, unknown>;
+  // TELNET (Phase 0) — a CLOSED ENUM, the `SerialProfile.mode` disposition
+  // rather than `bmcWebProtocol`'s tolerant type check, and the difference is
+  // deliberate. `bmcWebProtocol` only ever picks a URL scheme, and its read site
+  // neutralizes an unknown value to the safe default; `protocol` selects the
+  // whole TRANSPORT and, with it, whether the auth machinery runs at all. A
+  // record naming a transport this build does not implement is one whose author
+  // meant something we cannot honour, so it is rejected here rather than
+  // silently demoted to SSH — which for a device that only speaks telnet would
+  // mean handing its credentials to a service that is not listening.
+  //
+  // Absent is valid and means `"ssh"` (see `resolveServerProtocol`), so no
+  // record written before this field existed is affected.
+  if (obj.protocol !== undefined && obj.protocol !== "ssh" && obj.protocol !== "telnet") {
+    return false;
+  }
   if (
     !(
       isNonEmptyString(obj.id) &&
       isNonEmptyString(obj.name) &&
       isNonEmptyString(obj.host) &&
       isValidPort(obj.port) &&
-      isNonEmptyString(obj.username) &&
+      // TELNET (Phase 0) — the ONE field this feature relaxes. Telnet has no
+      // protocol-level login: the user logs in at the device's own prompt, in
+      // the terminal, so the server form never collects a username for a telnet
+      // record and the submission carries none. Requiring a non-empty one here
+      // would drop every telnet server at the storage/import boundary.
+      //
+      // MAJOR-2 (review) — ABSENT is accepted as well as blank, and that is the
+      // whole point rather than tidiness. An inventory sync writes
+      // `endpoint.username ?? source.defaultUsername`, which is `undefined` for
+      // a telnet console whose device names no username and whose source has no
+      // default. Demanding `typeof === "string"` made the SYNC'S OWN OUTPUT fail
+      // the guard that decides whether a record survives a reload
+      // (`VscodeConfigRepository.getServers` drops it with only a console
+      // warning), so the server appeared, worked for the session, and silently
+      // vanished — on every re-sync, forever. The writer normalizes to `""` now
+      // too; this end is the one that must never disagree with it again.
+      //
+      // SSH SEMANTICS ARE UNCHANGED: a non-empty username is still required
+      // there, so this is scoped to the transport that has no login rather than
+      // a general loosening.
+      (obj.protocol === "telnet"
+        ? obj.username === undefined || typeof obj.username === "string"
+        : isNonEmptyString(obj.username)) &&
       (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
     )
   ) {

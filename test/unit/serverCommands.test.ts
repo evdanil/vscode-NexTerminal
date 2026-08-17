@@ -18,6 +18,7 @@ import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { SshPty } from "../../src/services/ssh/sshPty";
+import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -42,6 +43,10 @@ const mockAddOutputObserver = vi.fn((_observer: unknown) => ({ dispose: vi.fn() 
 
 vi.mock("../../src/services/ssh/sshPty", () => ({
   SshPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
+}));
+
+vi.mock("../../src/services/telnet/telnetPty", () => ({
+  TelnetPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
 }));
 
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
@@ -4138,5 +4143,351 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
     expect(finalSecret).toBeUndefined();
+  });
+});
+
+describe("telnet connect path", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  function connectTelnet(overrides: Partial<ServerConfig> = {}) {
+    const server = makeServer({ protocol: "telnet", username: "", port: 2001, ...overrides });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+    return { ctx, server, run: () => registeredCommands.get("nexus.server.connect")!("srv-1") };
+  }
+
+  // ⊘ THE POINT OF THE BRANCH. A connect path that still built an SshPty for a
+  // telnet server would prompt for a password, touch the vault, and then hand
+  // an SSH handshake to a port that speaks telnet.
+  it("builds a TelnetPty and never an SshPty", async () => {
+    const { run } = connectTelnet();
+    await run();
+
+    expect(TelnetPty).toHaveBeenCalledTimes(1);
+    expect(SshPty).not.toHaveBeenCalled();
+  });
+
+  it("still builds an SshPty for an ordinary server", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(SshPty).toHaveBeenCalledTimes(1);
+    expect(TelnetPty).not.toHaveBeenCalled();
+  });
+
+  it("names the terminal 'Nexus Telnet: {name}' and registers it with the terminal registry", async () => {
+    const registry = { register: vi.fn() };
+    const server = makeServer({ protocol: "telnet", username: "" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx as any).terminalRegistry = registry;
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(vscode.window.createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "Nexus Telnet: Server 1" })
+    );
+    expect(registry.register).toHaveBeenCalledTimes(1);
+  });
+
+  it("registers an ActiveSession under the telnet terminal name so scripts can target it", async () => {
+    const { ctx, run } = connectTelnet();
+    await run();
+
+    const callbacks = vi.mocked(TelnetPty).mock.calls[0][1] as unknown as {
+      onSessionOpened(sessionId: string): void;
+    };
+    callbacks.onSessionOpened("telnet-session-1");
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "telnet-session-1",
+        serverId: "srv-1",
+        terminalName: "Nexus Telnet: Server 1"
+      })
+    );
+  });
+
+  it("passes the server's host and port through to the pty", async () => {
+    const { run } = connectTelnet({ host: "192.0.2.9", port: 5001 });
+    await run();
+
+    expect(vi.mocked(TelnetPty).mock.calls[0][0]).toEqual(
+      expect.objectContaining({ host: "192.0.2.9", port: 5001, protocol: "telnet" })
+    );
+  });
+});
+
+describe("SSH-only commands against a telnet server", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  // ⊘ Unguarded, this reached `sftpService.connect`, which opens an SSH
+  // connection to a telnet port and surfaces a raw handshake error several
+  // seconds later — naming a port that is answering perfectly well.
+  it("refuses Test Connection with a clear message instead of an SSH handshake error", async () => {
+    const server = makeServer({ protocol: "telnet", username: "" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("not available for telnet servers")
+    );
+  });
+});
+
+/**
+ * MAJOR-4 (review) — switching an existing server to Telnet must not DESTROY
+ * its SSH configuration.
+ *
+ * The mechanism: a field hidden by `visibleWhen` is DISABLED by the webview,
+ * a disabled control submits nothing, and `formValuesToServer` maps a missing
+ * key to `undefined`. So a Protocol=Telnet save of an SSH server silently wiped
+ * username, key file, alternate host, auth-profile link, proxy, multiplexing,
+ * legacy algorithms and the File Explorer flag, and reset authType to
+ * `password`. `preserveLinkedServerCredentials` cannot help — it returns `next`
+ * untouched when `!next.authProfileId`, and the auth-profile select is one of
+ * the hidden controls.
+ *
+ * The record must keep its SSH config DORMANT, exactly like the vault entry
+ * that survives beside it.
+ */
+describe("nexus.server.edit — flipping protocol must not destroy the other protocol's config", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  interface EditPanel {
+    onSubmit: (v: Record<string, unknown>) => Promise<void>;
+  }
+
+  async function openEdit(ctx: CommandContext): Promise<EditPanel> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as EditPanel;
+  }
+
+  /** A fully-configured SSH server — every field the flip used to erase. */
+  const CONFIGURED = makeServer({
+    username: "netadmin",
+    authType: "key",
+    keyPath: "/keys/id_ed25519",
+    altHost: "2001:db8::1",
+    authProfileId: "ap1",
+    proxy: { type: "socks5", host: "proxy.example.com", port: 1080, username: "puser" },
+    multiplexing: false,
+    legacyAlgorithms: true,
+    openFileExplorerOnFirstConnect: true
+  });
+
+  /**
+   * Exactly what the webview posts for a Protocol=Telnet save: the protocol,
+   * the three fields that stay visible, and NOTHING for any disabled control.
+   */
+  const TELNET_SUBMISSION = {
+    name: "Server 1",
+    host: "example.com",
+    port: 2001,
+    protocol: "telnet"
+  };
+
+  // ⊘ The whole finding in one assertion set. Every field listed here was
+  // measured lost on the pre-fix code; a fixture that left any of them at its
+  // default would not have shown the loss.
+  it("keeps every SSH-only field when the server is switched to Telnet", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    // The edit itself landed…
+    expect(saved.protocol).toBe("telnet");
+    expect(saved.port).toBe(2001);
+    // …and nothing else was collateral.
+    expect(saved.username).toBe("netadmin");
+    expect(saved.authType).toBe("key");
+    expect(saved.keyPath).toBe("/keys/id_ed25519");
+    expect(saved.altHost).toBe("2001:db8::1");
+    expect(saved.authProfileId).toBe("ap1");
+    expect(saved.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "puser" });
+    expect(saved.multiplexing).toBe(false);
+    expect(saved.legacyAlgorithms).toBe(true);
+    expect(saved.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  // ⊘ THE ROUND TRIP the finding names: a user who flips to Telnet and back
+  // must not have to rebuild the profile from memory. Discriminating because
+  // the second save re-submits the SSH fields the form re-rendered FROM THE
+  // PRESERVED RECORD — if the first save dropped them, the form has nothing to
+  // render and the second submission carries the losses forward.
+  it("survives a flip to Telnet and back to SSH with nothing lost", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    await (await openEdit(ctx)).onSubmit(TELNET_SUBMISSION);
+    const afterFlip = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+
+    // Re-open: the form is seeded from the stored record, so the SSH controls
+    // render the preserved values and submit them back.
+    registeredCommands.clear();
+    const panel = await openEdit(ctx);
+    await panel.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      protocol: "ssh",
+      username: afterFlip.username,
+      authType: afterFlip.authType,
+      keyPath: afterFlip.keyPath,
+      altHost: afterFlip.altHost,
+      authProfileId: afterFlip.authProfileId,
+      proxyType: "socks5",
+      proxySocks5Host: afterFlip.proxy?.type === "socks5" ? afterFlip.proxy.host : "",
+      proxySocks5Port: afterFlip.proxy?.type === "socks5" ? afterFlip.proxy.port : 0,
+      proxySocks5Username: afterFlip.proxy?.type === "socks5" ? afterFlip.proxy.username : "",
+      multiplexing: afterFlip.multiplexing,
+      legacyAlgorithms: afterFlip.legacyAlgorithms,
+      openFileExplorerOnFirstConnect: afterFlip.openFileExplorerOnFirstConnect
+    });
+
+    const restored = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(restored.protocol).toBeUndefined();
+    expect(restored.username).toBe("netadmin");
+    expect(restored.authType).toBe("key");
+    expect(restored.keyPath).toBe("/keys/id_ed25519");
+    expect(restored.altHost).toBe("2001:db8::1");
+    expect(restored.authProfileId).toBe("ap1");
+    expect(restored.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "puser" });
+    expect(restored.multiplexing).toBe(false);
+    expect(restored.legacyAlgorithms).toBe(true);
+    expect(restored.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  // ⊘ Scoped to the flip: an SSH save must still be able to CLEAR these fields.
+  // A blanket "always merge from existing" would make the key file, the
+  // alternate host and the proxy unclearable forever.
+  it("still lets an SSH save clear the fields the user actually cleared", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "netadmin",
+      authType: "password",
+      authProfileId: ""
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.keyPath).toBeUndefined();
+    expect(saved.altHost).toBeUndefined();
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.authProfileId).toBeUndefined();
+    expect(saved.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
+  // ⊘ The proxy PASSWORD is the vault half of the same loss: the proxy fields
+  // are hidden on a telnet save, so the secret-sync saw "no proxy" and deleted
+  // the stored password — the SSH config would come back on a flip-back with a
+  // credential silently missing.
+  it("keeps the stored proxy password across a flip to Telnet", async () => {
+    const secretKey = proxyPasswordSecretKey("srv-1");
+    const { ctx, secretDelete } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })],
+      initialSecrets: { [secretKey]: "proxy-secret" }
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    expect(secretDelete).not.toHaveBeenCalledWith(secretKey);
+    expect(await ctx.secretVault!.get(secretKey)).toBe("proxy-secret");
+  });
+});
+
+describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  // ⊘ A telnet server has no username, so the old template produced a leading
+  // "@" — `@10.0.0.1:23` — which is not a paste-able address in a ticket or a
+  // shell. Discriminating because the SSH control below proves the `user@`
+  // form is still emitted where there IS a user.
+  it("omits the empty username and its @ separator", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ protocol: "telnet", username: "", host: "10.0.0.1", port: 2001 })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:2001");
+  });
+
+  it("still emits user@host:port for an SSH server (control)", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "dev", host: "example.com", port: 22 })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("dev@example.com:22");
+  });
+
+  it("still carries the BMC address alongside", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ protocol: "telnet", username: "", host: "10.0.0.1", port: 23, ipmiHost: "10.9.9.9" })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:23\nIPMI/BMC: 10.9.9.9");
   });
 });

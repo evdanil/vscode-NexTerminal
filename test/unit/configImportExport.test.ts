@@ -1910,6 +1910,30 @@ describe("backup import", () => {
     await registeredCommands.get("nexus.config.import")!();
   }
 
+  // TELNET (Phase 0) — the round trip a telnet server has to survive. The
+  // fixture is discriminating on BOTH halves of the model change: a rebuild that
+  // enumerated fields and forgot `protocol` restores an SSH server (which would
+  // then prompt for credentials and connect to the wrong service), and a
+  // `validateServerConfig` that still demanded a non-empty username drops the
+  // record entirely at the import boundary — telnet collects none.
+  it("round-trips a telnet server, blank username and all", async () => {
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer({ id: "tel-1", name: "Console 1", protocol: "telnet", username: "", port: 2001 })],
+      settings: {}
+    };
+
+    await runBackupImport(exportData, "replace");
+
+    const imported = core.getSnapshot().servers.find((s) => s.name === "Console 1");
+    expect(imported).toBeDefined();
+    expect(imported?.protocol).toBe("telnet");
+    expect(imported?.username).toBe("");
+    expect(imported?.port).toBe(2001);
+  });
+
   it("decrypts and restores passwords, passphrases, and secret macros", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
     // Use version 2 backup format: top-level macros array + id-keyed secret blobs

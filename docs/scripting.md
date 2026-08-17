@@ -135,7 +135,7 @@ Every field except `@nexus-script` is optional.
 | `@nexus-script` | flag — no value | — | Required marker. Files without this are not Nexus scripts. |
 | `@name` | single-line string | filename without `.js` | Display name in tree, CodeLens, picker, and status bar. |
 | `@description` | single-line string | empty | Shown as tooltip in the sidebar. |
-| `@target-type` | `ssh`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. |
+| `@target-type` | `ssh`, `telnet`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. `ssh` and `telnet` are distinct — a telnet session is never offered to an `ssh` script, or the other way round. |
 | `@target-profile` | server name, serial profile name, Local Shell profile name, or matching id | none | When a session of this profile is active, it's auto-selected without showing the picker. Duplicate names are disambiguated with a narrowed picker. |
 | `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeoutSeconds` (30s) | Used by `waitFor`/`expect`/`waitAny` when no per-call `timeout` is provided. |
 | `@lock-input` | flag — no value | absent (terminal stays interactive) | Makes the bound terminal read-only for the run. User keystrokes are discarded with a one-shot notice line. |
@@ -144,7 +144,7 @@ Every field except `@nexus-script` is optional.
 ### Header validation
 
 - Unknown `@<tag>` names produce a warning in the Output Channel — the script still loads.
-- Invalid values for `@target-type` (not `ssh` / `serial` / `local`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
+- Invalid values for `@target-type` (not `ssh` / `telnet` / `serial` / `local`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
 - Duplicate fields are tolerated: the first occurrence wins and a warning is logged — **except `@allow-macros`, which concatenates** so you can spread a long allow-list across multiple lines.
 - Only the first JSDoc block in the file is examined.
 

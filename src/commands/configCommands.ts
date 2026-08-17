@@ -2712,6 +2712,12 @@ export function registerConfigCommands(
                       ...(rolledBackOrigin.syncedAltHost !== undefined
                         ? { syncedAltHost: rolledBackOrigin.syncedAltHost }
                         : {}),
+                      // TELNET (Phase 0) — the transport receipt, on exactly the terms of
+                      // the alternate-host one above: it says whether the `protocol` this
+                      // server keeps was the SYNC'S doing or the USER'S, which is the whole
+                      // of the `syncOwnsProtocol` write rule. Omitted rather than written as
+                      // `undefined` for the reason `instanceKey` is.
+                      ...(rolledBackOrigin.syncedProtocol !== undefined ? { syncedProtocol: rolledBackOrigin.syncedProtocol } : {}),
                       // DEVICE TEMPLATES (issue #48 PR-T1, Codex review round 3) —
                       // the template stamps, the fourth part of the origin that
                       // must OUTLIVE the strip, on exactly the terms of the auth/

@@ -3043,6 +3043,12 @@ export function registerInventoryCommands(
                     // update it. Omitted rather than written as `undefined` for the
                     // reason `instanceKey` is.
                     ...(origin.syncedAltHost !== undefined ? { syncedAltHost: origin.syncedAltHost } : {}),
+                    // TELNET (Phase 0) — the transport receipt, on exactly the terms of
+                    // the alternate-host one above: it says whether the `protocol` this
+                    // server keeps was the SYNC'S doing or the USER'S, which is the whole
+                    // of the `syncOwnsProtocol` write rule. Omitted rather than written as
+                    // `undefined` for the reason `instanceKey` is.
+                    ...(origin.syncedProtocol !== undefined ? { syncedProtocol: origin.syncedProtocol } : {}),
                     // DEVICE TEMPLATES (issue #48 PR-T1) — the third part of the
                     // origin that has to SURVIVE the strip, on exactly the terms
                     // of the auth/OOB provenance above. It says whether the

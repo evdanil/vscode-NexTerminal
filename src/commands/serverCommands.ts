@@ -11,11 +11,13 @@ import {
   effectiveServerUsername,
   formOfferedServerCredentials,
   mergeServerConfigFields,
+  resolveServerProtocol,
   serverConfigsEqual
 } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
+import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
@@ -40,6 +42,7 @@ import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { configMutationLock } from "../services/configMutationLock";
+import { telnetUnsupportedMessage } from "../utils/protocolGuards";
 
 export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -616,7 +619,16 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
   const host = typeof values.host === "string" ? values.host.trim() : "";
   const username = typeof values.username === "string" ? values.username.trim() : "";
   const normalizedGroup = normalizeOptionalFolderPath(values.group);
-  if (!name || !host || !username) {
+  // TELNET (Phase 0) — only `"telnet"` is stored. `"ssh"` is the default the
+  // absent field already means, and writing it explicitly would put a member on
+  // every server record no build before this one understands (the same rule
+  // `bmcWebProtocol` follows below). Anything else the submission carries is not
+  // a transport we implement, so it reads as the default.
+  const isTelnet = values.protocol === "telnet";
+  // A telnet server has no protocol-level login, so the form DISABLES the
+  // username control for one — a disabled control submits nothing, and the
+  // save must not reject the record over a field it never asked for.
+  if (!name || !host || (!username && !isTelnet)) {
     return undefined;
   }
   if (normalizedGroup === null) {
@@ -627,6 +639,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     name,
     host,
     port: typeof values.port === "number" ? values.port : 22,
+    protocol: isTelnet ? "telnet" : undefined,
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
@@ -704,6 +717,55 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
  * prefilled from the record. The edit path rejects such a submission outright
  * (`serverAuthProfileRejection`) rather than relying on that agreement.
  */
+/**
+ * TELNET (Phase 0, MAJOR-4) — carry a server's SSH configuration through a save
+ * that switched it to Telnet.
+ *
+ * WHY IT IS NEEDED. A field hidden by `visibleWhen` is DISABLED by the webview,
+ * a disabled control submits nothing, and `formValuesToServer` maps a missing
+ * key to `undefined`. So the very act of choosing Telnet erased `username`,
+ * `keyPath`, `altHost`, `authProfileId`, `proxy`, `multiplexing`,
+ * `legacyAlgorithms` and `openFileExplorerOnFirstConnect`, and reset `authType`
+ * to `password` — the profile was destroyed by the flip, and a user who
+ * flipped back rebuilt it from memory.
+ *
+ * `preserveLinkedServerCredentials` cannot cover this: it returns `next`
+ * untouched when `!next.authProfileId`, and the auth-profile select is itself
+ * one of the hidden controls, so the flip disarms it in the same submission.
+ *
+ * THE MODEL: a telnet server keeps its SSH config DORMANT, exactly like the
+ * vault entry that survives beside it (which is also why the edit path skips the
+ * proxy-password sync on a telnet save — see its call site). Nothing reads these
+ * fields while `protocol` is `"telnet"`; they exist so flipping back is
+ * lossless.
+ *
+ * SCOPED TO THE FLIP, deliberately. It fires ONLY when the submission is telnet,
+ * i.e. only when the form could not have offered the fields. An SSH save is
+ * untouched, so clearing a key file, an alternate host or a proxy still works —
+ * a blanket "always merge from existing" would make those fields unclearable
+ * forever, which is the opposite failure.
+ */
+export function preserveDormantSshConfig(existing: ServerConfig | undefined, next: ServerConfig): ServerConfig {
+  if (!existing || resolveServerProtocol(next) !== "telnet") {
+    return next;
+  }
+  return {
+    ...next,
+    // `username` is the one that must be carried even when blank-vs-absent
+    // looks identical: the submission has no username at all for a telnet save,
+    // and `formValuesToServer` produced `""`.
+    username: existing.username,
+    authType: existing.authType,
+    keyPath: existing.keyPath,
+    altHost: existing.altHost,
+    authProfileId: existing.authProfileId,
+    proxy: existing.proxy ? { ...existing.proxy } : undefined,
+    multiplexing: existing.multiplexing,
+    legacyAlgorithms: existing.legacyAlgorithms,
+    openFileExplorerOnFirstConnect: existing.openFileExplorerOnFirstConnect
+  };
+}
+
 export function preserveLinkedServerCredentials(
   existing: ServerConfig | undefined,
   next: ServerConfig,
@@ -890,9 +952,130 @@ export interface ConnectServerOptions {
   onConnectFailed?: (message: string) => void;
 }
 
+/**
+ * TELNET (Phase 0) — the telnet half of `connectServer`, split out rather than
+ * threaded through the SSH one because almost nothing is shared: no auth factory
+ * (so no password prompt and no vault read), no OSC 7 / cwd tracking, no SFTP
+ * auto-open and no auto-start tunnels — every one of those is SSH machinery.
+ *
+ * What IS shared is everything the terminal layer sees: the same
+ * `TerminalRegistry.register` call, the same `NexusCore.registerSession`
+ * bookkeeping under an `ActiveSession`, the same macro observer binding and the
+ * same activity-indicator wiring. That is what makes a telnet tab behave
+ * identically to an SSH one for highlighting, tab commands, macros and scripts.
+ */
+async function connectTelnetServer(
+  ctx: CommandContext,
+  server: ServerConfig,
+  options: ConnectServerOptions
+): Promise<void> {
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Connecting to ${server.name}...`,
+      cancellable: false
+    },
+    async () => {
+      const terminalName = `Nexus Telnet: ${server.name}`;
+      let terminalRef: vscode.Terminal | undefined;
+      let ptyRef: TelnetPty | undefined;
+      const triggerObserver = ctx.macroAutoTrigger.createObserver(
+        (text) => ptyRef?.handleInput(text),
+        () => ctx.focusedTerminal === terminalRef,
+        undefined,
+        server.id
+      );
+      const terminalType = vscode.workspace
+        .getConfiguration("nexus.ssh")
+        .get<string>("terminalType", "xterm-256color");
+      const pty = new TelnetPty(
+        server,
+        {
+          onSessionOpened: (sessionId) => {
+            ctx.core.registerSession({
+              id: sessionId,
+              serverId: server.id,
+              terminalName,
+              startedAt: Date.now(),
+              pty: ptyRef
+            });
+            ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
+            if (terminalRef) {
+              ctx.sessionTerminals.set(sessionId, terminalRef);
+            }
+            if (ptyRef) {
+              ctx.activityIndicators.set(sessionId, ptyRef);
+            }
+            if (vscode.window.activeTerminal === terminalRef) {
+              ctx.core.setFocusedSession(sessionId);
+            }
+          },
+          onSessionClosed: (sessionId) => {
+            ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
+            if (terminalRef) {
+              removeTerminal(server.id, terminalRef, ctx.terminalsByServer);
+            }
+          },
+          onDisconnected: (sessionId) => {
+            ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
+            // The terminal stays alive holding the press-any-key notice, so its
+            // `terminalsByServer` entry is deliberately kept — `onSessionClosed`
+            // clears it when the tab actually goes away.
+          },
+          onConnectFailed: (_sessionId, message) => {
+            options.onConnectFailed?.(message);
+          },
+          onDataReceived: (sessionId) => {
+            if (terminalRef && ctx.focusedTerminal !== terminalRef) {
+              ctx.core.markSessionActivity(sessionId);
+              ptyRef?.setActivityIndicator(true);
+            }
+          }
+        },
+        ctx.loggerFactory.create("terminal", server.id),
+        {
+          transcript: createSessionTranscript(
+            ctx.sessionLogDir,
+            server.name,
+            server.logSession ?? getDefaultSessionTranscriptsEnabled(),
+            getTranscriptRotationOptions(ctx)
+          ),
+          highlighter: ctx.highlighter,
+          outputObserver: triggerObserver,
+          terminalType
+        }
+      );
+      ptyRef = pty;
+      const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+      const terminal = vscode.window.createTerminal({
+        name: terminalName,
+        pty,
+        iconPath: new vscode.ThemeIcon("server"),
+        color: new vscode.ThemeColor("terminal.ansiCyan"),
+        location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+      });
+      terminalRef = terminal;
+      ctx.terminalRegistry?.register(terminal, pty);
+      addTerminal(server.id, terminal, ctx.terminalsByServer);
+      ctx.focusedTerminal = terminal;
+      terminal.show();
+    }
+  );
+}
+
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
+    return;
+  }
+  // TELNET (Phase 0) — branch BEFORE anything auth-shaped runs. A telnet server
+  // must never reach `SilentAuthSshFactory`: no password prompt, no vault read.
+  if (resolveServerProtocol(server) === "telnet") {
+    await connectTelnetServer(ctx, server, options);
     return;
   }
   const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
@@ -1074,6 +1257,14 @@ async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise
   if (!server) {
     return;
   }
+  // TELNET (Phase 0) — this opens an SSH connection and reports its handshake.
+  // Against a telnet server it would report a raw ssh2 error naming a port that
+  // is answering perfectly well; say the real reason instead.
+  const unsupported = telnetUnsupportedMessage(server, "Test Connection");
+  if (unsupported) {
+    void vscode.window.showWarningMessage(unsupported);
+    return;
+  }
 
   try {
     const connection = await vscode.window.withProgress(
@@ -1115,7 +1306,10 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
     void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
     return;
   }
-  const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, "ssh");
+  // TELNET (Phase 0) — filter by the protocol this server actually connects
+  // with, so a telnet profile offers telnet-targeted scripts (and `any`) rather
+  // than SSH-targeted ones it would then refuse to run.
+  const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, resolveServerProtocol(server));
   if (!scriptUri) return;
 
   const preExisting = new Set(
@@ -1275,7 +1469,9 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       }
       const existingGroups = collectGroups(ctx);
       const snapshot = ctx.core.getSnapshot();
-      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
+      // TELNET (Phase 0, MAJOR-3) — the protocol rides along so the Jump Host
+      // and IPMI Gateway pickers can leave telnet servers out of their options.
+      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       // Issue #48 — a caller that is sending the user here to fill in an
       // advanced field (a `${profile.ipmiHost}` refusal) says so, and the
@@ -1436,7 +1632,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             }
             // Which submitted credentials are this user's own, and which the
             // stored record keeps — see preserveLinkedServerCredentials.
-            const linked = preserveLinkedServerCredentials(existing, candidate, linkedProfile);
+            const linked = preserveDormantSshConfig(
+              existing,
+              preserveLinkedServerCredentials(existing, candidate, linkedProfile)
+            );
             const proxySecretKey = proxyPasswordSecretKey(existing.id);
             // FINDING 1 (P2, baseline-before-vault-read review) — this
             // secret-capture await MUST run BEFORE the baseline snapshot
@@ -1530,7 +1729,18 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             const writtenSnapshot = cloneServerConfig(updated);
             await ctx.core.addOrUpdateServer(updated);
             try {
-              await syncProxyPasswordSecret(ctx, updated.id, values);
+              // TELNET (Phase 0, MAJOR-4) — the vault half of the dormant SSH
+              // config. The proxy controls are hidden on a telnet save, so the
+              // submission carries no `proxyType` and this sync would read that
+              // as "no proxy" and DELETE the stored proxy password. The record
+              // keeps its proxy (see `preserveDormantSshConfig`), so deleting
+              // the credential beside it would mean the SSH config came back on
+              // a flip-back with a password silently missing. Skipped entirely
+              // rather than passed different values: this submission expressed
+              // nothing about the proxy, so there is nothing to sync.
+              if (resolveServerProtocol(updated) !== "telnet") {
+                await syncProxyPasswordSecret(ctx, updated.id, values);
+              }
             } catch {
               // The record above just committed to the NEW generation, but
               // its proxy secret never did — left alone, the new record
@@ -1862,7 +2072,15 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // copying connection details to paste into a ticket or a shell wants it
       // too, and it is otherwise only visible behind the form's Advanced section.
       const ipmiHost = typeof server.ipmiHost === "string" ? server.ipmiHost.trim() : "";
-      const info = `${server.username}@${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
+      // TELNET (Phase 0, MINOR-4) — a telnet server has no username, so the
+      // `user@` prefix is dropped rather than emitted empty: `@10.0.0.1:23` is
+      // not an address anyone can paste into a ticket or a shell. Keyed on the
+      // VALUE, not the protocol, so a blank username reads the same whatever put
+      // it there.
+      const account = typeof server.username === "string" && server.username.trim() !== ""
+        ? `${server.username}@`
+        : "";
+      const info = `${account}${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
       await vscode.env.clipboard.writeText(info);
       void vscode.window.showInformationMessage(`Copied: ${info.replace(/\n/g, "  ")}`);
     }),
@@ -1969,6 +2187,13 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     vscode.commands.registerCommand("nexus.server.deployKey", async (arg?: unknown) => {
       const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
       if (!server) {
+        return;
+      }
+      // TELNET (Phase 0) — there is no authorized_keys on the far side of a
+      // telnet session, and the deploy itself runs over SSH.
+      const unsupported = telnetUnsupportedMessage(server, "Deploy SSH Key");
+      if (unsupported) {
+        void vscode.window.showWarningMessage(unsupported);
         return;
       }
 

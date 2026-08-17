@@ -10,6 +10,7 @@ import {
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import { validateServerConfig } from "../../src/utils/validation";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { buildConnectConfig } from "../../src/services/ssh/ssh2Connector";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../src/models/inventory";
@@ -192,7 +193,7 @@ describe("computeSyncPlan — adds", () => {
     );
     const tree = makeTree(devices);
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
-    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("no usable ssh endpoint"));
+    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("no usable ssh or telnet endpoint"));
     expect(endpointWarnings).toHaveLength(1);
     expect(endpointWarnings[0]).toContain("5");
   });
@@ -201,19 +202,19 @@ describe("computeSyncPlan — adds", () => {
     const source = makeSource();
     const before = makeOwnedServer(); // origin.externalId === "device:1", matches the first device below
     const tree = makeTree([
-      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] }), // externalId "device:1" — owned, no usable ssh endpoint
+      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] }), // externalId "device:1" — owned, no usable ssh or telnet endpoint
       makeDevice({ externalId: "device:2", name: "unowned-noendpoint", endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })
     ]);
     const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
     // Owned device: dedicated per-device warning, naming it explicitly.
-    expect(plan.warnings.some((w) => w.includes(`Device "core-sw-1" (device:1) has no usable SSH endpoint and was skipped.`))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes(`Device "core-sw-1" (device:1) has no usable SSH or telnet endpoint and was skipped.`))).toBe(true);
     // Unowned device: no dedicated per-device warning of that form — it's folded
     // into the aggregate instead (its name may still appear as an aggregate example).
     expect(
-      plan.warnings.some((w) => w.includes(`Device "unowned-noendpoint" (device:2) has no usable SSH endpoint and was skipped.`))
+      plan.warnings.some((w) => w.includes(`Device "unowned-noendpoint" (device:2) has no usable SSH or telnet endpoint and was skipped.`))
     ).toBe(false);
     // Aggregate warning covers exactly the one unowned skip, and names it.
-    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("had no usable ssh endpoint"));
+    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("had no usable ssh or telnet endpoint"));
     expect(endpointWarnings).toHaveLength(1);
     expect(endpointWarnings[0]).toContain("1");
     expect(endpointWarnings[0]).toContain("unowned-noendpoint");
@@ -1409,7 +1410,7 @@ describe("computeSyncPlan — auth profile link", () => {
     // mapped the device.
     expect(plan.adds).toHaveLength(0);
     expect(plan.prunes).toHaveLength(0);
-    expect(plan.warnings).toContain('Device "renamed-at-source" (device:1) has no usable SSH endpoint and was skipped.');
+    expect(plan.warnings).toContain('Device "renamed-at-source" (device:1) has no usable SSH or telnet endpoint and was skipped.');
     expect(after.name).toBe("core-sw-1");
     expect(after.host).toBe("10.0.0.1");
     expect(after.port).toBe(22);
@@ -1771,18 +1772,18 @@ describe("computeSyncPlan — prunes", () => {
     expect(plan.hiddenPruneCount).toBe(1);
   });
 
-  it("(FIX 1) an owned server whose device is present in the tree but skipped (no usable ssh endpoint) is NOT pruned (kills pruning skipped-but-present devices)", () => {
+  it("(FIX 1) an owned server whose device is present in the tree but skipped (no usable ssh or telnet endpoint) is NOT pruned (kills pruning skipped-but-present devices)", () => {
     const source = makeSource({ prunePolicy: "delete" });
     const before = makeOwnedServer();
     // Same externalId as `before`'s origin, still present in the fetched tree,
-    // but unmappable (no ssh endpoint) — this must NOT read as "deleted at
+    // but unmappable (no ssh or telnet endpoint) — this must NOT read as "deleted at
     // the source".
     const tree = makeTree([makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })]);
     const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
     expect(plan.prunes).toHaveLength(0);
     expect(plan.adds).toHaveLength(0);
     expect(plan.updates).toHaveLength(0);
-    expect(plan.warnings.some((w) => w.includes("no usable SSH endpoint"))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes("no usable SSH or telnet endpoint"))).toBe(true);
   });
 
   it("(FIX 1) an owned server whose device is present but skipped for an empty name is NOT pruned", () => {
@@ -1955,6 +1956,112 @@ describe("computeSyncPlan — adopt-on-add", () => {
   }
 
   const profile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
+
+  /**
+   * M27/M29 (review) — THE ADOPTEE TWIN of the update path's protocol matrix.
+   * The update path had four discriminating tests and the adoption path none,
+   * so both `takesProtocol` forced true and the dropped `syncedProtocol`
+   * receipt restore survived the full suite.
+   *
+   * The substitution that makes it the same decision on a record this sync did
+   * not create: `DetachedServerOrigin.syncedProtocol` stands in for the origin
+   * stamp. Fixtures are built so the WRONG behaviour visibly changes the
+   * outcome, per CLAUDE.md's convention.
+   */
+  describe("adoption — the protocol write rule and its receipt", () => {
+    const telnetDevice = () => keptDevice({ endpoints: [{ kind: "telnet", host: "lab-sw-01" }] });
+
+    // ⊘ M27 — `takesProtocol` forced TRUE. The removed source's sync had
+    // written telnet; the user then switched the kept server back to SSH by
+    // hand. The device STILL reports telnet only, so an adoption that always
+    // takes the device's protocol flips it back — visibly, and against a choice
+    // the marker itself proves was the user's.
+    it("does NOT stomp a protocol the user changed by hand before the adoption", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: undefined,
+        formerlySynced: keptMarker({ syncedProtocol: "telnet" })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBeUndefined();
+      // ⊘ M29 — the receipt is RESTORED into the new origin, not dropped.
+      // Dropped, the next ordinary sync reads the record as "sync wrote ssh"
+      // (an absent stamp resolves to ssh), sees the device saying telnet, and
+      // row 3 flips it — the hand edit survives adoption and dies one sync later.
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    // The mirror of the test above, and the reason that one is not vacuous: on
+    // the SAME device, an adoptee whose protocol still equals what the removed
+    // source wrote DOES follow the device. Adoption eligibility corroborates
+    // host AND port, so the fixture keeps port 23 fixed and moves only the
+    // protocol — which is exactly what isolates the write rule.
+    it("DOES take the device's protocol when the kept record still carries what the removed source wrote", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: undefined,
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    it("stamps an adoptee whose protocol already agrees with the device", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: "telnet",
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    it("leaves a hand-set telnet protocol alone when the device offers SSH", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        protocol: "telnet",
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      // Not laundered into the stamp: the very next sync must still read this
+      // as the user's value, not as "what the sync wrote".
+      expect(after.origin?.syncedProtocol).toBeUndefined();
+    });
+
+    it("adopts an ordinary SSH kept server without inventing a protocol (control)", () => {
+      const source = makeSource();
+      const plan = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [makeKeptServer()],
+        now: 5000,
+        adoptionChoice: "adopt"
+      });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBeUndefined();
+      expect(after.origin?.syncedProtocol).toBeUndefined();
+    });
+  });
 
   it("(E-7) HEADLINE — a hand-made server at the device's exact address is NEVER adopted: no marker, no adoption (kills matching on address, the rejected design)", () => {
     const source = makeSource();
@@ -4529,5 +4636,266 @@ describe("computeSyncPlan — altHost (alternate host, Phase 2)", () => {
     expect(after.host).toBe("2001:db8::1");
     // Hand value untouched even though it now equals `host`; the sync never owned it.
     expect(after.altHost).toBe("2001:db8::1");
+  });
+});
+
+/**
+ * TELNET (Phase 0) — inventory contract. A device that offers a telnet console
+ * and no SSH maps to a telnet server; one that offers both stays SSH. The
+ * `syncedProtocol` stamp follows the `syncedAltHost` / `syncedIpmiHost`
+ * discipline verbatim: the sync owns the field only while the record still
+ * carries exactly what the sync put there (or exactly what the device says
+ * today), and a hand-flipped protocol is never stomped.
+ */
+describe("computeSyncPlan — telnet endpoints", () => {
+  const telnetDevice = (overrides: Partial<InventoryDevice> = {}) =>
+    makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }], ...overrides });
+
+  it("maps a telnet-only device to a telnet server on the telnet default port", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].protocol).toBe("telnet");
+    expect(plan.adds[0].host).toBe("10.0.0.5");
+    // ⊘ An implementation that reuses the SSH default lands every telnet
+    // console on port 22, where nothing is listening.
+    expect(plan.adds[0].port).toBe(23);
+    expect(plan.adds[0].origin?.syncedProtocol).toBe("telnet");
+  });
+
+  it("honours an explicit port on a telnet endpoint", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5", port: 2001 }] })]),
+      currentServers: [],
+      now: 1000
+    });
+    expect(plan.adds[0].port).toBe(2001);
+  });
+
+  // ⊘ THE PRIMARY RULE. A selector that simply took the first endpoint of
+  // either kind would make this device telnet, because the telnet endpoint is
+  // listed first.
+  it("gives SSH the primary slot when a device offers both", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({
+          endpoints: [
+            { kind: "telnet", host: "10.0.0.5" },
+            { kind: "ssh", host: "10.0.0.1" }
+          ]
+        })
+      ]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds[0].protocol).toBeUndefined();
+    expect(plan.adds[0].host).toBe("10.0.0.1");
+    expect(plan.adds[0].port).toBe(22);
+    expect(plan.adds[0].origin?.syncedProtocol).toBeUndefined();
+  });
+
+  it("still skips a device that offers neither kind, and says so", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "url", host: "https://example" }] })]),
+      currentServers: [],
+      now: 1000
+    });
+    expect(plan.adds).toHaveLength(0);
+  });
+
+  it("switches an owned server to telnet when the device stops offering SSH", () => {
+    const before = makeOwnedServer();
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [before],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.protocol).toBe("telnet");
+    expect(plan.updates[0].after.origin?.syncedProtocol).toBe("telnet");
+  });
+
+  // ⊘ THE STAMP DISCRIMINATOR. The sync wrote telnet; the user switched the
+  // record back to SSH by hand. The device STILL reports telnet only, so a
+  // "device always wins" implementation flips it back on the very next sync —
+  // and the fixture is built so that stomping visibly changes the outcome
+  // (protocol telnet vs ssh), not so that both paths agree.
+  it("does NOT stomp a protocol the user changed by hand", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.5",
+      port: 23,
+      protocol: undefined, // the user switched it back to SSH
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedProtocol: "telnet"
+      }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [before],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.protocol).toBeUndefined();
+    // The stamp is carried forward VERBATIM, not re-derived from the record —
+    // laundering it into "ssh" would let the sync after this one overwrite the
+    // user's choice.
+    expect(after.origin?.syncedProtocol).toBe("telnet");
+  });
+
+  it("does NOT stomp a hand-set telnet protocol back to SSH", () => {
+    const before = makeOwnedServer({
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice()]), // device offers SSH
+      currentServers: [before],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.protocol).toBe("telnet");
+  });
+
+  it("re-takes ownership when the record still carries exactly what the sync wrote", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.5",
+      port: 23,
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice()]), // the device gained an SSH endpoint
+      currentServers: [before],
+      now: 2000
+    });
+
+    expect(plan.updates[0].after.protocol).toBeUndefined();
+    expect(plan.updates[0].after.origin?.syncedProtocol).toBeUndefined();
+  });
+
+  it("stamps a legacy owned server whose protocol already agrees with the device", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.5",
+      port: 23,
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [before],
+      now: 2000
+    });
+
+    // Stamp-only change: the value does not move, but ownership is recorded so
+    // the field can follow the device the next time it changes.
+    expect(plan.updates[0].after.protocol).toBe("telnet");
+    expect(plan.updates[0].after.origin?.syncedProtocol).toBe("telnet");
+  });
+});
+
+/**
+ * MAJOR-2 (review) — THE WRITER AND THE VALIDATOR MUST AGREE. A record the sync
+ * writes that `validateServerConfig` rejects is dropped by
+ * `VscodeConfigRepository.getServers()` with only a console warning: the user
+ * watches the server sync in, work for the rest of the session, and silently
+ * vanish on the next reload — forever, on every re-sync.
+ */
+describe("computeSyncPlan — every telnet record it writes must validate", () => {
+  const telnetTree = () =>
+    makeTree([makeDevice({ externalId: "d1", name: "console-1", endpoints: [{ kind: "telnet", host: "10.0.0.5" }] })]);
+
+  // ⊘ The discriminator is the SOURCE with no `defaultUsername`: telnet
+  // endpoints legitimately carry no username (console servers, lab gear), so
+  // `endpoint.username ?? source.defaultUsername` is `undefined` and the record
+  // the sync just wrote fails the guard that decides whether it survives a
+  // reload. A fixture with a default username passes either way and proves
+  // nothing.
+  it("writes a valid record for a telnet device when the source has no default username", () => {
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const plan = computeSyncPlan({ source, tree: telnetTree(), currentServers: [], now: 1000 });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].protocol).toBe("telnet");
+    expect(validateServerConfig(plan.adds[0])).toBe(true);
+  });
+
+  it("writes a valid record for a telnet device when the source's default username is blank", () => {
+    const source = makeSource({ defaultUsername: "" });
+    const plan = computeSyncPlan({ source, tree: telnetTree(), currentServers: [], now: 1000 });
+    expect(validateServerConfig(plan.adds[0])).toBe(true);
+  });
+
+  it("keeps SSH records subject to the unchanged username rule", () => {
+    // An SSH device with no username anywhere is still an invalid record — the
+    // relaxation must be scoped to telnet, not a general loosening.
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [], now: 1000 });
+    expect(plan.adds[0].protocol).toBeUndefined();
+    expect(validateServerConfig(plan.adds[0])).toBe(false);
+  });
+
+  // MINOR-8 — the "no silent drops" guarantee, stated as a property over every
+  // record a telnet sync produces rather than over one hand-picked fixture.
+  it("produces only valid records across adds, updates and adoptions", () => {
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const owned = makeOwnedServer({ host: "10.0.0.5", port: 23, username: "" });
+    const tree = makeTree([
+      makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }] }),
+      makeDevice({ externalId: "d2", name: "console-2", endpoints: [{ kind: "telnet", host: "10.0.0.6", port: 2002 }] })
+    ]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [owned], now: 2000 });
+
+    const written = [...plan.adds, ...plan.updates.map((u) => u.after)];
+    expect(written.length).toBeGreaterThan(0);
+    for (const record of written) {
+      expect(validateServerConfig(record), `sync wrote an invalid record: ${JSON.stringify(record)}`).toBe(true);
+    }
+  });
+});
+
+describe("validateInventoryTree — telnet endpoint kind", () => {
+  it("accepts a device whose only endpoint is telnet", () => {
+    expect(() =>
+      validateInventoryTree({
+        contractVersion: 1,
+        devices: [{ externalId: "d1", name: "r1", endpoints: [{ kind: "telnet", host: "10.0.0.5", port: 2001 }] }]
+      })
+    ).not.toThrow();
+  });
+
+  // ⊘ A tree that validates but whose telnet endpoint is dropped on the way
+  // through would pass the assertion above and still be useless.
+  it("carries the accepted telnet endpoint all the way to a mapped server", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5", port: 2001 }] })]),
+      currentServers: [],
+      now: 1000
+    });
+    expect(plan.adds[0]).toEqual(expect.objectContaining({ host: "10.0.0.5", port: 2001, protocol: "telnet" }));
   });
 });

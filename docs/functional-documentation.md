@@ -19,12 +19,15 @@ Nexus Terminal provides one operational surface in VS Code for:
 - `TunnelRegistrySync` (`src/services/tunnel/tunnelRegistrySync.ts`): cross-window tunnel ownership and visibility sync.
 - `SerialSidecarManager` (`src/services/serial/serialSidecarManager.ts`): JSON-RPC sidecar client.
 - `serialSidecarWorker` (`src/services/serial/serialSidecarWorker.ts`): isolated process runtime.
+- `TelnetPty` (`src/services/telnet/telnetPty.ts`): raw telnet terminal transport.
+- `TelnetNegotiator` (`src/services/telnet/telnetProtocol.ts`): pure RFC 854 IAC state machine (no `vscode`, no socket).
 
 ### 2.2 Isolation Model
 - Interactive SSH terminals use `SshPty` shell channels. When SSH multiplexing is enabled, those channels can share a pooled underlying SSH connection; per-server disable and automatic standalone fallback are supported.
 - Tunnels default to shared mode: all TCP clients reuse a single SSH connection. Isolated mode (one SSH connection per client) is available as a per-profile or global setting.
 - SFTP reuses the shared SSH pool when connected to the same server.
 - Serial code executes outside the extension host process.
+- Telnet terminals run in-process on a plain `net.Socket`, like SSH — there is no native module to isolate.
 
 ## 3. Data Models
 - `ServerConfig` and `TunnelProfile` defined in `src/models/config.ts`.
@@ -132,6 +135,30 @@ Keeps the File Explorer pointed at whichever SSH terminal is focused, tracking t
   | 5 | Pinned (paused) | Following was on, but you navigated manually (Go to Path / Go Home / `..`). | Click **Resume Following Terminal Directory** to jump back to the terminal's directory and clear the pause. |
   | 6 | Following another server | The focused terminal is connected to a different server than the one the File Explorer is currently showing. | Switch focus to a terminal on the explorer's server, or point the explorer at the terminal's server instead — Nexus never auto-switches the explorer's active server on a focus change. |
   | 7 | Rate-limited off | The terminal reported directory changes faster than Nexus could safely apply them; following was turned off automatically for that session as a burst-protection measure. | Click **Follow Terminal Directory** to turn it back on. |
+
+### 4.4.4 Telnet Terminal Session
+
+Telnet is a per-server **protocol** choice, not a separate profile type: one server record, a `Protocol` select on the add/edit form with **SSH** (default) and **Telnet**. `ServerConfig.protocol` is optional and absent means SSH, so nothing changes for existing servers and there is no migration.
+
+1. Set **Protocol** to *Telnet* on a server profile. The SSH-only controls — Username, Authentication, Private Key File, Auth Profile, Alternate host, Proxy/Jump Host, connection multiplexing, legacy algorithms, and the automatic File Explorer — hide themselves, because telnet reads none of them.
+2. Run `Nexus: Connect Server`. The connect path branches **before** any credential handling: `SilentAuthSshFactory` is never reached, so there is no password prompt and no vault access.
+3. A custom PTY terminal is created (`Nexus Telnet: <server>`), registered with the `TerminalRegistry` and with `NexusCore` as an ordinary `ActiveSession`. Highlighting, the capture buffer, Reset / Clear Scrollback / Copy All, macros and scripts all behave exactly as they do for SSH.
+4. Log in at the device's own prompt, in the terminal. **Telnet is cleartext and has no protocol-level authentication** — that is the protocol, not a limitation of this client. The intended targets are console servers and lab gear on a trusted management network.
+
+**Protocol handling.** A separately tested IAC state machine parses negotiation out of the byte stream: it accepts the server's `WILL ECHO` / `WILL SGA`, agrees to `DO SGA`, answers TERMINAL-TYPE with `xterm-256color`, and reports the window size through NAWS on every resize (0xFF dimension bytes escaped). Everything else is refused, and each option is answered only when the answer changes — two polite implementations never loop. `IAC IAC` is unescaped in both directions, `CR NUL` collapses to `CR`, `CR LF` passes through, and outgoing keystrokes get the NVT `CR LF` newline most network-OS consoles expect. Binary mode is deliberately not negotiated: non-IAC bytes already pass through untouched, so UTF-8 works without it.
+
+**Lifecycle.** A connect that does not complete within 10 seconds, a refused connection, or a socket error before the session is up all report `[Nexus Telnet] Connection failed: …` in the terminal and leave the tab open on a press-any-key notice — no session is registered. A remote close reports `Remote host closed the connection.` and unregisters the session.
+
+**What telnet does not do.** SFTP browsing, port forwarding, jump hosts, SSH key deployment, Test Connection, directory sync and connection multiplexing are all SSH machinery. Each refuses rather than failing later inside an SSH handshake, and the refusals differ by kind:
+
+- **Refused out loud, naming the feature and the server** — File browsing (SFTP), Port forwarding (including dragging a tunnel profile onto the server), Test Connection, Deploy SSH Key.
+- **Not offered, then refused anyway** — a telnet server is left out of the **Jump Host** and **IPMI Gateway** pickers, and the SSH connect path refuses a stored jump-host id that resolves to one *before any credential is read or requested*. The second half is load-bearing: a server can be switched to Telnet long after another server named it, and no picker can retract a choice already saved.
+- **Silently skipped** — Directory sync (Follow Terminal Directory). If the File Explorer is rooted on a server that is later switched to Telnet, the sync stops instead of sending path text extracted from the device's own output to an SFTP call. Silent by design: this path runs on terminal output, so a notification would repeat for a state the user never asked about.
+- **Never engaged** — connection multiplexing and the SSH connection pool are only reached from the SSH connect path, which a telnet server branches away from before any of it.
+
+**Forward/backward compatibility.** `protocol` is additive and optional, so an older build round-trips a telnet record's *other* fields untouched — but it does not understand the field itself, and will connect such a server over SSH. A configuration exported here and imported by a pre-2.8.188 build therefore loses the protocol (and, with it, the meaning of a blank username). Nothing on this side can prevent that; the field does not exist in the older schema.
+
+**Inventory.** `InventoryEndpointKind` includes `"telnet"`. A device whose only usable endpoint is telnet syncs to a telnet server on port 23 by default; a device offering **both** ssh and telnet maps to SSH, whatever order the endpoints are listed in. The `ServerOrigin.syncedProtocol` stamp records what the sync wrote, so a protocol you change by hand is never overwritten by a later sync, while a device that genuinely changes transport is still followed.
 
 ### 4.5 Port Forwarding
 1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
@@ -491,7 +518,7 @@ Author-and-run automation on top of any active SSH, Serial, or Local Shell sessi
 ### 9.1 Flow
 1. Create a `.js` file under `<workspaceRoot>/<nexus.scripts.path>` (default `.nexus/scripts/`). Tag the leading JSDoc block with `@nexus-script` and any of the optional fields `@name`, `@description`, `@target-type`, `@target-profile`, `@default-timeout`, `@lock-input`, `@allow-macros`.
 2. First time a Nexus script command runs in the workspace, `ScriptTypesGenerator` seeds `types/nexus-scripts.d.ts` + `jsconfig.json` so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, `prompt`, etc.
-3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type` values `ssh`, `serial`, or `local`; auto-select on `@target-profile` id/name match; else QuickPick), and spawns a `node:worker_threads` Worker.
+3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type` values `ssh`, `telnet`, `serial`, or `local`; auto-select on `@target-profile` id/name match; else QuickPick), and spawns a `node:worker_threads` Worker.
 4. While running, the script's status shows in the **Nexus Scripts** status-bar entry and the **Nexus Scripts** Output Channel logs timestamped events (`→ expect …`, `← matched`, `log info: …`, `end: completed (…ms)`).
 
 #### 9.1.1 Script Templates

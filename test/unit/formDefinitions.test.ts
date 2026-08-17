@@ -43,9 +43,15 @@ function keyPathVisibleWhen(definition: ReturnType<typeof serverFormDefinition>)
 }
 
 describe("formDefinitions keyPath visibility", () => {
-  it("shows server keyPath field only for authType=key", () => {
+  it("shows server keyPath field only for authType=key on an SSH server", () => {
+    // TELNET (Phase 0) — the key-file control now carries the SSH-only gate as
+    // well: telnet has no key material, so the field must stay hidden there
+    // whatever `authType` reads.
     const visibleWhen = keyPathVisibleWhen(serverFormDefinition());
-    expect(visibleWhen).toEqual({ field: "authType", value: "key" });
+    expect(visibleWhen).toEqual([
+      { field: "protocol", value: "ssh" },
+      { field: "authType", value: "key" }
+    ]);
   });
 
   it("compounds unified form keyPath visibility with profileType=ssh", () => {
@@ -58,6 +64,7 @@ describe("formDefinitions keyPath visibility", () => {
     expect(Array.isArray(keyPathField!.visibleWhen)).toBe(true);
     expect(keyPathField!.visibleWhen).toEqual([
       { field: "profileType", value: "ssh" },
+      { field: "protocol", value: "ssh" },
       { field: "authType", value: "key" }
     ]);
   });
@@ -220,14 +227,19 @@ describe("formDefinitions keyPath visibility", () => {
       label: "Open File Explorer on first connection",
       value: true,
       advanced: true,
-      hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script."
+      hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script.",
+      // TELNET (Phase 0) — the SFTP file explorer is SSH-only machinery.
+      visibleWhen: { field: "protocol", value: "ssh" }
     }));
 
     const unifiedField = keyedField(unifiedProfileFormDefinition(), "openFileExplorerOnFirstConnect");
     expect(unifiedField).toEqual(expect.objectContaining({
       type: "checkbox",
       value: false,
-      visibleWhen: { field: "profileType", value: "ssh" }
+      visibleWhen: [
+        { field: "profileType", value: "ssh" },
+        { field: "protocol", value: "ssh" }
+      ]
     }));
     expect(maybeKeyedField(serialFormDefinition(), "openFileExplorerOnFirstConnect")).toBeUndefined();
     expect(maybeKeyedField(localShellFormDefinition(), "openFileExplorerOnFirstConnect")).toBeUndefined();

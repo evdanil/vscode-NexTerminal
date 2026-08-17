@@ -61,8 +61,27 @@ describe("scriptHeader / parseScriptHeader", () => {
   });
 
   it("records a parse error on unknown @target-type value", () => {
-    const h = parseScriptHeader(base("@nexus-script\n@target-type telnet"));
+    // Was `telnet` until telnet became a real target type (Phase 0).
+    const h = parseScriptHeader(base("@nexus-script\n@target-type rdp"));
     expect(h.parseErrors.join("\n")).toMatch(/target-type/i);
+  });
+
+  // ⊘ A header parser that still rejects `telnet` makes every telnet-targeted
+  // script unrunnable — the error surfaces as a parse failure, not as "no
+  // matching session", so the user has nothing to act on.
+  it("accepts telnet as a target type", () => {
+    const h = parseScriptHeader(base("@nexus-script\n@target-type telnet"));
+    expect(h.parseErrors).toEqual([]);
+    expect(h.targetType).toBe("telnet");
+    expect(parseScriptHeader(base("@nexus-script\n@target-type Telnet")).targetType).toBe("telnet");
+  });
+
+  it("names every accepted value in the parse error", () => {
+    const h = parseScriptHeader(base("@nexus-script\n@target-type rdp"));
+    const message = h.parseErrors.join("\n");
+    for (const value of ["ssh", "serial", "telnet", "local"]) {
+      expect(message).toContain(value);
+    }
   });
 
   it("accepts case-insensitive @target-type values", () => {

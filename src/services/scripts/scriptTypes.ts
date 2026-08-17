@@ -14,7 +14,15 @@ export type RunState =
 
 export type FinalState = Exclude<RunState, "starting" | "running">;
 
-export type ScriptTargetType = "ssh" | "serial" | "local";
+/**
+ * TELNET (Phase 0) — `telnet` is its own target type even though a telnet
+ * session is an `ActiveSession` beside the SSH ones. The two transports differ
+ * in exactly the ways a script cares about (no login prompt to expect, no
+ * SFTP/tunnel side effects to rely on), and a script written for one is not
+ * generally safe to fire at the other, so `@target-type ssh` deliberately does
+ * NOT match a telnet session and vice versa.
+ */
+export type ScriptTargetType = "ssh" | "telnet" | "serial" | "local";
 
 export interface ScriptRunOperation {
   kind: "wait" | "poll" | "prompt" | "sleep";

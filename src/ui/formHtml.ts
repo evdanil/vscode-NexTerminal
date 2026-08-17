@@ -104,9 +104,12 @@ function renderField(field: FormFieldDescriptor): string {
 
     case "number": {
       const step = field.step !== undefined ? ` step="${field.step}"` : "";
+      const defaultsFrom = field.defaultsFrom
+        ? ` data-defaults-from='${escapeHtml(JSON.stringify(field.defaultsFrom))}'`
+        : "";
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}"${step} placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
+  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}"${step} placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${defaultsFrom} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }
@@ -626,6 +629,40 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         }
       }
       updateVisibility();
+
+      /* TELNET (Phase 0, MINOR-3) — a numeric field whose DEFAULT follows
+         another control (the server form's Port following Protocol: 22 for ssh,
+         23 for telnet). The swap fires only while the field still holds one of
+         the mapped defaults, so a port the user typed is never clobbered — see
+         FieldDefaultsFrom in formTypes.ts. */
+      var defaultsTargets = document.querySelectorAll("[data-defaults-from]");
+      for (var di = 0; di < defaultsTargets.length; di++) {
+        (function(input) {
+          var spec;
+          try {
+            spec = JSON.parse(input.dataset.defaultsFrom);
+          } catch (_error) {
+            return;
+          }
+          if (!spec || !spec.field || !spec.defaults) return;
+          var source = form.elements[spec.field];
+          if (!source) return;
+          var applyDefault = function() {
+            var wanted = spec.defaults[source.value];
+            if (wanted === undefined) return;
+            var current = String(input.value);
+            var holdsADefault = false;
+            for (var k in spec.defaults) {
+              if (String(spec.defaults[k]) === current) holdsADefault = true;
+            }
+            if (holdsADefault && current !== String(wanted)) {
+              input.value = String(wanted);
+            }
+          };
+          source.addEventListener("change", applyDefault);
+          source.addEventListener("input", applyDefault);
+        })(defaultsTargets[di]);
+      }
 
       form.addEventListener("submit", function(e) {
         e.preventDefault();

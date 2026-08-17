@@ -1,5 +1,5 @@
-import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
-import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config";
+import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
+import { authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -300,9 +300,7 @@ function ipmiGatewaySelectField(
     filterable: true,
     options: [
       { label: "(None)", value: "" },
-      ...(servers ?? [])
-        .filter((s) => s.id !== seed?.id)
-        .map((s) => ({ label: s.name, value: s.id }))
+      ...sshInfrastructureCandidates(servers, seed?.id).map((s) => ({ label: s.name, value: s.id }))
     ],
     value: seed?.ipmiGatewayServerId ?? "",
     hint:
@@ -316,11 +314,72 @@ function ipmiGatewaySelectField(
   };
 }
 
+/**
+ * TELNET (Phase 0) — the condition every SSH-ONLY control is gated on. Telnet
+ * has no login, no key material, no multiplexing and no jump hosts, so asking a
+ * telnet server about any of them offers a setting nothing will ever read — and
+ * for `username`, which is `required`, it would make a telnet-only device
+ * impossible to save without inventing a credential.
+ *
+ * Hidden rather than merely labelled: `formHtml.ts` DISABLES the controls of a
+ * hidden group (and strips their `required`), so a gated field submits nothing
+ * at all and `formValuesToServer` never sees a value the connect path would
+ * ignore. That is the mechanism the whole approach rests on.
+ */
+const SSH_PROTOCOL_ONLY: VisibleWhenCondition = { field: "protocol", value: "ssh" };
+
+/** Default listener ports per protocol — mirrored by the sync engine's endpoint mapping. */
+const SSH_DEFAULT_PORT = 22;
+const TELNET_DEFAULT_PORT = 23;
+
+/** AND one more condition onto a possibly-absent, possibly-array `visibleWhen`. */
+function andVisibleWhen(vw: VisibleWhen | undefined, extra: VisibleWhenCondition): VisibleWhen {
+  if (!vw) {
+    return extra;
+  }
+  return [...(Array.isArray(vw) ? vw : [vw]), extra];
+}
+
+/** `vw` compounded with the SSH-only gate — the parent condition is never dropped. */
+function sshOnly(vw?: VisibleWhen): VisibleWhen {
+  return andVisibleWhen(vw, SSH_PROTOCOL_ONLY);
+}
+
 function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?: AuthProfile[], servers?: ServerListEntry[]): FormFieldDescriptor[] {
+  const sshVw = sshOnly(vw);
   return [
-    { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the SSH server.", visibleWhen: vw },
-    { type: "number", key: "port", label: "Port", required: true, min: 1, max: 65535, value: seed?.port ?? 22, visibleWhen: vw },
-    { type: "text", key: "username", label: "Username", required: true, placeholder: "root", value: seed?.username, visibleWhen: vw },
+    // TELNET (Phase 0) — first, because it decides which of the fields below
+    // even apply. Two literals and no free text: the transport is a closed set,
+    // and `ServerConfig.protocol` stores only `"telnet"` (absent means ssh).
+    {
+      type: "select",
+      key: "protocol",
+      label: "Protocol",
+      options: [
+        { label: "SSH", value: "ssh" },
+        { label: "Telnet", value: "telnet" }
+      ],
+      value: seed?.protocol === "telnet" ? "telnet" : "ssh",
+      hint: "Telnet is cleartext and has no login of its own — you log in at the device's own prompt. Use it for console servers and lab gear that offer nothing else; credentials, tunnels, SFTP and jump hosts are SSH-only.",
+      visibleWhen: vw
+    },
+    { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the server.", visibleWhen: vw },
+    // TELNET (Phase 0, MINOR-3) — the default follows the Protocol select (the
+    // sync engine already maps a telnet endpoint to 23), both at render time for
+    // an existing record and live in the form via `defaultsFrom`. A port the
+    // user typed is never overwritten; only one of the two defaults is swapped.
+    {
+      type: "number",
+      key: "port",
+      label: "Port",
+      required: true,
+      min: 1,
+      max: 65535,
+      value: seed?.port ?? (seed?.protocol === "telnet" ? TELNET_DEFAULT_PORT : SSH_DEFAULT_PORT),
+      defaultsFrom: { field: "protocol", defaults: { ssh: SSH_DEFAULT_PORT, telnet: TELNET_DEFAULT_PORT } },
+      visibleWhen: vw
+    },
+    { type: "text", key: "username", label: "Username", required: true, placeholder: "root", value: seed?.username, visibleWhen: sshVw },
     {
       type: "select",
       key: "authType",
@@ -332,9 +391,9 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       ],
       value: seed?.authType ?? "password",
       hint: "Choose how Nexus should authenticate to this server.",
-      visibleWhen: vw
+      visibleWhen: sshVw
     },
-    { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, hint: "Private key used when Authentication is Private Key.", visibleWhen: vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "authType", value: "key" }] : { field: "authType", value: "key" } },
+    { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, hint: "Private key used when Authentication is Private Key.", visibleWhen: andVisibleWhen(sshVw, { field: "authType", value: "key" }) },
     // Not part of the SSH connection at all — it is the out-of-band address
     // `${profile.ipmiHost}` resolves to when a macro is run against this
     // profile (services/profileTokens.ts). Advanced, because a server that has
@@ -344,7 +403,7 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
     // the primary Host is unreachable at the TCP/DNS level. Advanced, because
     // most servers have a single address; the connect-fallback (SshPty.start)
     // only ever engages when this is set. Not required.
-    { type: "text", key: "altHost", label: "Alternate host", placeholder: "2001:db8::1 or 10.0.0.2", value: seed?.altHost, hint: "A second address (e.g. the IPv6 to this host's IPv4) tried automatically if the primary Host can't be reached. Leave blank for none. Applies to the SSH terminal only — tunnels and jump hosts stay on the primary Host.", advanced: true, visibleWhen: vw },
+    { type: "text", key: "altHost", label: "Alternate host", placeholder: "2001:db8::1 or 10.0.0.2", value: seed?.altHost, hint: "A second address (e.g. the IPv6 to this host's IPv4) tried automatically if the primary Host can't be reached. Leave blank for none. Applies to the SSH terminal only — tunnels and jump hosts stay on the primary Host.", advanced: true, visibleWhen: sshVw },
     ipmiAuthProfileSelectField(authProfiles, seed?.ipmiAuthProfileId, vw),
     ipmiGatewaySelectField(seed, servers, vw),
     // Two literals, never a free-text scheme: `ipmiHost` is an address (no `/`,
@@ -363,8 +422,8 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       advanced: true,
       visibleWhen: vw
     },
-    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server.", advanced: true, visibleWhen: vw },
-    { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.legacyAlgorithms ?? false, hint: "Use only for older devices that reject modern SSH algorithms.", advanced: true, visibleWhen: vw }
+    { type: "checkbox", key: "multiplexing", label: "Enable connection multiplexing", value: seed?.multiplexing ?? true, hint: "Overrides the global multiplexing setting for this server.", advanced: true, visibleWhen: sshVw },
+    { type: "checkbox", key: "legacyAlgorithms", label: "Enable legacy SSH algorithms", value: seed?.legacyAlgorithms ?? false, hint: "Use only for older devices that reject modern SSH algorithms.", advanced: true, visibleWhen: sshVw }
   ];
 }
 
@@ -583,6 +642,32 @@ function sharedTrailingFields(
 export interface ServerListEntry {
   id: string;
   name: string;
+  /**
+   * TELNET (Phase 0, MAJOR-3) — carried so the pickers that name ANOTHER server
+   * as SSH infrastructure (Jump Host, IPMI Gateway) can leave telnet servers
+   * out. Optional: absent reads as SSH through `resolveServerProtocol`, so a
+   * caller that does not supply it keeps today's behaviour.
+   */
+  protocol?: ServerProtocol;
+}
+
+/**
+ * TELNET (Phase 0, MAJOR-3) — the servers eligible to be named as SSH
+ * INFRASTRUCTURE by another server: a jump host or an IPMI gateway. Both are id
+ * references the SSH connect path dereferences and then authenticates against,
+ * so a telnet server is not a candidate — choosing one read the vault, prompted
+ * for a password against a host that has no SSH login, and ended in a raw ssh2
+ * handshake error against port 23.
+ *
+ * Selection-time filtering only. The connect path carries its own refusal
+ * (`ProxySshFactory.connectViaSshJump`), because a stale id can already be
+ * stored — a server can be switched to Telnet long after some other server
+ * named it — and a picker cannot retract a choice already saved.
+ */
+function sshInfrastructureCandidates(servers: ServerListEntry[] | undefined, excludeId?: string): ServerListEntry[] {
+  return (servers ?? []).filter(
+    (s) => s.id !== excludeId && resolveServerProtocol(s) !== "telnet"
+  );
 }
 
 // Device templates (PR-T1b, UX-M4/m13) — per-server proxy passwords are never
@@ -628,9 +713,7 @@ function proxyFields(
   // Server options for jump host picker (exclude self to prevent circular ref)
   const serverOptions = [
     { label: "(Select jump host)", value: "" },
-    ...(servers ?? [])
-      .filter((s) => s.id !== seed?.id)
-      .map((s) => ({ label: s.name, value: s.id }))
+    ...sshInfrastructureCandidates(servers, seed?.id).map((s) => ({ label: s.name, value: s.id }))
   ];
 
   const jumpHostId = proxy?.type === "ssh" ? proxy.jumpHostId : "";
@@ -937,13 +1020,17 @@ export function serverFormDefinition(
   const ssh = applyLinkedAuthProfileValues(sshFields(seed, undefined, authProfiles, servers), linkedProfile);
 
   return {
-    title: isEdit ? "Edit SSH Server Profile" : "Add SSH Server Profile",
+    // TELNET (Phase 0) — the title stays protocol-neutral: one form now produces
+    // either kind of record, and the Protocol select inside it says which.
+    title: isEdit ? "Edit Server Profile" : "Add Server Profile",
     fields: withTemplateAppliedHints(seed, [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
-      authProfileSelectField(authProfiles, undefined, seed?.authProfileId, { displacedValues: ssh.displaced }),
+      // TELNET (Phase 0) — credentials, proxies/jump hosts and the SFTP file
+      // explorer are all SSH-only machinery; a telnet server reads none of them.
+      authProfileSelectField(authProfiles, sshOnly(), seed?.authProfileId, { displacedValues: ssh.displaced }),
       ...ssh.fields,
-      ...proxyFields(seed, servers),
-      openFileExplorerOnFirstConnectField(seed),
+      ...proxyFields(seed, servers, sshOnly()),
+      openFileExplorerOnFirstConnectField(seed, sshOnly()),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ])
   };
@@ -1163,10 +1250,13 @@ export function unifiedProfileFormDefinition(
     fields: [
       unifiedProfileTypeField(seed),
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server, Console, or Project Shell" },
-      authProfileSelectField(authProfiles, sshVw),
+      // TELNET (Phase 0) — compounded, never replaced: the SSH-only gate ANDs
+      // onto the profile-type gate, so these controls stay hidden on the Serial
+      // and Local Shell branches as well.
+      authProfileSelectField(authProfiles, sshOnly(sshVw)),
       ...sshFields(undefined, sshVw, authProfiles, servers),
-      ...proxyFields(undefined, servers, sshVw),
-      openFileExplorerOnFirstConnectField(undefined, sshVw),
+      ...proxyFields(undefined, servers, sshOnly(sshVw)),
+      openFileExplorerOnFirstConnectField(undefined, sshOnly(sshVw)),
       ...serialFields(undefined, serialVw),
       ...localShellFields(undefined, localShellVw, localShellOptions),
       ...sharedFields

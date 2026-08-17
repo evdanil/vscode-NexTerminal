@@ -97,8 +97,8 @@ export function parseScriptHeader(source: string): ScriptHeader {
         break;
       case "@target-type": {
         const normalized = value.toLowerCase();
-        if (normalized !== "ssh" && normalized !== "serial" && normalized !== "local") {
-          header.parseErrors.push(`@target-type must be "ssh", "serial", or "local", got "${value}"`);
+        if (normalized !== "ssh" && normalized !== "telnet" && normalized !== "serial" && normalized !== "local") {
+          header.parseErrors.push(`@target-type must be "ssh", "telnet", "serial", or "local", got "${value}"`);
           break;
         }
         header.targetType = normalized;

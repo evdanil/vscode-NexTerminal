@@ -5,6 +5,22 @@ export interface VisibleWhenCondition {
 
 export type VisibleWhen = VisibleWhenCondition | VisibleWhenCondition[];
 
+/**
+ * TELNET (Phase 0, MINOR-3) — "this numeric field's DEFAULT follows another
+ * field's value". `field` names the control to watch; `defaults` maps that
+ * control's values to the default this field should hold for each.
+ *
+ * THE RULE THAT MAKES IT SAFE: the value is swapped only when the current one
+ * is still one of the mapped defaults, i.e. only while the user has not typed
+ * their own. Anything hand-set is left alone forever after. Without that, a
+ * console-server port typed before the protocol was chosen would be destroyed
+ * by the choice.
+ */
+export interface FieldDefaultsFrom {
+  field: string;
+  defaults: Record<string, number>;
+}
+
 interface FormFieldCommon {
   advanced?: boolean;
   hint?: string;
@@ -16,7 +32,7 @@ export type FormFieldDescriptor =
   | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean } & FormFieldCommon)
   | ({ type: "textarea"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; rows?: number } & FormFieldCommon)
   | ({ type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
-  | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; step?: number | "any"; placeholder?: string; value?: number } & FormFieldCommon)
+  | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; step?: number | "any"; placeholder?: string; value?: number; defaultsFrom?: FieldDefaultsFrom } & FormFieldCommon)
   /**
    * `autofillFilledKeys` is the render-time half of field-ownership tracking
    * (see `updateProfileManagedFields` in formHtml.ts): the form keys the

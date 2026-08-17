@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-export type InventoryEndpointKind = "ssh" | "redfish" | "url" | "ipmi-sol";
+export type InventoryEndpointKind = "ssh" | "telnet" | "redfish" | "url" | "ipmi-sol";
 
 /**
  * One way to reach a device. The sync engine maps the FIRST endpoint with
@@ -15,6 +15,21 @@ export type InventoryEndpointKind = "ssh" | "redfish" | "url" | "ipmi-sol";
  * `syncedIpmiHost`'s). THE CONVENTION: first ssh = primary host, second ssh =
  * alternate host. All other kinds — and any THIRD-or-later ssh endpoint — are
  * accepted, preserved on the tree, and otherwise unused.
+ *
+ * TELNET (Phase 0) — the FIRST endpoint with kind === "telnet" maps onto
+ * `host`/`port` PLUS `protocol: "telnet"` (see `selectPrimaryEndpoint` in
+ * services/inventory/syncEngine.ts, and the `ServerOrigin.syncedProtocol` stamp
+ * rule, which twins `syncedAltHost`'s). Its default port is 23, not 22.
+ *
+ * SSH WINS THE PRIMARY SLOT. A device that reports BOTH an ssh and a telnet
+ * endpoint maps to an SSH server, whatever order they are listed in, and its
+ * telnet endpoint is then simply unused. This is a deliberate simplification
+ * rather than a preference setting: SSH is the protocol with authentication,
+ * file transfer and tunnelling, so where a device offers both there is no case
+ * for choosing the one that offers none of them — and a device reachable only
+ * over telnet (a virtual console server, lab gear) is exactly the population
+ * this kind exists for. A user who wants telnet on a dual-stack device switches
+ * the server by hand, and the `syncedProtocol` stamp keeps that choice.
  */
 export interface InventoryEndpoint {
   kind: InventoryEndpointKind;
