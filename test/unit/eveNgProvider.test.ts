@@ -993,6 +993,70 @@ describe("createEveNgProvider — hard caps", () => {
 });
 
 describe("createEveNgProvider — error mapping", () => {
+  /**
+   * P1 (data-loss) — a syntactically valid `status:"success"` envelope whose
+   * `data` is missing / null / a primitive / the wrong shape must FAIL the sync,
+   * not be coerced into an empty (non-truncated) inventory. An empty tree makes
+   * `computeSyncPlan` treat every owned device as absent and orphan/delete it —
+   * and its stored credentials — over what is really a malformed response.
+   */
+  it("P1 — rejects a success envelope whose `data` is not a folder listing at the ROOT folder, rather than turning it into an empty prune-everything inventory (⊘ coercing malformed data to {folders:[],labs:[]} deletes every owned device and its credentials)", async () => {
+    const malformed: unknown[] = [
+      null,
+      "oops",
+      42,
+      [],
+      { folders: [] }, // labs missing
+      { labs: [] }, // folders missing
+      { folders: {}, labs: [] }, // folders not an array
+      { folders: [], labs: "x" } // labs not an array
+    ];
+    for (const badData of malformed) {
+      const fetchImpl = (async (input: string) => {
+        const path = new URL(input).pathname;
+        if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+        if (path.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+        return makeResponse(200, { code: 200, status: "success", message: "", data: badData });
+      }) as unknown as typeof fetch;
+      const err = await createEveNgProvider(fetchImpl)
+        .fetchInventory(CONFIG, SECRETS)
+        .catch((e: unknown) => e);
+      expect(err, `data=${JSON.stringify(badData)}`).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, `data=${JSON.stringify(badData)}`).toBe("protocol");
+    }
+  });
+
+  it("P1 — accepts a genuinely empty-but-well-formed folder listing (both keys present as arrays), so a real lab-less/folder-less folder still syncs", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      return makeResponse(200, jsend({ folders: [], labs: [] }));
+    }) as unknown as typeof fetch;
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toEqual([]);
+    // ⊘ A well-formed empty tree is NOT truncated — pruning of genuinely gone
+    // devices must still run. (This is the shape the P1 guard must let through.)
+    expect(tree.truncated).toBeFalsy();
+  });
+
+  it("P1 — rejects a success envelope whose node payload is neither an object map nor an empty array, rather than reading it as 'this lab has no nodes' (⊘ `data:\"garbage\"` -> [] prunes the lab's servers)", async () => {
+    for (const badNodes of ["garbage", 7, null, [{ id: "1" }] /* non-empty array is not the node map */]) {
+      const fetchImpl = (async (input: string) => {
+        const path = decodeURIComponent(new URL(input).pathname);
+        if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+        if (path.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+        if (path === "/api/folders/") return makeResponse(200, jsend({ folders: [], labs: [{ file: "L.unl", path: "/L.unl" }] }));
+        return makeResponse(200, { code: 200, status: "success", message: "", data: badNodes });
+      }) as unknown as typeof fetch;
+      const err = await createEveNgProvider(fetchImpl)
+        .fetchInventory(CONFIG, SECRETS)
+        .catch((e: unknown) => e);
+      expect(err, `nodes=${JSON.stringify(badNodes)}`).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, `nodes=${JSON.stringify(badNodes)}`).toBe("protocol");
+    }
+  });
+
   it("maps an abort/timeout to `network`, naming the host rather than the stack", async () => {
     const fetchImpl = (async () => {
       const err = new Error("The operation was aborted due to timeout");

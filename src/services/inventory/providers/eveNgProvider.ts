@@ -480,19 +480,27 @@ class EveApiClient {
   /**
    * `GET /api/folders{path}` — the raw listing, already unwrapped from JSend.
    * `NOT_FOUND` when the folder 404s (deleted since it was listed — MINOR-12).
+   *
+   * P1 (data-loss) — the documented shape is STRICT: `data` is an object with a
+   * `folders` array and a `labs` array (both keys present even for an empty
+   * folder). A success envelope carrying anything else — `data` missing, null, a
+   * primitive, or a partial/wrong-typed object — is a protocol error, NOT an
+   * empty folder. Coercing it to `{folders:[],labs:[]}` would make the whole
+   * inventory look empty, and `computeSyncPlan` would then orphan/delete every
+   * owned device (and its credentials) over a malformed response.
    */
   public async listFolder(folderPath: string, timeoutMs: number): Promise<{ folders: unknown[]; labs: unknown[] } | typeof NOT_FOUND> {
     const data = await this.getDataAllowingGone(`/api/folders${encodePath(folderPath)}`, timeoutMs);
     if (data === NOT_FOUND) {
       return NOT_FOUND;
     }
-    if (!isObject(data)) {
-      return { folders: [], labs: [] };
+    if (!isObject(data) || !Array.isArray(data.folders) || !Array.isArray(data.labs)) {
+      throw new InventoryProviderError(
+        "protocol",
+        `EVE-NG returned a malformed folder listing for "${folderPath}" — expected { folders: [...], labs: [...] }. Failing the sync rather than risk pruning every device.`
+      );
     }
-    return {
-      folders: Array.isArray(data.folders) ? data.folders : [],
-      labs: Array.isArray(data.labs) ? data.labs : []
-    };
+    return { folders: data.folders, labs: data.labs };
   }
 
   /**
@@ -509,12 +517,25 @@ class EveApiClient {
     if (data === NOT_FOUND) {
       return NOT_FOUND;
     }
-    // Anything else that is not a keyed object — the empty ARRAY included — is
-    // simply "this lab has no nodes". A client that instead DEMANDS an object
-    // fails the entire sync over one empty lab, and every other lab's servers
-    // then look deleted to the prune phase.
+    // The documented shapes are exactly two: an object keyed by node id, or the
+    // EMPTY array EVE-NG returns for a lab with no nodes. P1 — anything else (a
+    // primitive, null, or a NON-empty array) is malformed and must fail the
+    // sync, not read as "this lab has no nodes" — which would prune the lab's
+    // servers over a bad response.
+    if (Array.isArray(data)) {
+      if (data.length === 0) {
+        return [];
+      }
+      throw new InventoryProviderError(
+        "protocol",
+        `EVE-NG returned a malformed node list for "${labPath}" — a non-empty array is not the expected node map.`
+      );
+    }
     if (!isObject(data)) {
-      return [];
+      throw new InventoryProviderError(
+        "protocol",
+        `EVE-NG returned a malformed node list for "${labPath}" — expected an object keyed by node id or an empty array.`
+      );
     }
     return Object.entries(data).filter((pair): pair is [string, Record<string, unknown>] => isObject(pair[1]));
   }
