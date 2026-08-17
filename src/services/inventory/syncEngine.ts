@@ -2630,7 +2630,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       name: device.name,
       host: endpoint.host,
       port,
-      username: endpoint.username ?? source.defaultUsername,
+      // MAJOR-2 (review) — normalized to `""` rather than left `undefined`. A
+      // telnet console commonly names no username and its source may carry no
+      // default, and a record whose `username` member is absent used to fail
+      // `validateServerConfig` — i.e. the sync wrote rows the storage layer then
+      // dropped on the next load. The validator tolerates absent for telnet now
+      // as well; writing the canonical blank keeps every telnet record — synced
+      // or hand-made through the form — the same shape.
+      username: endpoint.username ?? source.defaultUsername ?? "",
       authType: "agent",
       // The LINK only — never the profile's username/authType/keyPath. Those
       // are resolved fresh at connect time, so a profile edit reaches every

@@ -153,9 +153,26 @@ describe("validateServerConfig — protocol", () => {
     expect(validateServerConfig(server({ protocol: "telnet", username: "" }))).toBe(true);
     expect(validateServerConfig(server({ protocol: "ssh", username: "" }))).toBe(false);
     expect(validateServerConfig(server({ username: "" }))).toBe(false);
-    // Still a string: a missing username member is malformed for either protocol.
+  });
+
+  // ⊘ MAJOR-2 (review) — ABSENT, not merely blank. An inventory sync writes
+  // `endpoint.username ?? source.defaultUsername`, which is `undefined` for a
+  // telnet console whose device names no username and whose source has no
+  // default. A guard demanding `typeof === "string"` rejected the sync's OWN
+  // output, and `VscodeConfigRepository.getServers` drops a rejected row with
+  // only a console warning — so the server synced in, worked, and silently
+  // disappeared on reload, on every re-sync forever.
+  it("accepts a telnet server with no username member at all", () => {
     const { username: _dropped, ...withoutUsername } = server({ protocol: "telnet" });
-    expect(validateServerConfig(withoutUsername)).toBe(false);
+    expect(validateServerConfig(withoutUsername)).toBe(true);
+    // Scoped to the transport with no login — SSH still requires one.
+    const { username: _alsoDropped, ...sshWithoutUsername } = server();
+    expect(validateServerConfig(sshWithoutUsername)).toBe(false);
+  });
+
+  it("still rejects a non-string username on a telnet server", () => {
+    expect(validateServerConfig({ ...server({ protocol: "telnet" }), username: 42 })).toBe(false);
+    expect(validateServerConfig({ ...server({ protocol: "telnet" }), username: null })).toBe(false);
   });
 });
 

@@ -10,6 +10,7 @@ import {
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import { validateServerConfig } from "../../src/utils/validation";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { buildConnectConfig } from "../../src/services/ssh/ssh2Connector";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../src/models/inventory";
@@ -4707,6 +4708,66 @@ describe("computeSyncPlan — telnet endpoints", () => {
     // the field can follow the device the next time it changes.
     expect(plan.updates[0].after.protocol).toBe("telnet");
     expect(plan.updates[0].after.origin?.syncedProtocol).toBe("telnet");
+  });
+});
+
+/**
+ * MAJOR-2 (review) — THE WRITER AND THE VALIDATOR MUST AGREE. A record the sync
+ * writes that `validateServerConfig` rejects is dropped by
+ * `VscodeConfigRepository.getServers()` with only a console warning: the user
+ * watches the server sync in, work for the rest of the session, and silently
+ * vanish on the next reload — forever, on every re-sync.
+ */
+describe("computeSyncPlan — every telnet record it writes must validate", () => {
+  const telnetTree = () =>
+    makeTree([makeDevice({ externalId: "d1", name: "console-1", endpoints: [{ kind: "telnet", host: "10.0.0.5" }] })]);
+
+  // ⊘ The discriminator is the SOURCE with no `defaultUsername`: telnet
+  // endpoints legitimately carry no username (console servers, lab gear), so
+  // `endpoint.username ?? source.defaultUsername` is `undefined` and the record
+  // the sync just wrote fails the guard that decides whether it survives a
+  // reload. A fixture with a default username passes either way and proves
+  // nothing.
+  it("writes a valid record for a telnet device when the source has no default username", () => {
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const plan = computeSyncPlan({ source, tree: telnetTree(), currentServers: [], now: 1000 });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].protocol).toBe("telnet");
+    expect(validateServerConfig(plan.adds[0])).toBe(true);
+  });
+
+  it("writes a valid record for a telnet device when the source's default username is blank", () => {
+    const source = makeSource({ defaultUsername: "" });
+    const plan = computeSyncPlan({ source, tree: telnetTree(), currentServers: [], now: 1000 });
+    expect(validateServerConfig(plan.adds[0])).toBe(true);
+  });
+
+  it("keeps SSH records subject to the unchanged username rule", () => {
+    // An SSH device with no username anywhere is still an invalid record — the
+    // relaxation must be scoped to telnet, not a general loosening.
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [], now: 1000 });
+    expect(plan.adds[0].protocol).toBeUndefined();
+    expect(validateServerConfig(plan.adds[0])).toBe(false);
+  });
+
+  // MINOR-8 — the "no silent drops" guarantee, stated as a property over every
+  // record a telnet sync produces rather than over one hand-picked fixture.
+  it("produces only valid records across adds, updates and adoptions", () => {
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const owned = makeOwnedServer({ host: "10.0.0.5", port: 23, username: "" });
+    const tree = makeTree([
+      makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }] }),
+      makeDevice({ externalId: "d2", name: "console-2", endpoints: [{ kind: "telnet", host: "10.0.0.6", port: 2002 }] })
+    ]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [owned], now: 2000 });
+
+    const written = [...plan.adds, ...plan.updates.map((u) => u.after)];
+    expect(written.length).toBeGreaterThan(0);
+    for (const record of written) {
+      expect(validateServerConfig(record), `sync wrote an invalid record: ${JSON.stringify(record)}`).toBe(true);
+    }
   });
 });
 

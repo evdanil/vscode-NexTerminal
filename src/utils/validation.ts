@@ -283,10 +283,25 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
       // protocol-level login: the user logs in at the device's own prompt, in
       // the terminal, so the server form never collects a username for a telnet
       // record and the submission carries none. Requiring a non-empty one here
-      // would drop every telnet server at the storage/import boundary. Still
-      // required to BE a string for either protocol — a missing member is
-      // malformed whatever the transport.
-      (obj.protocol === "telnet" ? typeof obj.username === "string" : isNonEmptyString(obj.username)) &&
+      // would drop every telnet server at the storage/import boundary.
+      //
+      // MAJOR-2 (review) — ABSENT is accepted as well as blank, and that is the
+      // whole point rather than tidiness. An inventory sync writes
+      // `endpoint.username ?? source.defaultUsername`, which is `undefined` for
+      // a telnet console whose device names no username and whose source has no
+      // default. Demanding `typeof === "string"` made the SYNC'S OWN OUTPUT fail
+      // the guard that decides whether a record survives a reload
+      // (`VscodeConfigRepository.getServers` drops it with only a console
+      // warning), so the server appeared, worked for the session, and silently
+      // vanished — on every re-sync, forever. The writer normalizes to `""` now
+      // too; this end is the one that must never disagree with it again.
+      //
+      // SSH SEMANTICS ARE UNCHANGED: a non-empty username is still required
+      // there, so this is scoped to the transport that has no login rather than
+      // a general loosening.
+      (obj.protocol === "telnet"
+        ? obj.username === undefined || typeof obj.username === "string"
+        : isNonEmptyString(obj.username)) &&
       (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
     )
   ) {
