@@ -10,11 +10,17 @@ export type VisibleWhen = VisibleWhenCondition | VisibleWhenCondition[];
  * field's value". `field` names the control to watch; `defaults` maps that
  * control's values to the default this field should hold for each.
  *
- * THE RULE THAT MAKES IT SAFE: the value is swapped only when the current one
- * is still one of the mapped defaults, i.e. only while the user has not typed
- * their own. Anything hand-set is left alone forever after. Without that, a
- * console-server port typed before the protocol was chosen would be destroyed
- * by the choice.
+ * THE RULE THAT MAKES IT SAFE (P2-A): the value is swapped only while it is
+ * AUTO-DERIVED — it matched the source's own default when the form rendered, and
+ * the user has not typed into it since. Anything hand-set is left alone forever
+ * after.
+ *
+ * "Auto-derived", not "looks like a default": those differ exactly where it
+ * matters. A hand-set SSH-on-23 is byte-identical to the telnet default, so a
+ * value-only test rewrote it to 22 on a protocol round-trip — silently
+ * destroying a deliberate choice, which is the opposite of this contract. A
+ * dirty flag alone is not sufficient either, because the seeded value has to be
+ * judged before the user touches anything.
  */
 export interface FieldDefaultsFrom {
   field: string;
