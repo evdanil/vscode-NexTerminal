@@ -160,6 +160,49 @@ Telnet is a per-server **protocol** choice, not a separate profile type: one ser
 
 **Inventory.** `InventoryEndpointKind` includes `"telnet"`. A device whose only usable endpoint is telnet syncs to a telnet server on port 23 by default; a device offering **both** ssh and telnet maps to SSH, whatever order the endpoints are listed in. The `ServerOrigin.syncedProtocol` stamp records what the sync wrote, so a protocol you change by hand is never overwritten by a later sync, while a device that genuinely changes transport is still followed.
 
+### 4.4.5 EVE-NG Inventory Source
+
+A second built-in inventory provider (`src/services/inventory/providers/eveNgProvider.ts`, id `eve-ng`), registered beside NetBox in `activate()`. **Labs become folders; nodes become telnet servers.**
+
+**Config fields**, in form order — the list is part of the provider fingerprint, so it is fixed:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `baseUrl` | string, required | The EVE-NG web UI address; a trailing slash is tolerated. Self-signed HTTPS is **not** supported (the extension host's fetch has no per-source trust store to relax) — use `http`, or a trusted certificate. |
+| `username` | string, required | |
+| `password` | password, required | Vault-stored (`SecretStorage`), never in settings. |
+| `rootFolder` | string, optional | Subtree of the lab folder tree to scan. Defaults to `/`. |
+| `filter` | string, optional | Case-insensitive substring matched against each lab's full path. Id + type deliberately match `SAVED_FILTER_TARGET_FIELD_ID`, so the shared saved-filter picker attaches to it. |
+| `includeStopped` | boolean, **default true** | When off, stopped nodes are omitted — which makes them look deleted, so the source's prune policy applies to them. The default is expressed through `InventoryConfigField.defaultValue`. |
+| `consoleHost` | string, optional | Override host for console connections when EVE-NG is behind NAT. |
+
+**API surface.** All calls go through a module-private `EveApiClient`, so future Professional divergences land in one place. Login is `POST /api/auth/login` with `{username, password, html5: "-1"}` — the `html5: "-1"` is what makes EVE-NG report *native* `telnet://host:port` console URLs rather than browser HTML5 console links; without it every node maps to zero endpoints. undici's fetch keeps no cookie jar, so the `unetlab_session` cookie is captured from the login response and replayed as a `Cookie` header on every subsequent request. Every response is a JSend envelope (`{code, status, message, data}`) and is validated as such: a rejected password comes back as **HTTP 200 with `status: "fail"`**, which a status-code-only client would read as success.
+
+**Crawl.** `GET /api/folders{path}` (each path segment percent-encoded — lab and folder names routinely contain spaces) is walked breadth-first from `rootFolder`, collecting `data.labs`; `GET /api/labs{labPath}/nodes` then fetches each surviving lab's nodes. That payload is an object keyed by node id, except for an empty lab, where EVE-NG returns an empty **array** — both are accepted, because failing the sync over one empty lab makes every other lab's servers look deleted. Four guards bound the walk, and **each one that fires sets `truncated`**, which is what stops `computeSyncPlan` pruning the servers of labs the crawl never reached: a visited-path set (a listing may name any path, including an ancestor), the `..` entry skip, a depth cap of 12, and a 2 000-listing request budget. Hard caps: 1 000 labs and 10 000 nodes, each with a warning naming what was dropped.
+
+**Session expiry.** A mid-crawl 401/403 triggers exactly **one** silent re-login and one retry; a second failure surfaces as an `auth` error. EVE-NG expires sessions aggressively, so failing the first 401 loses syncs a single round trip would have saved — but retrying indefinitely turns a wrong password into an unbounded login loop.
+
+**Mapping.**
+- `externalId` = `` `${labPath}#${nodeId}` `` — every lab has a node `1`, so a bare node id would collapse them all into one server.
+- `name` = the node name, or `node-${id}` when blank. A node is **never dropped** for a cosmetic data problem: a device missing from the tree reads as deleted at the source.
+- `folderPath` = the lab's own folder, made relative to `rootFolder`, plus the lab name (file minus `.unl`) as the final segment.
+- `endpoints` = one `{kind: "telnet", host, port}` when `console === "telnet"` and `url` parses as `telnet://host:port` (see §4.4.4 for how the engine maps that onto a telnet server). The host is `consoleHost` when set; otherwise the URL's host, unless that is loopback or `0.0.0.0` — the usual answer, since EVE-NG is describing its own machine — in which case the `baseUrl` hostname is substituted. A non-telnet console, or none yet, yields `endpoints: []` and the device is still emitted; the count is reported as **one aggregate warning**, not one line per node.
+- `attributes` / `attributeKeys` = `lab`, `template`, `type`, `console`, `status` (`running` for EVE-NG status 2, else `stopped`), `image`, `name`; empty values are omitted so a filter like `image=` cannot match every diskless node.
+
+**`instanceKey`** is the canonical `scheme://host[:port]` of the base URL, mirroring `netboxInstanceKey` except that the **path is dropped**: EVE-NG's API always lives at the origin's `/api`, so a path is a typo rather than a second deployment. Userinfo, query and fragment are stripped — the key is persisted on every kept server and copied into backups.
+
+**`testConnection`** logs in and probes `GET /api/status`, falling back to `GET /api/folders/` **only** on a 404 (an older build without the endpoint). An auth failure bubbles as-is and is never masked by a fallback that could succeed on a laxer endpoint.
+
+**Edition.** `data.version` from `/api/status` naming `pro` (case-insensitive) marks the server Professional and appends exactly one warning per sync: *"EVE-NG Professional detected — Pro support is preliminary in this version; lab discovery and console mapping are validated against Community edition."* Community is the certified target. A missing `/api/status` is treated as *unknown* rather than fatal — edition detection is an optional capability probe.
+
+### 4.4.6 Inventory Sources in the Settings Tree
+
+The Settings view's flat "Inventory Sources" link is an expandable group (`InventorySourcesGroupItem` / `InventorySourceItem`, `src/ui/settingsTreeProvider.ts`). Its children are one row per `NexusCore.getSnapshot().inventorySources` entry — label = the source name, description = `{provider label} — {last sync relative, or "never synced"}` via the shared `services/inventory/sourceDescription.ts` (the same phrase the Manage Inventory Sources panel renders, so the two cannot drift) — followed by a trailing **Add Inventory Source…** row that is present even with zero sources.
+
+Each row carries `contextValue` `nexus.inventorySource`, which the four `view/item/context` inline entries key on: Sync Now, Edit, Template Rules, Remove. Clicking a row edits it. The rows are provider-agnostic — built from the snapshot record plus the registry's label lookup, with no branch on `providerId` — and a provider the registry cannot resolve falls back to its raw id, so a source whose provider extension is missing stays visible and removable.
+
+`SettingsTreeProvider` takes an optional `NexusCore` and `InventoryProviderRegistry` and refreshes on `core.onDidChange` (the descriptions are relative timestamps and the names are editable), unsubscribing on dispose. `nexus.inventory.manage` is unchanged and remains the palette route in.
+
 ### 4.5 Port Forwarding
 1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
    - **Local Forward (-L)**: local TCP listener forwards to a remote target through SSH.
@@ -421,9 +464,10 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexus.authProfile.add`, `nexus.authProfile.manage`
 - `nexus.authProfile.applyToFolder`, `nexus.authProfile.applyToServer`
 
-**Inventory (NetBox):**
+**Inventory (NetBox, EVE-NG):**
 - `nexus.inventory.addSource`, `nexus.inventory.editSource`, `nexus.inventory.removeSource`
 - `nexus.inventory.syncNow`, `nexus.inventory.manage`
+- `editSource` / `removeSource` / `syncNow` — and `nexus.deviceTemplate.editRules` — accept three argument shapes via `resolveSourceIdArg` (`src/commands/inventoryCommands.ts`): a source id string (the manage hub), an object carrying `sourceId` (a tree item — VS Code hands a `view/item/context` command the ITEM, never a string), or nothing (the palette, which falls through to the picker).
 
 **Device Template:**
 - `nexus.deviceTemplate.add` (New Device Template), `nexus.deviceTemplate.manage` (Manage Device Templates)

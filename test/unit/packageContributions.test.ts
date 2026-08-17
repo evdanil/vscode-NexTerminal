@@ -75,6 +75,36 @@ describe("package contributions", () => {
     });
   });
 
+  /**
+   * EVE-NG (Phase 1) — documentation coverage. The provider's two sharp edges
+   * (telnet-only consoles, Community-certified) are things a user hits during
+   * setup, not afterwards, so they have to be written down.
+   */
+  describe("EVE-NG documentation", () => {
+    it("documents the EVE-NG source in the functional docs, including the telnet-console requirement and the Pro stance", () => {
+      expect(functionalDocs).toContain("EVE-NG");
+      expect(functionalDocs).toMatch(/consoleHost/);
+      expect(functionalDocs).toMatch(/includeStopped/);
+      expect(functionalDocs).toMatch(/Community/);
+      expect(functionalDocs).toMatch(/preliminary/i);
+    });
+
+    it("mentions EVE-NG in the README as a second inventory source", () => {
+      expect(readme).toMatch(/EVE-NG/);
+    });
+
+    it("does not tell the reader to run a command title that no longer exists (\u2298 docs pinned to \"Add Inventory Source (NetBox)\" send an EVE-NG user looking for a NetBox-only command)", () => {
+      const staleTitle = "Add Inventory Source (NetBox)";
+      expect(readme).not.toContain(staleTitle);
+      expect(functionalDocs).not.toContain(staleTitle);
+    });
+
+    it("documents the Settings tree's per-source rows", () => {
+      expect(functionalDocs).toMatch(/Inventory Sources/);
+      expect(functionalDocs).toMatch(/nexus\.inventorySource/);
+    });
+  });
+
   it("includes serialport runtime dependency", () => {
     expect(packageJson.dependencies.serialport).toBeDefined();
   });

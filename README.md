@@ -11,7 +11,7 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
 - **Unlike Remote-SSH, nothing is installed on the remote.** It's a pure client: no `vscode-server` unpacked into the target, no node process running on the far end. That matters when the far end is a Cisco switch, a bastion you only get a shell on, or a change-controlled box where you can't drop an agent.
 - **Bring your existing connections** — import session profiles straight from MobaXterm `.ini` and SecureCRT XML exports, folder hierarchy preserved, so switching costs you minutes, not a weekend.
 - **Onboard a whole rack in one paste** — feed it a CSV export or a plain list of hostnames and it creates the connections in bulk, with folders, ports, and usernames picked up from the columns. Duplicates are skipped and unparsable lines are reported with their line numbers instead of failing the batch.
-- **Sync servers straight from NetBox** — point an inventory source at your NetBox instance and devices become connection profiles, foldered by site and rack, linked to an auth profile so they can actually connect the moment they land. Re-syncing follows renames and rack moves at the source, every sync shows you its plan before anything is applied, and removing a source then re-adding it later offers to re-adopt the servers you kept instead of duplicating them.
+- **Sync servers straight from NetBox or EVE-NG** — point an inventory source at your NetBox instance and devices become connection profiles, foldered by site and rack, linked to an auth profile so they can actually connect the moment they land. Re-syncing follows renames and rack moves at the source, every sync shows you its plan before anything is applied, and removing a source then re-adding it later offers to re-adopt the servers you kept instead of duplicating them.
 - **Edit root-owned files without dropping to a shell** — save `/etc/*` over SFTP with `sudo`, writing through the file's existing inode so owner, mode, and ACLs are preserved. Your sudo password goes to the SSH channel's stdin only: never to disk, never to secret storage, never to a log.
 
 ## Reaching a device two hops away
@@ -94,7 +94,7 @@ Nexus Terminal is available from both the VS Code Marketplace and Open VSX regis
 
 ### First Use Flow
 
-1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile` — or sync your whole device inventory in one go with `Nexus: Add Inventory Source (NetBox)`.
+1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile` — or sync your whole device inventory in one go with `Nexus: Add Inventory Source`.
 2. Select **Connect** / **Open Local Shell** on the profile to open an SSH, Serial, or Local Shell terminal.
 3. For SSH profiles, open **File Explorer** and run **Browse Files** to choose the connected profile and browse SFTP files.
 4. Open **Port Forwarding**, add a tunnel with `Nexus: Add Tunnel`, assign an SSH server, then select **Start**.
@@ -143,7 +143,7 @@ If your target server is behind a firewall or bastion host:
 
 If your device inventory already lives in NetBox, you don't have to re-type it:
 
-1. Run `Nexus: Add Inventory Source (NetBox)` — or open **Settings → Inventory Sources**, which lists every configured source with **Sync Now**, **Edit**, and **Remove**
+1. Run `Nexus: Add Inventory Source` — or open **Settings → Inventory Sources**, which lists every configured source with **Sync Now**, **Edit**, and **Remove**
 2. Enter your NetBox base URL and an API token with read access to DCIM (and Virtualization, if you include VMs). The token is stored in VS Code SecretStorage. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check that the token can read your devices, so a token NetBox accepts but hasn't granted DCIM access will pass here and fail on the first sync
 3. Optionally narrow the sync with a device filter (e.g. `status=active&site=syd`), shape the folder layout with a template (`{site}/{rack}` by default), and set a **Target Folder** to keep synced servers under
 4. Pick an **Auth Profile** so the servers the sync creates can actually connect — choose an existing profile or create one inline without leaving the form. Its username fills the **Default SSH Username** field; with **(None)**, servers use the default username with SSH agent authentication
@@ -158,6 +158,21 @@ Removing a source (**Remove**, beside Sync Now) asks what to do with the servers
 The eligibility rule is narrow on purpose. A server is offered for adoption only if a source actually synced it, you kept it when that source was removed, it's still at the address the device reports, and the source you're syncing points at the same NetBox it was synced from (compared by base URL, so a record kept from your lab instance can never be claimed by the same device id in production). A server you created by hand is never adopted, no matter how exactly its address matches. When adoption is refused — the device changed address while detached, or two kept records claim the same device — the device is added as a new server instead, and the plan's warnings say which device and why. There is one exception, and it is what a restored id-preserving backup leaves behind: when the kept server still holds the identifier a new server for its device would need, there is nothing to add the device beside, so it is skipped rather than duplicated. The warning says that too — naming that server as the device's own former record rather than as an unrelated one, and giving the repair, which is to put it back at the device's address and reclaim it on the next sync, or delete it and let the next sync add the device fresh.
 
 Credentials stay yours. If a source gains an auth profile later, servers from earlier syncs adopt it on the next sync — but only servers still carrying exactly what the sync gave them. A server whose username or authentication you've edited keeps its own credentials (use **Apply Auth Profile** on it or its folder if you do want it on the profile), and setting one synced server's Auth Profile back to **(None)** is a per-server opt-out that later syncs respect. That opt-out survives remove-and-re-add, too: a link you cleared before the source was removed stays cleared after the source adopts the server back, while a kept server the old source never gave a profile picks one up on the reclaim, exactly as a newly synced server does. One combination is refused up front: a private-key profile that carries no key file works fine on a server that brings its own key, but a synced server has none to bring, so linking such a profile to a source is rejected with the reason instead of creating servers that could never log in.
+
+### Sync Servers from an EVE-NG Lab
+
+EVE-NG labs are an inventory source too, and the shape is the same: **labs become folders, nodes become servers**, each pointed at the node's native telnet console.
+
+1. Run `Nexus: Add Inventory Source`, choose **EVE-NG**, and enter the base URL of the EVE-NG web UI plus the username and password you log into it with. The password is stored in VS Code SecretStorage. Self-signed HTTPS is not supported — use `http://`, or put a trusted certificate on the server
+2. Optionally set a **Root Folder** to scan only part of the lab tree, a **Lab Filter** (a case-insensitive substring of a lab's full path), and a **Console Host Override** for when EVE-NG sits behind NAT and reports console addresses you cannot reach
+3. **Include Stopped Nodes** is on by default. Turning it off makes a stopped node look deleted to the sync, so the source's Removed-Device Policy applies to it — leave it on unless you only ever want running gear
+4. Save, then **Sync Now**. As with any source, the plan is shown before anything is applied
+
+Each lab becomes a folder under the source's Target Folder, named after the lab file, nested under whatever folders it sits in relative to the Root Folder. A node with a native telnet console arrives as a **telnet** server on the console's own port. When EVE-NG reports that console on `127.0.0.1` or `0.0.0.0` — the usual answer, since it is describing its own machine — Nexus substitutes the host from the base URL, and a **Console Host Override** wins over both.
+
+Nodes with an HTML5/VNC console, and nodes that have no console address yet, are still imported — as servers with no address, counted in a single warning. They are deliberately not dropped: a device missing from the tree reads as *deleted at the source*, and the source's Removed-Device Policy would act on it.
+
+**Community edition is the certified target.** The client is edition-aware and works against Professional, but a Pro server adds a warning to every sync saying so: lab discovery and console mapping are validated against Community, and Pro's differences are not yet covered.
 
 ### Apply a Device Template to Synced Servers
 
