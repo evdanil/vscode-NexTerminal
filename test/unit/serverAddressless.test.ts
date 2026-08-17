@@ -59,9 +59,22 @@ describe("validateServerConfig — addressless", () => {
     expect(validateServerConfig({ ...server(), addressless: true, host: "", port: "x" } as never)).toBe(false);
   });
 
-  it("accepts an addressless server whose host is the empty string and whose port is the sentinel OR absent", () => {
+  it("accepts an addressless server whose host is the empty string and whose port is the finite sentinel", () => {
     expect(validateServerConfig(server({ addressless: true, host: "", port: 0 }))).toBe(true);
-    expect(validateServerConfig({ ...server({ addressless: true, host: "" }), port: undefined } as never)).toBe(true);
+  });
+
+  // P3-5 (Fable) — tighten the addressless relaxation beyond P2-b's type check:
+  // `port` must be a FINITE number (the sentinel), so a missing port or NaN — both
+  // of which pass `typeof === "number"` reasoning — are rejected; and `addressless:
+  // true` with a NON-EMPTY host is contradictory and rejected. Reachable only via a
+  // hand-edited backup.
+  it("P3-5 — rejects an addressless record with a missing or NaN port (⊘ port===undefined / NaN slips through a looser typeof check)", () => {
+    expect(validateServerConfig({ ...server({ addressless: true, host: "" }), port: undefined } as never)).toBe(false);
+    expect(validateServerConfig({ ...server({ addressless: true, host: "" }), port: Number.NaN } as never)).toBe(false);
+  });
+
+  it("P3-5 — rejects `addressless:true` with a NON-EMPTY host as contradictory (⊘ relaxing host to any string admits an addressless record that also claims an address)", () => {
+    expect(validateServerConfig(server({ addressless: true, host: "10.0.0.1", port: 0 }))).toBe(false);
   });
 });
 

@@ -285,15 +285,15 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     !(
       isNonEmptyString(obj.id) &&
       isNonEmptyString(obj.name) &&
-      // P2-b (Codex) — addressless relaxes host NON-EMPTINESS and port VALIDITY,
-      // never the underlying TYPES. `host` must still be a string (empty allowed
-      // only when addressless) and `port` must still be a number when present
-      // (the sentinel `0`, or absent). A non-string host or non-numeric port must
-      // FAIL even with addressless:true, or a downstream `host.toLowerCase()`
-      // (inventory sync, tree filtering) throws on a malformed backup that a
-      // blanket short-circuit would have admitted.
-      (addressless ? typeof obj.host === "string" : isNonEmptyString(obj.host)) &&
-      (addressless ? obj.port === undefined || typeof obj.port === "number" : isValidPort(obj.port)) &&
+      // P2-b (Codex) / P3-5 (Fable) — addressless relaxes host NON-EMPTINESS and
+      // port VALIDITY, never the underlying shape. An addressless record has an
+      // EMPTY host (a non-empty one is contradictory — it claims an address the
+      // flag says it lacks) and a FINITE sentinel port (`Number.isFinite` rejects a
+      // missing port and NaN, both of which a looser `typeof` check admits). A
+      // downstream `host.toLowerCase()` (inventory sync, tree filtering) would throw
+      // on a malformed backup a blanket short-circuit had let through.
+      (addressless ? obj.host === "" : isNonEmptyString(obj.host)) &&
+      (addressless ? Number.isFinite(obj.port) : isValidPort(obj.port)) &&
       // TELNET (Phase 0) — the ONE field this feature relaxes. Telnet has no
       // protocol-level login: the user logs in at the device's own prompt, in
       // the terminal, so the server form never collects a username for a telnet

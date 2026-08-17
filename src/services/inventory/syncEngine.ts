@@ -1433,6 +1433,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           if (addresslessGroup !== undefined) {
             folderSet.add(addresslessGroup);
           }
+        } else {
+          // P3-1 (Fable) — the no-change twin of the addressed path (~2280): a
+          // stay-addressless server the sync left untouched still counts toward the
+          // owned total, or the preview totals do not sum and the round-4 promotion
+          // decrement gate miscounts.
+          unchangedCount++;
+          unchangedServerIds.add(ownedForAddressless.id);
         }
       } else {
         // ADD — a fresh addressless placeholder. Minimal on purpose: no console

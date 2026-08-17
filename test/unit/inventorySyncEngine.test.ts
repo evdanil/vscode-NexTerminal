@@ -488,6 +488,17 @@ describe("computeSyncPlan — adds", () => {
       expect(plan.warnings.every((w) => !/lost .*console address|downgraded/i.test(w))).toBe(true);
     });
 
+    // P3-1 (Fable) — a stay-addressless server with no change must be counted in
+    // unchangedCount (and unchangedServerIds), like the addressed no-change branch,
+    // or preview totals don't sum to the owned count and the promotion decrement
+    // gate miscounts.
+    it("P3-1 — a stay-addressless server with no change is counted in unchangedCount", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [] })]), currentServers: [before], now: 5000 });
+      expect(plan.updates).toHaveLength(0);
+      expect(plan.unchangedCount).toBe(1);
+    });
+
     it("P1-C — a new addressless device from a KEYLESS source profile carries NO link (⊘ writing a keyless winner stamps a link no server can satisfy)", () => {
       const keyless: AuthProfile = { id: "p1", name: "Shared Key", username: "svc", authType: "key" };
       const plan = computeSyncPlan({
