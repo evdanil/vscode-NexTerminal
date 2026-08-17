@@ -1253,3 +1253,60 @@ describe("ServerTreeItem BMC ipmi contextValue marker", () => {
     expect(new ServerTreeItem(makeServer({ id: "c" }), true).contextValue).toBe("nexus.serverConnected");
   });
 });
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — an EVE-origin server whose running/stopped
+ * state is KNOWN gets a `.eveRunning` / `.eveStopped` marker APPENDED (after any
+ * `.ipmi`), so the Start/Stop Node menu entries can be gated by state. The
+ * marker is emitted ONLY for an EVE-origin server with a known status: a non-EVE
+ * server (even one that somehow carries a status) and a freshly-synced EVE
+ * server with no status yet get NOTHING — the user runs Refresh Lab Status
+ * first, so we never offer an action blind. The final constructor arg carries
+ * the caller-resolved "this origin is an eve-ng source" signal.
+ */
+describe("ServerTreeItem EVE node-control contextValue marker", () => {
+  // Positional args: (server, connected, lookup, showDesc, authName, authUser,
+  // syncedName, ipmiAuthName, status, isEveOrigin).
+  function item(
+    opts: { connected?: boolean; ipmiHost?: string; status?: "running" | "stopped"; isEveOrigin?: boolean } = {}
+  ): ServerTreeItem {
+    return new ServerTreeItem(
+      makeServer({ id: "s", ...(opts.ipmiHost ? { ipmiHost: opts.ipmiHost } : {}) }),
+      opts.connected ?? false,
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      opts.status,
+      opts.isEveOrigin
+    );
+  }
+
+  it("appends .eveRunning for an EVE-origin RUNNING server and .eveStopped for a stopped one (⊘ no marker means Start/Stop can never be gated by state)", () => {
+    expect(item({ isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.server.eveRunning");
+    expect(item({ isEveOrigin: true, status: "stopped" }).contextValue).toBe("nexus.server.eveStopped");
+  });
+
+  it("emits NO eve marker for an EVE-origin server whose status is UNKNOWN (⊘ offering Start/Stop before a status refresh acts blind)", () => {
+    expect(item({ isEveOrigin: true, status: undefined }).contextValue).toBe("nexus.server");
+  });
+
+  it("emits NO eve marker for a NON-EVE server even when a status is somehow set (⊘ a status dot on a NetBox server must never light up node control it does not support)", () => {
+    expect(item({ isEveOrigin: false, status: "running" }).contextValue).toBe("nexus.server");
+    expect(item({ isEveOrigin: undefined, status: "stopped" }).contextValue).toBe("nexus.server");
+  });
+
+  it("composes with .ipmi in the fixed order nexus.server[.ipmi][.eveRunning|.eveStopped] (⊘ a wrong order or a dropped .ipmi breaks the BMC and node-control gates simultaneously)", () => {
+    expect(item({ isEveOrigin: true, status: "running", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveRunning");
+    expect(item({ isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveStopped");
+  });
+
+  it("composes with the connected base string (⊘ a connected running EVE node must still expose Stop)", () => {
+    expect(item({ connected: true, isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.serverConnected.eveRunning");
+    expect(item({ connected: true, isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe(
+      "nexus.serverConnected.ipmi.eveStopped"
+    );
+  });
+});

@@ -1128,22 +1128,22 @@
       "view/item/context": [
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline"
         },
         {
           "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline@2"
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline@1"
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline@2"
         },
         {
@@ -1168,82 +1168,92 @@
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect"
         },
         {
           "command": "nexus.server.runWithScript",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@3"
         },
         {
           "command": "nexus.server.runMacro",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/ && nexus.hasMacros",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/ && nexus.hasMacros",
           "group": "0_connect@5"
         },
         {
           "command": "nexus.server.connectBmcSol",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@6"
         },
         {
           "command": "nexus.server.openBmcWebConsole",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@7"
         },
         {
+          "command": "nexus.inventory.startNode",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.eveStopped$/",
+          "group": "0_connect@8"
+        },
+        {
+          "command": "nexus.inventory.stopNode",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.eveRunning$/",
+          "group": "0_connect@9"
+        },
+        {
           "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@4"
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.server.edit",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.server.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.server.duplicate",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.files.browse",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@4"
         },
         {
           "command": "nexus.server.deployKey",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@5"
         },
         {
           "command": "nexus.authProfile.applyToServer",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@6"
         },
         {
           "command": "nexus.server.copyInfo",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.server.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "3_destructive"
         },
         {
