@@ -381,11 +381,20 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       // shows a sensible default (should the user give it a host, in which case the
       // save reads this value). While it stays addressless the save forces the
       // sentinel regardless of what this shows.
+      //
+      // P2-b (Codex) — that default is the PROTOCOL-appropriate one (telnet→23,
+      // ssh→22), NOT a hardcoded 22. `defaultsFrom` treats a shown port as automatic
+      // only when it equals the CURRENT protocol's default, so seeding 22 on a
+      // telnet placeholder was deemed user-owned and never corrected — typing a host
+      // then saved a telnet server on the SSH port. Seeding the matching default
+      // keeps it automatic (and already correct without a Protocol toggle).
       required: !seed?.addressless,
       min: 1,
       max: 65535,
       value: seed?.addressless
-        ? SSH_DEFAULT_PORT
+        ? seed?.protocol === "telnet"
+          ? TELNET_DEFAULT_PORT
+          : SSH_DEFAULT_PORT
         : seed?.port ?? (seed?.protocol === "telnet" ? TELNET_DEFAULT_PORT : SSH_DEFAULT_PORT),
       defaultsFrom: { field: "protocol", defaults: { ssh: SSH_DEFAULT_PORT, telnet: TELNET_DEFAULT_PORT } },
       visibleWhen: vw

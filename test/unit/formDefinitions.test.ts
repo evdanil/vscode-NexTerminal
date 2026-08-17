@@ -58,6 +58,20 @@ describe("serverFormDefinition — addressless (P2-a)", () => {
     expect(keyedField(def, "host").required).toBe(true);
     expect(keyedField(def, "port").required).toBe(true);
   });
+
+  // P2-b (Codex) — the addressless Port field must seed the PROTOCOL-appropriate
+  // default (its stored value is a sentinel, so it can't seed from that). Hardcoding
+  // 22 left a telnet placeholder showing the SSH port; because `defaultsFrom` treats
+  // a value as automatic only when it equals the CURRENT protocol's default (23 for
+  // telnet), 22 was deemed user-owned and NOT corrected — so typing a host without
+  // toggling Protocol saved a telnet server on port 22. ⊘ Seeding 22 regardless of
+  // protocol reproduces that.
+  it("seeds the addressless Port from the protocol-appropriate default — 23 for a telnet placeholder, 22 for an ssh one", () => {
+    const telnet = serverFormDefinition({ id: "s1", name: "t", host: "", port: 0, username: "", authType: "agent", addressless: true, protocol: "telnet" });
+    expect(keyedField(telnet, "port").value).toBe(23);
+    const ssh = serverFormDefinition({ id: "s1", name: "s", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
+    expect(keyedField(ssh, "port").value).toBe(22);
+  });
 });
 
 describe("formDefinitions keyPath visibility", () => {
