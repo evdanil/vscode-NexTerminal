@@ -286,6 +286,39 @@ describe("createEveNgProvider — login and session", () => {
     expect(calls[0]).toBe("http://eve.example.com/api/auth/login");
   });
 
+  /**
+   * P2 — a Base URL copied from a browser can carry a query string or a
+   * fragment. Appending `/api/auth/login` to `http://eve?foo=bar` yields
+   * `http://eve?foo=bar/api/auth/login`, whose pathname is `/` — login hits the
+   * root and fails. instanceKey already canonicalizes these away; the fetch
+   * must agree.
+   */
+  it("P2 — strips a query string / fragment from the base URL before appending API paths, so the request hits /api/... (⊘ the suffix survives and the login lands on pathname `/`)", async () => {
+    for (const baseUrl of ["http://eve.example.com?foo=bar", "http://eve.example.com#frag", "http://eve.example.com/?a=1#f"]) {
+      const calls: string[] = [];
+      const fetchImpl = (async (input: string) => {
+        calls.push(input);
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      }) as unknown as typeof fetch;
+      await createEveNgProvider(fetchImpl).testConnection({ ...CONFIG, baseUrl }, SECRETS).catch(() => undefined);
+      expect(new URL(calls[0]).pathname, baseUrl).toBe("/api/auth/login");
+      expect(calls[0], baseUrl).toBe("http://eve.example.com/api/auth/login");
+    }
+  });
+
+  it("P2 — keeps a mount path while stripping a trailing query/fragment, and the instanceKey still names exactly that origin+path (⊘ key and fetch disagree once a query is involved)", async () => {
+    const baseUrl = "http://gw.example.com/eve1?token=x";
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string) => {
+      calls.push(input);
+      return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+    }) as unknown as typeof fetch;
+    await createEveNgProvider(fetchImpl).testConnection({ ...CONFIG, baseUrl }, SECRETS).catch(() => undefined);
+    expect(calls[0]).toBe("http://gw.example.com/eve1/api/auth/login");
+    // The key names the same origin+path the fetch actually used.
+    expect(eveNgInstanceKey({ baseUrl })).toBe("http://gw.example.com/eve1");
+  });
+
   it("M13 — captures the exact `unetlab_session` cookie, not a decoy that merely ends in that name (⊘ a boundary-less match grabs `xunetlab_session=DECOY`)", async () => {
     const calls: { cookie?: string }[] = [];
     const fetchImpl = (async (input: string, init?: RequestInit) => {

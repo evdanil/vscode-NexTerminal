@@ -102,18 +102,36 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
 // ---------------------------------------------------------------------------
 
 /**
- * Trims, drops trailing slashes, and — like `netboxProvider.normalizeBaseUrl`
- * — strips a pasted `/api` SUFFIX. A user who copied the API URL out of the
- * browser types `http://eve/api`; without this the request path doubled into
- * `/api/api/auth/login` and the very first call 404'd. A path that is NOT the
- * API path (`http://gw/eve1`, a reverse-proxy mount) is kept — every request is
- * built from this exact string, so it must be the string the deployment
- * actually answers at.
+ * Canonicalizes the base URL into the exact string every request is built from,
+ * so the fetch and `eveNgInstanceKey` (which derives from this) cannot disagree:
+ *  - P2 — QUERY and FRAGMENT are dropped. A base URL pasted from a browser can
+ *    carry `?foo=bar` / `#x`; appending `/api/auth/login` to it would otherwise
+ *    yield `http://eve?foo=bar/api/auth/login`, whose pathname is `/`, and login
+ *    would hit the root.
+ *  - the trailing slash and a pasted `/api` SUFFIX are stripped (the latter like
+ *    `netboxProvider.normalizeBaseUrl`), so `http://eve/api` cannot double into
+ *    `/api/api/auth/login`.
+ *  - a real mount PATH (`http://gw/eve1`, a reverse-proxy mount) is KEPT, with
+ *    its case, since the deployment answers there (MAJOR-2).
+ * An unparseable value (a scheme-less `eve.example.com`) is returned trimmed, so
+ * `buildUrl` maps its `new URL` throw to a provider error at the boundary.
  */
 function normalizeBaseUrl(raw: string): string {
-  let url = raw.trim().replace(/\/+$/, "");
-  url = url.replace(/\/api$/i, "");
-  return url.replace(/\/+$/, "");
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return trimmed;
+  }
+  // Rebuilt from parts (scheme + host + path only), which by construction drops
+  // any query, fragment AND userinfo — so a browser-pasted `?foo=bar` / `#x`
+  // cannot survive into `${baseUrl}/api/...` and mangle the pathname (P2).
+  const path = parsed.pathname.replace(/\/+$/, "").replace(/\/api$/i, "");
+  return `${parsed.protocol}//${parsed.host}${path}`;
 }
 
 /**
