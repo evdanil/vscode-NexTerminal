@@ -8303,6 +8303,47 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(fetchStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("P3-4 — re-checks the busy latch immediately before the persisting heal: a source that becomes busy DURING the awaited fetch has its heal SKIPPED, while the pure applyInventoryStatus still runs (⊘ persisting the heal while a concurrent sync/edit writes the same servers races two persisted writes)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    // fetchStatus opens Edit Source WHILE it is in flight — the exact race: the
+    // outer busy-check already passed, then a sync/edit claims the source during
+    // the awaited fetch. editSource marks the source busy synchronously and holds
+    // it (the form stays open).
+    const fetchStatus = vi.fn(async () => {
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+    // applyInventoryStatus is a pure runtime-map update, safe to run alongside a
+    // sync, so it still applies. The heal WRITES servers, so it is skipped while
+    // the source is busy.
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(healSpy).not.toHaveBeenCalled();
+  });
+
+  it("P3-4 control — a refresh on an idle source DOES run the heal (⊘ a latch re-check that always skips would disable the heal entirely)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(healSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("loads the source's saved secrets and passes them to fetchStatus (⊘ calling the provider without credentials makes every refresh an auth failure)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

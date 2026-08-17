@@ -4453,7 +4453,15 @@ export function registerInventoryCommands(
             // connect targets the live port. Separate from the pure status apply
             // above and non-fatal per source: a rejecting write must not abort the
             // sweep, and the heal only ever affects the NEXT connect.
-            await core.healSyncedConsolePorts(source.id, report);
+            //
+            // P3-4 (review) — RE-CHECK the busy latch immediately before the heal
+            // PERSISTS. The latch was checked before the awaited fetch, but a
+            // sync/edit/remove can claim the source during it; applyInventoryStatus
+            // above is a pure runtime-map update (safe to run alongside), but the
+            // heal WRITES servers and must not race a concurrent persisted write.
+            if (inFlightSourceIds.get(source.id) === undefined) {
+              await core.healSyncedConsolePorts(source.id, report);
+            }
           }
         }
       } catch {
