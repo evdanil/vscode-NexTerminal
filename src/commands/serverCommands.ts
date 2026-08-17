@@ -1257,7 +1257,10 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
     void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
     return;
   }
-  const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, "ssh");
+  // TELNET (Phase 0) — filter by the protocol this server actually connects
+  // with, so a telnet profile offers telnet-targeted scripts (and `any`) rather
+  // than SSH-targeted ones it would then refuse to run.
+  const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, resolveServerProtocol(server));
   if (!scriptUri) return;
 
   const preExisting = new Set(

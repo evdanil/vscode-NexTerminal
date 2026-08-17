@@ -37,6 +37,17 @@ interface ScriptPickItem extends vscode.QuickPickItem {
  * why), so this also works correctly even if the Scripts view has never been
  * revealed in this session.
  */
+/**
+ * Display form of a target type for the "nothing matched" message. `.toUpperCase()`
+ * reads fine for SSH but shouts for the word-shaped ones ("TELNET", "LOCAL").
+ */
+function friendlyPickerTargetType(type: ScriptTargetType): string {
+  if (type === "ssh") return "SSH";
+  if (type === "telnet") return "Telnet";
+  if (type === "serial") return "Serial";
+  return "Local Shell";
+}
+
 export async function pickScriptFromWorkspace(
   globalStoragePath: string,
   targetType?: ScriptTargetType
@@ -99,7 +110,7 @@ export async function pickScriptFromWorkspace(
 
   if (items.length === 0) {
     const base = targetType
-      ? `No Nexus scripts compatible with ${targetType.toUpperCase()} profiles. Add one in ${dir.fsPath}.`
+      ? `No Nexus scripts compatible with ${friendlyPickerTargetType(targetType)} profiles. Add one in ${dir.fsPath}.`
       : `No Nexus scripts found in ${dir.fsPath}.`;
     void vscode.window.showInformationMessage(truncationNote ? `${base} ${truncationNote}` : base);
     return undefined;

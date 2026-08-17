@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
 import type { ActiveLocalShellSession, ActiveSession, ActiveSerialSession } from "../../models/config";
+import { resolveServerProtocol } from "../../models/config";
 import type { ScriptTargetType } from "./scriptTypes";
 
 export interface ScriptTargetDescriptor {
@@ -45,21 +46,33 @@ export async function pickTarget(
 ): Promise<ScriptTargetSession | undefined> {
   const snapshot = core.getSnapshot();
   const wantSsh = descriptor.targetType === undefined || descriptor.targetType === "ssh";
+  const wantTelnet = descriptor.targetType === undefined || descriptor.targetType === "telnet";
   const wantSerial = descriptor.targetType === undefined || descriptor.targetType === "serial";
   const wantLocal = descriptor.targetType === undefined || descriptor.targetType === "local";
 
-  const sshCandidates: Array<{ session: ActiveSession; serverId: string; serverName: string; label: string; description: string }> = wantSsh
-    ? snapshot.activeSessions.map((s) => {
-        const serverName = snapshot.servers.find((srv) => srv.id === s.serverId)?.name ?? s.serverId;
-        return {
-          session: s,
-          serverId: s.serverId,
-          serverName,
-          label: s.terminalName,
-          description: `SSH • ${serverName}`
-        };
-      })
-    : [];
+  // TELNET (Phase 0) — SSH and telnet sessions share ONE collection
+  // (`activeSessions`), so the split is by the protocol of the server each
+  // session names, not by which list it came from. A filter that keyed off the
+  // collection would put every telnet session in the `ssh` bucket and vice
+  // versa, and `@target-type ssh` would fire login-expecting scripts at a
+  // telnet console.
+  const sshCandidates: Array<{ session: ActiveSession; serverId: string; serverName: string; label: string; description: string }> = [];
+  const telnetCandidates: typeof sshCandidates = [];
+  for (const s of snapshot.activeSessions) {
+    const server = snapshot.servers.find((srv) => srv.id === s.serverId);
+    const serverName = server?.name ?? s.serverId;
+    const isTelnet = resolveServerProtocol(server ?? {}) === "telnet";
+    if (isTelnet ? !wantTelnet : !wantSsh) {
+      continue;
+    }
+    (isTelnet ? telnetCandidates : sshCandidates).push({
+      session: s,
+      serverId: s.serverId,
+      serverName,
+      label: s.terminalName,
+      description: `${isTelnet ? "Telnet" : "SSH"} • ${serverName}`
+    });
+  }
 
   const serialCandidates: Array<{
     session: ActiveSerialSession;
@@ -102,7 +115,7 @@ export async function pickTarget(
   // Try profile pre-select before showing the picker.
   if (descriptor.targetProfile) {
     // Match by id first (unambiguous — servers / profiles can share names but ids are unique).
-    const sshById = sshCandidates.find((c) => c.serverId === descriptor.targetProfile);
+    const sshById = [...sshCandidates, ...telnetCandidates].find((c) => c.serverId === descriptor.targetProfile);
     if (sshById) return sshById.session;
     const serialById = serialCandidates.find((c) => c.profileId === descriptor.targetProfile);
     if (serialById) return serialById.session;
@@ -111,7 +124,7 @@ export async function pickTarget(
 
     // Fall back to name — collect *all* matches. If exactly one, auto-pick; otherwise show
     // a narrowed QuickPick so the user can disambiguate.
-    const sshByName = sshCandidates.filter((c) => c.serverName === descriptor.targetProfile);
+    const sshByName = [...sshCandidates, ...telnetCandidates].filter((c) => c.serverName === descriptor.targetProfile);
     const serialByName = serialCandidates.filter((c) => c.profileName === descriptor.targetProfile);
     const localByName = localCandidates.filter((c) => c.profileName === descriptor.targetProfile);
     const nameMatches = sshByName.length + serialByName.length + localByName.length;
@@ -124,7 +137,7 @@ export async function pickTarget(
           label: c.label,
           description: c.description,
           sessionId: c.session.id,
-          targetKind: "ssh" as const,
+          targetKind: (c.description.startsWith("Telnet") ? "telnet" : "ssh") as ScriptTargetType,
           session: c.session
         })),
         ...serialByName.map((c) => ({
@@ -159,6 +172,13 @@ export async function pickTarget(
       targetKind: "ssh" as const,
       session: c.session
     })),
+    ...telnetCandidates.map((c) => ({
+      label: c.label,
+      description: c.description,
+      sessionId: c.session.id,
+      targetKind: "telnet" as const,
+      session: c.session
+    })),
     ...serialCandidates.map((c) => ({
       label: c.label,
       description: c.description,
@@ -176,15 +196,17 @@ export async function pickTarget(
   ];
 
   if (combined.length === 0) {
-    const kind = descriptor.targetType ?? "SSH, Serial, or Local Shell";
+    const kind = descriptor.targetType ?? "SSH, Telnet, Serial, or Local Shell";
     const friendly =
       descriptor.targetType === "ssh"
         ? "SSH"
-        : descriptor.targetType === "serial"
-          ? "Serial"
-          : descriptor.targetType === "local"
-            ? "Local Shell"
-            : kind;
+        : descriptor.targetType === "telnet"
+          ? "Telnet"
+          : descriptor.targetType === "serial"
+            ? "Serial"
+            : descriptor.targetType === "local"
+              ? "Local Shell"
+              : kind;
     void vscode.window.showErrorMessage(
       `No active ${friendly} sessions. Connect to one from the Connectivity Hub, then run the script again.`
     );

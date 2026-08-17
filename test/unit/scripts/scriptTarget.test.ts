@@ -49,7 +49,7 @@ interface MockSnapshot {
   activeSessions: Array<{ id: string; serverId: string; terminalName: string }>;
   activeSerialSessions: Array<{ id: string; profileId: string; terminalName: string }>;
   activeLocalShellSessions?: Array<{ id: string; profileId: string; terminalName: string }>;
-  servers: Array<{ id: string; name: string }>;
+  servers: Array<{ id: string; name: string; protocol?: "ssh" | "telnet" }>;
   serialProfiles: Array<{ id: string; name: string }>;
   localShellProfiles?: Array<{ id: string; name: string }>;
 }
@@ -290,5 +290,83 @@ describe("scriptTarget / pickTarget", () => {
     expect(byDuplicateName?.id).toBe("local2");
     expect(quickPickCalls).toHaveLength(1);
     expect(quickPickCalls[0].items).toHaveLength(2);
+  });
+});
+
+describe("pickTarget — telnet sessions", () => {
+  /**
+   * TELNET (Phase 0) — a telnet session is an `ActiveSession` exactly like an
+   * SSH one; the ONLY thing separating them is the protocol on the server the
+   * session names. That is what makes these fixtures discriminating: a filter
+   * that keys off the collection (which is all it could do before) puts both
+   * sessions in both buckets and every assertion below fails.
+   */
+  const snapshot: MockSnapshot = {
+    activeSessions: [
+      { id: "ssh-1", serverId: "srv-ssh", terminalName: "Nexus SSH: prod" },
+      { id: "tel-1", serverId: "srv-tel", terminalName: "Nexus Telnet: eve-r1" }
+    ],
+    activeSerialSessions: [],
+    activeLocalShellSessions: [],
+    servers: [
+      { id: "srv-ssh", name: "prod" },
+      { id: "srv-tel", name: "eve-r1", protocol: "telnet" }
+    ],
+    serialProfiles: [],
+    localShellProfiles: []
+  };
+
+  it("offers only telnet sessions for @target-type telnet", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    const picked = await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot));
+
+    expect(picked?.id).toBe("tel-1");
+    expect(quickPickCalls[0].items.map((i) => i.sessionId)).toEqual(["tel-1"]);
+  });
+
+  it("excludes telnet sessions from @target-type ssh", async () => {
+    resetPicker();
+    pickBySessionId = "ssh-1";
+    await pickTarget(makeDescriptor({ targetType: "ssh" }), makeCore(snapshot));
+
+    expect(quickPickCalls[0].items.map((i) => i.sessionId)).toEqual(["ssh-1"]);
+  });
+
+  it("offers both when no target type is declared", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor(), makeCore(snapshot));
+
+    expect(quickPickCalls[0].items.map((i) => i.sessionId)).toEqual(["ssh-1", "tel-1"]);
+  });
+
+  it("labels a telnet candidate as Telnet", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot));
+
+    expect(quickPickCalls[0].items[0]).toEqual(
+      expect.objectContaining({ description: "Telnet • eve-r1" })
+    );
+  });
+
+  it("auto-picks a telnet session by server name", async () => {
+    resetPicker();
+    const picked = await pickTarget(
+      makeDescriptor({ targetType: "telnet", targetProfile: "eve-r1" }),
+      makeCore(snapshot)
+    );
+    expect(picked?.id).toBe("tel-1");
+    expect(quickPickCalls).toHaveLength(0);
+  });
+
+  it("reports the absence of telnet sessions in the message the user sees", async () => {
+    resetPicker();
+    await pickTarget(
+      makeDescriptor({ targetType: "telnet" }),
+      makeCore({ ...snapshot, activeSessions: [snapshot.activeSessions[0]] })
+    );
+    expect(errorMessages.join("\n")).toContain("Telnet");
   });
 });

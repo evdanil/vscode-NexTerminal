@@ -491,7 +491,7 @@ Author-and-run automation on top of any active SSH, Serial, or Local Shell sessi
 ### 9.1 Flow
 1. Create a `.js` file under `<workspaceRoot>/<nexus.scripts.path>` (default `.nexus/scripts/`). Tag the leading JSDoc block with `@nexus-script` and any of the optional fields `@name`, `@description`, `@target-type`, `@target-profile`, `@default-timeout`, `@lock-input`, `@allow-macros`.
 2. First time a Nexus script command runs in the workspace, `ScriptTypesGenerator` seeds `types/nexus-scripts.d.ts` + `jsconfig.json` so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, `prompt`, etc.
-3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type` values `ssh`, `serial`, or `local`; auto-select on `@target-profile` id/name match; else QuickPick), and spawns a `node:worker_threads` Worker.
+3. Invoke `nexus.script.run` from the Command Palette / sidebar / `▶ Run in Nexus` CodeLens. The runtime parses the header, resolves the target session (filter by `@target-type` values `ssh`, `telnet`, `serial`, or `local`; auto-select on `@target-profile` id/name match; else QuickPick), and spawns a `node:worker_threads` Worker.
 4. While running, the script's status shows in the **Nexus Scripts** status-bar entry and the **Nexus Scripts** Output Channel logs timestamped events (`→ expect …`, `← matched`, `log info: …`, `end: completed (…ms)`).
 
 #### 9.1.1 Script Templates
