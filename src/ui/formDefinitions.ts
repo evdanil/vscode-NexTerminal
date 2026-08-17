@@ -1659,7 +1659,7 @@ export function inventorySourceFormDefinition(
         type: "text",
         key: "targetFolder",
         label: "Target Folder",
-        placeholder: "e.g. Datacenter/NetBox — leave empty for the top level",
+        placeholder: "e.g. Datacenter/Lab — leave empty for the top level",
         value: seed?.targetFolder ?? "",
         hint: "Servers synced from this source are placed under this folder. Leave empty for the top level."
       },

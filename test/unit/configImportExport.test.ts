@@ -1145,7 +1145,7 @@ describe("import chooser (nexus.config.import)", () => {
       "add servers in bulk",
       "$(clippy) Paste Host List from Clipboard",
       "$(list-flat) Host List File…",
-      "$(sync) Inventory Source (NetBox)…",
+      "$(sync) Inventory Source…",
       "migrate from another client",
       "$(file-code) MobaXterm INI File…",
       "$(file-code) SecureCRT XML Export…",
@@ -1164,7 +1164,7 @@ describe("import chooser (nexus.config.import)", () => {
     expect(byLabel("Nexus Export File")?.description).toBe("An encrypted backup or a shared config (.json)");
   });
 
-  it("Inventory Source (NetBox)… routes straight to nexus.inventory.addSource (no host-list dialog)", async () => {
+  it("Inventory Source… routes straight to nexus.inventory.addSource (no host-list dialog)", async () => {
     mockShowQuickPick.mockResolvedValueOnce({ value: "inventorySource" });
 
     const importCmd = registeredCommands.get("nexus.config.import")!;

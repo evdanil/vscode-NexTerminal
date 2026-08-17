@@ -442,6 +442,16 @@ describe("inventorySourceFormDefinition", () => {
     });
   });
 
+  // EVE-NG (Phase 1) — the Target Folder placeholder is an EXAMPLE shown on
+  // every provider's source form, so it must not read as an instruction to
+  // name a folder after one specific provider.
+  it("gives Target Folder a provider-neutral example placeholder (\u2298 \"e.g. Datacenter/NetBox\" is a NetBox instruction on an EVE-NG form)", () => {
+    const field = keyedField(inventorySourceFormDefinition(fakeProvider), "targetFolder");
+    const placeholder = String((field as { placeholder?: string }).placeholder ?? "");
+    expect(placeholder).not.toMatch(/NetBox/i);
+    expect(placeholder).toContain("e.g.");
+  });
+
   it("marks a provider-declared number field with step \"any\" so fractional values pass native validation (kills the missing-step regression)", () => {
     const definition = inventorySourceFormDefinition(fakeProvider);
     const field = keyedField(definition, "cfg_pollInterval");

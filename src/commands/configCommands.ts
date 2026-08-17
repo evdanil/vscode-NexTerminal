@@ -3496,7 +3496,7 @@ export function registerConfigCommands(
       value: "hostListFile"
     },
     {
-      label: "$(sync) Inventory Source (NetBox)…",
+      label: "$(sync) Inventory Source…",
       description: "Live sync — devices stay linked to the source",
       value: "inventorySource"
     },

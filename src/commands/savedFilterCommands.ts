@@ -40,7 +40,7 @@ async function promptFilterFields(seed?: SavedFilterDefinition): Promise<{ name:
   }
   const filter = await vscode.window.showInputBox({
     title: `${verb} Saved Filter (2/2) — Filter Query`,
-    prompt: "The NetBox Device Filter query string this saved filter applies. Leave empty to match all devices.",
+    prompt: "The filter query this saved filter applies to an inventory source's filter field. Leave empty to match all devices.",
     placeHolder: "e.g. role=core-switch&site=syd",
     value: seed?.filter ?? "",
     // An empty query is a legal catch-all (the Device Filter field admits ""),

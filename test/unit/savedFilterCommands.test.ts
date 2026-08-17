@@ -79,6 +79,22 @@ describe("nexus.savedFilter.manage", () => {
     expect(filters[0].filter).toBe("role=core&site=syd");
   });
 
+  // EVE-NG (Phase 1) — saved filters apply to whichever provider's source
+  // declares a `filter` field, and EVE-NG's matches lab paths rather than a
+  // NetBox query string. Naming one provider in the shared prompt tells the
+  // other's users the feature is not for them.
+  it("words the filter-query prompt without naming a provider (\u2298 \"The NetBox Device Filter query string\" is wrong for an EVE-NG source, which filters on lab paths)", async () => {
+    mockShowInformationMessage.mockResolvedValueOnce("New Saved Filter");
+    mockShowInputBox.mockResolvedValueOnce("Syd core");
+    mockShowInputBox.mockResolvedValueOnce("role=core");
+
+    await registeredCommands.get("nexus.savedFilter.manage")!();
+
+    const queryPrompt = String((mockShowInputBox.mock.calls[1][0] as { prompt: string }).prompt);
+    expect(queryPrompt).not.toMatch(/NetBox/i);
+    expect(queryPrompt.toLowerCase()).toContain("filter");
+  });
+
   it("editing a row re-prompts name + query (pre-filled) and updates in place, keeping the id", async () => {
     await core.addOrUpdateSavedFilter({ id: "f1", name: "Old", filter: "a=1" });
     // Manage hub: pick the row for f1 (action edit).

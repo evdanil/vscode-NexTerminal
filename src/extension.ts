@@ -72,6 +72,7 @@ import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
 import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
+import { createEveNgProvider } from "./services/inventory/providers/eveNgProvider";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
@@ -340,11 +341,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   );
   const secretVault = new VscodeSecretVault(context);
 
-  // B4 — built-in NetBox provider registered up front so it's available to
-  // registerInventoryCommands (below) and to any third party registering
-  // through the public API returned from this function.
+  // B4 — the built-in providers are registered up front so they're available
+  // to registerInventoryCommands (below) and to any third party registering
+  // through the public API returned from this function. Registration ORDER is
+  // the order the add-source provider picker lists them in.
   const inventoryProviderRegistry = new InventoryProviderRegistry();
   inventoryProviderRegistry.register(createNetboxProvider());
+  inventoryProviderRegistry.register(createEveNgProvider());
 
   const macroStore = new VscodeMacroStore(context);
   await macroStore.initialize();

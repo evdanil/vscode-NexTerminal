@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { EVE_NG_PROVIDER_ID, createEveNgProvider, eveNgInstanceKey } from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
@@ -689,5 +691,25 @@ describe("createEveNgProvider — testConnection", () => {
     expect((err as InventoryProviderError).kind).toBe("auth");
     // One original + one after the single silent re-login; never a folders fallback.
     expect(statusCalls).toBe(2);
+  });
+});
+
+/**
+ * Registration wiring. A provider that is never registered is unreachable: it
+ * cannot be picked on the Add Inventory Source form and nothing else in the
+ * product can name it. There is no cheaper seam than reading activate()'s
+ * source — `extension.ts` imports `vscode` at module scope, so importing it
+ * here would drag the whole extension host in.
+ */
+describe("activation wiring", () => {
+  const source = readFileSync(path.resolve(__dirname, "..", "..", "src", "extension.ts"), "utf8");
+
+  it("registers BOTH built-in providers in activate() (⊘ the import line alone satisfies a name check, so a version that imports the factory and never calls it would pass)", () => {
+    expect(source).toMatch(/inventoryProviderRegistry\.register\(createNetboxProvider\(\)\);/);
+    expect(source).toMatch(/inventoryProviderRegistry\.register\(createEveNgProvider\(\)\);/);
+  });
+
+  it("imports the EVE-NG factory from the provider module", () => {
+    expect(source).toMatch(/import \{ createEveNgProvider \} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
   });
 });

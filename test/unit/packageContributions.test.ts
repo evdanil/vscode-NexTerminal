@@ -25,6 +25,24 @@ describe("package contributions", () => {
     expect(packageJson.activationEvents).toContain("onUri");
   });
 
+  /**
+   * EVE-NG (Phase 1) — a SECOND inventory provider ships, so the entry points
+   * into the add-source flow are provider-agnostic. Naming one provider in
+   * them tells a user looking for the other that the feature is not there.
+   */
+  describe("provider-agnostic inventory entry points", () => {
+    it("titles nexus.inventory.addSource without naming a provider (\u2298 \"Add Inventory Source (NetBox)\" reads as NetBox-only to an EVE-NG user)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title;
+      expect(title).toBe("Add Inventory Source");
+    });
+
+    it("offers the same neutral wording in the Command Center welcome view", () => {
+      const welcome = packageJson.contributes.viewsWelcome?.find((w) => w.view === "nexusCommandCenter")?.contents ?? "";
+      expect(welcome).toContain("[Add Inventory Source](command:nexus.inventory.addSource)");
+      expect(welcome).not.toMatch(/NetBox/i);
+    });
+  });
+
   it("includes serialport runtime dependency", () => {
     expect(packageJson.dependencies.serialport).toBeDefined();
   });
