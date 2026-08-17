@@ -323,10 +323,10 @@ function selectTelnetEndpoint(device: InventoryDevice) {
  * `undefined` for SSH rather than `"ssh"`, so the value and its stamp can be
  * written verbatim without a translation step in between.
  *
- * `undefined` here IS "addressless" — the condition `hasConsoleEndpoint`
- * (models/inventory.ts) exposes to providers so they can describe their own
- * fetch in the same terms. Keep the two in step: a console kind added here is a
- * console kind there.
+ * `undefined` here IS "addressless", and THIS function is the only definition of
+ * that rule. A provider must not re-derive it: the sync engine owns the whole
+ * addressless disclosure (see the single addressless warning below), so a
+ * provider describes the tree it fetched and nothing about the outcome.
  */
 function selectPrimaryEndpoint(
   device: InventoryDevice

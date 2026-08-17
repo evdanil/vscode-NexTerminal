@@ -7,7 +7,6 @@ import {
   stripCidr,
   renderFolderTemplate
 } from "../../src/services/inventory/providers/netboxProvider";
-import { hasConsoleEndpoint } from "../../src/models/inventory";
 import { deviceMatchesFilter, parseTemplateFilter } from "../../src/services/inventory/templateApply";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
@@ -1079,23 +1078,3 @@ describe("createNetboxProvider", () => {
  * inconsistency lives in the shared notion — which EVE-NG devices, and any
  * third-party provider emitting telnet, do reach.
  */
-describe("hasConsoleEndpoint", () => {
-  it("a TELNET-only device HAS a console address (kills the ssh-only predicate, which counts a device that syncs as a telnet server as having none)", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "telnet", host: "10.0.0.9", port: 5001 }] })).toBe(true);
-  });
-
-  it("an ssh device has one, and a device with no endpoints at all has none", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] })).toBe(true);
-    expect(hasConsoleEndpoint({ endpoints: [] })).toBe(false);
-  });
-
-  it("an out-of-band address is NOT a console address (kills `endpoints.length > 0`, which would read a BMC-only device as reachable)", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] })).toBe(false);
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "url", host: "10.9.9.9" }] })).toBe(false);
-  });
-
-  it("an EMPTY host is no address, on either console kind (matches the engine's own non-empty-host rule rather than trusting the kind alone)", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "ssh", host: "" }] })).toBe(false);
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "telnet", host: "" }] })).toBe(false);
-  });
-});

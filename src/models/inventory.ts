@@ -73,35 +73,6 @@ export interface InventoryDevice {
   attributes?: Record<string, string | string[]>;
 }
 
-/**
- * Does this device offer a CONSOLE address at all? The boolean twin of
- * `selectPrimaryEndpoint` (services/inventory/syncEngine.ts): true for exactly
- * the devices that selector can map onto `ServerConfig.host`/`port` — an `ssh`
- * endpoint, else a `telnet` one, each with a NON-EMPTY host — and false for the
- * devices the engine therefore creates as ADDRESSLESS placeholders.
- *
- * It lives here, beside `InventoryEndpointKind`, as the contract-level statement
- * of what "has a console address" MEANS for an `InventoryDevice`, so a provider
- * can ask the question without duplicating — or drifting from — the engine's
- * rule. Keyed on the CONNECTABLE kinds, never on `endpoints.length`: `redfish` /
- * `ipmi-sol` / `url` are all real endpoints that reach no console, so a BMC-only
- * device has endpoints and still has no address.
- *
- * ONE ADDRESSLESS LINE (follow-up 1) — no BUNDLED provider calls this any more.
- * NetBox used it to count the addressless rows in its own fetch for a warning of
- * its own; that aggregate overlapped the sync engine's addressless line, so the
- * engine (the only layer that knows the OUTCOME) now owns the whole disclosure
- * and the providers describe only the TREE. The predicate is kept as the shared
- * definition — and as the documented counterpart of `selectPrimaryEndpoint`,
- * which is the engine's own, structurally different (it must also return WHICH
- * endpoint and which protocol) implementation of the same rule.
- *
- * KEEP IN STEP with `selectPrimaryEndpoint`: a console kind added there is a
- * console kind here.
- */
-export function hasConsoleEndpoint(device: Pick<InventoryDevice, "endpoints">): boolean {
-  return device.endpoints.some((e) => (e.kind === "ssh" || e.kind === "telnet") && e.host.length > 0);
-}
 
 export interface InventoryTree {
   contractVersion: 1;
