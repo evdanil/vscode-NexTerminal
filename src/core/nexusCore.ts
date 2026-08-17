@@ -1219,6 +1219,8 @@ export class NexusCore {
     for (const id of removeServerIds) {
       this.servers.delete(id);
       this.removeServerSessions(id);
+      // LIVE STATUS (Phase 2) — a pruned server must not leave a ghost status entry.
+      this.dropServerStatusEntry(id);
       batchWrittenServers.set(id, undefined);
     }
     for (const server of upsertServers) {
@@ -2158,6 +2160,8 @@ export class NexusCore {
 
   public async removeServer(serverId: string): Promise<void> {
     this.servers.delete(serverId);
+    // LIVE STATUS (Phase 2) — drop any runtime status keyed to the deleted server.
+    this.dropServerStatusEntry(serverId);
     // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 9, extracted to
     // the shared `clearGatewayReferencesTo` helper in round 10) — clear every
     // OTHER server's `ipmiGatewayServerId` that named the server just deleted,
@@ -2251,6 +2255,17 @@ export class NexusCore {
    * (which emits) and removeInventorySource (which emits once on its own way
    * out), so the two never drift on the clearing rule.
    */
+  /**
+   * LIVE STATUS (Phase 2) — drop a single server's runtime status entry, WITHOUT
+   * emitting. Called from every path that removes a server (manual delete, sync
+   * prune) so a gone server never strands a running/stopped highlight; the
+   * calling path's own emit covers the change.
+   */
+  private dropServerStatusEntry(serverId: string): void {
+    this.serverStatus.delete(serverId);
+    this.serverStatusSource.delete(serverId);
+  }
+
   private dropInventoryStatusForSource(sourceId: string): boolean {
     let changed = false;
     for (const [serverId, owner] of [...this.serverStatusSource]) {

@@ -4738,6 +4738,42 @@ describe("NexusCore inventory status", () => {
     expect(snap.serverStatus.get(b.id)).toBe("running");
   });
 
+  it("P3-4: removeServer drops that server's runtime status entry (⊘ a manual delete strands a running highlight keyed to a server that no longer exists)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    await core.removeServer(s1.id);
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("P3-4: applyInventorySyncPlan drops a pruned server's runtime status entry (⊘ a sync prune leaves a ghost running highlight behind)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const source = makeSourceConfig({ id: "source-1" });
+    await core.addOrUpdateInventorySource(source);
+    const persisted = core.getInventorySource("source-1")!;
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2000,
+      upsertServers: [],
+      removeServerIds: [s1.id],
+      folders: [],
+      expectedSource: persisted
+    });
+
+    expect(core.getServer(s1.id)).toBeUndefined();
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
   it("does not fire a change when clearInventoryStatus has nothing to clear (⊘ an unconditional emit churns every tree on an unrelated source removal)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
