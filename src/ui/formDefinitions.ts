@@ -649,6 +649,12 @@ export interface ServerListEntry {
    * caller that does not supply it keeps today's behaviour.
    */
   protocol?: ServerProtocol;
+  /**
+   * ADDRESSLESS (Codex P1 review MAJOR-1) — carried so the SSH-infrastructure
+   * pickers can leave placeholder servers with no console address out, exactly
+   * as they leave telnet servers out. Optional: absent reads as not-addressless.
+   */
+  addressless?: boolean;
 }
 
 /**
@@ -666,7 +672,11 @@ export interface ServerListEntry {
  */
 function sshInfrastructureCandidates(servers: ServerListEntry[] | undefined, excludeId?: string): ServerListEntry[] {
   return (servers ?? []).filter(
-    (s) => s.id !== excludeId && resolveServerProtocol(s) !== "telnet"
+    // ADDRESSLESS (Codex P1 review MAJOR-1) — a placeholder with no console
+    // address resolves ssh (host "") but is no more usable as a jump host or
+    // IPMI gateway than a telnet server: selecting it would prompt and handshake
+    // against nothing, so it is excluded here exactly as telnet is.
+    (s) => s.id !== excludeId && resolveServerProtocol(s) !== "telnet" && s.addressless !== true
   );
 }
 

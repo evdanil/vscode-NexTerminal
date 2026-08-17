@@ -5402,6 +5402,14 @@ describe("sanitizeForSharing", () => {
     expect(result.servers[0].bmcWebProtocol).toBe("http");
   });
 
+  it("ADDRESSLESS (Codex P1 review MINOR-1) — DROPS addressless placeholder servers from a shared export entirely (⊘ the `...s` spread ships an origin-less `addressless:true, host:\"\"` record the recipient can never connect to, re-address, or upgrade)", () => {
+    const normal = makeServer({ id: "srv-normal", name: "Prod", host: "10.0.0.1" });
+    const placeholder = makeServer({ id: "srv-addr", name: "Stopped Node", host: "", addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } });
+    const result = sanitizeForSharing([normal, placeholder], [], [], [], {}, [], []);
+    expect(result.servers.map((s) => s.name)).toEqual(["Prod"]);
+    expect(result.servers.some((s) => s.addressless)).toBe(false);
+  });
+
   it("clears defaultServerId when server not in export", () => {
     const servers: ServerConfig[] = [];
     const tunnels = [makeTunnel({ defaultServerId: "missing" })];

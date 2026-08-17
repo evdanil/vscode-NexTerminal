@@ -314,8 +314,22 @@ describe("server form — telnet servers are not selectable as SSH infrastructur
   const servers = [
     { id: "srv-ssh", name: "bastion" },
     { id: "srv-tel", name: "eve-console", protocol: "telnet" as const },
+    // ADDRESSLESS (Codex P1 review MAJOR-1) — a synced placeholder with no
+    // console address must not be offered as SSH infrastructure either.
+    { id: "srv-addressless", name: "stopped-node", addressless: true },
     { id: "srv-self", name: "me" }
   ];
+
+  it("omits ADDRESSLESS servers from the Jump Host and IPMI Gateway pickers (⊘ an addressless placeholder resolves ssh with host \"\", so a telnet-only filter offers it — and selecting it prompts and handshakes against nothing)", () => {
+    const jump = keyedField(serverFormDefinition({ id: "srv-self" }, undefined, true, servers), "proxyJumpHostId");
+    const gw = keyedField(serverFormDefinition({ id: "srv-self" }, undefined, true, servers), "ipmiGatewayServerId");
+    const values = (f: unknown) => (f && typeof f === "object" && "options" in (f as object) ? (f as { options: { value: string }[] }).options.map((o) => o.value) : []);
+    // The ordinary SSH server still shows — this is not a blanket drop.
+    expect(values(jump)).toContain("srv-ssh");
+    expect(values(jump)).not.toContain("srv-addressless");
+    expect(values(gw)).toContain("srv-ssh");
+    expect(values(gw)).not.toContain("srv-addressless");
+  });
 
   function optionValues(definition: FormDefinition, key: string): string[] {
     const field = keyedField(definition, key);

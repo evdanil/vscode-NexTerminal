@@ -318,7 +318,14 @@ export function resolveIpmiGatewayServer(ctx: CommandContext, server: ServerConf
   if (typeof id !== "string" || !id || id === server.id) {
     return undefined;
   }
-  return ctx.core.getSnapshot().servers.find((candidate) => candidate.id === id);
+  const found = ctx.core.getSnapshot().servers.find((candidate) => candidate.id === id);
+  // ADDRESSLESS (Codex P1 review MINOR-2) — an addressless gateway has no
+  // console to route ipmitool through. Resolved to "no reachable gateway" (the
+  // same disposition a dangling id gets), so the run path falls back to local
+  // delivery with the no-gateway note instead of trying to connect to a
+  // host-less placeholder — which the addressless connect guard would block,
+  // leaving the flow to hang out the ~90s connect-session timeout.
+  return found?.addressless === true ? undefined : found;
 }
 
 /**
