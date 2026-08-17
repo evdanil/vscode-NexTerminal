@@ -470,11 +470,27 @@ class EveApiClient {
       return "unknown";
     }
     const data = unwrap(raw);
-    const version = isObject(data) ? str(data.version) : "";
-    if (!version) {
+    if (!isObject(data)) {
       return "unknown";
     }
-    return /pro/i.test(version) ? "pro" : "community";
+    // P2 (round 5) — a dedicated `data.edition` field is authoritative when it
+    // names Pro. Some installs report the edition there while `data.version` is
+    // just a numeric build string ("6.2.0-4"), so version-only detection would
+    // return Community and never show the Pro-preliminary warning. Kept
+    // defensive: `edition` may be absent or non-string (`str` yields "" then),
+    // in which case we fall back to the legacy version check.
+    const edition = str(data.edition);
+    const version = str(data.version);
+    if (/pro/i.test(edition) || /pro/i.test(version)) {
+      return "pro";
+    }
+    // With no usable version AND no edition field there is no signal at all —
+    // the capability is unknown (a `/api/status` with an empty version, like the
+    // 404 case, shows no warning either way).
+    if (!version && !edition) {
+      return "unknown";
+    }
+    return "community";
   }
 
   /**

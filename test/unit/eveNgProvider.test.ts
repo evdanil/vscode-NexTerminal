@@ -167,6 +167,8 @@ interface FolderListing {
 
 interface World {
   version?: string;
+  /** Separate `data.edition` field some installs report; omitted from the response when undefined. */
+  edition?: string;
   statusHttp?: number;
   /** keyed by DECODED folder path ("/", "/ACME"). */
   folders?: Record<string, FolderListing>;
@@ -200,7 +202,11 @@ function makeWorld(world: World): { fetchImpl: typeof fetch; calls: Call[] } {
       if (http !== 200) {
         return makeResponse(http, "not here");
       }
-      return makeResponse(200, jsend({ version: world.version ?? "5.0.1-13" }));
+      const statusData: Record<string, unknown> = { version: world.version ?? "5.0.1-13" };
+      if (world.edition !== undefined) {
+        statusData.edition = world.edition;
+      }
+      return makeResponse(200, jsend(statusData));
     }
     if (path.startsWith("/api/folders")) {
       const folderPath = path.slice("/api/folders".length) || "/";
@@ -448,6 +454,33 @@ const PRO_WARNING =
 describe("createEveNgProvider — edition detection", () => {
   it("says nothing about editions on Community (⊘ warning unconditionally trains users to ignore the warning that matters)", async () => {
     const tree = await fetchTree({ ...oneLabWorld({ "1": node() }), version: "5.0.1-13" });
+    expect((tree.warnings ?? []).some((w) => w.includes("Professional"))).toBe(false);
+  });
+
+  /**
+   * P2 (round 5) — some installs report the edition via a dedicated
+   * `data.edition` field while `data.version` is just a numeric build string.
+   * Detecting Pro from the version alone misses those, so the Pro-preliminary
+   * warning never shows.
+   */
+  it("detects Pro from a `data.edition` field even when `data.version` is a plain numeric build, and warns exactly once (⊘ version-only detection returns community and the warning never appears)", async () => {
+    const world: World = {
+      version: "6.2.0-4",
+      edition: "Professional",
+      folders: { "/": { labs: [{ file: "A.unl", path: "/A.unl" }] } },
+      nodes: { "/A.unl": { "1": node() } }
+    };
+    const tree = await fetchTree(world);
+    expect((tree.warnings ?? []).filter((w) => w === PRO_WARNING)).toHaveLength(1);
+  });
+
+  it("still detects Pro from the legacy version string when there is no `edition` field (existing behavior preserved)", async () => {
+    const tree = await fetchTree({ ...oneLabWorld({ "1": node() }), version: "5.0.1-24-pro" });
+    expect((tree.warnings ?? []).filter((w) => w === PRO_WARNING)).toHaveLength(1);
+  });
+
+  it("stays Community when neither the edition field nor the version names pro (⊘ a stray `edition` presence must not itself trigger the warning)", async () => {
+    const tree = await fetchTree({ ...oneLabWorld({ "1": node() }), version: "6.2.0-4", edition: "Community" });
     expect((tree.warnings ?? []).some((w) => w.includes("Professional"))).toBe(false);
   });
 
