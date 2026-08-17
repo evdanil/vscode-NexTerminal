@@ -280,6 +280,9 @@ export interface FolderWalkResult {
 
 type Edition = "community" | "pro" | "unknown";
 
+/** MINOR-12 — a resource that 404'd (folder/lab deleted mid-walk), distinct from an empty one. */
+const NOT_FOUND = Symbol("eve-ng-not-found");
+
 class EveApiClient {
   private session?: string;
 
@@ -421,6 +424,21 @@ class EveApiClient {
   }
 
   /**
+   * MINOR-12 — like `getData`, but a 404 returns the `NOT_FOUND` sentinel
+   * instead of throwing. A folder or lab can vanish between the parent listing
+   * that named it and the request for its own contents; a live lab tree hits
+   * this routinely, and aborting the entire sync over one gone folder updates
+   * nothing. Every OTHER failure (auth, 500, malformed) still throws.
+   */
+  public async getDataAllowingGone(path: string, timeoutMs: number): Promise<unknown | typeof NOT_FOUND> {
+    const raw = await this.authedGet(path, timeoutMs);
+    if (raw.status === 404) {
+      return NOT_FOUND;
+    }
+    return unwrap(raw);
+  }
+
+  /**
    * `GET /api/status` → `data.version`. A version string naming "pro" (any
    * case) is Professional; anything else is Community. A MISSING endpoint is
    * `unknown` rather than fatal — edition detection is an optional capability
@@ -441,9 +459,15 @@ class EveApiClient {
     return /pro/i.test(version) ? "pro" : "community";
   }
 
-  /** `GET /api/folders{path}` — the raw listing, already unwrapped from JSend. */
-  public async listFolder(folderPath: string, timeoutMs: number): Promise<{ folders: unknown[]; labs: unknown[] }> {
-    const data = await this.getData(`/api/folders${encodePath(folderPath)}`, timeoutMs);
+  /**
+   * `GET /api/folders{path}` — the raw listing, already unwrapped from JSend.
+   * `NOT_FOUND` when the folder 404s (deleted since it was listed — MINOR-12).
+   */
+  public async listFolder(folderPath: string, timeoutMs: number): Promise<{ folders: unknown[]; labs: unknown[] } | typeof NOT_FOUND> {
+    const data = await this.getDataAllowingGone(`/api/folders${encodePath(folderPath)}`, timeoutMs);
+    if (data === NOT_FOUND) {
+      return NOT_FOUND;
+    }
     if (!isObject(data)) {
       return { folders: [], labs: [] };
     }
@@ -461,9 +485,13 @@ class EveApiClient {
    * here; a client that demands an object fails the entire sync over one empty
    * lab.
    */
-  public async listNodes(labPath: string, timeoutMs: number): Promise<[string, Record<string, unknown>][]> {
-    const data = await this.getData(`/api/labs${encodePath(labPath)}/nodes`, timeoutMs);
-    // Anything that is not a keyed object — the empty ARRAY included — is
+  public async listNodes(labPath: string, timeoutMs: number): Promise<[string, Record<string, unknown>][] | typeof NOT_FOUND> {
+    const data = await this.getDataAllowingGone(`/api/labs${encodePath(labPath)}/nodes`, timeoutMs);
+    // MINOR-12 — the lab was deleted between the folder listing and this fetch.
+    if (data === NOT_FOUND) {
+      return NOT_FOUND;
+    }
+    // Anything else that is not a keyed object — the empty ARRAY included — is
     // simply "this lab has no nodes". A client that instead DEMANDS an object
     // fails the entire sync over one empty lab, and every other lab's servers
     // then look deleted to the prune phase.
@@ -494,6 +522,10 @@ class EveApiClient {
     let requests = 0;
     let truncated = false;
     let depthCapped = false;
+    let budgetHit = false;
+    // MINOR-12 — child folders that 404'd (removed mid-walk); counted for one
+    // aggregate warning, never fatal (only the ROOT 404 is fatal — see below).
+    let goneFolders = 0;
     // MAJOR-1(a) — labs (and folders) the server reported OUTSIDE the Root
     // Folder subtree, or bearing a dot-segment. Counted, not silently dropped:
     // a scope violation is a hostile/misconfigured response worth surfacing,
@@ -501,19 +533,29 @@ class EveApiClient {
     // pruning of the in-scope servers that legitimately disappeared).
     let outOfScope = 0;
 
-    while (queue.length > 0) {
+    // MINOR-1 — the budget check breaks BOTH loops and the warning is pushed
+    // exactly once, below. The old code warned inside the loop and then let
+    // `queue = next` run, so every level already queued when the budget tripped
+    // warned again; its `queue = []` was dead, overwritten by `queue = next`.
+    while (queue.length > 0 && !budgetHit) {
       const next: typeof queue = [];
       for (const { path, depth } of queue) {
         if (requests >= MAX_FOLDER_REQUESTS) {
-          truncated = true;
-          warnings.push(
-            `Stopped after ${MAX_FOLDER_REQUESTS} folder listings — part of the EVE-NG folder tree was not scanned. Narrow the Root Folder.`
-          );
-          queue = [];
+          budgetHit = true;
           break;
         }
         requests++;
         const listing = await this.listFolder(path, timeoutMs);
+        if (listing === NOT_FOUND) {
+          // MINOR-12 — the ROOT folder being gone would yield an empty tree and
+          // prune every server the source owns, so it is fatal; a child folder
+          // vanishing mid-walk is just skipped.
+          if (depth === 0) {
+            throw new InventoryProviderError("protocol", `Root Folder "${path}" was not found on the EVE-NG server.`);
+          }
+          goneFolders++;
+          continue;
+        }
 
         for (const rawLab of listing.labs) {
           if (!isObject(rawLab)) continue;
@@ -562,6 +604,12 @@ class EveApiClient {
       queue = next;
     }
 
+    if (budgetHit) {
+      truncated = true;
+      warnings.push(
+        `Stopped after ${MAX_FOLDER_REQUESTS} folder listings — part of the EVE-NG folder tree was not scanned. Narrow the Root Folder.`
+      );
+    }
     if (labs.length >= MAX_LABS && truncated) {
       warnings.push(`Stopped after ${MAX_LABS} labs — later labs under the Root Folder were not imported. Narrow the Root Folder or the Lab Filter.`);
     }
@@ -573,6 +621,11 @@ class EveApiClient {
         `${outOfScope} lab${outOfScope === 1 ? "" : "s"} the server reported outside the Root Folder ${
           outOfScope === 1 ? "was" : "were"
         } skipped.`
+      );
+    }
+    if (goneFolders > 0) {
+      warnings.push(
+        `${goneFolders} folder${goneFolders === 1 ? "" : "s"} ${goneFolders === 1 ? "was" : "were"} not found (removed during the scan) and skipped.`
       );
     }
     return { labs, truncated, warnings };
@@ -820,10 +873,18 @@ async function fetchInventoryImpl(
 
   const devices: InventoryDevice[] = [];
   let noConsoleCount = 0;
+  let goneLabs = 0;
   let nodesCapped = false;
   for (const lab of walk.labs) {
     if (nodesCapped) break;
-    for (const [nodeId, raw] of await client.listNodes(lab.path, FETCH_TIMEOUT_MS)) {
+    const nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    // MINOR-12 — the lab was deleted between the folder listing that named it
+    // and this node fetch; skip it with a warning rather than aborting.
+    if (nodePairs === NOT_FOUND) {
+      goneLabs++;
+      continue;
+    }
+    for (const [nodeId, raw] of nodePairs) {
       if (!includeStopped && Number(raw.status) !== 2) {
         continue;
       }
@@ -848,6 +909,9 @@ async function fetchInventoryImpl(
         noConsoleCount === 1 ? "was" : "were"
       } imported without a connection endpoint.`
     );
+  }
+  if (goneLabs > 0) {
+    warnings.push(`${goneLabs} lab${goneLabs === 1 ? "" : "s"} ${goneLabs === 1 ? "was" : "were"} not found (removed during the scan) and skipped.`);
   }
   if (nodesCapped) {
     warnings.push(`Stopped after ${MAX_NODES} nodes — later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`);

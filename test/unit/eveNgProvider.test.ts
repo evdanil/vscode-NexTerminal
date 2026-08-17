@@ -286,6 +286,37 @@ describe("createEveNgProvider — login and session", () => {
     expect(calls[0]).toBe("http://eve.example.com/api/auth/login");
   });
 
+  it("M13 — captures the exact `unetlab_session` cookie, not a decoy that merely ends in that name (⊘ a boundary-less match grabs `xunetlab_session=DECOY`)", async () => {
+    const calls: { cookie?: string }[] = [];
+    const fetchImpl = (async (input: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({ cookie: headers.Cookie });
+      if (new URL(input).pathname.endsWith("/api/auth/login")) {
+        // Decoy first, so a leftmost substring match would grab it.
+        return makeResponse(200, jsend(null), ["xunetlab_session=DECOY; Path=/", "unetlab_session=REAL; Path=/; HttpOnly"]);
+      }
+      if (new URL(input).pathname.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      return makeResponse(200, jsend({ folders: [], labs: [] }));
+    }) as unknown as typeof fetch;
+    await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    const authed = calls.filter((c) => c.cookie !== undefined);
+    expect(authed.length).toBeGreaterThan(0);
+    expect(authed.every((c) => c.cookie === "unetlab_session=REAL")).toBe(true);
+  });
+
+  it("M45 — arms an abort signal on every request so a hung EVE-NG box cannot stall the crawl forever (⊘ dropping the signal leaves each fetch unbounded)", async () => {
+    const signals: unknown[] = [];
+    const fetchImpl = (async (input: string, init?: RequestInit) => {
+      signals.push(init?.signal);
+      if (new URL(input).pathname.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (new URL(input).pathname.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      return makeResponse(200, jsend({ folders: [], labs: [] }));
+    }) as unknown as typeof fetch;
+    await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every((s) => s instanceof AbortSignal)).toBe(true);
+  });
+
   it("captures the unetlab_session cookie and replays it on EVERY later request (⊘ undici's fetch keeps no cookie jar, so a client that never sets the header gets a 401 on the first folder listing)", async () => {
     const { fetchImpl, calls } = makeWorld(oneLabWorld({ "1": node() }));
     await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
@@ -568,6 +599,68 @@ describe("createEveNgProvider — folder walk", () => {
     expect((err as InventoryProviderError).kind).toBe("protocol");
     expect((err as Error).message.toLowerCase()).toContain("root folder");
   });
+
+  /**
+   * MINOR-1 — the request budget stops the walk once, warns once. The old code
+   * pushed the warning inside the per-item loop and then let `queue = next`
+   * run, so the next level re-hit the budget and warned again (and the
+   * `queue = []` it set was dead — immediately overwritten).
+   */
+  it("MINOR-1 — stops at the folder-listing budget, warns exactly once, and issues no more than the budget of listings (⊘ warning inside the loop fires again for each level already queued when the budget hit; the dead `queue = []` never stops anything)", async () => {
+    // NESTED on purpose: each level-1 folder enqueues a grandchild, so when the
+    // budget trips mid-level the `next` queue is NON-empty — which is exactly
+    // when the old in-loop warning re-fired on the following iteration. A flat
+    // tree would leave `next` empty and hide the double-warning.
+    const top = Array.from({ length: 2_100 }, (_, i) => ({ name: `f${i}`, path: `/f${i}` }));
+    const folders: Record<string, FolderListing> = { "/": { folders: top } };
+    for (const f of top) folders[f.path] = { folders: [{ name: "c", path: `${f.path}/c` }] };
+    const { fetchImpl, calls } = makeWorld({ folders });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    const budgetWarnings = (tree.warnings ?? []).filter((w) => /folder listings/i.test(w));
+    expect(budgetWarnings).toHaveLength(1);
+    expect(tree.truncated).toBe(true);
+    const folderRequests = calls.filter((c) => c.url.includes("/api/folders"));
+    expect(folderRequests.length).toBeLessThanOrEqual(2_000);
+    expect(folderRequests.length).toBeGreaterThan(1_900);
+  });
+
+  /**
+   * MINOR-12 — a folder or lab that 404s mid-walk (deleted between its parent's
+   * listing and its own fetch) is skipped with a warning, not aborted. A live
+   * lab tree will hit this, and failing the whole sync over one deleted folder
+   * updates NOTHING.
+   */
+  it("MINOR-12 — skips a child folder / lab that 404s mid-walk and warns, rather than aborting the whole sync (⊘ one 404 throws and no lab is updated)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = decodeURIComponent(new URL(input).pathname);
+      if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      if (path === "/api/folders/") {
+        return makeResponse(200, jsend({ folders: [{ name: "Ghost", path: "/Ghost" }], labs: [{ file: "Good.unl", path: "/Good.unl" }, { file: "Gone.unl", path: "/Gone.unl" }] }));
+      }
+      if (path === "/api/folders/Ghost") return makeResponse(404, "gone");
+      if (path === "/api/labs/Good.unl/nodes") return makeResponse(200, jsend({ "1": node() }));
+      if (path === "/api/labs/Gone.unl/nodes") return makeResponse(404, "gone");
+      return makeResponse(404, "nf");
+    }) as unknown as typeof fetch;
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices.map((d) => d.externalId)).toEqual(["/Good.unl#1"]);
+    expect((tree.warnings ?? []).some((w) => /not found|removed|skipped/i.test(w))).toBe(true);
+  });
+
+  it("MINOR-12 — a 404 on the ROOT folder is a hard error, since an empty result would prune every server the source owns (⊘ treating root-gone as 'no labs' deletes the whole inventory)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      return makeResponse(404, "gone");
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory({ ...CONFIG, rootFolder: "/Nope" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+  });
 });
 
 describe("createEveNgProvider — nodes", () => {
@@ -605,7 +698,38 @@ describe("createEveNgProvider — nodes", () => {
     expect((await fetchTree(world, { includeStopped: true })).devices).toHaveLength(2);
   });
 
-  it("applies `filter` as a case-insensitive substring of the lab's full path, and never even asks for a non-matching lab's nodes", async () => {
+  /**
+   * M42 — the filter matches the lab's FULL PATH, not just its name. The
+   * fixture deliberately separates the two: `Core.unl` sits in `/ACME`, whose
+   * only occurrence of "acme" is in the DIRECTORY, not the filename — so a
+   * name-only matcher would drop it. And `Edge.unl` carries "edge" in its
+   * NAME. Testing both directions verifies "full path", not one side of it.
+   */
+  it("M42 — filters on the lab's FULL PATH (directory included), not just its name, in both directions (⊘ a name-only matcher drops `/ACME/Core.unl` under filter `acme`)", async () => {
+    const world: World = {
+      folders: {
+        "/": { folders: [{ name: "ACME", path: "/ACME" }, { name: "Other", path: "/Other" }] },
+        "/ACME": { labs: [{ file: "Core.unl", path: "/ACME/Core.unl" }] },
+        "/Other": { labs: [{ file: "Edge.unl", path: "/Other/Edge.unl" }] }
+      },
+      nodes: { "/ACME/Core.unl": { "1": node() }, "/Other/Edge.unl": { "1": node() } }
+    };
+    // "acme" appears only in Core's DIRECTORY.
+    expect((await fetchTree(world, { filter: "acme" })).devices.map((d) => d.attributes?.lab)).toEqual(["Core"]);
+    // "edge" appears in Edge's NAME.
+    expect((await fetchTree(world, { filter: "edge" })).devices.map((d) => d.attributes?.lab)).toEqual(["Edge"]);
+    // A substring in neither path matches nothing.
+    expect((await fetchTree(world, { filter: "zzz" })).devices).toHaveLength(0);
+  });
+
+  it("M41 — matches case-insensitively on BOTH sides: an UPPERCASE filter against a lowercase path, and vice versa (⊘ lower-casing only one side misses the other)", async () => {
+    const lowerWorld: World = { folders: { "/": { labs: [{ file: "core.unl", path: "/acme/core.unl" }] } }, nodes: { "/acme/core.unl": { "1": node() } } };
+    expect((await fetchTree(lowerWorld, { filter: "ACME" })).devices).toHaveLength(1);
+    const upperWorld: World = { folders: { "/": { labs: [{ file: "CORE.unl", path: "/ACME/CORE.unl" }] } }, nodes: { "/ACME/CORE.unl": { "1": node() } } };
+    expect((await fetchTree(upperWorld, { filter: "acme" })).devices).toHaveLength(1);
+  });
+
+  it("never even asks for a non-matching lab's nodes (⊘ filtering after the node fetch still leaks a request for every lab)", async () => {
     const world: World = {
       folders: { "/": { labs: [{ file: "ACME Core.unl", path: "/ACME Core.unl" }, { file: "Other.unl", path: "/Other.unl" }] } },
       nodes: { "/ACME Core.unl": { "1": node() }, "/Other.unl": { "1": node() } }
