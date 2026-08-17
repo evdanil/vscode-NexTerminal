@@ -1194,12 +1194,12 @@
         {
           "command": "nexus.inventory.startNode",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.eveStopped$/",
-          "group": "0_connect@8"
+          "group": "00_power@1"
         },
         {
           "command": "nexus.inventory.stopNode",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.eveRunning$/",
-          "group": "0_connect@9"
+          "group": "00_power@2"
         },
         {
           "command": "nexus.server.testConnection",
