@@ -4642,6 +4642,44 @@ describe("NexusCore inventory status", () => {
     expect(snap.serverStatus.get(other.id)).toBe("running");
   });
 
+  it("P2 (adoption): decorates an ADOPTED server whose ServerConfig.id was PRESERVED (id !== deterministicServerId(newSource, X)) by resolving via origin.externalId — while still covering a normal deterministic-id server and not touching another source's server (⊘ a deterministicServerId lookup misses every adopted node, so Refresh/poll never highlight them)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // Adopted (#82): Remove Source → Keep Servers, then re-add → Adopt Existing
+    // preserves the ORIGINAL id and stamps the NEW source in origin. So the id is
+    // NOT deterministicServerId("new-source", "adopted#1").
+    const adopted: ServerConfig = {
+      id: "preserved-original-id-abc123",
+      name: "adopted",
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "new-source", externalId: "adopted#1", syncedAt: 1 }
+    };
+    // Normal server owned by the same source: id === deterministicServerId(...).
+    const normal = makeSyncedServer("n", "new-source", "normal#1");
+    // Owned by a DIFFERENT source — must stay untouched.
+    const foreign = makeSyncedServer("f", "other-source", "x#1");
+    expect(adopted.id).not.toBe(deterministicServerId("new-source", "adopted#1"));
+    await core.addServersBatch([adopted, normal, foreign]);
+
+    core.applyInventoryStatus("new-source", {
+      contractVersion: 1,
+      statuses: {
+        "adopted#1": { state: "running" },
+        "normal#1": { state: "stopped" },
+        "x#1": { state: "running" }
+      }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get("preserved-original-id-abc123")).toBe("running"); // adopted decorated
+    expect(snap.serverStatus.get(normal.id)).toBe("stopped"); // deterministic still works
+    expect(snap.serverStatus.get(foreign.id)).toBeUndefined(); // other source untouched
+  });
+
   it("does not set a status for a serverId that resolves to no owned server (⊘ populating the map for a device the sync has not materialized leaves a stale highlight with nothing to hang it on)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

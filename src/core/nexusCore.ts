@@ -16,7 +16,6 @@ import {
   type TunnelRegistryEntry
 } from "../models/config";
 import { inventorySourceValuesEqual, sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
-import { deterministicServerId } from "../services/inventory/deterministicId";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
@@ -2257,10 +2256,11 @@ export class NexusCore {
 
   /**
    * LIVE STATUS (Phase 2) — apply one source's fetchStatus report onto the
-   * runtime serverStatus map. Every externalId is mapped to a serverId via the
-   * same deterministicServerId scheme the sync uses, and a status is set ONLY for
-   * a server that exists AND is owned by this source (origin.sourceId ===
-   * sourceId). Entries this source previously wrote but no longer reports —
+   * runtime serverStatus map. Each report entry is resolved to a server by its
+   * REAL origin identity — a server owned by this source (origin.sourceId ===
+   * sourceId) whose origin.externalId matches — which covers both a normal
+   * deterministic-id server and an ADOPTED one whose id was preserved (#82).
+   * Entries this source previously wrote but no longer reports —
    * pruned nodes, removed servers — are dropped; entries owned by OTHER sources
    * are untouched. One emitChanged() on the way out, like registerSession.
    */
@@ -2273,10 +2273,23 @@ export class NexusCore {
         this.serverStatusSource.delete(serverId);
       }
     }
+    // Resolve report entries by the server's REAL origin identity, not by
+    // assuming `id === deterministicServerId(sourceId, externalId)`. Adoption
+    // (Keep Servers → re-add → Adopt Existing, #82) PRESERVES an adoptee's
+    // original id while stamping the NEW source into `origin`, so a deterministic
+    // lookup would miss every adopted node. Building the map from servers owned
+    // by this source (origin.sourceId === sourceId), keyed by origin.externalId,
+    // covers BOTH the deterministic (non-adopted) and the preserved-id (adopted)
+    // cases, and inherently keeps the source-ownership scoping.
+    const serverIdByExternalId = new Map<string, string>();
+    for (const server of this.servers.values()) {
+      if (server.origin?.sourceId === sourceId) {
+        serverIdByExternalId.set(server.origin.externalId, server.id);
+      }
+    }
     for (const [externalId, deviceStatus] of Object.entries(report.statuses)) {
-      const serverId = deterministicServerId(sourceId, externalId);
-      const server = this.servers.get(serverId);
-      if (server && server.origin?.sourceId === sourceId) {
+      const serverId = serverIdByExternalId.get(externalId);
+      if (serverId !== undefined) {
         this.serverStatus.set(serverId, deviceStatus.state);
         this.serverStatusSource.set(serverId, sourceId);
       }
