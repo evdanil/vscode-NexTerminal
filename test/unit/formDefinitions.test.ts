@@ -42,6 +42,24 @@ function keyPathVisibleWhen(definition: ReturnType<typeof serverFormDefinition>)
   return keyPathField!.visibleWhen;
 }
 
+describe("serverFormDefinition — addressless (P2-a)", () => {
+  // A synced placeholder has no console address, so the Edit form must not mark
+  // Host (or the sentinel-port field) required — otherwise the user cannot open it
+  // to set OOB fields without inventing a host. ⊘ Leaving `required: true` blocks
+  // the save at the webview boundary before formValuesToServer is ever reached.
+  it("does NOT require Host or Port when the seed is addressless", () => {
+    const def = serverFormDefinition({ id: "s1", name: "stopped", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
+    expect(keyedField(def, "host").required).toBe(false);
+    expect(keyedField(def, "port").required).toBe(false);
+  });
+
+  it("STILL requires Host and Port for an ordinary (non-addressless) server", () => {
+    const def = serverFormDefinition({ id: "s1", name: "prod", host: "h", port: 22, username: "admin", authType: "agent" });
+    expect(keyedField(def, "host").required).toBe(true);
+    expect(keyedField(def, "port").required).toBe(true);
+  });
+});
+
 describe("formDefinitions keyPath visibility", () => {
   it("shows server keyPath field only for authType=key on an SSH server", () => {
     // TELNET (Phase 0) — the key-file control now carries the SSH-only gate as

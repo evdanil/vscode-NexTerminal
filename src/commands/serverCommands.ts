@@ -614,7 +614,18 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
   await ctx.secretVault.delete(secretKey);
 }
 
-export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
+// ADDRESSLESS (Codex P2-a) — the sentinel port an addressless placeholder carries
+// (mirrors `ADDRESSLESS_PORT` in the sync engine, which mints these records). A
+// placeholder has no console endpoint, so the port is a placeholder too; kept in
+// sync-engine and form-save so an edited placeholder round-trips to the same shape.
+const ADDRESSLESS_PORT = 0;
+
+export function formValuesToServer(
+  values: FormValues,
+  existingId?: string,
+  preserveIsHidden = false,
+  existingAddressless = false
+): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
   const username = typeof values.username === "string" ? values.username.trim() : "";
@@ -625,10 +636,21 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
   // `bmcWebProtocol` follows below). Anything else the submission carries is not
   // a transport we implement, so it reads as the default.
   const isTelnet = values.protocol === "telnet";
+  // ADDRESSLESS (Codex P2-a) — editing a synced placeholder that has no console
+  // address. The Edit form leaves Host empty for it, and a normal record needs a
+  // host, so without this the save would abort (`return undefined`) and the user
+  // could never reach the OOB fields (IPMI auth profile, BMC protocol) the
+  // placeholder exists to hold. Preserve the addressless shape (empty host,
+  // sentinel port) instead — but ONLY when the user left Host empty. Typing a
+  // real host means "give this device an address": fall through to the normal
+  // addressed record and let the flag clear (the next sync's ownership decides).
+  const keepAddressless = existingAddressless && !host;
   // A telnet server has no protocol-level login, so the form DISABLES the
   // username control for one — a disabled control submits nothing, and the
-  // save must not reject the record over a field it never asked for.
-  if (!name || !host || (!username && !isTelnet)) {
+  // save must not reject the record over a field it never asked for. An
+  // addressless placeholder likewise never offered a Host (and may carry an
+  // empty username), so its emptiness is not a rejection either.
+  if (!name || (!keepAddressless && (!host || (!username && !isTelnet)))) {
     return undefined;
   }
   if (normalizedGroup === null) {
@@ -638,7 +660,10 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     id: existingId ?? randomUUID(),
     name,
     host,
-    port: typeof values.port === "number" ? values.port : 22,
+    port: keepAddressless ? ADDRESSLESS_PORT : typeof values.port === "number" ? values.port : 22,
+    // Preserved only while the record stays addressless; typing a host clears it
+    // (absent ≡ addressed), so a placeholder upgraded in the form saves as normal.
+    ...(keepAddressless ? { addressless: true } : {}),
     protocol: isTelnet ? "telnet" : undefined,
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
@@ -1551,7 +1576,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const candidate = formValuesToServer(values, existing.id, existing.isHidden);
+          const candidate = formValuesToServer(values, existing.id, existing.isHidden, existing.addressless === true);
           if (!candidate) {
             return;
           }

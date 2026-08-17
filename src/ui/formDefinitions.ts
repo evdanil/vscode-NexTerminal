@@ -363,7 +363,11 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       hint: "Telnet is cleartext and has no login of its own — you log in at the device's own prompt. Use it for console servers and lab gear that offer nothing else; credentials, tunnels, SFTP and jump hosts are SSH-only.",
       visibleWhen: vw
     },
-    { type: "text", key: "host", label: "Host", required: true, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the server.", visibleWhen: vw },
+    // ADDRESSLESS (Codex P2-a) — a synced placeholder has no console address, so
+    // Host is NOT required when editing one: the user opens it to set OOB fields
+    // (IPMI auth profile, BMC protocol), not to invent a host. Typing a real host
+    // gives it an address and clears the flag on save (`formValuesToServer`).
+    { type: "text", key: "host", label: "Host", required: !seed?.addressless, placeholder: "192.168.1.100 or hostname", value: seed?.host, hint: "Hostname or IP address of the server.", visibleWhen: vw },
     // TELNET (Phase 0, MINOR-3) — the default follows the Protocol select (the
     // sync engine already maps a telnet endpoint to 23), both at render time for
     // an existing record and live in the form via `defaultsFrom`. A port the
@@ -372,10 +376,17 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       type: "number",
       key: "port",
       label: "Port",
-      required: true,
+      // ADDRESSLESS (Codex P2-a) — the placeholder's stored port is a sentinel (0)
+      // that fails the min:1 control, so Port is not required for one and its field
+      // shows a sensible default (should the user give it a host, in which case the
+      // save reads this value). While it stays addressless the save forces the
+      // sentinel regardless of what this shows.
+      required: !seed?.addressless,
       min: 1,
       max: 65535,
-      value: seed?.port ?? (seed?.protocol === "telnet" ? TELNET_DEFAULT_PORT : SSH_DEFAULT_PORT),
+      value: seed?.addressless
+        ? SSH_DEFAULT_PORT
+        : seed?.port ?? (seed?.protocol === "telnet" ? TELNET_DEFAULT_PORT : SSH_DEFAULT_PORT),
       defaultsFrom: { field: "protocol", defaults: { ssh: SSH_DEFAULT_PORT, telnet: TELNET_DEFAULT_PORT } },
       visibleWhen: vw
     },

@@ -21,6 +21,7 @@ import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPass
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
+import { validateServerConfig } from "../../src/utils/validation";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -4185,6 +4186,83 @@ describe("addressless servers are not offered as SSH infrastructure (end-to-end 
       expect(optionValues(key), key).toContain("srv-ssh");
       expect(optionValues(key), key).not.toContain("srv-addr");
     }
+  });
+});
+
+/**
+ * ADDRESSLESS (Codex P2-a) — an addressless placeholder (host "", addressless:true)
+ * must be EDITABLE so the user can configure its OOB fields (IPMI auth profile, BMC
+ * protocol) without inventing a console host. The edit path must recognize and
+ * preserve `addressless` on save; typing a real host gives it an address and
+ * clears the flag. Measured on the PERSISTED record — the whole failure mode is
+ * the form and the save path disagreeing.
+ */
+describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  async function openEdit(ctx: CommandContext): Promise<{ onSubmit: (v: Record<string, unknown>) => Promise<void> }> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+  }
+
+  // The submission the webview composes for an addressless server: Host is left
+  // empty (the placeholder has no console address), only OOB fields differ.
+  function addresslessSubmit(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      name: "stopped-node",
+      host: "",
+      port: 0,
+      protocol: "ssh",
+      username: "admin",
+      authType: "agent",
+      ...overrides
+    };
+  }
+
+  const placeholder = () =>
+    makeServer({ id: "srv-1", name: "stopped-node", host: "", port: 0, username: "admin", authType: "agent", addressless: true, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } });
+
+  it("saves an edit to an addressless server, KEEPING addressless + empty host while applying the new IPMI auth profile (⊘ Host-required / formValuesToServer returning undefined aborts the save so the OOB fields can never be set)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: [makeAuthProfile({ id: "ap-bmc", username: "bmc" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ ipmiAuthProfileId: "ap-bmc" }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.addressless).toBe(true);
+    expect(saved.host).toBe("");
+    expect(saved.ipmiAuthProfileId).toBe("ap-bmc");
+    // The persisted record must survive its own reload.
+    expect(validateServerConfig(saved)).toBe(true);
+  });
+
+  it("CLEARS addressless when the user types a real host into an addressless profile — it becomes a normal addressed server (⊘ preserving addressless regardless of host freezes the placeholder even after the user gives it an address)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: []
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.addressless ?? false).toBe(false);
+    expect(saved.host).toBe("10.0.0.5");
+    expect(saved.port).toBe(22);
   });
 });
 
