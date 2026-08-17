@@ -1082,7 +1082,7 @@ function mapNode(
   rootPrefix: string,
   consoleHost: string,
   baseHostname: string
-): { device: InventoryDevice; hasEndpoint: boolean } {
+): InventoryDevice {
   const rawName = str(raw.name);
   // Never dropped for a cosmetic data problem: a dropped device reads as
   // "deleted at the source" and the source's prune policy acts on the server.
@@ -1106,23 +1106,22 @@ function mapNode(
   put("name", name);
 
   return {
-    hasEndpoint: target !== undefined,
-    device: {
-      // Stable and unique across labs: two labs each have a node "1", and a
-      // bare node id would collapse every lab's node 1 into one server.
-      //
-      // E-4 (Fable) — the identity is `<lab path>#<node id>`, so RENAMING OR MOVING
-      // a lab reidentifies every node in it: the old externalIds vanish from the
-      // fetch and the sync prunes their servers, while the new ones arrive as fresh
-      // adds. EVE-NG exposes no lab-stable GUID to key on, so this churn (prune +
-      // re-add, losing per-server hand edits and credentials on a lab rename) is a
-      // known limitation rather than a bug.
-      externalId: `${lab.path}#${nodeId}`,
-      name,
-      folderPath: labFolderPath(lab, rootPrefix),
-      endpoints: target ? [{ kind: "telnet", host: target.host, port: target.port }] : [],
-      attributes: Object.keys(attributes).length > 0 ? attributes : undefined
-    }
+    // Stable and unique across labs: two labs each have a node "1", and a
+    // bare node id would collapse every lab's node 1 into one server.
+    //
+    // E-4 (Fable) — the identity is `<lab path>#<node id>`, so RENAMING OR MOVING
+    // a lab reidentifies every node in it: the old externalIds vanish from the
+    // fetch and the sync prunes their servers, while the new ones arrive as fresh
+    // adds. EVE-NG exposes no lab-stable GUID to key on, so this churn (prune +
+    // re-add, losing per-server hand edits and credentials on a lab rename) is a
+    // known limitation rather than a bug.
+    externalId: `${lab.path}#${nodeId}`,
+    name,
+    folderPath: labFolderPath(lab, rootPrefix),
+    // No endpoint when the node has no usable telnet console — the sync engine
+    // turns such a node into an addressless placeholder and reports it.
+    endpoints: target ? [{ kind: "telnet", host: target.host, port: target.port }] : [],
+    attributes: Object.keys(attributes).length > 0 ? attributes : undefined
   };
 }
 
@@ -1193,7 +1192,6 @@ async function fetchInventoryImpl(
   let truncated = walk.truncated;
 
   const devices: InventoryDevice[] = [];
-  let noConsoleCount = 0;
   let goneLabs = 0;
   let nodesCapped = false;
   let deadlineHit = false;
@@ -1239,23 +1237,17 @@ async function fetchInventoryImpl(
         truncated = true;
         break;
       }
-      const mapped = mapNode(nodeId, raw, lab, rootPrefix, consoleHost, client.hostname);
-      devices.push(mapped.device);
-      if (!mapped.hasEndpoint) {
-        noConsoleCount++;
-      }
+      // ONE ADDRESSLESS LINE (follow-up 1) — the endpoint-less nodes are pushed
+      // and NOT counted here. This provider used to keep a `noConsoleCount` and
+      // push its own aggregate ("N nodes have no telnet console URL … were
+      // imported without a connection endpoint."), which overlapped the sync
+      // engine's addressless line: one sync, two lines, intersecting sets of
+      // nodes. The engine owns that disclosure now — it is the only layer that
+      // knows whether each node became a placeholder this run or already was one.
+      devices.push(mapNode(nodeId, raw, lab, rootPrefix, consoleHost, client.hostname));
     }
   }
 
-  if (noConsoleCount > 0) {
-    // ONE aggregate line, not one per node: a lab full of VNC-consoled
-    // appliances would otherwise bury every other warning in the plan summary.
-    warnings.push(
-      `${noConsoleCount} node${noConsoleCount === 1 ? " has" : "s have"} no telnet console URL (a non-telnet console type, or no console address yet) and ${
-        noConsoleCount === 1 ? "was" : "were"
-      } imported without a connection endpoint.`
-    );
-  }
   if (goneLabs > 0) {
     warnings.push(`${goneLabs} lab${goneLabs === 1 ? "" : "s"} ${goneLabs === 1 ? "was" : "were"} not found (removed during the scan) and skipped.`);
   }

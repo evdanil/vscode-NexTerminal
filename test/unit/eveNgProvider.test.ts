@@ -1120,7 +1120,7 @@ describe("createEveNgProvider — device mapping", () => {
     expect(loopback.devices[0].endpoints[0].host).toBe("nat.example.com");
   });
 
-  it("emits a node with a non-telnet console (or no console URL at all) WITH NO ENDPOINTS rather than dropping it, and reports the count ONCE (⊘ dropping the device reads as \"deleted at the source\" and prunes the server; one warning per node buries the summary)", async () => {
+  it("emits a node with a non-telnet console (or no console URL at all) WITH NO ENDPOINTS rather than dropping it, and says NOTHING about them in its own warnings (⊘ dropping the device reads as \"deleted at the source\" and prunes the server; ⊘ a provider-side aggregate duplicates the sync engine's addressless line)", async () => {
     const tree = await fetchTree(
       oneLabWorld({
         "1": node(),
@@ -1133,9 +1133,13 @@ describe("createEveNgProvider — device mapping", () => {
     for (const id of ["2", "3", "4"]) {
       expect(tree.devices.find((d) => d.externalId.endsWith(`#${id}`))?.endpoints).toEqual([]);
     }
-    const consoleWarnings = (tree.warnings ?? []).filter((w) => w.includes("telnet console"));
-    expect(consoleWarnings).toHaveLength(1);
-    expect(consoleWarnings[0]).toContain("3");
+    // ONE ADDRESSLESS LINE (follow-up 1) — the provider used to push its own
+    // aggregate here ("3 nodes have no telnet console URL … were imported without
+    // a connection endpoint."). It overlapped the sync engine's addressless line,
+    // so a sync showed two lines about intersecting sets of nodes. The engine owns
+    // the disclosure now: it is the only layer that knows whether each of these
+    // became a placeholder this run or already was one.
+    expect((tree.warnings ?? []).filter((w) => w.includes("telnet console"))).toEqual([]);
   });
 
   /**
@@ -1146,7 +1150,7 @@ describe("createEveNgProvider — device mapping", () => {
    * so the user gets a server pointed at port 23 of the EVE box, believing it
    * is a node.
    */
-  it("mints no endpoint for a console URL whose host is empty, and folds it into the aggregate no-console warning (⊘ empty host reads as loopback and points the server at the EVE box itself)", async () => {
+  it("mints no endpoint for a console URL whose host is empty (⊘ empty host reads as loopback and points the server at the EVE box itself)", async () => {
     const tree = await fetchTree(
       oneLabWorld({
         "1": node({ url: "telnet:1.2.3.4:9000" }), // no "//" — opaque, empty hostname
@@ -1157,7 +1161,10 @@ describe("createEveNgProvider — device mapping", () => {
     expect(tree.devices.find((d) => d.externalId.endsWith("#1"))?.endpoints).toEqual([]);
     expect(tree.devices.find((d) => d.externalId.endsWith("#2"))?.endpoints).toEqual([]);
     expect(tree.devices.find((d) => d.externalId.endsWith("#3"))?.endpoints).toEqual([{ kind: "telnet", host: "192.0.2.9", port: 9000 }]);
-    expect((tree.warnings ?? []).filter((w) => w.includes("telnet console"))).toHaveLength(1);
+    // No provider-side addressless aggregate (follow-up 1) — the endpoint
+    // suppression above is this test's subject, and the sync engine reports the
+    // two endpoint-less nodes.
+    expect((tree.warnings ?? []).filter((w) => w.includes("telnet console"))).toEqual([]);
   });
 
   it("mints no endpoint for a telnet console reported on port 0 (⊘ M18 — a port-0 endpoint dials port 0, which never connects)", async () => {

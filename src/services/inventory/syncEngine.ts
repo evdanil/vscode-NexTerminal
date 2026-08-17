@@ -1163,6 +1163,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // ADDRESSLESS (Codex P1) — devices with no usable primary endpoint that were
   // NEWLY created as placeholders this run, for one aggregate note.
   const addresslessAdded: string[] = [];
+  // ONE ADDRESSLESS LINE (follow-up 1) — the other half of that note: devices
+  // whose server was ALREADY an addressless placeholder and STAYED one this run.
+  // Both providers used to disclose these in an aggregate of their own (every
+  // addressless row in the fetch), which overlapped the engine's added-only line
+  // and showed the user two lines about intersecting sets. The engine is the only
+  // layer that knows the OUTCOME, so it now owns the whole disclosure and the
+  // providers push none.
+  const addresslessAlreadyPlaceholder: string[] = [];
   // P2-3 (Fable) — previously-ADDRESSED servers downgraded to placeholders this
   // sync (their console address blanked). Disclosed as an aggregate parallel to
   // `addresslessAdded`; a stay-addressless server is never added here.
@@ -1517,6 +1525,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // template value fields join the value half (the matrix can move any of
         // them on an otherwise-unchanged placeholder); their stamps ride the
         // `serverOriginStampsEqual` line, exactly as the addressed update path does.
+        // ONE ADDRESSLESS LINE (follow-up 1) — a STAY-addressless device, counted
+        // BEFORE the `changed` split because it belongs in the line either way: a
+        // placeholder renamed at the source is an update, an untouched one is not,
+        // and both are equally "still has no console address". Deliberately the
+        // exact complement of the downgrade condition below — `blanksAddress` says
+        // the record IS a placeholder after this sync, and `addressless === true`
+        // says it already was one before, so a real downgrade (previously
+        // ADDRESSED) and a hand-typed address the sync PRESERVED (`blanksAddress`
+        // false, the record stays addressed) both fall outside it.
+        if (blanksAddress && ownedForAddressless.addressless === true) {
+          addresslessAlreadyPlaceholder.push(device.name);
+        }
         const changed =
           ownedForAddressless.name !== after.name ||
           ownedForAddressless.host !== after.host ||
@@ -3583,11 +3603,43 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // summary: those devices are now CREATED as addressless placeholders, so the
   // aggregate note says what happened rather than that they were dropped. One
   // line, never per-device.
-  if (addresslessAdded.length > 0) {
-    const count = addresslessAdded.length;
-    warnings.push(
-      `${count} device${count === 1 ? "" : "s"} ${count === 1 ? "has" : "have"} no console address yet and ${count === 1 ? "was" : "were"} added without one (e.g. ${namedExamples(addresslessAdded)}).`
-    );
+  //
+  // ONE ADDRESSLESS LINE (follow-up 1) — and ONE line for BOTH outcomes, not one
+  // per outcome. This is the sync's whole addressless disclosure now: the two
+  // providers each used to push an aggregate covering every addressless row in
+  // their fetch, which overlapped this one (added-only) and left the user reading
+  // two lines about intersecting sets of devices. Owning it here also kills a
+  // genuine double-report — a row that is BOTH nameless and addressless was
+  // counted in the provider's addressless aggregate AND in the empty-name skip
+  // summary below; it now appears once, under the reason that actually stops it
+  // becoming a server.
+  //
+  // A DOWNGRADE is not in either bucket: it keeps its own line just below,
+  // because losing a working address is a different event from never having had
+  // one.
+  if (addresslessAdded.length > 0 || addresslessAlreadyPlaceholder.length > 0) {
+    const added = addresslessAdded.length;
+    const already = addresslessAlreadyPlaceholder.length;
+    const examples = namedExamples([...addresslessAdded, ...addresslessAlreadyPlaceholder]);
+    if (already === 0) {
+      // Added only — the common case, worded exactly as it always was so the
+      // line every user already reads does not churn.
+      warnings.push(
+        `${added} device${added === 1 ? "" : "s"} ${added === 1 ? "has" : "have"} no console address yet and ${added === 1 ? "was" : "were"} added without one (e.g. ${examples}).`
+      );
+    } else if (added === 0) {
+      // Standing placeholders only — must NOT imply this sync created anything.
+      warnings.push(
+        `${already} device${already === 1 ? "" : "s"} ${already === 1 ? "has" : "have"} no console address yet and ${already === 1 ? "remains a placeholder" : "remain placeholders"} (e.g. ${examples}).`
+      );
+    } else {
+      // Both — the total first (what the user wants to know), then the split.
+      // Each half carries its OWN number agreement; the total is >= 2 by
+      // construction, so its own verb is unconditionally plural.
+      warnings.push(
+        `${added + already} devices have no console address yet — ${added} ${added === 1 ? "was" : "were"} added without one and ${already} ${already === 1 ? "was" : "were"} already ${already === 1 ? "a placeholder" : "placeholders"} (e.g. ${examples}).`
+      );
+    }
   }
   // P2-3 (Fable) — the downgrade twin of the addressless-added disclosure: name the
   // previously-addressed servers whose console address this sync blanked.
