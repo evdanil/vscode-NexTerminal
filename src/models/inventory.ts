@@ -153,6 +153,11 @@ export interface InventoryStatusReport {
   // applyInventoryStatus MERGES a truncated report (retaining prior status for
   // absent entries) rather than clearing-then-applying (which treats an absent
   // node as removed). Absent/false ⇒ a complete report.
+  //
+  // CONSUMED BY `refreshStatus` (commands/inventoryCommands.ts): a truncated
+  // report that is APPLIED names its source in one manual-only warning, because
+  // the merge above leaves the unreached nodes showing stale (or `unknown`) state
+  // and nothing else on screen would say so. The poll path stays silent.
   truncated?: boolean;
 }
 
