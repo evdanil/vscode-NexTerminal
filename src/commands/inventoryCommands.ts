@@ -4544,7 +4544,12 @@ export function registerInventoryCommands(
     if (typeof arg === "object" && arg !== null) {
       const withServer = arg as { server?: { id?: unknown } };
       if (withServer.server && typeof withServer.server === "object" && typeof withServer.server.id === "string") {
-        return core.getServer(withServer.server.id) ?? (withServer.server as ServerConfig);
+        // Resolve strictly against the LIVE core — NO `?? withServer.server`
+        // fallback. A server removed between tree render and click carries a
+        // full, valid-looking (but stale) record on the item; trusting it would
+        // dispatch a control at a just-deleted node's old origin. A missing id
+        // falls through to the "Select a synced EVE-NG node" refusal instead.
+        return core.getServer(withServer.server.id);
       }
     }
     if (typeof arg === "string") {

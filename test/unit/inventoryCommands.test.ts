@@ -8302,6 +8302,20 @@ describe("inventoryCommands", () => {
       await start({ server: { id: server.id } });
       expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
     });
+
+    it("REFUSES a tree item whose server id is no longer in core — a server removed between render and click — instead of dispatching via its stale record (⊘ a `?? withServer.server` fallback fires a control at a just-deleted node's stale origin)", async () => {
+      const { start, controlSpy } = await setup();
+      // The tree item still carries a full, valid-looking record (origin + all),
+      // but its id was removed from core after the row was rendered. The handler
+      // must resolve strictly against the live core and fall through to the
+      // refusal, not trust the stale item.
+      await start({
+        server: { id: "removed-since-render", origin: { sourceId: "src-1", externalId: "/Lab.unl#9", syncedAt: 1 } }
+      });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
   });
 });
 
