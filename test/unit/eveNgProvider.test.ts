@@ -917,31 +917,33 @@ describe("createEveNgProvider — nodes", () => {
    * computeSyncPlan reads it as deleted and prunes its server + credentials on
    * the next sync of an otherwise-healthy lab.
    */
-  it("P1 — preserves a malformed node value (null / string / number) as an endpoint-less placeholder keyed by the map key, and does NOT truncate (⊘ filtering it out drops its externalId and computeSyncPlan prunes its server)", async () => {
-    const tree = await fetchTree(oneLabWorld({ "1": node(), "2": 42 as never, "3": "garbage" as never, "4": null as never }));
-    const byId = (id: string) => tree.devices.find((d) => d.externalId === `/Lab 1.unl#${id}`);
-    expect(tree.devices.map((d) => d.externalId).sort()).toEqual(["/Lab 1.unl#1", "/Lab 1.unl#2", "/Lab 1.unl#3", "/Lab 1.unl#4"]);
-    for (const id of ["2", "3", "4"]) {
-      expect(byId(id)?.name).toBe(`node-${id}`);
-      expect(byId(id)?.endpoints).toEqual([]);
+  it("P1-a — a NON-OBJECT node value FAILS the sync as protocol, rather than becoming an addressless placeholder (⊘ now that endpoint-less = an ACTIVE downgrade, a placeholder would clear a working sibling server's host over a transient corruption of one node value)", async () => {
+    for (const bad of [42, "garbage", null]) {
+      const err = await fetchTree(oneLabWorld({ "1": node(), "2": bad as never }))
+        .then(() => "resolved" as const)
+        .catch((e: unknown) => e);
+      expect(err, `value=${JSON.stringify(bad)}`).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, `value=${JSON.stringify(bad)}`).toBe("protocol");
     }
-    // ⊘ Nothing was capped — a placeholder must not disable pruning of genuinely gone nodes.
+  });
+
+  it("P1-a — a VALID node OBJECT with no telnet console STILL becomes an endpoint-less (addressless) device — the split is object-validity, NOT endpoint-presence (⊘ over-correcting fails the sync for a merely-stopped node the placeholder feature exists for)", async () => {
+    const tree = await fetchTree(
+      oneLabWorld({
+        "1": node({ status: 0, url: "" }), // stopped Community node
+        "2": node({ id: "2", name: "V1", console: "vnc", url: "http://eve.example.com/html5/vnc.html" }) // VNC console
+      })
+    );
+    expect(tree.devices).toHaveLength(2);
+    expect(tree.devices.every((d) => d.endpoints.length === 0)).toBe(true);
     expect(tree.truncated).toBeFalsy();
   });
 
-  it("P1 — reports the malformed node entries in an aggregate warning naming the count (⊘ one warning per node buries the summary; no warning hides a real data problem)", async () => {
-    const tree = await fetchTree(oneLabWorld({ "1": node(), "2": null as never, "3": "x" as never }));
-    const malformed = (tree.warnings ?? []).filter((w) => /malformed/i.test(w));
-    expect(malformed).toHaveLength(1);
-    expect(malformed[0]).toContain("2");
-  });
-
-  it("P1 — a prototype-polluting map key (`__proto__` / `constructor`) yields a plain-string externalId and never touches Object.prototype (⊘ a naive object-keyed write would pollute the prototype chain)", async () => {
-    // Built via a raw JSON body so the keys are OWN properties on the parsed
-    // object (a `{ __proto__: … }` object literal would set the prototype, not a
-    // key). This is exactly the shape a hostile server could send.
-    const rawNodes =
-      '{"code":200,"status":"success","message":"","data":{"__proto__":null,"constructor":"x","1":{"id":"1","name":"R1","console":"telnet","url":"telnet://10.0.0.5:23","status":2}}}';
+  it("P1-a — a prototype-polluting map key (`__proto__` / `constructor`) with a valid node OBJECT value yields a plain-string externalId and never touches Object.prototype (⊘ a naive object-keyed write would pollute the prototype chain)", async () => {
+    // Raw JSON body so the keys are OWN properties on the parsed object. The
+    // values are valid node objects (a non-object value now FAILS the sync).
+    const validNode = '{"id":"n","name":"N","console":"telnet","url":"telnet://10.0.0.5:23","status":2}';
+    const rawNodes = `{"code":200,"status":"success","message":"","data":{"__proto__":${validNode},"constructor":${validNode},"1":${validNode}}}`;
     const fetchImpl = (async (input: string) => {
       const path = decodeURIComponent(new URL(input).pathname);
       if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
@@ -955,33 +957,6 @@ describe("createEveNgProvider — nodes", () => {
     expect(tree.devices.some((d) => d.externalId === "/L.unl#constructor")).toBe(true);
     expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
-  });
-
-  it("P1 — an owned server for a now-malformed node is NOT pruned by computeSyncPlan (the whole point: the placeholder keeps it present) (⊘ a dropped node reads as deleted and lands in `prunes`)", async () => {
-    const tree = await fetchTree(oneLabWorld({ "1": node(), "2": null as never }));
-    const source = {
-      id: "src-eve",
-      providerId: EVE_NG_PROVIDER_ID,
-      name: "Lab",
-      targetFolder: "EVE",
-      prunePolicy: "delete" as const,
-      defaultUsername: "admin",
-      config: CONFIG,
-      secretFieldIds: ["password"]
-    };
-    const ownedForNode2: ServerConfig = {
-      id: deterministicServerId("src-eve", "/Lab 1.unl#2"),
-      name: "node-2",
-      host: "eve.example.com",
-      port: 23,
-      username: "admin",
-      authType: "agent",
-      isHidden: false,
-      group: "EVE/Lab 1",
-      origin: { sourceId: "src-eve", externalId: "/Lab 1.unl#2", syncedAt: 1 }
-    };
-    const plan = computeSyncPlan({ source, tree, currentServers: [ownedForNode2], now: 2_000 });
-    expect(plan.prunes.map((p) => p.server.origin?.externalId)).not.toContain("/Lab 1.unl#2");
   });
 
   it("maps status 2 to running and everything else to stopped", async () => {
