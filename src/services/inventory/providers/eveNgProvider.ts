@@ -20,6 +20,19 @@ const MAX_NODES = 10_000;
 const MAX_LABS = 1_000;
 const MAX_FOLDER_DEPTH = 12;
 const MAX_FOLDER_REQUESTS = 2_000;
+/**
+ * WALL-CLOCK CRAWL DEADLINE (task #30) — the whole crawl (folder walk + per-lab
+ * node fetch) is bounded in real time as well as by the request/lab/node/depth
+ * caps above. The caps bound WORK; this bounds TIME, which the others cannot: a
+ * tree well within every cap but served by a slow EVE-NG box can still take
+ * minutes per listing and hang the sync/refresh. Computed ONCE per crawl and
+ * shared between `walkFolders` and the node-fetch loop, so the two phases share a
+ * single budget rather than each getting a fresh one. Trips `truncated` (a
+ * partial crawl, so `applyInventoryStatus` MERGES rather than prunes) and pushes
+ * a deadline-named warning. `Date.now()` is allowed here — only Workflow scripts
+ * forbid it.
+ */
+const CRAWL_DEADLINE_MS = 120_000;
 
 /** Bound on an error message's echo of a response body — see `throwForStatus`. */
 const BODY_SLICE = 200;
@@ -219,6 +232,24 @@ function isObject(value: unknown): value is Record<string, unknown> {
 // parseJsonOrThrow trio so both providers fail in the same vocabulary.
 // ---------------------------------------------------------------------------
 
+/**
+ * WALL-CLOCK DEADLINE (task #30, #84 P2) — the sentinel `raw()` throws when a
+ * request's abort was caused by the CRAWL DEADLINE expiring mid-flight (as
+ * opposed to a genuine per-request network timeout with the deadline still far
+ * off). The crawl loops CATCH it and terminate as TRUNCATED — returning the
+ * partial results collected so far plus the deadline warning — rather than
+ * letting it propagate as a `network` failure that discards the whole crawl. Not
+ * an `InventoryProviderError`, so it can never be mistaken for a real fetch error
+ * anywhere it might leak (a leak surfaces as a plain Error, loud, not a
+ * misclassified network failure).
+ */
+class CrawlDeadlineExceeded extends Error {
+  public constructor() {
+    super("EVE-NG crawl deadline exceeded");
+    this.name = "CrawlDeadlineExceeded";
+  }
+}
+
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   const host = url.host || url.toString();
   if (err instanceof Error) {
@@ -296,6 +327,14 @@ export interface FolderWalkResult {
   /** Set when a cap (labs, depth, request budget) stopped the walk short. */
   truncated: boolean;
   warnings: string[];
+  /**
+   * WALL-CLOCK DEADLINE (task #30, P3-2) — set when the WALK itself tripped the
+   * shared crawl deadline and already pushed its deadline warning. The node-fetch
+   * loop reuses the same deadline, so it would otherwise re-observe the blown
+   * budget and push a SECOND identical warning; it suppresses its own when this
+   * is set, keeping one deadline warning per crawl.
+   */
+  deadlineHit: boolean;
 }
 
 type Edition = "community" | "pro" | "unknown";
@@ -305,6 +344,12 @@ const NOT_FOUND = Symbol("eve-ng-not-found");
 
 class EveApiClient {
   private session?: string;
+  // WALL-CLOCK DEADLINE (task #30, #84 P2-2) — the crawl's shared deadline, set
+  // once per crawl. When present, every request's timeout is bounded by the
+  // REMAINING budget (never past it), and the silent re-login on a 401 is skipped
+  // once the deadline has passed. Absent for the non-crawl paths (testConnection),
+  // which keep their own fixed timeouts.
+  private crawlDeadline?: number;
 
   public constructor(
     private readonly fetchImpl: typeof fetch,
@@ -312,6 +357,11 @@ class EveApiClient {
     private readonly username: string,
     private readonly password: string
   ) {}
+
+  /** WALL-CLOCK DEADLINE (#84 P2-2) — arm the shared per-crawl deadline. */
+  public setCrawlDeadline(deadline: number): void {
+    this.crawlDeadline = deadline;
+  }
 
   /**
    * The host requests fall back to when EVE-NG reports a console on loopback.
@@ -347,20 +397,59 @@ class EveApiClient {
 
   private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string }> {
     let res: Response;
+    // WALL-CLOCK DEADLINE (#84 P2-2) — cap this request's timeout by the REMAINING
+    // crawl budget, so a request issued just before the deadline (or a re-login
+    // retry) can never run the full `timeoutMs` past it. The per-request
+    // `timeoutMs` stays the ceiling when the deadline is far off (or absent, for
+    // testConnection). The between-request checks trip the deadline before issuing
+    // when the budget is already spent, so a >0 floor here is the near-boundary case.
+    const effectiveTimeout =
+      this.crawlDeadline !== undefined
+        ? Math.min(timeoutMs, Math.max(0, this.crawlDeadline - Date.now()))
+        : timeoutMs;
     try {
       // MINOR-5 — `redirect: "manual"` on every request. No EVE-NG endpoint
       // legitimately redirects; the default `"follow"` would let a 3xx from the
       // lab box carry the crawl (and, on 307/308, the login POST body — the
       // password) to another origin. A 3xx surfaces below as a non-2xx protocol
       // error instead.
-      res = await this.fetchImpl(url.toString(), { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+      res = await this.fetchImpl(url.toString(), { ...init, redirect: "manual", signal: AbortSignal.timeout(effectiveTimeout) });
     } catch (err) {
+      // WALL-CLOCK DEADLINE (#84 P2) — a request that STALLED until the crawl
+      // deadline aborts exactly when the budget hit zero (its effective timeout
+      // was the remaining budget). Distinguish that from a genuine per-request
+      // network timeout (deadline still far off): an abort/timeout with the
+      // deadline now passed is the crawl running out of time, not the server
+      // being unreachable. Signal it as the truncation sentinel so the loops
+      // return partial results + the deadline warning instead of failing the
+      // whole crawl. A real timeout with the deadline far off still maps to
+      // `network`.
+      if (
+        this.crawlDeadline !== undefined &&
+        Date.now() >= this.crawlDeadline &&
+        err instanceof Error &&
+        (err.name === "AbortError" || err.name === "TimeoutError")
+      ) {
+        throw new CrawlDeadlineExceeded();
+      }
       throw mapNetworkError(err, url);
     }
     let text = "";
     try {
       text = await res.text();
     } catch {
+      // WALL-CLOCK DEADLINE (#84 P2-2) — the BODY read can abort too: EVE may
+      // send HEADERS before the deadline (so `fetch()` already resolved) then
+      // STALL on the body, and the request's AbortSignal aborts `res.text()`.
+      // Classify it the same way as the `fetch()` abort above — past the deadline
+      // ⇒ the truncation sentinel, so the loops return partial results + the
+      // deadline warning instead of swallowing to "" and having the parser throw
+      // a `protocol` error that discards the whole crawl. Deadline far off ⇒ the
+      // pre-existing tolerant empty-string behaviour (a truncated/garbled body is
+      // not fatal on its own; the parser surfaces the real problem).
+      if (this.crawlDeadline !== undefined && Date.now() >= this.crawlDeadline) {
+        throw new CrawlDeadlineExceeded();
+      }
       text = "";
     }
     return { res, text };
@@ -431,6 +520,15 @@ class EveApiClient {
 
     let { res, text } = await send();
     if (res.status === 401 || res.status === 403) {
+      // WALL-CLOCK DEADLINE (#84 P2-2) — the silent re-login is TWO more requests
+      // (login + retry). Once the crawl deadline has passed, skip it and surface
+      // the 401: retrying would run the crawl a full re-login+retry past the
+      // budget for a session that expired at the tail of an already-overlong
+      // crawl. (When the deadline is merely NEAR, the retry still runs but each of
+      // its requests is bounded by the remaining budget in `raw` above.)
+      if (this.crawlDeadline !== undefined && Date.now() >= this.crawlDeadline) {
+        return { status: res.status, text, url };
+      }
       await this.login(timeoutMs);
       ({ res, text } = await send());
     }
@@ -593,7 +691,7 @@ class EveApiClient {
    * `computeSyncPlan` from reading the labs we never reached as "deleted at the
    * source" and pruning their servers.
    */
-  public async walkFolders(root: string, matchesFilter: (labPath: string) => boolean, timeoutMs: number): Promise<FolderWalkResult> {
+  public async walkFolders(root: string, matchesFilter: (labPath: string) => boolean, timeoutMs: number, deadline: number): Promise<FolderWalkResult> {
     const labs: EveLab[] = [];
     const warnings: string[] = [];
     const visited = new Set<string>([root]);
@@ -601,6 +699,11 @@ class EveApiClient {
     let requests = 0;
     let truncated = false;
     let depthCapped = false;
+    // WALL-CLOCK DEADLINE (task #30) — set when the crawl's shared time budget is
+    // exhausted, alongside `budgetHit` (which stops both loops). Kept as its OWN
+    // flag so the `if (budgetHit)` warning below can name the DEADLINE rather than
+    // the request cap, which would otherwise misreport a slow crawl as a wide one.
+    let deadlineHit = false;
     // E-2 (Fable) — set ONLY when a lab is actually skipped for the MAX_LABS cap, so
     // the "Stopped after N labs" warning does not misfire at exact capacity when the
     // tree was truncated for an unrelated reason (the depth/budget cap).
@@ -633,8 +736,31 @@ class EveApiClient {
           budgetHit = true;
           break;
         }
+        // WALL-CLOCK DEADLINE (task #30) — checked beside the request cap (both
+        // loops terminate via `budgetHit`), so a crawl that is slow rather than
+        // wide stops too. Checked BEFORE the listing request so a deadline already
+        // passed does not fire one more slow fetch.
+        if (Date.now() > deadline) {
+          budgetHit = true;
+          deadlineHit = true;
+          break;
+        }
         requests++;
-        const listing = await this.listFolder(path, timeoutMs);
+        // WALL-CLOCK DEADLINE (#84 P2) — a listing that STALLED until the deadline
+        // aborts as the truncation sentinel: stop the walk as TRUNCATED with the
+        // labs collected so far, exactly like the between-request check above,
+        // rather than failing the whole crawl. A real network error still throws.
+        let listing: Awaited<ReturnType<typeof this.listFolder>>;
+        try {
+          listing = await this.listFolder(path, timeoutMs);
+        } catch (err) {
+          if (err instanceof CrawlDeadlineExceeded) {
+            budgetHit = true;
+            deadlineHit = true;
+            break;
+          }
+          throw err;
+        }
         if (listing === NOT_FOUND) {
           // MINOR-12 — the ROOT folder being gone would yield an empty tree and
           // prune every server the source owns, so it is fatal; a child folder
@@ -753,7 +879,9 @@ class EveApiClient {
     if (budgetHit) {
       truncated = true;
       warnings.push(
-        `Stopped after ${MAX_FOLDER_REQUESTS} folder listings — part of the EVE-NG folder tree was not scanned. Narrow the Root Folder.`
+        deadlineHit
+          ? `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the EVE-NG crawl exceeded its time limit and part of the folder tree was not scanned. Narrow the Root Folder.`
+          : `Stopped after ${MAX_FOLDER_REQUESTS} folder listings — part of the EVE-NG folder tree was not scanned. Narrow the Root Folder.`
       );
     }
     if (labsCapped) {
@@ -774,7 +902,7 @@ class EveApiClient {
         `${goneFolders} folder${goneFolders === 1 ? "" : "s"} ${goneFolders === 1 ? "was" : "were"} not found (removed during the scan) and skipped.`
       );
     }
-    return { labs, truncated, warnings };
+    return { labs, truncated, warnings, deadlineHit };
   }
 }
 
@@ -1014,13 +1142,17 @@ async function fetchInventoryImpl(
   const consoleHost = str(config.consoleHost);
 
   const warnings: string[] = [];
+  // WALL-CLOCK DEADLINE (task #30) — one budget for the whole crawl, computed
+  // before the folder walk and reused in the node-fetch loop below.
+  const deadline = Date.now() + CRAWL_DEADLINE_MS;
+  client.setCrawlDeadline(deadline); // #84 P2-2 — bound every crawl request by the remaining budget
   await client.login(FETCH_TIMEOUT_MS);
 
   if ((await client.detectEdition(FETCH_TIMEOUT_MS)) === "pro") {
     warnings.push(EVE_NG_PRO_WARNING);
   }
 
-  const walk = await client.walkFolders(root, (labPath) => !filter || labPath.toLowerCase().includes(filter), FETCH_TIMEOUT_MS);
+  const walk = await client.walkFolders(root, (labPath) => !filter || labPath.toLowerCase().includes(filter), FETCH_TIMEOUT_MS, deadline);
   warnings.push(...walk.warnings);
   let truncated = walk.truncated;
 
@@ -1028,9 +1160,31 @@ async function fetchInventoryImpl(
   let noConsoleCount = 0;
   let goneLabs = 0;
   let nodesCapped = false;
+  let deadlineHit = false;
   for (const lab of walk.labs) {
-    if (nodesCapped) break;
-    const nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    if (nodesCapped || deadlineHit) break;
+    // WALL-CLOCK DEADLINE (task #30) — the node-fetch phase shares the crawl's
+    // budget, so a source whose LAB COUNT (not its folder tree) blows the time
+    // limit is bounded too. Stops the per-lab loop and signals truncation.
+    if (Date.now() > deadline) {
+      deadlineHit = true;
+      truncated = true;
+      break;
+    }
+    // WALL-CLOCK DEADLINE (#84 P2) — a node fetch that STALLED until the deadline
+    // aborts as the truncation sentinel: keep the devices collected so far and
+    // stop the loop as TRUNCATED, rather than failing the whole crawl.
+    let nodePairs: Awaited<ReturnType<typeof client.listNodes>>;
+    try {
+      nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof CrawlDeadlineExceeded) {
+        deadlineHit = true;
+        truncated = true;
+        break;
+      }
+      throw err;
+    }
     // MINOR-12 — the lab was deleted between the folder listing that named it
     // and this node fetch; skip it with a warning rather than aborting.
     if (nodePairs === NOT_FOUND) {
@@ -1072,6 +1226,15 @@ async function fetchInventoryImpl(
   if (nodesCapped) {
     warnings.push(`Stopped after ${MAX_NODES} nodes — later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`);
   }
+  // P3-2 (review) — push the node-phase deadline warning ONLY when the walk did
+  // not already name the deadline (the two share one budget, so a walk that
+  // tripped it leaves the node loop re-observing the same blown deadline). One
+  // deadline warning per crawl.
+  if (deadlineHit && !walk.deadlineHit) {
+    warnings.push(
+      `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the EVE-NG crawl exceeded its time limit and later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`
+    );
+  }
   return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
 }
 
@@ -1101,20 +1264,45 @@ async function fetchStatusImpl(
   const filter = str(config.filter).toLowerCase();
   const consoleHost = str(config.consoleHost);
 
+  // WALL-CLOCK DEADLINE (task #30) — one budget for the whole crawl, shared with
+  // the node-fetch loop below, exactly as fetchInventory does.
+  const deadline = Date.now() + CRAWL_DEADLINE_MS;
+  client.setCrawlDeadline(deadline); // #84 P2-2 — bound every crawl request by the remaining budget
   await client.login(FETCH_TIMEOUT_MS);
-  const walk = await client.walkFolders(root, (labPath) => !filter || labPath.toLowerCase().includes(filter), FETCH_TIMEOUT_MS);
+  const walk = await client.walkFolders(root, (labPath) => !filter || labPath.toLowerCase().includes(filter), FETCH_TIMEOUT_MS, deadline);
 
   const statuses: Record<string, InventoryDeviceStatus> = {};
   let nodeCount = 0;
-  // TRUNCATION — a partial scan (the node cap here, or the folder/lab/budget
-  // caps inside walkFolders) must be signalled, so applyInventoryStatus MERGES
-  // this report rather than clearing the decorations of nodes it never reached.
-  // Same idiom fetchInventory uses.
+  // TRUNCATION — a partial scan (the node cap here, the wall-clock deadline, or
+  // the folder/lab/budget caps inside walkFolders) must be signalled, so
+  // applyInventoryStatus MERGES this report rather than clearing the decorations
+  // of nodes it never reached. Same idiom fetchInventory uses.
   let truncated = walk.truncated;
   let nodesCapped = false;
+  let deadlineHit = false;
   for (const lab of walk.labs) {
-    if (nodesCapped) break;
-    const nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    if (nodesCapped || deadlineHit) break;
+    // WALL-CLOCK DEADLINE (task #30) — the node-fetch phase shares the crawl's
+    // budget, so a source whose lab count blows the time limit is bounded too.
+    if (Date.now() > deadline) {
+      deadlineHit = true;
+      truncated = true;
+      break;
+    }
+    // WALL-CLOCK DEADLINE (#84 P2) — a node fetch that STALLED until the deadline
+    // aborts as the truncation sentinel: keep the statuses collected so far and
+    // stop as TRUNCATED (so applyInventoryStatus MERGES), not a failed poll.
+    let nodePairs: Awaited<ReturnType<typeof client.listNodes>>;
+    try {
+      nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    } catch (err) {
+      if (err instanceof CrawlDeadlineExceeded) {
+        deadlineHit = true;
+        truncated = true;
+        break;
+      }
+      throw err;
+    }
     // MINOR-12 — the lab was deleted between the folder listing and this fetch;
     // skip it, exactly as fetchInventory does.
     if (nodePairs === NOT_FOUND) {

@@ -52,7 +52,7 @@ function tree(devices: InventoryDevice[]): InventoryTree {
 }
 
 function ownedServer(overrides: Partial<ServerConfig> = {}, origin: Partial<ServerOrigin> = {}): ServerConfig {
-  return {
+  const merged: ServerConfig = {
     id: deterministicServerId("source-1", overrides.origin?.externalId ?? "device:1"),
     name: "core-sw-1",
     host: "10.0.0.1",
@@ -64,6 +64,18 @@ function ownedServer(overrides: Partial<ServerConfig> = {}, origin: Partial<Serv
     origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, ...origin },
     ...overrides
   };
+  // PRIMARY HOST/PORT (task #29) — a real synced server OWNS its address; seed the
+  // host/port stamps so these fixtures don't churn a spurious row-5a stamp-only
+  // update that would break their template "unchanged" assertions.
+  if (merged.origin && merged.host !== "") {
+    if (merged.origin.syncedHost === undefined) {
+      merged.origin = { ...merged.origin, syncedHost: merged.host };
+    }
+    if (merged.origin.syncedPort === undefined && merged.port !== 0) {
+      merged.origin = { ...merged.origin, syncedPort: merged.port };
+    }
+  }
+  return merged;
 }
 
 function bystanderServer(id: string, name = id): ServerConfig {

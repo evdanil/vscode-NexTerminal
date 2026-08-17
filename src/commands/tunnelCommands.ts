@@ -415,7 +415,8 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
                 if (!server) {
                   return;
                 }
-                await ctx.core.addOrUpdateServer(server);
+                // #84 P1 (serialization audit) — serialize the inline jump-host add under configMutationLock (full-snapshot write).
+                await configMutationLock.runExclusive(() => ctx.core.addOrUpdateServer(server));
                 panel.addSelectOption("defaultServerId", server.id, server.name);
               },
               onBrowse: browseForKey
@@ -486,7 +487,8 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
                 if (!server) {
                   return;
                 }
-                await ctx.core.addOrUpdateServer(server);
+                // #84 P1 (serialization audit) — serialize the inline jump-host add under configMutationLock (full-snapshot write).
+                await configMutationLock.runExclusive(() => ctx.core.addOrUpdateServer(server));
                 panel.addSelectOption("defaultServerId", server.id, server.name);
               },
               onBrowse: browseForKey

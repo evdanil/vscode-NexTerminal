@@ -419,7 +419,11 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
         return;
       }
       const fullPath = parentPath ? parentPath + "/" + name.trim() : name.trim();
-      await ctx.core.addGroup(fullPath);
+      // #84 P1 (serialization audit) — addGroup persists the FULL folder list;
+      // serialize it under configMutationLock so two concurrent group writes (or a
+      // group write racing a folder rename/remove) cannot clobber each other's
+      // snapshot. Acquired after the input box resolves — no UI held under the lock.
+      await configMutationLock.runExclusive(() => ctx.core.addGroup(fullPath));
     }),
 
     vscode.commands.registerCommand("nexus.group.remove", async (arg?: unknown) => {
@@ -431,9 +435,17 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
       const itemCount = items.servers.length + items.serialProfiles.length + items.localShellProfiles.length;
       const hasContents = itemCount > 0;
 
+      // #84 P1 (Codex, serialization audit) — removeFolderCascade reassigns or
+      // DELETES every server in the subtree and persists a FULL server snapshot.
+      // Serialize it under configMutationLock like every other writer: a
+      // lock-free cascade racing a background port-heal (or edit/remove/sync)
+      // could restore deleted servers or revert folder reassignments on reload,
+      // or have the heal's port write reverted. The cascade reads and mutates the
+      // live server map inside the lock, so no stale snapshot is captured. The
+      // confirmation modal has already resolved — no UI held under the lock.
       if (!hasContents) {
         // Empty folder — remove silently
-        await ctx.core.removeFolderCascade(folderPath, false);
+        await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, false));
         return;
       }
 
@@ -444,9 +456,9 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
         "Delete contents"
       );
       if (choice === "Move to parent") {
-        await ctx.core.removeFolderCascade(folderPath, false);
+        await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, false));
       } else if (choice === "Delete contents") {
-        await ctx.core.removeFolderCascade(folderPath, true);
+        await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, true));
       }
     })
   ];

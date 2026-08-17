@@ -94,11 +94,15 @@ export interface InventoryTree {
 export interface InventoryDeviceStatus {
   state: "running" | "stopped";
   // OPTIONAL fresh console endpoint. A provider (EVE-NG Community) that reassigns
-  // console ports on node restart can surface the current one here; only ever
-  // present for a running node. RESERVED for the deferred port-healing follow-up
-  // (D8): these are produced by EVE fetchStatus and validated here, but
-  // `NexusCore.applyInventoryStatus` currently stores only `state` and NOTHING
-  // consumes them yet — kept because they are cheap and ready for that follow-up.
+  // console ports on node restart surfaces the current one here; only ever
+  // present for a running node. CONSUMED by `NexusCore.healSyncedConsolePorts`
+  // (task #29 / D8), the separate persisting step the status-refresh path runs
+  // right after the pure `applyInventoryStatus`: for a running, telnet,
+  // non-addressless, SYNC-OWNED server whose console address differs from these,
+  // it persists the reported value onto `host`/`port` (and advances the
+  // `syncedHost`/`syncedPort` stamp) so the next connect targets the live port.
+  // A hand-edited port is never healed. `applyInventoryStatus` itself still
+  // stores only `state`.
   consoleHost?: string;
   consolePort?: number;
 }
@@ -369,16 +373,26 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
       return undefined;
     }
     const status: InventoryDeviceStatus = { state: v.state };
-    if (Object.prototype.hasOwnProperty.call(v, "consoleHost")) {
-      if (typeof v.consoleHost !== "string") {
-        return undefined;
-      }
+    // P2-1 (review) — the console fields are HEAL INPUTS: `healSyncedConsolePorts`
+    // persists them into `ServerConfig.host`/`port`, which `validateServerConfig`
+    // then re-checks on reload (non-empty host, integer port 1..65535). An
+    // invalid one must therefore never be surfaced to the heal, or the heal would
+    // persist a record that is dropped on the next load — the #82 record-drop
+    // class. But `state` keying is unchanged and still drives the tree highlight,
+    // so a bad console field is DROPPED (not surfaced) rather than failing the
+    // whole entry or report, which would blank an entire source's decorations
+    // over one node's quirky console value. A non-empty string host and an
+    // `isValidPort` port are the exact bounds `validateServerConfig` enforces.
+    if (Object.prototype.hasOwnProperty.call(v, "consoleHost") && typeof v.consoleHost === "string" && v.consoleHost.length > 0) {
       status.consoleHost = v.consoleHost;
     }
-    if (Object.prototype.hasOwnProperty.call(v, "consolePort")) {
-      if (typeof v.consolePort !== "number" || !Number.isFinite(v.consolePort)) {
-        return undefined;
-      }
+    if (
+      Object.prototype.hasOwnProperty.call(v, "consolePort") &&
+      typeof v.consolePort === "number" &&
+      Number.isInteger(v.consolePort) &&
+      v.consolePort >= 1 &&
+      v.consolePort <= 65535
+    ) {
       status.consolePort = v.consolePort;
     }
     validated[key] = status;

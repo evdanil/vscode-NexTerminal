@@ -551,6 +551,52 @@ function syncOwnsAltHost(current: string | undefined, stamp: string | undefined,
 }
 
 /**
+ * PRIMARY HOST (task #29, the deferred #82 P2-3) — may this sync WRITE
+ * `ServerConfig.host` on an existing owned server? A VERBATIM copy of
+ * `syncOwnsIpmiHost` above — the SAME blank-normalize and the SAME
+ * `cur === stamp || cur === dev` — governed by the SAME 6-row + 5a matrix, read
+ * with `cur` = the record's `host`, `stamp` = `origin.syncedHost`, `dev` = the
+ * address this fetch's chosen endpoint supplies.
+ *
+ * WHY THIS DISCIPLINE NOW, WHEN `host` USED TO BE "device always wins". This is
+ * the DELIBERATE BEHAVIOR CHANGE (task #29): before the `syncedHost` stamp there
+ * was no way to tell a hand-edited console address apart from a sync-written one,
+ * so the sync wrote the device's `host` UNCONDITIONALLY and stomped every hand
+ * edit. The stamp closes exactly the gap `syncedAltHost`/`syncedIpmiHost` close
+ * for their fields — a hand-typed value (a stamp the value no longer equals) is
+ * now preserved, and only a value still carrying the sync's own last write (or
+ * the device's current one, row 5a) is overwritten. The `dev` blank-normalize is
+ * inherited too: an addressless placeholder's `host: ""` reads as absent, so its
+ * upgrade fills from the device (row 1) rather than reading as a hand entry.
+ */
+export function syncOwnsHost(current: string | undefined, stamp: string | undefined, dev: string): boolean {
+  const cur = current !== undefined && current.trim() === "" ? undefined : current;
+  return cur === stamp || cur === dev;
+}
+
+/**
+ * PRIMARY PORT (task #29) — the numeric twin of `syncOwnsHost` above, on
+ * `ServerConfig.port`. Numeric, so there is no whitespace to trim; the
+ * `ADDRESSLESS_PORT` (0) sentinel plays the role blank `""` plays for the host
+ * and is NORMALIZED TO ABSENT for two reasons the matrix needs:
+ *  - FILL-IN (row 1): an addressless placeholder carries `port: 0` with no
+ *    stamp; normalizing to `undefined` makes `cur === stamp` (undefined ===
+ *    undefined) true, so the upgrade takes the device's port — the numeric
+ *    analog of the blank-host fill-in.
+ *  - ROW 6 GUARD ("device supplies none"): were `dev` itself the sentinel, an
+ *    un-normalized `cur === dev` (0 === 0) would spuriously read as owned; with
+ *    `cur` normalized to `undefined` it cannot match a sentinel `dev`, so a
+ *    placeholder's 0 never reads as owned by coincidence.
+ * `stamp` needs no normalization — the sync only ever writes a real endpoint
+ * port (`>= 1`) or leaves it absent, exactly as `syncOwnsIpmiHost`'s stamp is
+ * only ever a selected non-empty host.
+ */
+export function syncOwnsPort(current: number, stamp: number | undefined, dev: number): boolean {
+  const cur = current === ADDRESSLESS_PORT ? undefined : current;
+  return cur === stamp || cur === dev;
+}
+
+/**
  * AUTH 2b (REVIEW FINDING, P1) — "can this server supply the key file the
  * profile does not?". The server-side half of `authProfileNeedsServerKeyPath`
  * (models/config.ts), which asks the same question of the profile.
@@ -1314,12 +1360,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // path uses — passing `undefined` as the device protocol (the addressless
         // shape is ssh-default): a sync-owned protocol is cleared to ssh, while a
         // hand-flipped one is left alone with its stamp carried forward verbatim.
+        // The actual clear is GATED on `blanksAddress` below (#84 P2) — protocol
+        // and host/port are one coherent console endpoint, so the protocol is only
+        // reset when the record truly downgrades to the addressless placeholder.
         const takesProtocol = syncOwnsProtocol(
           ownedForAddressless.protocol,
           ownedForAddressless.origin?.syncedProtocol,
           undefined
         );
-        const afterProtocol = takesProtocol ? undefined : ownedForAddressless.protocol;
         // OOB (Codex P2) — an addressless-for-console device can still expose a
         // BMC address, so the downgrade/stay path decides `ipmiHost` under the
         // SAME `syncOwnsIpmiHost` matrix the addressed path uses: it takes the new
@@ -1331,6 +1379,32 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesIpmiHost =
           mgmtHost !== undefined &&
           syncOwnsIpmiHost(ownedForAddressless.ipmiHost, ownedForAddressless.origin?.syncedIpmiHost, mgmtHost);
+        // PRIMARY HOST/PORT (task #29, the deferred #82 P2-3) — the console
+        // address is only BLANKED to the addressless placeholder shape when the
+        // sync still OWNS it. The device offers no console this fetch, so `dev`
+        // is the empty host / the `ADDRESSLESS_PORT` sentinel — `syncOwnsHost`/
+        // `syncOwnsPort` then answer yes for a sync-owned or already-blank address
+        // (matrix rows 1/3/5a) and NO for a value the user hand-typed onto the
+        // placeholder (rows 4/5). A hand-typed address is PRESERVED: the server
+        // stays addressed-by-hand rather than reverting to "", so `addressless`
+        // must be false in that branch. Decided on BOTH components as a unit —
+        // the address is owned as a whole — so a hand edit to either half keeps
+        // the pair.
+        const blanksAddress =
+          syncOwnsHost(ownedForAddressless.host, ownedForAddressless.origin?.syncedHost, "") &&
+          syncOwnsPort(ownedForAddressless.port, ownedForAddressless.origin?.syncedPort, ADDRESSLESS_PORT);
+        // #84 P2 (Codex) — COUPLE the protocol decision to the address decision.
+        // host/port and protocol are one coherent console endpoint. When the sync
+        // RETAINS a hand-edited endpoint (`blanksAddress` false — the record stays
+        // ADDRESSED), the protocol MUST ride with it unchanged: clearing a
+        // sync-owned telnet to the ssh default while keeping the telnet host/port
+        // would leave the next connect speaking SSH to a telnet endpoint. The
+        // protocol is reset (and its stamp dropped) ONLY when the record genuinely
+        // converts to the addressless placeholder (`blanksAddress` true), where the
+        // ssh-default shape is correct. A hand-flipped protocol (`takesProtocol`
+        // false) is left alone on both paths, exactly as before.
+        const clearsProtocol = blanksAddress && takesProtocol;
+        const afterProtocol = clearsProtocol ? undefined : ownedForAddressless.protocol;
         // DEVICE TEMPLATES (Codex P2-a) — the same matrix the addressed update runs,
         // against the placeholder's own id for the §5.3 self-proxy check. Its
         // `values` are the field writes, its `templated` the carried-forward stamp
@@ -1363,16 +1437,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // otherwise carried forward — including as `undefined`, which keeps a hand
           // entry hands-off (matrix row 5). `templated` is the matrix's carried
           // stamp record (writes folded in), same as the addressed update path.
-          syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
+          syncedProtocol: clearsProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
           syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedForAddressless.origin?.syncedIpmiHost,
+          // PRIMARY HOST/PORT (task #29) — the same `takes? written : carry`
+          // discipline as the stamps above. When the address is BLANKED the sync
+          // owns nothing there anymore, so the stamp is dropped to `undefined` (a
+          // placeholder owns no address); when a hand-typed address is PRESERVED
+          // the existing stamp is carried forward VERBATIM (the ...origin spread
+          // already carries it, but pinning it here documents the intent and
+          // guards against the spread being reordered). These override the spread.
+          syncedHost: blanksAddress ? undefined : ownedForAddressless.origin?.syncedHost,
+          syncedPort: blanksAddress ? undefined : ownedForAddressless.origin?.syncedPort,
           templated: templateMatrix.templated
         };
         const after: ServerConfig = {
           ...ownedForAddressless,
           name: device.name,
-          host: "",
-          port: ADDRESSLESS_PORT,
-          addressless: true,
           group: addresslessGroup,
           // The template field writes (proxy/multiplexing/legacyAlgorithms/logSession
           // /ipmiAuthProfileId/ipmiGatewayServerId) on exactly the rows the matrix
@@ -1380,6 +1460,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ...templateMatrix.values,
           origin: afterOrigin
         };
+        // PRIMARY HOST/PORT (task #29) — blank to the placeholder shape only when
+        // the sync owns the address; otherwise the ...ownedForAddressless spread
+        // preserves the hand-typed host/port and the record stays ADDRESSED (no
+        // `addressless` flag), which is why the flag is cleared rather than set.
+        if (blanksAddress) {
+          after.host = "";
+          after.port = ADDRESSLESS_PORT;
+          after.addressless = true;
+        } else {
+          delete after.addressless;
+        }
         if (afterProtocol === undefined) {
           delete after.protocol;
         } else {
@@ -1444,9 +1535,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         if (changed) {
           updates.push({ before: ownedForAddressless, after });
           // P2-3 (Fable) — disclose the loss of a console address, but ONLY when the
-          // server was previously ADDRESSED (a real downgrade). A stay-addressless
-          // server is unchanged in this respect and must not be named every sync.
-          if (ownedForAddressless.addressless !== true) {
+          // server was previously ADDRESSED (a real downgrade) AND the address was
+          // actually blanked. A stay-addressless server is unchanged in this
+          // respect, and a hand-typed address the sync PRESERVED (task #29) did not
+          // become addressless at all, so neither must be named every sync.
+          if (blanksAddress && ownedForAddressless.addressless !== true) {
             downgradedToAddressless.push(device.name);
           }
           if (addresslessGroup !== undefined) {
@@ -1556,6 +1649,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
             // answered — matrix row 1, exactly as the addressed add path stamps it.
             syncedIpmiHost: mgmtHost,
             syncedProtocol: undefined,
+            // PRIMARY HOST/PORT (task #29) — a fresh addressless placeholder owns
+            // NO console address yet (its `host: ""` / `port: 0` are the sentinel
+            // shape, not a synced value), so both stamps are `undefined`. The
+            // moment it gains a console the addressed update path fills and stamps
+            // them (matrix row 1 via `syncOwnsHost`'s blank-normalize).
+            syncedHost: undefined,
+            syncedPort: undefined,
             // The template stamps for the non-auth fields written above, so every
             // LATER sync has the ownership question already answered. Absent when
             // the template set none of them.
@@ -1744,11 +1844,46 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const ownedEndpoint = selectEndpointForProtocol(device, effectiveProtocol);
       const ownedHost = ownedEndpoint?.endpoint.host ?? ownedServer.host;
       const ownedPort = ownedEndpoint?.port ?? ownedServer.port;
+      // PRIMARY HOST/PORT (task #29) — the twin decision for `host`/`port`,
+      // decided HERE for the same reason `takesIpmiHost`/`takesAltHost` are: the
+      // stamps go INTO the origin literal below, which the retro-apply / rollback
+      // branches rebuild. See `syncOwnsHost`/`syncOwnsPort` for the write rules
+      // and the matrix. GATED on `ownedEndpoint !== undefined` — the twin of the
+      // `mgmtHost !== undefined` / `altHost !== undefined` guards those two carry:
+      // when no endpoint of the record's transport was found `ownedHost`/
+      // `ownedPort` fall back to the RECORD'S OWN value, and feeding the record's
+      // value in as `dev` would launder it into "owned" (row 5a on the record
+      // instead of the device) and re-stamp a hand edit. The P1-C "no matching
+      // endpoint ⇒ leave the address alone" branch is therefore a true no-op:
+      // both value and stamp carry forward untouched. When the endpoint IS
+      // present this is exactly the addressed decision (and the addressless
+      // upgrade: `host: ""`/`port: 0` blank-normalize to absent, so the fill-in
+      // row takes the device's address).
+      const takesHost =
+        ownedEndpoint !== undefined && syncOwnsHost(ownedServer.host, ownedServer.origin?.syncedHost, ownedHost);
+      const takesPort =
+        ownedEndpoint !== undefined && syncOwnsPort(ownedServer.port, ownedServer.origin?.syncedPort, ownedPort);
+      // #84 P2 (Codex) — ENDPOINT-TUPLE COHERENCE. host + port + protocol +
+      // username describe ONE console endpoint. The endpoint counts as "accepted"
+      // (the record is following the device's endpoint) only when the COMPLETE
+      // address is taken — BOTH components. When either half is handed off (the
+      // user hand-edited the address, so `takesHost`/`takesPort` is false and the
+      // manual host/port is retained), the record points at the USER's endpoint,
+      // and every OTHER field derived from the inventory endpoint the user rejected
+      // (username below; protocol further down) must NOT be applied over it —
+      // otherwise the record authenticates as the device's account or speaks the
+      // device's transport against the retained endpoint. host/port keep their own
+      // per-component ownership (`takesHost`/`takesPort`); this gates the fields
+      // that ride the endpoint without an ownership signal of their own.
+      const takesEndpoint = takesHost && takesPort;
       // The username rides the SAME endpoint the address came from, and is
       // `undefined` when no endpoint of the record's transport was found — a
       // username belongs to an endpoint, so taking one from an endpoint whose
       // address this update deliberately did NOT take would be incoherent (and
-      // would write a credential for the wrong service).
+      // would write a credential for the wrong service). #84 P2 — only when the
+      // endpoint was actually ACCEPTED (`takesEndpoint`); a retained hand address
+      // keeps the record's current username and its stamp.
+      const takesUsername = takesEndpoint && ownedEndpoint?.endpoint.username !== undefined;
       const ownedEndpointUsername = ownedEndpoint?.endpoint.username;
       // DEVICE TEMPLATES (PR-T1) — the §4.3 matrix for the four non-auth fields.
       // `templateMatrix.templated` is the carried-forward stamp record with the
@@ -1829,7 +1964,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         //     over a server still carrying the old one, permanently excluding a
         //     server the fallback adopts correctly today.
         // Nothing infers a stamp that was never taken: absent stays absent.
-        syncedUsername: ownedEndpointUsername ?? ownedServer.origin?.syncedUsername,
+        // #84 P2 — refreshed only when the endpoint was ACCEPTED (`takesUsername`
+        // ⇒ `takesEndpoint` and the endpoint supplies one); a retained hand address
+        // carries the previous stamp forward VERBATIM, so the username the record
+        // authenticates as and the stamp recording who wrote it never disagree.
+        syncedUsername: takesUsername ? ownedEndpointUsername : ownedServer.origin?.syncedUsername,
         // AUTH 2c — the auth-profile stamp obeys the SAME "records what the sync
         // wrote" discipline: carried forward verbatim here, and overwritten only
         // where this sync actually writes `authProfileId`, i.e. inside the
@@ -1869,7 +2008,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // which is what keeps a hand-flip to telnet hand-owned. Laundering the
         // record's current value into the stamp here would let the sync AFTER
         // this one overwrite the user's choice.
-        syncedProtocol: takesProtocol ? deviceProtocol : ownedServer.origin?.syncedProtocol,
+        //
+        // #84 P2 — ALSO composes with `takesEndpoint`: the protocol is part of the
+        // same console tuple as host/port, so it is refreshed only when the sync
+        // owns it AND the endpoint was accepted. A retained hand address (endpoint
+        // handed off) keeps the record's protocol and carries this stamp forward,
+        // so a device transport-flip cannot reset the protocol out from under a
+        // hand-edited endpoint (leaving e.g. SSH aimed at a retained telnet box).
+        syncedProtocol: takesProtocol && takesEndpoint ? deviceProtocol : ownedServer.origin?.syncedProtocol,
+        // PRIMARY HOST/PORT (task #29) — the same "records what the sync wrote"
+        // discipline one field down: refreshed exactly where this sync writes
+        // `host`/`port` (the `takesHost`/`takesPort` lines below), and otherwise
+        // carried forward VERBATIM — including as `undefined`, which keeps a
+        // hand-edited address hand-owned and a placeholder's absent stamp absent.
+        // The carry-forward is load-bearing for the reason `syncedAltHost`'s is:
+        // an update fired for an unrelated reason rebuilds this literal from scratch.
+        syncedHost: takesHost ? ownedHost : ownedServer.origin?.syncedHost,
+        syncedPort: takesPort ? ownedPort : ownedServer.origin?.syncedPort,
         // DEVICE TEMPLATES (PR-T1) — the per-field template stamps, carried
         // forward with this run's writes already folded in by the matrix above.
         // The one-line carry-forward the whole feature turns on (§5.2 / fixture
@@ -1881,9 +2036,6 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const after: ServerConfig = {
         ...ownedServer,
         name: device.name,
-        // P1-C — the tuple that agrees with `after.protocol`; see above.
-        host: ownedHost,
-        port: ownedPort,
         group,
         ...templateMatrix.values,
         origin: afterOrigin
@@ -1896,8 +2048,29 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       if (templateMatrix.clearProxy) {
         delete after.proxy;
       }
-      if (ownedEndpointUsername !== undefined) {
+      // #84 P2 — the value half of the username decision, on exactly the row
+      // `takesUsername` answered yes for (endpoint accepted AND it supplies one) —
+      // spelled with the explicit `!== undefined` so TS narrows the write, and
+      // equal to `takesUsername` since `ownedEndpointUsername` IS the endpoint's
+      // username. A retained hand address keeps the record's own username (the
+      // `...ownedServer` spread preserves it) instead of the rejected endpoint's.
+      if (takesEndpoint && ownedEndpointUsername !== undefined) {
         after.username = ownedEndpointUsername;
+      }
+      // PRIMARY HOST/PORT (task #29) — the value half of the decision stamped
+      // above, on exactly the rows `syncOwnsHost`/`syncOwnsPort` answer yes for,
+      // so the record and its stamp can never disagree about who owns the field.
+      // Conditional assignments (not members of the literal) so the
+      // `...ownedServer` spread PRESERVES a hand-edited address on the rows this
+      // must not touch — the deliberate behavior change (host/port were written
+      // unconditionally before). The addressless UPGRADE lands here too: a
+      // placeholder that gained a console has `takesHost`/`takesPort` true (its
+      // blank/sentinel address reads as absent, so the device fills it).
+      if (takesHost) {
+        after.host = ownedHost;
+      }
+      if (takesPort) {
+        after.port = ownedPort;
       }
       if (takesIpmiHost) {
         after.ipmiHost = mgmtHost;
@@ -1915,7 +2088,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // its stamp can never disagree about who owns the field. A conditional
       // assignment (not a member of the literal) so the `...ownedServer` spread
       // preserves a hand-flipped protocol on the rows this must not touch.
-      if (takesProtocol) {
+      // #84 P2 — composed with `takesEndpoint` (the protocol is part of the same
+      // console tuple): written only when the sync owns the protocol AND the
+      // endpoint was accepted, so a retained hand address keeps its protocol.
+      if (takesProtocol && takesEndpoint) {
         after.protocol = deviceProtocol;
       }
       // ADDRESSLESS (Codex P1) — the UPGRADE half: an owned server that was
@@ -2725,6 +2901,21 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // otherwise the marker's receipt RESTORED VERBATIM, which is what
           // keeps a protocol the user flipped before the detach hand-owned.
           syncedProtocol: takesProtocol ? deviceProtocol : adoptee.formerlySynced?.syncedProtocol,
+          // PRIMARY HOST/PORT (task #29) — stamped from the ADDRESS THIS ADOPTION
+          // WRITES (`endpoint.host` / `port`, the same values assigned onto
+          // `after` below), UNCONDITIONALLY, exactly as the add path stamps a
+          // fresh record. Unlike `syncedIpmiHost`/`syncedAltHost` — which may or
+          // may not be written this run and so restore from the marker receipt —
+          // adoption ALWAYS writes `host`/`port` (it only adopts when the record's
+          // address already corroborates the device's, up to case), so it
+          // genuinely owns the address and stamps it directly. There is no
+          // `DetachedServerOrigin` receipt for these (see models/config.ts) and
+          // none is needed: the value is the device's by corroboration, so
+          // stamping it here is truthful and it spares every adopted server a
+          // spurious stamp-only update on its first post-adoption sync (which a
+          // `syncedHost: undefined` here would guarantee via matrix row 5a).
+          syncedHost: endpoint.host,
+          syncedPort: port,
           // FIX 1 — the per-field template stamps for the non-auth fields the
           // matrix above wrote onto this adoptee, folded into the origin literal
           // so the auth-branch rebuild (`{ ...adoptionOrigin, syncedAuthProfileId }`)
@@ -3172,6 +3363,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // is the state the write rule can act on; one born stampless would read
         // as ssh whatever the device said.
         syncedProtocol: deviceProtocol,
+        // PRIMARY HOST/PORT (task #29) — mirror the `host`/`port` written above,
+        // stamped UNCONDITIONALLY (a fresh record OWNS its address): a record born
+        // with value and stamp agreeing is matrix row 1's state the write rule can
+        // act on, and every LATER sync then has the ownership question already
+        // answered — a hand edit read as hand-owned, an unchanged address followed.
+        syncedHost: endpoint.host,
+        syncedPort: port,
         // DEVICE TEMPLATES (PR-T1) — the template stamps for the non-auth fields
         // written above (row 1), so every LATER sync has the ownership question
         // already answered. Absent when the template set none of them.

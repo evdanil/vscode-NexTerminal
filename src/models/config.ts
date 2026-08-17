@@ -250,6 +250,43 @@ export interface ServerOrigin {
    */
   syncedProtocol?: ServerProtocol;
   /**
+   * PRIMARY HOST (task #29, the deferred #82 P2-3) — the primary console address
+   * the sync itself last WROTE into `ServerConfig.host`, and `undefined` when the
+   * sync wrote none (an addressless placeholder, or a server synced before this
+   * stamp existed).
+   *
+   * A FAITHFUL TWIN of `syncedAltHost`/`syncedIpmiHost`, and it exists to make
+   * `host` SYNC-OWNED WITH HAND-OFF rather than "device always wins". Before this
+   * stamp the sync wrote the device's `host`/`port` UNCONDITIONALLY, so a
+   * hand-edited console address on a synced server was stomped on the next sync.
+   * The stamp records what the SYNC put there, so the sync only ever overwrites a
+   * `host` still carrying exactly its own last value (or the device's current
+   * address — matrix row 5a); a hand-typed value (a stamp the value no longer
+   * equals) is left alone. This is what makes both the addressless-downgrade
+   * preserve (D3) and the telnet port-heal (D5) safe.
+   *
+   * Written ONLY where the sync writes `host` — the addressed add always, the
+   * update path only when the write rule (`syncOwnsHost`) fires, and the
+   * addressless downgrade only when it OWNS the value it is about to blank. Never
+   * inferred from the record's current value, which would launder a hand edit
+   * into "as stamped" one sync later.
+   */
+  syncedHost?: string;
+  /**
+   * PRIMARY PORT (task #29) — the numeric twin of `syncedHost` above: the console
+   * port the sync itself last WROTE into `ServerConfig.port`, and `undefined`
+   * when the sync wrote none. The SAME ownership discipline, governed by
+   * `syncOwnsPort` in the sync engine (`current === stamp || current === dev`,
+   * with the `ADDRESSLESS_PORT` sentinel normalized to absent).
+   *
+   * THE FIRST NUMERIC STAMP on this record — every other stamp is a string or an
+   * enum. Validated as an integer `>= 0` (not the non-empty-string check its
+   * siblings get) at `isValidServerOrigin`; the sync only ever writes it in the
+   * same breath as a real endpoint port, so the sentinel/undefined split carries
+   * the "no address" state exactly as an absent `syncedHost` does.
+   */
+  syncedPort?: number;
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — per-field record of what the sync's
    * TEMPLATE APPLICATION last wrote onto this server, one member per
    * non-auth templatable field. Same `syncedUsername`/`syncedAuthProfileId`
@@ -479,6 +516,17 @@ export interface DetachedServerOrigin {
    * Adopt round trip, and no later sync could move it again.
    */
   syncedProtocol?: ServerProtocol;
+  // PRIMARY HOST/PORT (task #29) — DELIBERATELY ABSENT. Unlike the receipts
+  // above, `syncedHost`/`syncedPort` (see ServerOrigin) are NOT mirrored onto the
+  // adoption marker, and the omission is correct rather than a forgotten mirror.
+  // Adoption corroborates by ADDRESS — a kept server is only adoptable when its
+  // `host` still equals the device's — so a freshly-adopted origin with
+  // `syncedHost === undefined` reads exactly right under the next update's
+  // `syncOwnsHost(current, undefined, dev)`: it returns false for a hand-typed
+  // value (current !== dev, so preserve) and true only when `current === dev`
+  // (the sync then owns and re-stamps it, matrix row 5a). A receipt here would
+  // buy nothing the address corroboration does not already guarantee. Documented
+  // so a future reader does not "complete" the mirror unnecessarily.
   /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — the per-field record of what the
    * REMOVED SOURCE'S TEMPLATE APPLICATION last wrote onto this server's
@@ -919,6 +967,15 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // the first time and changes nothing else, and an `after` discarded as
     // "unchanged" there would throw the new stamp away.
     a.syncedProtocol === b.syncedProtocol &&
+    // PRIMARY HOST/PORT (task #29) — the `host` and `port` stamps join for the
+    // same reason every stamp above them does, and this term is LOAD-BEARING:
+    // a legacy owned server whose `host` already equals the device's computes
+    // this stamp for the FIRST time (matrix row 5a) and changes nothing else,
+    // and an `after` discarded as "unchanged" here would throw the new stamp
+    // away — leaving that server permanently stampless, read as a hand entry by
+    // every later sync (its address then never followed and never healed).
+    a.syncedHost === b.syncedHost &&
+    a.syncedPort === b.syncedPort &&
     // DEVICE TEMPLATES (PR-T1) — the per-field template stamps join for the
     // same reason: a template application whose value already equals the
     // record must still land in `updates` to persist the stamp (AUTH 3a's

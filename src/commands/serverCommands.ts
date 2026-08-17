@@ -11,6 +11,7 @@ import {
   effectiveServerUsername,
   formOfferedServerCredentials,
   mergeServerConfigFields,
+  proxyConfigsEqual,
   resolveServerProtocol,
   serverConfigsEqual
 } from "../models/config";
@@ -363,6 +364,53 @@ function resolveEffectiveUsername(core: import("../core/nexusCore").NexusCore, s
     return server.username;
   }
   return effectiveServerUsername(server, core.getAuthProfile(server.authProfileId));
+}
+
+/**
+ * #84 P2 (Codex) — do two records name the SAME connection target — the box a
+ * key deploy physically lands on? The SSH key is deployed to the CAPTURED
+ * server's endpoint, so the conversion to key auth is only valid if the live
+ * record still points at that endpoint. If the target moved while the deploy or
+ * the conversion prompt was open (a concurrent host/port/proxy edit, or a
+ * replace-import reusing the id), converting would switch a DIFFERENT box — one
+ * that never received the key — to key auth, so the caller aborts instead.
+ *
+ * Connection IDENTITY = the fields that decide which host `sshFactory.connect`
+ * reaches and authenticates against: `host`, `port`, the `proxy`/jump config,
+ * and `username` (the account the key was authorized for). NOT `authType`
+ * (that is what the conversion changes), name, group, or other display fields.
+ */
+function sameConnectionIdentity(a: ServerConfig, b: ServerConfig): boolean {
+  return (
+    a.host === b.host &&
+    a.port === b.port &&
+    a.username === b.username &&
+    proxyConfigsEqual(a.proxy, b.proxy)
+  );
+}
+
+/**
+ * #84 P2 (Codex) — is the LIVE record still the same connection target the key
+ * was deployed to? Combines the structural identity (`sameConnectionIdentity`)
+ * with the RESOLVED effective username (P2-2): a profile-linked server's stored
+ * `username` is blank/unchanged even when its profile's username — the account
+ * the key was authorized for — changed under the open prompt, so the stored
+ * comparison alone accepts a moved account. `deployedEffectiveUsername` is the
+ * account resolved BEFORE the deploy (what `sshFactory.connect` authenticated
+ * as); it must still equal the live record's re-resolved effective username, or
+ * the key went to a different account and the conversion must abort. A removed
+ * record (undefined) is never the same target.
+ */
+function isSameKeyDeployTarget(
+  core: import("../core/nexusCore").NexusCore,
+  live: ServerConfig,
+  captured: ServerConfig,
+  deployedEffectiveUsername: string
+): boolean {
+  return (
+    sameConnectionIdentity(live, captured) &&
+    resolveEffectiveUsername(core, live) === deployedEffectiveUsername
+  );
 }
 
 function buildStandaloneKeyServer(server: ServerConfig, username: string, privateKeyPath: string): ServerConfig {
@@ -2235,7 +2283,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         origin: undefined,
         formerlySynced: undefined
       };
-      await ctx.core.addOrUpdateServer(copy);
+      // #84 P1 (serialization audit) — addOrUpdateServer persists a FULL server
+      // snapshot, so even adding a fresh copy must serialize under
+      // configMutationLock: a lock-free add captured its snapshot could commit
+      // after a concurrent port-heal and revert the heal on an UNRELATED server.
+      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateServer(copy));
     }),
 
     vscode.commands.registerCommand("nexus.server.rename", async (arg?: unknown) => {
@@ -2252,7 +2304,33 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === server.name) {
         return;
       }
-      await ctx.core.addOrUpdateServer({ ...server, name: newName.trim() });
+      const trimmedName = newName.trim();
+      // #84 P1 (Codex) — serialize under configMutationLock like every other
+      // server writer, and RE-READ the live record inside the lock, applying ONLY
+      // the name. `server` was captured before the input box opened; a background
+      // status-refresh port-heal (or any concurrent write) may have replaced the
+      // live host/port/stamps since. Committing the form-captured full snapshot
+      // would revert the heal and point the next connect at the stale console
+      // port — a data-loss race the heal's own lock cannot close from its side.
+      // rename holds no lock of its own and runs after the input box resolves, so
+      // there is no re-entrancy / interactive-UI-under-lock hazard.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getServer(server.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 (Codex) — BAIL if a CONCURRENT rename changed the name to some
+        // OTHER value while this input box was open: the live name no longer
+        // matches what this prompt started from (`server.name`), so writing
+        // `trimmedName` would overwrite the newer rename with a decision made
+        // against a stale name. (The port-heal re-read above is safe to keep —
+        // host/port are not the field this prompt owns — but a name that moved out
+        // from under the prompt means the prompt is stale.)
+        if (live.name !== server.name) {
+          return;
+        }
+        await ctx.core.addOrUpdateServer({ ...live, name: trimmedName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.group.rename", async (arg?: unknown) => {
@@ -2279,7 +2357,14 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === currentName) {
         return;
       }
-      await ctx.core.renameFolder(oldPath, newName.trim());
+      // #84 P1 (Codex, serialization audit) — a folder rename rewrites `group` on
+      // every server in the subtree and persists a FULL server snapshot; serialize
+      // it under configMutationLock like every other writer so a concurrent
+      // background port-heal (or edit/remove/sync) cannot interleave and clobber
+      // the folder move or have its own port write reverted. `renameFolder` reads
+      // and mutates the live server map inside the lock, so no stale snapshot is
+      // captured. The input box has already resolved — no UI is held under the lock.
+      await configMutationLock.runExclusive(() => ctx.core.renameFolder(oldPath, newName.trim()));
     }),
 
     vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {
@@ -2363,6 +2448,15 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
 
+      // #84 P2-2 (Codex) — the EFFECTIVE username the key was authorized for, as
+      // of THIS connection: for a profile-linked server it comes from the linked
+      // profile, which can change while the deploy/prompt is open. Captured BEFORE
+      // the deploy — this is the account `sshFactory.connect(server)` below
+      // installs the key for — so the conversion can later abort if the live
+      // record's effective username no longer matches it (the stored field would
+      // be identical — blank/profile-linked — and miss the change).
+      const deployedEffectiveUsername = resolveEffectiveUsername(ctx.core, server);
+
       let connection: import("../services/ssh/contracts").SshConnection | undefined;
       try {
         const deployResult = await vscode.window.withProgress(
@@ -2382,21 +2476,62 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           return;
         }
 
-        const effectiveUsername = resolveEffectiveUsername(ctx.core, server);
+        // #84 P1/P2 (Codex, serialization audit) — `server` was captured BEFORE
+        // the key deployment (a withProgress connect) and the conversion prompt,
+        // both long awaits during which a concurrent writer can replace the live
+        // record. Serialize the conversion write under configMutationLock, and
+        // inside the lock REVALIDATE the connection IDENTITY: the key physically
+        // landed on the captured endpoint, so converting is only correct if the
+        // live record still points at that endpoint. If it moved (host/port/proxy/
+        // username edit, or a replace-import reusing the id) — or the record was
+        // removed — ABORT rather than switch a box that never received the key to
+        // key auth. When it still matches, build from the LIVE record so any
+        // NON-identity concurrent edit (name, group, …) is preserved. Acquired
+        // AFTER the interactive prompts.
         if (conversionMode === "standalone") {
-          await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(server, effectiveUsername, privateKeyPath));
-          await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+          // #84 P2-1 (Codex) — the password cleanup + "switched to key auth"
+          // announcement must run ONLY when the conversion actually SUCCEEDED. On
+          // abort, the `return` exits just the mutex callback, so `converted` is
+          // propagated out to gate the cleanup — otherwise a still-password-auth
+          // (or replacement) record would have its stored password offered for
+          // deletion under a false announcement.
+          let converted = false;
+          await configMutationLock.runExclusive(async () => {
+            const live = ctx.core.getServer(server.id);
+            if (!live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
+              void vscode.window.showWarningMessage(
+                `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
+              );
+              return;
+            }
+            await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(live, deployedEffectiveUsername, privateKeyPath));
+            converted = true;
+          });
+          if (converted) {
+            await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+          }
           return;
         }
 
-        const profile = await pickOrCreateKeyAuthProfile(ctx, effectiveUsername, privateKeyPath);
+        const profile = await pickOrCreateKeyAuthProfile(ctx, deployedEffectiveUsername, privateKeyPath);
         if (!profile) {
           return;
         }
-        await ctx.core.addOrUpdateServer(
-          buildProfileLinkedKeyServer(server, effectiveUsername, privateKeyPath, profile.id)
-        );
-        await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+        let converted = false;
+        await configMutationLock.runExclusive(async () => {
+          const live = ctx.core.getServer(server.id);
+          if (!live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
+            void vscode.window.showWarningMessage(
+              `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
+            );
+            return;
+          }
+          await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, deployedEffectiveUsername, privateKeyPath, profile.id));
+          converted = true;
+        });
+        if (converted) {
+          await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+        }
       } catch (err: any) {
         void vscode.window.showErrorMessage(`Deploy failed: ${err?.message ?? err}`);
       } finally {

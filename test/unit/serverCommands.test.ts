@@ -22,6 +22,10 @@ import { SshPty } from "../../src/services/ssh/sshPty";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { validateServerConfig } from "../../src/utils/validation";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { CommandContext as CmdCtx } from "../../src/commands/types";
+import { registerProfileCommands } from "../../src/commands/profileCommands";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -533,6 +537,55 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
+  });
+
+  it("(#84 P1) rename re-reads the LIVE record under the lock and applies only the name — a console-port heal that lands while the input box is open is NOT reverted (⊘ committing the form-captured snapshot clobbers the healed port with the stale one)", async () => {
+    // The record the user's context-menu click captured — a telnet node at its
+    // pre-heal console port.
+    const captured = makeServer({ name: "old-name", host: "10.0.0.9", port: 32769, protocol: "telnet" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [captured] });
+    registerServerCommands(ctx);
+
+    // While the rename input box is open, a background status-refresh heals the
+    // console port on the LIVE record (a fresh object replaces the map entry).
+    (vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      await ctx.core.addOrUpdateServer({ ...captured, port: 32800, origin: { sourceId: "s", externalId: "e", syncedAt: 2, syncedHost: "10.0.0.9", syncedPort: 32800 } });
+      return "new-name";
+    });
+
+    // The rename is submitted with the STALE captured snapshot (ServerTreeItem
+    // returns arg.server verbatim), exactly as the context-menu path does.
+    await registeredCommands.get("nexus.server.rename")!(new ServerTreeItem(captured, false));
+
+    // The heal survives, and only the name changed.
+    const live = ctx.core.getServer("srv-1");
+    expect(live?.name).toBe("new-name");
+    expect(live?.port).toBe(32800);
+    expect(live?.origin?.syncedPort).toBe(32800);
+    // The last write must have been the merge of the LIVE record + name, never the
+    // form-captured 32769 snapshot.
+    const lastWrite = addOrUpdateServer.mock.calls.at(-1)?.[0] as ServerConfig;
+    expect(lastWrite.port).toBe(32800);
+    expect(lastWrite.name).toBe("new-name");
+  });
+
+  it("(#84 P2-1) rename bails when a CONCURRENT rename changed the name to a DIFFERENT value while the input box was open — it does not overwrite the newer rename with this stale prompt (⊘ checking only `live.name === trimmedName` lets a stale 'C' clobber a concurrent 'B')", async () => {
+    const captured = makeServer({ name: "A", host: "10.0.0.9", port: 32769 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [captured] });
+    registerServerCommands(ctx);
+
+    // While THIS rename's input box is open (renaming A -> C), another rename
+    // lands first and changes the live record to "B".
+    (vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      await ctx.core.addOrUpdateServer({ ...captured, name: "B" });
+      return "C";
+    });
+
+    await registeredCommands.get("nexus.server.rename")!(new ServerTreeItem(captured, false));
+
+    // The concurrent "B" survives — the stale "A -> C" prompt is discarded because
+    // the live name no longer matches the captured "A".
+    expect(ctx.core.getServer("srv-1")?.name).toBe("B");
   });
 
   it("(P1, remove-lock-picker-fallback fix) remove command re-checks server presence inside the lock and bails out with an info message — never falls through to an interactive picker or performs any teardown/vault/removal work — when the record was deleted while the confirmation modal or the lock wait was pending", async () => {
@@ -4900,5 +4953,327 @@ describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
     expect(copied).toContain("(no console address)");
     expect(copied).not.toContain(":0");
     expect(copied).toContain("IPMI/BMC: 10.9.9.9");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P1 (Codex, serialization audit) — folder ops that persist a FULL server
+// snapshot must serialize under configMutationLock, or a concurrent background
+// port-heal (or any other writer) can clobber the folder result or have its own
+// port write reverted on reload. Uses a REAL NexusCore + a gated repository so
+// the heal's write can be held in flight while the folder op commits.
+// ---------------------------------------------------------------------------
+describe("folder-op serialization (#84 P1)", () => {
+  class GatedRepo extends InMemoryConfigRepository {
+    private armed = false;
+    private releaseFn: () => void = () => {};
+    private startedFn: () => void = () => {};
+    public gate = new Promise<void>((r) => (this.releaseFn = r));
+    public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+    public arm(): void {
+      this.armed = true;
+    }
+    public releaseGate(): void {
+      this.releaseFn();
+    }
+    public override async saveServers(servers: ServerConfig[]): Promise<void> {
+      if (this.armed) {
+        this.armed = false; // gate ONLY the first save after arming
+        this.startedFn();
+        await this.gate;
+      }
+      return super.saveServers(servers);
+    }
+  }
+
+  function realCtx(core: NexusCore, extra: Partial<CmdCtx> = {}): CmdCtx {
+    return { core, ...extra } as unknown as CmdCtx;
+  }
+
+  function telnetServer(id: string, group: string, port: number): ServerConfig {
+    return {
+      id,
+      name: id,
+      host: "10.0.0.9",
+      port,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group,
+      origin: { sourceId: "src-1", externalId: id, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: port, syncedProtocol: "telnet" }
+    };
+  }
+
+  const healReport = (externalId: string, port: number) => ({
+    contractVersion: 1 as const,
+    statuses: { [externalId]: { state: "running" as const, consolePort: port } }
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("nexus.group.rename does not clobber a concurrent port-heal: the folder move stands AND the healed port survives (⊘ dropping the runExclusive lets the rename's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addServersBatch([telnetServer("t1", "Old", 32769)], ["Old"]);
+    registerServerCommands(realCtx(core));
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValue("New");
+
+    repo.arm();
+    const renameP = registeredCommands.get("nexus.group.rename")!(new FolderTreeItem("Old", "Old")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the rename's saveServers is blocked
+
+    // A background heal (serialized like refreshStatus does) re-ports t1.
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("t1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+
+    repo.releaseGate();
+    await Promise.all([renameP, healP]);
+
+    const t1 = (await repo.getServers()).find((s) => s.id === "t1");
+    expect(t1?.group).toBe("New"); // folder rename stands
+    expect(t1?.port).toBe(32800); // heal survives (not reverted on disk)
+  });
+
+  it("a folder rename does not clobber a concurrent server EDIT of an UNRELATED server (a latent race even before the heal) (⊘ dropping the runExclusive lets the rename's stale snapshot revert the edit)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // t1 lives in "Old" (to be renamed); x1 lives in an untouched folder.
+    const x1 = telnetServer("x1", "Keep", 22);
+    await core.addServersBatch([telnetServer("t1", "Old", 32769), x1], ["Old", "Keep"]);
+    registerServerCommands(realCtx(core));
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValue("New");
+
+    repo.arm();
+    const renameP = registeredCommands.get("nexus.group.rename")!(new FolderTreeItem("Old", "Old")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the rename's saveServers is blocked
+
+    // A concurrent server edit (serialized like nexus.server.edit) changes x1's
+    // host — replacing its object in the map, which the rename's stale snapshot
+    // (holding x1's original object) would revert.
+    const editP = configMutationLock.runExclusive(() => core.addOrUpdateServer({ ...x1, host: "10.9.9.9" }));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([renameP, editP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "t1")?.group).toBe("New"); // rename stands
+    expect(persisted.find((s) => s.id === "x1")?.host).toBe("10.9.9.9"); // edit survives
+  });
+
+  it("nexus.group.remove (delete contents) does not clobber a concurrent port-heal on a SURVIVOR: the deleted server stays deleted AND the survivor's healed port survives (⊘ dropping the runExclusive lets the cascade's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // t1 is in the folder being deleted; s1 (a survivor, telnet, sync-owned) is elsewhere.
+    await core.addServersBatch(
+      [telnetServer("t1", "Trash", 22), telnetServer("s1", "Keep", 32769)],
+      ["Trash", "Keep"]
+    );
+    registerProfileCommands(realCtx(core));
+
+    mockShowWarningMessage.mockResolvedValue("Delete contents");
+
+    repo.arm();
+    const removeP = registeredCommands.get("nexus.group.remove")!(new FolderTreeItem("Trash", "Trash")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the cascade's saveServers is blocked
+
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("s1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([removeP, healP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "t1")).toBeUndefined(); // deleted stays deleted
+    expect(persisted.find((s) => s.id === "s1")?.port).toBe(32800); // survivor's heal survives
+  });
+
+  it("nexus.server.deployKey (key conversion) does not clobber a concurrent heal of an UNRELATED telnet server, and builds from the LIVE deploy target (⊘ dropping the runExclusive+re-read lets the conversion's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // d1 is the ssh server being converted to key auth; t1 is an unrelated telnet
+    // node a background refresh heals while the deploy/prompt awaits.
+    const d1: ServerConfig = {
+      id: "d1",
+      name: "deploy-target",
+      host: "10.0.0.1",
+      port: 22,
+      username: "dev",
+      authType: "agent",
+      isHidden: false
+    };
+    await core.addServersBatch([d1, telnetServer("t1", "Keep", 32769)]);
+
+    const sshFactory = { connect: vi.fn(async () => ({ dispose: vi.fn() })) };
+    registerServerCommands(realCtx(core, { sshFactory: sshFactory as unknown as CmdCtx["sshFactory"] }));
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
+    // pickKeyForDeployment's quick pick → choose the existing key.
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // withProgress runs its callback (connect + deploy) directly.
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_opts: unknown, task: (...a: unknown[]) => unknown) => task());
+    // pickDeployConversionMode → "Use standalone key".
+    vi.mocked(vscode.window.showInformationMessage).mockResolvedValue("Use standalone key" as unknown as vscode.MessageItem);
+
+    repo.arm();
+    const deployP = registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false)) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the conversion write's saveServers is blocked
+
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("t1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([deployP, healP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "d1")?.authType).toBe("key"); // conversion stands
+    expect(persisted.find((s) => s.id === "d1")?.keyPath).toBe("/home/user/.ssh/id_ed25519");
+    expect(persisted.find((s) => s.id === "t1")?.port).toBe(32800); // unrelated heal survives
+  });
+
+  // #84 P2 (Codex) — the key is deployed to the CAPTURED endpoint; if the live
+  // connection identity (host/port/proxy/username) changed while the deploy or
+  // conversion prompt was open, converting would switch a box that never got the
+  // key to key auth. The conversion must ABORT instead. Uses a plain repo — the
+  // edit lands during the conversion prompt, BEFORE the conversion write.
+  function deployKit(core: NexusCore, sshFactory: { connect: ReturnType<typeof vi.fn> }): void {
+    registerServerCommands(realCtx(core, { sshFactory: sshFactory as unknown as CmdCtx["sshFactory"] }));
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_o: unknown, task: (...a: unknown[]) => unknown) => task());
+  }
+  const sshDeploy = () => ({ connect: vi.fn(async () => ({ dispose: vi.fn() })) });
+
+  it("nexus.server.deployKey ABORTS the conversion when the connection identity changed during deploy (standalone) — the box is NOT switched to key auth and the concurrent edit survives (⊘ skipping the identity revalidation switches a box that never received the key to key auth)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "agent", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // The conversion-mode prompt is the last await before the write: a concurrent
+    // edit changes d1's HOST (an identity field) while it is open.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateServer({ ...d1, host: "10.9.9.9" });
+      return "Use standalone key";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.host).toBe("10.9.9.9"); // the concurrent edit survives
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
+  });
+
+  it("nexus.server.deployKey ABORTS the conversion when the identity changed during deploy (profile-linked branch) — same revalidation (⊘ skipping it links a moved box to a key auth profile it can't use)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "agent", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    // A matching key auth profile so pickOrCreateKeyAuthProfile resolves without creating one.
+    await core.addOrUpdateAuthProfile({ id: "kp1", name: "K", username: "dev", authType: "key", keyPath: "/home/user/.ssh/id_ed25519" });
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick)
+      .mockResolvedValueOnce({
+        keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+      } as unknown as vscode.QuickPickItem)
+      .mockResolvedValueOnce({ profile: { id: "kp1", name: "K", username: "dev", authType: "key", keyPath: "/home/user/.ssh/id_ed25519" } } as unknown as vscode.QuickPickItem);
+    // Edit d1's PORT (identity) during the conversion-mode prompt → then choose profile.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateServer({ ...d1, port: 2222 });
+      return "Use key auth profile";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.authProfileId).toBeUndefined(); // not linked to the profile
+    expect(live?.port).toBe(2222); // the concurrent edit survives
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
+  });
+
+  it("(#84 P2-1) deployKey runs the password cleanup ONLY on a SUCCESSFUL conversion — an aborted conversion neither announces 'switched to key auth' nor deletes the stored password (⊘ running cleanup regardless of success announces a false switch and offers a still-password-auth record's password for deletion)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "password", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    const vaultGet = vi.fn(async () => "stored-pw");
+    const vaultDelete = vi.fn(async () => {});
+    deployKit(core, sshDeploy());
+    // Attach a vault so the (buggy) cleanup could act.
+    registerServerCommands(realCtx(core, {
+      sshFactory: sshDeploy() as unknown as CmdCtx["sshFactory"],
+      secretVault: { get: vaultGet, store: vi.fn(async () => {}), delete: vaultDelete } as unknown as CmdCtx["secretVault"]
+    }));
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // Mode prompt: edit d1's host (identity change → abort). The removal
+    // announcement, if the buggy cleanup ran, would return the delete action.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async (msg: string) => {
+      if (typeof msg === "string" && msg.includes("Choose how to use it")) {
+        await core.addOrUpdateServer({ ...d1, host: "10.9.9.9" });
+        return "Use standalone key";
+      }
+      return "Remove stored password";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    // Conversion aborted, so the cleanup must not have run at all.
+    expect(vi.mocked(vscode.window.showInformationMessage)).not.toHaveBeenCalledWith(
+      expect.stringContaining("switched to key authentication"),
+      expect.anything()
+    );
+    expect(vaultDelete).not.toHaveBeenCalled();
+    expect(core.getServer("d1")?.authType).toBe("password"); // never converted
+  });
+
+  it("(#84 P2-2) deployKey ABORTS when the linked profile's USERNAME changed during deploy — the stored username field is unchanged (profile-linked) but the effective account the key was authorized for moved (⊘ comparing the stored username instead of the resolved effective one converts a moved account to key auth)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // Profile-linked server: stored username blank, effective username comes from p1.
+    await core.addOrUpdateAuthProfile({ id: "p1", name: "P", username: "old-acct", authType: "password" });
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "", authType: "agent", authProfileId: "p1", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // During the mode prompt, the linked profile's username changes — the key was
+    // installed for "old-acct", the profile now resolves to "new-acct".
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateAuthProfile({ id: "p1", name: "P", username: "new-acct", authType: "password" });
+      return "Use standalone key";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.authProfileId).toBe("p1"); // still profile-linked, unchanged
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
   });
 });

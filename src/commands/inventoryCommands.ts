@@ -4422,6 +4422,15 @@ export function registerInventoryCommands(
       // apply is dropped. Complements the global generation guard, which only
       // orders sweeps against each other.
       const startRevision = source.revision;
+      // #84 P2 (Codex) — capture this source's MUTATION EPOCH as of the fetch
+      // start. A routine syncNow that lands while this fetch is in flight changes
+      // servers (e.g. a device console port) WITHOUT bumping the source revision
+      // (revision tracks config edits, not sync applies), so the revision guard
+      // alone lets a report fetched under the pre-sync state heal onto the freshly
+      // synced records — a stale write. The epoch is bumped by every server
+      // mutation for the source (sync-apply and the heal itself), so a change here
+      // means the report straddled a completed mutation and must be dropped.
+      const startEpoch = core.getSourceMutationEpoch(source.id);
       attempted++;
       try {
         const secrets: InventorySourceSecrets = {};
@@ -4448,6 +4457,61 @@ export function registerInventoryCommands(
           const currentSource = core.getInventorySource(source.id);
           if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
             core.applyInventoryStatus(source.id, report);
+            // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
+            // console-port reassignment onto sync-owned nodes, so the next
+            // connect targets the live port. Separate from the pure status apply
+            // above and non-fatal per source: a rejecting write must not abort the
+            // sweep, and the heal only ever affects the NEXT connect.
+            //
+            // P3-4 (review) — RE-CHECK the busy latch immediately before the heal
+            // PERSISTS. The latch was checked before the awaited fetch, but a
+            // sync/edit/remove can claim the source during it; applyInventoryStatus
+            // above is a pure runtime-map update (safe to run alongside), but the
+            // heal WRITES servers and must not race a concurrent persisted write.
+            //
+            // #84 P1 (Codex) — and SERIALIZE the persist itself under
+            // `configMutationLock`, the SAME singleton every other server writer
+            // holds (server edit/remove, inventory sync, template/saved-filter ops,
+            // config import/reset). `healSyncedConsolePorts` persists via
+            // `addServersBatch`, which submits a FULL server snapshot to
+            // `saveServers`; without this lock a concurrent locked write could
+            // commit between the heal's snapshot and its awaited save, and the
+            // heal's stale full snapshot would then overwrite it on disk —
+            // reverting an UNRELATED server after reload. The heal re-reads the
+            // live server list INSIDE this lock (it takes no snapshot before an
+            // await), so it never persists stale state. Acquired at the command
+            // layer, not inside core, per the AsyncMutex non-reentrancy convention
+            // (see NexusCore's configMutationLock note); refreshStatus never itself
+            // holds the lock, so there is no deadlock.
+            if (inFlightSourceIds.get(source.id) === undefined) {
+              await configMutationLock.runExclusive(async () => {
+                // #84 P2-1 (Codex) — RE-VALIDATE inside the critical section. The
+                // generation / revision / busy-latch checks above ran BEFORE this
+                // callback waited in the mutex queue. A lock-holding writer — a
+                // replace-mode config import that swaps the source AND its servers
+                // (new records reusing the old deterministic ids) — can commit
+                // while the heal waits, after which applying a report fetched under
+                // the OLD source config onto the NEW records is a stale write.
+                // Bail if the generation, this source's revision, or the busy latch
+                // changed since the pre-lock checks.
+                //
+                // #84 P2 (Codex) — ALSO bail if the source's mutation epoch
+                // advanced since fetch start. A full syncNow that completed while
+                // this fetch was outstanding changes servers (e.g. a device port)
+                // and bumps the epoch WITHOUT bumping the revision, so only the
+                // epoch check catches a report that straddled a completed sync; the
+                // revision guard would let it heal stale over the synced records.
+                if (
+                  myGeneration !== statusRefreshGeneration ||
+                  core.getInventorySource(source.id)?.revision !== startRevision ||
+                  core.getSourceMutationEpoch(source.id) !== startEpoch ||
+                  inFlightSourceIds.get(source.id) !== undefined
+                ) {
+                  return;
+                }
+                await core.healSyncedConsolePorts(source.id, report);
+              });
+            }
           }
         }
       } catch {

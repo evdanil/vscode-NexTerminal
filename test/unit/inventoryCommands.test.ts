@@ -216,7 +216,7 @@ function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySo
 }
 
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
-  return {
+  const merged: ServerConfig = {
     id: "owned-1",
     name: "old-sw",
     host: "10.0.0.1",
@@ -226,6 +226,20 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     isHidden: false,
     ...overrides
   };
+  // PRIMARY HOST/PORT (task #29) — a real synced server OWNS its address, so seed
+  // its origin's `syncedHost`/`syncedPort` to match its own host/port (when the
+  // fixture supplied an origin but not the stamps, and the record is addressed).
+  // The sync then follows a device address move rather than reading the address
+  // as a hand edit and preserving it.
+  if (merged.origin && merged.host !== "") {
+    if (merged.origin.syncedHost === undefined) {
+      merged.origin = { ...merged.origin, syncedHost: merged.host };
+    }
+    if (merged.origin.syncedPort === undefined && merged.port !== 0) {
+      merged.origin = { ...merged.origin, syncedPort: merged.port };
+    }
+  }
+  return merged;
 }
 
 // A synthetic plan for the pure rendering/drift helpers (describePlanDetail,
@@ -8287,6 +8301,277 @@ describe("nexus.inventory.refreshStatus", () => {
     panel.fireDispose();
     await registeredCommands.get("nexus.inventory.refreshStatus")!();
     expect(fetchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("P3-4 — re-checks the busy latch immediately before the persisting heal: a source that becomes busy DURING the awaited fetch has its heal SKIPPED, while the pure applyInventoryStatus still runs (⊘ persisting the heal while a concurrent sync/edit writes the same servers races two persisted writes)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    // fetchStatus opens Edit Source WHILE it is in flight — the exact race: the
+    // outer busy-check already passed, then a sync/edit claims the source during
+    // the awaited fetch. editSource marks the source busy synchronously and holds
+    // it (the form stays open).
+    const fetchStatus = vi.fn(async () => {
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+    // applyInventoryStatus is a pure runtime-map update, safe to run alongside a
+    // sync, so it still applies. The heal WRITES servers, so it is skipped while
+    // the source is busy.
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(healSpy).not.toHaveBeenCalled();
+  });
+
+  it("P3-4 control — a refresh on an idle source DOES run the heal (⊘ a latch re-check that always skips would disable the heal entirely)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(healSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // #84 P1 (Codex) — the heal persists via addServersBatch, which submits a FULL
+  // server snapshot to saveServers. If the heal's read-modify-persist is not
+  // serialized against the other server writers, a concurrent (lock-holding)
+  // edit/remove/sync can commit BETWEEN the heal's snapshot and its awaited save,
+  // and the heal's stale full snapshot then overwrites it on disk — reverting an
+  // UNRELATED server after reload. The fix runs the heal under the SAME
+  // configMutationLock every other server writer uses.
+  it("#84 — the heal does not clobber a concurrent edit of an UNRELATED server: serialized under configMutationLock, the edit survives (⊘ removing the lock lets the heal's stale full snapshot revert the concurrent edit)", async () => {
+    // A repository whose saveServers can be gated on a barrier, so the heal's
+    // save can be held in flight while a concurrent edit commits.
+    class GatedRepo extends InMemoryConfigRepository {
+      private armed = false;
+      private releaseFn: () => void = () => {};
+      private startedFn: () => void = () => {};
+      public gate = new Promise<void>((r) => (this.releaseFn = r));
+      public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+      public arm(): void {
+        this.armed = true;
+      }
+      public releaseGate(): void {
+        this.releaseFn();
+      }
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        if (this.armed) {
+          this.armed = false; // gate ONLY the first save after arming — the heal's
+          this.startedFn();
+          await this.gate;
+        }
+        return super.saveServers(servers);
+      }
+    }
+
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+
+    const externalId = "dev#1";
+    // T — the sync-owned telnet node the heal will re-port.
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    // U — an UNRELATED server the concurrent edit renames.
+    const unrelated: ServerConfig = {
+      id: "unrelated-1",
+      name: "U-original",
+      host: "10.9.9.9",
+      port: 22,
+      username: "root",
+      authType: "password",
+      isHidden: false
+    };
+    await core.addServersBatch([telnet, unrelated]);
+
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    // Gate the NEXT saveServers — the heal's.
+    repo.arm();
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    // Wait until the heal's save is in flight (blocked on the barrier).
+    await repo.firstGatedSaveStarted;
+
+    // A concurrent server edit, serialized through configMutationLock exactly as
+    // nexus.server.edit / .remove do — renames the UNRELATED server.
+    const editP = configMutationLock.runExclusive(() => core.addOrUpdateServer({ ...unrelated, name: "U-RENAMED" }));
+    // Give the edit a chance to run. WITHOUT the heal holding the lock, it
+    // acquires the lock, commits its save, and returns here; WITH the lock, it is
+    // queued behind the still-blocked heal and cannot commit yet.
+    await new Promise((r) => setTimeout(r, 0));
+
+    repo.releaseGate();
+    await Promise.all([refreshP, editP]);
+
+    // After both settle, the concurrent rename must have SURVIVED on disk.
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "unrelated-1")?.name).toBe("U-RENAMED");
+    // ...and the heal still landed (its whole point).
+    expect(persisted.find((s) => s.id === telnet.id)?.port).toBe(32800);
+  });
+
+  it("#84 P2-1 — re-validates staleness INSIDE the mutex: a source-revision bump (a replace-import) committed while the heal is QUEUED on the lock makes the heal SKIP its now-stale report (⊘ dropping the in-critical-section revision recheck lands a report fetched under the OLD source config onto the replaced records)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const externalId = "dev#1";
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    await core.addServersBatch([telnet]);
+
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const persistedSource = core.getInventorySource("src-1")!;
+
+    // A concurrent lock-holder standing in for a replace-mode config import: it
+    // HOLDS configMutationLock and, while holding, bumps the source revision
+    // (addOrUpdateInventorySource assigns a fresh revision on a config change) —
+    // exactly the window where the heal's pre-lock revision check is already stale
+    // but the heal is queued behind this holder.
+    let holdStartedResolve: () => void = () => {};
+    let releaseHold: () => void = () => {};
+    const holdStarted = new Promise<void>((r) => (holdStartedResolve = r));
+    const holdBarrier = new Promise<void>((r) => (releaseHold = r));
+    const holderP = configMutationLock.runExclusive(async () => {
+      holdStartedResolve();
+      await holdBarrier;
+      await core.addOrUpdateInventorySource({ ...persistedSource, config: { host: "replaced" } });
+    });
+    await holdStarted; // the lock is now held
+
+    // Trigger the refresh: the fetch resolves, the OUTER revision check passes
+    // (the holder has not bumped yet), applyInventoryStatus runs (pure), and the
+    // heal's runExclusive queues BEHIND the held lock.
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await new Promise((r) => setTimeout(r, 0)); // drain microtasks: heal is now queued
+
+    // Release the holder → it bumps the revision, releases the lock → the queued
+    // heal callback runs against the NEW revision.
+    releaseHold();
+    await Promise.all([holderP, refreshP]);
+
+    // The heal must have SKIPPED — the report was fetched under the pre-replace
+    // config, so its port write must not land on the replaced record.
+    expect(core.getServer(telnet.id)?.port).toBe(32769);
+  });
+
+  it("#84 P2 — a report straddling a COMPLETED sync (which changes the port + bumps the mutation epoch but NOT the source revision) does not heal stale: the in-lock epoch recheck bails, preserving the synced port (⊘ dropping the epoch recheck lands the pre-sync report over the freshly-synced record)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const externalId = "dev#1";
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    await core.addServersBatch([telnet]);
+
+    const registry = new InventoryProviderRegistry();
+    // The report was fetched under the PRE-sync state and would heal the console
+    // port to 32800.
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const persistedSource = core.getInventorySource("src-1")!;
+    const startRevision = persistedSource.revision;
+
+    // A concurrent lock-holder standing in for a full syncNow that has ALREADY
+    // cleared its busy latch (inFlightSourceIds) by the time the heal's outer
+    // checks ran, but whose server mutation lands while the heal is QUEUED on the
+    // lock. It applies a sync plan that re-ports the node to 32900 and bumps the
+    // source mutation epoch — WITHOUT bumping the config revision (a routine sync
+    // only touches lastSyncAt/managedFolders). So the heal's pre-lock revision
+    // guard and busy-latch guard BOTH pass; only the in-lock epoch recheck can
+    // catch that the report now straddles a completed sync.
+    let holdStartedResolve: () => void = () => {};
+    let releaseHold: () => void = () => {};
+    const holdStarted = new Promise<void>((r) => (holdStartedResolve = r));
+    const holdBarrier = new Promise<void>((r) => (releaseHold = r));
+    const holderP = configMutationLock.runExclusive(async () => {
+      holdStartedResolve();
+      await holdBarrier;
+      await core.applyInventorySyncPlan({
+        sourceId: "src-1",
+        syncedAt: 2,
+        upsertServers: [
+          { ...telnet, port: 32900, origin: { ...telnet.origin!, syncedPort: 32900, syncedAt: 2 } }
+        ],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: persistedSource
+      });
+    });
+    await holdStarted; // the lock is now held
+
+    // Trigger the refresh: the fetch resolves, the OUTER revision + busy checks
+    // pass (the sync has not applied yet), applyInventoryStatus runs (pure), and
+    // the heal's runExclusive queues BEHIND the held lock.
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await new Promise((r) => setTimeout(r, 0)); // drain microtasks: heal is now queued
+
+    // Release the holder → it applies the sync (port -> 32900, epoch bumped, same
+    // revision), releases the lock → the queued heal callback runs.
+    releaseHold();
+    await Promise.all([holderP, refreshP]);
+
+    // The revision never changed, so ONLY the epoch guard can drop the stale
+    // report. The synced port must survive — the report's 32800 must not land.
+    expect(core.getInventorySource("src-1")?.revision).toBe(startRevision);
+    expect(core.getServer(telnet.id)?.port).toBe(32900);
   });
 
   it("loads the source's saved secrets and passes them to fetchStatus (⊘ calling the provider without credentials makes every refresh an auth failure)", async () => {

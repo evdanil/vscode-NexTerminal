@@ -130,6 +130,7 @@ import { IMPORTED_CAPABILITY_RESET_NOTICE } from "../../src/models/terminalMacro
 import { SETTINGS_META } from "../../src/ui/settingsMetadata";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
@@ -7948,5 +7949,123 @@ describe("backup export round-trip", () => {
       typeof msg === "string" && msg.includes("missing credential")
     );
     expect(missingCredentialWarnings).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P1 (Codex, serialization audit) — the config-import writers (share import,
+// MobaXterm/SecureCRT import, host-list/inventory import) persist FULL server
+// snapshots and were lock-free. A concurrent background telnet port-heal could
+// clobber them, or be reverted by their snapshot. Each is now serialized under
+// configMutationLock. Real NexusCore + a gated repository proves it.
+// ---------------------------------------------------------------------------
+describe("config-import serialization (#84 P1)", () => {
+  class GatedRepo extends InMemoryConfigRepository {
+    private armed = false;
+    private releaseFn: () => void = () => {};
+    private startedFn: () => void = () => {};
+    public gate = new Promise<void>((r) => (this.releaseFn = r));
+    public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+    public arm(): void {
+      this.armed = true;
+    }
+    public releaseGate(): void {
+      this.releaseFn();
+    }
+    public override async saveServers(servers: ServerConfig[]): Promise<void> {
+      if (this.armed) {
+        this.armed = false; // gate ONLY the first server save after arming
+        this.startedFn();
+        await this.gate;
+      }
+      return super.saveServers(servers);
+    }
+  }
+
+  let repo: GatedRepo;
+  let importCore: NexusCore;
+
+  function existingTelnet(): ServerConfig {
+    return {
+      id: "x1",
+      name: "x1",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId: "x1", syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+  }
+  const healReport = { contractVersion: 1 as const, statuses: { x1: { state: "running" as const, consolePort: 32800 } } };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+    repo = new GatedRepo();
+    importCore = new NexusCore(repo);
+    await importCore.initialize();
+    await importCore.addOrUpdateServer(existingTelnet());
+    registerConfigCommands(importCore, vault);
+  });
+
+  // Runs an import that adds exactly one server, gated on its saveServers, while a
+  // concurrent (lock-wrapped) heal re-ports the pre-existing x1. Returns after both settle.
+  async function importWithConcurrentHeal(trigger: () => Promise<void>): Promise<void> {
+    repo.arm();
+    const importP = trigger();
+    await repo.firstGatedSaveStarted; // the import's server save is blocked
+    const healP = configMutationLock.runExclusive(() => importCore.healSyncedConsolePorts("src-1", healReport));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([importP, healP]);
+  }
+
+  it("host-list/inventory import (applyInventoryText) does not clobber a concurrent heal (⊘ dropping the runExclusive lets the batch's snapshot revert the heal)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue("10.1.1.1,imported-sw,admin\n");
+    mockShowInputBox.mockResolvedValue("");
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await importWithConcurrentHeal(() => registeredCommands.get("nexus.config.import")!() as Promise<void>);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "x1")?.port).toBe(32800); // heal survives on disk
+    expect(persisted.some((s) => s.name === "imported-sw")).toBe(true); // import lands
+  });
+
+  it("MobaXterm import (applyImportedSessions) does not clobber a concurrent heal (⊘ dropping the runExclusive lets the import's snapshot revert the heal)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "mobaxterm" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/moba.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from("[Bookmarks]\nSubRep=\nServer=#109#0%host.test%22%user%%-1%\n", "utf8"));
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await importWithConcurrentHeal(() => registeredCommands.get("nexus.config.import")!() as Promise<void>);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "x1")?.port).toBe(32800); // heal survives
+    expect(persisted.length).toBeGreaterThan(1); // the imported session landed
+  });
+
+  it("share import (importShareData) does not clobber a concurrent heal (⊘ dropping the runExclusive lets the share import's snapshot revert the heal)", async () => {
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [makeServer({ id: "imp-1", name: "shared-sw" })],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+
+    await importWithConcurrentHeal(() => registeredCommands.get("nexus.config.import")!() as Promise<void>);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "x1")?.port).toBe(32800); // heal survives
+    expect(persisted.some((s) => s.name === "shared-sw")).toBe(true); // share import lands
   });
 });
