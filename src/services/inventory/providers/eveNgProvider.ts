@@ -511,17 +511,17 @@ class EveApiClient {
    * here; a client that demands an object fails the entire sync over one empty
    * lab.
    */
-  public async listNodes(labPath: string, timeoutMs: number): Promise<[string, Record<string, unknown>][] | typeof NOT_FOUND> {
+  public async listNodes(labPath: string, timeoutMs: number): Promise<[string, unknown][] | typeof NOT_FOUND> {
     const data = await this.getDataAllowingGone(`/api/labs${encodePath(labPath)}/nodes`, timeoutMs);
     // MINOR-12 — the lab was deleted between the folder listing and this fetch.
     if (data === NOT_FOUND) {
       return NOT_FOUND;
     }
     // The documented shapes are exactly two: an object keyed by node id, or the
-    // EMPTY array EVE-NG returns for a lab with no nodes. P1 — anything else (a
-    // primitive, null, or a NON-empty array) is malformed and must fail the
-    // sync, not read as "this lab has no nodes" — which would prune the lab's
-    // servers over a bad response.
+    // EMPTY array EVE-NG returns for a lab with no nodes. P1 (data boundary) —
+    // anything else (a primitive, null, or a NON-empty array) is malformed and
+    // must fail the sync, not read as "this lab has no nodes" — which would
+    // prune the lab's servers over a bad response.
     if (Array.isArray(data)) {
       if (data.length === 0) {
         return [];
@@ -537,7 +537,17 @@ class EveApiClient {
         `EVE-NG returned a malformed node list for "${labPath}" — expected an object keyed by node id or an empty array.`
       );
     }
-    return Object.entries(data).filter((pair): pair is [string, Record<string, unknown>] => isObject(pair[1]));
+    // P1 (one level deeper) — every OWN entry is returned UNFILTERED, malformed
+    // values included. A node whose value is not an object still has a
+    // recoverable identity (its map KEY), so the caller preserves it as an
+    // endpoint-less placeholder rather than dropping it — dropping would remove
+    // its externalId and let computeSyncPlan prune its server. Contrast the LAB
+    // case in `walkFolders`, which FAILS on a malformed entry: a lab has no
+    // recoverable node identity, so there is nothing safe to place. `Object.entries`
+    // reads only own enumerable properties and never writes, so a
+    // prototype-polluting key (`__proto__`, `constructor` from JSON.parse) is
+    // just a harmless string that becomes part of the externalId.
+    return Object.entries(data);
   }
 
   /**
@@ -597,9 +607,28 @@ class EveApiClient {
         }
 
         for (const rawLab of listing.labs) {
-          if (!isObject(rawLab)) continue;
+          // P1 — a malformed LAB entry FAILS the sync (the OPPOSITE of the
+          // malformed-NODE case in `listNodes`, and the asymmetry is the point).
+          // A node has a recoverable identity — its map key — so a bad node
+          // value is preserved as an endpoint-less placeholder. A lab does not:
+          // if the entry is not an object, or is an object with no usable `.unl`
+          // path, we cannot enumerate which nodes/servers it should contain, so
+          // there is no safe placeholder. Skipping it would omit an UNKNOWN
+          // number of real servers while leaving the tree non-truncated, and
+          // computeSyncPlan would prune every one of them — so we fail loudly.
+          if (!isObject(rawLab)) {
+            throw new InventoryProviderError(
+              "protocol",
+              `EVE-NG returned a malformed lab entry under "${path}" (not an object). Failing the sync rather than risk pruning that lab's servers.`
+            );
+          }
           const labPath = normalizeFolderPath(str(rawLab.path) || joinPath(path, str(rawLab.file)));
-          if (!labPath.toLowerCase().endsWith(".unl")) continue;
+          if (!labPath.toLowerCase().endsWith(".unl")) {
+            throw new InventoryProviderError(
+              "protocol",
+              `EVE-NG returned a lab entry under "${path}" with no usable .unl path. Failing the sync rather than risk pruning that lab's servers.`
+            );
+          }
           // MAJOR-1(a)/(b) — confine the lab path with the SAME boundary check
           // as folder edges, and reject dot-segments, before it is ever turned
           // into a `/api/labs{labPath}/nodes` request. Skipping a lab hides
@@ -863,6 +892,23 @@ function mapNode(
 }
 
 /**
+ * P1 — the endpoint-less placeholder for a node whose VALUE was malformed (not
+ * an object). Its identity survives on the map KEY, so it keeps its stable
+ * externalId and stays present in the tree — which is what stops
+ * `computeSyncPlan` reading it as deleted and pruning its server. The key is
+ * used only as an interpolated string; nothing is ever written through it, so a
+ * `__proto__` / `constructor` key is harmless here.
+ */
+function placeholderNodeDevice(nodeId: string, lab: EveLab, rootPrefix: string): InventoryDevice {
+  return {
+    externalId: `${lab.path}#${nodeId}`,
+    name: `node-${nodeId}`,
+    folderPath: labFolderPath(lab, rootPrefix),
+    endpoints: []
+  };
+}
+
+/**
  * The lab's own folder, made RELATIVE to the source's root folder, with the lab
  * name as the final segment — so every lab is a folder in the tree and the
  * source's `targetFolder` is not shadowed by a repeat of the root path.
@@ -926,6 +972,7 @@ async function fetchInventoryImpl(
 
   const devices: InventoryDevice[] = [];
   let noConsoleCount = 0;
+  let malformedNodeCount = 0;
   let goneLabs = 0;
   let nodesCapped = false;
   for (const lab of walk.labs) {
@@ -938,7 +985,14 @@ async function fetchInventoryImpl(
       continue;
     }
     for (const [nodeId, raw] of nodePairs) {
-      if (!includeStopped && Number(raw.status) !== 2) {
+      // P1 — a malformed node VALUE keeps its identity (the map key), so it is
+      // NEVER dropped: emit it as an endpoint-less placeholder that survives the
+      // prune. The includeStopped filter is skipped for it (we cannot read a
+      // status we do not have, and dropping it would prune its server). This is
+      // the deliberate counterpart to the malformed-LAB case, which fails the
+      // sync because a lab has no recoverable node identity to place.
+      const malformed = !isObject(raw);
+      if (!malformed && !includeStopped && Number((raw as Record<string, unknown>).status) !== 2) {
         continue;
       }
       if (devices.length >= MAX_NODES) {
@@ -946,7 +1000,12 @@ async function fetchInventoryImpl(
         truncated = true;
         break;
       }
-      const mapped = mapNode(nodeId, raw, lab, rootPrefix, consoleHost, client.hostname);
+      if (malformed) {
+        devices.push(placeholderNodeDevice(nodeId, lab, rootPrefix));
+        malformedNodeCount++;
+        continue;
+      }
+      const mapped = mapNode(nodeId, raw as Record<string, unknown>, lab, rootPrefix, consoleHost, client.hostname);
       devices.push(mapped.device);
       if (!mapped.hasEndpoint) {
         noConsoleCount++;
@@ -961,6 +1020,13 @@ async function fetchInventoryImpl(
       `${noConsoleCount} node${noConsoleCount === 1 ? " has" : "s have"} no telnet console URL (a non-telnet console type, or no console address yet) and ${
         noConsoleCount === 1 ? "was" : "were"
       } imported without a connection endpoint.`
+    );
+  }
+  if (malformedNodeCount > 0) {
+    // P1 — one aggregate line. These devices are kept (endpoint-less) so their
+    // servers are not pruned, but the data problem is surfaced.
+    warnings.push(
+      `${malformedNodeCount} node ${malformedNodeCount === 1 ? "entry was" : "entries were"} malformed and imported without a console endpoint.`
     );
   }
   if (goneLabs > 0) {

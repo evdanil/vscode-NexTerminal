@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { EVE_NG_PROVIDER_ID, createEveNgProvider, eveNgInstanceKey, labFolderPath } from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
+import { deterministicServerId } from "../../src/services/inventory/deterministicId";
+import type { ServerConfig } from "../../src/models/config";
 
 /**
  * EVE-NG's identity as a deployment — the same contract `netboxInstanceKey`
@@ -641,6 +643,57 @@ describe("createEveNgProvider — folder walk", () => {
     expect(tree.truncated).toBeFalsy();
   });
 
+  /**
+   * P1 (data-loss) — the OPPOSITE treatment to the malformed-node case, and the
+   * asymmetry is the point. A malformed LAB entry inside an accepted `labs`
+   * array has NO recoverable identity: you cannot enumerate which nodes it
+   * should contain, so there is no safe placeholder to emit. Skip-and-continue
+   * would omit an UNKNOWN number of real servers while leaving the tree
+   * non-truncated → computeSyncPlan prunes them all. So this FAILS the sync.
+   */
+  it("P1 — fails the sync on a non-object lab entry inside a valid labs array, rather than skipping it (⊘ `continue` omits every node of that lab and prunes its servers)", async () => {
+    for (const badLab of [null, "L.unl", 42]) {
+      const world: World = {
+        folders: { "/": { folders: [], labs: [{ file: "Good.unl", path: "/Good.unl" }, badLab as never] } },
+        nodes: { "/Good.unl": { "1": node() } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      const err = await createEveNgProvider(fetchImpl)
+        .fetchInventory(CONFIG, SECRETS)
+        .catch((e: unknown) => e);
+      expect(err, `lab=${JSON.stringify(badLab)}`).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, `lab=${JSON.stringify(badLab)}`).toBe("protocol");
+    }
+  });
+
+  it("P1 — the sync fails ATOMICALLY: a valid sibling lab is not partially imported alongside a malformed one (⊘ importing the good lab while dropping the bad one still prunes the bad lab's servers)", async () => {
+    const world: World = {
+      folders: { "/": { folders: [], labs: [{ file: "Good.unl", path: "/Good.unl" }, null as never] } },
+      nodes: { "/Good.unl": { "1": node() } }
+    };
+    const { fetchImpl } = makeWorld(world);
+    const result = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .then(() => "resolved" as const)
+      .catch(() => "rejected" as const);
+    expect(result).toBe("rejected");
+  });
+
+  it("P1 — fails the sync on a lab entry that is a valid object but carries no usable `.unl` path (⊘ silently dropping it has the same prune consequence as a non-object entry)", async () => {
+    for (const badLab of [{ file: "", path: "" }, { name: "x" }, { path: "/NotALab" }]) {
+      const world: World = {
+        folders: { "/": { folders: [], labs: [{ file: "Good.unl", path: "/Good.unl" }, badLab as never] } },
+        nodes: { "/Good.unl": { "1": node() } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      const err = await createEveNgProvider(fetchImpl)
+        .fetchInventory(CONFIG, SECRETS)
+        .catch((e: unknown) => e);
+      expect(err, `lab=${JSON.stringify(badLab)}`).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, `lab=${JSON.stringify(badLab)}`).toBe("protocol");
+    }
+  });
+
   it("MAJOR-1(b) — refuses a folder child path containing a `..` segment BEFORE requesting it, so `new URL` cannot collapse it to a different origin path after the guard approved it (⊘ isWithin runs on the pre-normalized path — `/A/../../secret` startsWith `/A/`, passes, then the fetch lands on /api/secret with the cookie)", async () => {
     const world: World = {
       folders: {
@@ -758,9 +811,79 @@ describe("createEveNgProvider — nodes", () => {
     expect(tree.devices).toHaveLength(1);
   });
 
-  it("M38 — skips a node entry whose value is not an object (a string, number, or null), keeping only real nodes (⊘ dropping the isObject filter turns `\"2\": 42` into a phantom `node-2` server)", async () => {
+  /**
+   * P1 (data-loss, one level deeper) — a malformed node VALUE inside an
+   * ACCEPTED node map has a recoverable identity (its map key), so it must be
+   * PRESERVED as an endpoint-less placeholder rather than filtered out. Dropping
+   * it removes its externalId while leaving the tree non-truncated, so
+   * computeSyncPlan reads it as deleted and prunes its server + credentials on
+   * the next sync of an otherwise-healthy lab.
+   */
+  it("P1 — preserves a malformed node value (null / string / number) as an endpoint-less placeholder keyed by the map key, and does NOT truncate (⊘ filtering it out drops its externalId and computeSyncPlan prunes its server)", async () => {
     const tree = await fetchTree(oneLabWorld({ "1": node(), "2": 42 as never, "3": "garbage" as never, "4": null as never }));
-    expect(tree.devices.map((d) => d.externalId)).toEqual(["/Lab 1.unl#1"]);
+    const byId = (id: string) => tree.devices.find((d) => d.externalId === `/Lab 1.unl#${id}`);
+    expect(tree.devices.map((d) => d.externalId).sort()).toEqual(["/Lab 1.unl#1", "/Lab 1.unl#2", "/Lab 1.unl#3", "/Lab 1.unl#4"]);
+    for (const id of ["2", "3", "4"]) {
+      expect(byId(id)?.name).toBe(`node-${id}`);
+      expect(byId(id)?.endpoints).toEqual([]);
+    }
+    // ⊘ Nothing was capped — a placeholder must not disable pruning of genuinely gone nodes.
+    expect(tree.truncated).toBeFalsy();
+  });
+
+  it("P1 — reports the malformed node entries in an aggregate warning naming the count (⊘ one warning per node buries the summary; no warning hides a real data problem)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node(), "2": null as never, "3": "x" as never }));
+    const malformed = (tree.warnings ?? []).filter((w) => /malformed/i.test(w));
+    expect(malformed).toHaveLength(1);
+    expect(malformed[0]).toContain("2");
+  });
+
+  it("P1 — a prototype-polluting map key (`__proto__` / `constructor`) yields a plain-string externalId and never touches Object.prototype (⊘ a naive object-keyed write would pollute the prototype chain)", async () => {
+    // Built via a raw JSON body so the keys are OWN properties on the parsed
+    // object (a `{ __proto__: … }` object literal would set the prototype, not a
+    // key). This is exactly the shape a hostile server could send.
+    const rawNodes =
+      '{"code":200,"status":"success","message":"","data":{"__proto__":null,"constructor":"x","1":{"id":"1","name":"R1","console":"telnet","url":"telnet://10.0.0.5:23","status":2}}}';
+    const fetchImpl = (async (input: string) => {
+      const path = decodeURIComponent(new URL(input).pathname);
+      if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      if (path === "/api/folders/") return makeResponse(200, jsend({ folders: [], labs: [{ file: "L.unl", path: "/L.unl" }] }));
+      return makeResponse(200, rawNodes);
+    }) as unknown as typeof fetch;
+
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices.some((d) => d.externalId === "/L.unl#__proto__")).toBe(true);
+    expect(tree.devices.some((d) => d.externalId === "/L.unl#constructor")).toBe(true);
+    expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("P1 — an owned server for a now-malformed node is NOT pruned by computeSyncPlan (the whole point: the placeholder keeps it present) (⊘ a dropped node reads as deleted and lands in `prunes`)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node(), "2": null as never }));
+    const source = {
+      id: "src-eve",
+      providerId: EVE_NG_PROVIDER_ID,
+      name: "Lab",
+      targetFolder: "EVE",
+      prunePolicy: "delete" as const,
+      defaultUsername: "admin",
+      config: CONFIG,
+      secretFieldIds: ["password"]
+    };
+    const ownedForNode2: ServerConfig = {
+      id: deterministicServerId("src-eve", "/Lab 1.unl#2"),
+      name: "node-2",
+      host: "eve.example.com",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "EVE/Lab 1",
+      origin: { sourceId: "src-eve", externalId: "/Lab 1.unl#2", syncedAt: 1 }
+    };
+    const plan = computeSyncPlan({ source, tree, currentServers: [ownedForNode2], now: 2_000 });
+    expect(plan.prunes.map((p) => p.server.origin?.externalId)).not.toContain("/Lab 1.unl#2");
   });
 
   it("maps status 2 to running and everything else to stopped", async () => {
