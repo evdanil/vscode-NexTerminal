@@ -361,6 +361,31 @@ describe("nexus.server.connectBmcSol", () => {
     expect(err).toContain("unavailable");
   });
 
+  it("ABORTS — no telnet session touched, no local terminal — when the configured gateway is a TELNET profile", async () => {
+    const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
+    // Addressed, but telnet — no SSH console to route the SOL command through.
+    const gateway = server({ id: "gw-1", name: "telnet-box", host: "10.9.9.9", protocol: "telnet" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus Telnet: telnet-box", show: vi.fn(), sendText: (text: string) => gwSent.push(text) };
+    const ctx = gatewayContext({
+      servers: [target, gateway],
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]]),
+      secrets: VAULTED
+    });
+
+    await connectBmcSol(ctx, { server: target });
+
+    // Nothing sent into the telnet console, and no local -E fall-back.
+    expect(gwSent).toEqual([]);
+    expect(createdTerminals).toHaveLength(0);
+    expect(showErrorMessage).toHaveBeenCalledTimes(1);
+    const err = String(showErrorMessage.mock.calls[0][0]);
+    expect(err).toContain("Core Switch");
+    expect(err).toContain("unavailable");
+    expect(err).toContain("Telnet");
+  });
+
   it("ABORTS — no local -E terminal — when the configured gateway is ADDRESSLESS", async () => {
     const target = server({ id: "srv-1", name: "Core Switch", ipmiGatewayServerId: "gw-1" });
     const gateway = server({ id: "gw-1", name: "stopped-gw", host: "", addressless: true });

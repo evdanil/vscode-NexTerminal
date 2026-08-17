@@ -1430,6 +1430,32 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(status).not.toContain("running locally");
   });
 
+  it("ABORTS — no session opened, nothing sent — when route:ipmiGateway but the configured gateway is a TELNET profile (⊘ routing into it sends the gateway macro into that device's telnet console, not an SSH gateway)", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    // Has a host (so NOT addressless), but speaks telnet — no SSH console.
+    const gateway = server({ id: "gw-1", name: "telnet-box", host: "10.9.9.9", protocol: "telnet" });
+    const gwSent: string[] = [];
+    const gwTerminal = { name: "Nexus Telnet: telnet-box", show: () => {}, sendText: (text: string) => gwSent.push(text) };
+    const ctx = routingContext({
+      servers: [target, gateway],
+      // A pre-seeded session so a buggy "route anyway" impl would visibly reuse it.
+      sessions: [{ id: "sess-gw", serverId: "gw-1" }],
+      terminals: new Map<string, unknown>([["sess-gw", gwTerminal]])
+    });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // Nothing ran anywhere — not into the telnet session, not into a local terminal.
+    expect(gwSent).toEqual([]);
+    expect(createdTerminals).toHaveLength(0);
+    expect(connectServer).not.toHaveBeenCalled();
+    const err = showErrorMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(err).toContain("unavailable");
+    expect(err).toContain("Telnet");
+  });
+
   it("ABORTS — no local terminal — when route:ipmiGateway but the gateway id is dangling/deleted (names no server)", async () => {
     const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "ghost" });
     const ctx = routingContext({ servers: [target] });

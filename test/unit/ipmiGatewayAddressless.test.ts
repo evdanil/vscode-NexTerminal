@@ -66,6 +66,15 @@ describe("resolveIpmiGatewayServer — three dispositions", () => {
     });
   });
 
+  it("resolves a TELNET-protocol gateway to { kind: 'unavailable', reason: 'telnet' } — it has a host but no SSH console to route ipmitool through (⊘ returning { kind:'server' } sends the gateway-routed command into that device's telnet console)", () => {
+    const target = server({ id: "t", ipmiGatewayServerId: "gw" });
+    const gateway = server({ id: "gw", name: "telnet-box", host: "10.0.0.9", protocol: "telnet" });
+    expect(resolveIpmiGatewayServer(ctxWith([target, gateway]), target)).toEqual({
+      kind: "unavailable",
+      reason: "telnet"
+    });
+  });
+
   it("resolves NO configured gateway (id unset) to { kind: 'none' } — local is the route (⊘ returning 'unavailable' here would wrongly abort a legitimate local run)", () => {
     const target = server({ id: "t" });
     expect(resolveIpmiGatewayServer(ctxWith([target]), target)).toEqual({ kind: "none" });
