@@ -11,6 +11,7 @@ import {
   effectiveServerUsername,
   formOfferedServerCredentials,
   mergeServerConfigFields,
+  proxyConfigsEqual,
   resolveServerProtocol,
   serverConfigsEqual
 } from "../models/config";
@@ -363,6 +364,29 @@ function resolveEffectiveUsername(core: import("../core/nexusCore").NexusCore, s
     return server.username;
   }
   return effectiveServerUsername(server, core.getAuthProfile(server.authProfileId));
+}
+
+/**
+ * #84 P2 (Codex) — do two records name the SAME connection target — the box a
+ * key deploy physically lands on? The SSH key is deployed to the CAPTURED
+ * server's endpoint, so the conversion to key auth is only valid if the live
+ * record still points at that endpoint. If the target moved while the deploy or
+ * the conversion prompt was open (a concurrent host/port/proxy edit, or a
+ * replace-import reusing the id), converting would switch a DIFFERENT box — one
+ * that never received the key — to key auth, so the caller aborts instead.
+ *
+ * Connection IDENTITY = the fields that decide which host `sshFactory.connect`
+ * reaches and authenticates against: `host`, `port`, the `proxy`/jump config,
+ * and `username` (the account the key was authorized for). NOT `authType`
+ * (that is what the conversion changes), name, group, or other display fields.
+ */
+function sameConnectionIdentity(a: ServerConfig, b: ServerConfig): boolean {
+  return (
+    a.host === b.host &&
+    a.port === b.port &&
+    a.username === b.username &&
+    proxyConfigsEqual(a.proxy, b.proxy)
+  );
 }
 
 function buildStandaloneKeyServer(server: ServerConfig, username: string, privateKeyPath: string): ServerConfig {
@@ -2420,20 +2444,28 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         }
 
         const effectiveUsername = resolveEffectiveUsername(ctx.core, server);
-        // #84 P1 (Codex, serialization audit) — `server` was captured BEFORE the
-        // key deployment (a withProgress connect) and the conversion prompt, both
-        // long awaits during which a background port-heal (or any writer) can
-        // replace the live record. Serialize the conversion write under
-        // configMutationLock and build it from the RE-READ live record, so only
-        // the auth-type/key/username changes land and a concurrent heal's
-        // host/port survives. The key builders spread `...server`, so passing
-        // `live` preserves its address. Acquired AFTER the interactive prompts.
+        // #84 P1/P2 (Codex, serialization audit) — `server` was captured BEFORE
+        // the key deployment (a withProgress connect) and the conversion prompt,
+        // both long awaits during which a concurrent writer can replace the live
+        // record. Serialize the conversion write under configMutationLock, and
+        // inside the lock REVALIDATE the connection IDENTITY: the key physically
+        // landed on the captured endpoint, so converting is only correct if the
+        // live record still points at that endpoint. If it moved (host/port/proxy/
+        // username edit, or a replace-import reusing the id) — or the record was
+        // removed — ABORT rather than switch a box that never received the key to
+        // key auth. When it still matches, build from the LIVE record so any
+        // NON-identity concurrent edit (name, group, …) is preserved. Acquired
+        // AFTER the interactive prompts.
         if (conversionMode === "standalone") {
           await configMutationLock.runExclusive(async () => {
             const live = ctx.core.getServer(server.id);
-            if (live) {
-              await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(live, effectiveUsername, privateKeyPath));
+            if (!live || !sameConnectionIdentity(live, server)) {
+              void vscode.window.showWarningMessage(
+                `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
+              );
+              return;
             }
+            await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(live, effectiveUsername, privateKeyPath));
           });
           await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
           return;
@@ -2445,9 +2477,13 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         }
         await configMutationLock.runExclusive(async () => {
           const live = ctx.core.getServer(server.id);
-          if (live) {
-            await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, effectiveUsername, privateKeyPath, profile.id));
+          if (!live || !sameConnectionIdentity(live, server)) {
+            void vscode.window.showWarningMessage(
+              `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
+            );
+            return;
           }
+          await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, effectiveUsername, privateKeyPath, profile.id));
         });
         await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
       } catch (err: any) {

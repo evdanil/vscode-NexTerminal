@@ -5142,4 +5142,73 @@ describe("folder-op serialization (#84 P1)", () => {
     expect(persisted.find((s) => s.id === "d1")?.keyPath).toBe("/home/user/.ssh/id_ed25519");
     expect(persisted.find((s) => s.id === "t1")?.port).toBe(32800); // unrelated heal survives
   });
+
+  // #84 P2 (Codex) — the key is deployed to the CAPTURED endpoint; if the live
+  // connection identity (host/port/proxy/username) changed while the deploy or
+  // conversion prompt was open, converting would switch a box that never got the
+  // key to key auth. The conversion must ABORT instead. Uses a plain repo — the
+  // edit lands during the conversion prompt, BEFORE the conversion write.
+  function deployKit(core: NexusCore, sshFactory: { connect: ReturnType<typeof vi.fn> }): void {
+    registerServerCommands(realCtx(core, { sshFactory: sshFactory as unknown as CmdCtx["sshFactory"] }));
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_o: unknown, task: (...a: unknown[]) => unknown) => task());
+  }
+  const sshDeploy = () => ({ connect: vi.fn(async () => ({ dispose: vi.fn() })) });
+
+  it("nexus.server.deployKey ABORTS the conversion when the connection identity changed during deploy (standalone) — the box is NOT switched to key auth and the concurrent edit survives (⊘ skipping the identity revalidation switches a box that never received the key to key auth)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "agent", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // The conversion-mode prompt is the last await before the write: a concurrent
+    // edit changes d1's HOST (an identity field) while it is open.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateServer({ ...d1, host: "10.9.9.9" });
+      return "Use standalone key";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.host).toBe("10.9.9.9"); // the concurrent edit survives
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
+  });
+
+  it("nexus.server.deployKey ABORTS the conversion when the identity changed during deploy (profile-linked branch) — same revalidation (⊘ skipping it links a moved box to a key auth profile it can't use)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "agent", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    // A matching key auth profile so pickOrCreateKeyAuthProfile resolves without creating one.
+    await core.addOrUpdateAuthProfile({ id: "kp1", name: "K", username: "dev", authType: "key", keyPath: "/home/user/.ssh/id_ed25519" });
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick)
+      .mockResolvedValueOnce({
+        keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+      } as unknown as vscode.QuickPickItem)
+      .mockResolvedValueOnce({ profile: { id: "kp1", name: "K", username: "dev", authType: "key", keyPath: "/home/user/.ssh/id_ed25519" } } as unknown as vscode.QuickPickItem);
+    // Edit d1's PORT (identity) during the conversion-mode prompt → then choose profile.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateServer({ ...d1, port: 2222 });
+      return "Use key auth profile";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.authProfileId).toBeUndefined(); // not linked to the profile
+    expect(live?.port).toBe(2222); // the concurrent edit survives
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
+  });
 });
