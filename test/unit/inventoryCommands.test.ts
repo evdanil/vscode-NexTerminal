@@ -8344,6 +8344,100 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(healSpy).toHaveBeenCalledTimes(1);
   });
 
+  // #84 P1 (Codex) — the heal persists via addServersBatch, which submits a FULL
+  // server snapshot to saveServers. If the heal's read-modify-persist is not
+  // serialized against the other server writers, a concurrent (lock-holding)
+  // edit/remove/sync can commit BETWEEN the heal's snapshot and its awaited save,
+  // and the heal's stale full snapshot then overwrites it on disk — reverting an
+  // UNRELATED server after reload. The fix runs the heal under the SAME
+  // configMutationLock every other server writer uses.
+  it("#84 — the heal does not clobber a concurrent edit of an UNRELATED server: serialized under configMutationLock, the edit survives (⊘ removing the lock lets the heal's stale full snapshot revert the concurrent edit)", async () => {
+    // A repository whose saveServers can be gated on a barrier, so the heal's
+    // save can be held in flight while a concurrent edit commits.
+    class GatedRepo extends InMemoryConfigRepository {
+      private armed = false;
+      private releaseFn: () => void = () => {};
+      private startedFn: () => void = () => {};
+      public gate = new Promise<void>((r) => (this.releaseFn = r));
+      public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+      public arm(): void {
+        this.armed = true;
+      }
+      public releaseGate(): void {
+        this.releaseFn();
+      }
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        if (this.armed) {
+          this.armed = false; // gate ONLY the first save after arming — the heal's
+          this.startedFn();
+          await this.gate;
+        }
+        return super.saveServers(servers);
+      }
+    }
+
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+
+    const externalId = "dev#1";
+    // T — the sync-owned telnet node the heal will re-port.
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    // U — an UNRELATED server the concurrent edit renames.
+    const unrelated: ServerConfig = {
+      id: "unrelated-1",
+      name: "U-original",
+      host: "10.9.9.9",
+      port: 22,
+      username: "root",
+      authType: "password",
+      isHidden: false
+    };
+    await core.addServersBatch([telnet, unrelated]);
+
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    // Gate the NEXT saveServers — the heal's.
+    repo.arm();
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    // Wait until the heal's save is in flight (blocked on the barrier).
+    await repo.firstGatedSaveStarted;
+
+    // A concurrent server edit, serialized through configMutationLock exactly as
+    // nexus.server.edit / .remove do — renames the UNRELATED server.
+    const editP = configMutationLock.runExclusive(() => core.addOrUpdateServer({ ...unrelated, name: "U-RENAMED" }));
+    // Give the edit a chance to run. WITHOUT the heal holding the lock, it
+    // acquires the lock, commits its save, and returns here; WITH the lock, it is
+    // queued behind the still-blocked heal and cannot commit yet.
+    await new Promise((r) => setTimeout(r, 0));
+
+    repo.releaseGate();
+    await Promise.all([refreshP, editP]);
+
+    // After both settle, the concurrent rename must have SURVIVED on disk.
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "unrelated-1")?.name).toBe("U-RENAMED");
+    // ...and the heal still landed (its whole point).
+    expect(persisted.find((s) => s.id === telnet.id)?.port).toBe(32800);
+  });
+
   it("loads the source's saved secrets and passes them to fetchStatus (⊘ calling the provider without credentials makes every refresh an auth failure)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

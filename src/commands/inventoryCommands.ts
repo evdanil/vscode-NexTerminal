@@ -4459,8 +4459,23 @@ export function registerInventoryCommands(
             // sync/edit/remove can claim the source during it; applyInventoryStatus
             // above is a pure runtime-map update (safe to run alongside), but the
             // heal WRITES servers and must not race a concurrent persisted write.
+            //
+            // #84 P1 (Codex) — and SERIALIZE the persist itself under
+            // `configMutationLock`, the SAME singleton every other server writer
+            // holds (server edit/remove, inventory sync, template/saved-filter ops,
+            // config import/reset). `healSyncedConsolePorts` persists via
+            // `addServersBatch`, which submits a FULL server snapshot to
+            // `saveServers`; without this lock a concurrent locked write could
+            // commit between the heal's snapshot and its awaited save, and the
+            // heal's stale full snapshot would then overwrite it on disk —
+            // reverting an UNRELATED server after reload. The heal re-reads the
+            // live server list INSIDE this lock (it takes no snapshot before an
+            // await), so it never persists stale state. Acquired at the command
+            // layer, not inside core, per the AsyncMutex non-reentrancy convention
+            // (see NexusCore's configMutationLock note); refreshStatus never itself
+            // holds the lock, so there is no deadlock.
             if (inFlightSourceIds.get(source.id) === undefined) {
-              await core.healSyncedConsolePorts(source.id, report);
+              await configMutationLock.runExclusive(() => core.healSyncedConsolePorts(source.id, report));
             }
           }
         }
