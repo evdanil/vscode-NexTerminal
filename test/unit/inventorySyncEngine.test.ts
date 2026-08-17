@@ -846,6 +846,99 @@ describe("computeSyncPlan — updates", () => {
     expect(planWithoutUsername.updates[0].after.username).toBe("evgeny");
   });
 
+  // #84 P2 (Codex) — ENDPOINT-TUPLE COHERENCE. host + port + protocol + username
+  // describe ONE endpoint. When the user hand-edits the ADDRESS (so the sync hands
+  // off host/port and retains the manual endpoint), the OTHER endpoint-derived
+  // fields must NOT be applied from the inventory endpoint the user effectively
+  // rejected — otherwise the record points at the user's endpoint but authenticates
+  // as the device's account (username) or speaks the device's transport (protocol).
+  // `takesEndpoint = takesHost && takesPort` is the "the record is following the
+  // device's endpoint" gate; the endpoint-derived fields ride on it.
+  it("#84 P2 — a hand-edited HOST (address retained) keeps the CURRENT username and its syncedUsername stamp, NOT the inventory endpoint's (⊘ applying the endpoint username regardless of takesEndpoint authenticates the retained endpoint as the device's account)", () => {
+    // The sync last wrote host 10.0.0.1; the user hand-retyped it to 10.0.0.99. The
+    // device still advertises 10.0.0.1 WITH an endpoint username; renamed so an
+    // update is produced regardless of the username decision.
+    const before = makeOwnedServer({
+      username: "evgeny",
+      host: "10.0.0.99",
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedHost: "10.0.0.1",
+        syncedPort: 22,
+        syncedUsername: "prevsync"
+      }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "netops" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.host).toBe("10.0.0.99"); // the hand address is retained (#82 P2-3)
+    expect(after.username).toBe("evgeny"); // the rejected endpoint's username must NOT land
+    expect(after.origin?.syncedUsername).toBe("prevsync"); // ...nor its stamp
+  });
+
+  it("#84 P2 — a hand-edited PORT (address retained) likewise keeps the CURRENT username and its syncedUsername stamp (⊘ same bug reached via the port half of the tuple)", () => {
+    const before = makeOwnedServer({
+      username: "evgeny",
+      port: 9999,
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedHost: "10.0.0.1",
+        syncedPort: 22,
+        syncedUsername: "prevsync"
+      }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "netops" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.port).toBe(9999); // the hand port is retained
+    expect(after.username).toBe("evgeny");
+    expect(after.origin?.syncedUsername).toBe("prevsync");
+  });
+
+  it("#84 P2 — DISCRIMINATOR: when the address IS accepted (sync-owned, not hand-edited), the endpoint username IS applied and stamped, exactly as before (⊘ gating the username on 'address NOT taken' would strand a genuinely-followed endpoint on the old account)", () => {
+    const before = makeOwnedServer({ username: "evgeny" }); // sync-owned address (host === syncedHost)
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "netops" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.username).toBe("netops"); // the endpoint is followed → its username applies
+    expect(after.origin?.syncedUsername).toBe("netops");
+  });
+
+  it("#84 P2 — a sync-owned PROTOCOL rides with a RETAINED hand-edited address: a device that flips to SSH does NOT reset the telnet protocol while the telnet endpoint is kept (⊘ writing the protocol on takesProtocol alone leaves SSH pointed at the retained telnet endpoint)", () => {
+    // Sync-owned telnet (record telnet, stamp telnet) whose console was ALSO
+    // hand-edited (host 10.9.9.9:2222, sync last wrote 10.0.0.5:22). The device now
+    // advertises an SSH primary — a transport change the sync owns — so on
+    // takesProtocol alone the protocol would flip to ssh while the hand telnet
+    // endpoint is retained: SSH aimed at a telnet box.
+    const before = makeOwnedServer({
+      protocol: "telnet",
+      host: "10.9.9.9",
+      port: 2222,
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedHost: "10.0.0.5",
+        syncedPort: 22,
+        syncedProtocol: "telnet"
+      }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.host).toBe("10.9.9.9"); // the hand address is retained
+    expect(after.protocol).toBe("telnet"); // ...so the protocol rides with it
+    expect(after.origin?.syncedProtocol).toBe("telnet"); // stamp carried verbatim
+  });
+
   it("an identical device produces no add/update, only unchangedCount (kills always-update + syncedAt-refresh-on-unchanged)", () => {
     const source = makeSource();
     const before = makeOwnedServer();

@@ -1863,11 +1863,27 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedEndpoint !== undefined && syncOwnsHost(ownedServer.host, ownedServer.origin?.syncedHost, ownedHost);
       const takesPort =
         ownedEndpoint !== undefined && syncOwnsPort(ownedServer.port, ownedServer.origin?.syncedPort, ownedPort);
+      // #84 P2 (Codex) — ENDPOINT-TUPLE COHERENCE. host + port + protocol +
+      // username describe ONE console endpoint. The endpoint counts as "accepted"
+      // (the record is following the device's endpoint) only when the COMPLETE
+      // address is taken — BOTH components. When either half is handed off (the
+      // user hand-edited the address, so `takesHost`/`takesPort` is false and the
+      // manual host/port is retained), the record points at the USER's endpoint,
+      // and every OTHER field derived from the inventory endpoint the user rejected
+      // (username below; protocol further down) must NOT be applied over it —
+      // otherwise the record authenticates as the device's account or speaks the
+      // device's transport against the retained endpoint. host/port keep their own
+      // per-component ownership (`takesHost`/`takesPort`); this gates the fields
+      // that ride the endpoint without an ownership signal of their own.
+      const takesEndpoint = takesHost && takesPort;
       // The username rides the SAME endpoint the address came from, and is
       // `undefined` when no endpoint of the record's transport was found — a
       // username belongs to an endpoint, so taking one from an endpoint whose
       // address this update deliberately did NOT take would be incoherent (and
-      // would write a credential for the wrong service).
+      // would write a credential for the wrong service). #84 P2 — only when the
+      // endpoint was actually ACCEPTED (`takesEndpoint`); a retained hand address
+      // keeps the record's current username and its stamp.
+      const takesUsername = takesEndpoint && ownedEndpoint?.endpoint.username !== undefined;
       const ownedEndpointUsername = ownedEndpoint?.endpoint.username;
       // DEVICE TEMPLATES (PR-T1) — the §4.3 matrix for the four non-auth fields.
       // `templateMatrix.templated` is the carried-forward stamp record with the
@@ -1948,7 +1964,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         //     over a server still carrying the old one, permanently excluding a
         //     server the fallback adopts correctly today.
         // Nothing infers a stamp that was never taken: absent stays absent.
-        syncedUsername: ownedEndpointUsername ?? ownedServer.origin?.syncedUsername,
+        // #84 P2 — refreshed only when the endpoint was ACCEPTED (`takesUsername`
+        // ⇒ `takesEndpoint` and the endpoint supplies one); a retained hand address
+        // carries the previous stamp forward VERBATIM, so the username the record
+        // authenticates as and the stamp recording who wrote it never disagree.
+        syncedUsername: takesUsername ? ownedEndpointUsername : ownedServer.origin?.syncedUsername,
         // AUTH 2c — the auth-profile stamp obeys the SAME "records what the sync
         // wrote" discipline: carried forward verbatim here, and overwritten only
         // where this sync actually writes `authProfileId`, i.e. inside the
@@ -1988,7 +2008,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // which is what keeps a hand-flip to telnet hand-owned. Laundering the
         // record's current value into the stamp here would let the sync AFTER
         // this one overwrite the user's choice.
-        syncedProtocol: takesProtocol ? deviceProtocol : ownedServer.origin?.syncedProtocol,
+        //
+        // #84 P2 — ALSO composes with `takesEndpoint`: the protocol is part of the
+        // same console tuple as host/port, so it is refreshed only when the sync
+        // owns it AND the endpoint was accepted. A retained hand address (endpoint
+        // handed off) keeps the record's protocol and carries this stamp forward,
+        // so a device transport-flip cannot reset the protocol out from under a
+        // hand-edited endpoint (leaving e.g. SSH aimed at a retained telnet box).
+        syncedProtocol: takesProtocol && takesEndpoint ? deviceProtocol : ownedServer.origin?.syncedProtocol,
         // PRIMARY HOST/PORT (task #29) — the same "records what the sync wrote"
         // discipline one field down: refreshed exactly where this sync writes
         // `host`/`port` (the `takesHost`/`takesPort` lines below), and otherwise
@@ -2021,7 +2048,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       if (templateMatrix.clearProxy) {
         delete after.proxy;
       }
-      if (ownedEndpointUsername !== undefined) {
+      // #84 P2 — the value half of the username decision, on exactly the row
+      // `takesUsername` answered yes for (endpoint accepted AND it supplies one) —
+      // spelled with the explicit `!== undefined` so TS narrows the write, and
+      // equal to `takesUsername` since `ownedEndpointUsername` IS the endpoint's
+      // username. A retained hand address keeps the record's own username (the
+      // `...ownedServer` spread preserves it) instead of the rejected endpoint's.
+      if (takesEndpoint && ownedEndpointUsername !== undefined) {
         after.username = ownedEndpointUsername;
       }
       // PRIMARY HOST/PORT (task #29) — the value half of the decision stamped
@@ -2055,7 +2088,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // its stamp can never disagree about who owns the field. A conditional
       // assignment (not a member of the literal) so the `...ownedServer` spread
       // preserves a hand-flipped protocol on the rows this must not touch.
-      if (takesProtocol) {
+      // #84 P2 — composed with `takesEndpoint` (the protocol is part of the same
+      // console tuple): written only when the sync owns the protocol AND the
+      // endpoint was accepted, so a retained hand address keeps its protocol.
+      if (takesProtocol && takesEndpoint) {
         after.protocol = deviceProtocol;
       }
       // ADDRESSLESS (Codex P1) — the UPGRADE half: an owned server that was
