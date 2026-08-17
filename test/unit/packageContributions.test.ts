@@ -218,6 +218,15 @@ describe("package contributions", () => {
     expect(item?.when).toBe("false");
   });
 
+  it("H1 — hides the state-conditional Start/Stop Node commands from the command palette (⊘ palette-visible, they always error there — Start only makes sense on a stopped EVE node, Stop only on a running one, so a generic picker would let you 'start' a running node)", () => {
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    for (const command of ["nexus.inventory.startNode", "nexus.inventory.stopNode"]) {
+      const item = paletteMenu.find((entry) => entry.command === command);
+      expect(item, command).toBeDefined();
+      expect(item?.when, command).toBe("false");
+    }
+  });
+
   it("contributes settings.openPanel command", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.settings.openPanel");

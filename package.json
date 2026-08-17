@@ -2021,6 +2021,14 @@
           "when": "true"
         },
         {
+          "command": "nexus.inventory.startNode",
+          "when": "false"
+        },
+        {
+          "command": "nexus.inventory.stopNode",
+          "when": "false"
+        },
+        {
           "command": "nexus.macro.editor",
           "when": "true"
         },
