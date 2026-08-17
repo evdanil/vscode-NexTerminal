@@ -155,6 +155,28 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.warnings.some((w) => w.includes("invalid port"))).toBe(true);
   });
 
+  // P3-4 (Fable) — the OOB extraction was hoisted before the addressless branch,
+  // which also put it before the invalid-port skip. A device skipped for a bad port
+  // then still pushed an "out-of-band address cannot be used" warning it never did
+  // pre-PR. ⊘ Extracting OOB before the skip warns for a device that produces nothing.
+  it("P3-4 — a device skipped for an invalid port does NOT also push an out-of-band-address warning", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({
+          endpoints: [
+            { kind: "ssh", host: "10.0.0.1", port: 0 }, // invalid port → skipped
+            { kind: "redfish", host: "bad host with spaces" } // malformed OOB
+          ]
+        })
+      ]),
+      currentServers: [],
+      now: 5000
+    });
+    expect(plan.warnings.some((w) => /invalid port/i.test(w))).toBe(true);
+    expect(plan.warnings.every((w) => !/out-of-band address that cannot be used/i.test(w))).toBe(true);
+  });
+
   it("root targetFolder (''): a device with no folder gets group undefined, not '' (kills '' + '/' + rel concatenation)", () => {
     const source = makeSource({ targetFolder: "" });
     const tree = makeTree([makeDevice()]);

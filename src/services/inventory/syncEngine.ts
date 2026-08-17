@@ -1183,6 +1183,25 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // endpoint (see `selectPrimaryEndpoint` for why ssh always wins).
     const primary = selectPrimaryEndpoint(device);
 
+    // P3-4 (Fable) — the invalid-port skip runs BEFORE the OOB extraction below.
+    // Hoisting OOB extraction ahead of the addressless branch (Codex P2) also put
+    // it ahead of this skip, so a device destined to be skipped for a bad port
+    // first pushed an "out-of-band address cannot be used" warning it never did
+    // pre-PR. Deciding the skip first keeps a skipped device silent about fields it
+    // will never carry. Guarded on `primary`: an addressless device (no primary)
+    // has no port to validate and belongs to the branch below.
+    if (primary) {
+      const primaryPort = primary.endpoint.port ?? primary.defaultPort;
+      if (!isValidPort(primaryPort)) {
+        if (isOwned) {
+          warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid port ${primaryPort} and was skipped.`);
+        } else {
+          invalidPortSkipped.push(device.name);
+        }
+        continue;
+      }
+    }
+
     // OOB — the out-of-band management address this fetch offers for
     // `ServerConfig.ipmiHost`, or `undefined` when the device supplies none
     // (matrix row 6 in `syncOwnsIpmiHost`) or supplies one nothing can use.
@@ -1549,17 +1568,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
       continue;
     }
+    // P3-4 (Fable) — the port was already validated (and a bad one skipped) right
+    // after `selectPrimaryEndpoint` above, before the OOB extraction, so `port`
+    // here is known valid.
     const endpoint = primary.endpoint;
     const deviceProtocol = primary.protocol;
     const port = endpoint.port ?? primary.defaultPort;
-    if (!isValidPort(port)) {
-      if (isOwned) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid port ${port} and was skipped.`);
-      } else {
-        invalidPortSkipped.push(device.name);
-      }
-      continue;
-    }
 
     // ALTERNATE HOST (issue #48, Phase 2) — the alternate SSH address this fetch
     // offers for `ServerConfig.altHost`, or `undefined` when the device supplies
