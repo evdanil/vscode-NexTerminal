@@ -94,11 +94,15 @@ export interface InventoryTree {
 export interface InventoryDeviceStatus {
   state: "running" | "stopped";
   // OPTIONAL fresh console endpoint. A provider (EVE-NG Community) that reassigns
-  // console ports on node restart can surface the current one here; only ever
-  // present for a running node. RESERVED for the deferred port-healing follow-up
-  // (D8): these are produced by EVE fetchStatus and validated here, but
-  // `NexusCore.applyInventoryStatus` currently stores only `state` and NOTHING
-  // consumes them yet — kept because they are cheap and ready for that follow-up.
+  // console ports on node restart surfaces the current one here; only ever
+  // present for a running node. CONSUMED by `NexusCore.healSyncedConsolePorts`
+  // (task #29 / D8), the separate persisting step the status-refresh path runs
+  // right after the pure `applyInventoryStatus`: for a running, telnet,
+  // non-addressless, SYNC-OWNED server whose console address differs from these,
+  // it persists the reported value onto `host`/`port` (and advances the
+  // `syncedHost`/`syncedPort` stamp) so the next connect targets the live port.
+  // A hand-edited port is never healed. `applyInventoryStatus` itself still
+  // stores only `state`.
   consoleHost?: string;
   consolePort?: number;
 }
