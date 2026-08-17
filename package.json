@@ -569,6 +569,12 @@
         "icon": "$(circle-slash)"
       },
       {
+        "command": "nexus.networkServer.tftp.clearHistory",
+        "title": "Clear Transfer History",
+        "category": "Nexus Network Server",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "nexus.networkServer.profile.saveCurrent",
         "title": "Save Current Settings as Profile",
         "category": "Nexus Network Server",
@@ -1711,6 +1717,16 @@
           "group": "0_connect@1"
         },
         {
+          "command": "nexus.networkServer.tftp.clearHistory",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerHistory.group",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.tftp.clearHistory",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerHistory.group",
+          "group": "0_connect@1"
+        },
+        {
           "command": "nexus.tunnel.start",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "inline"
@@ -2248,6 +2264,10 @@
         },
         {
           "command": "nexus.networkServer.tftp.cancelTransfer",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.tftp.clearHistory",
           "when": "workspace.isTrusted"
         },
         {

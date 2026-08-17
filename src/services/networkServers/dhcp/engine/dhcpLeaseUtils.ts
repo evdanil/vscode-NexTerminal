@@ -33,9 +33,63 @@ export interface DhcpLeaseInfo {
   readonly leaseType: DhcpLeaseType;
 }
 
-/** Determines whether a MAC/IP corresponds to a configured static entry. */
+/**
+ * Rewrites a MAC into the exact key format the `dhcp` library uses for
+ * `Server._state`: uppercase hex pairs joined by dashes, `AA-BB-CC-DD-EE-FF`.
+ *
+ * That format is not a style preference — it is what `seqbuffer.js:177`
+ * (`mac.toUpperCase().match(/../g).join('-')`) produces when it decodes
+ * `chaddr` off the wire, so it is the key every `_state` lookup in the library
+ * is performed against. Settings, meanwhile, are typed by hand and usually
+ * colon-separated and lowercase. Seeding `_state` under the user's spelling
+ * would be worse than not seeding at all: the reserved address would be held
+ * out of the pool under a key the library never matches, so the reserved
+ * device would be handed a *different* dynamic address while its own sat
+ * blocked.
+ *
+ * @param mac MAC in any common spelling (`aa:bb:cc:dd:ee:ff`, `AA-BB-…`,
+ *   `aabb.ccdd.eeff`, `aabbccddeeff`).
+ * @returns The canonical key, or the trimmed uppercase input when it does not
+ *   contain exactly 12 hex digits — a malformed entry is passed through rather
+ *   than silently reshaped into a valid-looking MAC that was never configured.
+ */
+export function toLibraryMacKey(mac: string): string {
+  const hex = mac.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+  if (hex.length !== 12) return mac.trim().toUpperCase();
+  return (hex.match(/../g) ?? []).join('-');
+}
+
+/**
+ * Re-keys a configured static map into the library's MAC format.
+ *
+ * Every consumer that has to line a configured reservation up against
+ * `_state` — the reservation seeding, the persistence reconciler, the
+ * dynamic/static classification below — goes through this, so a MAC typed with
+ * colons in Settings matches a MAC decoded with dashes off the wire.
+ */
+export function normalizeStaticMap(
+  staticMap: Readonly<Record<string, string>>,
+): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const [mac, ip] of Object.entries(staticMap)) {
+    normalized[toLibraryMacKey(mac)] = ip;
+  }
+  return normalized;
+}
+
+/**
+ * Determines whether a MAC/IP corresponds to a configured static entry.
+ *
+ * Both sides are canonicalised first: `mac` arrives as a `_state` key
+ * (`AA-BB-…`) while `staticMap` is keyed by whatever the user typed, and a raw
+ * comparison would classify every reserved lease as `dynamic`.
+ */
 export function isStaticLease(mac: string, ip: string, staticMap: Readonly<Record<string, string>>): boolean {
-  return Object.prototype.hasOwnProperty.call(staticMap, mac) && staticMap[mac] === ip;
+  const key = toLibraryMacKey(mac);
+  for (const [candidate, address] of Object.entries(staticMap)) {
+    if (toLibraryMacKey(candidate) === key) return address === ip;
+  }
+  return false;
 }
 
 /**

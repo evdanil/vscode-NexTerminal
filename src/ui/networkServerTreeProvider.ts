@@ -18,6 +18,7 @@ import type {
   NetworkServerLeaseSummary,
   NetworkServerRuntimeDetail,
   NetworkServerStatus,
+  NetworkServerTransferHistoryEntry,
   NetworkServerTransferSummary
 } from "../models/networkServer";
 import {
@@ -124,6 +125,17 @@ export class NetworkServerRootTreeItem extends vscode.TreeItem {
  * Start / Stop / Quick Settings on a transfer row.
  */
 export const NETWORK_SERVER_TRANSFER_CONTEXT = "nexus.networkServerTransfer.active";
+
+/**
+ * `contextValue` of the TFTP "History" group — what the "Clear History" menu
+ * entry gates on.
+ *
+ * Kept outside the `nexus.networkServer.` prefix for the same reason as
+ * {@link NETWORK_SERVER_TRANSFER_CONTEXT}: that prefix is regex-matched by the
+ * service-level menu entries and would otherwise offer Start / Stop on this
+ * node.
+ */
+export const NETWORK_SERVER_HISTORY_CONTEXT = "nexus.networkServerHistory.group";
 
 export class NetworkServerDetailTreeItem extends vscode.TreeItem {
   public readonly children: readonly NetworkServerDetailTreeItem[];
@@ -234,6 +246,7 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
     }
 
     rows.push(this.transfersGroup(detail.transfers ?? []));
+    rows.push(this.transferHistoryGroup(root.session?.transferHistory ?? []));
     return rows;
   }
 
@@ -375,6 +388,62 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
         ].join("\n"),
         contextValue: NETWORK_SERVER_TRANSFER_CONTEXT,
         transferId: transfer.id
+      }
+    );
+  }
+
+  /**
+   * Builds the "History" group: transfers that already finished this run.
+   *
+   * A sibling of "Active Transfers" rather than a section inside it — a
+   * finished transfer is not a row you can act on, and mixing the two would put
+   * "Cancel Transfer" one mis-click away from an entry it cannot affect.
+   *
+   * Collapsed by default even when populated: during a ZTP boot this fills with
+   * dozens of entries, and an expanded list would push the DHCP root off
+   * screen. {@link NetworkServerDetailTreeItem} expands any node with children,
+   * so the state is overridden here.
+   */
+  private transferHistoryGroup(
+    history: readonly NetworkServerTransferHistoryEntry[]
+  ): NetworkServerDetailTreeItem {
+    if (history.length === 0) {
+      return new NetworkServerDetailTreeItem("networkServer:tftp:history", "History (0)", {
+        description: "No completed transfers",
+        icon: "history",
+        tooltip: "Completed transfers appear here. The list is cleared when the service is started, stopped or restarted.",
+        contextValue: NETWORK_SERVER_HISTORY_CONTEXT
+      });
+    }
+    const item = new NetworkServerDetailTreeItem(
+      "networkServer:tftp:history",
+      `History (${String(history.length)})`,
+      {
+        icon: "history",
+        tooltip: `${String(history.length)} completed transfers this run — cleared on start, stop and restart.`,
+        children: history.map((entry, index) => this.historyRow(entry, index)),
+        contextValue: NETWORK_SERVER_HISTORY_CONTEXT
+      }
+    );
+    item.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
+    return item;
+  }
+
+  private historyRow(entry: NetworkServerTransferHistoryEntry, index: number): NetworkServerDetailTreeItem {
+    const time = new Date(entry.timestamp).toLocaleTimeString();
+    // The adapter reports a filename for every real transfer; the fallback only
+    // covers an event that arrived without one, and says so rather than
+    // rendering an empty row.
+    const filename = entry.filename ?? "(unnamed file)";
+    return new NetworkServerDetailTreeItem(
+      `networkServer:tftp:history:${String(index)}:${entry.id}`,
+      filename,
+      {
+        // `entry.client` is the same pre-rendered `"hostname (ip)"` string the
+        // live rows and toasts use, so a client reads identically everywhere.
+        description: `${entry.client} · ${time}`,
+        icon: "check",
+        tooltip: [`Completed: ${filename}`, `Client: ${entry.client}`, `Finished: ${new Date(entry.timestamp).toLocaleString()}`].join("\n")
       }
     );
   }

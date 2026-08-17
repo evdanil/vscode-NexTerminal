@@ -28,6 +28,7 @@ import {
   type NetworkServerLeaseSummary,
   type NetworkServerRuntimeDetail,
   type NetworkServerStatus,
+  type NetworkServerTransferHistoryEntry,
   type NetworkServerTransferSummary
 } from "../../models/networkServer";
 import { readBoundedNumber } from "../../utils/boundedConfig";
@@ -75,6 +76,16 @@ export function isNetworkServerVerboseMode(): boolean {
  * is plenty for a human-facing view.
  */
 const RUNTIME_REFRESH_DEBOUNCE_MS = 150;
+
+/**
+ * How many completed transfers the sidebar History keeps per service.
+ *
+ * The list is a convenience for "what did that device just pull?", not an audit
+ * log — it is in-memory only and reset on every start/stop/restart. The cap
+ * bounds both the memory held and the number of tree rows VS Code renders when
+ * a ZTP boot pulls dozens of files in a burst.
+ */
+const TRANSFER_HISTORY_LIMIT = 50;
 
 export interface NetworkServerManagerOptions {
   core: NexusCore;
@@ -260,6 +271,16 @@ export class NetworkServerManager implements vscode.Disposable {
   private readonly host: NetworkServerDaemonHost;
   private readonly subscriptions: Array<() => void> = [];
   private readonly refreshTimers = new Map<NetworkServerKind, ReturnType<typeof setTimeout>>();
+  /**
+   * Completed transfers per service, newest first — the source of truth for the
+   * sidebar's History node.
+   *
+   * Host-side and in-memory on purpose. The daemon is restartable and holds
+   * only live state; persisting this through `ConfigRepository` would turn a
+   * throwaway view of the current run into durable state that has to be
+   * migrated, pruned and reasoned about across sessions.
+   */
+  private readonly transferHistory = new Map<NetworkServerKind, NetworkServerTransferHistoryEntry[]>();
   private disposed = false;
 
   public constructor(private readonly options: NetworkServerManagerOptions) {
@@ -310,6 +331,7 @@ export class NetworkServerManager implements vscode.Disposable {
       throw this.toNetworkServerError(kind, error);
     }
     await this.refreshRuntime(kind);
+    this.clearTransferHistory(kind);
     this.notifyLifecycle(kind, "started");
   }
 
@@ -325,6 +347,7 @@ export class NetworkServerManager implements vscode.Disposable {
       throw this.toNetworkServerError(kind, error);
     }
     this.core.updateNetworkServerSessionStatus(kind, "stopped", { boundPort: null });
+    this.clearTransferHistory(kind);
     this.notifyLifecycle(kind, "stopped");
   }
 
@@ -342,6 +365,7 @@ export class NetworkServerManager implements vscode.Disposable {
       throw this.toNetworkServerError(kind, error);
     }
     await this.refreshRuntime(kind);
+    this.clearTransferHistory(kind);
     this.notifyLifecycle(kind, "restarted");
   }
 
@@ -372,6 +396,26 @@ export class NetworkServerManager implements vscode.Disposable {
     }
     this.refreshRuntimeNow("tftp");
     return cancelled;
+  }
+
+  /**
+   * Empties the completed-transfer History for a service.
+   *
+   * Called both by the "Clear History" command and automatically on every
+   * start/stop/restart. Unlike {@link notifyLifecycle} this is **not** gated on
+   * Verbose Mode: the toast is a preference, but a History list that survived a
+   * restart would be showing transfers from a service instance that no longer
+   * exists — wrong regardless of what the user opted into.
+   *
+   * Idempotent: clearing an already-empty history still pushes the empty list,
+   * which costs one snapshot emit and keeps the tree honest if it had somehow
+   * drifted.
+   *
+   * @param kind Service whose history to drop.
+   */
+  public clearTransferHistory(kind: NetworkServerKind): void {
+    this.transferHistory.set(kind, []);
+    this.publishTransferHistory(kind);
   }
 
   /**
@@ -419,6 +463,7 @@ export class NetworkServerManager implements vscode.Disposable {
       clearTimeout(timer);
     }
     this.refreshTimers.clear();
+    this.transferHistory.clear();
     for (const unsubscribe of this.subscriptions) {
       try { unsubscribe(); } catch { /* tolerate */ }
     }
@@ -501,6 +546,13 @@ export class NetworkServerManager implements vscode.Disposable {
     if (event.phase !== "started") {
       this.refreshRuntimeNow(id);
     }
+    // History is recorded before the Verbose Mode check on purpose: the toast
+    // decides whether the user is interrupted, not whether the transfer
+    // happened. Gating the record too would make the sidebar's contents depend
+    // on a notification preference.
+    if (id === "tftp" && event.phase === "completed") {
+      this.recordCompletedTransfer(id, event);
+    }
     if (!isNetworkServerVerboseMode()) return;
     const headline = `${SERVICE_LABELS[id]}: ${event.summary}`;
     if (event.phase !== "failed") {
@@ -510,6 +562,54 @@ export class NetworkServerManager implements vscode.Disposable {
     const detail = event.detail ? ` — ${event.detail}` : "";
     const code = event.code ? ` (${event.code})` : "";
     void vscode.window.showErrorMessage(`${headline}${detail}${code}`);
+  }
+
+  /**
+   * Appends one finished transfer to the service's History.
+   *
+   * The structured `id` / `resource` / `client` fields come straight off the
+   * `connection` event, which the TFTP adapter fills in alongside the
+   * human-readable `summary`. Nothing here parses `summary`: it is a sentence
+   * written for a toast, and reverse-engineering fields out of it would break
+   * the moment its wording changed.
+   *
+   * @param kind Service the transfer belongs to.
+   * @param event The `completed`-phase connection event.
+   * @sideeffect Trims to {@link TRANSFER_HISTORY_LIMIT} and republishes.
+   */
+  private recordCompletedTransfer(kind: NetworkServerKind, event: ServerConnectionEvent): void {
+    const entries = this.transferHistory.get(kind) ?? [];
+    entries.unshift({
+      // A transfer id is only unique among *live* transfers (it is the client's
+      // `address:port`), so a later transfer from the same ephemeral port can
+      // legitimately repeat one already in the list. It is kept for correlation
+      // with the live rows, never used as a key.
+      id: event.id ?? `${kind}-${Date.now()}`,
+      filename: event.resource,
+      // `client` is pre-rendered daemon-side so History, the live rows and the
+      // toasts all name a client identically. The id's address half is the
+      // fallback when reverse DNS had not resolved in time.
+      client: event.client ?? event.id?.split(":")[0] ?? "unknown client",
+      timestamp: Date.now()
+    });
+    if (entries.length > TRANSFER_HISTORY_LIMIT) {
+      entries.length = TRANSFER_HISTORY_LIMIT;
+    }
+    this.transferHistory.set(kind, entries);
+    this.publishTransferHistory(kind);
+  }
+
+  /**
+   * Mirrors the manager's history list into NexusCore so the tree can render it.
+   *
+   * Pushes a defensive copy: the manager keeps mutating its own array in place,
+   * and handing that same reference to the snapshot would let a consumer
+   * observe entries appearing without a change event.
+   */
+  private publishTransferHistory(kind: NetworkServerKind): void {
+    if (this.disposed) return;
+    this.ensureRegistered(kind);
+    this.core.setNetworkServerTransferHistory(kind, [...(this.transferHistory.get(kind) ?? [])]);
   }
 
   /**

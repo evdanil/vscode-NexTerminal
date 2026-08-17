@@ -48,14 +48,16 @@ import type { ServerConfig, LeaseState, Server, DhcpConfigValue } from 'dhcp';
 import { EventEmitter } from 'node:events';
 
 import { DEFAULT_PORT, FALLBACK_ALT_PORT, DEFAULTS, DHCP_MESSAGE_NAMES } from './dhcpConstants';
-import { computePoolSize, computeBroadcastAddress } from './dhcpNetworkUtils';
+import { computePoolSize, computeBroadcastAddress, isIpInPool } from './dhcpNetworkUtils';
 import { DhcpEngineError, classifyNodeError } from './dhcpErrors';
-import { buildLeaseInfo, type DhcpLeaseInfo } from './dhcpLeaseUtils';
+import { buildLeaseInfo, toLibraryMacKey, type DhcpLeaseInfo } from './dhcpLeaseUtils';
 import {
   createDhcpLeaseStore,
   loadLeases,
   reconcilePersistedLeases,
+  toReservedLeaseState,
   toRestoredLeaseState,
+  RESERVED_LEASE_STATE,
   type DhcpLeaseStore,
 } from './dhcpLeasePersistence';
 import {
@@ -460,6 +462,7 @@ export class DhcpEngine extends EventEmitter {
       this._server = server;
       this._boundPort = preferredPort;
       this.bindLeasePersistence(server);
+      this.seedStaticReservations(server);
       this.emit('listening', this.bindAddress, preferredPort);
       this.emit('log', 'info', `listening on ${this.bindAddress}:${preferredPort}`);
       return { boundPort: preferredPort };
@@ -480,6 +483,7 @@ export class DhcpEngine extends EventEmitter {
           this._server = server;
           this._boundPort = FALLBACK_ALT_PORT;
           this.bindLeasePersistence(server);
+          this.seedStaticReservations(server);
           this.emit('listening', this.bindAddress, FALLBACK_ALT_PORT);
           this.emit('log', 'info', `listening on ${this.bindAddress}:${FALLBACK_ALT_PORT} (alternate)`);
           this._log(
@@ -556,6 +560,12 @@ export class DhcpEngine extends EventEmitter {
     const now = Date.now();
     const result: DhcpLeaseInfo[] = [];
     for (const mac of Object.keys(state)) {
+      // A reservation placeholder is not a lease: no device has bound it. It is
+      // excluded here so it cannot inflate pool utilisation, appear in the
+      // sidebar's Active Leases, or be written to the persisted lease file —
+      // that last one also keeps seeding idempotent, since a persisted
+      // reservation would come back as a real lease on the next start.
+      if (state[mac]?.state === RESERVED_LEASE_STATE) continue;
       const info = buildLeaseInfo(mac, state[mac], staticMap, now, this.leaseTimeSec);
       if (info) result.push(info);
     }
@@ -612,6 +622,68 @@ export class DhcpEngine extends EventEmitter {
     this._log(
       'info',
       `Engine: restored ${restored.length} lease(s) from ${filePath}${dropped.length > 0 ? ` · dropped ${dropped.length}: ${dropped.map((d) => `${d.lease.mac}→${d.lease.ip} (${d.reason})`).join(', ')}` : ''}`,
+    );
+  }
+
+  /**
+   * Holds every configured static address that falls inside the dynamic pool
+   * out of that pool, before the socket has processed a single packet.
+   *
+   * The problem this solves: `_selectAddress` (dhcp.js:290-310) walks the range
+   * and takes the first address not already present in `_state`. A reservation
+   * lives in `config.static`, which that scan never consults — so until the
+   * reserved device happens to boot, its address is just another free slot, and
+   * whichever client DISCOVERs first walks away with it. The reserved device
+   * then arrives to find its own address already in use.
+   *
+   * Reservations *outside* the range are skipped: they never compete with
+   * dynamic allocation, and seeding them would only add rows to a table the
+   * library scans on every packet.
+   *
+   * Ordering matters — this runs after {@link bindLeasePersistence}, so a
+   * restored lease is already in `_state` and can be inspected here. A static
+   * reservation outranks a persisted dynamic lease on the same address, which
+   * is why a conflicting entry is overwritten rather than skipped.
+   * ({@link reconcilePersistedLeases} normally drops those on the way in; this
+   * is the backstop for when persistence is switched off entirely.)
+   *
+   * Idempotent by construction: each `start()` builds a fresh `dhcp.Server`
+   * with an empty `_state`, and seeding derives purely from current
+   * configuration. A reservation whose entry already carries the right address
+   * is left untouched, so a restarted device keeps the `bindTime` history a
+   * restore gave it.
+   *
+   * @param server Freshly listening server whose `_state` is being seeded.
+   * @sideeffect Writes placeholder entries into `server._state`.
+   */
+  private seedStaticReservations(server: Server): void {
+    const staticMap = this._cfg.static ?? {};
+    const entries = Object.entries(staticMap);
+    if (entries.length === 0) return;
+
+    const state = server._state as Record<string, LeaseState>;
+    const seeded: string[] = [];
+    const skipped: string[] = [];
+
+    for (const [rawMac, ip] of entries) {
+      if (!isIpInPool(ip, this.rangeStart, this.rangeEnd)) {
+        skipped.push(`${rawMac}→${ip}`);
+        continue;
+      }
+      const mac = toLibraryMacKey(rawMac);
+      // Already holding the reserved address — either seeded by an earlier pass
+      // or restored from disk with real bind history worth keeping.
+      if (state[mac]?.address === ip) continue;
+      state[mac] = toReservedLeaseState(ip, this.serverId, this.leaseTimeSec);
+      seeded.push(`${mac}→${ip}`);
+    }
+
+    if (seeded.length === 0 && skipped.length === 0) return;
+    this._log(
+      'info',
+      `Engine: reserved ${seeded.length} in-pool static address(es)${seeded.length > 0 ? `: ${seeded.join(', ')}` : ''}${
+        skipped.length > 0 ? ` · ${skipped.length} outside the pool (no reservation needed): ${skipped.join(', ')}` : ''
+      }`,
     );
   }
 
@@ -770,7 +842,13 @@ export class DhcpEngine extends EventEmitter {
   private _diffLeases(): void {
     if (!this._server) return;
     const state = this._server._state as Record<string, LeaseState>;
-    const currKeys = new Set<string>(Object.keys(state));
+    // Reservation placeholders are invisible to the diff while they are still
+    // placeholders, which gets both edges right: no phantom `lease:bound` at
+    // startup for a device that has not booted, and a real `lease:bound` the
+    // moment that device's DISCOVER flips the entry out of RESERVED.
+    const currKeys = new Set<string>(
+      Object.keys(state).filter((mac) => state[mac]?.state !== RESERVED_LEASE_STATE),
+    );
     const allMacs = new Set<string>([...this._prevLeaseKeys, ...currKeys]);
     const staticMap = this._cfg.static ?? {};
     const now = Date.now();

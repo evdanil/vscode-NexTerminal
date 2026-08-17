@@ -2,6 +2,7 @@
  * Command handlers for individual TFTP transfers.
  * Surface area:
  *   nexus.networkServer.tftp.cancelTransfer — abort one in-flight transfer
+ *   nexus.networkServer.tftp.clearHistory   — empty the completed-transfer list
  *
  * Split out of `networkServerCommands.ts` for the same reason
  * `networkServerQuickAdjust.ts` and `networkServerProfileCommands.ts` are:
@@ -126,6 +127,21 @@ export function registerNetworkServerTransferCommands(
       } catch (error) {
         void vscode.window.showErrorMessage(errorMessageFor(error, "Failed to cancel TFTP transfer"));
       }
+    }),
+
+    vscode.commands.registerCommand("nexus.networkServer.tftp.clearHistory", () => {
+      const cleared = ctx.core.getNetworkServerSession("tftp")?.transferHistory?.length ?? 0;
+      manager.clearTransferHistory("tftp");
+      // Answering a button press, so not gated behind Verbose Mode — same rule
+      // as the cancel outcomes above. The no-op case is reported too: silence
+      // after a click reads as a broken command.
+      if (cleared === 0) {
+        void vscode.window.showInformationMessage("TFTP transfer history is already empty.");
+        return;
+      }
+      void vscode.window.showInformationMessage(
+        `Cleared ${String(cleared)} completed TFTP transfer${cleared === 1 ? "" : "s"} from history.`
+      );
     })
   ];
 }

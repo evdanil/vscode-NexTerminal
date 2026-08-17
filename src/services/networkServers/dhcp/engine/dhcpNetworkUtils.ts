@@ -46,6 +46,28 @@ export function computeRangeEnd(rangeStart: string, count: number): string {
 }
 
 /**
+ * Whether `ip` falls inside the inclusive dynamic pool `[rangeStart, rangeEnd]`.
+ *
+ * This is the question "does this static reservation collide with the pool?" —
+ * an address inside the range can be handed to some other client by the
+ * library's free-address scan, so it has to be reserved up front, while one
+ * outside the range never competes with dynamic allocation at all.
+ *
+ * Comparisons are unsigned (`>>> 0`) so addresses above `127.x` — where the
+ * signed 32-bit conversion goes negative — still order correctly.
+ *
+ * @returns `false` when any of the three addresses fails to parse, which keeps
+ *   a malformed setting from silently reserving (or freeing) the wrong thing.
+ */
+export function isIpInPool(ip: string, rangeStart: string, rangeEnd: string): boolean {
+  const address = ipToInt(ip) >>> 0;
+  const first = ipToInt(rangeStart) >>> 0;
+  const last = ipToInt(rangeEnd) >>> 0;
+  if (address === 0 || first === 0 || last === 0) return false;
+  return address >= first && address <= last;
+}
+
+/**
  * Calculates the broadcast address from the gateway and netmask
  * (`broadcast = (gateway & mask) | ~mask`).
  *

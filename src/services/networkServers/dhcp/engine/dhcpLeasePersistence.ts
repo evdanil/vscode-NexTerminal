@@ -40,7 +40,8 @@ import * as path from 'node:path';
 
 import type { LeaseState } from 'dhcp';
 
-import { ipToInt } from './dhcpNetworkUtils';
+import { isIpInPool } from './dhcpNetworkUtils';
+import { normalizeStaticMap, toLibraryMacKey } from './dhcpLeaseUtils';
 import type { DhcpLeaseInfo, DhcpLeaseType } from './dhcpLeaseUtils';
 
 /**
@@ -192,9 +193,11 @@ export function reconcilePersistedLeases(
   const restored: DhcpLeaseInfo[] = [];
   const dropped: DroppedLease[] = [];
   const reservedAddresses = new Set(Object.values(context.staticMap));
-  // Unsigned so addresses above 127.x compare correctly against the range.
-  const first = ipToInt(context.rangeStart) >>> 0;
-  const last = ipToInt(context.rangeEnd) >>> 0;
+  // Re-keyed to the library's MAC format: persisted leases carry `_state` keys
+  // (`AA-BB-…`) while the configured map is keyed as the user typed it, and a
+  // raw lookup would miss every reservation written with colons — silently
+  // restoring the stale dynamic lease that the reservation is meant to beat.
+  const staticMap = normalizeStaticMap(context.staticMap);
 
   for (const lease of leases) {
     if (lease.expiresAt <= context.now) {
@@ -202,7 +205,7 @@ export function reconcilePersistedLeases(
       continue;
     }
 
-    const reservedForMac = context.staticMap[lease.mac];
+    const reservedForMac = staticMap[toLibraryMacKey(lease.mac)];
     if (reservedForMac !== undefined) {
       if (reservedForMac === lease.ip) {
         restored.push({ ...lease, leaseType: 'static' });
@@ -217,8 +220,7 @@ export function reconcilePersistedLeases(
       continue;
     }
 
-    const address = ipToInt(lease.ip) >>> 0;
-    if (first === 0 || last === 0 || address < first || address > last) {
+    if (!isIpInPool(lease.ip, context.rangeStart, context.rangeEnd)) {
       dropped.push({ lease, reason: 'out-of-pool' });
       continue;
     }
@@ -255,6 +257,51 @@ export function toRestoredLeaseState(lease: DhcpLeaseInfo, serverId: string): Le
     server: serverId,
     address: lease.ip,
     options: lease.hostname ? { hostname: lease.hostname } : {},
+    tries: 0,
+    xid: 1,
+  };
+}
+
+/**
+ * `state` marker for a placeholder entry that holds a static reservation's
+ * address out of the dynamic pool before its device has ever spoken.
+ *
+ * A value the `dhcp` library never writes itself (it only ever sets `OFFERED`,
+ * `BOUND` and `RENEWING`), which is what makes it safe to use as the flag that
+ * tells a reservation apart from a real lease. The engine filters entries
+ * carrying it out of `activeLeases()` and out of its lease diff, so a
+ * reservation never inflates pool utilisation, never appears in the sidebar's
+ * Active Leases, never reaches the persisted lease file, and never fires a
+ * `lease:bound` for a device that has not booted yet.
+ */
+export const RESERVED_LEASE_STATE = 'RESERVED';
+
+/**
+ * Builds the placeholder `_state` entry that reserves `ip` for a configured
+ * static MAC.
+ *
+ * Poking `_state` is the same "no public seeding API" pattern as
+ * {@link toRestoredLeaseState}, and it buys both halves of the reservation from
+ * one write: `_selectAddress` returns `_state[mac].address` for the reserved
+ * MAC itself (dhcp.js:275-277), and excludes that address from the free-IP scan
+ * for every *other* MAC (dhcp.js:304-306). The second half is the point — it is
+ * what stops another client's DISCOVER from being offered the address.
+ *
+ * `bindTime` is left unset: nothing is bound yet, and a timestamp here would
+ * make the engine's renewal diff read the eventual real bind as a renewal of a
+ * lease that never existed. `leaseTime` is unset for the same reason as in
+ * {@link toRestoredLeaseState} — a numeric value would make reservations the
+ * first entries evicted when the pool fills, which is precisely backwards.
+ */
+export function toReservedLeaseState(ip: string, serverId: string, leaseSec: number): LeaseState {
+  return {
+    leasePeriod: leaseSec,
+    renewPeriod: Math.floor(leaseSec / 2),
+    rebindPeriod: leaseSec,
+    state: RESERVED_LEASE_STATE,
+    server: serverId,
+    address: ip,
+    options: {},
     tries: 0,
     xid: 1,
   };
