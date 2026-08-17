@@ -4701,10 +4701,9 @@ describe("NexusCore inventory status", () => {
     expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
   });
 
-  it("clearInventoryStatus removes only that source's entries and fires a change; removeInventorySource clears them too", async () => {
+  it("clearInventoryStatus removes only that source's entries and fires a change", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
-    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1" }));
     const a = makeSyncedServer("a", "source-1", "dev#1");
     const b = makeSyncedServer("b", "source-2", "dev#2");
     await core.addServersBatch([a, b]);
@@ -4715,13 +4714,28 @@ describe("NexusCore inventory status", () => {
     core.onDidChange(listener);
     core.clearInventoryStatus("source-1");
     expect(listener).toHaveBeenCalledTimes(1);
-    let snap = core.getSnapshot();
+    const snap = core.getSnapshot();
     expect(snap.serverStatus.has(a.id)).toBe(false);
     expect(snap.serverStatus.get(b.id)).toBe("running");
+  });
 
+  it("P2-3/P3-3: removeInventorySource ALONE clears the removed source's status and leaves other sources' entries (⊘ removing the clear from removeInventorySource strands a running highlight on a deleted source's servers)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1" }));
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-2", "dev#2");
+    await core.addServersBatch([a, b]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    core.applyInventoryStatus("source-2", { contractVersion: 1, statuses: { "dev#2": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(a.id)).toBe("running");
+
+    // NO pre-clear — removeInventorySource must do the clearing itself.
     await core.removeInventorySource("source-1");
-    // source-2's entry survives a DIFFERENT source's removal.
-    expect(core.getSnapshot().serverStatus.get(b.id)).toBe("running");
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false);
+    expect(snap.serverStatus.get(b.id)).toBe("running");
   });
 
   it("does not fire a change when clearInventoryStatus has nothing to clear (⊘ an unconditional emit churns every tree on an unrelated source removal)", async () => {

@@ -653,13 +653,9 @@ export class NexusCore {
     }
     // LIVE STATUS (Phase 2) — the source is gone; drop any runtime status it
     // owned so a removed source leaves no lingering running/stopped highlight.
-    // Clears the maps directly (no extra emit) since emitChanged() fires below.
-    for (const [serverId, owner] of [...this.serverStatusSource]) {
-      if (owner === id) {
-        this.serverStatus.delete(serverId);
-        this.serverStatusSource.delete(serverId);
-      }
-    }
+    // Shares clearInventoryStatus's loop; no extra emit since emitChanged()
+    // fires below regardless.
+    this.dropInventoryStatusForSource(id);
     this.emitChanged();
   }
 
@@ -2250,11 +2246,12 @@ export class NexusCore {
   }
 
   /**
-   * LIVE STATUS (Phase 2) — drop every status entry a source owns (used on
-   * source removal). Silent when there was nothing to clear, so an unrelated
-   * source removal does not churn every tree.
+   * LIVE STATUS (Phase 2) — drop every status entry a source owns, WITHOUT
+   * emitting. Returns whether anything changed. Shared by clearInventoryStatus
+   * (which emits) and removeInventorySource (which emits once on its own way
+   * out), so the two never drift on the clearing rule.
    */
-  public clearInventoryStatus(sourceId: string): void {
+  private dropInventoryStatusForSource(sourceId: string): boolean {
     let changed = false;
     for (const [serverId, owner] of [...this.serverStatusSource]) {
       if (owner === sourceId) {
@@ -2263,7 +2260,16 @@ export class NexusCore {
         changed = true;
       }
     }
-    if (changed) {
+    return changed;
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — drop every status entry a source owns (used on
+   * source removal). Silent when there was nothing to clear, so an unrelated
+   * source removal does not churn every tree.
+   */
+  public clearInventoryStatus(sourceId: string): void {
+    if (this.dropInventoryStatusForSource(sourceId)) {
       this.emitChanged();
     }
   }
