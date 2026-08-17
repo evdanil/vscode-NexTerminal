@@ -6,6 +6,7 @@ import { templateAppliedFields, TEMPLATE_FIELD_SHORT_LABELS } from "../services/
 import { toParityCode } from "../utils/helpers";
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
+import { serverStatusUri, folderStatusUri } from "./inventoryStatusDecorationProvider";
 
 export class FolderTreeItem extends vscode.TreeItem {
   public constructor(
@@ -56,7 +57,12 @@ export class ServerTreeItem extends vscode.TreeItem {
     // D3 — the linked IPMI Auth Profile's name, so the tooltip's IPMI line
     // predicts whether Connect BMC Serial Console will find a username/password
     // or prompt. Resolved by the caller against `server.ipmiAuthProfileId`.
-    ipmiAuthProfileName?: string
+    ipmiAuthProfileName?: string,
+    // LIVE STATUS (Phase 2) — the server's inventory running/stopped state,
+    // resolved by the caller from snapshot.serverStatus. Only EVE-origin servers
+    // ever carry one (only EVE reports status), so `undefined` means "not a
+    // status-bearing server" and the row renders exactly as before.
+    status?: "running" | "stopped"
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -91,13 +97,25 @@ export class ServerTreeItem extends vscode.TreeItem {
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";
     const addresslessDesc = addressless ? " (no address)" : "";
+    // LIVE STATUS (Phase 2) — a " (running)" suffix on a running lab node. A
+    // stopped node gets no suffix (the dim dot carries it), and a non-status
+    // server gets nothing at all.
+    const runningDesc = status === "running" ? " (running)" : "";
     const descHead = addressless ? displayUsername : `${displayUsername}@${server.host}`;
-    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}` : undefined;
+    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${runningDesc}` : undefined;
     this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
-    this.iconPath = new vscode.ThemeIcon(
-      connected ? "plug" : "debug-disconnect",
-      new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
-    );
+    // LIVE STATUS (Phase 2) — a status-bearing (EVE-origin) server shows a
+    // running/stopped dot; every other server keeps the plain connect icon.
+    if (status === "running") {
+      this.iconPath = new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.green"));
+    } else if (status === "stopped") {
+      this.iconPath = new vscode.ThemeIcon("circle-outline", new vscode.ThemeColor("descriptionForeground"));
+    } else {
+      this.iconPath = new vscode.ThemeIcon(
+        connected ? "plug" : "debug-disconnect",
+        new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
+      );
+    }
     this.command = {
       command: "nexus.profile.actions",
       title: "Profile Actions",
@@ -260,7 +278,10 @@ export class NexusTreeProvider
     this.snapshot = {
       ...snapshot,
       localShellProfiles: snapshot.localShellProfiles ?? [],
-      activeLocalShellSessions: snapshot.activeLocalShellSessions ?? []
+      activeLocalShellSessions: snapshot.activeLocalShellSessions ?? [],
+      // LIVE STATUS (Phase 2) — tolerate a partial snapshot (older callers /
+      // test fixtures predating serverStatus) so reads below never hit undefined.
+      serverStatus: snapshot.serverStatus ?? new Map()
     };
     this.authProfileById = new Map(snapshot.authProfiles.map((profile) => [profile.id, profile]));
     this.computeFolderCache();
@@ -521,7 +542,7 @@ export class NexusTreeProvider
 
   private makeFolderItem(path: string): FolderTreeItem {
     const hasDirectServers = this.snapshot.servers.some((s) => !s.isHidden && s.group === path);
-    return new FolderTreeItem(
+    const item = new FolderTreeItem(
       path,
       folderDisplayName(path),
       this.collapsedFolders.has(path)
@@ -529,6 +550,12 @@ export class NexusTreeProvider
         : vscode.TreeItemCollapsibleState.Expanded,
       hasDirectServers
     );
+    // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
+    // to paint the ▶ badge for a lab folder that directly contains a running
+    // server. Set only on Command Center folders (this method) — the Macros
+    // view builds its own FolderTreeItems and must not inherit lab highlights.
+    item.resourceUri = folderStatusUri(path);
+    return item;
   }
 
   private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
@@ -618,7 +645,8 @@ export class NexusTreeProvider
     // whitespace-only username as the server's, rendering "@host:22" in the
     // label and tooltip while the connection uses the server's own username.
     const ipmiAuthProfile = server.ipmiAuthProfileId ? this.authProfileById.get(server.ipmiAuthProfileId) : undefined;
-    return new ServerTreeItem(
+    const status = this.snapshot.serverStatus.get(server.id);
+    const item = new ServerTreeItem(
       server,
       connected,
       lookup,
@@ -626,8 +654,13 @@ export class NexusTreeProvider
       authProfile?.name,
       authProfileOwnedCredentials(authProfile).username,
       syncedSourceName,
-      ipmiAuthProfile?.name
+      ipmiAuthProfile?.name,
+      status
     );
+    // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
+    // to paint the ▶ badge for a running server.
+    item.resourceUri = serverStatusUri(server.id);
+    return item;
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {

@@ -18,6 +18,7 @@ import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
+import { InventoryStatusDecorationProvider } from "./ui/inventoryStatusDecorationProvider";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
@@ -836,6 +837,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     dragAndDropController: nexusTreeProvider,
     showCollapseAll: true
   });
+  // LIVE STATUS (Phase 2) — the running-lab highlight. Registered globally; it
+  // decorates only the nexus-status: resourceUris the Command Center tree stamps
+  // on running servers and their lab folders. Fed the latest snapshot in
+  // syncViewsImmediate below.
+  const inventoryStatusDecoration = new InventoryStatusDecorationProvider();
+  context.subscriptions.push(vscode.window.registerFileDecorationProvider(inventoryStatusDecoration), inventoryStatusDecoration);
   void vscode.commands.executeCommand("setContext", "nexus.filterActive", false);
 
   const filterCommand = vscode.commands.registerCommand("nexus.filter", async () => {
@@ -1046,6 +1053,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     const snapshot = core.getSnapshot();
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
+    inventoryStatusDecoration.update(snapshot);
     const totalTunnels = snapshot.activeTunnels.length + snapshot.remoteTunnels.length;
     statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length + snapshot.activeLocalShellSessions.length} sessions, ${totalTunnels} tunnels`;
     if (snapshot.remoteTunnels.length > 0) {
