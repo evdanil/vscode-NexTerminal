@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { EVE_NG_PROVIDER_ID, createEveNgProvider, eveNgInstanceKey } from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
+import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 
 /**
  * EVE-NG's identity as a deployment — the same contract `netboxInstanceKey`
@@ -711,5 +712,54 @@ describe("activation wiring", () => {
 
   it("imports the EVE-NG factory from the provider module", () => {
     expect(source).toMatch(/import \{ createEveNgProvider \} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
+  });
+});
+
+/**
+ * END-TO-END CROSS-CHECK — the provider and the Phase 0 telnet engine work are
+ * two halves of one promise ("an EVE-NG node becomes a working telnet server"),
+ * and each half's own tests pass whether or not they agree. This runs the
+ * provider's REAL output through the REAL `computeSyncPlan` and asserts the
+ * server that comes out is dialable.
+ */
+describe("EVE-NG → computeSyncPlan", () => {
+  it("turns a running lab node into a telnet server on the console's own port, stamped so a later hand-flip is respected", async () => {
+    const tree = await fetchTree({
+      folders: { "/": { folders: [{ name: "ACME", path: "/ACME" }] }, "/ACME": { labs: [{ file: "Core.unl", path: "/ACME/Core.unl" }] } },
+      nodes: { "/ACME/Core.unl": { "3": node({ id: "3", name: "R3", url: "telnet://127.0.0.1:32771" }) } }
+    });
+
+    // The tree crosses the provider boundary, so it goes through the same
+    // runtime shape check a third-party provider's would.
+    expect(() => validateInventoryTree(tree)).not.toThrow();
+
+    const plan = computeSyncPlan({
+      source: {
+        id: "src-eve",
+        providerId: EVE_NG_PROVIDER_ID,
+        name: "Lab",
+        targetFolder: "EVE",
+        prunePolicy: "orphan",
+        defaultUsername: "admin",
+        config: CONFIG,
+        secretFieldIds: ["password"]
+      },
+      tree,
+      currentServers: [],
+      now: 1_000
+    });
+
+    expect(plan.adds).toHaveLength(1);
+    const [server] = plan.adds;
+    // ⊘ A provider emitting `kind: "ssh"` (or the engine ignoring the telnet
+    // kind) yields a record on port 22 with no protocol — three assertions that
+    // are individually plausible and jointly unusable.
+    expect(server.protocol).toBe("telnet");
+    expect(server.host).toBe("eve.example.com");
+    expect(server.port).toBe(32771);
+    // The stamp is what makes a later hand-flip to SSH survive the next sync.
+    expect(server.origin?.syncedProtocol).toBe("telnet");
+    expect(server.origin?.externalId).toBe("/ACME/Core.unl#3");
+    expect(server.group).toBe("EVE/ACME/Core");
   });
 });
