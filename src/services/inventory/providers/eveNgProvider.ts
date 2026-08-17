@@ -438,6 +438,18 @@ class EveApiClient {
     try {
       text = await res.text();
     } catch {
+      // WALL-CLOCK DEADLINE (#84 P2-2) — the BODY read can abort too: EVE may
+      // send HEADERS before the deadline (so `fetch()` already resolved) then
+      // STALL on the body, and the request's AbortSignal aborts `res.text()`.
+      // Classify it the same way as the `fetch()` abort above — past the deadline
+      // ⇒ the truncation sentinel, so the loops return partial results + the
+      // deadline warning instead of swallowing to "" and having the parser throw
+      // a `protocol` error that discards the whole crawl. Deadline far off ⇒ the
+      // pre-existing tolerant empty-string behaviour (a truncated/garbled body is
+      // not fatal on its own; the parser surfaces the real problem).
+      if (this.crawlDeadline !== undefined && Date.now() >= this.crawlDeadline) {
+        throw new CrawlDeadlineExceeded();
+      }
       text = "";
     }
     return { res, text };

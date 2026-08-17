@@ -1466,6 +1466,87 @@ describe("createEveNgProvider — crawl deadline (task #30)", () => {
       nowSpy.mockRestore();
     }
   });
+
+  // A response whose HEADERS arrive (fetch resolves) but whose BODY read aborts:
+  // `res.text()` rejects, exactly as the request's AbortSignal aborting the body
+  // stream would. `advanceClock` runs at body-read time so the abort can be timed
+  // relative to the deadline.
+  function headersThenBodyStall(advanceClock: () => void): unknown {
+    return {
+      status: 200,
+      text: async () => {
+        advanceClock();
+        throw timeoutError();
+      },
+      headers: { get: () => null, getSetCookie: () => [] }
+    };
+  }
+
+  it("#84 P2-2 — a stall during the BODY READ (headers before the deadline, body after) TRUNCATES the crawl, not a protocol failure (⊘ swallowing the body-read abort to '' makes parsing throw a protocol error and discards the partial crawl)", async () => {
+    let clock = 1_000_000_000;
+    const deadline = clock + DEADLINE_MS;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const world: World = {
+        folders: { "/": { labs: [{ file: "L1.unl", path: "/L1.unl" }, { file: "L2.unl", path: "/L2.unl" }] } },
+        nodes: { "/L1.unl": { "1": node({ id: "1" }) }, "/L2.unl": { "2": node({ id: "2" }) } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      let nodeReq = 0;
+      const wrapped = (async (input: string, init?: RequestInit) => {
+        const path = decodeURIComponent(new URL(input).pathname);
+        if (path.startsWith("/api/labs") && path.endsWith("/nodes")) {
+          nodeReq++;
+          if (nodeReq === 2) {
+            // The fetch() resolves with headers BEFORE the deadline; the body read
+            // then stalls and aborts AFTER it.
+            return headersThenBodyStall(() => {
+              clock = deadline + 5_000;
+            });
+          }
+        }
+        return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+      }) as unknown as typeof fetch;
+
+      const tree = await createEveNgProvider(wrapped).fetchInventory(CONFIG, SECRETS);
+      expect(tree.truncated).toBe(true);
+      expect(tree.devices.some((d) => d.externalId.includes("/L1.unl"))).toBe(true);
+      expect(tree.devices.some((d) => d.externalId.includes("/L2.unl"))).toBe(false);
+      expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("time limit"))).toBe(true);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("#84 P2-2 — a body-read failure with the deadline FAR OFF is unchanged (the crawl still fails, not a silent truncation) (⊘ classifying every body-read abort as a deadline trip would swallow a real mid-body network failure into a partial sync)", async () => {
+    let clock = 1_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const world: World = {
+        folders: { "/": { labs: [{ file: "L1.unl", path: "/L1.unl" }] } },
+        nodes: { "/L1.unl": { "1": node({ id: "1" }) } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      const wrapped = (async (input: string, init?: RequestInit) => {
+        const path = decodeURIComponent(new URL(input).pathname);
+        if (path.startsWith("/api/labs") && path.endsWith("/nodes")) {
+          // Body read fails with the deadline nowhere near (clock unchanged).
+          return headersThenBodyStall(() => {});
+        }
+        return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+      }) as unknown as typeof fetch;
+
+      const result = await createEveNgProvider(wrapped)
+        .fetchInventory(CONFIG, SECRETS)
+        .then((t) => ({ ok: true as const, t }))
+        .catch((e) => ({ ok: false as const, e }));
+      // Unchanged: the swallowed empty body makes parsing fail (protocol), not truncate.
+      expect(result.ok).toBe(false);
+      expect((result as { e: unknown }).e).toBeInstanceOf(InventoryProviderError);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
 });
 
 describe("createEveNgProvider — error mapping", () => {
