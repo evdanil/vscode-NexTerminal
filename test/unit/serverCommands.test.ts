@@ -794,6 +794,34 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(ctx.core.getServer("srv-1")?.formerlySynced).toEqual(marker);
   });
 
+  // P2-1 (Fable) — duplicating spreads the record and strips `origin`, so an
+  // addressless placeholder would become a MANUAL addressless record: an invariant
+  // violation (addressless exists only for synced placeholders), which no sync will
+  // ever upgrade (no origin) and whose connect refusal tells the user to "re-sync the
+  // source" it has no link to. ⊘ Minting the copy leaves that record in the store.
+  it("P2-1 — refuses to duplicate an addressless placeholder with a message, writing nothing", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ addressless: true, host: "", port: 0, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.duplicate")!("srv-1");
+
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("can't be duplicated"));
+  });
+
+  it("P2-1 control — still duplicates an ORDINARY addressed server (⊘ an over-broad guard would block normal duplication)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.duplicate")!("srv-1");
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(expect.objectContaining({ name: "Server 1 (copy)" }));
+  });
+
   it("group disconnect applies only to direct-folder servers and skips hidden ones", async () => {
     const { ctx, disconnectPool } = setupHarness({
       profiles: [],

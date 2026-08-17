@@ -2184,6 +2184,19 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!server) {
         return;
       }
+      // P2-1 (Fable) — refuse duplicating an addressless placeholder. A duplicate
+      // strips `origin` (see below), so the copy would be a MANUAL addressless
+      // record — an invariant violation: `addressless` exists only for synced
+      // placeholders. No sync would ever upgrade it (no origin), and its connect
+      // refusal tells the user to re-sync a source it has no link to. Stripping the
+      // flag instead would leave an empty host that fails validation, so refusing is
+      // the only coherent answer.
+      if (server.addressless === true) {
+        void vscode.window.showInformationMessage(
+          `"${server.name}" has no console address yet, so it can't be duplicated — it will get one when its inventory source next syncs.`
+        );
+        return;
+      }
       // F6 — a duplicate of a synced server is a manual server: keeping `origin`
       // would make the copy compete with the original for the SAME deterministic
       // id on the next sync (both share externalId, but only one id can win it).
