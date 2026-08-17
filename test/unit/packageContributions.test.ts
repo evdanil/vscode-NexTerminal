@@ -691,6 +691,50 @@ describe("package contributions", () => {
     });
   });
 
+  describe("Live lab status (Phase 2)", () => {
+    it("contributes nexus.inventory.refreshStatus as a palette-invocable Nexus command", () => {
+      const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.refreshStatus");
+      expect(command).toBeDefined();
+      expect(command?.category).toBe("Nexus");
+      expect(command?.title).toBeTruthy();
+
+      const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+      const paletteEntry = paletteMenu.find((item) => item.command === "nexus.inventory.refreshStatus");
+      expect(paletteEntry).toBeDefined();
+      expect(paletteEntry?.when).not.toBe("false");
+    });
+
+    it("surfaces Refresh Lab Status as a Command Center title action (least-intrusive tree affordance)", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      const entry = titleMenuItems.find(
+        (item) => item.command === "nexus.inventory.refreshStatus" && item.when === "view == nexusCommandCenter"
+      );
+      expect(entry).toBeDefined();
+    });
+
+    it("does NOT add refreshStatus to the inventory-source row inline group, keeping those rows' four actions intact", () => {
+      const rowMenus = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexus.inventorySource") && (m.when ?? "").includes("nexusSettings")
+      );
+      expect(rowMenus.map((m) => m.command)).not.toContain("nexus.inventory.refreshStatus");
+    });
+
+    it("contributes nexus.inventory.statusPollSeconds as an integer setting defaulting to 0 (off), bounded 0..3600", () => {
+      // ⊘ registering it only in SETTINGS_META: VS Code's settings.json UI would
+      // not know the key, and the poll timer in extension.ts reads it via
+      // workspace.getConfiguration — an unregistered key returns undefined and the
+      // poll never arms.
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.inventory.statusPollSeconds"];
+      expect(prop).toBeDefined();
+      expect(prop?.type).toBe("integer");
+      expect(prop?.default).toBe(0);
+      expect(prop?.minimum).toBe(0);
+      expect(prop?.maximum).toBe(3600);
+      const description = prop?.markdownDescription || prop?.description || "";
+      expect(description).toMatch(/0 disables|0 = off|disables/i);
+    });
+  });
+
   it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
     const command = packageJson.contributes.commands.find((item) => item.command === "nexus.config.import.inventory");
     expect(command).toBeDefined();

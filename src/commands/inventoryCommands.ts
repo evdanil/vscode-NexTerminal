@@ -6,6 +6,7 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
+  fetchProviderStatus,
   InventoryProviderError,
   inventorySecretKey,
   inventorySourceValuesEqual,
@@ -4365,6 +4366,58 @@ export function registerInventoryCommands(
     };
   }
 
+  /**
+   * LIVE STATUS (Phase 2) — refresh the running/stopped state of one source (by
+   * id) or ALL sources (no arg, the poll path). Read-only: it never mutates
+   * servers or secrets, only NexusCore's runtime status map. Per-source errors
+   * are non-fatal (the whole point of the visible poll is that a flaky lab box
+   * never nags), so the sweep continues past any single failure:
+   *  - a source whose provider has no `fetchStatus` is skipped (NetBox);
+   *  - a source currently claimed in `inFlightSourceIds` (an in-flight
+   *    sync/edit/remove) is skipped so this never races the vault read or
+   *    provider call that operation is making — refresh never CLAIMS the guard
+   *    itself, so it can never block a real operation and overlapping refreshes
+   *    stay harmless (fetchProviderStatus is idempotent);
+   *  - `fetchProviderStatus` swallows a throwing/ malformed provider answer into
+   *    `undefined`, and a vault read that rejects is caught here.
+   */
+  async function refreshStatus(sourceIdArg?: string): Promise<void> {
+    const targets = sourceIdArg
+      ? (() => {
+          const source = core.getInventorySource(sourceIdArg);
+          return source ? [source] : [];
+        })()
+      : core.getSnapshot().inventorySources;
+    for (const source of targets) {
+      if (inFlightSourceIds.get(source.id) !== undefined) {
+        continue; // busy with a sync/edit/remove — skip, don't race it
+      }
+      const provider = registry.get(source.providerId);
+      if (!provider || typeof provider.fetchStatus !== "function") {
+        continue; // provider gone or offers no status (e.g. NetBox)
+      }
+      try {
+        const secrets: InventorySourceSecrets = {};
+        for (const fieldId of source.secretFieldIds) {
+          const value = await vault.get(inventorySecretKey(source.id, fieldId));
+          if (value !== undefined) {
+            secrets[fieldId] = value;
+          }
+        }
+        // fetchProviderStatus clones source.config internally (so the stored
+        // record is never mutated) and degrades every provider failure to
+        // undefined; secrets is a fresh local object, safe to pass as-is.
+        const report = await fetchProviderStatus(provider, source.config, secrets);
+        if (report) {
+          core.applyInventoryStatus(source.id, report);
+        }
+      } catch {
+        // Non-fatal per source (e.g. a rejecting vault read) — continue the sweep.
+        continue;
+      }
+    }
+  }
+
   function manageSources(): void {
     ManagementListPanel.open(core, inventorySourcesDescriptor());
   }
@@ -4381,6 +4434,7 @@ export function registerInventoryCommands(
     vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(resolveSourceIdArg(arg))),
+    vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => refreshStatus(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
   ];
 }

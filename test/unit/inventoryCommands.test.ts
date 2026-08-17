@@ -8182,3 +8182,127 @@ describe("inventoryCommands", () => {
     );
   });
 });
+
+/**
+ * LIVE STATUS (Phase 2) — nexus.inventory.refreshStatus fetches each targeted
+ * source's running/stopped report and applies it. It skips providers with no
+ * fetchStatus, is non-fatal per source, and respects the inFlightSourceIds
+ * busy-guard so it never races a sync/edit/remove on the same source.
+ */
+describe("nexus.inventory.refreshStatus", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
+  });
+
+  const REPORT = { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" as const } } };
+
+  it("applies a report from a source whose provider implements fetchStatus (⊘ never calling applyInventoryStatus leaves the tree without any live status)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledWith("src-1", REPORT);
+  });
+
+  it("skips a source whose provider has NO fetchStatus, without throwing or applying (⊘ calling a missing method throws into the refresh loop; NetBox has no status)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider()); // no fetchStatus
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+    expect(applySpy).not.toHaveBeenCalled();
+  });
+
+  it("is non-fatal per source: a source whose fetchStatus throws does not stop another source from applying (⊘ a single provider failure aborting the whole sweep)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    // One provider, per-source behaviour keyed on config.host.
+    const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+      if (config.host === "boom") throw new Error("provider down");
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "bad", name: "Bad", config: { host: "boom" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "good", name: "Good", config: { host: "ok" } }));
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+
+    // The good source still applied; the throwing one degraded to no update.
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledWith("good", REPORT);
+  });
+
+  it("refreshes only the named source when given a source id argument", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "A", config: { host: "a" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "B", config: { host: "b" } }));
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "a" });
+
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledWith("a", REPORT);
+  });
+
+  it("respects the inFlightSourceIds busy-guard — a source open in Edit Source is skipped, not hit concurrently (⊘ refreshing a busy source races the vault read/provider call the edit/sync is doing)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    // Open the edit form → the source is marked busy ("edit") while it stays open.
+    await registeredCommands.get("nexus.inventory.editSource")!();
+    const { panel } = latestFormCall();
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(fetchStatus).not.toHaveBeenCalled();
+
+    // Once the form closes the guard releases and a later refresh proceeds.
+    panel.fireDispose();
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads the source's saved secrets and passes them to fetchStatus (⊘ calling the provider without credentials makes every refresh an auth failure)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async (_config: InventorySourceValues, secrets: Record<string, string>) => {
+      expect(secrets.apiToken).toBe("tok");
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+    registerInventoryCommands(core, registry, vault, makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"], config: { host: "h" } }));
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+  });
+});

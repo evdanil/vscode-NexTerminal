@@ -3,7 +3,7 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "securityData" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts";
+  category: "logging" | "ssh" | "securityData" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts" | "inventory";
   description?: string;
   badge?: string;
   badgeClass?: string;
@@ -529,10 +529,24 @@ export const SETTINGS_META: SettingMeta[] = [
     description:
       "Automatically restore terminal.integrated.commandsToSkipShell when an external program strips it. Forensic logging stays active even when disabled.",
     default: true
+  },
+  // --- Inventory (Phase 2) ---
+  {
+    key: "statusPollSeconds",
+    section: "nexus.inventory",
+    label: "Lab status poll interval",
+    type: "number",
+    category: "inventory",
+    min: 0,
+    max: 3600,
+    unit: "seconds",
+    default: 0,
+    description:
+      "How often to refresh EVE-NG lab running status while the Command Center is visible. 0 disables polling (use Refresh Lab Status manually)."
   }
 ];
 
-export const CATEGORY_ORDER = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts", "inventory"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
@@ -543,7 +557,8 @@ export const CATEGORY_LABELS: Record<string, string> = {
   ui: "Interface",
   sftp: "SFTP / File Explorer",
   serial: "Serial",
-  scripts: "Scripts"
+  scripts: "Scripts",
+  inventory: "Inventory"
 };
 
 export const CATEGORY_ICONS: Record<string, string> = {
@@ -555,7 +570,8 @@ export const CATEGORY_ICONS: Record<string, string> = {
   ui: "layout",
   sftp: "folder-opened",
   serial: "circuit-board",
-  scripts: "play"
+  scripts: "play",
+  inventory: "server-environment"
 };
 
 export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
@@ -567,7 +583,8 @@ export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   ui: "Adjust how Nexus connection details are shown in the VS Code views.",
   sftp: "Configure remote file browsing, caching, watching, transfer timeouts, and delete safety limits.",
   serial: "Set serial command timeout behavior.",
-  scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs."
+  scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs.",
+  inventory: "Control how synced inventory sources refresh live device status in the Command Center."
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {

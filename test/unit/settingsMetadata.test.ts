@@ -3,11 +3,40 @@ import { formatSettingValueForTree, CATEGORY_DESCRIPTIONS, CATEGORY_ICONS, SETTI
 
 describe("CATEGORY_ICONS", () => {
   it("has an icon for every category", () => {
-    const expectedCategories = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"];
+    const expectedCategories = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts", "inventory"];
     for (const cat of expectedCategories) {
       expect(CATEGORY_ICONS[cat]).toBeDefined();
       expect(typeof CATEGORY_ICONS[cat]).toBe("string");
     }
+  });
+});
+
+/**
+ * LIVE STATUS (Phase 2) — the new Inventory settings category and its first
+ * setting. Being in SETTINGS_META gives the poll-interval a Settings-panel row
+ * and Reset All coverage automatically (SETTINGS_KEYS derives from this list),
+ * so ⊘ registering it only in package.json would leave it invisible in the
+ * in-extension Settings page and silently dropped from config export/import.
+ */
+describe("Inventory settings category (Phase 2)", () => {
+  it("registers the inventory category across ORDER/LABELS/ICONS/DESCRIPTIONS", async () => {
+    const { CATEGORY_ORDER, CATEGORY_LABELS, CATEGORY_ICONS, CATEGORY_DESCRIPTIONS } = await import("../../src/ui/settingsMetadata");
+    expect(CATEGORY_ORDER).toContain("inventory");
+    expect(CATEGORY_LABELS.inventory).toBe("Inventory");
+    expect(typeof CATEGORY_ICONS.inventory).toBe("string");
+    expect(CATEGORY_ICONS.inventory.length).toBeGreaterThan(0);
+    expect(CATEGORY_DESCRIPTIONS.inventory).toBeTruthy();
+  });
+
+  it("exposes nexus.inventory.statusPollSeconds with default 0 (off) and the documented bounds", () => {
+    const meta = SETTINGS_META.find((item) => item.section === "nexus.inventory" && item.key === "statusPollSeconds");
+    expect(meta).toBeDefined();
+    expect(meta?.category).toBe("inventory");
+    expect(meta?.type).toBe("number");
+    expect(meta?.default).toBe(0);
+    expect(meta?.min).toBe(0);
+    expect(meta?.max).toBe(3600);
+    expect(meta?.unit).toBe("seconds");
   });
 });
 

@@ -583,6 +583,12 @@
         "icon": "$(sync)"
       },
       {
+        "command": "nexus.inventory.refreshStatus",
+        "title": "Refresh Lab Status",
+        "category": "Nexus",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "nexus.inventory.manage",
         "title": "Manage Inventory Sources",
         "category": "Nexus"
@@ -955,6 +961,11 @@
           "command": "nexus.inventory.syncNow",
           "when": "view == nexusCommandCenter",
           "group": "1_manage@4"
+        },
+        {
+          "command": "nexus.inventory.refreshStatus",
+          "when": "view == nexusCommandCenter",
+          "group": "1_manage@5"
         },
         {
           "command": "nexus.tunnel.add",
@@ -1977,6 +1988,10 @@
         },
         {
           "command": "nexus.inventory.syncNow",
+          "when": "true"
+        },
+        {
+          "command": "nexus.inventory.refreshStatus",
           "when": "true"
         },
         {
@@ -3736,6 +3751,14 @@
           "maximum": 60,
           "order": 30,
           "markdownDescription": "Timeout in seconds for commands sent to the serial port sidecar process."
+        },
+        "nexus.inventory.statusPollSeconds": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 3600,
+          "order": 10,
+          "markdownDescription": "How often (in seconds) to refresh EVE-NG lab running status while the Command Center is visible. `0` disables polling — use the **Refresh Lab Status** command manually. Only EVE-NG sources report status."
         },
         "nexus.scripts.path": {
           "type": "string",
