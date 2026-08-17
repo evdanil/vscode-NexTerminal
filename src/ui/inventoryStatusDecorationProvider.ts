@@ -46,6 +46,12 @@ export function computeRunningStatus(snapshot: SessionSnapshot): RunningStatus {
   const runningFolders = new Set<string>();
   const status = snapshot.serverStatus;
   for (const server of snapshot.servers) {
+    // P3-5 — skip hidden servers so a hidden running node cannot light a folder
+    // whose VISIBLE contents are all stopped (the tree's own membership rule
+    // excludes hidden servers via `!s.isHidden`).
+    if (server.isHidden) {
+      continue;
+    }
     if (status?.get(server.id) === "running") {
       runningServerIds.add(server.id);
       if (server.group) {

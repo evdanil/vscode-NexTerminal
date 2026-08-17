@@ -44,9 +44,9 @@ import {
   STATUS_URI_SCHEME
 } from "../../src/ui/inventoryStatusDecorationProvider";
 
-function server(id: string, group: string | undefined, status?: "running" | "stopped"): { server: ServerConfig; status?: "running" | "stopped" } {
+function server(id: string, group: string | undefined, status?: "running" | "stopped", isHidden = false): { server: ServerConfig; status?: "running" | "stopped" } {
   return {
-    server: { id, name: id, host: "h", port: 23, username: "u", authType: "agent", isHidden: false, group },
+    server: { id, name: id, host: "h", port: 23, username: "u", authType: "agent", isHidden, group },
     status
   };
 }
@@ -77,6 +77,16 @@ describe("computeRunningStatus", () => {
   it("highlights a mixed folder as long as ≥1 node runs (⊘ requiring ALL nodes running would leave a partially-up lab dark)", () => {
     const snap = snapshotOf([server("a", "Lab", "stopped"), server("b", "Lab", "running")]);
     expect([...computeRunningStatus(snap).runningFolders]).toEqual(["Lab"]);
+  });
+
+  it("P3-5: ignores a HIDDEN running server, so its folder (whose visible contents are all stopped) does NOT highlight (⊘ iterating isHidden servers diverges from the tree's membership rule and lights an apparently-dead lab)", () => {
+    const snap = snapshotOf([
+      server("hidden", "EVE/LabH", "running", true), // hidden + running
+      server("shown", "EVE/LabH", "stopped") // the only visible node is stopped
+    ]);
+    const { runningServerIds, runningFolders } = computeRunningStatus(snap);
+    expect(runningServerIds.has("hidden")).toBe(false);
+    expect(runningFolders.has("EVE/LabH")).toBe(false);
   });
 
   it("produces empty sets when no server has status (a non-EVE tree)", () => {
