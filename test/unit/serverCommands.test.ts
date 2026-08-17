@@ -4292,6 +4292,38 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     expect(saved.host).toBe("10.0.0.5");
     expect(saved.port).toBe(22);
   });
+
+  // P2-3 fallback (Fable) — there is no syncedHost ownership stamp, so the next
+  // sync of a still-consoleless device will blank a hand-typed host. Warn the user
+  // at save so the impending revert is not a silent surprise. ⊘ Saving silently
+  // lets the address vanish on the next sync with no disclosure.
+  it("P2-3 — warns that the next sync may revert a host typed into an addressless placeholder", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: []
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("next sync"));
+  });
+
+  it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host does not warn about a revert (⊘ warning on every placeholder edit is noise)", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: [makeAuthProfile({ id: "ap-bmc", username: "bmc" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ ipmiAuthProfileId: "ap-bmc" }));
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("next sync"));
+  });
 });
 
 describe("addressless connect guard", () => {

@@ -459,6 +459,35 @@ describe("computeSyncPlan — adds", () => {
     // The other direction: a KEYLESS source profile writes no link on the placeholder
     // (blanket per-profile refusal), exactly as the addressed add drops a keyless
     // winner — the placeholder falls back to agent auth.
+    // P2-3 facet 1 (Fable) — a downgrade blanks a previously-addressed server's
+    // host with NO warning (the addresslessAdded aggregate covers only NEW
+    // placeholders). Disclose it, parallel to addresslessAdded.
+    it("P2-3 — downgrading a previously-addressed server emits an aggregate disclosure warning", () => {
+      const before = makeOwnedServer({ host: "10.0.0.1", port: 22 }); // addressed
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [] })]), // device lost its console
+        currentServers: [before],
+        now: 5000
+      });
+      expect(plan.updates[0].after.addressless).toBe(true);
+      expect(plan.warnings.some((w) => /lost their console address|lost its console address|downgraded/i.test(w))).toBe(true);
+    });
+
+    it("P2-3 control — a server that was ALREADY addressless does NOT emit the downgrade warning even when the sync updates it (⊘ warning every stay-addressless sync spams the log)", () => {
+      const before = makeOwnedServer({ name: "old-name", host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        // Renamed at the source so the stay-addressless server IS an update this
+        // sync — exercising the "was it previously addressed?" guard.
+        tree: makeTree([makeDevice({ name: "renamed", endpoints: [] })]),
+        currentServers: [before],
+        now: 5000
+      });
+      expect(plan.updates).toHaveLength(1);
+      expect(plan.warnings.every((w) => !/lost .*console address|downgraded/i.test(w))).toBe(true);
+    });
+
     it("P1-C — a new addressless device from a KEYLESS source profile carries NO link (⊘ writing a keyless winner stamps a link no server can satisfy)", () => {
       const keyless: AuthProfile = { id: "p1", name: "Shared Key", username: "svc", authType: "key" };
       const plan = computeSyncPlan({

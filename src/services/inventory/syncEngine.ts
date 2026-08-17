@@ -1112,6 +1112,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // ADDRESSLESS (Codex P1) — devices with no usable primary endpoint that were
   // NEWLY created as placeholders this run, for one aggregate note.
   const addresslessAdded: string[] = [];
+  // P2-3 (Fable) — previously-ADDRESSED servers downgraded to placeholders this
+  // sync (their console address blanked). Disclosed as an aggregate parallel to
+  // `addresslessAdded`; a stay-addressless server is never added here.
+  const downgradedToAddressless: string[] = [];
 
   // Folder → `group` resolution, shared by the addressed add/update path and the
   // ADDRESSLESS branch (which decides earlier, before the primary-endpoint check
@@ -1420,6 +1424,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           !serverOriginStampsEqual(ownedForAddressless.origin, after.origin);
         if (changed) {
           updates.push({ before: ownedForAddressless, after });
+          // P2-3 (Fable) — disclose the loss of a console address, but ONLY when the
+          // server was previously ADDRESSED (a real downgrade). A stay-addressless
+          // server is unchanged in this respect and must not be named every sync.
+          if (ownedForAddressless.addressless !== true) {
+            downgradedToAddressless.push(device.name);
+          }
           if (addresslessGroup !== undefined) {
             folderSet.add(addresslessGroup);
           }
@@ -3353,6 +3363,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const count = addresslessAdded.length;
     warnings.push(
       `${count} device${count === 1 ? "" : "s"} ${count === 1 ? "has" : "have"} no console address yet and ${count === 1 ? "was" : "were"} added without one (e.g. ${namedExamples(addresslessAdded)}).`
+    );
+  }
+  // P2-3 (Fable) — the downgrade twin of the addressless-added disclosure: name the
+  // previously-addressed servers whose console address this sync blanked.
+  if (downgradedToAddressless.length > 0) {
+    const count = downgradedToAddressless.length;
+    warnings.push(
+      `${count} previously-addressed server${count === 1 ? "" : "s"} lost ${count === 1 ? "its" : "their"} console address and ${count === 1 ? "was" : "were"} downgraded to ${count === 1 ? "a placeholder" : "placeholders"} (e.g. ${namedExamples(downgradedToAddressless)}).`
     );
   }
   pushSkipSummary(warnings, "had an empty name", emptyNameSkipped);

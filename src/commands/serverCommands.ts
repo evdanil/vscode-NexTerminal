@@ -2022,6 +2022,16 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
             );
           }
+          // P2-3 fallback (Fable) — the user gave an addressless placeholder a host
+          // in the form (`existing` was addressless, the saved record is not). There
+          // is no host-ownership stamp yet, so the NEXT sync of a still-consoleless
+          // device will blank this hand-typed host. Warn so the revert is disclosed
+          // rather than a silent surprise.
+          if (existing.addressless === true && candidate.addressless !== true) {
+            void vscode.window.showWarningMessage(
+              `You gave "${existing.name}" a console address by hand. Its inventory source did not assign one, so the next sync will revert it to a placeholder unless the device has an address by then.`
+            );
+          }
         },
         onBrowse: browseForKey,
         onCreateInline: inlineAuthProfile.handleCreateInline,
