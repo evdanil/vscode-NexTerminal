@@ -620,6 +620,37 @@ describe("createEveNgProvider — folder walk", () => {
     expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("deep"))).toBe(true);
   });
 
+  // E-2 (Fable) — the "Stopped after N labs" warning fired whenever
+  // `labs.length >= MAX_LABS && truncated`, so a tree with EXACTLY the cap of labs
+  // that was truncated for an UNRELATED reason (the depth cap here) wrongly claimed
+  // labs were dropped when none were. ⊘ Gate on `labs.length >= MAX_LABS` and it
+  // fires at exact capacity with no lab skipped.
+  it("E-2 — does NOT claim labs were dropped when exactly the cap was collected and truncation came from the depth cap", async () => {
+    const folders: Record<string, FolderListing> = {};
+    // Root carries exactly MAX_LABS (1000) labs — all pushed, none skipped for the
+    // cap — plus a chain deeper than the folder-depth cap to set `truncated`.
+    const labs = Array.from({ length: 1000 }, (_, i) => ({ file: `L${i}.unl`, path: `/L${i}.unl` }));
+    let path = "/deep0";
+    folders["/"] = { folders: [{ name: "deep0", path: "/deep0" }], labs };
+    for (let d = 1; d <= 20; d++) {
+      const child = `${path}/d${d}`;
+      folders[path] = { folders: [{ name: `d${d}`, path: child }] };
+      path = child;
+    }
+    const tree = await fetchTree({ folders });
+    // Truncated by the depth cap...
+    expect(tree.truncated).toBe(true);
+    expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("deep"))).toBe(true);
+    // ...but NO lab was skipped for the lab cap, so no "Stopped after N labs".
+    expect((tree.warnings ?? []).some((w) => /stopped after \d+ labs/i.test(w))).toBe(false);
+  });
+
+  it("E-2 control — DOES warn when a lab is genuinely skipped for the cap (⊘ gating on labsCapped must still fire when labs really were dropped)", async () => {
+    const labs = Array.from({ length: 1001 }, (_, i) => ({ file: `L${i}.unl`, path: `/L${i}.unl` }));
+    const tree = await fetchTree({ folders: { "/": { labs } } });
+    expect((tree.warnings ?? []).some((w) => /stopped after \d+ labs/i.test(w))).toBe(true);
+  });
+
   it("percent-encodes each path segment, so a lab or folder named with a space or a hash is actually requested (⊘ interpolating the raw path lets the hash start a URL fragment, and the request lands on a truncated path)", async () => {
     const world: World = {
       folders: {

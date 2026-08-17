@@ -599,15 +599,25 @@ class EveApiClient {
     let requests = 0;
     let truncated = false;
     let depthCapped = false;
+    // E-2 (Fable) — set ONLY when a lab is actually skipped for the MAX_LABS cap, so
+    // the "Stopped after N labs" warning does not misfire at exact capacity when the
+    // tree was truncated for an unrelated reason (the depth/budget cap).
+    let labsCapped = false;
     let budgetHit = false;
     // MINOR-12 — child folders that 404'd (removed mid-walk); counted for one
     // aggregate warning, never fatal (only the ROOT 404 is fatal — see below).
     let goneFolders = 0;
-    // MAJOR-1(a) — labs (and folders) the server reported OUTSIDE the Root
-    // Folder subtree, or bearing a dot-segment. Counted, not silently dropped:
-    // a scope violation is a hostile/misconfigured response worth surfacing,
-    // but it is NOT a cap, so it must not set `truncated` (that would disable
-    // pruning of the in-scope servers that legitimately disappeared).
+    // MAJOR-1(a) — LABS the server reported OUTSIDE the Root Folder subtree, or
+    // bearing a dot-segment. Counted, not silently dropped: a lab carries devices,
+    // so a scope violation that hides one is worth surfacing. It is NOT a cap, so
+    // it must not set `truncated` (that would disable pruning of the in-scope
+    // servers that legitimately disappeared).
+    //
+    // E-3 (Fable) — only LABS are counted here. An out-of-scope FOLDER EDGE is
+    // silently skipped by `isDescendable` below rather than counted: a folder edge
+    // is a descent target, not a device, so skipping one hides nothing on its own
+    // (any in-scope labs are still reached by their own in-scope paths). The warning
+    // copy therefore says "labs", never "labs and folders".
     let outOfScope = 0;
 
     // MINOR-1 — the budget check breaks BOTH loops and the warning is pushed
@@ -669,6 +679,7 @@ class EveApiClient {
           if (!matchesFilter(labPath)) continue;
           if (labs.length >= MAX_LABS) {
             truncated = true;
+            labsCapped = true;
             continue;
           }
           labs.push({ path: labPath, name: labNameOf(labPath) });
@@ -743,7 +754,7 @@ class EveApiClient {
         `Stopped after ${MAX_FOLDER_REQUESTS} folder listings — part of the EVE-NG folder tree was not scanned. Narrow the Root Folder.`
       );
     }
-    if (labs.length >= MAX_LABS && truncated) {
+    if (labsCapped) {
       warnings.push(`Stopped after ${MAX_LABS} labs — later labs under the Root Folder were not imported. Narrow the Root Folder or the Lab Filter.`);
     }
     if (depthCapped) {
@@ -933,6 +944,13 @@ function mapNode(
     device: {
       // Stable and unique across labs: two labs each have a node "1", and a
       // bare node id would collapse every lab's node 1 into one server.
+      //
+      // E-4 (Fable) — the identity is `<lab path>#<node id>`, so RENAMING OR MOVING
+      // a lab reidentifies every node in it: the old externalIds vanish from the
+      // fetch and the sync prunes their servers, while the new ones arrive as fresh
+      // adds. EVE-NG exposes no lab-stable GUID to key on, so this churn (prune +
+      // re-add, losing per-server hand edits and credentials on a lab rename) is a
+      // known limitation rather than a bug.
       externalId: `${lab.path}#${nodeId}`,
       name,
       folderPath: labFolderPath(lab, rootPrefix),
