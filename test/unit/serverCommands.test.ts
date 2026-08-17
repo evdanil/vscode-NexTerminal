@@ -4146,6 +4146,50 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
   });
 });
 
+/**
+ * ADDRESSLESS (Codex P1 on #82) — a synced placeholder with no console address
+ * (a stopped EVE node). Connecting must show a friendly "start it and re-sync"
+ * message and do NOTHING else — no vault read, no prompt, no transport.
+ */
+describe("addressless connect guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("refuses to connect an addressless server with a friendly message and builds NEITHER an SshPty NOR a TelnetPty (⊘ no guard reaches SshPty with host \"\", prompting and handshaking against nothing)", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx.sshFactory as any).connect = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(SshPty).not.toHaveBeenCalled();
+    expect(TelnetPty).not.toHaveBeenCalled();
+    expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining("no console address yet")
+    );
+  });
+
+  it("refuses Test Connection against an addressless server without touching the SSH factory (⊘ an SSH-only feature slips through to a raw empty-host failure)", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx.sshFactory as any).connect = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+
+    expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+  });
+});
+
 describe("telnet connect path", () => {
   beforeEach(() => {
     vi.clearAllMocks();

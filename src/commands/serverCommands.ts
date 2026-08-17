@@ -42,7 +42,7 @@ import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { configMutationLock } from "../services/configMutationLock";
-import { telnetUnsupportedMessage } from "../utils/protocolGuards";
+import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 
 export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -1080,6 +1080,15 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   if (!server) {
     return;
   }
+  // ADDRESSLESS (Codex P1) — refuse BEFORE any transport branch: a placeholder
+  // with no console address has nothing to connect to, so it must not reach the
+  // SSH factory (prompt + vault + handshake to an empty host) or the telnet
+  // path. This is the first thing checked, ahead of the protocol branch.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showInformationMessage(addresslessMessage);
+    return;
+  }
   // TELNET (Phase 0) — branch BEFORE anything auth-shaped runs. A telnet server
   // must never reach `SilentAuthSshFactory`: no password prompt, no vault read.
   if (resolveServerProtocol(server) === "telnet") {
@@ -1266,6 +1275,13 @@ function formatSshDiagnosticDetails(server: ServerConfig, diagnostic: Connection
 async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
+    return;
+  }
+  // ADDRESSLESS (Codex P1) — an SSH-only feature against a placeholder with no
+  // console address must refuse up front rather than handshake against nothing.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showWarningMessage(addresslessMessage);
     return;
   }
   // TELNET (Phase 0) — this opens an SSH connection and reports its handshake.
@@ -2221,6 +2237,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       }
       // TELNET (Phase 0) — there is no authorized_keys on the far side of a
       // telnet session, and the deploy itself runs over SSH.
+      const addresslessDeploy = addresslessUnavailableMessage(server);
+      if (addresslessDeploy) {
+        void vscode.window.showWarningMessage(addresslessDeploy);
+        return;
+      }
       const unsupported = telnetUnsupportedMessage(server, "Deploy SSH Key");
       if (unsupported) {
         void vscode.window.showWarningMessage(unsupported);
