@@ -4793,6 +4793,34 @@ describe("NexusCore inventory status", () => {
     expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
   });
 
+  it("P2-2: a sync apply that prunes a status-bearing server then FAILS its repo write restores BOTH the server and its runtime status on rollback (⊘ the rollback envelope restores server/sessions/folders/source but not status, so a failed save strands the highlight lost until another refresh — which may never come with polling off)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1" }));
+    const persisted = core.getInventorySource("source-1")!;
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("disk full"));
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 2000,
+        upsertServers: [],
+        removeServerIds: [s1.id],
+        folders: [],
+        expectedSource: persisted
+      })
+    ).rejects.toThrow("disk full");
+
+    // Rolled back: the server is back AND its running status is back with it.
+    expect(core.getServer(s1.id)).toBeDefined();
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+  });
+
   it("does not fire a change when clearInventoryStatus has nothing to clear (⊘ an unconditional emit churns every tree on an unrelated source removal)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

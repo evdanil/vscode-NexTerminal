@@ -1227,10 +1227,19 @@ export class NexusCore {
         }
       }
     }
+    // LIVE STATUS (Phase 2) — capture the runtime status entries this prune is
+    // about to drop, so a rejected persist below can restore them alongside the
+    // servers they belong to (the rollback envelope otherwise loses the
+    // running/stopped highlight even though the server itself comes back).
+    const droppedServerStatus = new Map<string, { state: "running" | "stopped"; source: string | undefined }>();
     for (const id of removeServerIds) {
+      const priorStatus = this.serverStatus.get(id);
+      if (priorStatus !== undefined) {
+        droppedServerStatus.set(id, { state: priorStatus, source: this.serverStatusSource.get(id) });
+      }
       this.servers.delete(id);
       this.removeServerSessions(id);
-      // LIVE STATUS (Phase 2) — a pruned server must not leave a ghost status entry.
+      // A pruned server must not leave a ghost status entry (P3-4).
       this.dropServerStatusEntry(id);
       batchWrittenServers.set(id, undefined);
     }
@@ -1878,6 +1887,19 @@ export class NexusCore {
           return depthA !== depthB ? depthA - depthB : idA.localeCompare(idB);
         }
       );
+      // LIVE STATUS (Phase 2) — restore a pruned server's runtime status
+      // entry when (and only when) the server itself is restored below, so the
+      // rollback leaves status and server consistent. A server left deleted (a
+      // concurrent recreation) keeps its status dropped.
+      const restoreDroppedStatus = (id: string): void => {
+        const dropped = droppedServerStatus.get(id);
+        if (dropped) {
+          this.serverStatus.set(id, dropped.state);
+          if (dropped.source !== undefined) {
+            this.serverStatusSource.set(id, dropped.source);
+          }
+        }
+      };
       for (const [id, priorServer] of orderedRemovedServerRestores) {
         if (this.servers.get(id) !== undefined) {
           continue; // something concurrent recreated this record — leave theirs.
@@ -1888,6 +1910,7 @@ export class NexusCore {
           // Sound chain (or nothing to judge): restore the captured pre-batch
           // record itself, byte-for-byte, exactly as before this fix.
           this.servers.set(id, priorServer);
+          restoreDroppedStatus(id);
           addSurvivingFolderChain(group);
           continue;
         }
@@ -1910,6 +1933,7 @@ export class NexusCore {
         const restored = cloneServerConfig(priorServer);
         restored.group = remappedGroup;
         this.servers.set(id, restored);
+        restoreDroppedStatus(id);
         addSurvivingFolderChain(remappedGroup);
       }
       // TOMBSTONE — a captured session that was genuinely torn down by
