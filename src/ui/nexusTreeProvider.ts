@@ -110,17 +110,20 @@ export class ServerTreeItem extends vscode.TreeItem {
     // so no existing menu is dropped for a BMC server.
     const hasIpmi = typeof server.ipmiHost === "string" && server.ipmiHost.trim() !== "";
     this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}`;
-    // LIVE STATUS (Phase 2) — a status-bearing (EVE-origin) server shows a
-    // running/stopped dot; every other server keeps the plain connect icon.
-    if (status === "running") {
+    // LIVE STATUS (Phase 2) — the icon. A CONNECTED server always keeps its
+    // connected (plug) icon: the connected affordance must not be lost (P3-6),
+    // and the running state is still conveyed by the " (running)" description
+    // and the green ▶ FileDecoration. The running/stopped dot is only for a
+    // NON-connected status-bearing (EVE-origin) server; every other server keeps
+    // the plain disconnect icon.
+    if (connected) {
+      this.iconPath = new vscode.ThemeIcon("plug", new vscode.ThemeColor("testing.iconPassed"));
+    } else if (status === "running") {
       this.iconPath = new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.green"));
     } else if (status === "stopped") {
       this.iconPath = new vscode.ThemeIcon("circle-outline", new vscode.ThemeColor("descriptionForeground"));
     } else {
-      this.iconPath = new vscode.ThemeIcon(
-        connected ? "plug" : "debug-disconnect",
-        new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
-      );
+      this.iconPath = new vscode.ThemeIcon("debug-disconnect", new vscode.ThemeColor("testing.iconQueued"));
     }
     this.command = {
       command: "nexus.profile.actions",

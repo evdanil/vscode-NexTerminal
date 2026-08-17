@@ -1178,6 +1178,24 @@ describe("ServerTreeItem inventory status affordance", () => {
     expect(item.description).not.toContain("(running)");
   });
 
+  function connectedItemWithStatus(status: "running" | "stopped"): ServerTreeItem {
+    return new ServerTreeItem(makeServer({ id: "c" }), true, undefined, true, undefined, undefined, undefined, undefined, status);
+  }
+
+  it("P3-6: a CONNECTED running EVE node keeps its connected (plug) icon; the running state is carried by the '(running)' description, not by replacing the icon (⊘ swapping the plug for a status dot regresses the connected affordance)", () => {
+    const item = connectedItemWithStatus("running");
+    expect((item.iconPath as { id: string }).id).toBe("plug");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconPassed");
+    expect(item.description).toContain("(running)");
+  });
+
+  it("P3-6: a CONNECTED stopped EVE node keeps its connected icon and shows no dim dot and no '(running)' suffix", () => {
+    const item = connectedItemWithStatus("stopped");
+    expect((item.iconPath as { id: string }).id).toBe("plug");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconPassed");
+    expect(item.description).not.toContain("(running)");
+  });
+
   it("threads status from the snapshot and stamps a nexus-status: resourceUri on both the running server and its lab folder (⊘ no resourceUri means the decoration provider can never match the row)", async () => {
     const provider = new NexusTreeProvider({
       onTunnelDropped: vi.fn(async () => {}),
