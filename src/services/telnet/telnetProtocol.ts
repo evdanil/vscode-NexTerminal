@@ -194,6 +194,26 @@ export class TelnetNegotiator {
     this.rows = clampDimension(options.initialRows ?? DEFAULT_ROWS);
   }
 
+  /**
+   * Append one byte to the subnegotiation payload, or — at the cap — ABANDON the
+   * subnegotiation and resync to the data state (see MAX_SUBNEGOTIATION_BYTES).
+   *
+   * THE SINGLE APPEND POINT, deliberately: the cap has to hold on the plain-byte
+   * path AND on the `IAC IAC` escape path, and keeping two copies of the check is
+   * exactly how the escape path came to be missing one (P1-A). The byte is
+   * reprocessed AS DATA on abandonment rather than dropped, so the escape
+   * swallows nothing — matching the malformed-`IAC <x>` branch's disposition.
+   */
+  private appendSubnegotiationByte(byte: number, data: number[]): void {
+    if (this.sbPayload.length >= MAX_SUBNEGOTIATION_BYTES) {
+      this.sbPayload = [];
+      this.state = "data";
+      this.consumeDataByte(byte, data);
+      return;
+    }
+    this.sbPayload.push(byte);
+  }
+
   /** The per-subnegotiation payload cap this parser enforces. */
   public get maxSubnegotiationBytes(): number {
     return MAX_SUBNEGOTIATION_BYTES;
@@ -257,15 +277,8 @@ export class TelnetNegotiator {
         case "sb-payload":
           if (byte === IAC) {
             this.state = "sb-iac";
-          } else if (this.sbPayload.length >= MAX_SUBNEGOTIATION_BYTES) {
-            // Over the cap — abandon this subnegotiation and resync to data
-            // (see MAX_SUBNEGOTIATION_BYTES). This byte is reprocessed AS DATA
-            // rather than dropped, so the escape swallows nothing.
-            this.sbPayload = [];
-            this.state = "data";
-            this.consumeDataByte(byte, data);
           } else {
-            this.sbPayload.push(byte);
+            this.appendSubnegotiationByte(byte, data);
           }
           break;
         case "sb-iac":
@@ -275,8 +288,17 @@ export class TelnetNegotiator {
             this.state = "data";
           } else if (byte === IAC) {
             // `IAC IAC` inside a payload is an escaped 0xFF, NOT the end.
-            this.sbPayload.push(IAC);
+            //
+            // P1-A (Codex) — THIS APPEND IS CAPPED TOO, and that is the whole
+            // finding. A peer streaming nothing but `IAC IAC` never executes the
+            // plain-byte branch at all: the first IAC moves the parser here, and
+            // this branch used to append and return to `sb-payload`, so the two
+            // states alternated forever and the payload grew without bound —
+            // reopening the OOM the cap was added to close, through the one path
+            // that skipped it. Both appends now go through the same helper, so
+            // they cannot drift apart again.
             this.state = "sb-payload";
+            this.appendSubnegotiationByte(IAC, data);
           } else {
             // Malformed: an IAC inside a subnegotiation followed by something
             // other than SE or IAC. Treat it as the command it looks like and
