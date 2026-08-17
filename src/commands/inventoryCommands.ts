@@ -4580,7 +4580,7 @@ export function registerInventoryCommands(
     const provider = source ? registry.get(source.providerId) : undefined;
     if (!origin || !source || !provider || typeof provider.controlNode !== "function") {
       void vscode.window.showErrorMessage(
-        `"${server.name}" is not an inventory-synced node that supports Start/Stop.`
+        `"${server.name}" is not synced from an inventory source that supports node control.`
       );
       return;
     }
