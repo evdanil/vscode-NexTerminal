@@ -4649,6 +4649,45 @@ describe("NexusCore inventory status", () => {
     expect(core.getSnapshot().serverStatus.size).toBe(0);
   });
 
+  it("P2-2: does NOT stamp status onto a server sitting at deterministicServerId(source-1, x) whose origin was STRIPPED (kept via Remove Source → Keep Servers) or belongs to another source (⊘ dropping the origin.sourceId ownership check lets a stale in-flight refresh re-light a detached server)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // The deterministic id still resolves — but ownership no longer does.
+    const detachedId = deterministicServerId("source-1", "dev#1");
+    const detached: ServerConfig = {
+      id: detachedId,
+      name: "kept",
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false
+      // origin ABSENT — the Keep-Servers strip removed it.
+    };
+    // A second server that resolves under source-1's namespace but is OWNED by source-2.
+    const foreign: ServerConfig = {
+      id: deterministicServerId("source-1", "dev#2"),
+      name: "foreign",
+      host: "10.0.0.10",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-2", externalId: "dev#2", syncedAt: 1 }
+    };
+    await core.addServersBatch([detached, foreign]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(detachedId)).toBe(false);
+    expect(snap.serverStatus.has(foreign.id)).toBe(false);
+    expect(snap.serverStatus.size).toBe(0);
+  });
+
   it("drops an entry the source no longer reports on the next apply (⊘ retaining it shows a pruned/gone node as still running)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
