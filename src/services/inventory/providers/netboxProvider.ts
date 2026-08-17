@@ -1,5 +1,6 @@
 import {
   InventoryProviderError,
+  hasConsoleEndpoint,
   type InventoryConfigField,
   type InventoryDevice,
   type InventoryProvider,
@@ -813,28 +814,41 @@ async function fetchInventoryImpl(
       : [];
 
   const devices: InventoryDevice[] = [];
-  // FIX 1 — "skipped" now means "mapped with no endpoints" (unmappable name or
-  // IP), not "dropped from the tree" — mapEntry throws (FINDING 1) rather
-  // than returning undefined for a row with no usable id.
+  // NO-CONSOLE-ADDRESS COUNT — an OBSERVATION about what NetBox returned, never a
+  // claim about what the sync did with it (Codex P1 on PR #86). `devices.push` is
+  // UNCONDITIONAL: since the addressless-placeholder change these devices are not
+  // skipped, they sync as visible servers with no address, and the OUTCOME is the
+  // sync engine's to report — which it does, per plan, naming examples ("N devices
+  // have no console address yet and were added without one"). A provider claiming
+  // they "were skipped" contradicted that line with something simply untrue.
   //
-  // Keyed on "has no SSH endpoint", NOT on `endpoints.length === 0`: since
-  // `oob_ip` can put an endpoint on a device that has no primary IP, the length
-  // test would silently drop exactly those devices out of this warning while
-  // they remain just as unmappable to SSH as before.
-  const hasNoSshEndpoint = (mapped: InventoryDevice): boolean => !mapped.endpoints.some((e) => e.kind === "ssh");
-  let skippedCount = 0;
+  // The provider still counts them, rather than deferring entirely: the engine's
+  // aggregate covers the devices it ADDED this sync, so a device that was already
+  // an addressless placeholder before this run appears in no engine line at all.
+  // This is the only place that says NetBox holds no usable address for it.
+  //
+  // Keyed on `hasConsoleEndpoint` (models/inventory.ts) — the engine's own
+  // addressless notion — NOT on "has no ssh endpoint" and NOT on
+  // `endpoints.length === 0`. Both alternatives miscount: `oob_ip` puts a
+  // (console-less) endpoint on a device with no primary IP, so the length test
+  // drops exactly those out of the warning, while an ssh-only test counts a
+  // device whose only address is telnet, which syncs perfectly well as a telnet
+  // server.
+  let noAddressCount = 0;
   rawDevices.forEach((raw, index) => {
     const mapped = mapEntry(raw, "/api/dcim/devices/", index, template, "device", primaryIpFamily);
     devices.push(mapped);
-    if (hasNoSshEndpoint(mapped)) skippedCount++;
+    if (!hasConsoleEndpoint(mapped)) noAddressCount++;
   });
   rawVms.forEach((raw, index) => {
     const mapped = mapEntry(raw, "/api/virtualization/virtual-machines/", index, template, "vm", primaryIpFamily);
     devices.push(mapped);
-    if (hasNoSshEndpoint(mapped)) skippedCount++;
+    if (!hasConsoleEndpoint(mapped)) noAddressCount++;
   });
-  if (skippedCount > 0) {
-    warnings.push(`${skippedCount} device${skippedCount === 1 ? "" : "s"} without a primary IP were skipped.`);
+  if (noAddressCount > 0) {
+    warnings.push(
+      `${noAddressCount} device${noAddressCount === 1 ? "" : "s"} ${noAddressCount === 1 ? "has" : "have"} no usable SSH or telnet address in NetBox.`
+    );
   }
 
   // FIX 3 — an exact-cap fetch (the source has precisely HARD_CAP records) must

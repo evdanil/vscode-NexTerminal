@@ -7,6 +7,7 @@ import {
   stripCidr,
   renderFolderTemplate
 } from "../../src/services/inventory/providers/netboxProvider";
+import { hasConsoleEndpoint } from "../../src/models/inventory";
 import { deviceMatchesFilter, parseTemplateFilter } from "../../src/services/inventory/templateApply";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
@@ -424,7 +425,7 @@ describe("createNetboxProvider", () => {
       expect(byExternalId.get("device:1")?.endpoints).toHaveLength(1);
       expect(byExternalId.get("device:2")?.endpoints).toEqual([]);
       expect(byExternalId.get("device:3")?.endpoints).toEqual([]);
-      expect(tree.warnings.some((w) => w.includes("2") && w.toLowerCase().includes("primary ip"))).toBe(true);
+      expect(tree.warnings.some((w) => w.includes("2") && w.toLowerCase().includes("no usable ssh or telnet address"))).toBe(true);
     });
 
     it("(FIX 1) a device with an id and a name but no primary IP appears in tree.devices with an empty endpoints array (kills drop-at-mapper)", async () => {
@@ -445,10 +446,10 @@ describe("createNetboxProvider", () => {
     /**
      * OOB (issue #48, Phase 2) — `oob_ip` becomes a SECOND endpoint beside the
      * SSH one, which the sync engine maps onto `ServerConfig.ipmiHost`. The
-     * bookkeeping trap these fixtures exist for: the "devices without a primary
-     * IP were skipped" warning used to be keyed on `endpoints.length === 0`, and
-     * an OOB-only device has a non-empty endpoints array while being exactly as
-     * unmappable to SSH as before.
+     * bookkeeping trap these fixtures exist for: the no-console-address warning
+     * used to be keyed on `endpoints.length === 0`, and an OOB-only device has a
+     * non-empty endpoints array while reaching exactly as little console as
+     * before.
      */
     it("(OOB) emits a second `redfish` endpoint from oob_ip, CIDR-stripped, without disturbing the ssh one (kills reading oob_ip into the ssh endpoint, and kills ignoring it)", async () => {
       const fetchImpl = vi.fn(async () =>
@@ -516,7 +517,7 @@ describe("createNetboxProvider", () => {
       expect(byName.get("real-oob")!.endpoints).toContainEqual({ kind: "redfish", host: "10.9.9.9" });
     });
 
-    it("(OOB) a device with an oob_ip but NO primary IP carries the redfish endpoint alone AND is still counted in the no-SSH warning (kills the stale `endpoints.length === 0` skip predicate, which silently drops exactly these devices out of the warning)", async () => {
+    it("(OOB) a device with an oob_ip but NO primary IP carries the redfish endpoint alone AND is still counted in the no-console-address warning (kills the stale `endpoints.length === 0` predicate, which silently drops exactly these devices out of the warning)", async () => {
       const fetchImpl = vi.fn(async () =>
         makeResponse(200, {
           count: 2,
@@ -535,7 +536,12 @@ describe("createNetboxProvider", () => {
       const byExternalId = new Map(tree.devices.map((d) => [d.externalId, d]));
       expect(byExternalId.get("device:1")?.endpoints).toEqual([{ kind: "redfish", host: "10.9.9.9" }]);
       expect(byExternalId.get("device:2")?.endpoints).toEqual([]);
-      expect(tree.warnings).toEqual(["2 devices without a primary IP were skipped."]);
+      // CORRECTED STRING (Codex P1 on PR #86) — the old assertion pinned
+      // "2 devices without a primary IP were skipped.", which stopped being true
+      // when these devices started syncing as addressless placeholders instead of
+      // being dropped. The provider now reports what it OBSERVED in NetBox and
+      // leaves the outcome to the engine's own aggregate.
+      expect(tree.warnings).toEqual(["2 devices have no usable SSH or telnet address in NetBox."]);
     });
 
     it("(OOB) VMs never get a management endpoint, even when the payload carries oob_ip (kills applying the device-only field to the VM branch)", async () => {
@@ -1021,5 +1027,41 @@ describe("createNetboxProvider", () => {
       expect(vm.attributes!.rack).toBeUndefined();
       expect(vm.attributes!.location).toBeUndefined();
     });
+  });
+});
+
+/**
+ * The predicate behind the provider's no-console-address warning (Codex P2 on
+ * PR #86). It must mean "no CONNECTABLE console endpoint" — exactly what the
+ * sync engine's `selectPrimaryEndpoint` decides addressless on: an `ssh`
+ * endpoint, else a `telnet` one, each with a non-empty host. Keyed on "no ssh
+ * endpoint" it reports a device that syncs perfectly well as a TELNET server as
+ * having no address.
+ *
+ * Exercised at the predicate rather than through a NetBox payload DELIBERATELY:
+ * `mapEntry` emits only `ssh` (primary + alternate) and `redfish` (`oob_ip`)
+ * endpoints, so no NetBox response can put a telnet endpoint on the tree today
+ * and the telnet case is unreachable from this provider's own fetch path. The
+ * inconsistency lives in the shared notion — which EVE-NG devices, and any
+ * third-party provider emitting telnet, do reach.
+ */
+describe("hasConsoleEndpoint", () => {
+  it("a TELNET-only device HAS a console address (kills the ssh-only predicate, which counts a device that syncs as a telnet server as having none)", () => {
+    expect(hasConsoleEndpoint({ endpoints: [{ kind: "telnet", host: "10.0.0.9", port: 5001 }] })).toBe(true);
+  });
+
+  it("an ssh device has one, and a device with no endpoints at all has none", () => {
+    expect(hasConsoleEndpoint({ endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] })).toBe(true);
+    expect(hasConsoleEndpoint({ endpoints: [] })).toBe(false);
+  });
+
+  it("an out-of-band address is NOT a console address (kills `endpoints.length > 0`, which would read a BMC-only device as reachable)", () => {
+    expect(hasConsoleEndpoint({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] })).toBe(false);
+    expect(hasConsoleEndpoint({ endpoints: [{ kind: "url", host: "10.9.9.9" }] })).toBe(false);
+  });
+
+  it("an EMPTY host is no address, on either console kind (matches the engine's own non-empty-host rule rather than trusting the kind alone)", () => {
+    expect(hasConsoleEndpoint({ endpoints: [{ kind: "ssh", host: "" }] })).toBe(false);
+    expect(hasConsoleEndpoint({ endpoints: [{ kind: "telnet", host: "" }] })).toBe(false);
   });
 });
