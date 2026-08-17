@@ -113,6 +113,13 @@ export interface InventoryDeviceStatus {
 export interface InventoryStatusReport {
   contractVersion: 1;
   statuses: Record<string, InventoryDeviceStatus>;
+  // TRUNCATION — set when the provider stopped collecting early because it hit
+  // its own hard cap (mirrors InventoryTree.truncated). A truncated report is
+  // PARTIAL: nodes beyond the cap are simply absent, NOT gone — so
+  // applyInventoryStatus MERGES a truncated report (retaining prior status for
+  // absent entries) rather than clearing-then-applying (which treats an absent
+  // node as removed). Absent/false ⇒ a complete report.
+  truncated?: boolean;
 }
 
 export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
@@ -342,6 +349,11 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   if (obj.contractVersion !== 1) {
     return undefined;
   }
+  // TRUNCATION — optional; when present it MUST be a real boolean (a string /
+  // number would be read truthily and silently flip the clear-vs-merge decision).
+  if (Object.prototype.hasOwnProperty.call(obj, "truncated") && typeof obj.truncated !== "boolean") {
+    return undefined;
+  }
   const statuses = obj.statuses;
   // A plain object, not an array (Array is typeof "object") and not null.
   if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
@@ -371,7 +383,12 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
     }
     validated[key] = status;
   }
-  return { contractVersion: 1, statuses: validated };
+  const result: InventoryStatusReport = { contractVersion: 1, statuses: validated };
+  // Preserve an explicit boolean (true OR false); never invent the key when absent.
+  if (typeof obj.truncated === "boolean") {
+    result.truncated = obj.truncated;
+  }
+  return result;
 }
 
 /**

@@ -2265,12 +2265,20 @@ export class NexusCore {
    * are untouched. One emitChanged() on the way out, like registerSession.
    */
   public applyInventoryStatus(sourceId: string, report: InventoryStatusReport): void {
-    // Clear this source's prior entries first, then rebuild from the fresh
-    // report — so a server the source stops reporting drops out on this pass.
-    for (const [serverId, owner] of [...this.serverStatusSource]) {
-      if (owner === sourceId) {
-        this.serverStatus.delete(serverId);
-        this.serverStatusSource.delete(serverId);
+    // TRUNCATION — a COMPLETE report is authoritative: clear this source's prior
+    // entries first, then rebuild, so a node the source stops reporting (a
+    // stopped node is still present as "stopped", so absent == removed) drops
+    // out. A TRUNCATED report is PARTIAL — nodes beyond the provider's cap are
+    // merely absent, not gone — so we MERGE instead: skip the clear and retain
+    // the prior status of any entry not in this report, applying only what is
+    // present (present entries overwrite below, keeping serverStatusSource ===
+    // sourceId consistently for both retained and freshly-applied entries).
+    if (!report.truncated) {
+      for (const [serverId, owner] of [...this.serverStatusSource]) {
+        if (owner === sourceId) {
+          this.serverStatus.delete(serverId);
+          this.serverStatusSource.delete(serverId);
+        }
       }
     }
     // Resolve report entries by the server's REAL origin identity, not by

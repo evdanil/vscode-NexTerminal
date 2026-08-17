@@ -71,6 +71,29 @@ describe("validateInventoryStatusReport", () => {
     expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {} })).toEqual({ contractVersion: 1, statuses: {} });
   });
 
+  it("accepts an optional boolean `truncated` and preserves it; a report without it is unchanged (⊘ a capped report with no truncation signal reads as complete and clears decorations for nodes beyond the cap)", () => {
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, truncated: true })).toEqual({
+      contractVersion: 1,
+      statuses: {},
+      truncated: true
+    });
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, truncated: false })).toEqual({
+      contractVersion: 1,
+      statuses: {},
+      truncated: false
+    });
+    // Absent is fine and does not invent the field.
+    const noFlag = validateInventoryStatusReport({ contractVersion: 1, statuses: {} });
+    expect(noFlag).toEqual({ contractVersion: 1, statuses: {} });
+    expect(Object.prototype.hasOwnProperty.call(noFlag!, "truncated")).toBe(false);
+  });
+
+  it("rejects a non-boolean `truncated` (⊘ a string/number truncation flag would be read truthily and silently change the clear-vs-merge decision)", () => {
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, truncated: "yes" })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, truncated: 1 })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, truncated: null })).toBeUndefined();
+  });
+
   it("is prototype-pollution-safe AND preserves a __proto__ own key as real data (⊘ writing into a plain `{}` triggers the inherited setter — the entry is silently dropped and `state` leaks onto Object.prototype)", () => {
     const raw = JSON.parse('{"contractVersion":1,"statuses":{"__proto__":{"state":"running"},"real":{"state":"stopped"}}}');
     const result = validateInventoryStatusReport(raw);

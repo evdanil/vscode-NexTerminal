@@ -4680,6 +4680,56 @@ describe("NexusCore inventory status", () => {
     expect(snap.serverStatus.get(foreign.id)).toBeUndefined(); // other source untouched
   });
 
+  it("P2 (truncation): a TRUNCATED report MERGES — a previously-running node absent from the partial report KEEPS its running status, while present entries still apply (⊘ clearing all prior entries under a capped report loses the decoration of every node beyond the cap)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-1", "dev#2");
+    await core.addServersBatch([a, b]);
+
+    // Complete report first: both running.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+    expect(core.getSnapshot().serverStatus.get(a.id)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(b.id)).toBe("running");
+
+    // A TRUNCATED report that only reached dev#2 (dev#1 is beyond the cap).
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#2": { state: "stopped" } },
+      truncated: true
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(a.id)).toBe("running"); // retained — merge, not clear
+    expect(snap.serverStatus.get(b.id)).toBe("stopped"); // present entry applied
+  });
+
+  it("P2 (truncation) DISCRIMINATOR: a NON-truncated report still CLEARS an absent node's status (an absent node in a complete report is genuinely removed — do not turn every apply into a merge) (⊘ merging a complete report leaves a pruned node highlighted forever)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-1", "dev#2");
+    await core.addServersBatch([a, b]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+
+    // Complete (non-truncated) report omitting dev#1 → dev#1 is gone.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#2": { state: "stopped" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false); // cleared — absent == removed
+    expect(snap.serverStatus.get(b.id)).toBe("stopped");
+  });
+
   it("does not set a status for a serverId that resolves to no owned server (⊘ populating the map for a device the sync has not materialized leaves a stale highlight with nothing to hang it on)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

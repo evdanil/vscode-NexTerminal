@@ -1106,8 +1106,14 @@ async function fetchStatusImpl(
 
   const statuses: Record<string, InventoryDeviceStatus> = {};
   let nodeCount = 0;
+  // TRUNCATION — a partial scan (the node cap here, or the folder/lab/budget
+  // caps inside walkFolders) must be signalled, so applyInventoryStatus MERGES
+  // this report rather than clearing the decorations of nodes it never reached.
+  // Same idiom fetchInventory uses.
+  let truncated = walk.truncated;
+  let nodesCapped = false;
   for (const lab of walk.labs) {
-    if (nodeCount >= MAX_NODES) break;
+    if (nodesCapped) break;
     const nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
     // MINOR-12 — the lab was deleted between the folder listing and this fetch;
     // skip it, exactly as fetchInventory does.
@@ -1115,7 +1121,11 @@ async function fetchStatusImpl(
       continue;
     }
     for (const [nodeId, raw] of nodePairs) {
-      if (nodeCount >= MAX_NODES) break;
+      if (nodeCount >= MAX_NODES) {
+        nodesCapped = true;
+        truncated = true;
+        break;
+      }
       nodeCount++;
       const running = Number(raw.status) === 2;
       const status: InventoryDeviceStatus = { state: running ? "running" : "stopped" };
@@ -1129,7 +1139,7 @@ async function fetchStatusImpl(
       statuses[`${lab.path}#${nodeId}`] = status;
     }
   }
-  return { contractVersion: 1, statuses };
+  return { contractVersion: 1, statuses, truncated: truncated || undefined };
 }
 
 async function testConnectionImpl(fetchImpl: typeof fetch, config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {

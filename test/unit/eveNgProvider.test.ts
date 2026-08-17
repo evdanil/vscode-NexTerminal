@@ -1599,4 +1599,24 @@ describe("createEveNgProvider — fetchStatus", () => {
     }) as unknown as typeof fetch;
     await expect(createEveNgProvider(fetchImpl).fetchStatus!(CONFIG, SECRETS)).rejects.toBeInstanceOf(InventoryProviderError);
   });
+
+  it("sets truncated:true when the node scan hits the MAX_NODES cap, so a partial report is not mistaken for complete (⊘ an ordinary complete-looking report makes applyInventoryStatus clear decorations for every node beyond the cap)", async () => {
+    // One lab with more nodes than the 10 000-node cap. Numeric string keys
+    // iterate in numeric order, so the cap deterministically stops the scan
+    // partway and the report must carry the truncation signal.
+    const many: Record<string, unknown> = {};
+    for (let i = 0; i <= 10_000; i++) {
+      many[String(i)] = node({ id: String(i), status: 2 });
+    }
+    const report = await fetchStatus(oneLabWorld(many));
+    expect(report.truncated).toBe(true);
+    // The report is genuinely capped (fewer than the nodes offered).
+    expect(Object.keys(report.statuses).length).toBeLessThan(10_001);
+    expect(Object.keys(report.statuses).length).toBeGreaterThan(0);
+  });
+
+  it("does NOT mark a normal (under-cap) report truncated (⊘ flagging every report truncated turns each apply into a merge and never clears a genuinely-removed node)", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node(), "2": node({ id: "2", status: 0, url: "" }) }));
+    expect(report.truncated).toBeFalsy();
+  });
 });
