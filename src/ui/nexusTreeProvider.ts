@@ -103,7 +103,13 @@ export class ServerTreeItem extends vscode.TreeItem {
     const runningDesc = status === "running" ? " (running)" : "";
     const descHead = addressless ? displayUsername : `${displayUsername}@${server.host}`;
     this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${runningDesc}` : undefined;
-    this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
+    // BMC-menu gating (task #27) — a server with an ipmiHost (same truthiness as
+    // the tooltip's ipmiSuffix above) gets an `.ipmi` marker APPENDED so the two
+    // BMC menu entries can require it. The base string is left UNCHANGED and the
+    // other server menus were broadened to /^nexus\.server(Connected)?(\.ipmi)?$/,
+    // so no existing menu is dropped for a BMC server.
+    const hasIpmi = typeof server.ipmiHost === "string" && server.ipmiHost.trim() !== "";
+    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}`;
     // LIVE STATUS (Phase 2) — a status-bearing (EVE-origin) server shows a
     // running/stopped dot; every other server keeps the plain connect icon.
     if (status === "running") {

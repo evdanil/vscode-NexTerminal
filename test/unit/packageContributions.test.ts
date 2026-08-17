@@ -123,7 +123,9 @@ describe("package contributions", () => {
     expect(menuCommands).toContain("nexus.tunnel.edit");
     expect(menuCommands).toContain("nexus.serial.edit");
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.sessionNode"))).toBe(true);
-    expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serverConnected"))).toBe(true);
+    // BMC gating (Phase 2) broadened the connected-server menus to a regex that
+    // also matches the .ipmi variant, so the assertion follows the new form.
+    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?$/"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
@@ -161,12 +163,12 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem == nexus.server",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem == nexus.server",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
         group: "0_connect@4"
       }),
       expect.objectContaining({
@@ -676,17 +678,51 @@ describe("package contributions", () => {
       }
     });
 
-    it("places them on server items UNCONDITIONALLY, matching the existing anchored contextValue regex", () => {
-      // B5 — the server item's `contextValue` is matched by ~15 anchored `when`
-      // regexes, so expressing "this server has a BMC" would mean a new variant
-      // and a rewrite of all of them. The standing rule is "pickers flag, menus
-      // don't hide": an unconfigured server gets an actionable refusal instead.
+    // BMC-menu gating (task #27, Phase 2) — the two BMC entries now require the
+    // `.ipmi` contextValue marker, so they show ONLY on a server that actually
+    // has an ipmiHost. Every OTHER server menu was broadened with an optional
+    // `(\.ipmi)?` so a BMC server keeps all its ordinary actions.
+    function viewItemRegex(when?: string): RegExp | null {
+      const m = /viewItem =~ \/(.+?)\/(?=\s|$)/.exec(when ?? "");
+      return m ? new RegExp(m[1]) : null;
+    }
+
+    it("gates both BMC entries on the .ipmi marker: shown for a server WITH ipmiHost, hidden for one without (⊘ offering BMC on a server with no ipmiHost is an action that can only fail)", () => {
       const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
       for (const id of ids) {
         const entry = menuItems.find((item) => item.command === id);
         expect(entry, id).toBeDefined();
-        expect(entry!.when).toBe("view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/");
         expect(entry!.group).toMatch(/^0_connect@/);
+        const re = viewItemRegex(entry!.when);
+        expect(re, id).not.toBeNull();
+        // The .ipmi variants match; the plain (no-BMC) contextValues do not.
+        expect(re!.test("nexus.server.ipmi"), id).toBe(true);
+        expect(re!.test("nexus.serverConnected.ipmi"), id).toBe(true);
+        expect(re!.test("nexus.server"), id).toBe(false);
+        expect(re!.test("nexus.serverConnected"), id).toBe(false);
+      }
+    });
+
+    it("keeps every OTHER server-scoped menu working for BOTH the plain and the .ipmi contextValue, and leaves no brittle == match (⊘ appending .ipmi without broadening the base menus silently drops edit/rename/connect/etc for a BMC server)", () => {
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      // No server-row menu may pin an exact `== nexus.server[...]` — that would
+      // miss the .ipmi variant. (Substring catches both nexus.server and
+      // nexus.serverConnected exact matches.)
+      const brittle = menuItems.filter((m) => (m.when ?? "").includes("viewItem == nexus.server"));
+      expect(brittle.map((m) => m.command)).toEqual([]);
+
+      const serverScoped = menuItems.filter(
+        (m) => !ids.includes(m.command) && /viewItem =~ \/\^nexus\\\.server/.test(m.when ?? "")
+      );
+      expect(serverScoped.length).toBeGreaterThan(0);
+      for (const m of serverScoped) {
+        const re = viewItemRegex(m.when);
+        expect(re, m.command).not.toBeNull();
+        for (const base of ["nexus.server", "nexus.serverConnected"]) {
+          if (re!.test(base)) {
+            expect(re!.test(`${base}.ipmi`), `${m.command} should also match ${base}.ipmi`).toBe(true);
+          }
+        }
       }
     });
   });

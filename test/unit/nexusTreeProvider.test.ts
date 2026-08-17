@@ -1216,3 +1216,22 @@ describe("ServerTreeItem inventory status affordance", () => {
     expect((serverItem!.iconPath as { color: { id: string } }).color.id).toBe("charts.green");
   });
 });
+
+/**
+ * BMC-menu gating (task #27, Phase 2) — a server with an ipmiHost gets an
+ * `.ipmi` marker appended to its contextValue so the two BMC menu entries can
+ * require it; the base string is UNCHANGED so every other server menu (matched
+ * by /^nexus\.server(Connected)?(\.ipmi)?$/) keeps working.
+ */
+describe("ServerTreeItem BMC ipmi contextValue marker", () => {
+  it("appends .ipmi when the server has a non-blank ipmiHost, for both connected states (⊘ no marker means the BMC entries cannot be gated per-server)", () => {
+    expect(new ServerTreeItem(makeServer({ id: "a", ipmiHost: "10.0.0.9" }), false).contextValue).toBe("nexus.server.ipmi");
+    expect(new ServerTreeItem(makeServer({ id: "b", ipmiHost: "10.0.0.9" }), true).contextValue).toBe("nexus.serverConnected.ipmi");
+  });
+
+  it("leaves the base contextValue untouched when ipmiHost is absent or blank (⊘ appending .ipmi to a non-BMC server would show BMC actions that can only fail)", () => {
+    expect(new ServerTreeItem(makeServer({ id: "a" }), false).contextValue).toBe("nexus.server");
+    expect(new ServerTreeItem(makeServer({ id: "b", ipmiHost: "   " }), false).contextValue).toBe("nexus.server");
+    expect(new ServerTreeItem(makeServer({ id: "c" }), true).contextValue).toBe("nexus.serverConnected");
+  });
+});
