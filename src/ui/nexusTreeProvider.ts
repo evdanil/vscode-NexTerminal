@@ -100,17 +100,27 @@ export class ServerTreeItem extends vscode.TreeItem {
     // host, in the tooltip or the description.
     const addressless = server.addressless === true;
     const hostSummary = addressless ? "no console address yet" : `${displayUsername}@${server.host}:${server.port}`;
-    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}`;
+    // NODE CONTROL (Phase 4, task #28) — a lab-status line for EVE-origin nodes
+    // only, so a freshly-synced node (no status yet) hints that Refresh Lab
+    // Status is what unlocks Start/Stop. Matches the labeled-line tooltip idiom.
+    const labStatusSuffix = isEveOrigin
+      ? `\nLab status: ${status === "running" ? "running" : status === "stopped" ? "stopped" : "unknown — run Refresh Lab Status"}`
+      : "";
+    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}${labStatusSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";
     const addresslessDesc = addressless ? " (no address)" : "";
-    // LIVE STATUS (Phase 2) — a " (running)" suffix on a running lab node. A
-    // stopped node gets no suffix (the dim dot carries it), and a non-status
-    // server gets nothing at all.
-    const runningDesc = status === "running" ? " (running)" : "";
+    // LIVE STATUS (Phase 2) / NODE CONTROL (Phase 4, task #28 — M4) — a state
+    // suffix on a status-bearing lab node. Phase 4 makes stopped-ness
+    // load-bearing (it is the premise for "Start Node"), and the worst case —
+    // connected + stopped — otherwise shows a green plug, no state text, and a
+    // "Start Node" menu, a row that contradicts its own menu. So a stopped node
+    // now gets an explicit " (stopped)" mirroring " (running)"; a non-status
+    // server still gets nothing at all.
+    const statusDesc = status === "running" ? " (running)" : status === "stopped" ? " (stopped)" : "";
     const descHead = addressless ? displayUsername : `${displayUsername}@${server.host}`;
-    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${runningDesc}` : undefined;
+    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${statusDesc}` : undefined;
     // BMC-menu gating (task #27) — a server with an ipmiHost (same truthiness as
     // the tooltip's ipmiSuffix above) gets an `.ipmi` marker APPENDED so the two
     // BMC menu entries can require it. The base string is left UNCHANGED and the

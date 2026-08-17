@@ -1379,3 +1379,59 @@ describe("NexusTreeProvider EVE node-control marker — end-to-end snapshot wiri
     expect(serverItemById(provider, "nb").contextValue).toBe("nexus.server");
   });
 });
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — M3. An EVE-origin node's tooltip carries a
+ * labeled "Lab status:" line so a freshly-synced node (unknown status) hints
+ * that Refresh Lab Status is what unlocks Start/Stop. Non-EVE nodes get no such
+ * line. isEveOrigin is the final constructor arg.
+ */
+describe("ServerTreeItem EVE lab-status tooltip line", () => {
+  function tip(opts: { status?: "running" | "stopped"; isEveOrigin?: boolean }): string {
+    return new ServerTreeItem(
+      makeServer({ id: "s", origin: { sourceId: "eve", externalId: "/L.unl#1", syncedAt: 1 } }),
+      false, undefined, true, undefined, undefined, undefined, undefined, opts.status, opts.isEveOrigin
+    ).tooltip as string;
+  }
+
+  it("shows 'Lab status: running' for a running EVE node (⊘ no lab-status line leaves running/stopped undiscoverable in the tooltip)", () => {
+    expect(tip({ isEveOrigin: true, status: "running" })).toContain("Lab status: running");
+  });
+
+  it("shows 'Lab status: stopped' for a stopped EVE node", () => {
+    expect(tip({ isEveOrigin: true, status: "stopped" })).toContain("Lab status: stopped");
+  });
+
+  it("shows 'Lab status: unknown — run Refresh Lab Status' for a freshly-synced EVE node with no status yet (⊘ a silent tooltip gives no hint that Refresh Lab Status unlocks Start/Stop)", () => {
+    expect(tip({ isEveOrigin: true, status: undefined })).toContain("Lab status: unknown — run Refresh Lab Status");
+  });
+
+  it("adds NO lab-status line for a non-EVE node even when a status is set (⊘ a Lab status line on a NetBox server invents a lab it does not have)", () => {
+    expect(tip({ isEveOrigin: false, status: "running" })).not.toContain("Lab status:");
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — M4. Stopped-ness is now load-bearing (it is
+ * the premise for "Start Node"), so a stopped node gets an explicit
+ * " (stopped)" description suffix mirroring the existing " (running)". A node
+ * with no status still gets neither.
+ */
+describe("ServerTreeItem stopped description suffix", () => {
+  function desc(status: "running" | "stopped" | undefined): string | undefined {
+    return new ServerTreeItem(makeServer({ id: "s" }), false, undefined, true, undefined, undefined, undefined, undefined, status)
+      .description;
+  }
+
+  it("appends ' (running)' for a running node and ' (stopped)' for a stopped node (⊘ no stopped suffix leaves a connected+stopped row showing a green plug and a Start menu with no state text)", () => {
+    expect(desc("running")).toContain("(running)");
+    expect(desc("stopped")).toContain("(stopped)");
+    // The two states must be distinct — a stopped node must NOT read as running.
+    expect(desc("stopped")).not.toContain("(running)");
+  });
+
+  it("appends NEITHER suffix for a node with no status (⊘ a state suffix on a non-status server invents state it lacks)", () => {
+    expect(desc(undefined)).not.toContain("(running)");
+    expect(desc(undefined)).not.toContain("(stopped)");
+  });
+});
