@@ -435,6 +435,42 @@ describe("computeSyncPlan — adds", () => {
       expect(after.host).toBe("10.0.0.1");
       expect(validateServerConfig(after)).toBe(true);
     });
+
+    // P1-C (Fable) — a NEW addressless placeholder from a source with a USABLE auth
+    // profile must carry the source-level auth link, exactly as the addressed ADD
+    // does. It is inert while addressless but correct on upgrade, and BMC/IPMI
+    // features may use it. ⊘ The addressless add omitting the winner leaves the
+    // placeholder link-less, so upgrading it later reads as a hand-cleared link.
+    it("P1-C — a new addressless device from an auth-profile'd source carries the source-level authProfileId + stamp", () => {
+      const usable: AuthProfile = { id: "p1", name: "Prod", username: "svc", authType: "agent" };
+      const plan = computeSyncPlan({
+        source: makeSource({ authProfileId: "p1", defaultUsername: "admin" }),
+        tree: makeTree([makeDevice({ endpoints: [] })]),
+        currentServers: [],
+        now: 5000,
+        authProfile: usable
+      });
+      expect(plan.adds).toHaveLength(1);
+      expect(plan.adds[0].addressless).toBe(true);
+      expect(plan.adds[0].authProfileId).toBe("p1");
+      expect(plan.adds[0].origin?.syncedAuthProfileId).toBe("p1");
+    });
+
+    // The other direction: a KEYLESS source profile writes no link on the placeholder
+    // (blanket per-profile refusal), exactly as the addressed add drops a keyless
+    // winner — the placeholder falls back to agent auth.
+    it("P1-C — a new addressless device from a KEYLESS source profile carries NO link (⊘ writing a keyless winner stamps a link no server can satisfy)", () => {
+      const keyless: AuthProfile = { id: "p1", name: "Shared Key", username: "svc", authType: "key" };
+      const plan = computeSyncPlan({
+        source: makeSource({ authProfileId: "p1", defaultUsername: "admin" }),
+        tree: makeTree([makeDevice({ endpoints: [] })]),
+        currentServers: [],
+        now: 5000,
+        authProfile: keyless
+      });
+      expect(plan.adds[0].authProfileId).toBeUndefined();
+      expect(plan.adds[0].origin?.syncedAuthProfileId).toBeUndefined();
+    });
   });
 
   it("skips (never adopts/overwrites) a device whose deterministic id collides with an unrelated server", () => {

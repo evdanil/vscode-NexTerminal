@@ -1254,6 +1254,26 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const addresslessDesired = addresslessComposed.desired;
       const addresslessProxyTemplateName = addresslessCascade.proxyTemplateName;
       const addresslessGatewayTemplateName = addresslessCascade.provenance.ipmiGatewayServerId?.templateName;
+      // P1-C (Fable) — the SSH auth winner, resolved exactly as the addressed path
+      // does, so the addressless ADD can write the source-level link (`authProfileId`
+      // + `syncedAuthProfileId`). A dangling reference writes no link (and warns for a
+      // template referrer); a keyless winner is dropped by the blanket per-profile
+      // refusal, mirroring the addressed add. The link is inert while the placeholder
+      // is addressless but correct on upgrade, and BMC/IPMI features may read it.
+      const addresslessAuthWinnerField = addresslessCascade.winners.authProfileId;
+      const addresslessWinnerProfile =
+        addresslessAuthWinnerField !== undefined ? resolveAuthProfileById(addresslessAuthWinnerField.value) : undefined;
+      if (addresslessAuthWinnerField !== undefined && addresslessWinnerProfile === undefined && !addresslessCascade.authFromImplicit) {
+        pushDedupTemplateWarning(
+          `A device template rule on "${source.name}" links an auth profile that no longer exists — the auth field was skipped.`
+        );
+      }
+      const addresslessWinnerKeyless =
+        addresslessWinnerProfile !== undefined && authProfileNeedsServerKeyPath(addresslessWinnerProfile);
+      const addresslessWinnerResolvedId =
+        addresslessAuthWinnerField !== undefined && addresslessWinnerProfile !== undefined && !addresslessWinnerKeyless
+          ? addresslessAuthWinnerField.value
+          : undefined;
       if (ownedForAddressless) {
         // DOWNGRADE / stay-addressless. Decided here so the post-loop rollback
         // pass does not touch this server a second time.
@@ -1444,6 +1464,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           addressless: true,
           username: source.defaultUsername ?? "",
           authType: "agent",
+          // P1-C (Fable) — the source-level auth LINK (never the profile's
+          // credentials, resolved fresh at connect time), exactly as the addressed
+          // add writes it. `authType: "agent"` above stays the inert fallback if the
+          // profile is later deleted. Undefined when the source/winner has no usable
+          // (non-keyless, resolvable) profile — the pre-feature record, field for field.
+          authProfileId: addresslessWinnerResolvedId,
           isHidden: false,
           group: addresslessGroup,
           // DEVICE TEMPLATES (Codex P2-a) — the non-auth template field values this
@@ -1463,6 +1489,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
             syncedAt: now,
             syncedInstanceKey: providerInstanceKey,
             syncedUsername: source.defaultUsername,
+            // P1-C (Fable) — mirrors the `authProfileId` written above (the RESOLVED
+            // id, `undefined` for a dangling/keyless winner), recorded so a later sync
+            // knows the sync put this link here — exactly as the addressed add stamps it.
+            syncedAuthProfileId: addresslessWinnerResolvedId,
             // Records the OOB address written above (UNCONDITIONALLY, `undefined`
             // included) so every LATER sync has the ownership question already
             // answered — matrix row 1, exactly as the addressed add path stamps it.
