@@ -126,6 +126,15 @@ export class NexusCore {
   // servers pruned or removed) without touching another source's entries.
   private readonly serverStatus = new Map<string, "running" | "stopped">();
   private readonly serverStatusSource = new Map<string, string>();
+  // #84 P2 (Codex) — per-source MUTATION EPOCH: a monotonic counter bumped
+  // whenever THIS source's servers are mutated+persisted (a sync apply, or the
+  // heal's own writes). The refresh path captures it at fetch start and re-checks
+  // it inside the heal's lock, so a status report that straddled a completed sync
+  // (which bumps the epoch but NOT the config revision — a routine sync only
+  // touches lastSyncAt/managedFolders) is dropped instead of persisting a stale
+  // console port over the freshly-synced one. A dedicated counter, not
+  // `lastSyncAt` (a timestamp can collide and is not bumped by non-sync writes).
+  private readonly sourceMutationEpoch = new Map<string, number>();
   private focusedSessionId: string | undefined = undefined;
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
@@ -2020,6 +2029,12 @@ export class NexusCore {
     // so any recorded ids are moot).
     this.inventorySyncApplyInFlight = false;
     this.inventorySyncTombstonedSessionIds.clear();
+    // #84 P2 (Codex) — a sync apply mutated+persisted this source's servers.
+    // Advance its mutation epoch so a status report captured before this apply,
+    // resolving after it, is dropped by the heal's in-lock epoch re-check — even
+    // when the config revision is unchanged (a routine sync bumps lastSyncAt /
+    // managedFolders, not the revision).
+    this.bumpSourceMutationEpoch(apply.sourceId);
     this.emitChanged();
     return { skippedCount, removedServerIds: [...removeServerIds], removedEmptyFolderCount: removedEmptyGroups.size };
   }
@@ -2268,6 +2283,23 @@ export class NexusCore {
   }
 
   /**
+   * #84 P2 (Codex) — the current MUTATION EPOCH for a source (0 if never
+   * mutated). The refresh path captures this before its status fetch and the
+   * heal re-checks it inside its lock; if it advanced during the fetch, a
+   * server-mutating operation for this source (a sync apply, or a prior heal)
+   * completed while the fetch was outstanding, so the report may be stale and the
+   * heal bails. See `sourceMutationEpoch`.
+   */
+  public getSourceMutationEpoch(sourceId: string): number {
+    return this.sourceMutationEpoch.get(sourceId) ?? 0;
+  }
+
+  /** #84 P2 (Codex) — advance a source's mutation epoch after a persisted server write. */
+  private bumpSourceMutationEpoch(sourceId: string): void {
+    this.sourceMutationEpoch.set(sourceId, this.getSourceMutationEpoch(sourceId) + 1);
+  }
+
+  /**
    * LIVE STATUS (Phase 2) — apply one source's fetchStatus report onto the
    * runtime serverStatus map. Each report entry is resolved to a server by its
    * REAL origin identity — a server owned by this source (origin.sourceId ===
@@ -2416,9 +2448,15 @@ export class NexusCore {
       }
       healed.push(next);
     }
-    // addServersBatch is the existing one-save/one-emit batch primitive, and it
-    // early-returns on an empty list, so no separate guard is needed.
+    if (healed.length === 0) {
+      return;
+    }
+    // addServersBatch is the existing one-save/one-emit batch primitive.
     await this.addServersBatch(healed);
+    // #84 P2 (Codex) — a heal mutated+persisted this source's servers; advance
+    // the epoch so a concurrent refresh whose fetch straddled this heal re-checks
+    // and bails rather than persisting its own (now potentially stale) report.
+    this.bumpSourceMutationEpoch(sourceId);
   }
 
   /**

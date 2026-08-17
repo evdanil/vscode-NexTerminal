@@ -8498,6 +8498,82 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(core.getServer(telnet.id)?.port).toBe(32769);
   });
 
+  it("#84 P2 — a report straddling a COMPLETED sync (which changes the port + bumps the mutation epoch but NOT the source revision) does not heal stale: the in-lock epoch recheck bails, preserving the synced port (⊘ dropping the epoch recheck lands the pre-sync report over the freshly-synced record)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const externalId = "dev#1";
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    await core.addServersBatch([telnet]);
+
+    const registry = new InventoryProviderRegistry();
+    // The report was fetched under the PRE-sync state and would heal the console
+    // port to 32800.
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const persistedSource = core.getInventorySource("src-1")!;
+    const startRevision = persistedSource.revision;
+
+    // A concurrent lock-holder standing in for a full syncNow that has ALREADY
+    // cleared its busy latch (inFlightSourceIds) by the time the heal's outer
+    // checks ran, but whose server mutation lands while the heal is QUEUED on the
+    // lock. It applies a sync plan that re-ports the node to 32900 and bumps the
+    // source mutation epoch — WITHOUT bumping the config revision (a routine sync
+    // only touches lastSyncAt/managedFolders). So the heal's pre-lock revision
+    // guard and busy-latch guard BOTH pass; only the in-lock epoch recheck can
+    // catch that the report now straddles a completed sync.
+    let holdStartedResolve: () => void = () => {};
+    let releaseHold: () => void = () => {};
+    const holdStarted = new Promise<void>((r) => (holdStartedResolve = r));
+    const holdBarrier = new Promise<void>((r) => (releaseHold = r));
+    const holderP = configMutationLock.runExclusive(async () => {
+      holdStartedResolve();
+      await holdBarrier;
+      await core.applyInventorySyncPlan({
+        sourceId: "src-1",
+        syncedAt: 2,
+        upsertServers: [
+          { ...telnet, port: 32900, origin: { ...telnet.origin!, syncedPort: 32900, syncedAt: 2 } }
+        ],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: persistedSource
+      });
+    });
+    await holdStarted; // the lock is now held
+
+    // Trigger the refresh: the fetch resolves, the OUTER revision + busy checks
+    // pass (the sync has not applied yet), applyInventoryStatus runs (pure), and
+    // the heal's runExclusive queues BEHIND the held lock.
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await new Promise((r) => setTimeout(r, 0)); // drain microtasks: heal is now queued
+
+    // Release the holder → it applies the sync (port -> 32900, epoch bumped, same
+    // revision), releases the lock → the queued heal callback runs.
+    releaseHold();
+    await Promise.all([holderP, refreshP]);
+
+    // The revision never changed, so ONLY the epoch guard can drop the stale
+    // report. The synced port must survive — the report's 32800 must not land.
+    expect(core.getInventorySource("src-1")?.revision).toBe(startRevision);
+    expect(core.getServer(telnet.id)?.port).toBe(32900);
+  });
+
   it("loads the source's saved secrets and passes them to fetchStatus (⊘ calling the provider without credentials makes every refresh an auth failure)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

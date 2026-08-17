@@ -4422,6 +4422,15 @@ export function registerInventoryCommands(
       // apply is dropped. Complements the global generation guard, which only
       // orders sweeps against each other.
       const startRevision = source.revision;
+      // #84 P2 (Codex) — capture this source's MUTATION EPOCH as of the fetch
+      // start. A routine syncNow that lands while this fetch is in flight changes
+      // servers (e.g. a device console port) WITHOUT bumping the source revision
+      // (revision tracks config edits, not sync applies), so the revision guard
+      // alone lets a report fetched under the pre-sync state heal onto the freshly
+      // synced records — a stale write. The epoch is bumped by every server
+      // mutation for the source (sync-apply and the heal itself), so a change here
+      // means the report straddled a completed mutation and must be dropped.
+      const startEpoch = core.getSourceMutationEpoch(source.id);
       attempted++;
       try {
         const secrets: InventorySourceSecrets = {};
@@ -4485,9 +4494,17 @@ export function registerInventoryCommands(
                 // the OLD source config onto the NEW records is a stale write.
                 // Bail if the generation, this source's revision, or the busy latch
                 // changed since the pre-lock checks.
+                //
+                // #84 P2 (Codex) — ALSO bail if the source's mutation epoch
+                // advanced since fetch start. A full syncNow that completed while
+                // this fetch was outstanding changes servers (e.g. a device port)
+                // and bumps the epoch WITHOUT bumping the revision, so only the
+                // epoch check catches a report that straddled a completed sync; the
+                // revision guard would let it heal stale over the synced records.
                 if (
                   myGeneration !== statusRefreshGeneration ||
                   core.getInventorySource(source.id)?.revision !== startRevision ||
+                  core.getSourceMutationEpoch(source.id) !== startEpoch ||
                   inFlightSourceIds.get(source.id) !== undefined
                 ) {
                   return;
