@@ -22,6 +22,10 @@ import { SshPty } from "../../src/services/ssh/sshPty";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { validateServerConfig } from "../../src/utils/validation";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { CommandContext as CmdCtx } from "../../src/commands/types";
+import { registerProfileCommands } from "../../src/commands/profileCommands";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -4949,5 +4953,145 @@ describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
     expect(copied).toContain("(no console address)");
     expect(copied).not.toContain(":0");
     expect(copied).toContain("IPMI/BMC: 10.9.9.9");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P1 (Codex, serialization audit) — folder ops that persist a FULL server
+// snapshot must serialize under configMutationLock, or a concurrent background
+// port-heal (or any other writer) can clobber the folder result or have its own
+// port write reverted on reload. Uses a REAL NexusCore + a gated repository so
+// the heal's write can be held in flight while the folder op commits.
+// ---------------------------------------------------------------------------
+describe("folder-op serialization (#84 P1)", () => {
+  class GatedRepo extends InMemoryConfigRepository {
+    private armed = false;
+    private releaseFn: () => void = () => {};
+    private startedFn: () => void = () => {};
+    public gate = new Promise<void>((r) => (this.releaseFn = r));
+    public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+    public arm(): void {
+      this.armed = true;
+    }
+    public releaseGate(): void {
+      this.releaseFn();
+    }
+    public override async saveServers(servers: ServerConfig[]): Promise<void> {
+      if (this.armed) {
+        this.armed = false; // gate ONLY the first save after arming
+        this.startedFn();
+        await this.gate;
+      }
+      return super.saveServers(servers);
+    }
+  }
+
+  function realCtx(core: NexusCore): CmdCtx {
+    return { core } as unknown as CmdCtx;
+  }
+
+  function telnetServer(id: string, group: string, port: number): ServerConfig {
+    return {
+      id,
+      name: id,
+      host: "10.0.0.9",
+      port,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group,
+      origin: { sourceId: "src-1", externalId: id, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: port, syncedProtocol: "telnet" }
+    };
+  }
+
+  const healReport = (externalId: string, port: number) => ({
+    contractVersion: 1 as const,
+    statuses: { [externalId]: { state: "running" as const, consolePort: port } }
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("nexus.group.rename does not clobber a concurrent port-heal: the folder move stands AND the healed port survives (⊘ dropping the runExclusive lets the rename's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addServersBatch([telnetServer("t1", "Old", 32769)], ["Old"]);
+    registerServerCommands(realCtx(core));
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValue("New");
+
+    repo.arm();
+    const renameP = registeredCommands.get("nexus.group.rename")!(new FolderTreeItem("Old", "Old")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the rename's saveServers is blocked
+
+    // A background heal (serialized like refreshStatus does) re-ports t1.
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("t1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+
+    repo.releaseGate();
+    await Promise.all([renameP, healP]);
+
+    const t1 = (await repo.getServers()).find((s) => s.id === "t1");
+    expect(t1?.group).toBe("New"); // folder rename stands
+    expect(t1?.port).toBe(32800); // heal survives (not reverted on disk)
+  });
+
+  it("a folder rename does not clobber a concurrent server EDIT of an UNRELATED server (a latent race even before the heal) (⊘ dropping the runExclusive lets the rename's stale snapshot revert the edit)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // t1 lives in "Old" (to be renamed); x1 lives in an untouched folder.
+    const x1 = telnetServer("x1", "Keep", 22);
+    await core.addServersBatch([telnetServer("t1", "Old", 32769), x1], ["Old", "Keep"]);
+    registerServerCommands(realCtx(core));
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValue("New");
+
+    repo.arm();
+    const renameP = registeredCommands.get("nexus.group.rename")!(new FolderTreeItem("Old", "Old")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the rename's saveServers is blocked
+
+    // A concurrent server edit (serialized like nexus.server.edit) changes x1's
+    // host — replacing its object in the map, which the rename's stale snapshot
+    // (holding x1's original object) would revert.
+    const editP = configMutationLock.runExclusive(() => core.addOrUpdateServer({ ...x1, host: "10.9.9.9" }));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([renameP, editP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "t1")?.group).toBe("New"); // rename stands
+    expect(persisted.find((s) => s.id === "x1")?.host).toBe("10.9.9.9"); // edit survives
+  });
+
+  it("nexus.group.remove (delete contents) does not clobber a concurrent port-heal on a SURVIVOR: the deleted server stays deleted AND the survivor's healed port survives (⊘ dropping the runExclusive lets the cascade's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // t1 is in the folder being deleted; s1 (a survivor, telnet, sync-owned) is elsewhere.
+    await core.addServersBatch(
+      [telnetServer("t1", "Trash", 22), telnetServer("s1", "Keep", 32769)],
+      ["Trash", "Keep"]
+    );
+    registerProfileCommands(realCtx(core));
+
+    mockShowWarningMessage.mockResolvedValue("Delete contents");
+
+    repo.arm();
+    const removeP = registeredCommands.get("nexus.group.remove")!(new FolderTreeItem("Trash", "Trash")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the cascade's saveServers is blocked
+
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("s1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([removeP, healP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "t1")).toBeUndefined(); // deleted stays deleted
+    expect(persisted.find((s) => s.id === "s1")?.port).toBe(32800); // survivor's heal survives
   });
 });

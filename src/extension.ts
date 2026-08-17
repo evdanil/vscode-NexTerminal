@@ -9,6 +9,7 @@ import { registerServerCommands, teardownServerRuntime } from "./commands/server
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
+import { configMutationLock } from "./services/configMutationLock";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
 import { CwdTracker } from "./services/terminal/cwdTracker";
@@ -781,10 +782,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     async onItemGroupChanged(itemType, itemId, newGroup) {
       if (itemType === "server") {
-        const server = core.getServer(itemId);
-        if (server) {
-          await core.addOrUpdateServer({ ...server, group: newGroup });
-        }
+        // #84 P1 (Codex, serialization audit) — a drag-drop group change persists
+        // a FULL server snapshot; serialize it under configMutationLock and
+        // RE-READ the live record inside the lock, applying ONLY the group so a
+        // concurrent background port-heal is never reverted (the same discipline
+        // as the rename fix).
+        await configMutationLock.runExclusive(async () => {
+          const live = core.getServer(itemId);
+          if (live) {
+            await core.addOrUpdateServer({ ...live, group: newGroup });
+          }
+        });
       } else if (itemType === "serial") {
         const profile = core.getSerialProfile(itemId);
         if (profile) {
@@ -798,7 +806,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       }
     },
     async onFolderMoved(oldPath, newParentPath) {
-      await core.moveFolder(oldPath, newParentPath);
+      // #84 P1 (serialization audit) — moveFolder rewrites `group` on every server
+      // in the subtree and persists a FULL server snapshot; serialize it under
+      // configMutationLock (it reads/mutates the live map inside the lock).
+      await configMutationLock.runExclusive(() => core.moveFolder(oldPath, newParentPath));
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();

@@ -2235,7 +2235,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         origin: undefined,
         formerlySynced: undefined
       };
-      await ctx.core.addOrUpdateServer(copy);
+      // #84 P1 (serialization audit) — addOrUpdateServer persists a FULL server
+      // snapshot, so even adding a fresh copy must serialize under
+      // configMutationLock: a lock-free add captured its snapshot could commit
+      // after a concurrent port-heal and revert the heal on an UNRELATED server.
+      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateServer(copy));
     }),
 
     vscode.commands.registerCommand("nexus.server.rename", async (arg?: unknown) => {
@@ -2305,7 +2309,14 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === currentName) {
         return;
       }
-      await ctx.core.renameFolder(oldPath, newName.trim());
+      // #84 P1 (Codex, serialization audit) — a folder rename rewrites `group` on
+      // every server in the subtree and persists a FULL server snapshot; serialize
+      // it under configMutationLock like every other writer so a concurrent
+      // background port-heal (or edit/remove/sync) cannot interleave and clobber
+      // the folder move or have its own port write reverted. `renameFolder` reads
+      // and mutates the live server map inside the lock, so no stale snapshot is
+      // captured. The input box has already resolved — no UI is held under the lock.
+      await configMutationLock.runExclusive(() => ctx.core.renameFolder(oldPath, newName.trim()));
     }),
 
     vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {
