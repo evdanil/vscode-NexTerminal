@@ -739,6 +739,11 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
  * fields while `protocol` is `"telnet"`; they exist so flipping back is
  * lossless.
  *
+ * SOURCED FROM THE LIVE RECORD (P2-B), never from the form-open snapshot — see
+ * the call site. These fields were never offered by this submission, so the
+ * record should keep what it holds NOW; restoring a form-open copy resurrected
+ * an auth-profile link that had been deleted while the form sat open.
+ *
  * SCOPED TO THE FLIP, deliberately. It fires ONLY when the submission is telnet,
  * i.e. only when the form could not have offered the fields. An SSH save is
  * untouched, so clearing a key file, an alternate host or a proxy still works —
@@ -997,6 +1002,9 @@ async function connectTelnetServer(
               serverId: server.id,
               terminalName,
               startedAt: Date.now(),
+              // P1-B — the transport this session opened with, fixed for its
+              // lifetime even if the profile is edited underneath it.
+              protocol: "telnet",
               pty: ptyRef
             });
             ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
@@ -1109,6 +1117,9 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               serverId: server.id,
               terminalName,
               startedAt: Date.now(),
+              // P1-B — see the telnet path: stamped so a later Protocol edit
+              // cannot reclassify a terminal that is already connected.
+              protocol: "ssh",
               pty: ptyRef
             });
             ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
@@ -1632,10 +1643,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             }
             // Which submitted credentials are this user's own, and which the
             // stored record keeps — see preserveLinkedServerCredentials.
-            const linked = preserveDormantSshConfig(
-              existing,
-              preserveLinkedServerCredentials(existing, candidate, linkedProfile)
-            );
+            const linked = preserveLinkedServerCredentials(existing, candidate, linkedProfile);
             const proxySecretKey = proxyPasswordSecretKey(existing.id);
             // FINDING 1 (P2, baseline-before-vault-read review) — this
             // secret-capture await MUST run BEFORE the baseline snapshot
@@ -1687,8 +1695,30 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // conditional spread is what keeps "absent stays absent" true for
             // both, rather than writing an explicit `undefined` key onto a
             // record that never had one.
+            // P2-B (Codex) — the dormant SSH fields are restored from the LIVE
+            // record, captured immediately above, NOT from the form-open
+            // `existing` snapshot.
+            //
+            // WHY THESE AND NOT `preserveLinkedServerCredentials` one step up.
+            // That helper deliberately sources from `existing` (see its doc): it
+            // restores credentials the form RENDERED, so the form-open snapshot
+            // is what the user's submission was composed against, and
+            // last-writer-wins is the intended rule. These fields are the
+            // opposite case — a telnet save never OFFERED them at all (hidden ⇒
+            // disabled ⇒ absent from the submission), so the user expressed
+            // nothing about them and the record should simply keep whatever it
+            // currently holds.
+            //
+            // The failure that forced it: delete the linked auth profile while a
+            // telnet edit form sits open. `removeAuthProfile`'s sweep clears the
+            // link on the live record, but the stale snapshot still remembers it,
+            // so saving RESURRECTED a dangling id — and nothing downstream
+            // catches that, because the auth-profile rejection is keyed on
+            // `candidate.authProfileId` and the hidden select produced no
+            // candidate. Synchronous, so the "nothing may await between the
+            // liveRecord capture and the write" rule above still holds.
             const updated: ServerConfig = {
-              ...linked,
+              ...preserveDormantSshConfig(liveRecord ?? existing, linked),
               ...(liveRecord?.origin !== undefined ? { origin: liveRecord.origin } : {}),
               ...(liveRecord?.formerlySynced !== undefined ? { formerlySynced: liveRecord.formerlySynced } : {})
             };

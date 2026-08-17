@@ -456,6 +456,50 @@ describe("server form script — port default follows the Protocol select", () =
     expect(form.value("port")).toBe("2001");
   });
 
+  // ⊘ P2-A (Codex) — THE FINDING. A hand-set SSH-on-23 is indistinguishable
+  // from the telnet default by VALUE alone, so a hook that only asks "is this
+  // one of the mapped defaults?" rewrites it to 22 on a protocol round-trip,
+  // violating `FieldDefaultsFrom`'s own "hand-set values are retained" contract.
+  // The user never touches the port control here — a dirty flag alone does not
+  // fix it; the SEEDED value has to be judged against the seeded protocol.
+  it("keeps an intentional SSH-on-23 across a telnet round-trip", () => {
+    const form = openForm(serverFormDefinition({ id: "s1", port: 23 }));
+    expect(form.value("port")).toBe("23");
+
+    form.choose("protocol", "telnet");
+    expect(form.value("port")).toBe("23");
+
+    form.choose("protocol", "ssh");
+    expect(form.value("port")).toBe("23");
+  });
+
+  it("keeps an intentional telnet-on-22 across an SSH round-trip", () => {
+    const form = openForm(serverFormDefinition({ id: "s1", protocol: "telnet", port: 22 }));
+    expect(form.value("port")).toBe("22");
+
+    form.choose("protocol", "ssh");
+    expect(form.value("port")).toBe("22");
+
+    form.choose("protocol", "telnet");
+    expect(form.value("port")).toBe("22");
+  });
+
+  // The other half of the contract: a value that IS the seeded protocol's own
+  // default is auto-derived, so it must still follow the switch.
+  it("still follows the switch for a telnet server sitting on the telnet default", () => {
+    const form = openForm(serverFormDefinition({ id: "s1", protocol: "telnet", port: 23 }));
+    form.choose("protocol", "ssh");
+    expect(form.value("port")).toBe("22");
+  });
+
+  it("stops following once the user types a port, even a default-looking one", () => {
+    const form = openForm(serverFormDefinition());
+    form.type("port", "23");
+    form.choose("protocol", "telnet");
+    form.choose("protocol", "ssh");
+    expect(form.value("port")).toBe("23");
+  });
+
   it("leaves a stored non-default port alone when editing an existing server", () => {
     const form = openForm(serverFormDefinition({ id: "s1", port: 2222 }));
     form.choose("protocol", "telnet");

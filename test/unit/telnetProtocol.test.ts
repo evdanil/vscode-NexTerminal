@@ -137,6 +137,55 @@ describe("TelnetNegotiator — data-stream handling", () => {
     expect(Buffer.from(after.data).toString("utf8")).toBe("Router> ");
   });
 
+  // ⊘ P1-A (Codex) — THE ESCAPE-PATH BYPASS that reopened MAJOR-1. The cap is
+  // checked in the `sb-payload` branch, but an `IAC IAC` pair never reaches it:
+  // the first IAC moves the parser to `sb-iac`, which appended the escaped byte
+  // with NO cap check and returned to `sb-payload`. A peer streaming nothing but
+  // `IAC IAC` therefore alternated between the two states forever and grew
+  // `sbPayload` without bound — the exact OOM the cap was added to close.
+  //
+  // Discriminating because EVERY byte here is 0xFF: a fix that only caps the
+  // plain-byte branch leaves this test failing.
+  it("caps a subnegotiation payload built entirely from escaped IAC IAC pairs", () => {
+    const n = new TelnetNegotiator();
+    feed(n, bytes(IAC, SB, 99));
+
+    // 100_000 escaped pairs — 200_000 bytes on the wire, all of them 0xFF.
+    const pairs = Buffer.alloc(200_000, IAC);
+    const during = feed(n, pairs);
+
+    expect(n.pendingSubnegotiationBytes).toBeLessThanOrEqual(n.maxSubnegotiationBytes);
+    expect(during.response).toEqual([]);
+
+    // …and the parser recovered to the data state, so ordinary output arrives.
+    expect(Buffer.from(feed(n, text("prompt> ")).data).toString("utf8")).toBe("prompt> ");
+  });
+
+  it("caps a payload that alternates escaped pairs with plain bytes", () => {
+    const n = new TelnetNegotiator();
+    feed(n, bytes(IAC, SB, 99));
+    // The interleaving a naive fix (cap only on entry to `sb-iac`) still misses.
+    const mixed: number[] = [];
+    for (let i = 0; i < 50_000; i += 1) {
+      mixed.push(IAC, IAC, 0x41);
+    }
+    feed(n, Buffer.from(mixed));
+
+    expect(n.pendingSubnegotiationBytes).toBeLessThanOrEqual(n.maxSubnegotiationBytes);
+    expect(Buffer.from(feed(n, text("ok")).data).toString("utf8")).toContain("ok");
+  });
+
+  // A well-formed escaped byte inside a SHORT subnegotiation must still be
+  // unescaped into the payload — the cap must not cost correctness.
+  it("still unescapes IAC IAC inside a subnegotiation that stays under the cap", () => {
+    const n = new TelnetNegotiator();
+    const { data } = feed(
+      n,
+      Buffer.concat([bytes(IAC, SB, 99, 0x01, IAC, IAC, 0x02, IAC, SE), text("after")])
+    );
+    expect(Buffer.from(data).toString("utf8")).toBe("after");
+  });
+
   it("still answers a legitimately long-but-valid subnegotiation after an abandoned one", () => {
     const n = new TelnetNegotiator({ terminalType: "vt100" });
     feed(n, Buffer.concat([bytes(IAC, SB, 99), Buffer.alloc(4096, 0x43)]));

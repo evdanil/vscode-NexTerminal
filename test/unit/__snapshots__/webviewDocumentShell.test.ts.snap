@@ -2135,9 +2135,17 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
 
       /* TELNET (Phase 0, MINOR-3) — a numeric field whose DEFAULT follows
          another control (the server form's Port following Protocol: 22 for ssh,
-         23 for telnet). The swap fires only while the field still holds one of
-         the mapped defaults, so a port the user typed is never clobbered — see
-         FieldDefaultsFrom in formTypes.ts. */
+         23 for telnet).
+
+         P2-A (Codex) — the swap tracks whether the value is AUTO-DERIVED, not
+         whether it merely looks like a default. Asking "is this one of the
+         mapped defaults?" cannot tell a hand-set SSH-on-23 apart from the telnet
+         default, so a protocol round-trip silently rewrote it to 22 — breaking
+         the "hand-set values are retained" contract this hook is supposed to
+         keep. A value is auto-derived only if it matched the SOURCE'S OWN
+         default at render time, and it stops being auto the moment the user
+         types into the field. A dirty flag alone is not enough: the seeded value
+         is judged before any typing happens. */
       var defaultsTargets = document.querySelectorAll("[data-defaults-from]");
       for (var di = 0; di < defaultsTargets.length; di++) {
         (function(input) {
@@ -2150,16 +2158,20 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           if (!spec || !spec.field || !spec.defaults) return;
           var source = form.elements[spec.field];
           if (!source) return;
+          /* Auto-derived iff the rendered value is exactly the default for the
+             protocol the form OPENED on. A telnet server on 23 is auto; an SSH
+             server on 23 is the user's own choice and is never touched again. */
+          var isAuto = String(input.value) === String(spec.defaults[source.value]);
+          input.addEventListener("input", function() { isAuto = false; });
+          input.addEventListener("change", function() { isAuto = false; });
           var applyDefault = function() {
+            if (!isAuto) return;
             var wanted = spec.defaults[source.value];
             if (wanted === undefined) return;
-            var current = String(input.value);
-            var holdsADefault = false;
-            for (var k in spec.defaults) {
-              if (String(spec.defaults[k]) === current) holdsADefault = true;
-            }
-            if (holdsADefault && current !== String(wanted)) {
+            if (String(input.value) !== String(wanted)) {
               input.value = String(wanted);
+              /* Still auto: this write is the hook's own, not the user's. */
+              isAuto = true;
             }
           };
           source.addEventListener("change", applyDefault);
@@ -3605,9 +3617,17 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
 
       /* TELNET (Phase 0, MINOR-3) — a numeric field whose DEFAULT follows
          another control (the server form's Port following Protocol: 22 for ssh,
-         23 for telnet). The swap fires only while the field still holds one of
-         the mapped defaults, so a port the user typed is never clobbered — see
-         FieldDefaultsFrom in formTypes.ts. */
+         23 for telnet).
+
+         P2-A (Codex) — the swap tracks whether the value is AUTO-DERIVED, not
+         whether it merely looks like a default. Asking "is this one of the
+         mapped defaults?" cannot tell a hand-set SSH-on-23 apart from the telnet
+         default, so a protocol round-trip silently rewrote it to 22 — breaking
+         the "hand-set values are retained" contract this hook is supposed to
+         keep. A value is auto-derived only if it matched the SOURCE'S OWN
+         default at render time, and it stops being auto the moment the user
+         types into the field. A dirty flag alone is not enough: the seeded value
+         is judged before any typing happens. */
       var defaultsTargets = document.querySelectorAll("[data-defaults-from]");
       for (var di = 0; di < defaultsTargets.length; di++) {
         (function(input) {
@@ -3620,16 +3640,20 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           if (!spec || !spec.field || !spec.defaults) return;
           var source = form.elements[spec.field];
           if (!source) return;
+          /* Auto-derived iff the rendered value is exactly the default for the
+             protocol the form OPENED on. A telnet server on 23 is auto; an SSH
+             server on 23 is the user's own choice and is never touched again. */
+          var isAuto = String(input.value) === String(spec.defaults[source.value]);
+          input.addEventListener("input", function() { isAuto = false; });
+          input.addEventListener("change", function() { isAuto = false; });
           var applyDefault = function() {
+            if (!isAuto) return;
             var wanted = spec.defaults[source.value];
             if (wanted === undefined) return;
-            var current = String(input.value);
-            var holdsADefault = false;
-            for (var k in spec.defaults) {
-              if (String(spec.defaults[k]) === current) holdsADefault = true;
-            }
-            if (holdsADefault && current !== String(wanted)) {
+            if (String(input.value) !== String(wanted)) {
               input.value = String(wanted);
+              /* Still auto: this write is the hook's own, not the user's. */
+              isAuto = true;
             }
           };
           source.addEventListener("change", applyDefault);

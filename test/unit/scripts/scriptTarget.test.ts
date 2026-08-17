@@ -46,7 +46,7 @@ function makeDescriptor(overrides: Partial<ScriptTargetDescriptor> = {}): Script
 }
 
 interface MockSnapshot {
-  activeSessions: Array<{ id: string; serverId: string; terminalName: string }>;
+  activeSessions: Array<{ id: string; serverId: string; terminalName: string; protocol?: "ssh" | "telnet" }>;
   activeSerialSessions: Array<{ id: string; profileId: string; terminalName: string }>;
   activeLocalShellSessions?: Array<{ id: string; profileId: string; terminalName: string }>;
   servers: Array<{ id: string; name: string; protocol?: "ssh" | "telnet" }>;
@@ -405,5 +405,74 @@ describe("pickTarget — telnet sessions", () => {
       makeCore({ ...snapshot, activeSessions: [snapshot.activeSessions[0]] })
     );
     expect(errorMessages.join("\n")).toContain("Telnet");
+  });
+});
+
+/**
+ * P1-B (Codex) — a session's transport is fixed the moment it opens. Editing
+ * the server's Protocol afterwards must not reclassify a terminal that is
+ * already connected: the open SSH terminal is still speaking SSH, and offering
+ * it to a `@target-type telnet` script sends automation down the wrong
+ * transport (and vice versa).
+ */
+describe("pickTarget — classification follows the SESSION, not the live config", () => {
+  // ⊘ The config says telnet, the session says ssh. An implementation that
+  // reads `snapshot.servers[…].protocol` classifies this session as telnet and
+  // both assertions below flip.
+  it("keeps an SSH session SSH after its server is flipped to telnet", async () => {
+    resetPicker();
+    const snapshot: MockSnapshot = {
+      activeSessions: [{ id: "ssh-1", serverId: "srv-1", terminalName: "Nexus SSH: edge", protocol: "ssh" }],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      // The user edited the profile while the terminal stayed open.
+      servers: [{ id: "srv-1", name: "edge", protocol: "telnet" }],
+      serialProfiles: [],
+      localShellProfiles: []
+    };
+
+    pickBySessionId = "ssh-1";
+    expect((await pickTarget(makeDescriptor({ targetType: "ssh" }), makeCore(snapshot)))?.id).toBe("ssh-1");
+
+    resetPicker();
+    await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot));
+    expect(quickPickCalls).toHaveLength(0);
+    expect(errorMessages.join("\n")).toContain("Telnet");
+  });
+
+  it("keeps a telnet session telnet after its server is flipped to SSH", async () => {
+    resetPicker();
+    const snapshot: MockSnapshot = {
+      activeSessions: [{ id: "tel-1", serverId: "srv-1", terminalName: "Nexus Telnet: edge", protocol: "telnet" }],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      servers: [{ id: "srv-1", name: "edge" }],
+      serialProfiles: [],
+      localShellProfiles: []
+    };
+
+    pickBySessionId = "tel-1";
+    expect((await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot)))?.id).toBe("tel-1");
+
+    resetPicker();
+    await pickTarget(makeDescriptor({ targetType: "ssh" }), makeCore(snapshot));
+    expect(quickPickCalls).toHaveLength(0);
+  });
+
+  // Back-compat: a session registered without the field falls back to the
+  // server's configured protocol — today's behaviour for anything that has not
+  // been taught to stamp it.
+  it("falls back to the server's protocol when the session carries none", async () => {
+    resetPicker();
+    const snapshot: MockSnapshot = {
+      activeSessions: [{ id: "tel-1", serverId: "srv-1", terminalName: "Nexus Telnet: edge" }],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      servers: [{ id: "srv-1", name: "edge", protocol: "telnet" }],
+      serialProfiles: [],
+      localShellProfiles: []
+    };
+    pickBySessionId = "tel-1";
+    expect((await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot)))?.id).toBe("tel-1");
   });
 });

@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
 import type { ActiveLocalShellSession, ActiveSession, ActiveSerialSession } from "../../models/config";
-import { resolveServerProtocol } from "../../models/config";
+import { resolveSessionProtocol } from "../../models/config";
 import type { ScriptTargetType } from "./scriptTypes";
 
 export interface ScriptTargetDescriptor {
@@ -72,7 +72,7 @@ export async function pickTarget(
   for (const s of snapshot.activeSessions) {
     const server = snapshot.servers.find((srv) => srv.id === s.serverId);
     const serverName = server?.name ?? s.serverId;
-    const isTelnet = resolveServerProtocol(server ?? {}) === "telnet";
+    const isTelnet = resolveSessionProtocol(s, server) === "telnet";
     if (isTelnet ? !wantTelnet : !wantSsh) {
       continue;
     }

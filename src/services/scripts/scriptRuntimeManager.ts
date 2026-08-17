@@ -3,7 +3,7 @@ import { Worker } from "node:worker_threads";
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
 import type { ActiveLocalShellSession, ActiveSession, ActiveSerialSession, SessionPtyHandle } from "../../models/config";
-import { resolveServerProtocol } from "../../models/config";
+import { resolveSessionProtocol } from "../../models/config";
 import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
@@ -486,7 +486,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const ssh = snapshot.activeSessions.find((s) => s.id === sessionId);
     // TELNET (Phase 0) — SSH and telnet sessions share `activeSessions`, so the
     // type comes from the server the session names, never from the collection.
-    if (ssh) return { type: this.sessionProtocolType(ssh.serverId), session: ssh };
+    if (ssh) return { type: this.sessionProtocolType(ssh), session: ssh };
     const serial = snapshot.activeSerialSessions.find((s) => s.id === sessionId);
     if (serial) return { type: "serial", session: serial };
     const local = snapshot.activeLocalShellSessions.find((s) => s.id === sessionId);
@@ -494,10 +494,16 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     return undefined;
   }
 
-  /** `"telnet"` when the named server is a telnet server, `"ssh"` otherwise. */
-  private sessionProtocolType(serverId: string): ScriptTargetType {
-    const server = this.deps.core.getSnapshot().servers.find((s) => s.id === serverId);
-    return resolveServerProtocol(server ?? {}) === "telnet" ? "telnet" : "ssh";
+  /**
+   * The transport a live session is speaking. P1-B (Codex) — sourced from the
+   * SESSION's own stamp, not the server's current `protocol`: editing a profile
+   * while its terminal is open must not reclassify a connection that is already
+   * up, or a `@target-type telnet` script would be handed an SSH terminal (and
+   * the reverse) and would drive automation down the wrong transport.
+   */
+  private sessionProtocolType(session: ActiveSession): ScriptTargetType {
+    const server = this.deps.core.getSnapshot().servers.find((s) => s.id === session.serverId);
+    return resolveSessionProtocol(session, server) === "telnet" ? "telnet" : "ssh";
   }
 
   private validateExplicitTarget(
@@ -555,7 +561,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const snapshot = this.deps.core.getSnapshot();
     const sshSession = snapshot.activeSessions.find((s) => s.id === session.id);
     const kind: ScriptTargetType = sshSession
-      ? this.sessionProtocolType(sshSession.serverId)
+      ? this.sessionProtocolType(sshSession)
       : snapshot.activeSerialSessions.some((s) => s.id === session.id)
         ? "serial"
         : "local";

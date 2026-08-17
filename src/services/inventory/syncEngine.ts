@@ -329,6 +329,34 @@ function selectPrimaryEndpoint(
 }
 
 /**
+ * TELNET (P1-C, Codex) — the endpoint tuple that AGREES with a given protocol.
+ *
+ * WHY IT EXISTS. `host`/`port` and `protocol` used to be decided by two
+ * independent rules: the endpoint came from `selectPrimaryEndpoint` (ssh wins),
+ * the protocol from `syncOwnsProtocol` (which can answer "the user owns this,
+ * leave it telnet"). On a device offering BOTH, those two correct answers
+ * composed into a broken record — a telnet profile pointed at port 22, which
+ * cannot connect and which the next sync would rewrite the same way forever.
+ *
+ * Returns the endpoint of the wanted transport plus the port to use, or
+ * `undefined` when the device offers none of that kind. `undefined` is a real
+ * answer, not a failure: the caller's conservative response is to leave the
+ * record's address ALONE rather than aim it at the other transport's port.
+ */
+function selectEndpointForProtocol(
+  device: InventoryDevice,
+  protocol: ServerProtocol | undefined
+): { endpoint: InventoryEndpoint; port: number } | undefined {
+  const wantTelnet = protocol === "telnet";
+  const endpoint = wantTelnet ? selectTelnetEndpoint(device) : selectSshEndpoint(device);
+  if (!endpoint) {
+    return undefined;
+  }
+  const port = endpoint.port ?? (wantTelnet ? 23 : 22);
+  return isValidPort(port) ? { endpoint, port } : undefined;
+}
+
+/**
  * TELNET (Phase 0) — may this sync WRITE `ServerConfig.protocol` on an existing
  * owned server? A FAITHFUL TWIN of `syncOwnsIpmiHost` / `syncOwnsAltHost`:
  * governed by the SAME matrix documented on the first of them, read with
@@ -1322,6 +1350,32 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.origin?.syncedProtocol,
         deviceProtocol
       );
+      // P1-C (Codex) — decide the ADDRESS against the protocol the record will
+      // ACTUALLY end up with, not against the device's preferred endpoint.
+      //
+      // When the sync owns the protocol this is the primary endpoint and nothing
+      // changes. When the USER owns it (a hand-flip the stamp protects), the
+      // record keeps its transport, so the address has to come from an endpoint
+      // of THAT transport — otherwise a hand-telnet server on a dual-stack
+      // device was rewritten to the ssh endpoint's host and port 22, i.e. a
+      // telnet profile aimed at the ssh port.
+      //
+      // NO MATCHING ENDPOINT ⇒ LEAVE THE ADDRESS ALONE. That is the conservative
+      // branch and it is deliberate: the alternatives are to clobber the tuple
+      // with the other transport's (the bug) or to drop the server (a device
+      // that merely stopped advertising one of its two endpoints is not gone).
+      // Staleness here is the same accepted trade the `ipmiHost` matrix's row 6
+      // makes — the user's own value stands until the user changes it.
+      const effectiveProtocol = takesProtocol ? deviceProtocol : ownedServer.protocol;
+      const ownedEndpoint = selectEndpointForProtocol(device, effectiveProtocol);
+      const ownedHost = ownedEndpoint?.endpoint.host ?? ownedServer.host;
+      const ownedPort = ownedEndpoint?.port ?? ownedServer.port;
+      // The username rides the SAME endpoint the address came from, and is
+      // `undefined` when no endpoint of the record's transport was found — a
+      // username belongs to an endpoint, so taking one from an endpoint whose
+      // address this update deliberately did NOT take would be incoherent (and
+      // would write a credential for the wrong service).
+      const ownedEndpointUsername = ownedEndpoint?.endpoint.username;
       // DEVICE TEMPLATES (PR-T1) — the §4.3 matrix for the four non-auth fields.
       // `templateMatrix.templated` is the carried-forward stamp record with the
       // written fields updated (the one-line `templated:` carry-forward
@@ -1401,7 +1455,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         //     over a server still carrying the old one, permanently excluding a
         //     server the fallback adopts correctly today.
         // Nothing infers a stamp that was never taken: absent stays absent.
-        syncedUsername: endpoint.username ?? ownedServer.origin?.syncedUsername,
+        syncedUsername: ownedEndpointUsername ?? ownedServer.origin?.syncedUsername,
         // AUTH 2c — the auth-profile stamp obeys the SAME "records what the sync
         // wrote" discipline: carried forward verbatim here, and overwritten only
         // where this sync actually writes `authProfileId`, i.e. inside the
@@ -1453,8 +1507,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const after: ServerConfig = {
         ...ownedServer,
         name: device.name,
-        host: endpoint.host,
-        port,
+        // P1-C — the tuple that agrees with `after.protocol`; see above.
+        host: ownedHost,
+        port: ownedPort,
         group,
         ...templateMatrix.values,
         origin: afterOrigin
@@ -1467,8 +1522,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       if (templateMatrix.clearProxy) {
         delete after.proxy;
       }
-      if (endpoint.username !== undefined) {
-        after.username = endpoint.username;
+      if (ownedEndpointUsername !== undefined) {
+        after.username = ownedEndpointUsername;
       }
       if (takesIpmiHost) {
         after.ipmiHost = mgmtHost;
@@ -1832,7 +1887,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.ipmiAuthProfileId !== after.ipmiAuthProfileId ||
         ownedServer.ipmiGatewayServerId !== after.ipmiGatewayServerId ||
         !serverOriginStampsEqual(ownedServer.origin, after.origin) ||
-        (endpoint.username !== undefined && ownedServer.username !== after.username);
+        (ownedEndpointUsername !== undefined && ownedServer.username !== after.username);
       if (changed) {
         updates.push({ before: ownedServer, after });
         if (group !== undefined) {
