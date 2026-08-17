@@ -309,6 +309,14 @@ export interface FolderWalkResult {
   /** Set when a cap (labs, depth, request budget) stopped the walk short. */
   truncated: boolean;
   warnings: string[];
+  /**
+   * WALL-CLOCK DEADLINE (task #30, P3-2) — set when the WALK itself tripped the
+   * shared crawl deadline and already pushed its deadline warning. The node-fetch
+   * loop reuses the same deadline, so it would otherwise re-observe the blown
+   * budget and push a SECOND identical warning; it suppresses its own when this
+   * is set, keeping one deadline warning per crawl.
+   */
+  deadlineHit: boolean;
 }
 
 type Edition = "community" | "pro" | "unknown";
@@ -803,7 +811,7 @@ class EveApiClient {
         `${goneFolders} folder${goneFolders === 1 ? "" : "s"} ${goneFolders === 1 ? "was" : "were"} not found (removed during the scan) and skipped.`
       );
     }
-    return { labs, truncated, warnings };
+    return { labs, truncated, warnings, deadlineHit };
   }
 }
 
@@ -1113,7 +1121,11 @@ async function fetchInventoryImpl(
   if (nodesCapped) {
     warnings.push(`Stopped after ${MAX_NODES} nodes — later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`);
   }
-  if (deadlineHit) {
+  // P3-2 (review) — push the node-phase deadline warning ONLY when the walk did
+  // not already name the deadline (the two share one budget, so a walk that
+  // tripped it leaves the node loop re-observing the same blown deadline). One
+  // deadline warning per crawl.
+  if (deadlineHit && !walk.deadlineHit) {
     warnings.push(
       `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the EVE-NG crawl exceeded its time limit and later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`
     );

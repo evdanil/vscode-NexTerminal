@@ -1264,6 +1264,10 @@ describe("createEveNgProvider — crawl deadline (task #30)", () => {
       expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("time limit") && w.toLowerCase().includes("folder tree"))).toBe(true);
       // "/A" (and its L2) was never reached.
       expect(tree.devices.some((d) => d.externalId.includes("/A/L2.unl"))).toBe(false);
+      // P3-2 (review) — EXACTLY ONE deadline warning per crawl. The walk collected
+      // L1 before tripping, so the node loop re-observes the already-blown deadline;
+      // it must NOT push a second "Stopped after 120s…" line the walk already named.
+      expect((tree.warnings ?? []).filter((w) => w.toLowerCase().includes("time limit"))).toHaveLength(1);
     } finally {
       restore();
     }

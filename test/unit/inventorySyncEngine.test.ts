@@ -366,6 +366,11 @@ describe("computeSyncPlan — adds", () => {
       // The record the sync writes must survive its own reload (a preserved-address
       // non-addressless record is a normal addressed server).
       expect(validateServerConfig(after)).toBe(true);
+      // P3-3 (review, M19) — the "downgraded to a placeholder" DISCLOSURE must be
+      // EMPTY: this server did NOT become addressless, so announcing it as
+      // downgraded is a false preview. Dropping `blanksAddress &&` from the
+      // disclosure gate would push this warning for a hand-preserved address.
+      expect((plan.warnings ?? []).some((w) => w.toLowerCase().includes("downgraded to"))).toBe(false);
     });
 
     it("PRIMARY HOST (task #29) — a genuinely SYNC-OWNED addressed node that loses its console downgrades to the addressless placeholder as before, and its host/port stamps are cleared (⊘ forcing blanksAddress false leaves a sync-owned node addressed with a dead console)", () => {
