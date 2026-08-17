@@ -1220,6 +1220,111 @@ describe("createEveNgProvider — hard caps", () => {
   });
 });
 
+/**
+ * WALL-CLOCK CRAWL DEADLINE (task #30) — the crawl is bounded in real time as
+ * well as by the request/lab/node/depth caps: a tree well within every cap but
+ * served by a slow EVE-NG box can still take minutes. The deadline is driven by
+ * `Date.now()`, so the seam is a `Date.now` spy plus an injected fetch that
+ * advances the clock — no real sleeps, so the suite stays fast.
+ */
+describe("createEveNgProvider — crawl deadline (task #30)", () => {
+  // Wraps makeWorld's fetch, advancing a controllable clock by `stepMs` on every
+  // request whose path matches `advanceWhen`. The Date.now spy reads that clock,
+  // so the deadline (Date.now() + CRAWL_DEADLINE_MS, captured at crawl start)
+  // trips deterministically once enough matching requests have run.
+  function slowWorld(world: World, advanceWhen: (path: string) => boolean, stepMs: number) {
+    let clock = 1_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const { fetchImpl, calls } = makeWorld(world);
+    const wrapped = (async (input: string, init?: RequestInit) => {
+      const path = decodeURIComponent(new URL(input).pathname);
+      if (advanceWhen(path)) {
+        clock += stepMs;
+      }
+      return (fetchImpl as unknown as (i: string, n?: RequestInit) => Promise<unknown>)(input, init);
+    }) as unknown as typeof fetch;
+    return { fetchImpl: wrapped, calls, restore: () => nowSpy.mockRestore() };
+  }
+
+  it("trips the deadline during the FOLDER WALK when listings are slow → the tree is truncated with a deadline-named warning (⊘ removing the deadline check lets a slow-but-narrow tree crawl unbounded)", async () => {
+    // Root has a child folder, so there is a second folder-listing iteration at
+    // which the clock — advanced past the whole budget by the first listing — has
+    // already blown the deadline.
+    const world: World = {
+      folders: {
+        "/": { folders: [{ name: "A", path: "/A" }], labs: [{ file: "L1.unl", path: "/L1.unl" }] },
+        "/A": { labs: [{ file: "L2.unl", path: "/A/L2.unl" }] }
+      },
+      nodes: { "/L1.unl": { "1": node() }, "/A/L2.unl": { "2": node() } }
+    };
+    const { fetchImpl, restore } = slowWorld(world, (p) => p.startsWith("/api/folders"), 130_000);
+    try {
+      const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+      expect(tree.truncated).toBe(true);
+      expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("time limit") && w.toLowerCase().includes("folder tree"))).toBe(true);
+      // "/A" (and its L2) was never reached.
+      expect(tree.devices.some((d) => d.externalId.includes("/A/L2.unl"))).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it("trips the deadline during the NODE-FETCH phase when a source's lab count is what blows the budget → truncated + partial + a deadline warning (⊘ a deadline only in walkFolders leaves the per-lab node loop unbounded)", async () => {
+    // Two labs at the root (fast folder walk). The FIRST lab's node fetch eats the
+    // whole budget, so the second lab's node fetch is never issued.
+    const world: World = {
+      folders: { "/": { labs: [{ file: "L1.unl", path: "/L1.unl" }, { file: "L2.unl", path: "/L2.unl" }] } },
+      nodes: { "/L1.unl": { "1": node({ id: "1" }) }, "/L2.unl": { "2": node({ id: "2" }) } }
+    };
+    const { fetchImpl, restore } = slowWorld(world, (p) => p.startsWith("/api/labs") && p.endsWith("/nodes"), 130_000);
+    try {
+      const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+      expect(tree.truncated).toBe(true);
+      // Partial: the first lab's node was imported, the second lab's was not.
+      expect(tree.devices.some((d) => d.externalId.includes("/L1.unl"))).toBe(true);
+      expect(tree.devices.some((d) => d.externalId.includes("/L2.unl"))).toBe(false);
+      expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("time limit") && w.toLowerCase().includes("later labs"))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("a FAST crawl (clock never advances past the budget) is NOT truncated and carries no deadline warning (⊘ a deadline that trips regardless disables pruning on every healthy source)", async () => {
+    const world: World = {
+      folders: { "/": { folders: [{ name: "A", path: "/A" }], labs: [{ file: "L1.unl", path: "/L1.unl" }] }, "/A": { labs: [{ file: "L2.unl", path: "/A/L2.unl" }] } },
+      nodes: { "/L1.unl": { "1": node() }, "/A/L2.unl": { "2": node() } }
+    };
+    // Advance by a trivial 1ms per request — nowhere near the 120s budget.
+    const { fetchImpl, restore } = slowWorld(world, () => true, 1);
+    try {
+      const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+      expect(tree.truncated).toBeFalsy();
+      expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("time limit"))).toBe(false);
+      // Both labs' nodes were imported.
+      expect(tree.devices).toHaveLength(2);
+    } finally {
+      restore();
+    }
+  });
+
+  it("the deadline also truncates the fetchStatus report (⊘ leaving fetchStatus's node loop unbounded lets a slow status poll hang the Command Center)", async () => {
+    const world: World = {
+      folders: { "/": { labs: [{ file: "L1.unl", path: "/L1.unl" }, { file: "L2.unl", path: "/L2.unl" }] } },
+      nodes: { "/L1.unl": { "1": node({ id: "1" }) }, "/L2.unl": { "2": node({ id: "2" }) } }
+    };
+    const { fetchImpl, restore } = slowWorld(world, (p) => p.startsWith("/api/labs") && p.endsWith("/nodes"), 130_000);
+    try {
+      const report = await createEveNgProvider(fetchImpl).fetchStatus!(CONFIG, SECRETS);
+      expect(report.truncated).toBe(true);
+      // Partial: the first lab's status is present, the second's is not.
+      expect(Object.keys(report.statuses).some((k) => k.includes("/L1.unl"))).toBe(true);
+      expect(Object.keys(report.statuses).some((k) => k.includes("/L2.unl"))).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("createEveNgProvider — error mapping", () => {
   /**
    * P1 (data-loss) — a syntactically valid `status:"success"` envelope whose
