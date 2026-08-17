@@ -36,6 +36,9 @@ vi.mock("vscode", () => ({
   TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
   ThemeIcon: class {
     public constructor(public readonly id: string) {}
+  },
+  ThemeColor: class {
+    public constructor(public readonly id: string) {}
   }
 }));
 
@@ -68,7 +71,7 @@ vi.mock("../../src/commands/inlineAuthProfileCreation", () => ({
 }));
 
 import { openUnifiedForm, registerProfileCommands } from "../../src/commands/profileCommands";
-import { LocalShellProfileTreeItem } from "../../src/ui/nexusTreeProvider";
+import { LocalShellProfileTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
@@ -205,6 +208,79 @@ describe("openUnifiedForm test action", () => {
     expect(picks.map((pick) => pick.label)).toContain("Open and Run Script");
     expect(picks.map((pick) => pick.label)).not.toContain("Test Connection");
     expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.localShell.runWithScript", item);
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — M5. The row-click Profile Actions quick-pick
+ * gates entries by state, but node power (the headline EVE-row capability) was
+ * right-click-only. It now conditionally appends Start Node (EVE + stopped) /
+ * Stop Node (EVE + running), reusing the eve marker already composed into the
+ * tree item's contextValue, and passes the tree item through as the command arg.
+ */
+describe("Profile Actions quick-pick — EVE node power (M5)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({ get: (_key: string, fallback: unknown) => fallback });
+    mockShowQuickPick.mockReset();
+  });
+
+  function serverItem(opts: { status?: "running" | "stopped"; isEveOrigin?: boolean }): ServerTreeItem {
+    const server = {
+      id: "eve-1",
+      name: "R1",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      origin: { sourceId: "src", externalId: "/L.unl#1", syncedAt: 1 }
+    } as any;
+    // (server, connected, lookup, showDesc, authName, authUser, syncedName,
+    // ipmiAuthName, status, isEveOrigin)
+    return new ServerTreeItem(server, false, undefined, true, undefined, undefined, undefined, undefined, opts.status, opts.isEveOrigin);
+  }
+
+  async function labelsFor(item: ServerTreeItem): Promise<string[]> {
+    const ctx = { core: { isServerConnected: () => false } } as any;
+    mockShowQuickPick.mockResolvedValueOnce(undefined);
+    registerProfileCommands(ctx);
+    const handler = vi.mocked((await import("vscode")).commands.registerCommand).mock.calls.find(
+      ([command]) => command === "nexus.profile.actions"
+    )?.[1] as (arg: unknown) => Promise<void>;
+    await handler(item);
+    return (mockShowQuickPick.mock.calls[0][0] as Array<{ label: string }>).map((p) => p.label);
+  }
+
+  it("offers Start Node (not Stop) for a STOPPED EVE node (⊘ omitting Start leaves the click path showing only futile Connect/Test on a down node)", async () => {
+    const labels = await labelsFor(serverItem({ isEveOrigin: true, status: "stopped" }));
+    expect(labels).toContain("Start Node");
+    expect(labels).not.toContain("Stop Node");
+  });
+
+  it("offers Stop Node (not Start) for a RUNNING EVE node (⊘ offering Start on a running node lets the click path issue a no-op the right-click menu correctly hides)", async () => {
+    const labels = await labelsFor(serverItem({ isEveOrigin: true, status: "running" }));
+    expect(labels).toContain("Stop Node");
+    expect(labels).not.toContain("Start Node");
+  });
+
+  it("offers NEITHER for a non-EVE node, or an EVE node with unknown status (⊘ a Start/Stop entry on a node with no controlNode, or before a status refresh, is an action that can only fail)", async () => {
+    const nonEve = await labelsFor(serverItem({ isEveOrigin: false, status: "running" }));
+    expect(nonEve).not.toContain("Start Node");
+    expect(nonEve).not.toContain("Stop Node");
+    const unknown = await labelsFor(serverItem({ isEveOrigin: true, status: undefined }));
+    expect(unknown).not.toContain("Start Node");
+    expect(unknown).not.toContain("Stop Node");
+  });
+
+  it("passes the tree item through as the command arg so resolveServerArg gets arg.server (⊘ passing nothing makes the handler fall through to the palette refusal)", async () => {
+    const item = serverItem({ isEveOrigin: true, status: "stopped" });
+    const ctx = { core: { isServerConnected: () => false } } as any;
+    mockShowQuickPick.mockResolvedValueOnce({ label: "Start Node", command: "nexus.inventory.startNode" });
+    registerProfileCommands(ctx);
+    const handler = vi.mocked((await import("vscode")).commands.registerCommand).mock.calls.find(
+      ([command]) => command === "nexus.profile.actions"
+    )?.[1] as (arg: unknown) => Promise<void>;
+    await handler(item);
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.startNode", item);
   });
 });
 

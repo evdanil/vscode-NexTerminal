@@ -321,9 +321,23 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
 export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[] {
   const showProfileActions = async (arg?: unknown): Promise<void> => {
     if (arg instanceof ServerTreeItem) {
+      // NODE CONTROL (Phase 4, task #28 — M5) — node power is the headline EVE-row
+      // capability, but the click-path quick-pick only offered Connect/Test
+      // (futile on a stopped node) and left Start/Stop right-click-only. Reuse the
+      // same origin+status resolution the row already ran: the eve marker is
+      // composed into contextValue, so read it back rather than re-resolving. Only
+      // ONE ever shows (the whens are mutually exclusive). The command arg is the
+      // tree item, so the handler's resolveServerArg receives arg.server.
+      const eveState = arg.contextValue?.endsWith(".eveStopped")
+        ? "stopped"
+        : arg.contextValue?.endsWith(".eveRunning")
+          ? "running"
+          : undefined;
       const picks: ProfileActionPick[] = [
         { label: "Connect", command: "nexus.server.connect" },
         { label: "Test Connection", command: "nexus.server.testConnection" },
+        ...(eveState === "stopped" ? [{ label: "Start Node", command: "nexus.inventory.startNode" }] : []),
+        ...(eveState === "running" ? [{ label: "Stop Node", command: "nexus.inventory.stopNode" }] : []),
         ...(ctx.core.isServerConnected(arg.server.id)
           ? [{ label: "Browse Files", command: "nexus.files.browse" }]
           : []),
