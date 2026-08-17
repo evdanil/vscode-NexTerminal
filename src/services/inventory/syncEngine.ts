@@ -1377,6 +1377,20 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesIpmiHost =
           mgmtHost !== undefined &&
           syncOwnsIpmiHost(ownedForAddressless.ipmiHost, ownedForAddressless.origin?.syncedIpmiHost, mgmtHost);
+        // PRIMARY HOST/PORT (task #29, the deferred #82 P2-3) — the console
+        // address is only BLANKED to the addressless placeholder shape when the
+        // sync still OWNS it. The device offers no console this fetch, so `dev`
+        // is the empty host / the `ADDRESSLESS_PORT` sentinel — `syncOwnsHost`/
+        // `syncOwnsPort` then answer yes for a sync-owned or already-blank address
+        // (matrix rows 1/3/5a) and NO for a value the user hand-typed onto the
+        // placeholder (rows 4/5). A hand-typed address is PRESERVED: the server
+        // stays addressed-by-hand rather than reverting to "", so `addressless`
+        // must be false in that branch. Decided on BOTH components as a unit —
+        // the address is owned as a whole — so a hand edit to either half keeps
+        // the pair.
+        const blanksAddress =
+          syncOwnsHost(ownedForAddressless.host, ownedForAddressless.origin?.syncedHost, "") &&
+          syncOwnsPort(ownedForAddressless.port, ownedForAddressless.origin?.syncedPort, ADDRESSLESS_PORT);
         // DEVICE TEMPLATES (Codex P2-a) — the same matrix the addressed update runs,
         // against the placeholder's own id for the §5.3 self-proxy check. Its
         // `values` are the field writes, its `templated` the carried-forward stamp
@@ -1411,14 +1425,20 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // stamp record (writes folded in), same as the addressed update path.
           syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
           syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedForAddressless.origin?.syncedIpmiHost,
+          // PRIMARY HOST/PORT (task #29) — the same `takes? written : carry`
+          // discipline as the stamps above. When the address is BLANKED the sync
+          // owns nothing there anymore, so the stamp is dropped to `undefined` (a
+          // placeholder owns no address); when a hand-typed address is PRESERVED
+          // the existing stamp is carried forward VERBATIM (the ...origin spread
+          // already carries it, but pinning it here documents the intent and
+          // guards against the spread being reordered). These override the spread.
+          syncedHost: blanksAddress ? undefined : ownedForAddressless.origin?.syncedHost,
+          syncedPort: blanksAddress ? undefined : ownedForAddressless.origin?.syncedPort,
           templated: templateMatrix.templated
         };
         const after: ServerConfig = {
           ...ownedForAddressless,
           name: device.name,
-          host: "",
-          port: ADDRESSLESS_PORT,
-          addressless: true,
           group: addresslessGroup,
           // The template field writes (proxy/multiplexing/legacyAlgorithms/logSession
           // /ipmiAuthProfileId/ipmiGatewayServerId) on exactly the rows the matrix
@@ -1426,6 +1446,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ...templateMatrix.values,
           origin: afterOrigin
         };
+        // PRIMARY HOST/PORT (task #29) — blank to the placeholder shape only when
+        // the sync owns the address; otherwise the ...ownedForAddressless spread
+        // preserves the hand-typed host/port and the record stays ADDRESSED (no
+        // `addressless` flag), which is why the flag is cleared rather than set.
+        if (blanksAddress) {
+          after.host = "";
+          after.port = ADDRESSLESS_PORT;
+          after.addressless = true;
+        } else {
+          delete after.addressless;
+        }
         if (afterProtocol === undefined) {
           delete after.protocol;
         } else {
@@ -1490,9 +1521,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         if (changed) {
           updates.push({ before: ownedForAddressless, after });
           // P2-3 (Fable) — disclose the loss of a console address, but ONLY when the
-          // server was previously ADDRESSED (a real downgrade). A stay-addressless
-          // server is unchanged in this respect and must not be named every sync.
-          if (ownedForAddressless.addressless !== true) {
+          // server was previously ADDRESSED (a real downgrade) AND the address was
+          // actually blanked. A stay-addressless server is unchanged in this
+          // respect, and a hand-typed address the sync PRESERVED (task #29) did not
+          // become addressless at all, so neither must be named every sync.
+          if (blanksAddress && ownedForAddressless.addressless !== true) {
             downgradedToAddressless.push(device.name);
           }
           if (addresslessGroup !== undefined) {
@@ -1602,6 +1635,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
             // answered — matrix row 1, exactly as the addressed add path stamps it.
             syncedIpmiHost: mgmtHost,
             syncedProtocol: undefined,
+            // PRIMARY HOST/PORT (task #29) — a fresh addressless placeholder owns
+            // NO console address yet (its `host: ""` / `port: 0` are the sentinel
+            // shape, not a synced value), so both stamps are `undefined`. The
+            // moment it gains a console the addressed update path fills and stamps
+            // them (matrix row 1 via `syncOwnsHost`'s blank-normalize).
+            syncedHost: undefined,
+            syncedPort: undefined,
             // The template stamps for the non-auth fields written above, so every
             // LATER sync has the ownership question already answered. Absent when
             // the template set none of them.

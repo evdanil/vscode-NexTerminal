@@ -333,6 +333,56 @@ describe("computeSyncPlan — adds", () => {
       expect(after.id).toBe(before.id);
     });
 
+    it("PRIMARY HOST (task #29, the deferred #82 P2-3) — a synced node the user gave a HAND host to keeps that address when the device loses its console: PRESERVED, not blanked to \"\", and the record stays ADDRESSED (⊘ forcing blanksAddress true reverts the hand host to the placeholder shape and strands the user's address)", () => {
+      // The sync last wrote host 10.0.0.5 / port 22 (a telnet console node); the
+      // user hand-edited the console to 10.0.0.50:2222. The device now loses its
+      // console, and the node is renamed so an update is produced regardless.
+      const before = makeOwnedServer({
+        protocol: "telnet",
+        host: "10.0.0.50",
+        port: 2222,
+        origin: {
+          sourceId: "source-1",
+          externalId: "device:1",
+          syncedAt: 1000,
+          syncedHost: "10.0.0.5",
+          syncedPort: 22,
+          syncedProtocol: "telnet"
+        }
+      });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice({ name: "renamed" })]), currentServers: [before], now: 5000 });
+      expect(plan.prunes).toHaveLength(0);
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.name).toBe("renamed");
+      // The hand-typed address survives — this is the #82 P2-3 fix.
+      expect(after.host).toBe("10.0.0.50");
+      expect(after.port).toBe(2222);
+      // ...and because a hand address is preserved, the record is NOT addressless.
+      expect(after.addressless ?? false).toBe(false);
+      // The stamp is carried forward verbatim, never laundered to the current value.
+      expect(after.origin?.syncedHost).toBe("10.0.0.5");
+      expect(after.origin?.syncedPort).toBe(22);
+      // The record the sync writes must survive its own reload (a preserved-address
+      // non-addressless record is a normal addressed server).
+      expect(validateServerConfig(after)).toBe(true);
+    });
+
+    it("PRIMARY HOST (task #29) — a genuinely SYNC-OWNED addressed node that loses its console downgrades to the addressless placeholder as before, and its host/port stamps are cleared (⊘ forcing blanksAddress false leaves a sync-owned node addressed with a dead console)", () => {
+      // Sync-owned address (host === syncedHost, port === syncedPort — seeded by
+      // the helper). Device loses its console.
+      const before = makeOwnedServer({ host: "10.0.0.5", port: 2200 });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.addressless).toBe(true);
+      expect(after.host).toBe("");
+      expect(after.port).toBe(0);
+      // The placeholder owns no address, so the stamps are dropped to undefined.
+      expect(after.origin?.syncedHost).toBeUndefined();
+      expect(after.origin?.syncedPort).toBeUndefined();
+    });
+
     it("re-syncing an already-addressless owned device with no change produces NO update (⊘ churning a no-op update every sync on every stopped node)", () => {
       const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
       const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [before], now: 5000 });
