@@ -62,7 +62,9 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const existingGroups = collectGroups(ctx);
   const defaultLogSession = vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
   const snapshot = ctx.core.getSnapshot();
-  const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
+  // TELNET (Phase 0, MAJOR-3) — see serverCommands.ts: the protocol is what
+  // keeps telnet servers out of the SSH-infrastructure pickers.
+  const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles, {
     vscodeTerminalProfileNames: getConfiguredVscodeTerminalProfileNames()
   });

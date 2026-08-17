@@ -59,6 +59,8 @@ function makeHarness(overrides?: {
   activeServerId?: string | undefined;
   focusedSessionId?: string | undefined;
   activeSessions?: ActiveSessionLike[];
+  /** TELNET (MINOR-1) — protocol of the server the explorer is rooted on. */
+  serverProtocol?: "ssh" | "telnet";
 }): Harness {
   sessionIdCounter += 1;
   const defaultSessionId = `session-auto-${sessionIdCounter}`;
@@ -88,7 +90,7 @@ function makeHarness(overrides?: {
   const ctx: CommandContext = {
     core: {
       getSnapshot: vi.fn(() => ({ focusedSessionId, activeSessions })),
-      getServer: vi.fn((id: string) => ({ id, name: `Server ${id}` }))
+      getServer: vi.fn((id: string) => ({ id, name: `Server ${id}`, protocol: overrides?.serverProtocol }))
     } as any,
     tunnelManager: {} as any,
     serialSidecar: {} as any,
@@ -361,6 +363,59 @@ describe("cwdSyncCommands", () => {
       await registeredCommands.get("nexus.files.syncFromTerminal")!();
 
       expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+    });
+
+    /**
+     * MINOR-1 (review) — a STALE EXPLORER ROOT after a protocol flip. The
+     * explorer is rooted on a server; that server is then edited to Telnet; the
+     * explorer root survives the edit. `syncFromTerminal` would still call
+     * `sftpService.realpath(serverId, candidate)` — and the candidate comes from
+     * the TELNET DEVICE'S OWN OUTPUT (the tracker record or the prompt-text
+     * heuristic), so remote text reached a credentialed SFTP call on a server
+     * that cannot serve one.
+     */
+    it("no-ops when the explorer's server has been switched to telnet", async () => {
+      const { ctx } = makeHarness({ serverProtocol: "telnet" });
+      (ctx.cwdTracker!.getRecord as any).mockReturnValue({
+        sessionId: "session-1",
+        serverId: "srv-1",
+        cwd: "/etc/../root",
+        source: "osc7",
+        authority: "",
+        updatedAt: 0
+      });
+      (ctx.cwdTracker!.isStale as any).mockReturnValue(false);
+      registerCwdSyncCommands(ctx);
+
+      await registeredCommands.get("nexus.files.syncFromTerminal")!();
+
+      // ⊘ The load-bearing assertion: no SFTP call at all. An implementation
+      // that merely declines to RE-ROOT still sends the device's own text to
+      // `realpath` on a credentialed connection first.
+      expect(ctx.sftpService.realpath).not.toHaveBeenCalled();
+      expect(ctx.sftpService.tryStat).not.toHaveBeenCalled();
+      expect(ctx.fileExplorerProvider.setRootPath).not.toHaveBeenCalled();
+      // …and it must not dead-end into the goToPath prompt either — there is
+      // nothing to browse on a telnet server.
+      expect(mockPromptGoToPath).not.toHaveBeenCalled();
+    });
+
+    it("still syncs for an ordinary SSH server (control)", async () => {
+      const { ctx } = makeHarness({ serverProtocol: "ssh" });
+      (ctx.cwdTracker!.getRecord as any).mockReturnValue({
+        sessionId: "session-1",
+        serverId: "srv-1",
+        cwd: "/var/log",
+        source: "osc7",
+        authority: "",
+        updatedAt: 0
+      });
+      (ctx.cwdTracker!.isStale as any).mockReturnValue(false);
+      registerCwdSyncCommands(ctx);
+
+      await registeredCommands.get("nexus.files.syncFromTerminal")!();
+
+      expect(ctx.sftpService.realpath).toHaveBeenCalled();
     });
 
     it("no-ops when the focused session is on a different server than the explorer", async () => {

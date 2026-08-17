@@ -149,7 +149,12 @@ Telnet is a per-server **protocol** choice, not a separate profile type: one ser
 
 **Lifecycle.** A connect that does not complete within 10 seconds, a refused connection, or a socket error before the session is up all report `[Nexus Telnet] Connection failed: …` in the terminal and leave the tab open on a press-any-key notice — no session is registered. A remote close reports `Remote host closed the connection.` and unregisters the session.
 
-**What telnet does not do.** SFTP browsing, port forwarding, jump hosts, SSH key deployment, Test Connection, directory sync and connection multiplexing are all SSH machinery. Invoking one against a telnet server (including dragging a tunnel profile onto it) refuses up front with a message naming the feature and the server, rather than failing later inside an SSH handshake.
+**What telnet does not do.** SFTP browsing, port forwarding, jump hosts, SSH key deployment, Test Connection, directory sync and connection multiplexing are all SSH machinery. Each refuses rather than failing later inside an SSH handshake, and the refusals differ by kind:
+
+- **Refused out loud, naming the feature and the server** — File browsing (SFTP), Port forwarding (including dragging a tunnel profile onto the server), Test Connection, Deploy SSH Key.
+- **Not offered, then refused anyway** — a telnet server is left out of the **Jump Host** and **IPMI Gateway** pickers, and the SSH connect path refuses a stored jump-host id that resolves to one *before any credential is read or requested*. The second half is load-bearing: a server can be switched to Telnet long after another server named it, and no picker can retract a choice already saved.
+- **Silently skipped** — Directory sync (Follow Terminal Directory). If the File Explorer is rooted on a server that is later switched to Telnet, the sync stops instead of sending path text extracted from the device's own output to an SFTP call. Silent by design: this path runs on terminal output, so a notification would repeat for a state the user never asked about.
+- **Never engaged** — connection multiplexing and the SSH connection pool are only reached from the SSH connect path, which a telnet server branches away from before any of it.
 
 **Inventory.** `InventoryEndpointKind` includes `"telnet"`. A device whose only usable endpoint is telnet syncs to a telnet server on port 23 by default; a device offering **both** ssh and telnet maps to SSH, whatever order the endpoints are listed in. The `ServerOrigin.syncedProtocol` stamp records what the sync wrote, so a protocol you change by hand is never overwritten by a later sync, while a device that genuinely changes transport is still followed.
 

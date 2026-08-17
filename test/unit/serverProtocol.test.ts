@@ -301,3 +301,45 @@ describe("isValidServerOrigin — syncedProtocol stamp", () => {
     expect(isValidServerOrigin({ ...valid, syncedProtocol: 1 })).toBe(false);
   });
 });
+
+/**
+ * MAJOR-3 (review) — a telnet server must never be offered as an SSH jump host
+ * or an IPMI gateway. Both are id references the SSH connect path dereferences
+ * and then authenticates against: choosing one used to read the vault, prompt
+ * for a password for the telnet server, and finally fail with a raw ssh2
+ * handshake error against port 23.
+ */
+describe("server form — telnet servers are not selectable as SSH infrastructure", () => {
+  const servers = [
+    { id: "srv-ssh", name: "bastion" },
+    { id: "srv-tel", name: "eve-console", protocol: "telnet" as const },
+    { id: "srv-self", name: "me" }
+  ];
+
+  function optionValues(definition: FormDefinition, key: string): string[] {
+    const field = keyedField(definition, key);
+    return field && "options" in field ? field.options.map((o) => o.value) : [];
+  }
+
+  // ⊘ A filter that only excludes self (`s.id !== seed?.id`) lists the telnet
+  // server here; the fixture keeps an ordinary SSH server in the list so a
+  // filter that dropped EVERYTHING would fail too.
+  it("omits telnet servers from the Jump Host picker", () => {
+    const values = optionValues(serverFormDefinition({ id: "srv-self" }, undefined, true, servers), "proxyJumpHostId");
+    expect(values).toContain("srv-ssh");
+    expect(values).not.toContain("srv-tel");
+    expect(values).not.toContain("srv-self");
+  });
+
+  it("omits telnet servers from the IPMI Gateway picker", () => {
+    const values = optionValues(serverFormDefinition({ id: "srv-self" }, undefined, true, servers), "ipmiGatewayServerId");
+    expect(values).toContain("srv-ssh");
+    expect(values).not.toContain("srv-tel");
+  });
+
+  it("omits telnet servers from the unified add form's pickers too", () => {
+    const definition = unifiedProfileFormDefinition(undefined, undefined, true, servers);
+    expect(optionValues(definition, "proxyJumpHostId")).not.toContain("srv-tel");
+    expect(optionValues(definition, "ipmiGatewayServerId")).not.toContain("srv-tel");
+  });
+});

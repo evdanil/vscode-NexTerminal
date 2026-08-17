@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { extractLatestPromptPath } from "../services/terminal/promptPathHeuristic";
 import { promptGoToPath } from "./fileCommands";
 import { isTerminalArg } from "./terminalTabCommands";
+import { resolveServerProtocol } from "../models/config";
 import type { CommandContext } from "./types";
 
 /**
@@ -353,6 +354,24 @@ async function syncFromTerminal(ctx: CommandContext, arg?: unknown): Promise<voi
   const activeServerId = ctx.fileExplorerProvider.getActiveServerId();
   if (!activeServerId) {
     log(ctx, "syncFromTerminal: no active File Explorer server");
+    return;
+  }
+
+  // TELNET (Phase 0, MINOR-1) — the explorer root OUTLIVES a protocol flip. A
+  // server the explorer is rooted on can be edited to Telnet afterwards, and
+  // nothing clears the root, so this ran on a server that can serve no SFTP.
+  //
+  // The harm is not the failed call, it is WHERE THE ARGUMENT COMES FROM: the
+  // candidate below is extracted from the session's own output (the OSC 7
+  // tracker record, or the prompt-text heuristic against the scrollback), so
+  // remote text from a telnet device reached `sftpService.realpath` on a
+  // credentialed connection. Refused before any candidate is computed, and
+  // deliberately silent — this fires on terminal output in follow mode, so a
+  // notification here would fire repeatedly for a state the user did not ask
+  // about. `browseServerFiles` already refuses out loud on the way in.
+  const explorerServer = ctx.core.getServer(activeServerId);
+  if (explorerServer && resolveServerProtocol(explorerServer) === "telnet") {
+    log(ctx, `syncFromTerminal: explorer server ${activeServerId} is a telnet server — no SFTP to sync`);
     return;
   }
 

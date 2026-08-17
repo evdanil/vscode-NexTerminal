@@ -126,7 +126,7 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
 }
 
 function serverListEntries(ctx: CommandContext): ServerListEntry[] {
-  return ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name }));
+  return ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
 }
 
 /** The inventory sources whose `templateRules` reference this template id. */

@@ -1420,7 +1420,9 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       }
       const existingGroups = collectGroups(ctx);
       const snapshot = ctx.core.getSnapshot();
-      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
+      // TELNET (Phase 0, MAJOR-3) — the protocol rides along so the Jump Host
+      // and IPMI Gateway pickers can leave telnet servers out of their options.
+      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       // Issue #48 — a caller that is sending the user here to fill in an
       // advanced field (a `${profile.ipmiHost}` refusal) says so, and the

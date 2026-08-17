@@ -1,5 +1,5 @@
-import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile, TunnelType } from "../models/config";
-import { authProfileOwnedCredentials, resolveTunnelType } from "../models/config";
+import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
+import { authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -300,9 +300,7 @@ function ipmiGatewaySelectField(
     filterable: true,
     options: [
       { label: "(None)", value: "" },
-      ...(servers ?? [])
-        .filter((s) => s.id !== seed?.id)
-        .map((s) => ({ label: s.name, value: s.id }))
+      ...sshInfrastructureCandidates(servers, seed?.id).map((s) => ({ label: s.name, value: s.id }))
     ],
     value: seed?.ipmiGatewayServerId ?? "",
     hint:
@@ -626,6 +624,32 @@ function sharedTrailingFields(
 export interface ServerListEntry {
   id: string;
   name: string;
+  /**
+   * TELNET (Phase 0, MAJOR-3) — carried so the pickers that name ANOTHER server
+   * as SSH infrastructure (Jump Host, IPMI Gateway) can leave telnet servers
+   * out. Optional: absent reads as SSH through `resolveServerProtocol`, so a
+   * caller that does not supply it keeps today's behaviour.
+   */
+  protocol?: ServerProtocol;
+}
+
+/**
+ * TELNET (Phase 0, MAJOR-3) — the servers eligible to be named as SSH
+ * INFRASTRUCTURE by another server: a jump host or an IPMI gateway. Both are id
+ * references the SSH connect path dereferences and then authenticates against,
+ * so a telnet server is not a candidate — choosing one read the vault, prompted
+ * for a password against a host that has no SSH login, and ended in a raw ssh2
+ * handshake error against port 23.
+ *
+ * Selection-time filtering only. The connect path carries its own refusal
+ * (`ProxySshFactory.connectViaSshJump`), because a stale id can already be
+ * stored — a server can be switched to Telnet long after some other server
+ * named it — and a picker cannot retract a choice already saved.
+ */
+function sshInfrastructureCandidates(servers: ServerListEntry[] | undefined, excludeId?: string): ServerListEntry[] {
+  return (servers ?? []).filter(
+    (s) => s.id !== excludeId && resolveServerProtocol(s) !== "telnet"
+  );
 }
 
 // Device templates (PR-T1b, UX-M4/m13) — per-server proxy passwords are never
@@ -671,9 +695,7 @@ function proxyFields(
   // Server options for jump host picker (exclude self to prevent circular ref)
   const serverOptions = [
     { label: "(Select jump host)", value: "" },
-    ...(servers ?? [])
-      .filter((s) => s.id !== seed?.id)
-      .map((s) => ({ label: s.name, value: s.id }))
+    ...sshInfrastructureCandidates(servers, seed?.id).map((s) => ({ label: s.name, value: s.id }))
   ];
 
   const jumpHostId = proxy?.type === "ssh" ? proxy.jumpHostId : "";
