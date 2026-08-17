@@ -123,6 +123,29 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(makeProvider({ instanceKey: 42 as never }))).toThrow(/instanceKey/);
   });
 
+  // fetchStatus provider capability (Phase 2) — the twin of the instanceKey
+  // clause. OPTIONAL, so absence is not an error (NetBox never implements it); a
+  // non-function value under that name IS an error, loudly, for the same reason
+  // instanceKey's is: a typo'd `fetchStatus: {...}` would otherwise be
+  // indistinguishable at runtime from a provider that never declared one, and the
+  // symptom (status silently never refreshing) is invisible until a user wonders
+  // why their running labs are not highlighted.
+  it("accepts a provider with NO fetchStatus — it is optional (kills making it required, which would break every provider that only supplies inventory)", () => {
+    const provider = makeProvider();
+    expect(provider.fetchStatus).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("accepts a provider WITH a function fetchStatus", () => {
+    const provider = makeProvider({ fetchStatus: async () => ({ contractVersion: 1, statuses: {} }) });
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function fetchStatus loudly (kills a silent degrade for a typo'd `fetchStatus` that is not callable)", () => {
+    expect(() => validateProviderShape(makeProvider({ fetchStatus: "http://eve" as never }))).toThrow(/fetchStatus/);
+    expect(() => validateProviderShape(makeProvider({ fetchStatus: 42 as never }))).toThrow(/fetchStatus/);
+  });
+
   // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
   // the field contract now, so a malformed one must be caught at the
   // registration boundary rather than silently coerced when the Add form reads

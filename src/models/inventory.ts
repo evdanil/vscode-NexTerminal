@@ -84,6 +84,34 @@ export interface InventoryTree {
   truncated?: boolean;
 }
 
+/**
+ * LIVE STATUS (Phase 2) — one device's running/stopped state, as reported by a
+ * provider's optional `fetchStatus`. Deliberately smaller than a full
+ * `InventoryDevice`: status polling runs while the Command Center is visible and
+ * must stay cheap, so it carries only what the tree highlight and the optional
+ * port-heal need.
+ */
+export interface InventoryDeviceStatus {
+  state: "running" | "stopped";
+  // OPTIONAL fresh console endpoint. A provider (EVE-NG Community) that reassigns
+  // console ports on node restart can surface the current one here so a later
+  // connect uses it; absent ⇒ no heal, and never present for a stopped node.
+  consoleHost?: string;
+  consolePort?: number;
+}
+
+/**
+ * LIVE STATUS (Phase 2) — the result of `InventoryProvider.fetchStatus`, keyed
+ * by `InventoryDevice.externalId` exactly as `fetchInventory` keys its devices,
+ * so the same `deterministicServerId(sourceId, externalId)` maps a status onto
+ * the server it belongs to. Reports ALL known devices' status (the tree decides
+ * what to render); it is never persisted.
+ */
+export interface InventoryStatusReport {
+  contractVersion: 1;
+  statuses: Record<string, InventoryDeviceStatus>;
+}
+
 export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
 
 export interface InventoryConfigField {
@@ -191,6 +219,17 @@ export interface InventoryProvider {
    * this method.
    */
   instanceKey?(config: InventorySourceValues): string | undefined;
+  /**
+   * LIVE STATUS (Phase 2) — OPTIONAL. Report the current running/stopped state
+   * of this source's devices, keyed by the same `externalId` `fetchInventory`
+   * uses. Called on an explicit "Refresh Lab Status" and on the visible-gated
+   * poll, NOT on a sync. A provider that does not implement it simply shows no
+   * status (NetBox). The ONLY sanctioned caller is `fetchProviderStatus` below,
+   * which clones the config, validates the return, and degrades every failure to
+   * "no update" — so an implementation may throw / return garbage without
+   * breaking the refresh path, exactly like `instanceKey`.
+   */
+  fetchStatus?(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport>;
 }
 
 /**
@@ -271,6 +310,90 @@ export function resolveProviderInstanceKey(
     return undefined;
   }
   return trimmed;
+}
+
+/**
+ * LIVE STATUS (Phase 2) — validates a raw `fetchStatus` return into an
+ * `InventoryStatusReport`, or `undefined` for anything malformed. A provider is
+ * third-party code, so this is the boundary that keeps a garbage report from
+ * reaching the tree; it never throws.
+ *
+ * Prototype-pollution-safe like the highlight-rule upgrade: `Object.entries`
+ * reads only own enumerable keys and never walks the prototype, and each value
+ * is validated field-by-field. A crafted `__proto__` OWN key (as JSON.parse
+ * produces) is therefore read as ordinary data — a device key whose value must
+ * itself be a valid status — and cannot poison `Object.prototype`.
+ *
+ * The whole report is rejected on the FIRST bad entry rather than dropping it:
+ * a partial report applied against a differently-keyed intent is worse than no
+ * update, since the tree would then show some nodes stale and some fresh with no
+ * way to tell which.
+ */
+export function validateInventoryStatusReport(raw: unknown): InventoryStatusReport | undefined {
+  if (typeof raw !== "object" || raw === null) {
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.contractVersion !== 1) {
+    return undefined;
+  }
+  const statuses = obj.statuses;
+  // A plain object, not an array (Array is typeof "object") and not null.
+  if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
+    return undefined;
+  }
+  const validated: Record<string, InventoryDeviceStatus> = {};
+  for (const [key, value] of Object.entries(statuses as Record<string, unknown>)) {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    const v = value as Record<string, unknown>;
+    if (v.state !== "running" && v.state !== "stopped") {
+      return undefined;
+    }
+    const status: InventoryDeviceStatus = { state: v.state };
+    if (Object.prototype.hasOwnProperty.call(v, "consoleHost")) {
+      if (typeof v.consoleHost !== "string") {
+        return undefined;
+      }
+      status.consoleHost = v.consoleHost;
+    }
+    if (Object.prototype.hasOwnProperty.call(v, "consolePort")) {
+      if (typeof v.consolePort !== "number" || !Number.isFinite(v.consolePort)) {
+        return undefined;
+      }
+      status.consolePort = v.consolePort;
+    }
+    validated[key] = status;
+  }
+  return { contractVersion: 1, statuses: validated };
+}
+
+/**
+ * LIVE STATUS (Phase 2) — the ONE sanctioned way to invoke
+ * `InventoryProvider.fetchStatus`, mirroring `resolveProviderInstanceKey`'s
+ * discipline: undefined when the provider has no `fetchStatus`; the provider is
+ * handed a `structuredClone` of the config inside the try (so an in-place
+ * normalization cannot mutate the caller's stored source config, and a
+ * non-cloneable config degrades to undefined rather than throwing); the return
+ * is validated. A throw or a malformed report both degrade to `undefined` — "no
+ * status update" — never an exception escaping into the refresh loop.
+ */
+export async function fetchProviderStatus(
+  provider: Pick<InventoryProvider, "fetchStatus">,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets
+): Promise<InventoryStatusReport | undefined> {
+  if (typeof provider.fetchStatus !== "function") {
+    return undefined;
+  }
+  let raw: unknown;
+  try {
+    raw = await provider.fetchStatus(structuredClone(config), secrets);
+  } catch {
+    return undefined;
+  }
+  return validateInventoryStatusReport(raw);
 }
 
 export type InventoryErrorKind = "auth" | "network" | "protocol";
