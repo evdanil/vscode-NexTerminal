@@ -18,7 +18,7 @@
  * opaque JSON array under a single globalState key).
  */
 
-import type { DhcpAdapterConfig, DhcpVendorSpecificEntry, TftpAdapterConfig } from "../services/networkServers/core/index";
+import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
 
 export interface TftpConfigProfile {
   id: string;
@@ -76,75 +76,4 @@ export function cloneDhcpProfile(profile: DhcpConfigProfile): DhcpConfigProfile 
       vendorSpecificOptions: config.vendorSpecificOptions ? [...config.vendorSpecificOptions] : config.vendorSpecificOptions
     }
   };
-}
-
-export function tftpProfilesEqual(a: TftpConfigProfile, b: TftpConfigProfile): boolean {
-  if (a.id !== b.id) return false;
-  if (a.name !== b.name) return false;
-  if (a.description !== b.description) return false;
-  return (
-    a.config.root === b.config.root &&
-    a.config.port === b.config.port &&
-    a.config.allowWrite === b.config.allowWrite &&
-    a.config.interface === b.config.interface
-  );
-}
-
-export function dhcpProfilesEqual(a: DhcpConfigProfile, b: DhcpConfigProfile): boolean {
-  if (a.id !== b.id) return false;
-  if (a.name !== b.name) return false;
-  if (a.description !== b.description) return false;
-  if (a.autoLinkTftp !== b.autoLinkTftp) return false;
-  const left = a.config;
-  const right = b.config;
-  if (
-    left.rangeStart !== right.rangeStart ||
-    left.rangeEnd !== right.rangeEnd ||
-    left.subnet !== right.subnet ||
-    left.gateway !== right.gateway ||
-    left.leaseTimeSec !== right.leaseTimeSec ||
-    left.serverId !== right.serverId ||
-    left.broadcast !== right.broadcast ||
-    left.bindAddress !== right.bindAddress ||
-    left.leaseStorePath !== right.leaseStorePath ||
-    left.bootFileName !== right.bootFileName ||
-    left.nextServer !== right.nextServer ||
-    left.vendorClassId !== right.vendorClassId
-  ) {
-    return false;
-  }
-  return (
-    stringListsEqual(left.dns, right.dns) &&
-    stringListsEqual(left.tftpServerAddresses, right.tftpServerAddresses) &&
-    stringMapsEqual(left.static, right.static) &&
-    vendorOptionsEqual(left.vendorSpecificOptions, right.vendorSpecificOptions)
-  );
-}
-
-function stringListsEqual(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
-  const left = a ?? [];
-  const right = b ?? [];
-  if (left.length !== right.length) return false;
-  return left.every((value, index) => value === right[index]);
-}
-
-function stringMapsEqual(
-  a: Readonly<Record<string, string>> | undefined,
-  b: Readonly<Record<string, string>> | undefined
-): boolean {
-  const left = a ?? {};
-  const right = b ?? {};
-  const leftKeys = Object.keys(left);
-  if (leftKeys.length !== Object.keys(right).length) return false;
-  return leftKeys.every((key) => left[key] === right[key]);
-}
-
-function vendorOptionsEqual(
-  a: readonly DhcpVendorSpecificEntry[] | undefined,
-  b: readonly DhcpVendorSpecificEntry[] | undefined
-): boolean {
-  const left = a ?? [];
-  const right = b ?? [];
-  if (left.length !== right.length) return false;
-  return left.every((entry, index) => entry.subOption === right[index].subOption && entry.value === right[index].value);
 }

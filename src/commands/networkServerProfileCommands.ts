@@ -22,7 +22,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { NetworkServerKind } from "../models/networkServer";
+import { NETWORK_SERVER_KINDS, isNetworkServerKind, type NetworkServerKind } from "../models/networkServer";
 import {
   cloneDhcpProfile,
   cloneTftpProfile,
@@ -39,12 +39,6 @@ import {
   readSettingString
 } from "./networkServerSettings";
 import type { CommandContext } from "./types";
-
-const NETWORK_SERVER_KINDS: readonly NetworkServerKind[] = ["tftp", "dhcp"];
-
-function isNetworkServerKind(value: unknown): value is NetworkServerKind {
-  return value === "tftp" || value === "dhcp";
-}
 
 /**
  * Current DHCP settings as a profile body.

@@ -23,7 +23,9 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
 import {
+  NETWORK_SERVER_KINDS,
   NetworkServerError,
+  isNetworkServerKind,
   type NetworkServerKind,
   type NetworkServerLeaseSummary,
   type NetworkServerRuntimeDetail,
@@ -48,7 +50,8 @@ import {
   type TftpRuntimeSnapshot
 } from "./daemonHost";
 
-export const NETWORK_SERVER_KINDS: readonly NetworkServerKind[] = ["tftp", "dhcp"];
+/** Re-exported from the model so tree/UI consumers keep a single import site. */
+export { NETWORK_SERVER_KINDS };
 
 /** Service names as they appear at the head of a notification. */
 const SERVICE_LABELS: Record<NetworkServerKind, string> = { tftp: "TFTP", dhcp: "DHCP" };
@@ -677,10 +680,6 @@ export class NetworkServerManager implements vscode.Disposable {
     const stamp = new Date().toISOString();
     this.outputChannel.appendLine(`[${stamp}] [${level}] ${message}`);
   }
-}
-
-function isNetworkServerKind(value: string): value is NetworkServerKind {
-  return value === "tftp" || value === "dhcp";
 }
 
 function describeError(error: unknown): string {

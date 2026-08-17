@@ -16,6 +16,14 @@
 /** The two fixed services. There is no third, and no user-defined kind. */
 export type NetworkServerKind = "tftp" | "dhcp";
 
+/** Every service kind, in the order the UI lists them. */
+export const NETWORK_SERVER_KINDS: readonly NetworkServerKind[] = ["tftp", "dhcp"];
+
+/** Narrows an untrusted value (command argument, stored id) to a service kind. */
+export function isNetworkServerKind(value: unknown): value is NetworkServerKind {
+  return value === "tftp" || value === "dhcp";
+}
+
 /**
  * Lifecycle states, mirroring the daemon-side `ServerStatus` enum 1:1 so the
  * wire values pass straight through without a translation table.

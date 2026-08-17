@@ -33,6 +33,7 @@ import {
 } from './engine/TftpEngine';
 import type { ServerLogLevel } from '../core/NexusServer';
 import { ReverseDnsCache, formatTftpClient } from './clientIdentity';
+import { formatDuration } from '../formatDuration';
 
 /** Official IANA TFTP port (requires root/Administrator on Windows/Linux). */
 const DEFAULT_PORT = 69;
@@ -488,21 +489,4 @@ function formatSpeed(bytesPerSec: number): string {
     i++;
   }
   return `${v.toFixed(v < 10 ? 2 : 1)} ${units[i]}`;
-}
-
-/**
- * Formats a number of seconds into human-readable duration: `0s`, `32s`, `5m 12s`, `1h 30m 5s`.
- *
- * @param totalSec Duration in seconds (integer or float).
- * @returns Formatted string.
- */
-function formatDuration(totalSec: number): string {
-  if (totalSec <= 0) return '0s';
-  const s = Math.max(0, Math.floor(totalSec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const rs = s % 60;
-  if (h > 0) return `${h}h ${m}m ${rs}s`;
-  if (m > 0) return `${m}m ${rs}s`;
-  return `${rs}s`;
 }

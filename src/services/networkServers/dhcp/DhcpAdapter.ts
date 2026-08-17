@@ -61,6 +61,8 @@ import {
   type DhcpPacketCounters,
   type DhcpPoolInfo,
 } from './engine/DhcpEngine';
+import { computePoolSize } from './engine/dhcpNetworkUtils';
+import { formatDuration } from '../formatDuration';
 import type { ServerLogLevel } from '../core/NexusServer';
 
 /** DHCP adapter configuration (1:1 with the engine). */
@@ -421,33 +423,3 @@ function describeDecline(req: unknown): { mac: string; address?: string } {
   return { mac, address };
 }
 
-/** Converts IPv4 → int to calculate pool size (copy from engine to avoid circular import). */
-function ipToInt(ip: string): number {
-  const parts = ip.split('.').map((p) => Number(p) >>> 0);
-  if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return 0;
-  return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
-}
-
-/** Pool size (copy for when engine is null/stopped). */
-function computePoolSize(rangeStart: string, rangeEnd: string): number {
-  const a = ipToInt(rangeStart);
-  const b = ipToInt(rangeEnd);
-  if (a === 0 || b === 0 || b < a) return 0;
-  return b - a + 1;
-}
-
-/**
- * Formats a number of seconds into human-readable duration: `0s`, `32s`,
- * `5m 12s`, `1h 30m 5s`.
- * (Parity with `formatDuration` from TftpAdapter — used for leases.)
- */
-function formatDuration(totalSec: number): string {
-  if (totalSec <= 0) return '0s';
-  const s = Math.max(0, Math.floor(totalSec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const rs = s % 60;
-  if (h > 0) return `${h}h ${m}m ${rs}s`;
-  if (m > 0) return `${m}m ${rs}s`;
-  return `${rs}s`;
-}

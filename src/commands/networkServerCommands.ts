@@ -22,7 +22,7 @@
  */
 
 import * as vscode from "vscode";
-import { NetworkServerError, type NetworkServerKind } from "../models/networkServer";
+import { NetworkServerError, isNetworkServerKind, type NetworkServerKind } from "../models/networkServer";
 import type { NetworkServerManager } from "../services/networkServers/networkServerManager";
 import type { DhcpAdapterConfig, DhcpVendorSpecificEntry } from "../services/networkServers/core/index";
 import { isValidSubOptionCode } from "../services/networkServers/dhcp/engine/dhcpBootOptions";
@@ -51,10 +51,6 @@ const NETWORK_SERVER_PICKS: readonly NetworkServerPick[] = [
   { label: "TFTP", description: "File transfer service (UDP 69)", serviceKind: "tftp" },
   { label: "DHCP", description: "Address assignment service (UDP 67)", serviceKind: "dhcp" }
 ];
-
-function isNetworkServerKind(value: unknown): value is NetworkServerKind {
-  return value === "tftp" || value === "dhcp";
-}
 
 function toNetworkServerKindFromArg(arg: unknown): NetworkServerKind | undefined {
   if (isNetworkServerKind(arg)) {

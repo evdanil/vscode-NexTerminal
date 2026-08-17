@@ -928,7 +928,7 @@ export class DhcpEngine extends EventEmitter {
   ): Promise<Server> {
     return new Promise<Server>((resolve, reject) => {
       let settled = false;
-      const server = dhcp.createServer(cfg as ServerConfig);
+      const server = dhcp.createServer(cfg);
       onBeforeListen(server);
       this.attachServerListeners(server);
 
