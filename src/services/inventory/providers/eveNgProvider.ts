@@ -241,10 +241,9 @@ function parseEnvelope(text: string, url: URL): JSendEnvelope {
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new InventoryProviderError(
-      "protocol",
-      `Response from ${url} is not EVE-NG JSON — is the base URL correct? (${text.slice(0, BODY_SLICE)})`
-    );
+    // MINOR-7 — the body is attacker-influenced (a proxy's HTML error page,
+    // say) and is NOT echoed into the message, matching NetBox's parse error.
+    throw new InventoryProviderError("protocol", `Response from ${url} is not EVE-NG JSON — is the base URL correct?`);
   }
   if (!isObject(parsed) || !isString(parsed.status)) {
     throw new InventoryProviderError("protocol", `Response from ${url} is not an EVE-NG API envelope — is the base URL correct?`);
@@ -306,10 +305,32 @@ class EveApiClient {
     }
   }
 
+  /**
+   * MINOR-6 — build a request URL, mapping `new URL`'s `TypeError` (a
+   * scheme-less base URL is the common typo) into a provider error at the
+   * client boundary instead of letting a raw `TypeError: Invalid URL` escape
+   * `fetchInventory`.
+   */
+  private buildUrl(path: string): URL {
+    try {
+      return new URL(`${this.baseUrl}${path}`);
+    } catch {
+      throw new InventoryProviderError(
+        "network",
+        `The EVE-NG base URL "${this.baseUrl}" is not a valid URL — include http:// or https://.`
+      );
+    }
+  }
+
   private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string }> {
     let res: Response;
     try {
-      res = await this.fetchImpl(url.toString(), { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      // MINOR-5 — `redirect: "manual"` on every request. No EVE-NG endpoint
+      // legitimately redirects; the default `"follow"` would let a 3xx from the
+      // lab box carry the crawl (and, on 307/308, the login POST body — the
+      // password) to another origin. A 3xx surfaces below as a non-2xx protocol
+      // error instead.
+      res = await this.fetchImpl(url.toString(), { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
     } catch (err) {
       throw mapNetworkError(err, url);
     }
@@ -333,7 +354,7 @@ class EveApiClient {
    * captured here by hand and replayed on every later request.
    */
   public async login(timeoutMs: number): Promise<void> {
-    const url = new URL(`${this.baseUrl}/api/auth/login`);
+    const url = this.buildUrl("/api/auth/login");
     const { res, text } = await this.raw(
       url,
       {
@@ -381,7 +402,7 @@ class EveApiClient {
    * every other failure (surface it).
    */
   public async authedGet(path: string, timeoutMs: number): Promise<RawResponse> {
-    const url = new URL(`${this.baseUrl}${path}`);
+    const url = this.buildUrl(path);
     const send = async (): Promise<{ res: Response; text: string }> =>
       this.raw(url, { headers: { Cookie: `unetlab_session=${this.session ?? ""}`, Accept: "application/json" } }, timeoutMs);
 

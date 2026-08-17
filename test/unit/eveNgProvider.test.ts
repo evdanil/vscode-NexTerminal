@@ -585,6 +585,11 @@ describe("createEveNgProvider — nodes", () => {
     expect(tree.devices).toHaveLength(1);
   });
 
+  it("M38 — skips a node entry whose value is not an object (a string, number, or null), keeping only real nodes (⊘ dropping the isObject filter turns `\"2\": 42` into a phantom `node-2` server)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node(), "2": 42 as never, "3": "garbage" as never, "4": null as never }));
+    expect(tree.devices.map((d) => d.externalId)).toEqual(["/Lab 1.unl#1"]);
+  });
+
   it("maps status 2 to running and everything else to stopped", async () => {
     const tree = await fetchTree(oneLabWorld({ "1": node({ status: 2 }), "2": node({ id: "2", status: 0 }), "3": node({ id: "3", status: 3 }) }));
     const statusOf = (id: string) => tree.devices.find((d) => d.externalId.endsWith(`#${id}`))?.attributes?.status;
@@ -808,20 +813,76 @@ describe("createEveNgProvider — error mapping", () => {
     expect((err as Error).message).toContain("ECONNREFUSED");
   });
 
-  it("maps a non-JSON body (a proxy's HTML error page) to `protocol` with a BOUNDED slice of it (⊘ echoing the whole body puts a full HTML page into a notification)", async () => {
+  it("maps a non-JSON body (a proxy's HTML error page) to `protocol` WITHOUT echoing the untrusted body (⊘ MINOR-7 — echoing 200 bytes of an attacker-influenced page into the error puts markup into a notification; NetBox echoes none)", async () => {
     const html = `<!doctype html><html><body>${"x".repeat(5_000)}</body></html>`;
     const fetchImpl = (async () => makeResponse(200, html, [`unetlab_session=${SESSION}`])) as unknown as typeof fetch;
     const err = await createEveNgProvider(fetchImpl)
       .fetchInventory(CONFIG, SECRETS)
       .catch((e: unknown) => e);
     expect((err as InventoryProviderError).kind).toBe("protocol");
-    expect((err as Error).message.length).toBeLessThan(500);
+    expect((err as Error).message).not.toContain("xxxx");
+    expect((err as Error).message.length).toBeLessThan(300);
   });
 
   it("maps a 500 to `protocol`, not to `auth`", async () => {
     const fetchImpl = (async (input: string) => {
       if (new URL(input).pathname === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
       return makeResponse(500, "Internal Server Error");
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+  });
+
+  it("MINOR-6 — maps an unparseable base URL (a scheme-less host) to a mapped provider error, not a raw TypeError (⊘ `new URL(\"eve.example.com/api/...\")` throws straight out of fetchInventory)", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory({ ...CONFIG, baseUrl: "eve.example.com" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as Error).message.toLowerCase()).toContain("base url");
+    // Never even attempted a request against a URL that cannot be built.
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("M36 — a JSend `code:401` envelope on a NON-login endpoint (HTTP 200) maps to `auth`, not `protocol` (⊘ keying auth only off the HTTP status misses EVE-NG's in-envelope 401)", async () => {
+    const fetchImpl = (async (input: string) => {
+      if (new URL(input).pathname.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (new URL(input).pathname.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      return makeResponse(200, { code: 401, status: "fail", message: "Unauthorized access (90403).", data: null });
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("auth");
+  });
+
+  it("M37 — rejects a response whose envelope is missing `status` as `protocol` (⊘ a shape check that trusts `data` without `status` accepts a non-EVE-NG body)", async () => {
+    const fetchImpl = (async () => makeResponse(200, { code: 200, data: {} }, [`unetlab_session=${SESSION}`])) as unknown as typeof fetch;
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+  });
+
+  it("MINOR-5 — sends `redirect: \"manual\"` on the login POST and on GETs, so a 3xx from the lab box is never auto-followed across origins with the password (⊘ default `redirect: \"follow\"` retains the POST body on 307/308)", async () => {
+    const redirects: (RequestRedirect | undefined)[] = [];
+    const fetchImpl = (async (input: string, init?: RequestInit) => {
+      redirects.push(init?.redirect);
+      if (new URL(input).pathname.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (new URL(input).pathname.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1" }));
+      return makeResponse(200, jsend({ folders: [], labs: [] }));
+    }) as unknown as typeof fetch;
+    await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(redirects.length).toBeGreaterThan(1);
+    expect(redirects.every((r) => r === "manual")).toBe(true);
+  });
+
+  it("MINOR-5 — treats a 3xx as a protocol error rather than success (⊘ no EVE-NG endpoint legitimately redirects; following one is how the crawl leaves the origin)", async () => {
+    const fetchImpl = (async (input: string) => {
+      if (new URL(input).pathname.endsWith("/api/auth/login")) return makeResponse(302, "", [`unetlab_session=${SESSION}`]);
+      return makeResponse(200, jsend({}));
     }) as unknown as typeof fetch;
     const err = await createEveNgProvider(fetchImpl)
       .fetchInventory(CONFIG, SECRETS)
