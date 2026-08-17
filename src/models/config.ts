@@ -552,6 +552,29 @@ export function resolveServerProtocol(server: Pick<ServerConfig, "protocol">): S
   return (server.protocol as unknown) === "telnet" ? "telnet" : "ssh";
 }
 
+/**
+ * TELNET (P1-B) — the transport a LIVE SESSION is speaking.
+ *
+ * The session's own stamp wins (see `ActiveSession.protocol`): it records what
+ * the connection actually opened with, and a profile edited while the terminal
+ * is open must not reclassify it. Falls back to the server's configured protocol
+ * only when the session carries no stamp — a session described by something that
+ * did not go through a connect path — which is the behaviour every reader had
+ * before the stamp existed.
+ *
+ * THE ONE RESOLVER both the script target picker and the script runtime call, so
+ * "which transport is this session?" cannot be answered two different ways.
+ */
+export function resolveSessionProtocol(
+  session: Pick<ActiveSession, "protocol">,
+  server: Pick<ServerConfig, "protocol"> | undefined
+): ServerProtocol {
+  if (session.protocol !== undefined) {
+    return resolveServerProtocol(session);
+  }
+  return resolveServerProtocol(server ?? {});
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
@@ -1175,6 +1198,24 @@ export interface ActiveSession {
   serverId: string;
   terminalName: string;
   startedAt: number;
+  /**
+   * TELNET (P1-B) — the transport this session ACTUALLY OPENED WITH, stamped by
+   * the connect path and never changed afterwards.
+   *
+   * WHY IT IS ON THE SESSION AND NOT READ FROM THE SERVER. `ServerConfig.protocol`
+   * is mutable: the user can edit a profile while its terminal is still open, and
+   * the open terminal keeps speaking whatever it connected with. Classifying a
+   * live session from the CURRENT config therefore offered an SSH terminal to a
+   * `@target-type telnet` script (and the reverse), which sends automation —
+   * `sendLine`, `expect` — down the wrong transport. A session's transport is a
+   * fact about the connection, so it is recorded on the connection.
+   *
+   * RUNTIME-ONLY, exactly like `pty`: never persisted, absent on anything that
+   * did not go through a connect path. Readers fall back to the server's
+   * configured protocol when it is absent, which is the pre-existing behaviour
+   * and correct for a session that has only just been described to us.
+   */
+  protocol?: ServerProtocol;
   pty?: SessionPtyHandle;
 }
 

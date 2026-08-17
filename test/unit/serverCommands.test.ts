@@ -4198,6 +4198,24 @@ describe("telnet connect path", () => {
     expect(registry.register).toHaveBeenCalledTimes(1);
   });
 
+  // ⊘ P1-B (Codex) — the session records the transport it actually opened with,
+  // so a later edit to the server's Protocol cannot reclassify a terminal that
+  // is already connected. Without the stamp the classifier falls back to live
+  // config, which is precisely the bug.
+  it("stamps the session with the transport it opened on", async () => {
+    const { ctx, run } = connectTelnet();
+    await run();
+
+    const callbacks = vi.mocked(TelnetPty).mock.calls[0][1] as unknown as {
+      onSessionOpened(sessionId: string): void;
+    };
+    callbacks.onSessionOpened("telnet-session-1");
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(
+      expect.objectContaining({ protocol: "telnet" })
+    );
+  });
+
   it("registers an ActiveSession under the telnet terminal name so scripts can target it", async () => {
     const { ctx, run } = connectTelnet();
     await run();
@@ -4223,6 +4241,28 @@ describe("telnet connect path", () => {
     expect(vi.mocked(TelnetPty).mock.calls[0][0]).toEqual(
       expect.objectContaining({ host: "192.0.2.9", port: 5001, protocol: "telnet" })
     );
+  });
+});
+
+describe("SSH connect path — session protocol stamp (P1-B)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("stamps an SSH session with ssh, so flipping the profile later cannot reclassify it", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    ctx.core.registerSession = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    latestSshCallbacks().onSessionOpened("session-1");
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(expect.objectContaining({ protocol: "ssh" }));
   });
 });
 

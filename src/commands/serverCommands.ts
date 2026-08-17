@@ -997,6 +997,9 @@ async function connectTelnetServer(
               serverId: server.id,
               terminalName,
               startedAt: Date.now(),
+              // P1-B — the transport this session opened with, fixed for its
+              // lifetime even if the profile is edited underneath it.
+              protocol: "telnet",
               pty: ptyRef
             });
             ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
@@ -1109,6 +1112,9 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               serverId: server.id,
               terminalName,
               startedAt: Date.now(),
+              // P1-B — see the telnet path: stamped so a later Protocol edit
+              // cannot reclassify a terminal that is already connected.
+              protocol: "ssh",
               pty: ptyRef
             });
             ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
