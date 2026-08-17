@@ -47,5 +47,9 @@ export function addresslessUnavailableMessage(server: Pick<ServerConfig, "name" 
   if (server.addressless !== true) {
     return undefined;
   }
-  return `"${server.name}" has no console address yet — it may be stopped. Start it in EVE-NG and re-sync the inventory source.`;
+  // P2 (Codex review) — PROVIDER-NEUTRAL. This guard is shared and gets no
+  // provider identity, and an addressless server can come from an IP-less NetBox
+  // row (remedy: assign an address in NetBox) as well as a stopped EVE-NG node —
+  // so it must not prescribe an EVE-NG-specific remedy.
+  return `"${server.name}" has no console address yet. It may be offline, or its inventory source hasn't assigned one — re-sync the source once it has an address.`;
 }

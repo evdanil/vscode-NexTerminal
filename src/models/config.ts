@@ -585,9 +585,10 @@ export interface ServerConfig {
    * ADDRESSLESS (Codex P1 on #82) — a SYNCED PLACEHOLDER with no usable primary
    * endpoint yet: a stopped EVE-NG node, a VNC/HTML5-console node, or a NetBox
    * row with no IP. `true` here means `host` is `""` and there is nothing to
-   * connect to; the connect path refuses it with a friendly "no console address
-   * yet — start it and re-sync" message instead of a raw handshake failure, and
-   * the tree renders a `" (no address)"` suffix.
+   * connect to; the connect path refuses it with a friendly, provider-neutral
+   * "no console address yet — re-sync the source once it has an address" message
+   * instead of a raw handshake failure, and the tree renders a `" (no address)"`
+   * suffix.
    *
    * Written ONLY by inventory sync — a hand-created server is never addressless,
    * and `validateServerConfig` only relaxes the empty-host requirement when this
