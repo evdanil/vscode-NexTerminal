@@ -48,6 +48,10 @@ export interface SessionSnapshot {
   explicitGroups: string[];
   authProfiles: AuthProfile[];
   activitySessionIds: ReadonlySet<string>;
+  // LIVE STATUS (Phase 2) — runtime-only running/stopped state per serverId,
+  // driven by applyInventoryStatus. Empty unless a fetchStatus report has been
+  // applied; never persisted.
+  serverStatus: Map<string, "running" | "stopped">;
   focusedSessionId: string | undefined;
   inventorySources: InventorySourceConfig[];
   deviceTemplates: DeviceTemplateProfile[];

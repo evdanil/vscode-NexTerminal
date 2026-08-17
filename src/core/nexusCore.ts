@@ -15,7 +15,8 @@ import {
   type TunnelProfile,
   type TunnelRegistryEntry
 } from "../models/config";
-import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
+import { sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
+import { deterministicServerId } from "../services/inventory/deterministicId";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
@@ -105,6 +106,14 @@ export class NexusCore {
   private readonly activeLocalShellSessions = new Map<string, ActiveLocalShellSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
+  // LIVE STATUS (Phase 2) — runtime-only running/stopped state per server,
+  // driven by applyInventoryStatus from a provider's fetchStatus report. NOT
+  // persisted (it dies with the window and is re-fetched on demand / poll).
+  // `serverStatusSource` records which source each entry came from, so a later
+  // apply for that source can drop the entries it no longer reports (including
+  // servers pruned or removed) without touching another source's entries.
+  private readonly serverStatus = new Map<string, "running" | "stopped">();
+  private readonly serverStatusSource = new Map<string, string>();
   private focusedSessionId: string | undefined = undefined;
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
@@ -199,6 +208,7 @@ export class NexusCore {
       explicitGroups: [...this.explicitGroups],
       authProfiles: [...this.authProfiles.values()],
       activitySessionIds: new Set(this.activitySessionIds),
+      serverStatus: new Map(this.serverStatus),
       focusedSessionId: this.focusedSessionId,
       inventorySources: [...this.inventorySources.values()],
       deviceTemplates: [...this.deviceTemplates.values()],
@@ -640,6 +650,15 @@ export class NexusCore {
         this.inventorySources.set(id, previous!);
       }
       throw error;
+    }
+    // LIVE STATUS (Phase 2) — the source is gone; drop any runtime status it
+    // owned so a removed source leaves no lingering running/stopped highlight.
+    // Clears the maps directly (no extra emit) since emitChanged() fires below.
+    for (const [serverId, owner] of [...this.serverStatusSource]) {
+      if (owner === id) {
+        this.serverStatus.delete(serverId);
+        this.serverStatusSource.delete(serverId);
+      }
     }
     this.emitChanged();
   }
@@ -2199,6 +2218,54 @@ export class NexusCore {
   public registerSession(session: ActiveSession): void {
     this.activeSessions.set(session.id, session);
     this.emitChanged();
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — apply one source's fetchStatus report onto the
+   * runtime serverStatus map. Every externalId is mapped to a serverId via the
+   * same deterministicServerId scheme the sync uses, and a status is set ONLY for
+   * a server that exists AND is owned by this source (origin.sourceId ===
+   * sourceId). Entries this source previously wrote but no longer reports —
+   * pruned nodes, removed servers — are dropped; entries owned by OTHER sources
+   * are untouched. One emitChanged() on the way out, like registerSession.
+   */
+  public applyInventoryStatus(sourceId: string, report: InventoryStatusReport): void {
+    // Clear this source's prior entries first, then rebuild from the fresh
+    // report — so a server the source stops reporting drops out on this pass.
+    for (const [serverId, owner] of [...this.serverStatusSource]) {
+      if (owner === sourceId) {
+        this.serverStatus.delete(serverId);
+        this.serverStatusSource.delete(serverId);
+      }
+    }
+    for (const [externalId, deviceStatus] of Object.entries(report.statuses)) {
+      const serverId = deterministicServerId(sourceId, externalId);
+      const server = this.servers.get(serverId);
+      if (server && server.origin?.sourceId === sourceId) {
+        this.serverStatus.set(serverId, deviceStatus.state);
+        this.serverStatusSource.set(serverId, sourceId);
+      }
+    }
+    this.emitChanged();
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — drop every status entry a source owns (used on
+   * source removal). Silent when there was nothing to clear, so an unrelated
+   * source removal does not churn every tree.
+   */
+  public clearInventoryStatus(sourceId: string): void {
+    let changed = false;
+    for (const [serverId, owner] of [...this.serverStatusSource]) {
+      if (owner === sourceId) {
+        this.serverStatus.delete(serverId);
+        this.serverStatusSource.delete(serverId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.emitChanged();
+    }
   }
 
   public registerSerialSession(session: ActiveSerialSession): void {
