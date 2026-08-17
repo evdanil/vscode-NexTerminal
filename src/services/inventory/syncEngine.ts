@@ -551,6 +551,52 @@ function syncOwnsAltHost(current: string | undefined, stamp: string | undefined,
 }
 
 /**
+ * PRIMARY HOST (task #29, the deferred #82 P2-3) — may this sync WRITE
+ * `ServerConfig.host` on an existing owned server? A VERBATIM copy of
+ * `syncOwnsIpmiHost` above — the SAME blank-normalize and the SAME
+ * `cur === stamp || cur === dev` — governed by the SAME 6-row + 5a matrix, read
+ * with `cur` = the record's `host`, `stamp` = `origin.syncedHost`, `dev` = the
+ * address this fetch's chosen endpoint supplies.
+ *
+ * WHY THIS DISCIPLINE NOW, WHEN `host` USED TO BE "device always wins". This is
+ * the DELIBERATE BEHAVIOR CHANGE (task #29): before the `syncedHost` stamp there
+ * was no way to tell a hand-edited console address apart from a sync-written one,
+ * so the sync wrote the device's `host` UNCONDITIONALLY and stomped every hand
+ * edit. The stamp closes exactly the gap `syncedAltHost`/`syncedIpmiHost` close
+ * for their fields — a hand-typed value (a stamp the value no longer equals) is
+ * now preserved, and only a value still carrying the sync's own last write (or
+ * the device's current one, row 5a) is overwritten. The `dev` blank-normalize is
+ * inherited too: an addressless placeholder's `host: ""` reads as absent, so its
+ * upgrade fills from the device (row 1) rather than reading as a hand entry.
+ */
+function syncOwnsHost(current: string | undefined, stamp: string | undefined, dev: string): boolean {
+  const cur = current !== undefined && current.trim() === "" ? undefined : current;
+  return cur === stamp || cur === dev;
+}
+
+/**
+ * PRIMARY PORT (task #29) — the numeric twin of `syncOwnsHost` above, on
+ * `ServerConfig.port`. Numeric, so there is no whitespace to trim; the
+ * `ADDRESSLESS_PORT` (0) sentinel plays the role blank `""` plays for the host
+ * and is NORMALIZED TO ABSENT for two reasons the matrix needs:
+ *  - FILL-IN (row 1): an addressless placeholder carries `port: 0` with no
+ *    stamp; normalizing to `undefined` makes `cur === stamp` (undefined ===
+ *    undefined) true, so the upgrade takes the device's port — the numeric
+ *    analog of the blank-host fill-in.
+ *  - ROW 6 GUARD ("device supplies none"): were `dev` itself the sentinel, an
+ *    un-normalized `cur === dev` (0 === 0) would spuriously read as owned; with
+ *    `cur` normalized to `undefined` it cannot match a sentinel `dev`, so a
+ *    placeholder's 0 never reads as owned by coincidence.
+ * `stamp` needs no normalization — the sync only ever writes a real endpoint
+ * port (`>= 1`) or leaves it absent, exactly as `syncOwnsIpmiHost`'s stamp is
+ * only ever a selected non-empty host.
+ */
+function syncOwnsPort(current: number, stamp: number | undefined, dev: number): boolean {
+  const cur = current === ADDRESSLESS_PORT ? undefined : current;
+  return cur === stamp || cur === dev;
+}
+
+/**
  * AUTH 2b (REVIEW FINDING, P1) — "can this server supply the key file the
  * profile does not?". The server-side half of `authProfileNeedsServerKeyPath`
  * (models/config.ts), which asks the same question of the profile.
@@ -1744,6 +1790,25 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const ownedEndpoint = selectEndpointForProtocol(device, effectiveProtocol);
       const ownedHost = ownedEndpoint?.endpoint.host ?? ownedServer.host;
       const ownedPort = ownedEndpoint?.port ?? ownedServer.port;
+      // PRIMARY HOST/PORT (task #29) — the twin decision for `host`/`port`,
+      // decided HERE for the same reason `takesIpmiHost`/`takesAltHost` are: the
+      // stamps go INTO the origin literal below, which the retro-apply / rollback
+      // branches rebuild. See `syncOwnsHost`/`syncOwnsPort` for the write rules
+      // and the matrix. GATED on `ownedEndpoint !== undefined` — the twin of the
+      // `mgmtHost !== undefined` / `altHost !== undefined` guards those two carry:
+      // when no endpoint of the record's transport was found `ownedHost`/
+      // `ownedPort` fall back to the RECORD'S OWN value, and feeding the record's
+      // value in as `dev` would launder it into "owned" (row 5a on the record
+      // instead of the device) and re-stamp a hand edit. The P1-C "no matching
+      // endpoint ⇒ leave the address alone" branch is therefore a true no-op:
+      // both value and stamp carry forward untouched. When the endpoint IS
+      // present this is exactly the addressed decision (and the addressless
+      // upgrade: `host: ""`/`port: 0` blank-normalize to absent, so the fill-in
+      // row takes the device's address).
+      const takesHost =
+        ownedEndpoint !== undefined && syncOwnsHost(ownedServer.host, ownedServer.origin?.syncedHost, ownedHost);
+      const takesPort =
+        ownedEndpoint !== undefined && syncOwnsPort(ownedServer.port, ownedServer.origin?.syncedPort, ownedPort);
       // The username rides the SAME endpoint the address came from, and is
       // `undefined` when no endpoint of the record's transport was found — a
       // username belongs to an endpoint, so taking one from an endpoint whose
@@ -1870,6 +1935,15 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // record's current value into the stamp here would let the sync AFTER
         // this one overwrite the user's choice.
         syncedProtocol: takesProtocol ? deviceProtocol : ownedServer.origin?.syncedProtocol,
+        // PRIMARY HOST/PORT (task #29) — the same "records what the sync wrote"
+        // discipline one field down: refreshed exactly where this sync writes
+        // `host`/`port` (the `takesHost`/`takesPort` lines below), and otherwise
+        // carried forward VERBATIM — including as `undefined`, which keeps a
+        // hand-edited address hand-owned and a placeholder's absent stamp absent.
+        // The carry-forward is load-bearing for the reason `syncedAltHost`'s is:
+        // an update fired for an unrelated reason rebuilds this literal from scratch.
+        syncedHost: takesHost ? ownedHost : ownedServer.origin?.syncedHost,
+        syncedPort: takesPort ? ownedPort : ownedServer.origin?.syncedPort,
         // DEVICE TEMPLATES (PR-T1) — the per-field template stamps, carried
         // forward with this run's writes already folded in by the matrix above.
         // The one-line carry-forward the whole feature turns on (§5.2 / fixture
@@ -1881,9 +1955,6 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const after: ServerConfig = {
         ...ownedServer,
         name: device.name,
-        // P1-C — the tuple that agrees with `after.protocol`; see above.
-        host: ownedHost,
-        port: ownedPort,
         group,
         ...templateMatrix.values,
         origin: afterOrigin
@@ -1898,6 +1969,21 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
       if (ownedEndpointUsername !== undefined) {
         after.username = ownedEndpointUsername;
+      }
+      // PRIMARY HOST/PORT (task #29) — the value half of the decision stamped
+      // above, on exactly the rows `syncOwnsHost`/`syncOwnsPort` answer yes for,
+      // so the record and its stamp can never disagree about who owns the field.
+      // Conditional assignments (not members of the literal) so the
+      // `...ownedServer` spread PRESERVES a hand-edited address on the rows this
+      // must not touch — the deliberate behavior change (host/port were written
+      // unconditionally before). The addressless UPGRADE lands here too: a
+      // placeholder that gained a console has `takesHost`/`takesPort` true (its
+      // blank/sentinel address reads as absent, so the device fills it).
+      if (takesHost) {
+        after.host = ownedHost;
+      }
+      if (takesPort) {
+        after.port = ownedPort;
       }
       if (takesIpmiHost) {
         after.ipmiHost = mgmtHost;
@@ -2725,6 +2811,21 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // otherwise the marker's receipt RESTORED VERBATIM, which is what
           // keeps a protocol the user flipped before the detach hand-owned.
           syncedProtocol: takesProtocol ? deviceProtocol : adoptee.formerlySynced?.syncedProtocol,
+          // PRIMARY HOST/PORT (task #29) — stamped from the ADDRESS THIS ADOPTION
+          // WRITES (`endpoint.host` / `port`, the same values assigned onto
+          // `after` below), UNCONDITIONALLY, exactly as the add path stamps a
+          // fresh record. Unlike `syncedIpmiHost`/`syncedAltHost` — which may or
+          // may not be written this run and so restore from the marker receipt —
+          // adoption ALWAYS writes `host`/`port` (it only adopts when the record's
+          // address already corroborates the device's, up to case), so it
+          // genuinely owns the address and stamps it directly. There is no
+          // `DetachedServerOrigin` receipt for these (see models/config.ts) and
+          // none is needed: the value is the device's by corroboration, so
+          // stamping it here is truthful and it spares every adopted server a
+          // spurious stamp-only update on its first post-adoption sync (which a
+          // `syncedHost: undefined` here would guarantee via matrix row 5a).
+          syncedHost: endpoint.host,
+          syncedPort: port,
           // FIX 1 — the per-field template stamps for the non-auth fields the
           // matrix above wrote onto this adoptee, folded into the origin literal
           // so the auth-branch rebuild (`{ ...adoptionOrigin, syncedAuthProfileId }`)
@@ -3172,6 +3273,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // is the state the write rule can act on; one born stampless would read
         // as ssh whatever the device said.
         syncedProtocol: deviceProtocol,
+        // PRIMARY HOST/PORT (task #29) — mirror the `host`/`port` written above,
+        // stamped UNCONDITIONALLY (a fresh record OWNS its address): a record born
+        // with value and stamp agreeing is matrix row 1's state the write rule can
+        // act on, and every LATER sync then has the ownership question already
+        // answered — a hand edit read as hand-owned, an unchanged address followed.
+        syncedHost: endpoint.host,
+        syncedPort: port,
         // DEVICE TEMPLATES (PR-T1) — the template stamps for the non-auth fields
         // written above (row 1), so every LATER sync has the ownership question
         // already answered. Absent when the template set none of them.
