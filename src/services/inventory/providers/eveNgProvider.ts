@@ -101,8 +101,19 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
 // URL / config helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Trims, drops trailing slashes, and — like `netboxProvider.normalizeBaseUrl`
+ * — strips a pasted `/api` SUFFIX. A user who copied the API URL out of the
+ * browser types `http://eve/api`; without this the request path doubled into
+ * `/api/api/auth/login` and the very first call 404'd. A path that is NOT the
+ * API path (`http://gw/eve1`, a reverse-proxy mount) is kept — every request is
+ * built from this exact string, so it must be the string the deployment
+ * actually answers at.
+ */
 function normalizeBaseUrl(raw: string): string {
-  return raw.trim().replace(/\/+$/, "");
+  let url = raw.trim().replace(/\/+$/, "");
+  url = url.replace(/\/api$/i, "");
+  return url.replace(/\/+$/, "");
 }
 
 /**
@@ -110,16 +121,23 @@ function normalizeBaseUrl(raw: string): string {
  * (models/inventory.ts) for the contract and `netboxInstanceKey` for the
  * reference implementation this mirrors.
  *
- * THE PATH IS DROPPED, which is the one deliberate difference from the NetBox
- * key. EVE-NG's API is always at the origin's `/api`; the product cannot be
- * mounted under a path prefix, so a path in the base URL is a typo or a stray
- * copy-paste out of the browser — keeping it would fragment one server into as
- * many keys as there are spellings, which is precisely the failure the key
- * exists to prevent. Everything else is the same canonicalization: scheme and
- * host lower-cased, a default port dropped, and userinfo/query/fragment
- * removed — userinfo because this key is PERSISTED on every kept server and
- * copied into backups, and `http://admin:pw@eve` is a credential typed into a
- * non-secret field.
+ * MAJOR-2 (review) — THE KEY DERIVES FROM EXACTLY THE STRING THE FETCH DERIVES
+ * FROM. `login`/`authedGet` build `new URL(`${baseUrl}${path}`)`, so a base URL
+ * carrying a mount path (`http://gw/eve1`, a reverse proxy fronting several
+ * EVE-NG boxes) issues every request under that path — and the key MUST keep
+ * the path too, or `http://gw/eve1` and `http://gw/eve2` (two distinct working
+ * deployments) collapse onto one identity and source B can adopt, then its
+ * prune policy delete, servers and credentials kept from source A on a
+ * different box. The `/api` suffix is the one path segment `normalizeBaseUrl`
+ * removes, and it removes it from the fetch string too, so the two never
+ * disagree.
+ *
+ * Canonicalization otherwise matches NetBox: scheme and host lower-cased (both
+ * case-insensitive per RFC 3986, and `new URL` does it), a default port
+ * dropped, the path's trailing slash removed but its case kept (a mount path is
+ * server-significant), and userinfo/query/fragment stripped — userinfo because
+ * this key is PERSISTED on every kept server and copied into backups, and
+ * `http://admin:pw@eve` is a credential typed into a non-secret field.
  *
  * `undefined` for anything `new URL` rejects (a scheme-less host is the common
  * typo): the fetch path builds its URLs from the same string, so a source whose
@@ -137,8 +155,10 @@ export function eveNgInstanceKey(config: InventorySourceValues): string | undefi
     return undefined;
   }
   // `host` rather than `hostname` so a non-default port stays part of the
-  // identity; the parser has already dropped the scheme's default port.
-  return `${parsed.protocol}//${parsed.host}`;
+  // identity; the parser has already dropped the scheme's default port. The
+  // path is kept (trailing slash trimmed) because the fetch honours it.
+  const path = parsed.pathname.replace(/\/+$/, "");
+  return `${parsed.protocol}//${parsed.host}${path}`;
 }
 
 /**

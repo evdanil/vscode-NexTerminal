@@ -14,7 +14,7 @@ import { computeSyncPlan, validateInventoryTree } from "../../src/services/inven
  * or a stray copy-paste rather than a second deployment on the same host.
  */
 describe("eveNgInstanceKey", () => {
-  it("collapses every spelling of ONE deployment onto ONE key — trailing slashes, host case, the scheme's default port, a stray path/query/fragment (⊘ a raw-string key fragments one instance into seven and refuses the re-add adoption exists for)", () => {
+  it("collapses every spelling of ONE deployment onto ONE key — trailing slashes, host case, the scheme's default port, the /api suffix, a stray query/fragment (⊘ a raw-string key fragments one instance into seven and refuses the re-add adoption exists for)", () => {
     const canonical = "http://eve.example.com";
     for (const spelling of [
       "http://eve.example.com",
@@ -23,12 +23,38 @@ describe("eveNgInstanceKey", () => {
       "http://EVE.Example.COM",
       "http://eve.example.com:80",
       "  http://eve.example.com  ",
+      // A pasted `/api` is the API path the user copied out of the browser, not
+      // a mount point — it is stripped so it cannot double up into
+      // `/api/api/auth/login`, and the key derived from the same normalized
+      // string agrees.
       "http://eve.example.com/api",
+      "http://eve.example.com/api/",
       "http://eve.example.com?foo=bar",
       "http://eve.example.com#frag"
     ]) {
       expect(eveNgInstanceKey({ baseUrl: spelling })).toBe(canonical);
     }
+  });
+
+  /**
+   * MAJOR-2 — the key and the fetch MUST agree. `authedGet`/`login` build
+   * `new URL(`${baseUrl}${path}`)`, so a base URL with a mount path
+   * (`http://gw/eve1`, a reverse proxy fronting several EVE-NG boxes) issues
+   * every request UNDER that path. Dropping the path from the key would map
+   * `http://gw/eve1` and `http://gw/eve2` — two distinct working deployments —
+   * onto one identity, and source B could then adopt (and its prune policy
+   * delete) servers and credentials kept from source A on a different box.
+   */
+  it("KEEPS a real mount path, so two proxied deployments on one host stay distinct (⊘ dropping the path collides two boxes onto one key and lets one adopt the other's kept servers)", () => {
+    expect(eveNgInstanceKey({ baseUrl: "http://gw.example.com/eve1" })).toBe("http://gw.example.com/eve1");
+    const a = eveNgInstanceKey({ baseUrl: "http://gw.example.com/eve1" });
+    const b = eveNgInstanceKey({ baseUrl: "http://gw.example.com/eve2" });
+    expect(a).not.toBe(b);
+  });
+
+  it("normalizes only the path's trailing slash, and keeps path case (a mount path is server-significant, unlike host case)", () => {
+    expect(eveNgInstanceKey({ baseUrl: "http://gw.example.com/eve1/" })).toBe("http://gw.example.com/eve1");
+    expect(eveNgInstanceKey({ baseUrl: "http://gw.example.com/EVE1" })).toBe("http://gw.example.com/EVE1");
   });
 
   it("keeps host, non-default port and scheme — the three things that actually distinguish two EVE-NG servers (⊘ over-normalizing is the failure that hands one lab's records to another)", () => {
@@ -230,6 +256,34 @@ describe("createEveNgProvider — login and session", () => {
     const login = calls.find((c) => c.url.endsWith("/api/auth/login"));
     expect(login?.method).toBe("POST");
     expect(JSON.parse(login?.body ?? "{}")).toEqual({ username: "admin", password: "pw", html5: "-1" });
+  });
+
+  it("issues every request UNDER a base-URL mount path, matching the deployment the instanceKey names (⊘ ignoring the path fetches `/api/...` at the origin while the key claims `/eve1` — key and fetch disagree)", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string) => {
+      calls.push(input);
+      const path = new URL(input).pathname;
+      if (path.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path.endsWith("/api/status")) return makeResponse(200, jsend({ version: "5.0.1-13" }));
+      if (path.includes("/api/folders")) return makeResponse(200, jsend({ folders: [], labs: [] }));
+      return makeResponse(200, jsend({}));
+    }) as unknown as typeof fetch;
+
+    await createEveNgProvider(fetchImpl).fetchInventory({ ...CONFIG, baseUrl: "http://gw.example.com/eve1" }, SECRETS);
+    expect(calls).toContain("http://gw.example.com/eve1/api/auth/login");
+    expect(calls.some((u) => u.includes("/eve1/api/folders"))).toBe(true);
+    // ⊘ Nothing may be requested at the bare origin — that is a different box.
+    expect(calls.every((u) => new URL(u).pathname.startsWith("/eve1/"))).toBe(true);
+  });
+
+  it("strips a pasted `/api` suffix so it cannot double into `/api/api/auth/login` (⊘ treating the API path as a mount path makes the very first request 404)", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string) => {
+      calls.push(input);
+      return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+    }) as unknown as typeof fetch;
+    await createEveNgProvider(fetchImpl).testConnection({ ...CONFIG, baseUrl: "http://eve.example.com/api" }, SECRETS).catch(() => undefined);
+    expect(calls[0]).toBe("http://eve.example.com/api/auth/login");
   });
 
   it("captures the unetlab_session cookie and replays it on EVERY later request (⊘ undici's fetch keeps no cookie jar, so a client that never sets the header gets a 401 on the first folder listing)", async () => {
