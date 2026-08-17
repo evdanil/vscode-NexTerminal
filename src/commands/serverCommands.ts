@@ -2265,7 +2265,17 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       await configMutationLock.runExclusive(async () => {
         const live = ctx.core.getServer(server.id);
         if (!live || live.name === trimmedName) {
-          return; // removed, or already renamed, while the input box was open
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 (Codex) — BAIL if a CONCURRENT rename changed the name to some
+        // OTHER value while this input box was open: the live name no longer
+        // matches what this prompt started from (`server.name`), so writing
+        // `trimmedName` would overwrite the newer rename with a decision made
+        // against a stale name. (The port-heal re-read above is safe to keep —
+        // host/port are not the field this prompt owns — but a name that moved out
+        // from under the prompt means the prompt is stale.)
+        if (live.name !== server.name) {
+          return;
         }
         await ctx.core.addOrUpdateServer({ ...live, name: trimmedName });
       });

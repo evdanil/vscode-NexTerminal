@@ -565,6 +565,25 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(lastWrite.name).toBe("new-name");
   });
 
+  it("(#84 P2-1) rename bails when a CONCURRENT rename changed the name to a DIFFERENT value while the input box was open — it does not overwrite the newer rename with this stale prompt (⊘ checking only `live.name === trimmedName` lets a stale 'C' clobber a concurrent 'B')", async () => {
+    const captured = makeServer({ name: "A", host: "10.0.0.9", port: 32769 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [captured] });
+    registerServerCommands(ctx);
+
+    // While THIS rename's input box is open (renaming A -> C), another rename
+    // lands first and changes the live record to "B".
+    (vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      await ctx.core.addOrUpdateServer({ ...captured, name: "B" });
+      return "C";
+    });
+
+    await registeredCommands.get("nexus.server.rename")!(new ServerTreeItem(captured, false));
+
+    // The concurrent "B" survives — the stale "A -> C" prompt is discarded because
+    // the live name no longer matches the captured "A".
+    expect(ctx.core.getServer("srv-1")?.name).toBe("B");
+  });
+
   it("(P1, remove-lock-picker-fallback fix) remove command re-checks server presence inside the lock and bails out with an info message — never falls through to an interactive picker or performs any teardown/vault/removal work — when the record was deleted while the confirmation modal or the lock wait was pending", async () => {
     const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
       profiles: [],
