@@ -1963,10 +1963,16 @@ interface ControlWorldOpts {
   actionHttp?: number;
   /** When set, the action endpoint returns a JSend `status:"fail"` envelope. */
   actionFail?: boolean;
+  /**
+   * When set, the FIRST node-action request 401s (an expired session) and every
+   * later one succeeds — exercises `authedRequest`'s single silent re-login.
+   */
+  actionFirst401?: boolean;
 }
 
 function controlWorld(opts: ControlWorldOpts = {}): { fetchImpl: typeof fetch; calls: Call[] } {
   const calls: Call[] = [];
+  let actionHits = 0;
   const impl = async (input: string, init?: RequestInit): Promise<unknown> => {
     const url = new URL(input);
     const path = decodeURIComponent(url.pathname);
@@ -1987,6 +1993,10 @@ function controlWorld(opts: ControlWorldOpts = {}): { fetchImpl: typeof fetch; c
       return makeResponse(200, jsend(data));
     }
     // Any /api/labs/.../nodes/{id}/{action} endpoint is the control call.
+    actionHits++;
+    if (opts.actionFirst401 && actionHits === 1) {
+      return makeResponse(401, "session expired");
+    }
     const http = opts.actionHttp ?? 200;
     if (http !== 200) {
       return makeResponse(http, "control failed");
@@ -1997,6 +2007,11 @@ function controlWorld(opts: ControlWorldOpts = {}): { fetchImpl: typeof fetch; c
     return makeResponse(200, jsend(true));
   };
   return { fetchImpl: impl as unknown as typeof fetch, calls };
+}
+
+/** Login requests seen so far. */
+function loginCount(calls: Call[]): number {
+  return calls.filter((c) => c.url.endsWith("/api/auth/login")).length;
 }
 
 /** The single node-action request (everything that is not login or /api/status). */
@@ -2056,6 +2071,16 @@ describe("createEveNgProvider — controlNode", () => {
     await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start");
     const call = actionCall(calls);
     expect(call?.headers.Cookie).toBe(`unetlab_session=${SESSION}`);
+  });
+
+  it("re-logs in ONCE and retries when the node-action request 401s, and the control still succeeds (⊘ authedRequest without the silent re-login surfaces the first expired-session 401 as an auth failure, so a Start that a single re-login would have saved is reported as failed)", async () => {
+    const { fetchImpl, calls } = controlWorld({ actionFirst401: true });
+    // Resolves (no throw) only because the 401 triggered a re-login + retry.
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start");
+    // The initial login plus exactly one silent re-login off the 401.
+    expect(loginCount(calls)).toBe(2);
+    // The action endpoint was hit twice: the 401 and the successful retry.
+    expect(calls.filter((c) => c.url.includes("/nodes/")).length).toBe(2);
   });
 
   it("Pro (PRELIMINARY) uses PUT for START, faithful to the edition-aware evengsdk verbs (⊘ falling back to the Community GET path is the un-edition-aware bug)", async () => {
