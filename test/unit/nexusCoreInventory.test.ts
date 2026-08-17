@@ -5126,6 +5126,41 @@ describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
     expect(core.getServer(b.id)?.port).toBe(32770); // absent ⇒ untouched
   });
 
+  it("NEVER persists a heal whose result would fail validateServerConfig — the write-site defense (⊘ a bad port/host reaching the heal directly, bypassing the report validator, would persist a record dropped at reload — the #82 record-drop class)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    await core.addServersBatch([s]);
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    // Reports constructed DIRECTLY (not through validateInventoryStatusReport), as
+    // an untrusted second provider could hand in-process. Port 0 is the ADDRESSLESS
+    // sentinel and would make a NON-addressless record invalid; the heal recognises
+    // it as sync-owned (cur === stamp) but MUST refuse to persist the invalid result.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 0 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(32769);
+    // An out-of-range port is the same class.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 70000 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(32769);
+    // An empty console host would blank host — the whole entry is refused (the
+    // resulting record fails validateServerConfig), so its port is not healed either.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consoleHost: "", consolePort: 40000 } }
+    });
+    const after = core.getServer(s.id);
+    expect(after?.host).toBe("10.0.0.9");
+    expect(after?.port).toBe(32769);
+    // Nothing was ever persisted, so no change fired across all three refusals.
+    expect(listener).not.toHaveBeenCalled();
+  });
+
   it("does not heal when the reported port EQUALS the persisted one (⊘ an unconditional write churns a persist + emit every refresh on every unchanged node)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

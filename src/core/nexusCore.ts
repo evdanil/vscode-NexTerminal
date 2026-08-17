@@ -23,6 +23,12 @@ import { inventorySourceValuesEqual, sourceConfigUnchanged, type InventorySource
 // runtime import into syncEngine; the reverse edge (syncEngine → nexusCore) is
 // type-only, so there is no runtime cycle.
 import { syncOwnsHost, syncOwnsPort } from "../services/inventory/syncEngine";
+// P2-1 (review) — the heal validates its own resulting record before persisting,
+// so it can NEVER write a host/port that `validateServerConfig` would reject on
+// the next reload (the #82 record-drop class). Belt-and-suspenders behind the
+// tightened status-report validator, for an untrusted provider that hands a
+// report straight in-process without going through validateInventoryStatusReport.
+import { validateServerConfig } from "../utils/validation";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
@@ -2398,6 +2404,15 @@ export class NexusCore {
       if (healPort && reportedPort !== undefined && next.origin !== undefined) {
         next.port = reportedPort;
         next.origin.syncedPort = reportedPort;
+      }
+      // P2-1 (review) — WRITE-SITE DEFENSE. Never persist a record the next reload
+      // would reject: a bad host/port that slipped past the report validator (a
+      // provider calling this in-process without validateInventoryStatusReport)
+      // would otherwise be dropped whole on reload, taking its credentials/tunnels
+      // with it. Validating the RESULT — not just the reported field — means the
+      // heal structurally cannot write what the sync path never would.
+      if (!validateServerConfig(next)) {
+        continue;
       }
       healed.push(next);
     }

@@ -52,19 +52,37 @@ describe("validateInventoryStatusReport", () => {
     ).toBeUndefined();
   });
 
-  it("rejects a non-string consoleHost or a non-finite / non-number consolePort (⊘ a NaN/Infinity port would be persisted and dialled)", () => {
-    expect(
-      validateInventoryStatusReport({ contractVersion: 1, statuses: { a: { state: "running", consolePort: Number.NaN } } })
-    ).toBeUndefined();
-    expect(
-      validateInventoryStatusReport({ contractVersion: 1, statuses: { a: { state: "running", consolePort: Number.POSITIVE_INFINITY } } })
-    ).toBeUndefined();
-    expect(
-      validateInventoryStatusReport({ contractVersion: 1, statuses: { a: { state: "running", consolePort: "32769" } } })
-    ).toBeUndefined();
-    expect(
-      validateInventoryStatusReport({ contractVersion: 1, statuses: { a: { state: "running", consoleHost: 10 } } })
-    ).toBeUndefined();
+  // P2-1 (review) — the console fields are HEAL INPUTS now (healSyncedConsolePorts
+  // persists them into ServerConfig.host/port), so an invalid one must never be
+  // surfaced to the heal. But the ENTRY's `state` still drives the tree highlight
+  // and its keying is unchanged, so a bad console field drops JUST that field
+  // rather than the whole entry or the whole report — the auxiliary hint is
+  // suppressed while the running/stopped decoration survives.
+  it("drops an INVALID consoleHost/consolePort field but keeps the entry's state (⊘ surfacing an empty host / port 0 / NaN / out-of-range port lets the heal persist a value validateServerConfig rejects on reload — the #82 record-drop class)", () => {
+    // A non-string host, an empty-string host, a non-finite port, a non-integer
+    // port, and out-of-range ports (0, negative, > 65535) are each stripped; the
+    // entry survives as a bare running state.
+    const bad = (over: Record<string, unknown>) =>
+      validateInventoryStatusReport({ contractVersion: 1, statuses: { a: { state: "running", ...over } } });
+    expect(bad({ consoleHost: 10 })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consoleHost: "" })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consolePort: Number.NaN })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consolePort: Number.POSITIVE_INFINITY })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consolePort: "32769" })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consolePort: 0 })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consolePort: -1 })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consolePort: 1.5 })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consolePort: 70000 })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    // A valid port that just happens to be low/high still passes.
+    expect(bad({ consoleHost: "10.0.0.1", consolePort: 65535 })).toEqual({
+      contractVersion: 1,
+      statuses: { a: { state: "running", consoleHost: "10.0.0.1", consolePort: 65535 } }
+    });
+    // Only the invalid HALF is dropped — a valid host beside a bad port keeps the host.
+    expect(bad({ consoleHost: "10.0.0.1", consolePort: 0 })).toEqual({
+      contractVersion: 1,
+      statuses: { a: { state: "running", consoleHost: "10.0.0.1" } }
+    });
   });
 
   it("accepts an empty statuses map (a source with no devices reports nothing running)", () => {
