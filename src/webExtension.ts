@@ -87,6 +87,8 @@ const unsupportedCommands = [
   "nexus.inventory.syncNow",
   "nexus.inventory.refreshStatus",
   "nexus.inventory.manage",
+  "nexus.inventory.startNode",
+  "nexus.inventory.stopNode",
   "nexus.macro.editor",
   "nexus.macro.add",
   "nexus.macro.addFromTemplate",
