@@ -193,7 +193,7 @@ A second built-in inventory provider (`src/services/inventory/providers/eveNgPro
 
 **`testConnection`** logs in and probes `GET /api/status`, falling back to `GET /api/folders/` **only** on a 404 (an older build without the endpoint). An auth failure bubbles as-is and is never masked by a fallback that could succeed on a laxer endpoint.
 
-**Edition.** `data.version` from `/api/status` naming `pro` (case-insensitive) marks the server Professional and appends exactly one warning per sync: *"EVE-NG Professional detected — Pro support is preliminary in this version; lab discovery and console mapping are validated against Community edition."* Community is the certified target. A missing `/api/status` is treated as *unknown* rather than fatal — edition detection is an optional capability probe.
+**Edition.** `detectEdition` marks the server Professional when EITHER a string `data.edition` from `/api/status` contains `pro` (case-insensitive) OR the legacy `data.version` suffix does — some installs report the edition in the dedicated `data.edition` field while `data.version` is just a numeric build string, so a version-only check would miss them. It then appends exactly one warning per sync: *"EVE-NG Professional detected — Pro support is preliminary in this version; lab discovery and console mapping are validated against Community edition."* Community is the certified target. The check is defensive — an absent or non-string `edition` falls back to the version check, and a non-Pro `edition` string still resolves to Community. A missing `/api/status` is treated as *unknown* rather than fatal — edition detection is an optional capability probe.
 
 ### 4.4.6 Inventory Sources in the Settings Tree
 
@@ -201,7 +201,7 @@ The Settings view's flat "Inventory Sources" link is an expandable group (`Inven
 
 Each row carries `contextValue` `nexus.inventorySource`, which the four `view/item/context` inline entries key on: Sync Now, Edit, Template Rules, Remove. Clicking a row edits it. The rows are provider-agnostic — built from the snapshot record plus the registry's label lookup, with no branch on `providerId` — and a provider the registry cannot resolve falls back to its raw id, so a source whose provider extension is missing stays visible and removable.
 
-`SettingsTreeProvider` takes an optional `NexusCore` and `InventoryProviderRegistry` and refreshes on `core.onDidChange` (the descriptions are relative timestamps and the names are editable), unsubscribing on dispose. `nexus.inventory.manage` is unchanged and remains the palette route in.
+`SettingsTreeProvider` takes an optional `NexusCore` and `InventoryProviderRegistry` and refreshes on `core.onDidChange`, but ONLY when the inventory-source signature actually changes (MINOR-8) — a terminal or tunnel blink does not re-render the tree. It does not need a periodic refresh to keep the row labels accurate, because the row's last-sync stamp is absolute (`sourceDescriptionAbsolute`) rather than a relative age; a source edit or a new sync is exactly what changes the signature and re-renders. Subscriptions are released on dispose. `nexus.inventory.manage` is unchanged and remains the palette route in.
 
 ### 4.5 Port Forwarding
 1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
