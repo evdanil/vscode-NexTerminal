@@ -94,8 +94,11 @@ export interface InventoryTree {
 export interface InventoryDeviceStatus {
   state: "running" | "stopped";
   // OPTIONAL fresh console endpoint. A provider (EVE-NG Community) that reassigns
-  // console ports on node restart can surface the current one here so a later
-  // connect uses it; absent ⇒ no heal, and never present for a stopped node.
+  // console ports on node restart can surface the current one here; only ever
+  // present for a running node. RESERVED for the deferred port-healing follow-up
+  // (D8): these are produced by EVE fetchStatus and validated here, but
+  // `NexusCore.applyInventoryStatus` currently stores only `state` and NOTHING
+  // consumes them yet — kept because they are cheap and ready for that follow-up.
   consoleHost?: string;
   consolePort?: number;
 }
@@ -319,10 +322,12 @@ export function resolveProviderInstanceKey(
  * reaching the tree; it never throws.
  *
  * Prototype-pollution-safe like the highlight-rule upgrade: `Object.entries`
- * reads only own enumerable keys and never walks the prototype, and each value
- * is validated field-by-field. A crafted `__proto__` OWN key (as JSON.parse
- * produces) is therefore read as ordinary data — a device key whose value must
- * itself be a valid status — and cannot poison `Object.prototype`.
+ * reads only own enumerable keys and never walks the prototype, each value is
+ * validated field-by-field, AND the result is built on a null-prototype object
+ * (`Object.create(null)`) so writing a device key named `__proto__` (as
+ * JSON.parse can produce) stores it as ordinary own data rather than hitting the
+ * inherited `__proto__` setter — which on a plain `{}` would silently drop the
+ * entry and leak its `state` onto `Object.prototype`.
  *
  * The whole report is rejected on the FIRST bad entry rather than dropping it:
  * a partial report applied against a differently-keyed intent is worse than no
@@ -342,7 +347,7 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
     return undefined;
   }
-  const validated: Record<string, InventoryDeviceStatus> = {};
+  const validated: Record<string, InventoryDeviceStatus> = Object.create(null);
   for (const [key, value] of Object.entries(statuses as Record<string, unknown>)) {
     if (typeof value !== "object" || value === null) {
       return undefined;

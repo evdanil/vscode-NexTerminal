@@ -71,15 +71,19 @@ describe("validateInventoryStatusReport", () => {
     expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {} })).toEqual({ contractVersion: 1, statuses: {} });
   });
 
-  it("is prototype-pollution-safe — a __proto__ own key is read as data, not walked into the prototype (⊘ using `for..in` or bracket access would let a crafted report poison Object.prototype)", () => {
+  it("is prototype-pollution-safe AND preserves a __proto__ own key as real data (⊘ writing into a plain `{}` triggers the inherited setter — the entry is silently dropped and `state` leaks onto Object.prototype)", () => {
     const raw = JSON.parse('{"contractVersion":1,"statuses":{"__proto__":{"state":"running"},"real":{"state":"stopped"}}}');
     const result = validateInventoryStatusReport(raw);
     expect(result).toBeDefined();
     expect(result?.statuses.real).toEqual({ state: "stopped" });
-    // The crafted __proto__ own key is a legitimate device key here (its value is
-    // a valid status), so it survives as data — and nothing leaked onto the real
-    // prototype.
+    // The __proto__ device key survives as a genuine own data property — not
+    // swallowed by a prototype setter — and nothing leaked onto Object.prototype.
+    const descriptor = Object.getOwnPropertyDescriptor(result!.statuses, "__proto__");
+    expect(descriptor).toBeDefined();
+    expect(descriptor?.value).toEqual({ state: "running" });
     expect(({} as Record<string, unknown>).state).toBeUndefined();
+    // A neutral object's prototype is untouched.
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
   });
 });
 
