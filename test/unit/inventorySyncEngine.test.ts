@@ -363,6 +363,15 @@ describe("computeSyncPlan — adds", () => {
       // The stamp is carried forward verbatim, never laundered to the current value.
       expect(after.origin?.syncedHost).toBe("10.0.0.5");
       expect(after.origin?.syncedPort).toBe(22);
+      // #84 P2 (Codex) — the PROTOCOL rides with the retained endpoint. host/port
+      // and protocol are one coherent console: because the hand-typed telnet
+      // endpoint is preserved (not blanked to a placeholder), the protocol must
+      // STAY telnet — a working addressed telnet server. Clearing it to the ssh
+      // default here (as the sync-owned-protocol rule would in isolation) would
+      // leave a telnet endpoint that the next connect speaks SSH to. The stamp
+      // rides forward with the value.
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
       // The record the sync writes must survive its own reload (a preserved-address
       // non-addressless record is a normal addressed server).
       expect(validateServerConfig(after)).toBe(true);

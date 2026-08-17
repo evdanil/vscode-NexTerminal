@@ -1360,12 +1360,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // path uses — passing `undefined` as the device protocol (the addressless
         // shape is ssh-default): a sync-owned protocol is cleared to ssh, while a
         // hand-flipped one is left alone with its stamp carried forward verbatim.
+        // The actual clear is GATED on `blanksAddress` below (#84 P2) — protocol
+        // and host/port are one coherent console endpoint, so the protocol is only
+        // reset when the record truly downgrades to the addressless placeholder.
         const takesProtocol = syncOwnsProtocol(
           ownedForAddressless.protocol,
           ownedForAddressless.origin?.syncedProtocol,
           undefined
         );
-        const afterProtocol = takesProtocol ? undefined : ownedForAddressless.protocol;
         // OOB (Codex P2) — an addressless-for-console device can still expose a
         // BMC address, so the downgrade/stay path decides `ipmiHost` under the
         // SAME `syncOwnsIpmiHost` matrix the addressed path uses: it takes the new
@@ -1391,6 +1393,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const blanksAddress =
           syncOwnsHost(ownedForAddressless.host, ownedForAddressless.origin?.syncedHost, "") &&
           syncOwnsPort(ownedForAddressless.port, ownedForAddressless.origin?.syncedPort, ADDRESSLESS_PORT);
+        // #84 P2 (Codex) — COUPLE the protocol decision to the address decision.
+        // host/port and protocol are one coherent console endpoint. When the sync
+        // RETAINS a hand-edited endpoint (`blanksAddress` false — the record stays
+        // ADDRESSED), the protocol MUST ride with it unchanged: clearing a
+        // sync-owned telnet to the ssh default while keeping the telnet host/port
+        // would leave the next connect speaking SSH to a telnet endpoint. The
+        // protocol is reset (and its stamp dropped) ONLY when the record genuinely
+        // converts to the addressless placeholder (`blanksAddress` true), where the
+        // ssh-default shape is correct. A hand-flipped protocol (`takesProtocol`
+        // false) is left alone on both paths, exactly as before.
+        const clearsProtocol = blanksAddress && takesProtocol;
+        const afterProtocol = clearsProtocol ? undefined : ownedForAddressless.protocol;
         // DEVICE TEMPLATES (Codex P2-a) — the same matrix the addressed update runs,
         // against the placeholder's own id for the §5.3 self-proxy check. Its
         // `values` are the field writes, its `templated` the carried-forward stamp
@@ -1423,7 +1437,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           // otherwise carried forward — including as `undefined`, which keeps a hand
           // entry hands-off (matrix row 5). `templated` is the matrix's carried
           // stamp record (writes folded in), same as the addressed update path.
-          syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
+          syncedProtocol: clearsProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
           syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedForAddressless.origin?.syncedIpmiHost,
           // PRIMARY HOST/PORT (task #29) — the same `takes? written : carry`
           // discipline as the stamps above. When the address is BLANKED the sync
