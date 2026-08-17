@@ -6,6 +6,7 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
+  controlProviderNode,
   fetchProviderStatus,
   InventoryProviderError,
   inventorySecretKey,
@@ -4531,6 +4532,73 @@ export function registerInventoryCommands(
     ManagementListPanel.open(core, inventorySourcesDescriptor());
   }
 
+  /**
+   * NODE CONTROL (Phase 4) — resolve the ServerConfig a Start/Stop command was
+   * invoked on. VS Code hands a `view/item/context` command its TREE ITEM (a
+   * `ServerTreeItem`, whose `.server` is the record); the palette hands nothing.
+   * Duck-typed on `.server`/string rather than importing `toServerFromArg` from
+   * serverCommands, which would drag `ServerTreeItem extends vscode.TreeItem`
+   * into this module's (VS-Code-mocked) unit tests.
+   */
+  function resolveServerArg(arg: unknown): ServerConfig | undefined {
+    if (typeof arg === "object" && arg !== null) {
+      const withServer = arg as { server?: { id?: unknown } };
+      if (withServer.server && typeof withServer.server === "object" && typeof withServer.server.id === "string") {
+        return core.getServer(withServer.server.id) ?? (withServer.server as ServerConfig);
+      }
+    }
+    if (typeof arg === "string") {
+      return core.getServer(arg);
+    }
+    return undefined;
+  }
+
+  /**
+   * NODE CONTROL (Phase 4) — Start/Stop one EVE-NG lab node from its tree item.
+   * Resolves the server → its inventory source → the source's provider, and only
+   * dispatches when that provider exposes `controlNode` (so a manual server or a
+   * NetBox-origin one is refused rather than offered an action that can only
+   * fail). Dispatch goes through `controlProviderNode`, which PROPAGATES a
+   * failure — surfaced here as an error naming the node — unlike the swallowing
+   * status refresh. On success it fires a best-effort `refreshStatus` for the
+   * source WITHOUT awaiting: the node boots over seconds, so the status will lag
+   * a beat, which is expected and fine.
+   */
+  async function controlNode(arg: unknown, action: "start" | "stop"): Promise<void> {
+    const server = resolveServerArg(arg);
+    if (!server) {
+      void vscode.window.showErrorMessage(`Select a synced EVE-NG node to ${action} it.`);
+      return;
+    }
+    const origin = server.origin;
+    const source = origin ? core.getInventorySource(origin.sourceId) : undefined;
+    const provider = source ? registry.get(source.providerId) : undefined;
+    if (!origin || !source || !provider || typeof provider.controlNode !== "function") {
+      void vscode.window.showErrorMessage(
+        `"${server.name}" is not an inventory-synced node that supports Start/Stop.`
+      );
+      return;
+    }
+    const secrets: InventorySourceSecrets = {};
+    for (const fieldId of source.secretFieldIds) {
+      const value = await vault.get(inventorySecretKey(source.id, fieldId));
+      if (value !== undefined) {
+        secrets[fieldId] = value;
+      }
+    }
+    try {
+      await controlProviderNode(provider, source.config, secrets, origin.externalId, action);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${detail}`);
+      return;
+    }
+    void vscode.window.showInformationMessage(`${action === "start" ? "Starting" : "Stopping"} "${server.name}"…`);
+    // Best-effort, NOT awaited — the node takes seconds to boot, so the status
+    // will lag this refresh by a poll or two, which is expected.
+    void vscode.commands.executeCommand("nexus.inventory.refreshStatus", source.id);
+  }
+
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
     // Arg widening: these four run from the palette (no argument at all), from
@@ -4550,6 +4618,10 @@ export function registerInventoryCommands(
       const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
       return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
     }),
-    vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
+    vscode.commands.registerCommand("nexus.inventory.manage", manageSources),
+    // NODE CONTROL (Phase 4) — gated in package.json to EVE-origin servers by
+    // running/stopped state; the handler re-guards on the provider capability.
+    vscode.commands.registerCommand("nexus.inventory.startNode", (arg?: unknown) => controlNode(arg, "start")),
+    vscode.commands.registerCommand("nexus.inventory.stopNode", (arg?: unknown) => controlNode(arg, "stop"))
   ];
 }

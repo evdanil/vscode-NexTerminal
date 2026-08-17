@@ -594,6 +594,18 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.inventory.startNode",
+        "title": "Start Node",
+        "category": "Nexus",
+        "icon": "$(play)"
+      },
+      {
+        "command": "nexus.inventory.stopNode",
+        "title": "Stop Node",
+        "category": "Nexus",
+        "icon": "$(debug-stop)"
+      },
+      {
         "command": "nexus.settings.fixMacroKeybindings",
         "title": "Fix Macro Keybindings",
         "category": "Nexus"

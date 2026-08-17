@@ -8195,6 +8195,114 @@ describe("inventoryCommands", () => {
       }
     );
   });
+
+  /**
+   * NODE CONTROL (Phase 4) — the Start/Stop Node commands. Each takes a
+   * server-bearing tree item, resolves the server's inventory source, and — only
+   * when that source's provider exposes `controlNode` — dispatches through the
+   * PROPAGATING `controlProviderNode` wrapper, then fires a best-effort status
+   * refresh. A server that is not synced, or whose provider has no node control,
+   * is refused with a message rather than offered an action that can only fail.
+   */
+  describe("nexus.inventory.startNode / stopNode", () => {
+    async function setup(
+      opts: {
+        withControl?: boolean;
+        controlNode?: InventoryProvider["controlNode"];
+        noOrigin?: boolean;
+        externalId?: string;
+        secretFieldIds?: string[];
+        secrets?: Record<string, string>;
+      } = {}
+    ) {
+      const withControl = opts.withControl ?? true;
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        ...(opts.noOrigin
+          ? {}
+          : { origin: { sourceId: "src-1", externalId: opts.externalId ?? "/Lab.unl#3", syncedAt: 1 } })
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const controlSpy = vi.fn(async () => {});
+      const provider = makeProvider(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {});
+      registry.register(provider);
+      const vault = makeVault(opts.secrets ?? {});
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [] }));
+      const start = registeredCommands.get("nexus.inventory.startNode")!;
+      const stop = registeredCommands.get("nexus.inventory.stopNode")!;
+      return { core, registry, vault, provider, controlSpy, server, start, stop };
+    }
+
+    it("registers both startNode and stopNode command handlers", async () => {
+      await setup();
+      expect(registeredCommands.get("nexus.inventory.startNode")).toBeTypeOf("function");
+      expect(registeredCommands.get("nexus.inventory.stopNode")).toBeTypeOf("function");
+    });
+
+    it("START dispatches controlNode with the origin's externalId and action 'start', then fires a status refresh for the source (⊘ the wrong externalId controls the wrong node; no refresh leaves the tree stale)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+      const info = mockShowInformationMessage.mock.calls[0]?.[0] as string;
+      expect(info).toContain("R1");
+    });
+
+    it("STOP dispatches controlNode with action 'stop' (⊘ reusing the start action never stops the node)", async () => {
+      const { stop, controlSpy, server } = await setup();
+      await stop({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "stop");
+    });
+
+    it("loads the source's secrets from the vault by secretFieldIds and passes them to controlNode (⊘ dispatching with empty secrets fails auth against the lab server)", async () => {
+      const { start, controlSpy, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+    });
+
+    it("refuses a server whose provider has NO controlNode, with a message, and dispatches nothing (⊘ offering Start/Stop on a NetBox-origin server is an action that can only fail)", async () => {
+      const { start, server } = await setup({ withControl: false });
+      await start({ server });
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    it("refuses a manual (non-synced) server with no origin (⊘ start/stop on a server with no inventory node has nothing to control)", async () => {
+      const { start, controlSpy, server } = await setup({ noOrigin: true });
+      await start({ server });
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(controlSpy).not.toHaveBeenCalled();
+    });
+
+    it("PROPAGATES a controlNode failure into an error message naming the node, and fires NO success info or refresh (⊘ swallowing the failure reports a node that never started as started)", async () => {
+      const { start, server } = await setup({
+        controlNode: vi.fn(async () => {
+          throw new Error("EVE-NG refused the start");
+        })
+      });
+      await start({ server });
+      const msg = mockShowErrorMessage.mock.calls[0]?.[0] as string;
+      expect(msg).toContain("R1");
+      expect(msg).toContain("EVE-NG refused the start");
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    it("resolves the server from a bare source-less arg via core.getServer when the tree item carries the record id (⊘ a handler that only reads a string id misses the tree-item object VS Code actually passes)", async () => {
+      const { start, controlSpy, server } = await setup();
+      // VS Code passes the ServerTreeItem, whose `.server` is the record — the
+      // handler must read it, not require a string id.
+      await start({ server: { id: server.id } });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+    });
+  });
 });
 
 /**
