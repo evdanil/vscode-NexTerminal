@@ -8438,6 +8438,66 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(persisted.find((s) => s.id === telnet.id)?.port).toBe(32800);
   });
 
+  it("#84 P2-1 — re-validates staleness INSIDE the mutex: a source-revision bump (a replace-import) committed while the heal is QUEUED on the lock makes the heal SKIP its now-stale report (⊘ dropping the in-critical-section revision recheck lands a report fetched under the OLD source config onto the replaced records)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const externalId = "dev#1";
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    await core.addServersBatch([telnet]);
+
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const persistedSource = core.getInventorySource("src-1")!;
+
+    // A concurrent lock-holder standing in for a replace-mode config import: it
+    // HOLDS configMutationLock and, while holding, bumps the source revision
+    // (addOrUpdateInventorySource assigns a fresh revision on a config change) —
+    // exactly the window where the heal's pre-lock revision check is already stale
+    // but the heal is queued behind this holder.
+    let holdStartedResolve: () => void = () => {};
+    let releaseHold: () => void = () => {};
+    const holdStarted = new Promise<void>((r) => (holdStartedResolve = r));
+    const holdBarrier = new Promise<void>((r) => (releaseHold = r));
+    const holderP = configMutationLock.runExclusive(async () => {
+      holdStartedResolve();
+      await holdBarrier;
+      await core.addOrUpdateInventorySource({ ...persistedSource, config: { host: "replaced" } });
+    });
+    await holdStarted; // the lock is now held
+
+    // Trigger the refresh: the fetch resolves, the OUTER revision check passes
+    // (the holder has not bumped yet), applyInventoryStatus runs (pure), and the
+    // heal's runExclusive queues BEHIND the held lock.
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await new Promise((r) => setTimeout(r, 0)); // drain microtasks: heal is now queued
+
+    // Release the holder → it bumps the revision, releases the lock → the queued
+    // heal callback runs against the NEW revision.
+    releaseHold();
+    await Promise.all([holderP, refreshP]);
+
+    // The heal must have SKIPPED — the report was fetched under the pre-replace
+    // config, so its port write must not land on the replaced record.
+    expect(core.getServer(telnet.id)?.port).toBe(32769);
+  });
+
   it("loads the source's saved secrets and passes them to fetchStatus (⊘ calling the provider without credentials makes every refresh an auth failure)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

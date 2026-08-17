@@ -4475,7 +4475,25 @@ export function registerInventoryCommands(
             // (see NexusCore's configMutationLock note); refreshStatus never itself
             // holds the lock, so there is no deadlock.
             if (inFlightSourceIds.get(source.id) === undefined) {
-              await configMutationLock.runExclusive(() => core.healSyncedConsolePorts(source.id, report));
+              await configMutationLock.runExclusive(async () => {
+                // #84 P2-1 (Codex) — RE-VALIDATE inside the critical section. The
+                // generation / revision / busy-latch checks above ran BEFORE this
+                // callback waited in the mutex queue. A lock-holding writer — a
+                // replace-mode config import that swaps the source AND its servers
+                // (new records reusing the old deterministic ids) — can commit
+                // while the heal waits, after which applying a report fetched under
+                // the OLD source config onto the NEW records is a stale write.
+                // Bail if the generation, this source's revision, or the busy latch
+                // changed since the pre-lock checks.
+                if (
+                  myGeneration !== statusRefreshGeneration ||
+                  core.getInventorySource(source.id)?.revision !== startRevision ||
+                  inFlightSourceIds.get(source.id) !== undefined
+                ) {
+                  return;
+                }
+                await core.healSyncedConsolePorts(source.id, report);
+              });
             }
           }
         }
