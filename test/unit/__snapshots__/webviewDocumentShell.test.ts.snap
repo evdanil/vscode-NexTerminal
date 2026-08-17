@@ -9795,6 +9795,19 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.macroPolicy"></span>
 </div>
 
+  <h3 id="section-inventory">Inventory</h3>
+  <div class="form-group">
+  <label for="setting-nexus-inventory-statusPollSeconds">Lab status poll interval</label>
+  <div class="setting-desc">How often to refresh EVE-NG lab running status while the Command Center is visible. 0 disables polling (use Refresh Lab Status manually).</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-inventory-statusPollSeconds" data-section="nexus.inventory" data-key="statusPollSeconds" value="0" min="0" max="3600" />
+    <span class="unit-suffix">seconds</span>
+    <span class="range-hint">(0–3600, default: 0)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.inventory.statusPollSeconds"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.inventory.statusPollSeconds"></span>
+</div>
+
   <h3 id="section-importexport">Import / Export</h3>
   <div class="setting-desc">Create an encrypted backup or export a sanitized copy to share.</div>
   <div class="button-row">
