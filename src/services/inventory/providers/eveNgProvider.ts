@@ -578,16 +578,29 @@ class EveApiClient {
           labs.push({ path: labPath, name: labNameOf(labPath) });
         }
 
+        // A folder entry Nexus would actually descend into: an in-scope,
+        // unvisited, dot-segment-free child. The `..` parent entry every
+        // listing carries (and any out-of-scope or already-visited entry) is
+        // NOT one, so it must not count toward "there is more tree below".
+        const isDescendable = (rawFolder: unknown): boolean => {
+          if (!isObject(rawFolder)) return false;
+          const childPath = normalizeFolderPath(str(rawFolder.path));
+          return !hasDotSegment(childPath) && isWithin(childPath, root) && !visited.has(childPath);
+        };
+
         if (depth >= MAX_FOLDER_DEPTH) {
-          if (listing.folders.length > 0) {
+          // P2-2 — only mark truncated when a GENUINELY descendable child
+          // remains below the cap. Counting `folders.length` treated the
+          // ever-present `..` entry of a valid leaf as unfinished work, marking
+          // the whole tree truncated forever — which makes `computeSyncPlan`
+          // skip pruning, so servers for deleted nodes are never removed.
+          if (listing.folders.some(isDescendable)) {
             depthCapped = true;
             truncated = true;
           }
           continue;
         }
         for (const rawFolder of listing.folders) {
-          if (!isObject(rawFolder)) continue;
-          const childPath = normalizeFolderPath(str(rawFolder.path));
           // NEVER LEAVE THE SUBTREE the user scoped with Root Folder. The
           // listing's paths are server-supplied. A dot-segment
           // (`/A/../../secret`) is rejected outright — `new URL` would
@@ -596,7 +609,8 @@ class EveApiClient {
           // skip, whose path always points at an ancestor and so fails
           // `isWithin` too. A visited path cannot be re-entered, so a cycle
           // spelled with real folder names still terminates.
-          if (hasDotSegment(childPath) || !isWithin(childPath, root) || visited.has(childPath)) continue;
+          if (!isDescendable(rawFolder)) continue;
+          const childPath = normalizeFolderPath(str((rawFolder as Record<string, unknown>).path));
           visited.add(childPath);
           next.push({ path: childPath, depth: depth + 1 });
         }

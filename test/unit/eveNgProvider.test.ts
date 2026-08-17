@@ -505,6 +505,53 @@ describe("createEveNgProvider — folder walk", () => {
     expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("deep"))).toBe(true);
   });
 
+  /**
+   * P2-2 — at the depth cap, `truncated` must reflect whether a genuinely
+   * DESCENDABLE in-scope unvisited child remains, not merely `folders.length >
+   * 0`. Every EVE-NG listing carries a `..` parent entry, so a valid tree whose
+   * deepest folder sits exactly at the cap would otherwise be marked truncated
+   * forever — and `computeSyncPlan` would then never prune the servers of
+   * genuinely deleted nodes.
+   */
+  it("P2-2 — a folder exactly at the depth cap whose only child entries are `..`, out-of-scope, or already-visited does NOT mark the tree truncated (⊘ counting `folders.length` treats the ever-present `..` entry as unfinished work and disables pruning forever)", async () => {
+    const root = "/A";
+    const folders: Record<string, FolderListing> = {};
+    let path = root;
+    // root (depth 0) -> /A/d1 (1) -> ... -> leaf at depth MAX_FOLDER_DEPTH (12).
+    for (let d = 1; d <= 12; d++) {
+      const child = `${path}/d${d}`;
+      folders[path] = { folders: [{ name: `d${d}`, path: child }] };
+      path = child;
+    }
+    const parentOfLeaf = path.slice(0, path.lastIndexOf("/")); // depth-11, already visited
+    // The leaf's only folder entries are all non-descendable.
+    folders[path] = {
+      folders: [
+        { name: "..", path: parentOfLeaf }, // parent — visited
+        { name: "seen", path: root }, // root — visited
+        { name: "escape", path: "/SECRET/x" } // out of the /A subtree
+      ]
+    };
+    const tree = await fetchTree({ folders }, { rootFolder: root });
+    expect(tree.truncated).toBeFalsy();
+    expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("deep"))).toBe(false);
+  });
+
+  it("P2-2 — but a REAL unvisited in-scope child beyond the depth cap still marks the tree truncated, so its unreached labs are not pruned (⊘ over-correcting would silently drop a genuinely deeper subtree)", async () => {
+    const root = "/A";
+    const folders: Record<string, FolderListing> = {};
+    let path = root;
+    for (let d = 1; d <= 12; d++) {
+      const child = `${path}/d${d}`;
+      folders[path] = { folders: [{ name: `d${d}`, path: child }] };
+      path = child;
+    }
+    folders[path] = { folders: [{ name: "deeper", path: `${path}/deeper` }] }; // in-scope, unvisited, below the cap
+    const tree = await fetchTree({ folders }, { rootFolder: root });
+    expect(tree.truncated).toBe(true);
+    expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("deep"))).toBe(true);
+  });
+
   it("percent-encodes each path segment, so a lab or folder named with a space or a hash is actually requested (⊘ interpolating the raw path lets the hash start a URL fragment, and the request lands on a truncated path)", async () => {
     const world: World = {
       folders: {
