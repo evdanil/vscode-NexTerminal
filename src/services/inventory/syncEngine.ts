@@ -1813,14 +1813,21 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       if (takesProtocol) {
         after.protocol = deviceProtocol;
       }
-      // ADDRESSLESS (Codex P1) — this branch runs only when the device HAS a
-      // usable primary endpoint, so `after` is an ADDRESSED record: clear the
-      // flag the `...ownedServer` spread carried forward. This is the UPGRADE
-      // half — an owned server that was addressless (device just gained a
-      // console) becomes addressed here, host/port/protocol already filled
-      // above. For a normal addressed server the field was absent, so the delete
-      // is a no-op.
-      if (after.addressless !== undefined) {
+      // ADDRESSLESS (Codex P1) — the UPGRADE half: an owned server that was
+      // addressless (device just gained a console) becomes addressed here,
+      // host/port/protocol already filled above. For a normal addressed server the
+      // field was absent, so the clear is a no-op.
+      //
+      // P1-A (Fable) — clear the flag ONLY when the record actually GAINED an
+      // address (`ownedEndpoint !== undefined`). This branch runs whenever the
+      // device has a usable PRIMARY endpoint, but `selectEndpointForProtocol`
+      // returns undefined when the record's protocol is user-owned (a hand-flip)
+      // and the device offers only the OTHER transport — leaving `ownedHost`/
+      // `ownedPort` at the record's carried ""/0. Clearing the flag there wrote an
+      // invalid `{host:"",port:0}` record with no addressless flag, which
+      // `validateServerConfig` rejects and storage silently drops on the next
+      // reload. When no address was gained the placeholder stays addressless.
+      if (ownedEndpoint !== undefined && after.addressless !== undefined) {
         delete after.addressless;
       }
 

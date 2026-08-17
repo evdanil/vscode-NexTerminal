@@ -394,6 +394,47 @@ describe("computeSyncPlan — adds", () => {
       expect(plan.adds[0].ipmiHost).toBeUndefined();
       expect(plan.adds[0].origin?.syncedIpmiHost).toBeUndefined();
     });
+
+    // P1-A (Fable) — the addressed-update path deletes `addressless` UNCONDITIONALLY,
+    // but `selectEndpointForProtocol` returns undefined when the record's protocol is
+    // USER-OWNED (a hand-flip) and the device offers only the OTHER transport — so the
+    // host/port stay ""/0 while the flag is cleared, producing an invalid record that
+    // storage silently drops on the next reload. ⊘ Clearing the flag when no address
+    // was gained writes `{host:"",port:0}` with no addressless flag.
+    it("P1-A — a hand-flipped-telnet placeholder whose device offers only SSH stays a VALID addressless record, never {host:'',port:0} sans flag (probe: computeSyncPlan on the hand-flip × single-transport fixture)", () => {
+      // Hand-flipped: record protocol telnet, stamp ssh (syncedProtocol undefined).
+      const before = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        protocol: "telnet",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+      });
+      // Device gained an SSH-ONLY console — the other transport from the hand-flip.
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]),
+        currentServers: [before],
+        now: 5000
+      });
+      const after = plan.updates[0]?.after ?? before;
+      // The record the sync writes must survive its own reload.
+      expect(validateServerConfig(after)).toBe(true);
+      // It gained no address of its (hand-owned telnet) transport, so it stays addressless.
+      expect(after.addressless).toBe(true);
+      expect(after.host).toBe("");
+    });
+
+    // The other direction: a genuine upgrade (device offers the record's OWN transport)
+    // still clears the flag and fills the address — the fix must not freeze real upgrades.
+    it("P1-A control — an upgrade whose device offers the record's transport still clears addressless and fills the host (⊘ gating the clear on the wrong condition would freeze every upgrade addressless)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]), currentServers: [before], now: 5000 });
+      const after = plan.updates[0].after;
+      expect(after.addressless ?? false).toBe(false);
+      expect(after.host).toBe("10.0.0.1");
+      expect(validateServerConfig(after)).toBe(true);
+    });
   });
 
   it("skips (never adopts/overwrites) a device whose deterministic id collides with an unrelated server", () => {
