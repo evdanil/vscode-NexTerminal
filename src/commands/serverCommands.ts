@@ -1087,6 +1087,14 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   const addresslessMessage = addresslessUnavailableMessage(server);
   if (addresslessMessage) {
     void vscode.window.showInformationMessage(addresslessMessage);
+    // REVIEW FINDING (P2) — signal the refusal, do not just return. A watchdog
+    // wrapper (Run Macro on Server / Connect and Run Script) arms a 90s timer
+    // and then awaits `onConnectFailed` (or a new session) to know the connect
+    // is over. A silent early-return here leaves that wrapper with nothing to
+    // settle on, so it sits out the whole watchdog and then shows a MISLEADING
+    // timeout. Firing `onConnectFailed` is the same signal a real initial-connect
+    // failure raises (services/ssh/sshPty.ts), so the wrappers settle at once.
+    options.onConnectFailed?.(addresslessMessage);
     return;
   }
   // TELNET (Phase 0) — branch BEFORE anything auth-shaped runs. A telnet server
@@ -1376,7 +1384,22 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
   }, timeoutMs);
 
   try {
-    await connectServer(ctx, server.id, { allowAutoFileExplorer: false });
+    await connectServer(ctx, server.id, {
+      allowAutoFileExplorer: false,
+      // REVIEW FINDING (P2) — an initial-connect failure (or an addressless
+      // refusal) never produces a session, so the change-event subscription
+      // above stays silent and, without this, the timer would sit out the full
+      // 90s before showing a MISLEADING "the script did not start" warning. Tear
+      // the watchdog down the moment the connect reports it failed — the cause
+      // has already been surfaced (SSH diagnostic, or the addressless notice),
+      // so there is nothing to add here.
+      onConnectFailed: () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        unsubscribe();
+      }
+    });
   } catch (err) {
     // connectServer can reject (auth failure, proxy error). Without this
     // the subscription + timer would leak until the 90-second watchdog.

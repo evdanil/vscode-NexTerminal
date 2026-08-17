@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import {
   registerServerCommands,
+  connectServer,
   authProfileCredentialMirror,
   formValuesToServer,
   formValuesToProxy,
@@ -4223,6 +4224,50 @@ describe("addressless connect guard", () => {
 
     expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+  });
+
+  // REVIEW FINDING (P2) — a watchdog wrapper (Run Macro on Server / Connect and
+  // Run Script) arms a 90s timer, then calls connectServer and waits for its
+  // onConnectFailed signal (or a session). The addressless early-return showed the
+  // friendly message but never fired that signal, so the wrapper had nothing to
+  // settle on and sat out the full watchdog before showing a MISLEADING timeout.
+  // ⊘ Drop the onConnectFailed call from the early-return and the caller is left
+  // awaiting a signal that never comes.
+  it("fires onConnectFailed when refusing an addressless server, so a watchdog wrapper settles at once instead of hanging 90s", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const onConnectFailed = vi.fn();
+
+    await connectServer(ctx, "srv-1", { onConnectFailed });
+
+    expect(onConnectFailed).toHaveBeenCalledTimes(1);
+    expect(onConnectFailed).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+  });
+
+  // The script wrapper (nexus.server.runWithScript → connectAndRunScript) does not
+  // await connectServer's result the way the macro wrapper does; it arms its own
+  // 90s timer and fires the script when a session appears. On an addressless
+  // target no session ever appears, so without an onConnectFailed hook the timer
+  // waits out the full 90s and shows "the script did not start within 90s".
+  // ⊘ Leave the wrapper's onConnectFailed unwired (or connectServer not firing it)
+  // and the misleading timeout warning fires after the watchdog elapses.
+  it("cancels the connect-and-run-script watchdog immediately on an addressless target, never the misleading 90s timeout", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    ctx.scriptRuntimeManager = { runScript: vi.fn(async () => {}) } as any;
+    registerServerCommands(ctx);
+
+    vi.useFakeTimers();
+    try {
+      await registeredCommands.get("nexus.server.runWithScript")!("srv-1");
+      // Run out the entire watchdog: a live timer would fire its warning here.
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("did not start within"));
+      expect(ctx.scriptRuntimeManager.runScript).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
