@@ -769,6 +769,16 @@ describe("package contributions", () => {
       const description = prop?.markdownDescription || prop?.description || "";
       expect(description).toMatch(/0 disables|0 = off|disables/i);
     });
+
+    it("documents the live-status feature, the poll setting, and the BMC-menu gating in the functional docs and README", () => {
+      expect(functionalDocs).toContain("nexus.inventory.statusPollSeconds");
+      expect(functionalDocs).toMatch(/Refresh Lab Status/);
+      expect(functionalDocs).toMatch(/Live lab status/i);
+      // BMC-menu gating note.
+      expect(functionalDocs).toMatch(/ipmiHost/);
+      expect(functionalDocs).toMatch(/connectBmcSol|BMC menu gating/);
+      expect(readme).toMatch(/Refresh Lab Status/);
+    });
   });
 
   it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
