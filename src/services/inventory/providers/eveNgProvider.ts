@@ -1,0 +1,787 @@
+import {
+  InventoryProviderError,
+  type InventoryConfigField,
+  type InventoryDevice,
+  type InventoryProvider,
+  type InventorySourceSecrets,
+  type InventorySourceValues,
+  type InventoryTree
+} from "../../../models/inventory";
+
+export const EVE_NG_PROVIDER_ID = "eve-ng";
+
+const FETCH_TIMEOUT_MS = 20_000;
+const TEST_CONNECTION_TIMEOUT_MS = 10_000;
+
+/** Hard caps. See `fetchInventoryImpl` for why every one of them sets `truncated`. */
+const MAX_NODES = 10_000;
+const MAX_LABS = 1_000;
+const MAX_FOLDER_DEPTH = 12;
+const MAX_FOLDER_REQUESTS = 2_000;
+
+/** Bound on an error message's echo of a response body — see `throwForStatus`. */
+const BODY_SLICE = 200;
+
+export const EVE_NG_PRO_WARNING =
+  "EVE-NG Professional detected — Pro support is preliminary in this version; lab discovery and console mapping are validated against Community edition.";
+
+/**
+ * THE CONFIG FIELD LIST IS PART OF THE PROVIDER FINGERPRINT
+ * (`computeProviderFingerprint`, models/inventory.ts): its ids, labels, types,
+ * required flags and ORDER are hashed and stamped onto every source at save
+ * time, and a later change makes every existing source re-prompt the user to
+ * re-confirm handing the registrant its saved credentials. Adding a field later
+ * is therefore a user-visible event, not a refactor — which is why the whole
+ * set this provider will need is declared up front.
+ */
+const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
+  {
+    id: "baseUrl",
+    label: "EVE-NG Base URL",
+    type: "string",
+    required: true,
+    placeholder: "http://eve.example.com",
+    // The HTTPS caveat lives here rather than only in the docs because the
+    // symptom is an opaque `fetch failed` that never mentions certificates:
+    // the extension host's fetch has no per-source trust store to relax, and
+    // EVE-NG ships a self-signed certificate by default.
+    description:
+      "The EVE-NG web UI address; a trailing slash is fine. Self-signed HTTPS is not supported — use http or a trusted certificate."
+  },
+  { id: "username", label: "Username", type: "string", required: true, placeholder: "admin" },
+  {
+    id: "password",
+    label: "Password",
+    type: "password",
+    required: true,
+    description: "Stored in the OS credential vault, never in settings."
+  },
+  {
+    id: "rootFolder",
+    label: "Root Folder",
+    type: "string",
+    required: false,
+    placeholder: "/",
+    description: "Subtree of the EVE-NG lab folder tree to scan. Defaults to the whole tree."
+  },
+  {
+    // Deliberately id `filter` + `type: "string"`: that exact pair is what
+    // attaches the shared saved-filter picker above the field
+    // (`SAVED_FILTER_TARGET_FIELD_ID`, ui/formDefinitions.ts).
+    id: "filter",
+    label: "Lab Filter",
+    type: "string",
+    required: false,
+    placeholder: "acme",
+    description: "Case-insensitive substring matched against each lab's full path. Empty imports every lab."
+  },
+  {
+    id: "includeStopped",
+    label: "Include Stopped Nodes",
+    type: "boolean",
+    required: false,
+    // Lab nodes are stopped most of the time; a source that imported none of
+    // them would look like an empty inventory and, under a `delete` prune
+    // policy, remove the servers a previous sync created.
+    defaultValue: true,
+    description:
+      "Import nodes that are not currently running. Turning this off makes a stopped node look deleted to the sync, so the source's prune policy applies to it."
+  },
+  {
+    id: "consoleHost",
+    label: "Console Host Override",
+    type: "string",
+    required: false,
+    placeholder: "eve.example.com",
+    description: "Host to use for telnet consoles when EVE-NG reports an address you cannot reach (NAT, port forwarding)."
+  }
+];
+
+// ---------------------------------------------------------------------------
+// URL / config helpers
+// ---------------------------------------------------------------------------
+
+function normalizeBaseUrl(raw: string): string {
+  return raw.trim().replace(/\/+$/, "");
+}
+
+/**
+ * This EVE-NG deployment's identity — see `InventoryProvider.instanceKey`
+ * (models/inventory.ts) for the contract and `netboxInstanceKey` for the
+ * reference implementation this mirrors.
+ *
+ * THE PATH IS DROPPED, which is the one deliberate difference from the NetBox
+ * key. EVE-NG's API is always at the origin's `/api`; the product cannot be
+ * mounted under a path prefix, so a path in the base URL is a typo or a stray
+ * copy-paste out of the browser — keeping it would fragment one server into as
+ * many keys as there are spellings, which is precisely the failure the key
+ * exists to prevent. Everything else is the same canonicalization: scheme and
+ * host lower-cased, a default port dropped, and userinfo/query/fragment
+ * removed — userinfo because this key is PERSISTED on every kept server and
+ * copied into backups, and `http://admin:pw@eve` is a credential typed into a
+ * non-secret field.
+ *
+ * `undefined` for anything `new URL` rejects (a scheme-less host is the common
+ * typo): the fetch path builds its URLs from the same string, so a source whose
+ * base URL cannot be parsed cannot sync at all and must not claim an identity.
+ */
+export function eveNgInstanceKey(config: InventorySourceValues): string | undefined {
+  const normalized = normalizeBaseUrl(String(config.baseUrl ?? ""));
+  if (!normalized) {
+    return undefined;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    return undefined;
+  }
+  // `host` rather than `hostname` so a non-default port stays part of the
+  // identity; the parser has already dropped the scheme's default port.
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
+/**
+ * Percent-encodes each SEGMENT and rejoins on "/". A whole-string
+ * `encodeURIComponent` would escape the separators too and address a single
+ * bizarrely-named folder; leaving the path raw sends a literal space, which the
+ * URL parser mangles into a 404. EVE-NG lab and folder names routinely contain
+ * spaces, so this is the common case rather than a corner.
+ */
+function encodePath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/** "/", "", "  " and "/Customers/" all normalize to a canonical, slash-led, un-suffixed path. */
+function normalizeFolderPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "/") {
+    return "/";
+  }
+  const withLead = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLead.replace(/\/+$/, "") || "/";
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function str(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// ---------------------------------------------------------------------------
+// Error mapping — mirrors netboxProvider's mapNetworkError / throwForStatus /
+// parseJsonOrThrow trio so both providers fail in the same vocabulary.
+// ---------------------------------------------------------------------------
+
+function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
+  const host = url.host || url.toString();
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") {
+      return new InventoryProviderError("network", `Connection to ${host} timed out.`);
+    }
+    const cause = (err as { cause?: { code?: string } }).cause;
+    const code = cause?.code ?? (err as { code?: string }).code;
+    if (code) {
+      return new InventoryProviderError("network", `Could not reach ${host}: ${code}.`);
+    }
+    return new InventoryProviderError("network", `Could not reach ${host}: ${err.message}`);
+  }
+  return new InventoryProviderError("network", `Could not reach ${host}: ${String(err)}`);
+}
+
+function throwForStatus(status: number, text: string, url: URL): never {
+  if (status === 401 || status === 403) {
+    throw new InventoryProviderError("auth", `EVE-NG rejected the credentials (HTTP ${status}) at ${url}.`);
+  }
+  throw new InventoryProviderError("protocol", `EVE-NG request to ${url} failed with HTTP ${status}: ${text.slice(0, BODY_SLICE)}`);
+}
+
+/**
+ * Every EVE-NG endpoint answers with a JSend envelope
+ * (`{code, status, message, data}`), and — this is the part a status-code-only
+ * client gets wrong — a REJECTED LOGIN comes back as HTTP 200 with
+ * `status: "fail"`. The envelope is therefore validated as carefully as the
+ * status line.
+ */
+interface JSendEnvelope {
+  code?: number;
+  status: string;
+  message?: string;
+  data?: unknown;
+}
+
+function parseEnvelope(text: string, url: URL): JSendEnvelope {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new InventoryProviderError(
+      "protocol",
+      `Response from ${url} is not EVE-NG JSON — is the base URL correct? (${text.slice(0, BODY_SLICE)})`
+    );
+  }
+  if (!isObject(parsed) || !isString(parsed.status)) {
+    throw new InventoryProviderError("protocol", `Response from ${url} is not an EVE-NG API envelope — is the base URL correct?`);
+  }
+  return parsed as unknown as JSendEnvelope;
+}
+
+interface RawResponse {
+  status: number;
+  text: string;
+  url: URL;
+}
+
+// ---------------------------------------------------------------------------
+// EveApiClient — owns login/cookie, JSend parsing, edition detection, the
+// folder walk and per-lab node fetches. Every endpoint call goes through it, so
+// a future Pro divergence lands inside this class rather than being sprinkled
+// through the mapper.
+// ---------------------------------------------------------------------------
+
+export interface EveLab {
+  /** Full EVE-NG path, ending ".unl" — the stable half of a node's externalId. */
+  path: string;
+  /** Lab name with the ".unl" suffix removed — the folder segment and the `lab` attribute. */
+  name: string;
+}
+
+export interface FolderWalkResult {
+  labs: EveLab[];
+  /** Set when a cap (labs, depth, request budget) stopped the walk short. */
+  truncated: boolean;
+  warnings: string[];
+}
+
+type Edition = "community" | "pro" | "unknown";
+
+class EveApiClient {
+  private session?: string;
+
+  public constructor(
+    private readonly fetchImpl: typeof fetch,
+    private readonly baseUrl: string,
+    private readonly username: string,
+    private readonly password: string
+  ) {}
+
+  /** The host requests fall back to when EVE-NG reports a console on loopback. */
+  public get hostname(): string {
+    try {
+      return new URL(this.baseUrl).hostname;
+    } catch {
+      return "";
+    }
+  }
+
+  private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string }> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url.toString(), { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (err) {
+      throw mapNetworkError(err, url);
+    }
+    let text = "";
+    try {
+      text = await res.text();
+    } catch {
+      text = "";
+    }
+    return { res, text };
+  }
+
+  /**
+   * `POST /api/auth/login` with `html5: "-1"`, which is what makes EVE-NG report
+   * NATIVE `telnet://host:port` console URLs instead of browser HTML5 console
+   * links. Without it every node's `url` is an HTML5 page and the entire
+   * inventory maps to zero endpoints — a silent, total mapping failure rather
+   * than an error.
+   *
+   * undici's fetch keeps NO cookie jar, so the `unetlab_session` cookie is
+   * captured here by hand and replayed on every later request.
+   */
+  public async login(timeoutMs: number): Promise<void> {
+    const url = new URL(`${this.baseUrl}/api/auth/login`);
+    const { res, text } = await this.raw(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ username: this.username, password: this.password, html5: "-1" })
+      },
+      timeoutMs
+    );
+    if (res.status < 200 || res.status >= 300) {
+      throwForStatus(res.status, text, url);
+    }
+    const envelope = parseEnvelope(text, url);
+    if (envelope.status !== "success") {
+      // A rejected password is HTTP 200 + `status: "fail"`. Anything non-success
+      // on the LOGIN endpoint is a credential problem by definition, so it maps
+      // to `auth` regardless of the code the envelope claims.
+      throw new InventoryProviderError(
+        "auth",
+        `EVE-NG rejected the credentials for "${this.username}": ${str(envelope.message) || envelope.status}`
+      );
+    }
+    const session = readSessionCookie(res);
+    if (!session) {
+      // Carrying on without a cookie produces a 401 on the very next call, which
+      // would be reported as expired credentials — pointing the user at a
+      // password that is in fact correct.
+      throw new InventoryProviderError(
+        "protocol",
+        `EVE-NG accepted the login at ${url} but returned no unetlab_session cookie — a proxy in front of it may be stripping Set-Cookie.`
+      );
+    }
+    this.session = session;
+  }
+
+  /**
+   * One authenticated GET, with the single silent re-login the session lifetime
+   * makes necessary: EVE-NG expires sessions aggressively, and a mid-crawl 401
+   * on a large tree would otherwise fail a sync that one extra round trip
+   * saves. Exactly ONE retry — a wrong password must not become an unbounded
+   * login loop against the lab server.
+   *
+   * Returns the raw response rather than throwing on a non-2xx, because
+   * `testConnection` has to tell a 404 (fall back to another endpoint) from
+   * every other failure (surface it).
+   */
+  public async authedGet(path: string, timeoutMs: number): Promise<RawResponse> {
+    const url = new URL(`${this.baseUrl}${path}`);
+    const send = async (): Promise<{ res: Response; text: string }> =>
+      this.raw(url, { headers: { Cookie: `unetlab_session=${this.session ?? ""}`, Accept: "application/json" } }, timeoutMs);
+
+    let { res, text } = await send();
+    if (res.status === 401 || res.status === 403) {
+      await this.login(timeoutMs);
+      ({ res, text } = await send());
+    }
+    return { status: res.status, text, url };
+  }
+
+  /** `authedGet` plus the 2xx + JSend-success checks — the normal path. */
+  public async getData(path: string, timeoutMs: number): Promise<unknown> {
+    const raw = await this.authedGet(path, timeoutMs);
+    return unwrap(raw);
+  }
+
+  /**
+   * `GET /api/status` → `data.version`. A version string naming "pro" (any
+   * case) is Professional; anything else is Community. A MISSING endpoint is
+   * `unknown` rather than fatal — edition detection is an optional capability
+   * probe, and failing a whole sync over it would make an older build unusable.
+   * Any other failure still propagates: a 500 here means the server is unwell,
+   * not that it is old.
+   */
+  public async detectEdition(timeoutMs: number): Promise<Edition> {
+    const raw = await this.authedGet("/api/status", timeoutMs);
+    if (raw.status === 404) {
+      return "unknown";
+    }
+    const data = unwrap(raw);
+    const version = isObject(data) ? str(data.version) : "";
+    if (!version) {
+      return "unknown";
+    }
+    return /pro/i.test(version) ? "pro" : "community";
+  }
+
+  /** `GET /api/folders{path}` — the raw listing, already unwrapped from JSend. */
+  public async listFolder(folderPath: string, timeoutMs: number): Promise<{ folders: unknown[]; labs: unknown[] }> {
+    const data = await this.getData(`/api/folders${encodePath(folderPath)}`, timeoutMs);
+    if (!isObject(data)) {
+      return { folders: [], labs: [] };
+    }
+    return {
+      folders: Array.isArray(data.folders) ? data.folders : [],
+      labs: Array.isArray(data.labs) ? data.labs : []
+    };
+  }
+
+  /**
+   * `GET /api/labs{labPath}/nodes` → `[nodeId, node]` pairs.
+   *
+   * `data` is an OBJECT keyed by node id — except for a lab with no nodes,
+   * where EVE-NG returns an empty ARRAY instead. Both shapes are normalized
+   * here; a client that demands an object fails the entire sync over one empty
+   * lab.
+   */
+  public async listNodes(labPath: string, timeoutMs: number): Promise<[string, Record<string, unknown>][]> {
+    const data = await this.getData(`/api/labs${encodePath(labPath)}/nodes`, timeoutMs);
+    // Anything that is not a keyed object — the empty ARRAY included — is
+    // simply "this lab has no nodes". A client that instead DEMANDS an object
+    // fails the entire sync over one empty lab, and every other lab's servers
+    // then look deleted to the prune phase.
+    if (!isObject(data)) {
+      return [];
+    }
+    return Object.entries(data).filter((pair): pair is [string, Record<string, unknown>] => isObject(pair[1]));
+  }
+
+  /**
+   * Breadth-first walk from `root`, collecting labs. Three independent guards,
+   * because an EVE-NG folder listing is server-supplied data that can name any
+   * path at all:
+   *  - a VISITED SET, so a listing pointing back at an ancestor (or the ".."
+   *    entry every listing carries) cannot loop;
+   *  - a DEPTH CAP, so a pathological generator of ever-deeper paths terminates;
+   *  - a REQUEST BUDGET, so a wide-and-deep tree cannot hammer the server.
+   *
+   * Every guard that actually fires sets `truncated`, which is what stops
+   * `computeSyncPlan` from reading the labs we never reached as "deleted at the
+   * source" and pruning their servers.
+   */
+  public async walkFolders(root: string, matchesFilter: (labPath: string) => boolean, timeoutMs: number): Promise<FolderWalkResult> {
+    const labs: EveLab[] = [];
+    const warnings: string[] = [];
+    const visited = new Set<string>([root]);
+    let queue: { path: string; depth: number }[] = [{ path: root, depth: 0 }];
+    let requests = 0;
+    let truncated = false;
+    let depthCapped = false;
+
+    while (queue.length > 0) {
+      const next: typeof queue = [];
+      for (const { path, depth } of queue) {
+        if (requests >= MAX_FOLDER_REQUESTS) {
+          truncated = true;
+          warnings.push(
+            `Stopped after ${MAX_FOLDER_REQUESTS} folder listings — part of the EVE-NG folder tree was not scanned. Narrow the Root Folder.`
+          );
+          queue = [];
+          break;
+        }
+        requests++;
+        const listing = await this.listFolder(path, timeoutMs);
+
+        for (const rawLab of listing.labs) {
+          if (!isObject(rawLab)) continue;
+          const labPath = str(rawLab.path) || joinPath(path, str(rawLab.file));
+          if (!labPath.toLowerCase().endsWith(".unl")) continue;
+          if (!matchesFilter(labPath)) continue;
+          if (labs.length >= MAX_LABS) {
+            truncated = true;
+            continue;
+          }
+          labs.push({ path: labPath, name: labNameOf(labPath) });
+        }
+
+        if (depth >= MAX_FOLDER_DEPTH) {
+          if (listing.folders.length > 0) {
+            depthCapped = true;
+            truncated = true;
+          }
+          continue;
+        }
+        for (const rawFolder of listing.folders) {
+          if (!isObject(rawFolder)) continue;
+          // ".." is the parent link every listing carries; following it walks
+          // straight back up. The visited set catches it too, but only after
+          // one wasted request per folder.
+          if (str(rawFolder.name) === "..") continue;
+          const childPath = normalizeFolderPath(str(rawFolder.path));
+          // NEVER LEAVE THE SUBTREE the user scoped with Root Folder. The
+          // listing's paths are server-supplied, and the ".." entry above is
+          // only the most common way one of them points at an ancestor — a
+          // crawl that follows any of them imports the whole EVE-NG server,
+          // which is exactly what Root Folder exists to prevent.
+          if (!isWithin(childPath, root) || visited.has(childPath)) continue;
+          visited.add(childPath);
+          next.push({ path: childPath, depth: depth + 1 });
+        }
+      }
+      queue = next;
+    }
+
+    if (labs.length >= MAX_LABS && truncated) {
+      warnings.push(`Stopped after ${MAX_LABS} labs — later labs under the Root Folder were not imported. Narrow the Root Folder or the Lab Filter.`);
+    }
+    if (depthCapped) {
+      warnings.push(`The EVE-NG folder tree is deeper than ${MAX_FOLDER_DEPTH} levels — folders below that depth were not scanned.`);
+    }
+    return { labs, truncated, warnings };
+  }
+}
+
+/** 2xx + JSend `status: "success"`, or the mapped error for whatever went wrong. */
+function unwrap(raw: RawResponse): unknown {
+  if (raw.status < 200 || raw.status >= 300) {
+    throwForStatus(raw.status, raw.text, raw.url);
+  }
+  const envelope = parseEnvelope(raw.text, raw.url);
+  if (envelope.status !== "success") {
+    if (envelope.code === 401 || envelope.code === 403) {
+      throw new InventoryProviderError("auth", `EVE-NG refused ${raw.url}: ${str(envelope.message) || envelope.status}`);
+    }
+    throw new InventoryProviderError(
+      "protocol",
+      `EVE-NG reported "${envelope.status}" for ${raw.url}: ${str(envelope.message).slice(0, BODY_SLICE) || "no message"}`
+    );
+  }
+  return envelope.data;
+}
+
+/**
+ * The `unetlab_session` value out of a login response's Set-Cookie header(s).
+ * `getSetCookie()` is the correct API (a response can carry several Set-Cookie
+ * headers and `get` folds them into one string); `get` is the fallback for a
+ * Response-alike that predates it.
+ */
+function readSessionCookie(res: Response): string | undefined {
+  const headers = res.headers as unknown as
+    | { getSetCookie?: () => string[]; get?: (name: string) => string | null }
+    | undefined;
+  if (!headers) {
+    return undefined;
+  }
+  const many = typeof headers.getSetCookie === "function" ? headers.getSetCookie() : [];
+  const one = typeof headers.get === "function" ? headers.get("set-cookie") : null;
+  for (const cookie of many.length > 0 ? many : one ? [one] : []) {
+    const match = /(?:^|[;,\s])unetlab_session=([^;,\s]+)/.exec(cookie);
+    if (match) {
+      return match[1];
+    }
+  }
+  return undefined;
+}
+
+/** Is `child` the root itself, or strictly beneath it? */
+function isWithin(child: string, root: string): boolean {
+  return root === "/" || child === root || child.startsWith(`${root}/`);
+}
+
+function joinPath(folder: string, file: string): string {
+  const base = folder === "/" ? "" : folder;
+  return `${base}/${file}`;
+}
+
+function labNameOf(labPath: string): string {
+  const file = labPath.slice(labPath.lastIndexOf("/") + 1);
+  return file.replace(/\.unl$/i, "");
+}
+
+// ---------------------------------------------------------------------------
+// Mapping
+// ---------------------------------------------------------------------------
+
+/**
+ * A console address EVE-NG reports that is only meaningful ON the EVE-NG host.
+ * Keeping it would point every console at the USER'S OWN machine, where the
+ * connection either fails opaquely or — worse — succeeds against something
+ * unrelated that happens to be listening.
+ */
+function isHostLocalOnly(host: string): boolean {
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return bare === "" || bare === "localhost" || bare === "0.0.0.0" || bare === "::" || bare === "::1" || /^127\./.test(bare);
+}
+
+interface TelnetTarget {
+  host: string;
+  port: number;
+}
+
+/**
+ * `telnet://127.0.0.1:32769` → the address a Nexus telnet server should
+ * actually dial. `undefined` when the node has no native telnet console — an
+ * HTML5/VNC console URL, an empty `url` (common on a stopped Community node),
+ * or something that is not a URL at all.
+ */
+function resolveTelnetTarget(consoleKind: string, rawUrl: string, consoleHost: string, baseHostname: string): TelnetTarget | undefined {
+  if (consoleKind.toLowerCase() !== "telnet" || !rawUrl) {
+    return undefined;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== "telnet:") {
+    return undefined;
+  }
+  const reported = parsed.hostname;
+  // The override wins over BOTH the reported host and the base URL host: it
+  // exists for the NAT case, where neither of those is reachable from here.
+  const host = consoleHost || (isHostLocalOnly(reported) ? baseHostname : reported.replace(/^\[|\]$/g, ""));
+  if (!host) {
+    return undefined;
+  }
+  const port = parsed.port ? Number(parsed.port) : 23;
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+    return undefined;
+  }
+  return { host, port };
+}
+
+function mapNode(
+  nodeId: string,
+  raw: Record<string, unknown>,
+  lab: EveLab,
+  rootPrefix: string,
+  consoleHost: string,
+  baseHostname: string
+): { device: InventoryDevice; hasEndpoint: boolean } {
+  const rawName = str(raw.name);
+  // Never dropped for a cosmetic data problem: a dropped device reads as
+  // "deleted at the source" and the source's prune policy acts on the server.
+  const name = rawName || `node-${nodeId}`;
+  const consoleKind = str(raw.console);
+  const target = resolveTelnetTarget(consoleKind, str(raw.url), consoleHost, baseHostname);
+  const running = Number(raw.status) === 2;
+
+  const attributes: Record<string, string> = {};
+  const put = (key: string, value: string): void => {
+    if (value) {
+      attributes[key] = value;
+    }
+  };
+  put("lab", lab.name);
+  put("template", str(raw.template));
+  put("type", str(raw.type));
+  put("console", consoleKind);
+  put("status", running ? "running" : "stopped");
+  put("image", str(raw.image));
+  put("name", name);
+
+  return {
+    hasEndpoint: target !== undefined,
+    device: {
+      // Stable and unique across labs: two labs each have a node "1", and a
+      // bare node id would collapse every lab's node 1 into one server.
+      externalId: `${lab.path}#${nodeId}`,
+      name,
+      folderPath: labFolderPath(lab, rootPrefix),
+      endpoints: target ? [{ kind: "telnet", host: target.host, port: target.port }] : [],
+      attributes: Object.keys(attributes).length > 0 ? attributes : undefined
+    }
+  };
+}
+
+/**
+ * The lab's own folder, made RELATIVE to the source's root folder, with the lab
+ * name as the final segment — so every lab is a folder in the tree and the
+ * source's `targetFolder` is not shadowed by a repeat of the root path.
+ */
+function labFolderPath(lab: EveLab, rootPrefix: string): string {
+  const dir = lab.path.slice(0, lab.path.lastIndexOf("/"));
+  const relative = (dir.startsWith(rootPrefix) ? dir.slice(rootPrefix.length) : dir).replace(/^\/+/, "");
+  return relative ? `${relative}/${lab.name}` : lab.name;
+}
+
+// ---------------------------------------------------------------------------
+// Provider
+// ---------------------------------------------------------------------------
+
+function makeClient(fetchImpl: typeof fetch, config: InventorySourceValues, secrets: InventorySourceSecrets): EveApiClient {
+  return new EveApiClient(
+    fetchImpl,
+    normalizeBaseUrl(String(config.baseUrl ?? "")),
+    String(config.username ?? ""),
+    secrets.password ?? ""
+  );
+}
+
+async function fetchInventoryImpl(
+  fetchImpl: typeof fetch,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets
+): Promise<InventoryTree> {
+  const client = makeClient(fetchImpl, config, secrets);
+  const root = normalizeFolderPath(String(config.rootFolder ?? "/"));
+  const rootPrefix = root === "/" ? "" : root;
+  const filter = str(config.filter).toLowerCase();
+  // Absent means INCLUDED — `includeStopped` defaults to true (see the field),
+  // and reading an absent value as false would silently drop every stopped node
+  // from a source the user never configured that way.
+  const includeStopped = config.includeStopped !== false;
+  const consoleHost = str(config.consoleHost);
+
+  const warnings: string[] = [];
+  await client.login(FETCH_TIMEOUT_MS);
+
+  if ((await client.detectEdition(FETCH_TIMEOUT_MS)) === "pro") {
+    warnings.push(EVE_NG_PRO_WARNING);
+  }
+
+  const walk = await client.walkFolders(root, (labPath) => !filter || labPath.toLowerCase().includes(filter), FETCH_TIMEOUT_MS);
+  warnings.push(...walk.warnings);
+  let truncated = walk.truncated;
+
+  const devices: InventoryDevice[] = [];
+  let noConsoleCount = 0;
+  let nodesCapped = false;
+  for (const lab of walk.labs) {
+    if (nodesCapped) break;
+    for (const [nodeId, raw] of await client.listNodes(lab.path, FETCH_TIMEOUT_MS)) {
+      if (!includeStopped && Number(raw.status) !== 2) {
+        continue;
+      }
+      if (devices.length >= MAX_NODES) {
+        nodesCapped = true;
+        truncated = true;
+        break;
+      }
+      const mapped = mapNode(nodeId, raw, lab, rootPrefix, consoleHost, client.hostname);
+      devices.push(mapped.device);
+      if (!mapped.hasEndpoint) {
+        noConsoleCount++;
+      }
+    }
+  }
+
+  if (noConsoleCount > 0) {
+    // ONE aggregate line, not one per node: a lab full of VNC-consoled
+    // appliances would otherwise bury every other warning in the plan summary.
+    warnings.push(
+      `${noConsoleCount} node${noConsoleCount === 1 ? " has" : "s have"} no telnet console URL (a non-telnet console type, or no console address yet) and ${
+        noConsoleCount === 1 ? "was" : "were"
+      } imported without a connection endpoint.`
+    );
+  }
+  if (nodesCapped) {
+    warnings.push(`Stopped after ${MAX_NODES} nodes — later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`);
+  }
+  return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
+}
+
+async function testConnectionImpl(fetchImpl: typeof fetch, config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
+  const client = makeClient(fetchImpl, config, secrets);
+  await client.login(TEST_CONNECTION_TIMEOUT_MS);
+  const status = await client.authedGet("/api/status", TEST_CONNECTION_TIMEOUT_MS);
+  // ONLY a 404 falls back — the endpoint is absent on an older build. An auth
+  // failure must bubble as-is (`unwrap` maps it), never masked by a second
+  // request that could succeed on a laxer endpoint and report a broken source
+  // as healthy. Branching on the STATUS CODE rather than on the shape of the
+  // error message keeps the two decisions from drifting apart.
+  if (status.status !== 404) {
+    unwrap(status);
+    return;
+  }
+  unwrap(await client.authedGet("/api/folders/", TEST_CONNECTION_TIMEOUT_MS));
+}
+
+export function createEveNgProvider(fetchImpl: typeof fetch = fetch): InventoryProvider {
+  return {
+    id: EVE_NG_PROVIDER_ID,
+    label: "EVE-NG",
+    configFields: EVE_NG_CONFIG_FIELDS,
+    attributeKeys: ["lab", "template", "type", "console", "status", "image", "name"],
+    instanceKey(config: InventorySourceValues): string | undefined {
+      return eveNgInstanceKey(config);
+    },
+    testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
+      return testConnectionImpl(fetchImpl, config, secrets);
+    },
+    fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree> {
+      return fetchInventoryImpl(fetchImpl, config, secrets);
+    }
+  };
+}
