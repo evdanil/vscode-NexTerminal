@@ -24,7 +24,7 @@ import {
   type CapturedProxyPasswordSecret
 } from "../services/inventory/proxySecretHygiene";
 import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
-import { deviceTemplateFormDefinition, type ServerListEntry } from "../ui/formDefinitions";
+import { deviceTemplateFormDefinition, type ServerListEntry , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { ManagementListPanel, type ManagementListDescriptor } from "../ui/managementListPanel";
@@ -127,7 +127,7 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
 }
 
 function serverListEntries(ctx: CommandContext): ServerListEntry[] {
-  return ctx.core.getSnapshot().servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
+  return toSshInfrastructureServerList(ctx.core.getSnapshot().servers);
 }
 
 /** The inventory sources whose `templateRules` reference this template id. */

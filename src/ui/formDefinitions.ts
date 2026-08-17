@@ -670,6 +670,21 @@ export interface ServerListEntry {
  * stored — a server can be switched to Telnet long after some other server
  * named it — and a picker cannot retract a choice already saved.
  */
+/**
+ * The single adapter every command uses to turn its `ServerConfig` snapshot into
+ * the `ServerListEntry[]` the SSH-infrastructure pickers consume. Co-located with
+ * `sshInfrastructureCandidates` (the filter) and `ServerListEntry` (the shape) on
+ * purpose: the filter can only exclude a telnet/addressless server if the flag it
+ * reads is actually carried here, and three inline `.map`s that each had to
+ * remember `protocol` and `addressless` was exactly how the flag got dropped
+ * (Codex review P2). One place to carry every field the pickers filter on.
+ */
+export function toSshInfrastructureServerList(
+  servers: ReadonlyArray<Pick<ServerConfig, "id" | "name" | "protocol" | "addressless">>
+): ServerListEntry[] {
+  return servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol, addressless: s.addressless }));
+}
+
 function sshInfrastructureCandidates(servers: ServerListEntry[] | undefined, excludeId?: string): ServerListEntry[] {
   return (servers ?? []).filter(
     // ADDRESSLESS (Codex P1 review MAJOR-1) — a placeholder with no console

@@ -21,7 +21,7 @@ import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
-import { serverFormDefinition } from "../ui/formDefinitions";
+import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -1498,7 +1498,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const snapshot = ctx.core.getSnapshot();
       // TELNET (Phase 0, MAJOR-3) — the protocol rides along so the Jump Host
       // and IPMI Gateway pickers can leave telnet servers out of their options.
-      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name, protocol: s.protocol }));
+      const serverList = toSshInfrastructureServerList(snapshot.servers);
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       // Issue #48 — a caller that is sending the user here to fill in an
       // advanced field (a `${profile.ipmiHost}` refusal) says so, and the

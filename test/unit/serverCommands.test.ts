@@ -4151,6 +4151,42 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
  * (a stopped EVE node). Connecting must show a friendly "start it and re-sync"
  * message and do NOTHING else — no vault read, no prompt, no transport.
  */
+/**
+ * ADDRESSLESS (Codex review P2) — the picker-exclusion filter in
+ * `sshInfrastructureCandidates` only works if the adapters that build
+ * `ServerListEntry` carry the `addressless` flag. This exercises the REAL edit
+ * adapter (serverCommands → serverFormDefinition), not a hand-built entry, so a
+ * future adapter that forgets the flag is caught end to end.
+ */
+describe("addressless servers are not offered as SSH infrastructure (end-to-end via the real edit adapter)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  it("omits an addressless server from the Jump Host and IPMI Gateway pickers, while an ordinary SSH server still appears (⊘ the adapter drops `addressless`, so the filter never sees it and the placeholder is offered as infrastructure)", async () => {
+    const edited = makeServer({ id: "srv-1", name: "prod" });
+    const bastion = makeServer({ id: "srv-ssh", name: "bastion" });
+    const placeholder = makeServer({ id: "srv-addr", name: "stopped-node", host: "", port: 0, addressless: true, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [edited, bastion, placeholder] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    const definition = mockWebviewFormPanelOpen.mock.calls.at(-1)![1] as { fields: Array<{ key?: string; options?: { value: string }[] }> };
+    const optionValues = (key: string): string[] => {
+      const field = definition.fields.find((f) => f.key === key);
+      return field?.options?.map((o) => o.value) ?? [];
+    };
+
+    for (const key of ["proxyJumpHostId", "ipmiGatewayServerId"]) {
+      expect(optionValues(key), key).toContain("srv-ssh");
+      expect(optionValues(key), key).not.toContain("srv-addr");
+    }
+  });
+});
+
 describe("addressless connect guard", () => {
   beforeEach(() => {
     vi.clearAllMocks();

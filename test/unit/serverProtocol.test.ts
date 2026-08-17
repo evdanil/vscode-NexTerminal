@@ -46,7 +46,7 @@ import {
 } from "../../src/models/config";
 import type { ServerConfig } from "../../src/models/config";
 import { isValidServerOrigin, validateServerConfig } from "../../src/utils/validation";
-import { serverFormDefinition, unifiedProfileFormDefinition } from "../../src/ui/formDefinitions";
+import { serverFormDefinition, toSshInfrastructureServerList, unifiedProfileFormDefinition } from "../../src/ui/formDefinitions";
 import { formValuesToServer } from "../../src/commands/serverCommands";
 import type { FormDefinition, FormFieldDescriptor, VisibleWhenCondition } from "../../src/ui/formTypes";
 import { openForm } from "../helpers/formScriptHarness";
@@ -356,6 +356,19 @@ describe("server form — telnet servers are not selectable as SSH infrastructur
     const definition = unifiedProfileFormDefinition(undefined, undefined, true, servers);
     expect(optionValues(definition, "proxyJumpHostId")).not.toContain("srv-tel");
     expect(optionValues(definition, "ipmiGatewayServerId")).not.toContain("srv-tel");
+  });
+
+  // ADDRESSLESS (Codex review P2) — the shared adapter every command routes its
+  // snapshot through MUST carry `addressless`, or the picker filter never sees
+  // it. This pins the single choke point the three inline adapters were folded
+  // into.
+  it("toSshInfrastructureServerList carries `addressless` through (⊘ an adapter that drops it leaves the picker filter blind, and placeholders appear as infrastructure)", () => {
+    const entries = toSshInfrastructureServerList([
+      { id: "a", name: "addressed", host: "10.0.0.1", port: 22, username: "u", authType: "agent", isHidden: false },
+      { id: "b", name: "stopped", host: "", port: 0, username: "", authType: "agent", isHidden: false, addressless: true }
+    ]);
+    expect(entries.find((e) => e.id === "b")?.addressless).toBe(true);
+    expect(entries.find((e) => e.id === "a")?.addressless).toBeUndefined();
   });
 });
 
