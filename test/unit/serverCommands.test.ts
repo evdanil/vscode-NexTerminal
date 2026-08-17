@@ -2162,6 +2162,36 @@ describe("SSH File Explorer auto-open on manual connect", () => {
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
   });
 
+  // P3-3 (Fable) — group connect swept every node through connectServer, which pops
+  // the addressless info message per node — a popup storm on an EVE lab folder
+  // (mostly stopped, the documented common case). Skip addressless nodes and show
+  // ONE aggregate message. ⊘ Sweeping them builds no pty but fires one toast each.
+  it("P3-3 — group connect skips addressless nodes and shows one aggregate message, not one toast per stopped node", async () => {
+    const origin = { sourceId: "s", externalId: "e", syncedAt: 1 };
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({ id: "a1", name: "stopped-1", group: "Lab", addressless: true, host: "", port: 0, origin }),
+        makeServer({ id: "a2", name: "stopped-2", group: "Lab", addressless: true, host: "", port: 0, origin }),
+        makeServer({ id: "s1", name: "live", group: "Lab", host: "10.0.0.1" })
+      ]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.group.connect")!(new FolderTreeItem("Lab", "Lab"));
+    await flushPromises();
+
+    // Exactly one addressless message — the aggregate — never one per stopped node.
+    const infoMsgs = vi.mocked(vscode.window.showInformationMessage as any).mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .filter((m: string) => /no console address/i.test(m));
+    expect(infoMsgs).toHaveLength(1);
+    expect(infoMsgs[0]).toContain("2");
+    // Only the live server built a pty.
+    expect(SshPty).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the SSH session registered when automatic File Explorer browse fails", async () => {
     const { ctx } = setupHarness({
       profiles: [],
@@ -4850,5 +4880,25 @@ describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
     await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
 
     expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:23\nIPMI/BMC: 10.9.9.9");
+  });
+
+  // P3-2 (Fable) — an addressless placeholder has no console address, so Copy Info
+  // must not paste the nonsense ":0"; it heads with "(no console address)" and
+  // still carries the BMC line, which is often the only usable address. ⊘ Emitting
+  // `${host}:${port}` renders ":0".
+  it("P3-2 — renders '(no console address)' for an addressless placeholder and keeps the BMC line", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ addressless: true, host: "", port: 0, username: "admin", ipmiHost: "10.9.9.9", origin: { sourceId: "s", externalId: "e", syncedAt: 1 } })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    const copied = vi.mocked(vscode.env.clipboard.writeText).mock.calls[0][0];
+    expect(copied).toContain("(no console address)");
+    expect(copied).not.toContain(":0");
+    expect(copied).toContain("IPMI/BMC: 10.9.9.9");
   });
 });

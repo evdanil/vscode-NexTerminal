@@ -56,7 +56,9 @@ export async function pickServer(core: import("../core/nexusCore").NexusCore): P
       .sort((a, b) => naturalCompare(a.name, b.name))
       .map((server) => ({
         label: server.name,
-        description: `${server.username}@${server.host}:${server.port}`,
+        // P3-2 (Fable) — an addressless placeholder has no endpoint, so show
+        // "(no address)" rather than the nonsense "user@:0".
+        description: server.addressless === true ? "(no address)" : `${server.username}@${server.host}:${server.port}`,
         server
       })),
     { title: "Select Nexus Server" }
@@ -2184,7 +2186,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const account = typeof server.username === "string" && server.username.trim() !== ""
         ? `${server.username}@`
         : "";
-      const info = `${account}${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
+      // P3-2 (Fable) — an addressless placeholder has no console address, so the
+      // `host:port` half renders the nonsense ":0". Head with "(no console address)"
+      // (and drop the `user@` prefix, which reads as an address it is not) while
+      // still carrying the BMC line below — often the only usable address.
+      const endpointLine = server.addressless === true ? "(no console address)" : `${account}${server.host}:${server.port}`;
+      const info = `${endpointLine}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
       await vscode.env.clipboard.writeText(info);
       void vscode.window.showInformationMessage(`Copied: ${info.replace(/\n/g, "  ")}`);
     }),
@@ -2283,8 +2290,22 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const servers = ctx.core
         .getSnapshot()
         .servers.filter((s) => s.group === folderPath && !s.isHidden);
+      // P3-3 (Fable) — skip addressless placeholders in the sweep rather than let
+      // connectServer pop its "no console address" info message once PER node. An
+      // EVE lab folder is mostly stopped nodes (the documented common case), so the
+      // per-node path is a popup storm. Disclose them once, in aggregate, instead.
+      const addresslessInGroup = servers.filter((s) => s.addressless === true);
       for (const server of servers) {
+        if (server.addressless === true) {
+          continue;
+        }
         void connectServer(ctx, server.id, { allowAutoFileExplorer: false });
+      }
+      if (addresslessInGroup.length > 0) {
+        const count = addresslessInGroup.length;
+        void vscode.window.showInformationMessage(
+          `${count} ${count === 1 ? "server has" : "servers have"} no console address yet and ${count === 1 ? "was" : "were"} skipped — ${count === 1 ? "it" : "they"} will connect once the inventory source assigns an address.`
+        );
       }
     }),
 
