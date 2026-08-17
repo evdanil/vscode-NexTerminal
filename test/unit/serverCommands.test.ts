@@ -4460,6 +4460,64 @@ describe("nexus.server.edit — flipping protocol must not destroy the other pro
     expect(saved.openFileExplorerOnFirstConnect).toBeUndefined();
   });
 
+  /**
+   * ⊘ P2-B (Codex) — the dormant fields must come from the LIVE record, not
+   * from the form-open snapshot.
+   *
+   * The sequence: open a telnet edit form; elsewhere, delete the linked auth
+   * profile — `removeAuthProfile` sweeps every server and clears the link on the
+   * live record; save the form. The form-open snapshot still remembers `ap1`, so
+   * restoring from it RESURRECTS a dangling link to a profile that no longer
+   * exists. Nothing catches it downstream: the auth-profile rejection is keyed on
+   * `candidate.authProfileId`, and the hidden select produced no candidate at all.
+   *
+   * Discriminating because the profile is deleted AFTER the form opened — the two
+   * snapshots disagree, which is the entire finding.
+   */
+  it("takes dormant fields from the LIVE record, so a profile deleted while the form was open stays deleted", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+
+    // `removeAuthProfile`'s own reference sweep, as it reaches this server.
+    await ctx.core.addOrUpdateServer({ ...CONFIGURED, authProfileId: undefined });
+
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.authProfileId).toBeUndefined();
+    // …and the fields nothing touched still come through.
+    expect(saved.username).toBe("netadmin");
+    expect(saved.keyPath).toBe("/keys/id_ed25519");
+  });
+
+  it("picks up a concurrent change to any dormant field, not just the auth link", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await ctx.core.addOrUpdateServer({
+      ...CONFIGURED,
+      proxy: { type: "ssh", jumpHostId: "bastion-2" },
+      keyPath: "/keys/rotated"
+    });
+
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.proxy).toEqual({ type: "ssh", jumpHostId: "bastion-2" });
+    expect(saved.keyPath).toBe("/keys/rotated");
+  });
+
   // ⊘ The proxy PASSWORD is the vault half of the same loss: the proxy fields
   // are hidden on a telnet save, so the secret-sync saw "no proxy" and deleted
   // the stored password — the SSH config would come back on a flip-back with a
