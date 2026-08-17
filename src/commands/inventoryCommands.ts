@@ -6,6 +6,7 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
+  controlProviderNode,
   fetchProviderStatus,
   InventoryProviderError,
   inventorySecretKey,
@@ -112,7 +113,7 @@ function providerMissingMessage(providerId: string): string {
  * `sourceBusyMessage`'s Record forces any future member to bring its own
  * wording instead of silently inheriting one of these.
  */
-type SourceBusyReason = "sync" | "edit" | "remove";
+type SourceBusyReason = "sync" | "edit" | "remove" | "control";
 
 /**
  * The warning a command shows when the source it was asked to act on is
@@ -133,7 +134,8 @@ function sourceBusyMessage(name: string, holder: SourceBusyReason, asking: Sourc
   const wording: Record<SourceBusyReason, string> = {
     sync: asking === "sync" ? `"${name}" is already syncing.` : `"${name}" is currently syncing — try again once the sync finishes.`,
     edit: `"${name}" is open in Edit Source — close that tab, then try again.`,
-    remove: `"${name}" is currently being removed — try again once the removal finishes.`
+    remove: `"${name}" is currently being removed — try again once the removal finishes.`,
+    control: `"${name}" is currently starting or stopping a node — try again in a moment.`
   };
   return wording[holder];
 }
@@ -4531,6 +4533,172 @@ export function registerInventoryCommands(
     ManagementListPanel.open(core, inventorySourcesDescriptor());
   }
 
+  /**
+   * NODE CONTROL (Phase 4) — resolve the ServerConfig a Start/Stop command was
+   * invoked on. VS Code hands a `view/item/context` command its TREE ITEM (a
+   * `ServerTreeItem`, whose `.server` is the record); the palette hands nothing.
+   * Duck-typed on `.server`/string rather than importing `toServerFromArg` from
+   * serverCommands, which would drag `ServerTreeItem extends vscode.TreeItem`
+   * into this module's (VS-Code-mocked) unit tests.
+   */
+  function resolveServerArg(arg: unknown): ServerConfig | undefined {
+    if (typeof arg === "object" && arg !== null) {
+      const withServer = arg as { server?: { id?: unknown } };
+      if (withServer.server && typeof withServer.server === "object" && typeof withServer.server.id === "string") {
+        // Resolve strictly against the LIVE core — NO `?? withServer.server`
+        // fallback. A server removed between tree render and click carries a
+        // full, valid-looking (but stale) record on the item; trusting it would
+        // dispatch a control at a just-deleted node's old origin. A missing id
+        // falls through to the "Select a synced EVE-NG node" refusal instead.
+        return core.getServer(withServer.server.id);
+      }
+    }
+    if (typeof arg === "string") {
+      return core.getServer(arg);
+    }
+    return undefined;
+  }
+
+  /**
+   * NODE CONTROL (Phase 4) — Start/Stop one EVE-NG lab node from its tree item.
+   * Resolves the server → its inventory source → the source's provider, and only
+   * dispatches when that provider exposes `controlNode` (so a manual server or a
+   * NetBox-origin one is refused rather than offered an action that can only
+   * fail). Dispatch goes through `controlProviderNode`, which PROPAGATES a
+   * failure — surfaced here as an error naming the node — unlike the swallowing
+   * status refresh. On success it fires a best-effort `refreshStatus` for the
+   * source WITHOUT awaiting: the node boots over seconds, so the status will lag
+   * a beat, which is expected and fine.
+   */
+  async function controlNode(arg: unknown, action: "start" | "stop"): Promise<void> {
+    const server = resolveServerArg(arg);
+    if (!server) {
+      void vscode.window.showErrorMessage(`Select a synced EVE-NG node to ${action} it.`);
+      return;
+    }
+    const origin = server.origin;
+    const source = origin ? core.getInventorySource(origin.sourceId) : undefined;
+    const provider = source ? registry.get(source.providerId) : undefined;
+    if (!origin || !source || !provider || typeof provider.controlNode !== "function") {
+      void vscode.window.showErrorMessage(
+        `"${server.name}" is not synced from an inventory source that supports node control.`
+      );
+      return;
+    }
+    // BUSY-GUARD (P3-2) — refuse BEFORE loading secrets when the source is
+    // mid-sync/edit/remove, mirroring refreshStatus's `inFlightSourceIds` check
+    // (~:4413). Without it a Start fired while the same source is being removed
+    // races the vault purge and dispatches with partial secrets naming a node
+    // whose source was just deleted; mid-edit it dispatches a stale
+    // `source.config` (old baseUrl). This guards the SOURCE-SCOPED siblings; the
+    // GLOBAL config mutations that bypass inFlightSourceIds are handled by the
+    // under-lock capture below (see the #85 P2 note before the claim).
+    if (inFlightSourceIds.get(source.id) !== undefined) {
+      void vscode.window.showInformationMessage(`"${source.name}" is busy — try again in a moment.`);
+      return;
+    }
+    // CLAIM the source atomically right after the check passes (no await in
+    // between, so a second control arriving on the next microtask sees it). The
+    // bare read above was a TOCTOU: after it passed, this handler still awaits
+    // `vault.get` + the network control request, during which Edit Source /
+    // Remove Source / Sync Now each pass THEIR own busy check and mutate or
+    // purge the source — so a control that only READ the marker could dispatch
+    // with a stale baseUrl, read credentials mid-replacement/purge, or act on a
+    // node whose source was just removed. Claiming closes that window; the
+    // siblings now find it held (they show the "control" wording).
+    //
+    // The claim is released in the `finally` below — deliberately BEFORE the
+    // post-action `refreshStatus` fires, because refreshStatus SKIPS a source
+    // that is inFlightSourceIds-held (~:4413 `continue`); firing it while still
+    // holding "control" would self-skip the very status refresh we want. So:
+    // claim → try{ capture; dispatch } finally{ release } → toast → refresh.
+    //
+    // #85 P2 (Codex) — the "control" claim above guards only the SOURCE-SCOPED
+    // siblings (Edit/Remove/Sync all honour inFlightSourceIds). But the two GLOBAL
+    // config mutations — an id-preserving replace-import (`importMergeReplace`) and
+    // Delete All Data (`completeReset`) — DELIBERATELY bypass inFlightSourceIds and
+    // serialize ONLY through `configMutationLock`. So the config mutation lock IS
+    // taken here — for the CAPTURE only: re-read the live source + read its vault
+    // secrets under the lock, serialized against a replace-import swapping the
+    // source and against completeReset purging its credentials. The ~60s provider
+    // DISPATCH stays OUTSIDE the lock, mirroring refreshStatus/sync (~:4470-4515):
+    // holding `configMutationLock` across long provider I/O would freeze every
+    // config mutation app-wide (including the Delete All Data a user needs to
+    // recover a hung source). The sole residual is a benign stale dispatch against
+    // a source removed DURING the network call — it persists nothing and sends the
+    // captured credentials only to the box they were captured for.
+    //
+    // `source` was resolved synchronously at handler entry, so this revision is
+    // fresh; the capture bails if a locked writer moved it before we re-read (an
+    // id-preserving import bumps `revision` via randomUUID(); a reset removes the
+    // record). `controlProviderNode` and the EVE provider are pure network — they
+    // never take `configMutationLock` — so the dispatch-outside-lock split has no
+    // reentrancy or deadlock.
+    const startRevision = source.revision;
+    inFlightSourceIds.set(source.id, "control");
+    let dispatched = false;
+    try {
+      const captured = await configMutationLock.runExclusive(async () => {
+        // Re-read the LIVE source inside the lock. A replace-import that swapped it
+        // (or a reset that removed it) commits under this same lock, so either it
+        // ran before us — caught here — or it queues behind us, and we captured a
+        // coherent snapshot first. Keep this callback SHORT: only the re-read and
+        // the vault reads, no network, no dispatch (that stays outside the lock).
+        const live = core.getInventorySource(source.id);
+        if (!live || live.revision !== startRevision) {
+          return undefined;
+        }
+        const secrets: InventorySourceSecrets = {};
+        for (const fieldId of live.secretFieldIds) {
+          const value = await vault.get(inventorySecretKey(source.id, fieldId));
+          if (value !== undefined) {
+            secrets[fieldId] = value;
+          }
+        }
+        return { config: structuredClone(live.config), secrets };
+      });
+      if (!captured) {
+        void vscode.window.showInformationMessage(`"${source.name}" changed — try again in a moment.`);
+        return;
+      }
+      // P3-4 — controlNode runs login → detectEdition → action sequentially (up to
+      // ~60s with a re-login), so without a progress UI the user sees nothing until
+      // it all resolves. Wrap the dispatch so the title shows DURING the call
+      // (mirrors serverCommands' "Connecting to …" and the "Testing connection to
+      // …" above). M2 — a FAILURE surfaces through describeInventoryError (the
+      // provider throws classified InventoryProviderErrors), matching every other
+      // inventory failure toast, rather than a bare err.message.
+      const verb = action === "start" ? "Starting" : "Stopping";
+      dispatched = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
+        async () => {
+          try {
+            await controlProviderNode(provider, captured.config, captured.secrets, origin.externalId, action);
+            return true;
+          } catch (err) {
+            void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);
+            return false;
+          }
+        }
+      );
+    } finally {
+      inFlightSourceIds.delete(source.id);
+    }
+    if (!dispatched) {
+      return;
+    }
+    // HONEST completion toast — the API has already returned by now, but the node
+    // boots over seconds so the lab status lags. Say that, rather than phrasing it
+    // as if the request were about to be sent.
+    const sent = action === "start" ? "Start" : "Stop";
+    void vscode.window.showInformationMessage(
+      `${sent} sent to "${server.name}" — lab status will catch up on the next Refresh Lab Status.`
+    );
+    // Best-effort, NOT awaited — the node takes seconds to boot, so the status
+    // will lag this refresh by a poll or two, which is expected.
+    void vscode.commands.executeCommand("nexus.inventory.refreshStatus", source.id);
+  }
+
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
     // Arg widening: these four run from the palette (no argument at all), from
@@ -4550,6 +4718,10 @@ export function registerInventoryCommands(
       const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
       return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
     }),
-    vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
+    vscode.commands.registerCommand("nexus.inventory.manage", manageSources),
+    // NODE CONTROL (Phase 4) — gated in package.json to EVE-origin servers by
+    // running/stopped state; the handler re-guards on the provider capability.
+    vscode.commands.registerCommand("nexus.inventory.startNode", (arg?: unknown) => controlNode(arg, "start")),
+    vscode.commands.registerCommand("nexus.inventory.stopNode", (arg?: unknown) => controlNode(arg, "stop"))
   ];
 }

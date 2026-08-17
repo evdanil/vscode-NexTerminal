@@ -62,7 +62,15 @@ export class ServerTreeItem extends vscode.TreeItem {
     // resolved by the caller from snapshot.serverStatus. Only EVE-origin servers
     // ever carry one (only EVE reports status), so `undefined` means "not a
     // status-bearing server" and the row renders exactly as before.
-    status?: "running" | "stopped"
+    status?: "running" | "stopped",
+    // NODE CONTROL (Phase 4, task #28) — whether this server's origin resolves to
+    // an `eve-ng` inventory source, decided by the caller (a live ServerOrigin
+    // carries no providerId — see toServerItem). Gates the `.eveRunning` /
+    // `.eveStopped` contextValue marker below: emitted ONLY for an EVE-origin
+    // server with a KNOWN status, so a non-EVE server that somehow carries a
+    // status, and a freshly-synced EVE server with none yet, get no node-control
+    // menu (the user runs Refresh Lab Status first — we never act blind).
+    isEveOrigin = false
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -92,24 +100,40 @@ export class ServerTreeItem extends vscode.TreeItem {
     // host, in the tooltip or the description.
     const addressless = server.addressless === true;
     const hostSummary = addressless ? "no console address yet" : `${displayUsername}@${server.host}:${server.port}`;
-    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}`;
+    // NODE CONTROL (Phase 4, task #28) — a lab-status line for EVE-origin nodes
+    // only, so a freshly-synced node (no status yet) hints that Refresh Lab
+    // Status is what unlocks Start/Stop. Matches the labeled-line tooltip idiom.
+    const labStatusSuffix = isEveOrigin
+      ? `\nLab status: ${status === "running" ? "running" : status === "stopped" ? "stopped" : "unknown — run Refresh Lab Status"}`
+      : "";
+    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}${labStatusSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";
     const addresslessDesc = addressless ? " (no address)" : "";
-    // LIVE STATUS (Phase 2) — a " (running)" suffix on a running lab node. A
-    // stopped node gets no suffix (the dim dot carries it), and a non-status
-    // server gets nothing at all.
-    const runningDesc = status === "running" ? " (running)" : "";
+    // LIVE STATUS (Phase 2) / NODE CONTROL (Phase 4, task #28 — M4) — a state
+    // suffix on a status-bearing lab node. Phase 4 makes stopped-ness
+    // load-bearing (it is the premise for "Start Node"), and the worst case —
+    // connected + stopped — otherwise shows a green plug, no state text, and a
+    // "Start Node" menu, a row that contradicts its own menu. So a stopped node
+    // now gets an explicit " (stopped)" mirroring " (running)"; a non-status
+    // server still gets nothing at all.
+    const statusDesc = status === "running" ? " (running)" : status === "stopped" ? " (stopped)" : "";
     const descHead = addressless ? displayUsername : `${displayUsername}@${server.host}`;
-    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${runningDesc}` : undefined;
+    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${statusDesc}` : undefined;
     // BMC-menu gating (task #27) — a server with an ipmiHost (same truthiness as
     // the tooltip's ipmiSuffix above) gets an `.ipmi` marker APPENDED so the two
     // BMC menu entries can require it. The base string is left UNCHANGED and the
     // other server menus were broadened to /^nexus\.server(Connected)?(\.ipmi)?$/,
     // so no existing menu is dropped for a BMC server.
     const hasIpmi = typeof server.ipmiHost === "string" && server.ipmiHost.trim() !== "";
-    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}`;
+    // NODE CONTROL (task #28) — the eve-state marker, APPENDED after `.ipmi` in
+    // the fixed order `nexus.server[Connected][.ipmi][.eveRunning|.eveStopped]`.
+    // Only an EVE-origin server with a KNOWN status carries it; every package.json
+    // server-menu `when` regex was broadened to tolerate the optional group first,
+    // so no existing action is dropped for an EVE node (the #83 hazard).
+    const eveMarker = isEveOrigin && status ? (status === "running" ? ".eveRunning" : ".eveStopped") : "";
+    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${eveMarker}`;
     // LIVE STATUS (Phase 2) — the icon. A CONNECTED server always keeps its
     // connected (plug) icon: the connected affordance must not be lost (P3-6),
     // and the running state is still conveyed by the " (running)" description
@@ -644,9 +668,16 @@ export class NexusTreeProvider
     // stored on the server itself, so a source rename is reflected immediately
     // and a removed source (origin left dangling — see B5's tree tooltip doc)
     // falls back to the generic "Synced from inventory" line in ServerTreeItem.
-    const syncedSourceName = server.origin
-      ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)?.name
+    // NODE CONTROL (task #28) — resolve the origin's source ONCE for both the
+    // display name and the providerId (a live ServerOrigin carries no providerId
+    // — Phase 4 gotcha #1). `isEveOrigin` gates the `.eveRunning`/`.eveStopped`
+    // contextValue marker; "eve-ng" is EVE_NG_PROVIDER_ID (string-literal here to
+    // avoid dragging the provider module into the UI bundle).
+    const originSource = server.origin
+      ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)
       : undefined;
+    const syncedSourceName = originSource?.name;
+    const isEveOrigin = originSource?.providerId === "eve-ng";
     // REVIEW FINDING (P2) — the username shown is the one a connection will
     // actually use, resolved through the shared ownership rule
     // (`authProfileOwnedCredentials`, models/config.ts). Reading
@@ -664,7 +695,8 @@ export class NexusTreeProvider
       authProfileOwnedCredentials(authProfile).username,
       syncedSourceName,
       ipmiAuthProfile?.name,
-      status
+      status,
+      isEveOrigin
     );
     // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
     // to paint the ▶ badge for a running server.

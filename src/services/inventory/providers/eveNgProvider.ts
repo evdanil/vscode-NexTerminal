@@ -535,6 +535,42 @@ class EveApiClient {
     return { status: res.status, text, url };
   }
 
+  /**
+   * NODE CONTROL (Phase 4) — `authedGet` for an arbitrary METHOD (and optional
+   * JSON body), so the Pro node-control path can issue a PUT. Mirrors
+   * `authedGet` exactly: the `unetlab_session` cookie is attached by hand (undici
+   * keeps no jar), a single silent re-login covers an expired session, and the
+   * raw response is returned so the caller can `unwrap` it. A body is sent as
+   * JSON with the matching Content-Type; omitting it sends no body (a bare GET).
+   */
+  public async authedRequest(method: string, path: string, body?: unknown, timeoutMs: number = FETCH_TIMEOUT_MS): Promise<RawResponse> {
+    const url = this.buildUrl(path);
+    const send = async (): Promise<{ res: Response; text: string }> =>
+      this.raw(
+        url,
+        {
+          method,
+          headers: {
+            Cookie: `unetlab_session=${this.session ?? ""}`,
+            Accept: "application/json",
+            ...(body !== undefined ? { "Content-Type": "application/json" } : {})
+          },
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {})
+        },
+        timeoutMs
+      );
+
+    let { res, text } = await send();
+    if (res.status === 401 || res.status === 403) {
+      // Same single-retry discipline as authedGet — one re-login, never a loop
+      // against the lab server. (No crawl deadline is armed on the control path,
+      // so the deadline short-circuit authedGet carries is simply inert here.)
+      await this.login(timeoutMs);
+      ({ res, text } = await send());
+    }
+    return { status: res.status, text, url };
+  }
+
   /** `authedGet` plus the 2xx + JSend-success checks — the normal path. */
   public async getData(path: string, timeoutMs: number): Promise<unknown> {
     const raw = await this.authedGet(path, timeoutMs);
@@ -1330,6 +1366,57 @@ async function fetchStatusImpl(
   return { contractVersion: 1, statuses, truncated: truncated || undefined };
 }
 
+/**
+ * NODE CONTROL (Phase 4) — start or stop ONE lab node, keyed by the same
+ * `${lab.path}#${nodeId}` externalId `fetchInventory`/`fetchStatus` use. Splits
+ * on the LAST `#` (a lab path can legitimately contain `#`), validates both
+ * halves, then dispatches by edition:
+ *  - Community (CERTIFIED) and unknown (best-effort, the provider's convention):
+ *    `GET /api/labs{labPath}/nodes/{nodeId}/{action}`.
+ *  - Pro (PRELIMINARY, uncertified — Phase 3 certifies against a real Pro
+ *    instance): the edition-aware evengsdk verbs — a PUT to the same node-action
+ *    endpoint, with `stopmode: 3` in the body on stop (evengsdk's default stop
+ *    mode). The Community path must NOT be blocked on getting the exact Pro shape
+ *    right; this branch is deliberately marked preliminary.
+ * Every response goes through `unwrap`, so a non-2xx or a JSend `status:"fail"`
+ * (a refused start) surfaces as a mapped `InventoryProviderError` — the wrapper
+ * (`controlProviderNode`) then PROPAGATES it to the user, unlike the status path.
+ */
+async function controlNodeImpl(
+  fetchImpl: typeof fetch,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets,
+  externalId: string,
+  action: "start" | "stop"
+): Promise<void> {
+  const hashIndex = externalId.lastIndexOf("#");
+  const labPath = hashIndex >= 0 ? externalId.slice(0, hashIndex) : "";
+  const nodeId = hashIndex >= 0 ? externalId.slice(hashIndex + 1) : "";
+  if (!labPath || !nodeId) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Malformed node id "${externalId}" — expected "<labPath>#<nodeId>".`
+    );
+  }
+
+  const client = makeClient(fetchImpl, config, secrets);
+  await client.login(FETCH_TIMEOUT_MS);
+  const edition = await client.detectEdition(FETCH_TIMEOUT_MS);
+  const nodeActionPath = `/api/labs${encodePath(labPath)}/nodes/${encodeURIComponent(nodeId)}/${action}`;
+
+  if (edition === "pro") {
+    // Pro (PRELIMINARY) — PUT the node-action endpoint, faithful to the
+    // edition-aware evengsdk verbs; stop carries stopmode=3 (evengsdk's default).
+    // Uncertified: Phase 3 validates the exact Pro shape against a real instance.
+    const body = action === "stop" ? { stopmode: 3 } : {};
+    unwrap(await client.authedRequest("PUT", nodeActionPath, body, FETCH_TIMEOUT_MS));
+    return;
+  }
+
+  // Community (CERTIFIED) — and unknown edition, treated as Community best-effort.
+  unwrap(await client.authedRequest("GET", nodeActionPath, undefined, FETCH_TIMEOUT_MS));
+}
+
 async function testConnectionImpl(fetchImpl: typeof fetch, config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
   const client = makeClient(fetchImpl, config, secrets);
   await client.login(TEST_CONNECTION_TIMEOUT_MS);
@@ -1363,6 +1450,14 @@ export function createEveNgProvider(fetchImpl: typeof fetch = fetch): InventoryP
     },
     fetchStatus(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport> {
       return fetchStatusImpl(fetchImpl, config, secrets);
+    },
+    controlNode(
+      config: InventorySourceValues,
+      secrets: InventorySourceSecrets,
+      externalId: string,
+      action: "start" | "stop"
+    ): Promise<void> {
+      return controlNodeImpl(fetchImpl, config, secrets, externalId, action);
     }
   };
 }

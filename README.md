@@ -176,6 +176,8 @@ Nodes with an HTML5/VNC console, and nodes that have no console address yet, are
 
 **See which labs are running, live.** Run **Refresh Lab Status** (or set `nexus.inventory.statusPollSeconds` to poll while the Command Center is open) and running EVE-NG nodes get a green dot with a `(running)` tag, while the lab folder holding them lights up with a green ▶ — so an at-a-glance look at the tree tells you which labs are up.
 
+**Start and stop nodes from the tree.** Right-click an EVE-NG node whose state is known and choose **Start Node** (on a stopped one) or **Stop Node** (on a running one); Nexus issues the start/stop and refreshes the status a beat later once the node has begun booting. Tested against EVE-NG Community; EVE-NG Professional support is preliminary.
+
 ### Apply a Device Template to Synced Servers
 
 A source's auth profile is one setting shared across every server it creates. A **device template** carries the rest: a proxy, a multiplexing choice, a legacy-algorithm toggle, session logging, and a BMC login (its own **IPMI Auth Profile** and **IPMI Gateway**) — a reusable bundle applied to matched devices so you don't set them on each synced server by hand.

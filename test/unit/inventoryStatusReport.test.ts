@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  controlProviderNode,
   fetchProviderStatus,
   validateInventoryStatusReport,
   type InventoryStatusReport
@@ -183,5 +184,68 @@ describe("fetchProviderStatus", () => {
     const uncloneable = { baseUrl: (() => "nope") as unknown as string };
     const result = await fetchProviderStatus({ fetchStatus: async () => validReport }, uncloneable, {});
     expect(result).toBeUndefined();
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4) — the mutating twin of `fetchProviderStatus`, with two
+ * DELIBERATE divergences: it throws (not silently no-ops) when the provider has
+ * no `controlNode`, and it PROPAGATES a provider failure rather than swallowing
+ * it — a start/stop the user asked for that did not happen must surface.
+ */
+describe("controlProviderNode", () => {
+  it("throws a clear 'does not support node control' error for a provider with no controlNode (⊘ a silent no-op reports an unsupported start/stop as if it succeeded)", async () => {
+    await expect(controlProviderNode({}, { baseUrl: "http://eve" }, {}, "lab.unl#1", "start")).rejects.toThrow(
+      /does not support node control/i
+    );
+  });
+
+  it("PROPAGATES a provider throw rather than swallowing it (⊘ mirroring fetchProviderStatus's swallow-to-undefined would make a failed action look successful)", async () => {
+    await expect(
+      controlProviderNode(
+        { controlNode: async () => { throw new Error("EVE-NG refused the start"); } },
+        {},
+        {},
+        "lab.unl#1",
+        "start"
+      )
+    ).rejects.toThrow(/EVE-NG refused the start/);
+  });
+
+  it("passes the externalId, action and secrets straight through to the provider", async () => {
+    const seen: Array<{ externalId: string; action: string; secrets: unknown }> = [];
+    await controlProviderNode(
+      { controlNode: async (_config, secrets, externalId, action) => { seen.push({ externalId, action, secrets }); } },
+      {},
+      { password: "pw" },
+      "lab/a.unl#3",
+      "stop"
+    );
+    expect(seen[0]).toEqual({ externalId: "lab/a.unl#3", action: "stop", secrets: { password: "pw" } });
+  });
+
+  it("hands the provider a COPY of config, so an in-place normalization cannot mutate the caller's stored source config (⊘ passing source.config straight through mutates globalState with no revision bump)", async () => {
+    const live = { baseUrl: "HTTP://EVE/" };
+    const seen: unknown[] = [];
+    await controlProviderNode(
+      {
+        controlNode: async (config) => {
+          seen.push(config);
+          (config as Record<string, unknown>).baseUrl = "mutated";
+        }
+      },
+      live,
+      {},
+      "lab.unl#1",
+      "start"
+    );
+    expect(seen[0]).not.toBe(live);
+    expect(live).toEqual({ baseUrl: "HTTP://EVE/" });
+  });
+
+  it("resolves for a provider whose controlNode succeeds (the happy path returns void, not a report)", async () => {
+    await expect(
+      controlProviderNode({ controlNode: async () => undefined }, {}, {}, "lab.unl#1", "stop")
+    ).resolves.toBeUndefined();
   });
 });

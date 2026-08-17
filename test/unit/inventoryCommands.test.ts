@@ -13,6 +13,7 @@ import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/n
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import {
   computeProviderFingerprint,
+  InventoryProviderError,
   inventorySecretKey,
   type InventoryProvider,
   type InventorySourceConfig,
@@ -36,6 +37,7 @@ const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
 const mockShowErrorMessage = vi.fn();
 const mockExecuteCommand = vi.fn();
+const mockWithProgress = vi.fn((_opts: unknown, task: (...a: unknown[]) => unknown) => task());
 const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
 const mockWebviewOpen = vi.fn();
@@ -55,7 +57,7 @@ vi.mock("vscode", () => ({
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
-    withProgress: (_opts: unknown, task: (...a: unknown[]) => unknown) => task(),
+    withProgress: (...args: unknown[]) => mockWithProgress(...(args as [unknown, (...a: unknown[]) => unknown])),
     showTextDocument: (...args: unknown[]) => mockShowTextDocument(...args)
   },
   workspace: {
@@ -8194,6 +8196,332 @@ describe("inventoryCommands", () => {
         expect(mockShowErrorMessage).not.toHaveBeenCalled();
       }
     );
+  });
+
+  /**
+   * NODE CONTROL (Phase 4) — the Start/Stop Node commands. Each takes a
+   * server-bearing tree item, resolves the server's inventory source, and — only
+   * when that source's provider exposes `controlNode` — dispatches through the
+   * PROPAGATING `controlProviderNode` wrapper, then fires a best-effort status
+   * refresh. A server that is not synced, or whose provider has no node control,
+   * is refused with a message rather than offered an action that can only fail.
+   */
+  describe("nexus.inventory.startNode / stopNode", () => {
+    async function setup(
+      opts: {
+        withControl?: boolean;
+        controlNode?: InventoryProvider["controlNode"];
+        noOrigin?: boolean;
+        externalId?: string;
+        secretFieldIds?: string[];
+        secrets?: Record<string, string>;
+      } = {}
+    ) {
+      const withControl = opts.withControl ?? true;
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        ...(opts.noOrigin
+          ? {}
+          : { origin: { sourceId: "src-1", externalId: opts.externalId ?? "/Lab.unl#3", syncedAt: 1 } })
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const controlSpy = vi.fn(async () => {});
+      const provider = makeProvider(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {});
+      registry.register(provider);
+      const vault = makeVault(opts.secrets ?? {});
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [] }));
+      const start = registeredCommands.get("nexus.inventory.startNode")!;
+      const stop = registeredCommands.get("nexus.inventory.stopNode")!;
+      return { core, registry, vault, provider, controlSpy, server, start, stop };
+    }
+
+    it("registers both startNode and stopNode command handlers", async () => {
+      await setup();
+      expect(registeredCommands.get("nexus.inventory.startNode")).toBeTypeOf("function");
+      expect(registeredCommands.get("nexus.inventory.stopNode")).toBeTypeOf("function");
+    });
+
+    it("START dispatches controlNode with the origin's externalId and action 'start', then fires a status refresh for the source (⊘ the wrong externalId controls the wrong node; no refresh leaves the tree stale)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+      const info = mockShowInformationMessage.mock.calls[0]?.[0] as string;
+      expect(info).toContain("R1");
+    });
+
+    it("STOP dispatches controlNode with action 'stop' (⊘ reusing the start action never stops the node)", async () => {
+      const { stop, controlSpy, server } = await setup();
+      await stop({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "stop");
+    });
+
+    it("loads the source's secrets from the vault by secretFieldIds and passes them to controlNode (⊘ dispatching with empty secrets fails auth against the lab server)", async () => {
+      const { start, controlSpy, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+    });
+
+    it("refuses a server whose provider has NO controlNode, with a message, and dispatches nothing (⊘ offering Start/Stop on a NetBox-origin server is an action that can only fail)", async () => {
+      const { start, server } = await setup({ withControl: false });
+      await start({ server });
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    it("refuses a manual (non-synced) server with no origin (⊘ start/stop on a server with no inventory node has nothing to control)", async () => {
+      const { start, controlSpy, server } = await setup({ noOrigin: true });
+      await start({ server });
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(controlSpy).not.toHaveBeenCalled();
+    });
+
+    it("PROPAGATES a controlNode failure into an error message naming the node, and fires NO success info or refresh (⊘ swallowing the failure reports a node that never started as started)", async () => {
+      const { start, server } = await setup({
+        controlNode: vi.fn(async () => {
+          throw new Error("EVE-NG refused the start");
+        })
+      });
+      await start({ server });
+      const msg = mockShowErrorMessage.mock.calls[0]?.[0] as string;
+      expect(msg).toContain("R1");
+      expect(msg).toContain("EVE-NG refused the start");
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    it("P3-4 — wraps the dispatch in withProgress so the '{Starting|Stopping} \"name\"…' title shows DURING the ~60s call, then still dispatches and refreshes (⊘ no withProgress leaves the user staring at a silent UI for the whole login→detect→action sequence)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(mockWithProgress).toHaveBeenCalled();
+      const opts = mockWithProgress.mock.calls[0][0] as { title?: string; location?: unknown };
+      expect(opts.title).toContain("R1");
+      expect(opts.title).toMatch(/starting/i);
+      // The dispatch and refresh still happen through the wrapped task.
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+    });
+
+    it("P3-4 — the success toast is HONEST about the status lag rather than phrased as if the request were about to be sent (⊘ 'Starting \"R1\"…' after the API already returned misreports the timing)", async () => {
+      const { start, server } = await setup();
+      await start({ server });
+      const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(info).toMatch(/sent/i);
+      expect(info).toMatch(/refresh lab status/i);
+    });
+
+    it("M2 — a classified InventoryProviderError surfaces through describeInventoryError, so the failure toast carries the classified prefix (⊘ a bare err.message drops the 'Authentication failed:' classification every other inventory failure shows)", async () => {
+      const { start, server } = await setup({
+        controlNode: vi.fn(async () => {
+          throw new InventoryProviderError("auth", "EVE-NG rejected the credentials");
+        })
+      });
+      await start({ server });
+      const msg = mockShowErrorMessage.mock.calls[0]?.[0] as string;
+      expect(msg).toContain("R1");
+      expect(msg).toContain("Authentication failed:");
+      expect(msg).toContain("EVE-NG rejected the credentials");
+    });
+
+    it("resolves the server from a bare source-less arg via core.getServer when the tree item carries the record id (⊘ a handler that only reads a string id misses the tree-item object VS Code actually passes)", async () => {
+      const { start, controlSpy, server } = await setup();
+      // VS Code passes the ServerTreeItem, whose `.server` is the record — the
+      // handler must read it, not require a string id.
+      await start({ server: { id: server.id } });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+    });
+
+    it("REFUSES to dispatch while the node's source is BUSY (mid-sync/edit/remove) — mirrors refreshStatus's busy-guard so it never races the vault purge or a stale config (⊘ dispatching mid-remove loads partial secrets and names a node whose source was just deleted; mid-edit dispatches a stale baseUrl)", async () => {
+      const { start, controlSpy, server } = await setup();
+      // Open Edit Source on src-1 → it is marked busy ("edit") while the form
+      // stays open (the same technique refreshStatus's busy-guard test uses).
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      await start({ server });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(true);
+    });
+
+    it("DISPATCHES when the source is idle (⊘ a busy-guard that never releases would block every control forever)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+    });
+
+    // The exact wording a sibling command (Sync/Edit/Remove) shows when it finds
+    // the source held by an in-flight control — asserted verbatim so a claim that
+    // records the wrong reason (or none) is unmissable.
+    const BUSY_CONTROL = '"My Source" is currently starting or stopping a node — try again in a moment.';
+
+    it("CLAIMS the source for the whole dispatch — a Sync Now / a second control fired while a control is in flight is refused, and the claim is RELEASED once it settles (⊘ a busy-guard that only READS inFlightSourceIds lets Edit/Remove/Sync race the vault read + control request: stale baseUrl, creds read mid-replacement, or a node whose source was just purged)", async () => {
+      let releaseControl!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseControl = resolve));
+      const controlNode = vi.fn(async () => {
+        await gate;
+      });
+      const { start, provider, server } = await setup({ controlNode });
+      const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
+
+      // Start a control and let it park inside controlNode — the claim is now
+      // held (set synchronously right after the busy check, before the awaited
+      // secrets load + dispatch).
+      const inFlight = start({ server });
+      await vi.waitFor(() => expect(controlNode).toHaveBeenCalledTimes(1));
+
+      // A sibling Sync Now on the same source is refused with the CONTROL-holder
+      // wording (not a running-sync lie) and starts no fetch — the mutation this
+      // guards against is the sync sailing past its own check and racing us.
+      await syncCmd("src-1");
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_CONTROL);
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+
+      // A SECOND control is refused too: controlNode is not entered a second time.
+      await start({ server });
+      expect(controlNode).toHaveBeenCalledTimes(1);
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(true);
+
+      // Release → the claim is freed → a subsequent control dispatches.
+      releaseControl();
+      await inFlight;
+      await start({ server });
+      expect(controlNode).toHaveBeenCalledTimes(2);
+    });
+
+    it("RELEASES the claim even when the control request FAILS — a control after a failed one on the same source is not refused as busy (⊘ deleting the marker only after the !dispatched early-return leaks the claim on every failure, wedging the node forever)", async () => {
+      const controlNode = vi.fn(async () => {
+        throw new Error("EVE-NG refused");
+      });
+      const { start, server } = await setup({ controlNode });
+
+      await start({ server }); // fails inside withProgress → dispatched === false
+      await start({ server }); // must NOT be refused as busy — the finally freed it
+
+      expect(controlNode).toHaveBeenCalledTimes(2);
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(false);
+    });
+
+    it("releases the claim BEFORE the un-awaited refreshStatus fires, so the status refresh is not self-skipped by its own 'control' claim (⊘ firing refreshStatus while the marker is still held makes refreshStatus SKIP the source (~:4413) — the tree never updates after a successful start/stop)", async () => {
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(makeProvider({ controlNode: vi.fn(async () => {}), fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1" }));
+
+      // Route the real refreshStatus through executeCommand so its skip-if-busy
+      // sweep actually runs against the live marker (the default mock only
+      // records the call, so it can't observe the self-skip). mockImplementationOnce
+      // is consumed by controlNode's single executeCommand and does not leak.
+      mockExecuteCommand.mockImplementationOnce((cmd: string, ...rest: unknown[]) =>
+        cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
+      );
+
+      await registeredCommands.get("nexus.inventory.startNode")!({ server });
+
+      // The un-awaited refresh's fetchStatus must run — proof the source was NOT
+      // still held by the 'control' claim when refreshStatus swept it.
+      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+    });
+
+    it("REFUSES a tree item whose server id is no longer in core — a server removed between render and click — instead of dispatching via its stale record (⊘ a `?? withServer.server` fallback fires a control at a just-deleted node's stale origin)", async () => {
+      const { start, controlSpy } = await setup();
+      // The tree item still carries a full, valid-looking record (origin + all),
+      // but its id was removed from core after the row was rendered. The handler
+      // must resolve strictly against the live core and fall through to the
+      // refusal, not trust the stale item.
+      await start({
+        server: { id: "removed-since-render", origin: { sourceId: "src-1", externalId: "/Lab.unl#9", syncedAt: 1 } }
+      });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    // ── #85 P2 (Codex) — capture under configMutationLock, dispatch OUTSIDE it ──
+    // The per-source "control" claim above guards the SOURCE-SCOPED siblings
+    // (Edit/Remove/Sync each honour inFlightSourceIds). But the GLOBAL config
+    // mutations — an id-preserving replace-import and Delete All Data — DELIBERATELY
+    // bypass inFlightSourceIds and serialize ONLY through configMutationLock. So the
+    // secrets+config CAPTURE is taken INSIDE that lock (re-reading the live source and
+    // bailing if its revision moved), while the ~60s provider dispatch stays OUTSIDE
+    // it (the firm I/O-outside-lock invariant refreshStatus/sync also obey).
+
+    it("BAILS without dispatching when a locked writer (replace-import) supersedes the source between handler entry and the under-lock capture — the live revision no longer matches (⊘ dropping the revision guard dispatches against a source swapped out from under it, with a stale baseUrl)", async () => {
+      const { start, controlSpy, core, server } = await setup();
+      const realSource = core.getInventorySource("src-1")!;
+      // The first getInventorySource (handler entry) sees the real record; the
+      // capture's re-read INSIDE configMutationLock sees a DIFFERENT revision —
+      // exactly what an id-preserving replace-import that swapped the source would
+      // present (addOrUpdateInventorySource re-assigns revision via randomUUID()).
+      let calls = 0;
+      vi.spyOn(core, "getInventorySource").mockImplementation((id: string) => {
+        void id;
+        calls += 1;
+        return calls === 1 ? realSource : { ...realSource, revision: "superseded-revision" };
+      });
+      await start({ server });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+      expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(true);
+    });
+
+    it("takes the secrets+config CAPTURE inside configMutationLock — while an unrelated writer holds the lock, no vault read and no dispatch happen; once the lock frees, the capture proceeds and dispatches (⊘ capturing without the lock reads credentials mid-purge, racing Delete All Data's vault wipe)", async () => {
+      const { start, controlSpy, vault, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      // Hold configMutationLock with a gated writer — as completeReset (Delete All
+      // Data) or a replace-import would while purging/swapping under the lock.
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+      const held = configMutationLock.runExclusive(async () => {
+        await gate;
+      });
+      await Promise.resolve(); // let the gated writer actually acquire the lock
+
+      const inFlight = start({ server });
+      try {
+        // Give controlNode room to run up to (and queue behind) the held lock.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        // The lock is held → the capture is queued behind it → NO vault read, NO dispatch.
+        expect(vault.get).not.toHaveBeenCalled();
+        expect(controlSpy).not.toHaveBeenCalled();
+      } finally {
+        // Always free the shared configMutationLock singleton, even if an
+        // assertion above threw — otherwise a red run would wedge every later test.
+        releaseGate();
+        await held;
+        await inFlight;
+      }
+      // Release → the capture runs → the vault read happens → the dispatch proceeds.
+      expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "password"));
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+    });
+
+    it("revision STABLE across handler entry and the under-lock re-read → the capture succeeds and dispatch proceeds with the source's secrets, no 'changed' refusal (⊘ a spurious bail would refuse every ordinary control)", async () => {
+      const { start, controlSpy, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+      expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(false);
+    });
   });
 });
 

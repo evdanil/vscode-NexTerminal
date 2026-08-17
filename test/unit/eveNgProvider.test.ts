@@ -1949,3 +1949,172 @@ describe("createEveNgProvider — fetchStatus", () => {
     expect(report.truncated).toBeFalsy();
   });
 });
+
+/**
+ * NODE CONTROL (Phase 4) — `controlNode` starts/stops one lab node. Community is
+ * the certified path (GET .../nodes/{id}/start|stop); Pro is edition-aware but
+ * PRELIMINARY (PUT + stopmode), matching the existing Pro-preliminary stance.
+ * The externalId is `${lab.path}#${nodeId}` and is split on the LAST `#`.
+ */
+interface ControlWorldOpts {
+  version?: string;
+  edition?: string;
+  /** HTTP status the node-action endpoint answers with (default 200). */
+  actionHttp?: number;
+  /** When set, the action endpoint returns a JSend `status:"fail"` envelope. */
+  actionFail?: boolean;
+  /**
+   * When set, the FIRST node-action request 401s (an expired session) and every
+   * later one succeeds — exercises `authedRequest`'s single silent re-login.
+   */
+  actionFirst401?: boolean;
+}
+
+function controlWorld(opts: ControlWorldOpts = {}): { fetchImpl: typeof fetch; calls: Call[] } {
+  const calls: Call[] = [];
+  let actionHits = 0;
+  const impl = async (input: string, init?: RequestInit): Promise<unknown> => {
+    const url = new URL(input);
+    const path = decodeURIComponent(url.pathname);
+    calls.push({
+      url: input,
+      method: (init?.method ?? "GET").toUpperCase(),
+      headers: (init?.headers ?? {}) as Record<string, string>,
+      body: typeof init?.body === "string" ? init.body : undefined
+    });
+    if (path === "/api/auth/login") {
+      return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}; Path=/; HttpOnly`]);
+    }
+    if (path === "/api/status") {
+      const data: Record<string, unknown> = { version: opts.version ?? "5.0.1-13" };
+      if (opts.edition !== undefined) {
+        data.edition = opts.edition;
+      }
+      return makeResponse(200, jsend(data));
+    }
+    // Any /api/labs/.../nodes/{id}/{action} endpoint is the control call.
+    actionHits++;
+    if (opts.actionFirst401 && actionHits === 1) {
+      return makeResponse(401, "session expired");
+    }
+    const http = opts.actionHttp ?? 200;
+    if (http !== 200) {
+      return makeResponse(http, "control failed");
+    }
+    if (opts.actionFail) {
+      return makeResponse(200, { code: 400, status: "fail", message: "cannot start node" });
+    }
+    return makeResponse(200, jsend(true));
+  };
+  return { fetchImpl: impl as unknown as typeof fetch, calls };
+}
+
+/** Login requests seen so far. */
+function loginCount(calls: Call[]): number {
+  return calls.filter((c) => c.url.endsWith("/api/auth/login")).length;
+}
+
+/** The single node-action request (everything that is not login or /api/status). */
+function actionCall(calls: Call[]): Call | undefined {
+  return calls.find((c) => c.url.includes("/nodes/") && !c.url.endsWith("/api/status"));
+}
+
+describe("createEveNgProvider — controlNode", () => {
+  it("Community START issues GET /api/labs/{path}/nodes/{id}/start with the label URL-encoded (⊘ the wrong verb/path never starts the node; a bare id targets the wrong lab's node 1)", async () => {
+    const { fetchImpl, calls } = controlWorld();
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab 1.unl#7", "start");
+    const call = actionCall(calls);
+    expect(call?.method).toBe("GET");
+    expect(new URL(call!.url).pathname).toBe("/api/labs/Lab%201.unl/nodes/7/start");
+  });
+
+  it("Community STOP issues GET .../nodes/{id}/stop (⊘ reusing the start path stops nothing)", async () => {
+    const { fetchImpl, calls } = controlWorld();
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab 1.unl#7", "stop");
+    const call = actionCall(calls);
+    expect(call?.method).toBe("GET");
+    expect(decodeURIComponent(new URL(call!.url).pathname)).toBe("/api/labs/Lab 1.unl/nodes/7/stop");
+  });
+
+  it("splits the externalId on the LAST '#', so a lab path (or node) that itself contains '#' still resolves the right node (⊘ splitting on the FIRST '#' truncates the lab path)", async () => {
+    const { fetchImpl, calls } = controlWorld();
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/A#B/Lab.unl#42", "start");
+    const call = actionCall(calls);
+    expect(decodeURIComponent(new URL(call!.url).pathname)).toBe("/api/labs/A#B/Lab.unl/nodes/42/start");
+  });
+
+  it("rejects a malformed externalId with a protocol error rather than firing a request at a bad path (⊘ a missing '#' or empty half silently hits /nodes//start)", async () => {
+    const provider = createEveNgProvider(controlWorld().fetchImpl);
+    for (const bad of ["no-hash", "#7", "/Lab.unl#", ""]) {
+      const err = await provider.controlNode!(CONFIG, SECRETS, bad, "start").then(() => undefined, (e) => e);
+      expect(err, bad).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, bad).toBe("protocol");
+    }
+  });
+
+  it("maps a JSend status:\"fail\" envelope on the action to an error, so a refused start surfaces (⊘ ignoring the envelope reports a failed start as success)", async () => {
+    const { fetchImpl } = controlWorld({ actionFail: true });
+    await expect(createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start")).rejects.toBeInstanceOf(
+      InventoryProviderError
+    );
+  });
+
+  it("maps a non-2xx action response to an error (⊘ a 500 that is not surfaced leaves the user thinking the node started)", async () => {
+    const { fetchImpl } = controlWorld({ actionHttp: 500 });
+    await expect(createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "stop")).rejects.toBeInstanceOf(
+      InventoryProviderError
+    );
+  });
+
+  it("reuses the login cookie on the action request, exactly like the other paths (⊘ dropping the cookie 401s the control call)", async () => {
+    const { fetchImpl, calls } = controlWorld();
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start");
+    const call = actionCall(calls);
+    expect(call?.headers.Cookie).toBe(`unetlab_session=${SESSION}`);
+  });
+
+  it("re-logs in ONCE and retries when the node-action request 401s, and the control still succeeds (⊘ authedRequest without the silent re-login surfaces the first expired-session 401 as an auth failure, so a Start that a single re-login would have saved is reported as failed)", async () => {
+    const { fetchImpl, calls } = controlWorld({ actionFirst401: true });
+    // Resolves (no throw) only because the 401 triggered a re-login + retry.
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start");
+    // The initial login plus exactly one silent re-login off the 401.
+    expect(loginCount(calls)).toBe(2);
+    // The action endpoint was hit twice: the 401 and the successful retry.
+    expect(calls.filter((c) => c.url.includes("/nodes/")).length).toBe(2);
+  });
+
+  it("Pro (PRELIMINARY) uses PUT for START, faithful to the edition-aware evengsdk verbs (⊘ falling back to the Community GET path is the un-edition-aware bug)", async () => {
+    const { fetchImpl, calls } = controlWorld({ version: "5.0.1-24-pro" });
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start");
+    const call = actionCall(calls);
+    expect(call?.method).toBe("PUT");
+    expect(decodeURIComponent(new URL(call!.url).pathname)).toBe("/api/labs/Lab.unl/nodes/1/start");
+  });
+
+  it("Pro (PRELIMINARY) STOP carries stopmode=3 in the PUT body (⊘ omitting stopmode is the Pro-shape divergence Phase 3 will certify)", async () => {
+    const { fetchImpl, calls } = controlWorld({ version: "5.0.1-24-pro" });
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "stop");
+    const call = actionCall(calls);
+    expect(call?.method).toBe("PUT");
+    expect(decodeURIComponent(new URL(call!.url).pathname)).toBe("/api/labs/Lab.unl/nodes/1/stop");
+    expect(JSON.parse(call?.body ?? "{}")).toMatchObject({ stopmode: 3 });
+  });
+
+  it("treats an UNKNOWN edition as Community best-effort — a GET start (⊘ failing closed on an absent /api/status blocks control on every older build)", async () => {
+    const { fetchImpl, calls } = controlWorld({ version: "" });
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start");
+    const call = actionCall(calls);
+    expect(call?.method).toBe("GET");
+  });
+
+  it("maps a rejected login to an InventoryProviderError before any action request (⊘ letting a raw fetch/JSend error escape the command path)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path.endsWith("/api/auth/login")) return makeResponse(401, "denied");
+      return makeResponse(404, "not found");
+    }) as unknown as typeof fetch;
+    await expect(createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start")).rejects.toBeInstanceOf(
+      InventoryProviderError
+    );
+  });
+});

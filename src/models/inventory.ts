@@ -244,6 +244,22 @@ export interface InventoryProvider {
    * breaking the refresh path, exactly like `instanceKey`.
    */
   fetchStatus?(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport>;
+  /**
+   * NODE CONTROL (Phase 4) — OPTIONAL. Start or stop ONE device, keyed by the
+   * same `externalId` `fetchInventory`/`fetchStatus` use. Unlike `fetchStatus`
+   * this MUTATES the source, so its ONLY sanctioned caller is
+   * `controlProviderNode` below — which, DELIBERATELY UNLIKE
+   * `fetchProviderStatus`, PROPAGATES a failure rather than degrading it to a
+   * no-op: a start/stop the user issued that did not happen must surface as an
+   * error, not vanish. A provider that does not implement it offers no node
+   * control (NetBox); the Start/Stop commands guard on it and stay hidden.
+   */
+  controlNode?(
+    config: InventorySourceValues,
+    secrets: InventorySourceSecrets,
+    externalId: string,
+    action: "start" | "stop"
+  ): Promise<void>;
 }
 
 /**
@@ -430,6 +446,36 @@ export async function fetchProviderStatus(
     return undefined;
   }
   return validateInventoryStatusReport(raw);
+}
+
+/**
+ * NODE CONTROL (Phase 4) — the ONE sanctioned way to invoke
+ * `InventoryProvider.controlNode`, the MUTATING twin of `fetchProviderStatus`.
+ * TWO deliberate divergences from that read-only wrapper:
+ *  - it PROPAGATES failures. A start/stop is a user-initiated action, not a
+ *    background poll: if it fails the user must be told, so — unlike the status
+ *    refresh, which degrades every flaky-lab error to "no update" so it can
+ *    never nag — the provider's throw is rethrown as-is.
+ *  - a provider with NO `controlNode` is a THROW, not a silent no-op, so a
+ *    caller that reached here without first guarding on the capability gets a
+ *    clear "not supported" error rather than a command that appears to succeed
+ *    while doing nothing.
+ * Like the status wrapper, the provider is handed a `structuredClone` of the
+ * config so an in-place normalization cannot mutate the caller's stored source
+ * config — but the clone is OUTSIDE any try, matching the propagate-everything
+ * stance: a non-cloneable config surfaces rather than masquerading as success.
+ */
+export async function controlProviderNode(
+  provider: Pick<InventoryProvider, "controlNode">,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets,
+  externalId: string,
+  action: "start" | "stop"
+): Promise<void> {
+  if (typeof provider.controlNode !== "function") {
+    throw new Error("This inventory source does not support node control.");
+  }
+  await provider.controlNode(structuredClone(config), secrets, externalId, action);
 }
 
 export type InventoryErrorKind = "auth" | "network" | "protocol";

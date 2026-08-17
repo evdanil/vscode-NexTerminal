@@ -1253,3 +1253,185 @@ describe("ServerTreeItem BMC ipmi contextValue marker", () => {
     expect(new ServerTreeItem(makeServer({ id: "c" }), true).contextValue).toBe("nexus.serverConnected");
   });
 });
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — an EVE-origin server whose running/stopped
+ * state is KNOWN gets a `.eveRunning` / `.eveStopped` marker APPENDED (after any
+ * `.ipmi`), so the Start/Stop Node menu entries can be gated by state. The
+ * marker is emitted ONLY for an EVE-origin server with a known status: a non-EVE
+ * server (even one that somehow carries a status) and a freshly-synced EVE
+ * server with no status yet get NOTHING — the user runs Refresh Lab Status
+ * first, so we never offer an action blind. The final constructor arg carries
+ * the caller-resolved "this origin is an eve-ng source" signal.
+ */
+describe("ServerTreeItem EVE node-control contextValue marker", () => {
+  // Positional args: (server, connected, lookup, showDesc, authName, authUser,
+  // syncedName, ipmiAuthName, status, isEveOrigin).
+  function item(
+    opts: { connected?: boolean; ipmiHost?: string; status?: "running" | "stopped"; isEveOrigin?: boolean } = {}
+  ): ServerTreeItem {
+    return new ServerTreeItem(
+      makeServer({ id: "s", ...(opts.ipmiHost ? { ipmiHost: opts.ipmiHost } : {}) }),
+      opts.connected ?? false,
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      opts.status,
+      opts.isEveOrigin
+    );
+  }
+
+  it("appends .eveRunning for an EVE-origin RUNNING server and .eveStopped for a stopped one (⊘ no marker means Start/Stop can never be gated by state)", () => {
+    expect(item({ isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.server.eveRunning");
+    expect(item({ isEveOrigin: true, status: "stopped" }).contextValue).toBe("nexus.server.eveStopped");
+  });
+
+  it("emits NO eve marker for an EVE-origin server whose status is UNKNOWN (⊘ offering Start/Stop before a status refresh acts blind)", () => {
+    expect(item({ isEveOrigin: true, status: undefined }).contextValue).toBe("nexus.server");
+  });
+
+  it("emits NO eve marker for a NON-EVE server even when a status is somehow set (⊘ a status dot on a NetBox server must never light up node control it does not support)", () => {
+    expect(item({ isEveOrigin: false, status: "running" }).contextValue).toBe("nexus.server");
+    expect(item({ isEveOrigin: undefined, status: "stopped" }).contextValue).toBe("nexus.server");
+  });
+
+  it("composes with .ipmi in the fixed order nexus.server[.ipmi][.eveRunning|.eveStopped] (⊘ a wrong order or a dropped .ipmi breaks the BMC and node-control gates simultaneously)", () => {
+    expect(item({ isEveOrigin: true, status: "running", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveRunning");
+    expect(item({ isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveStopped");
+  });
+
+  it("composes with the connected base string (⊘ a connected running EVE node must still expose Stop)", () => {
+    expect(item({ connected: true, isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.serverConnected.eveRunning");
+    expect(item({ connected: true, isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe(
+      "nexus.serverConnected.ipmi.eveStopped"
+    );
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — P2 review finding. The direct-constructor
+ * tests above pin the marker COMPOSITION but never exercise the SNAPSHOT WIRING
+ * that decides `isEveOrigin`: the resolution `snapshot.inventorySources` →
+ * `providerId === "eve-ng"` → constructor arg lives in `toServerItem`, and
+ * without a `getChildren`/`toServerItem` end-to-end test it is entirely
+ * unpinned. These tests drive the provider from a real snapshot so the following
+ * feature-killing mutations each DIE here:
+ *   - `isEveOrigin = false` (marker never emitted → Start/Stop dead in the UI),
+ *   - `isEveOrigin = originSource !== undefined` (any synced origin, e.g. NetBox,
+ *     lights up node control it does not support),
+ *   - the `"eve-ng"` literal typo'd (e.g. `"eveng"`) → never matches a real source,
+ *   - the `isEveOrigin` constructor arg at the ServerTreeItem call dropped
+ *     (defaults to false) → marker never reaches the item.
+ */
+describe("NexusTreeProvider EVE node-control marker — end-to-end snapshot wiring", () => {
+  function providerWith(
+    servers: ServerConfig[],
+    inventorySources: Array<{ id: string; providerId: string; name: string }>,
+    serverStatus: Map<string, "running" | "stopped">
+  ): NexusTreeProvider {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers,
+      inventorySources: inventorySources.map((s) => ({
+        ...s,
+        targetFolder: "",
+        prunePolicy: "orphan",
+        defaultUsername: "admin",
+        config: {},
+        secretFieldIds: []
+      })),
+      serverStatus
+    } as any);
+    return provider;
+  }
+
+  function serverItemById(provider: NexusTreeProvider, id: string): ServerTreeItem {
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    return children.find((c) => c instanceof ServerTreeItem && c.server.id === id) as ServerTreeItem;
+  }
+
+  it("resolves an eve-ng inventory source through origin.sourceId → providerId and stamps .eveRunning / .eveStopped from serverStatus (⊘ a broken isEveOrigin resolution, a typo'd 'eve-ng' literal, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
+    const provider = providerWith(
+      [
+        makeServer({ id: "run", name: "R1", origin: { sourceId: "eve-src", externalId: "/Lab.unl#1", syncedAt: 1 } }),
+        makeServer({ id: "stop", name: "R2", origin: { sourceId: "eve-src", externalId: "/Lab.unl#2", syncedAt: 1 } })
+      ],
+      [{ id: "eve-src", providerId: "eve-ng", name: "My EVE" }],
+      new Map<string, "running" | "stopped">([
+        ["run", "running"],
+        ["stop", "stopped"]
+      ])
+    );
+    expect(serverItemById(provider, "run").contextValue).toBe("nexus.server.eveRunning");
+    expect(serverItemById(provider, "stop").contextValue).toBe("nexus.server.eveStopped");
+  });
+
+  it("emits NO eve marker for a NON-eve-ng (e.g. netbox) source even when serverStatus carries a state (⊘ isEveOrigin = (originSource !== undefined) would light up node control on a NetBox-origin server that has no controlNode)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "nb", name: "N1", origin: { sourceId: "nb-src", externalId: "device:1", syncedAt: 1 } })],
+      [{ id: "nb-src", providerId: "netbox", name: "My NetBox" }],
+      new Map<string, "running" | "stopped">([["nb", "running"]])
+    );
+    expect(serverItemById(provider, "nb").contextValue).toBe("nexus.server");
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — M3. An EVE-origin node's tooltip carries a
+ * labeled "Lab status:" line so a freshly-synced node (unknown status) hints
+ * that Refresh Lab Status is what unlocks Start/Stop. Non-EVE nodes get no such
+ * line. isEveOrigin is the final constructor arg.
+ */
+describe("ServerTreeItem EVE lab-status tooltip line", () => {
+  function tip(opts: { status?: "running" | "stopped"; isEveOrigin?: boolean }): string {
+    return new ServerTreeItem(
+      makeServer({ id: "s", origin: { sourceId: "eve", externalId: "/L.unl#1", syncedAt: 1 } }),
+      false, undefined, true, undefined, undefined, undefined, undefined, opts.status, opts.isEveOrigin
+    ).tooltip as string;
+  }
+
+  it("shows 'Lab status: running' for a running EVE node (⊘ no lab-status line leaves running/stopped undiscoverable in the tooltip)", () => {
+    expect(tip({ isEveOrigin: true, status: "running" })).toContain("Lab status: running");
+  });
+
+  it("shows 'Lab status: stopped' for a stopped EVE node", () => {
+    expect(tip({ isEveOrigin: true, status: "stopped" })).toContain("Lab status: stopped");
+  });
+
+  it("shows 'Lab status: unknown — run Refresh Lab Status' for a freshly-synced EVE node with no status yet (⊘ a silent tooltip gives no hint that Refresh Lab Status unlocks Start/Stop)", () => {
+    expect(tip({ isEveOrigin: true, status: undefined })).toContain("Lab status: unknown — run Refresh Lab Status");
+  });
+
+  it("adds NO lab-status line for a non-EVE node even when a status is set (⊘ a Lab status line on a NetBox server invents a lab it does not have)", () => {
+    expect(tip({ isEveOrigin: false, status: "running" })).not.toContain("Lab status:");
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — M4. Stopped-ness is now load-bearing (it is
+ * the premise for "Start Node"), so a stopped node gets an explicit
+ * " (stopped)" description suffix mirroring the existing " (running)". A node
+ * with no status still gets neither.
+ */
+describe("ServerTreeItem stopped description suffix", () => {
+  function desc(status: "running" | "stopped" | undefined): string | undefined {
+    return new ServerTreeItem(makeServer({ id: "s" }), false, undefined, true, undefined, undefined, undefined, undefined, status)
+      .description;
+  }
+
+  it("appends ' (running)' for a running node and ' (stopped)' for a stopped node (⊘ no stopped suffix leaves a connected+stopped row showing a green plug and a Start menu with no state text)", () => {
+    expect(desc("running")).toContain("(running)");
+    expect(desc("stopped")).toContain("(stopped)");
+    // The two states must be distinct — a stopped node must NOT read as running.
+    expect(desc("stopped")).not.toContain("(running)");
+  });
+
+  it("appends NEITHER suffix for a node with no status (⊘ a state suffix on a non-status server invents state it lacks)", () => {
+    expect(desc(undefined)).not.toContain("(running)");
+    expect(desc(undefined)).not.toContain("(stopped)");
+  });
+});

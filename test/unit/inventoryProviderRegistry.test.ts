@@ -146,6 +146,28 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(makeProvider({ fetchStatus: 42 as never }))).toThrow(/fetchStatus/);
   });
 
+  // controlNode provider capability (Phase 4) — the twin of the fetchStatus
+  // clause. OPTIONAL (only EVE-NG implements node control); a non-function value
+  // under that name IS an error, loudly, for the same reason fetchStatus's is: a
+  // typo'd `controlNode` would otherwise be indistinguishable at runtime from a
+  // provider that never declared one, and the symptom (Start/Stop silently doing
+  // nothing) is invisible until a user wonders why a node never boots.
+  it("accepts a provider with NO controlNode — it is optional (kills making it required, which would break every provider that offers no node control)", () => {
+    const provider = makeProvider();
+    expect(provider.controlNode).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("accepts a provider WITH a function controlNode", () => {
+    const provider = makeProvider({ controlNode: async () => {} });
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function controlNode loudly (kills a silent degrade for a typo'd `controlNode` that is not callable)", () => {
+    expect(() => validateProviderShape(makeProvider({ controlNode: "start" as never }))).toThrow(/controlNode/);
+    expect(() => validateProviderShape(makeProvider({ controlNode: 42 as never }))).toThrow(/controlNode/);
+  });
+
   // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
   // the field contract now, so a malformed one must be caught at the
   // registration boundary rather than silently coerced when the Add form reads
