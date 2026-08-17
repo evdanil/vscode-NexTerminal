@@ -247,13 +247,35 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   const obj = item as Record<string, unknown>;
+  // TELNET (Phase 0) — a CLOSED ENUM, the `SerialProfile.mode` disposition
+  // rather than `bmcWebProtocol`'s tolerant type check, and the difference is
+  // deliberate. `bmcWebProtocol` only ever picks a URL scheme, and its read site
+  // neutralizes an unknown value to the safe default; `protocol` selects the
+  // whole TRANSPORT and, with it, whether the auth machinery runs at all. A
+  // record naming a transport this build does not implement is one whose author
+  // meant something we cannot honour, so it is rejected here rather than
+  // silently demoted to SSH — which for a device that only speaks telnet would
+  // mean handing its credentials to a service that is not listening.
+  //
+  // Absent is valid and means `"ssh"` (see `resolveServerProtocol`), so no
+  // record written before this field existed is affected.
+  if (obj.protocol !== undefined && obj.protocol !== "ssh" && obj.protocol !== "telnet") {
+    return false;
+  }
   if (
     !(
       isNonEmptyString(obj.id) &&
       isNonEmptyString(obj.name) &&
       isNonEmptyString(obj.host) &&
       isValidPort(obj.port) &&
-      isNonEmptyString(obj.username) &&
+      // TELNET (Phase 0) — the ONE field this feature relaxes. Telnet has no
+      // protocol-level login: the user logs in at the device's own prompt, in
+      // the terminal, so the server form never collects a username for a telnet
+      // record and the submission carries none. Requiring a non-empty one here
+      // would drop every telnet server at the storage/import boundary. Still
+      // required to BE a string for either protocol — a missing member is
+      // malformed whatever the transport.
+      (obj.protocol === "telnet" ? typeof obj.username === "string" : isNonEmptyString(obj.username)) &&
       (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
     )
   ) {

@@ -616,7 +616,16 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
   const host = typeof values.host === "string" ? values.host.trim() : "";
   const username = typeof values.username === "string" ? values.username.trim() : "";
   const normalizedGroup = normalizeOptionalFolderPath(values.group);
-  if (!name || !host || !username) {
+  // TELNET (Phase 0) — only `"telnet"` is stored. `"ssh"` is the default the
+  // absent field already means, and writing it explicitly would put a member on
+  // every server record no build before this one understands (the same rule
+  // `bmcWebProtocol` follows below). Anything else the submission carries is not
+  // a transport we implement, so it reads as the default.
+  const isTelnet = values.protocol === "telnet";
+  // A telnet server has no protocol-level login, so the form DISABLES the
+  // username control for one — a disabled control submits nothing, and the
+  // save must not reject the record over a field it never asked for.
+  if (!name || !host || (!username && !isTelnet)) {
     return undefined;
   }
   if (normalizedGroup === null) {
@@ -627,6 +636,7 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     name,
     host,
     port: typeof values.port === "number" ? values.port : 22,
+    protocol: isTelnet ? "telnet" : undefined,
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,

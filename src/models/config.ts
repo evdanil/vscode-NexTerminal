@@ -2,6 +2,8 @@ import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import type * as vscode from "vscode";
 
 export type AuthType = "password" | "key" | "agent";
+/** How a `ServerConfig` opens its terminal. See `ServerConfig.protocol`. */
+export type ServerProtocol = "ssh" | "telnet";
 export type TunnelConnectionMode = "isolated" | "shared" | "ask";
 export type ResolvedTunnelConnectionMode = Exclude<TunnelConnectionMode, "ask">;
 export type TunnelType = "local" | "reverse" | "dynamic";
@@ -491,12 +493,54 @@ export function resolveBmcWebProtocol(server: Pick<ServerConfig, "bmcWebProtocol
   return (server.bmcWebProtocol as unknown) === "http" ? "http" : "https";
 }
 
+/**
+ * The protocol a server's terminal ACTUALLY opens with, applied at every read
+ * site (the untrusted-field discipline `resolveBmcWebProtocol` sets): absent, a
+ * non-string, or anything outside the two literals resolves to `"ssh"` — the
+ * compatibility default, and the one every record written before the field
+ * existed implies. `"telnet"` is the only value that changes the transport, and
+ * only when it is spelled exactly.
+ *
+ * `validateServerConfig` is STRICTER than this (it rejects a record carrying a
+ * third value outright, the closed-enum disposition `SerialProfile.mode` gets),
+ * and the two are not in tension: the guard is what should stop such a value
+ * existing, this is what stops one that slipped past it from choosing a
+ * transport.
+ */
+export function resolveServerProtocol(server: Pick<ServerConfig, "protocol">): ServerProtocol {
+  return (server.protocol as unknown) === "telnet" ? "telnet" : "ssh";
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
   group?: string;
   host: string;
   port: number;
+  /**
+   * TELNET (Phase 0) — which transport this server's terminal opens. ABSENT
+   * MEANS `"ssh"`, so every record written before this field existed keeps
+   * working untouched and there is no migration.
+   *
+   * A `"telnet"` server takes an ENTIRELY different connect path
+   * (`TelnetPty`, services/telnet/telnetPty.ts): no `SilentAuthSshFactory`, no
+   * password prompt, no vault read, and none of the SSH-only machinery —
+   * tunnels, SFTP, jump hosts, cwd sync, multiplexing — applies to it. Telnet
+   * has no protocol-level login at all, so `username`/`authType`/`keyPath`/
+   * `authProfileId` are inapplicable rather than optional: the server form hides
+   * them, and a telnet record's `username` is legitimately blank (the one place
+   * `validateServerConfig` relaxes for this field).
+   *
+   * UNTRUSTED at every read site, like `bmcWebProtocol`: go through
+   * `resolveServerProtocol()`, never a direct read, so a hand-edited backup
+   * cannot name a third transport.
+   *
+   * Written by inventory sync, unlike `bmcWebProtocol` — a device that reports
+   * only a telnet endpoint maps to a telnet server. That write carries the
+   * `ServerOrigin.syncedProtocol` stamp and the ownership matrix that goes with
+   * it, so a user who switches a synced server's protocol by hand keeps it.
+   */
+  protocol?: ServerProtocol;
   /**
    * ALTERNATE HOST (issue #48) — an OPTIONAL, ADDITIVE second SSH address tried
    * as a fallback when the primary `host` is unreachable at the TCP/DNS level
@@ -892,6 +936,10 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.group === b.group &&
     a.host === b.host &&
     a.port === b.port &&
+    // TELNET (Phase 0) — present-vs-absent is a DIFFERENCE: absent means ssh, so
+    // a comparator that skipped this field would call a server the user just
+    // switched to telnet "unchanged" and a rollback would put it back on SSH.
+    a.protocol === b.protocol &&
     a.altHost === b.altHost &&
     a.username === b.username &&
     a.authType === b.authType &&
@@ -941,6 +989,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.group !== batchSnapshot.group) merged.group = current.group;
   if (current.host !== batchSnapshot.host) merged.host = current.host;
   if (current.port !== batchSnapshot.port) merged.port = current.port;
+  if (current.protocol !== batchSnapshot.protocol) merged.protocol = current.protocol;
   if (current.altHost !== batchSnapshot.altHost) merged.altHost = current.altHost;
   if (current.username !== batchSnapshot.username) merged.username = current.username;
   if (current.authType !== batchSnapshot.authType) merged.authType = current.authType;
