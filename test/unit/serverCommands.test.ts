@@ -535,6 +535,36 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(removeServer).toHaveBeenCalledWith("srv-1");
   });
 
+  it("(#84 P1) rename re-reads the LIVE record under the lock and applies only the name — a console-port heal that lands while the input box is open is NOT reverted (⊘ committing the form-captured snapshot clobbers the healed port with the stale one)", async () => {
+    // The record the user's context-menu click captured — a telnet node at its
+    // pre-heal console port.
+    const captured = makeServer({ name: "old-name", host: "10.0.0.9", port: 32769, protocol: "telnet" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [captured] });
+    registerServerCommands(ctx);
+
+    // While the rename input box is open, a background status-refresh heals the
+    // console port on the LIVE record (a fresh object replaces the map entry).
+    (vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      await ctx.core.addOrUpdateServer({ ...captured, port: 32800, origin: { sourceId: "s", externalId: "e", syncedAt: 2, syncedHost: "10.0.0.9", syncedPort: 32800 } });
+      return "new-name";
+    });
+
+    // The rename is submitted with the STALE captured snapshot (ServerTreeItem
+    // returns arg.server verbatim), exactly as the context-menu path does.
+    await registeredCommands.get("nexus.server.rename")!(new ServerTreeItem(captured, false));
+
+    // The heal survives, and only the name changed.
+    const live = ctx.core.getServer("srv-1");
+    expect(live?.name).toBe("new-name");
+    expect(live?.port).toBe(32800);
+    expect(live?.origin?.syncedPort).toBe(32800);
+    // The last write must have been the merge of the LIVE record + name, never the
+    // form-captured 32769 snapshot.
+    const lastWrite = addOrUpdateServer.mock.calls.at(-1)?.[0] as ServerConfig;
+    expect(lastWrite.port).toBe(32800);
+    expect(lastWrite.name).toBe("new-name");
+  });
+
   it("(P1, remove-lock-picker-fallback fix) remove command re-checks server presence inside the lock and bails out with an info message — never falls through to an interactive picker or performs any teardown/vault/removal work — when the record was deleted while the confirmation modal or the lock wait was pending", async () => {
     const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
       profiles: [],

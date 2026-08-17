@@ -2252,7 +2252,23 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === server.name) {
         return;
       }
-      await ctx.core.addOrUpdateServer({ ...server, name: newName.trim() });
+      const trimmedName = newName.trim();
+      // #84 P1 (Codex) — serialize under configMutationLock like every other
+      // server writer, and RE-READ the live record inside the lock, applying ONLY
+      // the name. `server` was captured before the input box opened; a background
+      // status-refresh port-heal (or any concurrent write) may have replaced the
+      // live host/port/stamps since. Committing the form-captured full snapshot
+      // would revert the heal and point the next connect at the stale console
+      // port — a data-loss race the heal's own lock cannot close from its side.
+      // rename holds no lock of its own and runs after the input box resolves, so
+      // there is no re-entrancy / interactive-UI-under-lock hazard.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getServer(server.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed, while the input box was open
+        }
+        await ctx.core.addOrUpdateServer({ ...live, name: trimmedName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.group.rename", async (arg?: unknown) => {
