@@ -377,7 +377,10 @@ describe("device template auth cascade — §4.4", () => {
       expect(p.warnings.some((w) => w.includes("device template") && w.includes('"B"'))).toBe(true);
     }
 
-    // Unmapped-pass variant: the device is present but endpoint-less this fetch.
+    // ADDRESSLESS (Codex P1) — variant: the device is present but endpoint-less
+    // this fetch, so its owned server DOWNGRADES to an addressless placeholder
+    // and carries the (keyless) link forward. The keyless-key unlink is deferred
+    // to the addressed upgrade, when there is actually a console to connect to.
     const unmapped = plan({
       source: makeSource({ templateRules: [rule("tmpl-1")] }),
       devices: [makeDevice({ endpoints: [] })],
@@ -385,7 +388,9 @@ describe("device template auth cascade — §4.4", () => {
       templates: [template({ authProfileId: { mode: "fill", value: "B" } })],
       authProfiles: [keylessB]
     });
-    expect(afterFor(unmapped, linkedB.id)!.authProfileId).toBeUndefined();
+    const uAfter = afterFor(unmapped, linkedB.id)!;
+    expect(uAfter.addressless).toBe(true);
+    expect(uAfter.authProfileId).toBe("B");
   });
 
   it("Fixture 14c — a RETAINED sync-owned link (its rule gone) to a now-keyless profile is rolled back; a hand link is NOT (kills a scan drawn only from current rules, and one that forgets to stay sync-owned)", () => {
@@ -462,15 +467,21 @@ describe("device template auth cascade — §4.4", () => {
         authProfile: keylessS
       });
 
-    for (const kEndpointless of [false, true]) {
-      const p = runWith(kEndpointless);
-      expect(afterFor(p, kId)!.authProfileId).toBeUndefined(); // K unlinked
-      expect((afterFor(p, xId) ?? X).authProfileId).toBe("S"); // X retains (own key)
-      // No NEW link to S stamped anywhere (AUTH 1b still refuses the keyless stamp).
-      expect(p.adds.every((a) => a.authProfileId !== "S")).toBe(true);
-      // Warning names S with the SOURCE referrer wording ("servers this source creates").
-      expect(p.warnings.some((w) => w.includes('"S"') && w.includes("servers this source creates"))).toBe(true);
-    }
+    // MAPPED: K has an endpoint → the mapped AUTH 2b unlinks its keyless link.
+    const mapped = runWith(false);
+    expect(afterFor(mapped, kId)!.authProfileId).toBeUndefined(); // K unlinked
+    expect((afterFor(mapped, xId) ?? X).authProfileId).toBe("S"); // X retains (own key)
+    expect(mapped.adds.every((a) => a.authProfileId !== "S")).toBe(true);
+    expect(mapped.warnings.some((w) => w.includes('"S"') && w.includes("servers this source creates"))).toBe(true);
+
+    // ADDRESSLESS (Codex P1): K has no endpoint → it DOWNGRADES to an addressless
+    // placeholder and carries the keyless link forward (unlink deferred to the
+    // addressed upgrade). X (own key, still mapped) is unaffected.
+    const addressless = runWith(true);
+    const kAfter = afterFor(addressless, kId)!;
+    expect(kAfter.addressless).toBe(true);
+    expect(kAfter.authProfileId).toBe("S");
+    expect((afterFor(addressless, xId) ?? X).authProfileId).toBe("S");
   });
 
   it("Fixture 14d — a sync-time OVERRIDE move onto a keyless profile is judged PER TARGET: own-key moves, no-own-key stays + warns; a FILL rule never stamps it (kills the blanket per-profile refusal and its 'generalize onto fill' inverse)", () => {

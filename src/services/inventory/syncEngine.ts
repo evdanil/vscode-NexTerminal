@@ -25,6 +25,15 @@ import {
 
 export const ORPHAN_FOLDER_NAME = "_orphaned";
 
+/**
+ * ADDRESSLESS (Codex P1 on #82) — the sentinel port an addressless placeholder
+ * carries. `ServerConfig.port` is a required `number`, so a value is needed;
+ * `0` is never a valid connect target (`isValidPort` rejects it), and
+ * `validateServerConfig` skips the port check entirely when `addressless` is
+ * true, so it never has to pass.
+ */
+const ADDRESSLESS_PORT = 0;
+
 export interface ComputeSyncPlanInput {
   source: InventorySourceConfig;
   tree: InventoryTree;
@@ -1089,9 +1098,38 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // other no-endpoint/empty-name/invalid-port skip is collected here and
   // reported as a single aggregate warning per category instead of drowning
   // the warnings list in one line per device.
-  const noEndpointSkipped: string[] = [];
   const emptyNameSkipped: string[] = [];
   const invalidPortSkipped: string[] = [];
+  // ADDRESSLESS (Codex P1) — devices with no usable primary endpoint that were
+  // NEWLY created as placeholders this run, for one aggregate note.
+  const addresslessAdded: string[] = [];
+
+  // Folder → `group` resolution, shared by the addressed add/update path and the
+  // ADDRESSLESS branch (which decides earlier, before the primary-endpoint check
+  // where the inline computation used to live). Pure but for the warnings it
+  // pushes on an invalid/over-deep path — the exact behaviour the inline block
+  // had.
+  const resolveDeviceGroup = (device: InventoryDevice): string | undefined => {
+    let rel: string | undefined;
+    if (device.folderPath) {
+      const normalizedRel = normalizeFolderPath(device.folderPath);
+      if (normalizedRel === undefined) {
+        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid folder path "${device.folderPath}"; placed at the source's target folder.`);
+      } else {
+        rel = normalizedRel;
+      }
+    }
+    const joined = joinTargetAndRel(source.targetFolder, rel);
+    if (joined === undefined) {
+      return undefined;
+    }
+    const normalizedJoined = normalizeFolderPath(joined);
+    if (normalizedJoined === undefined) {
+      warnings.push(`Device "${device.name}" (${device.externalId}) folder path exceeds the maximum depth; placed at the source's target folder.`);
+      return source.targetFolder ? source.targetFolder : undefined;
+    }
+    return normalizedJoined;
+  };
 
   for (const device of tree.devices) {
     if (!device.externalId) {
@@ -1132,10 +1170,100 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // endpoint (see `selectPrimaryEndpoint` for why ssh always wins).
     const primary = selectPrimaryEndpoint(device);
     if (!primary) {
-      if (isOwned) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has no usable SSH or telnet endpoint and was skipped.`);
+      // ADDRESSLESS (Codex P1 on #82) — a device with NO usable primary endpoint
+      // (a stopped EVE node, a VNC/HTML5-console node, a NetBox row with no IP)
+      // is no longer skipped: it becomes a VISIBLE addressless placeholder. This
+      // is reached only AFTER the empty-name (1116) and duplicate-id (1129)
+      // skips, and BEFORE the invalid-port skip below — which is deliberate:
+      // addressless is ONLY for a device with no primary endpoint AT ALL, never
+      // a swallow for malformed data (a bad name or a bad port stays skipped).
+      const ownedForAddressless = ownedByExternalId.get(device.externalId);
+      const addresslessGroup = resolveDeviceGroup(device);
+      if (ownedForAddressless) {
+        // DOWNGRADE / stay-addressless. Decided here so the post-loop rollback
+        // pass does not touch this server a second time.
+        decidedOwnedExternalIds.add(device.externalId);
+        // Protocol on downgrade obeys the SAME ownership discipline the addressed
+        // path uses — passing `undefined` as the device protocol (the addressless
+        // shape is ssh-default): a sync-owned protocol is cleared to ssh, while a
+        // hand-flipped one is left alone with its stamp carried forward verbatim.
+        const takesProtocol = syncOwnsProtocol(
+          ownedForAddressless.protocol,
+          ownedForAddressless.origin?.syncedProtocol,
+          undefined
+        );
+        const afterProtocol = takesProtocol ? undefined : ownedForAddressless.protocol;
+        const afterOrigin: ServerOrigin = {
+          ...ownedForAddressless.origin,
+          sourceId: source.id,
+          externalId: device.externalId,
+          syncedAt: now,
+          syncedInstanceKey: providerInstanceKey,
+          // Everything except the primary transport is carried forward VERBATIM
+          // — username/auth/ipmi/alt/template stamps and their values ride the
+          // `...ownedForAddressless` spread below. Only `protocol` follows the
+          // ownership decision above; the console address itself is device-owned
+          // and the device now supplies none.
+          syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol
+        };
+        const after: ServerConfig = {
+          ...ownedForAddressless,
+          name: device.name,
+          host: "",
+          port: ADDRESSLESS_PORT,
+          addressless: true,
+          group: addresslessGroup,
+          origin: afterOrigin
+        };
+        if (afterProtocol === undefined) {
+          delete after.protocol;
+        } else {
+          after.protocol = afterProtocol;
+        }
+        // A targeted `changed` check (NOT `serverConfigsEqual`, which compares
+        // `syncedAt` and would fire a no-op update on every sync of a stopped
+        // node). The origin STAMPS — not `syncedAt` — decide the origin half.
+        const changed =
+          ownedForAddressless.name !== after.name ||
+          ownedForAddressless.host !== after.host ||
+          ownedForAddressless.port !== after.port ||
+          ownedForAddressless.protocol !== after.protocol ||
+          ownedForAddressless.group !== after.group ||
+          (ownedForAddressless.addressless ?? false) !== (after.addressless ?? false) ||
+          !serverOriginStampsEqual(ownedForAddressless.origin, after.origin);
+        if (changed) {
+          updates.push({ before: ownedForAddressless, after });
+          if (addresslessGroup !== undefined) {
+            folderSet.add(addresslessGroup);
+          }
+        }
       } else {
-        noEndpointSkipped.push(device.name);
+        // ADD — a fresh addressless placeholder. Minimal on purpose: no console
+        // means no secondary addresses or template fields to protect yet; the
+        // moment it gains a console the addressed update path fills them.
+        addresslessAdded.push(device.name);
+        adds.push({
+          id: deterministicServerId(source.id, device.externalId),
+          name: device.name,
+          host: "",
+          port: ADDRESSLESS_PORT,
+          addressless: true,
+          username: source.defaultUsername ?? "",
+          authType: "agent",
+          isHidden: false,
+          group: addresslessGroup,
+          origin: {
+            sourceId: source.id,
+            externalId: device.externalId,
+            syncedAt: now,
+            syncedInstanceKey: providerInstanceKey,
+            syncedUsername: source.defaultUsername,
+            syncedProtocol: undefined
+          }
+        });
+        if (addresslessGroup !== undefined) {
+          folderSet.add(addresslessGroup);
+        }
       }
       continue;
     }
@@ -1192,28 +1320,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const altHost = altEndpoint?.host;
 
     // Folder resolution: device.folderPath is relative to source.targetFolder.
-    let rel: string | undefined;
-    if (device.folderPath) {
-      const normalizedRel = normalizeFolderPath(device.folderPath);
-      if (normalizedRel === undefined) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) has an invalid folder path "${device.folderPath}"; placed at the source's target folder.`);
-      } else {
-        rel = normalizedRel;
-      }
-    }
-    const joined = joinTargetAndRel(source.targetFolder, rel);
-    let group: string | undefined;
-    if (joined === undefined) {
-      group = undefined;
-    } else {
-      const normalizedJoined = normalizeFolderPath(joined);
-      if (normalizedJoined === undefined) {
-        warnings.push(`Device "${device.name}" (${device.externalId}) folder path exceeds the maximum depth; placed at the source's target folder.`);
-        group = source.targetFolder ? source.targetFolder : undefined;
-      } else {
-        group = normalizedJoined;
-      }
-    }
+    const group = resolveDeviceGroup(device);
 
     const id = deterministicServerId(source.id, device.externalId);
 
@@ -1544,6 +1651,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       if (takesProtocol) {
         after.protocol = deviceProtocol;
       }
+      // ADDRESSLESS (Codex P1) — this branch runs only when the device HAS a
+      // usable primary endpoint, so `after` is an ADDRESSED record: clear the
+      // flag the `...ownedServer` spread carried forward. This is the UPGRADE
+      // half — an owned server that was addressless (device just gained a
+      // console) becomes addressed here, host/port/protocol already filled
+      // above. For a normal addressed server the field was absent, so the delete
+      // is a no-op.
+      if (after.addressless !== undefined) {
+        delete after.addressless;
+      }
 
       // AUTH 2 — retro-apply. The single exception to the field-ownership rule
       // above, and the only reason servers synced before the source had a
@@ -1865,6 +1982,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.host !== after.host ||
         ownedServer.port !== after.port ||
         ownedServer.group !== after.group ||
+        // ADDRESSLESS (Codex P1) — the UPGRADE clearing the flag can be the
+        // change (host filling always co-changes it here, but pinning the flag
+        // makes the intent explicit and covers a value-identical upgrade).
+        (ownedServer.addressless ?? false) !== (after.addressless ?? false) ||
         ownedServer.authProfileId !== after.authProfileId ||
         ownedServer.ipmiHost !== after.ipmiHost ||
         // ALTERNATE HOST (issue #48, Phase 2) — joins the value half for the same
@@ -2981,7 +3102,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     );
   }
 
-  pushSkipSummary(warnings, "had no usable SSH or telnet endpoint", noEndpointSkipped);
+  // ADDRESSLESS (Codex P1) — replaces the old "no usable endpoint … skipped"
+  // summary: those devices are now CREATED as addressless placeholders, so the
+  // aggregate note says what happened rather than that they were dropped. One
+  // line, never per-device.
+  if (addresslessAdded.length > 0) {
+    const count = addresslessAdded.length;
+    warnings.push(
+      `${count} device${count === 1 ? "" : "s"} ${count === 1 ? "has" : "have"} no console address yet and ${count === 1 ? "was" : "were"} added without one (e.g. ${namedExamples(addresslessAdded)}).`
+    );
+  }
   pushSkipSummary(warnings, "had an empty name", emptyNameSkipped);
   pushSkipSummary(warnings, "had an invalid port", invalidPortSkipped);
 
