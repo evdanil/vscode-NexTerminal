@@ -236,8 +236,13 @@ describe("computeSyncPlan — adds", () => {
    * create/prune churn.
    */
   describe("addressless placeholders", () => {
+    // A device with NO usable endpoint of ANY kind — no ssh/telnet primary AND no
+    // redfish/ipmi-sol OOB. Deliberately endpoint-less rather than redfish-only:
+    // a redfish endpoint is now an OOB address the placeholder CARRIES (see the
+    // OOB (P2) tests below), so a redfish fixture here would conflate "no console"
+    // with "has a BMC address" and churn a spurious ipmiHost update.
     const noEndpointDevice = (overrides: Partial<InventoryDevice> = {}) =>
-      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }], ...overrides });
+      makeDevice({ endpoints: [], ...overrides });
 
     it("CREATES an addressless server for a new endpoint-less device instead of skipping it (⊘ the old skip leaves the device invisible in the tree)", () => {
       const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [], now: 5000 });
@@ -330,6 +335,64 @@ describe("computeSyncPlan — adds", () => {
         now: 5000
       });
       expect(plan.adds).toHaveLength(0);
+    });
+
+    // OOB on ADDRESSLESS (Codex P2) — an addressless-for-CONSOLE device (no
+    // ssh/telnet primary) can still expose a BMC web-console or locally-executed
+    // IPMI, neither of which needs a primary console address. The addressless
+    // branch used to run BEFORE management-endpoint extraction, so it dropped the
+    // OOB address entirely; extraction now happens first and both the add and the
+    // downgrade/stay paths populate ipmiHost under the SAME syncOwnsIpmiHost
+    // discipline the addressed path uses.
+    it("(a) a redfish-only device becomes addressless but CARRIES its ipmiHost + syncedIpmiHost (⊘ the addressless branch runs before management extraction, so the placeholder drops the OOB address)", () => {
+      const device = makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([device]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      const [added] = plan.adds;
+      expect(added.addressless).toBe(true);
+      expect(added.host).toBe("");
+      expect(added.ipmiHost).toBe("10.9.9.9");
+      expect(added.origin?.syncedIpmiHost).toBe("10.9.9.9");
+      // An addressless (empty-host) record carrying an ipmiHost must still validate.
+      expect(validateServerConfig(added)).toBe(true);
+    });
+
+    it("(b) re-syncing an addressless server whose OOB address moved follows it per syncOwnsIpmiHost, but a HAND-EDITED ipmiHost is NEVER stomped (⊘ the addressless path forks the ipmiHost ownership rules or ignores the stamp)", () => {
+      const movedOob = makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.10" }] });
+
+      // Sync-owned (value === stamp) → follows the device's new OOB address.
+      const owned = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        ipmiHost: "10.9.9.9",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9", syncedProtocol: undefined }
+      });
+      const p1 = computeSyncPlan({ source: makeSource(), tree: makeTree([movedOob]), currentServers: [owned], now: 5000 });
+      expect(p1.updates).toHaveLength(1);
+      expect(p1.updates[0].after.ipmiHost).toBe("10.9.9.10");
+      expect(p1.updates[0].after.origin?.syncedIpmiHost).toBe("10.9.9.10");
+
+      // Hand-edited (value present, stamp absent) → left alone; the discriminator.
+      const handEdited = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        ipmiHost: "192.168.99.99",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+      });
+      const p2 = computeSyncPlan({ source: makeSource(), tree: makeTree([movedOob]), currentServers: [handEdited], now: 5000 });
+      const after2 = p2.updates[0]?.after ?? handEdited;
+      expect(after2.ipmiHost).toBe("192.168.99.99");
+      expect(after2.origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    it("(c) a device with NO endpoints at all is addressless with NO ipmiHost (⊘ an over-broad fix that stamps an ipmiHost even without an OOB endpoint)", () => {
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [] })]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      expect(plan.adds[0].addressless).toBe(true);
+      expect(plan.adds[0].ipmiHost).toBeUndefined();
+      expect(plan.adds[0].origin?.syncedIpmiHost).toBeUndefined();
     });
   });
 

@@ -1169,6 +1169,43 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // TELNET (Phase 0) — ssh endpoint if the device has one, else its telnet
     // endpoint (see `selectPrimaryEndpoint` for why ssh always wins).
     const primary = selectPrimaryEndpoint(device);
+
+    // OOB — the out-of-band management address this fetch offers for
+    // `ServerConfig.ipmiHost`, or `undefined` when the device supplies none
+    // (matrix row 6 in `syncOwnsIpmiHost`) or supplies one nothing can use.
+    //
+    // EXTRACTED HERE, BEFORE the addressless branch (Codex P2). A device with no
+    // ssh/telnet primary endpoint but a redfish/ipmi-sol one is addressless FOR
+    // ITS CONSOLE, yet its BMC web-console / locally-executed IPMI needs no
+    // primary console address — so the placeholder must still carry this OOB
+    // address. Deciding it before the branch lets BOTH the addressless paths and
+    // the addressed path below read the one `mgmtHost`.
+    //
+    // VALIDATED HERE, at sync time, even though USE time remains the real
+    // chokepoint (`validateTokenValue`, services/profileTokens.ts, which refuses
+    // a hostile value on every single run whatever wrote it). Storing a value
+    // that chokepoint will always refuse helps nobody, and this is the only
+    // moment at which the user can connect the bad value to the device it came
+    // from — after the write it is just a broken field on a server. The SAME
+    // validator the chokepoint uses, deliberately: two answers to "is this a
+    // legal ipmiHost?" in one codebase is worse than one that is slightly
+    // wider than this path needs (it also admits a `:port` suffix, which a
+    // synced bare address never carries).
+    //
+    // The device's SSH mapping is untouched by this — a device whose `oob_ip` is
+    // garbage still syncs, it just does not get a BMC address.
+    let mgmtHost: string | undefined;
+    const mgmtEndpoint = selectManagementEndpoint(device);
+    if (mgmtEndpoint) {
+      if (isAddressValue(mgmtEndpoint.host)) {
+        mgmtHost = mgmtEndpoint.host;
+      } else {
+        warnings.push(
+          `Device "${device.name}" (${device.externalId}) has an out-of-band address that cannot be used ("${mgmtEndpoint.host}") — ignored.`
+        );
+      }
+    }
+
     if (!primary) {
       // ADDRESSLESS (Codex P1 on #82) — a device with NO usable primary endpoint
       // (a stopped EVE node, a VNC/HTML5-console node, a NetBox row with no IP)
@@ -1193,18 +1230,31 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           undefined
         );
         const afterProtocol = takesProtocol ? undefined : ownedForAddressless.protocol;
+        // OOB (Codex P2) — an addressless-for-console device can still expose a
+        // BMC address, so the downgrade/stay path decides `ipmiHost` under the
+        // SAME `syncOwnsIpmiHost` matrix the addressed path uses: it takes the new
+        // OOB address only when the sync still owns the field (row 1/3/5a), and
+        // otherwise leaves a hand-edited value alone (rows 4/5). When the device
+        // supplies NO OOB (`mgmtHost` undefined, matrix row 6) the field and its
+        // stamp are carried forward VERBATIM by the `...ownedForAddressless`
+        // spread — never touched.
+        const takesIpmiHost =
+          mgmtHost !== undefined &&
+          syncOwnsIpmiHost(ownedForAddressless.ipmiHost, ownedForAddressless.origin?.syncedIpmiHost, mgmtHost);
         const afterOrigin: ServerOrigin = {
           ...ownedForAddressless.origin,
           sourceId: source.id,
           externalId: device.externalId,
           syncedAt: now,
           syncedInstanceKey: providerInstanceKey,
-          // Everything except the primary transport is carried forward VERBATIM
-          // — username/auth/ipmi/alt/template stamps and their values ride the
-          // `...ownedForAddressless` spread below. Only `protocol` follows the
-          // ownership decision above; the console address itself is device-owned
-          // and the device now supplies none.
-          syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol
+          // Username/auth/alt/template stamps and their values are carried forward
+          // VERBATIM by the `...ownedForAddressless` spread below. `protocol`
+          // follows its ownership decision above; `ipmiHost` follows its own,
+          // refreshed only where this sync writes the value (the `takesIpmiHost`
+          // line below) and otherwise carried forward — including as `undefined`,
+          // which keeps a hand entry hands-off (matrix row 5).
+          syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
+          syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedForAddressless.origin?.syncedIpmiHost
         };
         const after: ServerConfig = {
           ...ownedForAddressless,
@@ -1220,6 +1270,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         } else {
           after.protocol = afterProtocol;
         }
+        // The value half of the `ipmiHost` decision, on exactly the rows
+        // `syncOwnsIpmiHost` answered yes for — a conditional assignment (not a
+        // member of the literal) so the `...ownedForAddressless` spread preserves
+        // a hand-edited value on the rows this must not touch.
+        if (takesIpmiHost) {
+          after.ipmiHost = mgmtHost;
+        }
         // A targeted `changed` check (NOT `serverConfigsEqual`, which compares
         // `syncedAt` and would fire a no-op update on every sync of a stopped
         // node). The origin STAMPS — not `syncedAt` — decide the origin half.
@@ -1228,6 +1285,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ownedForAddressless.host !== after.host ||
           ownedForAddressless.port !== after.port ||
           ownedForAddressless.protocol !== after.protocol ||
+          ownedForAddressless.ipmiHost !== after.ipmiHost ||
           ownedForAddressless.group !== after.group ||
           (ownedForAddressless.addressless ?? false) !== (after.addressless ?? false) ||
           !serverOriginStampsEqual(ownedForAddressless.origin, after.origin);
@@ -1269,12 +1327,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           authType: "agent",
           isHidden: false,
           group: addresslessGroup,
+          // OOB (Codex P2) — a placeholder with no console address can still have
+          // a BMC one: a BMC web-console / locally-executed IPMI needs no primary
+          // console address. A fresh record has nothing to protect, so no matrix —
+          // whatever this fetch offers (or `undefined`) is what the field starts
+          // as, mirroring the addressed add path.
+          ipmiHost: mgmtHost,
           origin: {
             sourceId: source.id,
             externalId: device.externalId,
             syncedAt: now,
             syncedInstanceKey: providerInstanceKey,
             syncedUsername: source.defaultUsername,
+            // Records the OOB address written above (UNCONDITIONALLY, `undefined`
+            // included) so every LATER sync has the ownership question already
+            // answered — matrix row 1, exactly as the addressed add path stamps it.
+            syncedIpmiHost: mgmtHost,
             syncedProtocol: undefined
           }
         });
@@ -1294,35 +1362,6 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         invalidPortSkipped.push(device.name);
       }
       continue;
-    }
-
-    // OOB — the out-of-band management address this fetch offers for
-    // `ServerConfig.ipmiHost`, or `undefined` when the device supplies none
-    // (matrix row 6 in `syncOwnsIpmiHost`) or supplies one nothing can use.
-    //
-    // VALIDATED HERE, at sync time, even though USE time remains the real
-    // chokepoint (`validateTokenValue`, services/profileTokens.ts, which refuses
-    // a hostile value on every single run whatever wrote it). Storing a value
-    // that chokepoint will always refuse helps nobody, and this is the only
-    // moment at which the user can connect the bad value to the device it came
-    // from — after the write it is just a broken field on a server. The SAME
-    // validator the chokepoint uses, deliberately: two answers to "is this a
-    // legal ipmiHost?" in one codebase is worse than one that is slightly
-    // wider than this path needs (it also admits a `:port` suffix, which a
-    // synced bare address never carries).
-    //
-    // The device's SSH mapping is untouched by this — a device whose `oob_ip` is
-    // garbage still syncs, it just does not get a BMC address.
-    let mgmtHost: string | undefined;
-    const mgmtEndpoint = selectManagementEndpoint(device);
-    if (mgmtEndpoint) {
-      if (isAddressValue(mgmtEndpoint.host)) {
-        mgmtHost = mgmtEndpoint.host;
-      } else {
-        warnings.push(
-          `Device "${device.name}" (${device.externalId}) has an out-of-band address that cannot be used ("${mgmtEndpoint.host}") — ignored.`
-        );
-      }
     }
 
     // ALTERNATE HOST (issue #48, Phase 2) — the alternate SSH address this fetch
