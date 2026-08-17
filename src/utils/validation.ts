@@ -273,12 +273,20 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
   if (obj.protocol !== undefined && obj.protocol !== "ssh" && obj.protocol !== "telnet") {
     return false;
   }
+  // ADDRESSLESS (Codex P1 on #82) — a synced placeholder for a device with no
+  // usable primary endpoint carries `host: ""` (and a sentinel port). Only an
+  // EXACT `true` relaxes the host/port requirement; any other value — a
+  // non-boolean smuggled in from a hand-edited backup included — is treated as
+  // false (fail-closed), so a broken hand-created empty-host record still fails
+  // exactly as before. `enabled`-style coercion, not a rejecting type guard, so
+  // a well-formed addressed record carrying a junk flag is not itself dropped.
+  const addressless = obj.addressless === true;
   if (
     !(
       isNonEmptyString(obj.id) &&
       isNonEmptyString(obj.name) &&
-      isNonEmptyString(obj.host) &&
-      isValidPort(obj.port) &&
+      (addressless || isNonEmptyString(obj.host)) &&
+      (addressless || isValidPort(obj.port)) &&
       // TELNET (Phase 0) — the ONE field this feature relaxes. Telnet has no
       // protocol-level login: the user logs in at the device's own prompt, in
       // the terminal, so the server form never collects a username for a telnet

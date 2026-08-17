@@ -582,6 +582,28 @@ export interface ServerConfig {
   host: string;
   port: number;
   /**
+   * ADDRESSLESS (Codex P1 on #82) — a SYNCED PLACEHOLDER with no usable primary
+   * endpoint yet: a stopped EVE-NG node, a VNC/HTML5-console node, or a NetBox
+   * row with no IP. `true` here means `host` is `""` and there is nothing to
+   * connect to; the connect path refuses it with a friendly "no console address
+   * yet — start it and re-sync" message instead of a raw handshake failure, and
+   * the tree renders a `" (no address)"` suffix.
+   *
+   * Written ONLY by inventory sync — a hand-created server is never addressless,
+   * and `validateServerConfig` only relaxes the empty-host requirement when this
+   * is exactly `true` (any other value, including a non-boolean, is treated as
+   * false and the host stays required). A later sync where the device gains a
+   * console UPGRADES the same record in place (fills `host`/`port`/`protocol`,
+   * clears this flag); losing the console again DOWNGRADES it back (no
+   * create/prune churn), under the same host/protocol ownership discipline the
+   * addressed update uses.
+   *
+   * Optional and additive, like every field added after 1.0 — absent ≡ false, so
+   * every record written before this existed round-trips untouched with no
+   * migration.
+   */
+  addressless?: boolean;
+  /**
    * TELNET (Phase 0) — which transport this server's terminal opens. ABSENT
    * MEANS `"ssh"`, so every record written before this field existed keeps
    * working untouched and there is no migration.
@@ -1012,6 +1034,10 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.group === b.group &&
     a.host === b.host &&
     a.port === b.port &&
+    // ADDRESSLESS (Codex P1) — absent ≡ false, so a legacy record and an
+    // explicit `false` compare equal; but a flip between addressless and
+    // addressed IS a difference the sync must apply (never dropped as a no-op).
+    (a.addressless ?? false) === (b.addressless ?? false) &&
     // TELNET (Phase 0) — present-vs-absent is a DIFFERENCE: absent means ssh, so
     // a comparator that skipped this field would call a server the user just
     // switched to telnet "unchanged" and a rollback would put it back on SSH.
@@ -1065,6 +1091,9 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.group !== batchSnapshot.group) merged.group = current.group;
   if (current.host !== batchSnapshot.host) merged.host = current.host;
   if (current.port !== batchSnapshot.port) merged.port = current.port;
+  // ADDRESSLESS (Codex P1) — a concurrent upgrade/downgrade the batch wrote is
+  // kept, not reverted to `prior`.
+  if (current.addressless !== batchSnapshot.addressless) merged.addressless = current.addressless;
   if (current.protocol !== batchSnapshot.protocol) merged.protocol = current.protocol;
   if (current.altHost !== batchSnapshot.altHost) merged.altHost = current.altHost;
   if (current.username !== batchSnapshot.username) merged.username = current.username;
