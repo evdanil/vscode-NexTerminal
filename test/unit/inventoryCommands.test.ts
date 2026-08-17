@@ -8355,6 +8355,87 @@ describe("inventoryCommands", () => {
       expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
     });
 
+    // The exact wording a sibling command (Sync/Edit/Remove) shows when it finds
+    // the source held by an in-flight control — asserted verbatim so a claim that
+    // records the wrong reason (or none) is unmissable.
+    const BUSY_CONTROL = '"My Source" is currently starting or stopping a node — try again in a moment.';
+
+    it("CLAIMS the source for the whole dispatch — a Sync Now / a second control fired while a control is in flight is refused, and the claim is RELEASED once it settles (⊘ a busy-guard that only READS inFlightSourceIds lets Edit/Remove/Sync race the vault read + control request: stale baseUrl, creds read mid-replacement, or a node whose source was just purged)", async () => {
+      let releaseControl!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseControl = resolve));
+      const controlNode = vi.fn(async () => {
+        await gate;
+      });
+      const { start, provider, server } = await setup({ controlNode });
+      const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
+
+      // Start a control and let it park inside controlNode — the claim is now
+      // held (set synchronously right after the busy check, before the awaited
+      // secrets load + dispatch).
+      const inFlight = start({ server });
+      await vi.waitFor(() => expect(controlNode).toHaveBeenCalledTimes(1));
+
+      // A sibling Sync Now on the same source is refused with the CONTROL-holder
+      // wording (not a running-sync lie) and starts no fetch — the mutation this
+      // guards against is the sync sailing past its own check and racing us.
+      await syncCmd("src-1");
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_CONTROL);
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+
+      // A SECOND control is refused too: controlNode is not entered a second time.
+      await start({ server });
+      expect(controlNode).toHaveBeenCalledTimes(1);
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(true);
+
+      // Release → the claim is freed → a subsequent control dispatches.
+      releaseControl();
+      await inFlight;
+      await start({ server });
+      expect(controlNode).toHaveBeenCalledTimes(2);
+    });
+
+    it("RELEASES the claim even when the control request FAILS — a control after a failed one on the same source is not refused as busy (⊘ deleting the marker only after the !dispatched early-return leaks the claim on every failure, wedging the node forever)", async () => {
+      const controlNode = vi.fn(async () => {
+        throw new Error("EVE-NG refused");
+      });
+      const { start, server } = await setup({ controlNode });
+
+      await start({ server }); // fails inside withProgress → dispatched === false
+      await start({ server }); // must NOT be refused as busy — the finally freed it
+
+      expect(controlNode).toHaveBeenCalledTimes(2);
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(false);
+    });
+
+    it("releases the claim BEFORE the un-awaited refreshStatus fires, so the status refresh is not self-skipped by its own 'control' claim (⊘ firing refreshStatus while the marker is still held makes refreshStatus SKIP the source (~:4413) — the tree never updates after a successful start/stop)", async () => {
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(makeProvider({ controlNode: vi.fn(async () => {}), fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1" }));
+
+      // Route the real refreshStatus through executeCommand so its skip-if-busy
+      // sweep actually runs against the live marker (the default mock only
+      // records the call, so it can't observe the self-skip). mockImplementationOnce
+      // is consumed by controlNode's single executeCommand and does not leak.
+      mockExecuteCommand.mockImplementationOnce((cmd: string, ...rest: unknown[]) =>
+        cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
+      );
+
+      await registeredCommands.get("nexus.inventory.startNode")!({ server });
+
+      // The un-awaited refresh's fetchStatus must run — proof the source was NOT
+      // still held by the 'control' claim when refreshStatus swept it.
+      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+    });
+
     it("REFUSES a tree item whose server id is no longer in core — a server removed between render and click — instead of dispatching via its stale record (⊘ a `?? withServer.server` fallback fires a control at a just-deleted node's stale origin)", async () => {
       const { start, controlSpy } = await setup();
       // The tree item still carries a full, valid-looking record (origin + all),

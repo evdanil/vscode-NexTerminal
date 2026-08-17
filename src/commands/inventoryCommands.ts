@@ -113,7 +113,7 @@ function providerMissingMessage(providerId: string): string {
  * `sourceBusyMessage`'s Record forces any future member to bring its own
  * wording instead of silently inheriting one of these.
  */
-type SourceBusyReason = "sync" | "edit" | "remove";
+type SourceBusyReason = "sync" | "edit" | "remove" | "control";
 
 /**
  * The warning a command shows when the source it was asked to act on is
@@ -134,7 +134,8 @@ function sourceBusyMessage(name: string, holder: SourceBusyReason, asking: Sourc
   const wording: Record<SourceBusyReason, string> = {
     sync: asking === "sync" ? `"${name}" is already syncing.` : `"${name}" is currently syncing — try again once the sync finishes.`,
     edit: `"${name}" is open in Edit Source — close that tab, then try again.`,
-    remove: `"${name}" is currently being removed — try again once the removal finishes.`
+    remove: `"${name}" is currently being removed — try again once the removal finishes.`,
+    control: `"${name}" is currently starting or stopping a node — try again in a moment.`
   };
   return wording[holder];
 }
@@ -4595,33 +4596,55 @@ export function registerInventoryCommands(
       void vscode.window.showInformationMessage(`"${source.name}" is busy — try again in a moment.`);
       return;
     }
-    const secrets: InventorySourceSecrets = {};
-    for (const fieldId of source.secretFieldIds) {
-      const value = await vault.get(inventorySecretKey(source.id, fieldId));
-      if (value !== undefined) {
-        secrets[fieldId] = value;
-      }
-    }
-    // P3-4 — controlNode runs login → detectEdition → action sequentially (up to
-    // ~60s with a re-login), so without a progress UI the user sees nothing until
-    // it all resolves. Wrap the dispatch so the title shows DURING the call
-    // (mirrors serverCommands' "Connecting to …" and the "Testing connection to
-    // …" above). M2 — a FAILURE surfaces through describeInventoryError (the
-    // provider throws classified InventoryProviderErrors), matching every other
-    // inventory failure toast, rather than a bare err.message.
-    const verb = action === "start" ? "Starting" : "Stopping";
-    const dispatched = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
-      async () => {
-        try {
-          await controlProviderNode(provider, source.config, secrets, origin.externalId, action);
-          return true;
-        } catch (err) {
-          void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);
-          return false;
+    // CLAIM the source atomically right after the check passes (no await in
+    // between, so a second control arriving on the next microtask sees it). The
+    // bare read above was a TOCTOU: after it passed, this handler still awaits
+    // `vault.get` + the network control request, during which Edit Source /
+    // Remove Source / Sync Now each pass THEIR own busy check and mutate or
+    // purge the source — so a control that only READ the marker could dispatch
+    // with a stale baseUrl, read credentials mid-replacement/purge, or act on a
+    // node whose source was just removed. Claiming closes that window; the
+    // siblings now find it held (they show the "control" wording).
+    //
+    // The claim is released in the `finally` below — deliberately BEFORE the
+    // post-action `refreshStatus` fires, because refreshStatus SKIPS a source
+    // that is inFlightSourceIds-held (~:4413 `continue`); firing it while still
+    // holding "control" would self-skip the very status refresh we want. So:
+    // claim → try{ load secrets; dispatch } finally{ release } → toast → refresh.
+    // No config mutation lock is taken — a control persists no servers.
+    inFlightSourceIds.set(source.id, "control");
+    let dispatched = false;
+    try {
+      const secrets: InventorySourceSecrets = {};
+      for (const fieldId of source.secretFieldIds) {
+        const value = await vault.get(inventorySecretKey(source.id, fieldId));
+        if (value !== undefined) {
+          secrets[fieldId] = value;
         }
       }
-    );
+      // P3-4 — controlNode runs login → detectEdition → action sequentially (up to
+      // ~60s with a re-login), so without a progress UI the user sees nothing until
+      // it all resolves. Wrap the dispatch so the title shows DURING the call
+      // (mirrors serverCommands' "Connecting to …" and the "Testing connection to
+      // …" above). M2 — a FAILURE surfaces through describeInventoryError (the
+      // provider throws classified InventoryProviderErrors), matching every other
+      // inventory failure toast, rather than a bare err.message.
+      const verb = action === "start" ? "Starting" : "Stopping";
+      dispatched = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
+        async () => {
+          try {
+            await controlProviderNode(provider, source.config, secrets, origin.externalId, action);
+            return true;
+          } catch (err) {
+            void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);
+            return false;
+          }
+        }
+      );
+    } finally {
+      inFlightSourceIds.delete(source.id);
+    }
     if (!dispatched) {
       return;
     }
