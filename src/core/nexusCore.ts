@@ -15,7 +15,7 @@ import {
   type TunnelProfile,
   type TunnelRegistryEntry
 } from "../models/config";
-import { sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
+import { inventorySourceValuesEqual, sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
 import { deterministicServerId } from "../services/inventory/deterministicId";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -589,6 +589,13 @@ export class NexusCore {
   public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
     const hadPrevious = this.inventorySources.has(source.id);
     const previous = this.inventorySources.get(source.id);
+    // LIVE STATUS (Phase 2) — a change to the PROVIDER CONFIG (baseUrl,
+    // rootFolder, filter, …) invalidates any runtime status: the report was
+    // fetched under the old config, so nodes the new config excludes — or the
+    // old deployment's nodes entirely — must not keep a stale highlight. Detected
+    // by a real config-value change so a no-op edit (or a non-config edit like a
+    // rename) does not needlessly clear. Cleared AFTER the persist succeeds.
+    const configChanged = hadPrevious && previous !== undefined && !inventorySourceValuesEqual(previous.config, source.config);
     const withRevision: InventorySourceConfig = { ...source, revision: randomUUID() };
     this.inventorySources.set(source.id, withRevision);
     try {
@@ -600,6 +607,10 @@ export class NexusCore {
         this.inventorySources.delete(source.id);
       }
       throw error;
+    }
+    if (configChanged) {
+      // No separate emit — the emitChanged() below covers the status drop too.
+      this.dropInventoryStatusForSource(source.id);
     }
     this.emitChanged();
   }

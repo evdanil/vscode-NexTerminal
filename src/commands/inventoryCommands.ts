@@ -4416,6 +4416,12 @@ export function registerInventoryCommands(
       if (!provider || typeof provider.fetchStatus !== "function") {
         continue; // provider gone or offers no status (e.g. NetBox)
       }
+      // P2-1(b) — capture the source's incarnation as of THIS fetch. If Edit
+      // Source (or any write) changes the record while the fetch is in flight,
+      // the report was produced under a config the source no longer has, so its
+      // apply is dropped. Complements the global generation guard, which only
+      // orders sweeps against each other.
+      const startRevision = source.revision;
       attempted++;
       try {
         const secrets: InventorySourceSecrets = {};
@@ -4432,12 +4438,15 @@ export function registerInventoryCommands(
         if (report) {
           // A report (even an empty one) means the source was reachable — count
           // it as a success for the total-failure warning regardless of whether
-          // the generation guard below actually applies it.
+          // the guards below actually apply it.
           succeeded++;
-          // Re-check AFTER the (awaited) fetch: this is the load-bearing guard —
-          // a newer sweep may have started and applied while this fetch was in
-          // flight, and applying now would clobber it with older data.
-          if (myGeneration === statusRefreshGeneration) {
+          // Re-check AFTER the (awaited) fetch, two guards:
+          //  - the global generation: a NEWER sweep may have started and applied
+          //    while this fetch was in flight (applying now would clobber it);
+          //  - this source's revision: an Edit Source may have superseded the
+          //    config this report was fetched under (P2-1b).
+          const currentSource = core.getInventorySource(source.id);
+          if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
             core.applyInventoryStatus(source.id, report);
           }
         }

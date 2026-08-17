@@ -8344,6 +8344,30 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
+  it("P2-1b: an in-flight refresh started under the OLD config does NOT reapply after the source is edited (⊘ a per-source-revision guard is missing, so a report fetched under the superseded config re-lands once the fetch resolves)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const fetchStatus = vi.fn(async () => { await gate; return REPORT; });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ config: { host: "old" } }));
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!(); // captures the source's current revision, parks on the gate
+    await Promise.resolve();
+
+    // Edit the source while the refresh is parked → a fresh revision.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("src-1")!, config: { host: "new" } });
+
+    release();
+    await sweep;
+    // The apply must be dropped: the report was fetched under the old config.
+    expect(applySpy).not.toHaveBeenCalled();
+  });
+
   it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

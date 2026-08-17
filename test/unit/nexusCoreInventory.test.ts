@@ -4774,6 +4774,25 @@ describe("NexusCore inventory status", () => {
     expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
   });
 
+  it("P2-1a: editing a source's config clears its stale runtime status, but a no-op edit does NOT (⊘ keying status only by the stable sourceId keeps a report fetched under the OLD baseUrl/rootFolder/filter active after Edit Source changes it)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", config: { baseUrl: "http://a" } }));
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    // No-op edit — config unchanged — must NOT clear the status.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, config: { baseUrl: "http://a" } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    // Real config change (baseUrl) — the report fetched under the old config is
+    // no longer trustworthy, so the status is cleared.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, config: { baseUrl: "http://b" } });
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
   it("does not fire a change when clearInventoryStatus has nothing to clear (⊘ an unconditional emit churns every tree on an unrelated source removal)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
