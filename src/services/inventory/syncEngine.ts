@@ -1241,9 +1241,26 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // ADD — a fresh addressless placeholder. Minimal on purpose: no console
         // means no secondary addresses or template fields to protect yet; the
         // moment it gains a console the addressed update path fills them.
+        //
+        // P1-b (Codex review) — the SAME id-collision guard the addressed add
+        // path uses (~2142): the addressless branch is reached only when the
+        // device is NOT owned, but an UNRELATED record can still hold the
+        // deterministic id — the supported ID-preserving Keep-Servers→restore
+        // flow, or a hand-imported fragment. Applying the plan does
+        // `servers.set(id, …)`, so an unconditional add would REPLACE that
+        // record and discard its config. Skip rather than clobber; a later sync
+        // where the node gains a console reaches the addressed path, which
+        // resolves the collision (adoption) properly.
+        const addresslessId = deterministicServerId(source.id, device.externalId);
+        if (serversById.has(addresslessId)) {
+          warnings.push(
+            `Device "${device.name}" (${device.externalId}) has no console address, and its id collides with an existing server — left the existing server in place rather than replacing it with a placeholder.`
+          );
+          continue;
+        }
         addresslessAdded.push(device.name);
         adds.push({
-          id: deterministicServerId(source.id, device.externalId),
+          id: addresslessId,
           name: device.name,
           host: "",
           port: ADDRESSLESS_PORT,

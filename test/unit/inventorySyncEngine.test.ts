@@ -294,6 +294,18 @@ describe("computeSyncPlan — adds", () => {
       expect(plan.prunes.map((p) => p.server.id)).toContain(before.id);
     });
 
+    it("P1-b — an addressless ADD does NOT clobber an existing server holding its deterministic id (a kept/restored profile), just like the addressed add path's collision guard (⊘ the addressless add unconditionally upserts the id, so applying the plan replaces the kept profile and discards its config)", () => {
+      const source = makeSource();
+      const collidingId = deterministicServerId("source-1", "device:1");
+      // A restored kept profile (no `origin`, so it is not owned by this source)
+      // that happens to hold the id this device's addressless placeholder would.
+      const kept = makeManualServer({ id: collidingId, name: "restored-kept", host: "10.0.0.7" });
+      const plan = computeSyncPlan({ source, tree: makeTree([noEndpointDevice()]), currentServers: [kept], now: 5000 });
+      // No add under the colliding id, and the kept server is left untouched.
+      expect(plan.adds.map((a) => a.id)).not.toContain(collidingId);
+      expect(plan.updates.map((u) => u.after.id)).not.toContain(collidingId);
+    });
+
     it("clears a SYNC-OWNED telnet protocol to ssh-default on downgrade, but LEAVES a hand-flipped telnet alone (⊘ forking the protocol stamp logic would either stomp the user's hand-flip or freeze a synced telnet)", () => {
       // Sync-owned telnet (record telnet, stamp telnet) → cleared to ssh-default.
       const syncedTelnet = makeOwnedServer({ protocol: "telnet", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet" } });
