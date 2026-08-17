@@ -216,7 +216,7 @@ function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySo
 }
 
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
-  return {
+  const merged: ServerConfig = {
     id: "owned-1",
     name: "old-sw",
     host: "10.0.0.1",
@@ -226,6 +226,20 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     isHidden: false,
     ...overrides
   };
+  // PRIMARY HOST/PORT (task #29) — a real synced server OWNS its address, so seed
+  // its origin's `syncedHost`/`syncedPort` to match its own host/port (when the
+  // fixture supplied an origin but not the stamps, and the record is addressed).
+  // The sync then follows a device address move rather than reading the address
+  // as a hand edit and preserving it.
+  if (merged.origin && merged.host !== "") {
+    if (merged.origin.syncedHost === undefined) {
+      merged.origin = { ...merged.origin, syncedHost: merged.host };
+    }
+    if (merged.origin.syncedPort === undefined && merged.port !== 0) {
+      merged.origin = { ...merged.origin, syncedPort: merged.port };
+    }
+  }
+  return merged;
 }
 
 // A synthetic plan for the pure rendering/drift helpers (describePlanDetail,
