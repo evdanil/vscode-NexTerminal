@@ -8306,6 +8306,44 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(fetchStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("P3-7: the MANUAL refresh warns once when every targeted source fails, but the POLL path stays silent (⊘ a palette command that silently no-ops on total auth failure looks broken; a warning on every poll tick would nag)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => { throw new Error("auth broken"); });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+
+    // Manual (palette / title) invocation with no arg → warn on total failure.
+    await cmd();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage.mock.calls[0][0]).toMatch(/lab status/i);
+
+    // Poll invocation carries the __poll marker → silent.
+    mockShowWarningMessage.mockClear();
+    await cmd({ __poll: true });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("P3-7: the manual refresh does NOT warn when at least one source produced a report", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+      if (config.host === "boom") throw new Error("down");
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "bad", name: "Bad", config: { host: "boom" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "ok", name: "Good", config: { host: "ok" } }));
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
   it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

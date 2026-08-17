@@ -4389,7 +4389,7 @@ export function registerInventoryCommands(
    *  - `fetchProviderStatus` swallows a throwing/ malformed provider answer into
    *    `undefined`, and a vault read that rejects is caught here.
    */
-  async function refreshStatus(sourceIdArg?: string): Promise<void> {
+  async function refreshStatus(sourceIdArg?: string, options?: { manual?: boolean }): Promise<void> {
     const myGeneration = ++statusRefreshGeneration;
     const targets = sourceIdArg
       ? (() => {
@@ -4397,6 +4397,11 @@ export function registerInventoryCommands(
           return source ? [source] : [];
         })()
       : core.getSnapshot().inventorySources;
+    // P3-7 — on the MANUAL path only, warn once if every source we actually
+    // tried failed to produce a report (all auth broken / unreachable). The
+    // poll path stays silent (a warning per tick would nag).
+    let attempted = 0;
+    let succeeded = 0;
     for (const source of targets) {
       // A newer sweep has started while this one was awaiting — stop applying
       // stale results (last-STARTED-wins, so an older completion never
@@ -4411,6 +4416,7 @@ export function registerInventoryCommands(
       if (!provider || typeof provider.fetchStatus !== "function") {
         continue; // provider gone or offers no status (e.g. NetBox)
       }
+      attempted++;
       try {
         const secrets: InventorySourceSecrets = {};
         for (const fieldId of source.secretFieldIds) {
@@ -4423,16 +4429,28 @@ export function registerInventoryCommands(
         // record is never mutated) and degrades every provider failure to
         // undefined; secrets is a fresh local object, safe to pass as-is.
         const report = await fetchProviderStatus(provider, source.config, secrets);
-        // Re-check AFTER the (awaited) fetch: this is the load-bearing guard —
-        // a newer sweep may have started and applied while this fetch was in
-        // flight, and applying now would clobber it with older data.
-        if (report && myGeneration === statusRefreshGeneration) {
-          core.applyInventoryStatus(source.id, report);
+        if (report) {
+          // A report (even an empty one) means the source was reachable — count
+          // it as a success for the total-failure warning regardless of whether
+          // the generation guard below actually applies it.
+          succeeded++;
+          // Re-check AFTER the (awaited) fetch: this is the load-bearing guard —
+          // a newer sweep may have started and applied while this fetch was in
+          // flight, and applying now would clobber it with older data.
+          if (myGeneration === statusRefreshGeneration) {
+            core.applyInventoryStatus(source.id, report);
+          }
         }
       } catch {
         // Non-fatal per source (e.g. a rejecting vault read) — continue the sweep.
         continue;
       }
+    }
+    // P3-7 — every attempted source failed to report: surface it, manual only.
+    if (options?.manual && attempted > 0 && succeeded === 0) {
+      void vscode.window.showWarningMessage(
+        "Could not refresh lab status from any inventory source — check the source's credentials and connectivity."
+      );
     }
   }
 
@@ -4452,7 +4470,13 @@ export function registerInventoryCommands(
     vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(resolveSourceIdArg(arg))),
-    vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => refreshStatus(resolveSourceIdArg(arg))),
+    // The poll fires with a `{ __poll: true }` marker so it stays silent on
+    // total failure; every other invocation (palette, title action, a tree row)
+    // is the MANUAL path and warns if every source failed.
+    vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => {
+      const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
+      return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
+    }),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
   ];
 }
