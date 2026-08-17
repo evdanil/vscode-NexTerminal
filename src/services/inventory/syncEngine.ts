@@ -322,6 +322,11 @@ function selectTelnetEndpoint(device: InventoryDevice) {
  * The protocol is returned in the SHAPE `ServerConfig.protocol` stores, i.e.
  * `undefined` for SSH rather than `"ssh"`, so the value and its stamp can be
  * written verbatim without a translation step in between.
+ *
+ * `undefined` here IS "addressless" — the condition `hasConsoleEndpoint`
+ * (models/inventory.ts) exposes to providers so they can describe their own
+ * fetch in the same terms. Keep the two in step: a console kind added here is a
+ * console kind there.
  */
 function selectPrimaryEndpoint(
   device: InventoryDevice

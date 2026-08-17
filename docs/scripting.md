@@ -135,7 +135,7 @@ Every field except `@nexus-script` is optional.
 | `@nexus-script` | flag — no value | — | Required marker. Files without this are not Nexus scripts. |
 | `@name` | single-line string | filename without `.js` | Display name in tree, CodeLens, picker, and status bar. |
 | `@description` | single-line string | empty | Shown as tooltip in the sidebar. |
-| `@target-type` | `ssh`, `telnet`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. `ssh` and `telnet` are distinct — a telnet session is never offered to an `ssh` script, or the other way round. |
+| `@target-type` | `ssh`, `telnet`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. `ssh` and `telnet` are distinct — a telnet session is never offered to an `ssh` script, or the other way round. Classification follows the transport the session was **opened** on, not the profile's current setting, so editing a server's Protocol while its terminal is open does not reclassify a terminal already running. |
 | `@target-profile` | server name, serial profile name, Local Shell profile name, or matching id | none | When a session of this profile is active, it's auto-selected without showing the picker. Duplicate names are disambiguated with a narrowed picker. |
 | `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeoutSeconds` (30s) | Used by `waitFor`/`expect`/`waitAny` when no per-call `timeout` is provided. |
 | `@lock-input` | flag — no value | absent (terminal stays interactive) | Makes the bound terminal read-only for the run. User keystrokes are discarded with a one-shot notice line. |
