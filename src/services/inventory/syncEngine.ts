@@ -702,6 +702,15 @@ function namedExamples(names: string[]): string {
     .join(", ");
 }
 
+/**
+ * P2-2 (Fable) — how a kept/colliding server's OWN address reads in a refusal
+ * warning. An addressless placeholder carries `host: ""` / `port: 0`, which
+ * rendered as the nonsense ":0"; it has no address by design, so say so.
+ */
+function renderServerAddress(server: ServerConfig): string {
+  return server.addressless === true ? "(no address)" : `${server.host}:${server.port}`;
+}
+
 /** N1 — appends one summary warning for a category of non-owned device skips, naming up to 3 examples. No-op when the category is empty. */
 function pushSkipSummary(warnings: string[], reason: string, examples: string[]): void {
   const count = examples.length;
@@ -1435,6 +1444,19 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
             `Device "${device.name}" (${device.externalId}) has no console address, and its id collides with an existing server — left the existing server in place rather than replacing it with a placeholder.`
           );
           continue;
+        }
+        // P2-2 (Fable) — a kept placeholder for this device (a "Keep Servers" marker
+        // for the same provider deployment) cannot be adopted by address: it has none
+        // by design, and adoption corroborates by address. So a fresh placeholder is
+        // minted here rather than reclaiming the kept one. WARN so the kept copy is
+        // not stranded silently — the addressless ADD otherwise consults only the
+        // id-collision map and would leave the user to discover the duplicate.
+        const keptForAddressless = keptByExternalId.get(device.externalId) ?? [];
+        if (keptForAddressless.length > 0) {
+          const keptNames = namedExamples(keptForAddressless.map((s) => s.name));
+          warnings.push(
+            `Device "${device.name}" (${device.externalId}) has no console address and matches ${keptForAddressless.length === 1 ? "a server" : `${keptForAddressless.length} servers`} kept from a removed inventory source (${keptNames}) — a new placeholder was added because an addressless placeholder cannot be adopted by address. Once the device has a console, re-add the source and choose Adopt Existing, or delete the kept ${keptForAddressless.length === 1 ? "copy" : "copies"}.`
+          );
         }
         // DEVICE TEMPLATES (Codex P2-a) — the add matrix, against this fresh id for
         // the §5.3 self-proxy check, exactly as the addressed add path runs it. A
@@ -2427,11 +2449,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         warnings.push(`Device "${device.name}" (${device.externalId}) maps to an id already used by unrelated server "${collidingServer.name}" — skipped.`);
       } else if (eligibleForAdoption.length === 0) {
         warnings.push(
-          `Device "${device.name}" (${device.externalId}) was previously synced onto server "${collidingServer.name}", which is now at ${collidingServer.host}:${collidingServer.port} while the device is at ${endpoint.host}:${port} — and it still uses the id a new server for this device would need, so the device is skipped rather than added as a new server. Point "${collidingServer.name}" back at ${endpoint.host}:${port} and sync again to reclaim it with Adopt Existing, or delete it and the next sync adds the device fresh.`
+          `Device "${device.name}" (${device.externalId}) was previously synced onto server "${collidingServer.name}", which is now at ${renderServerAddress(collidingServer)} while the device is at ${endpoint.host}:${port} — and it still uses the id a new server for this device would need, so the device is skipped rather than added as a new server. Point "${collidingServer.name}" back at ${endpoint.host}:${port} and sync again to reclaim it with Adopt Existing, or delete it and the next sync adds the device fresh.`
         );
       } else if (eligibleForAdoption.length === 1) {
         warnings.push(
-          `Device "${device.name}" (${device.externalId}) matches server "${eligibleForAdoption[0].name}" kept from a removed inventory source at ${endpoint.host}:${port}, but server "${collidingServer.name}" — kept from an earlier sync of this same device, now at ${collidingServer.host}:${collidingServer.port} — still uses the id a new server for this device would need, so the device is skipped rather than offered for adoption. Delete "${collidingServer.name}", then sync again and choose Adopt Existing to reclaim "${eligibleForAdoption[0].name}".`
+          `Device "${device.name}" (${device.externalId}) matches server "${eligibleForAdoption[0].name}" kept from a removed inventory source at ${endpoint.host}:${port}, but server "${collidingServer.name}" — kept from an earlier sync of this same device, now at ${renderServerAddress(collidingServer)} — still uses the id a new server for this device would need, so the device is skipped rather than offered for adoption. Delete "${collidingServer.name}", then sync again and choose Adopt Existing to reclaim "${eligibleForAdoption[0].name}".`
         );
       } else {
         warnings.push(
@@ -2914,7 +2936,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // its own reason and the repair is obvious (the addresses are both named).
       warnings.push(
         keptMatches.length === 1
-          ? `Device "${device.name}" was previously synced onto server "${keptMatches[0].name}", but that server is now at ${keptMatches[0].host}:${keptMatches[0].port} and the device is at ${endpoint.host}:${port} — it will be added as a new server instead.`
+          ? `Device "${device.name}" was previously synced onto server "${keptMatches[0].name}", but that server is now at ${renderServerAddress(keptMatches[0])} and the device is at ${endpoint.host}:${port} — it will be added as a new server instead.`
           : `Device "${device.name}" was previously synced onto ${keptMatches.length} servers in your list, none of which is still at ${endpoint.host}:${port} — it will be added as a new server instead.`
       );
     } else {

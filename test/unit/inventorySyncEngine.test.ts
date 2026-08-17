@@ -2278,6 +2278,41 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
   const profile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
 
+  // P2-2 (Fable) — a kept ADDRESSLESS placeholder ("":0) cannot corroborate by
+  // address, and the addressless ADD consults only the id-collision map, never the
+  // kept markers. So (a) a still-addressless re-added device mints a SECOND
+  // placeholder while the kept copy is stranded with no warning, and (b) the
+  // moved-address refusal renders the kept record as ":0" (nonsense).
+  describe("P2-2 — kept addressless placeholders", () => {
+    it("(a) a still-addressless device with a matching kept marker WARNS instead of silently stranding the kept placeholder", () => {
+      // kept-1 holds a marker for device:1 but a NON-deterministic id, so no id
+      // collision — a fresh placeholder is minted for the deterministic id.
+      const keptAddressless = makeKeptServer({ host: "", port: 0, addressless: true });
+      const plan = planFor({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [] })]), // device:1 still addressless
+        currentServers: [keptAddressless],
+        now: 5000
+      });
+      // A placeholder is added (still no adoption-by-address possible), but the user
+      // is told a kept copy exists rather than being left to find the duplicate.
+      expect(plan.adds.some((a) => a.addressless === true)).toBe(true);
+      expect(plan.warnings.some((w) => w.includes("device:1") && /kept/i.test(w))).toBe(true);
+    });
+
+    it("(b) the moved-address refusal renders '(no address)' for an addressless kept record, never ':0'", () => {
+      const keptAddressless = makeKeptServer({ host: "", port: 0, addressless: true });
+      const plan = planFor({
+        source: makeSource(),
+        tree: makeTree([keptDevice()]), // device gained the address lab-sw-01
+        currentServers: [keptAddressless],
+        now: 5000
+      });
+      expect(plan.warnings.some((w) => w.includes("(no address)"))).toBe(true);
+      expect(plan.warnings.every((w) => !/:0\b/.test(w))).toBe(true);
+    });
+  });
+
   /**
    * M27/M29 (review) — THE ADOPTEE TWIN of the update path's protocol matrix.
    * The update path had four discriminating tests and the adoption path none,
