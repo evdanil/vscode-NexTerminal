@@ -4590,8 +4590,9 @@ export function registerInventoryCommands(
     // (~:4413). Without it a Start fired while the same source is being removed
     // races the vault purge and dispatches with partial secrets naming a node
     // whose source was just deleted; mid-edit it dispatches a stale
-    // `source.config` (old baseUrl). We do NOT take the config mutation lock —
-    // a control persists no servers — we only decline to race.
+    // `source.config` (old baseUrl). This guards the SOURCE-SCOPED siblings; the
+    // GLOBAL config mutations that bypass inFlightSourceIds are handled by the
+    // under-lock capture below (see the #85 P2 note before the claim).
     if (inFlightSourceIds.get(source.id) !== undefined) {
       void vscode.window.showInformationMessage(`"${source.name}" is busy — try again in a moment.`);
       return;
@@ -4610,17 +4611,55 @@ export function registerInventoryCommands(
     // post-action `refreshStatus` fires, because refreshStatus SKIPS a source
     // that is inFlightSourceIds-held (~:4413 `continue`); firing it while still
     // holding "control" would self-skip the very status refresh we want. So:
-    // claim → try{ load secrets; dispatch } finally{ release } → toast → refresh.
-    // No config mutation lock is taken — a control persists no servers.
+    // claim → try{ capture; dispatch } finally{ release } → toast → refresh.
+    //
+    // #85 P2 (Codex) — the "control" claim above guards only the SOURCE-SCOPED
+    // siblings (Edit/Remove/Sync all honour inFlightSourceIds). But the two GLOBAL
+    // config mutations — an id-preserving replace-import (`importMergeReplace`) and
+    // Delete All Data (`completeReset`) — DELIBERATELY bypass inFlightSourceIds and
+    // serialize ONLY through `configMutationLock`. So the config mutation lock IS
+    // taken here — for the CAPTURE only: re-read the live source + read its vault
+    // secrets under the lock, serialized against a replace-import swapping the
+    // source and against completeReset purging its credentials. The ~60s provider
+    // DISPATCH stays OUTSIDE the lock, mirroring refreshStatus/sync (~:4470-4515):
+    // holding `configMutationLock` across long provider I/O would freeze every
+    // config mutation app-wide (including the Delete All Data a user needs to
+    // recover a hung source). The sole residual is a benign stale dispatch against
+    // a source removed DURING the network call — it persists nothing and sends the
+    // captured credentials only to the box they were captured for.
+    //
+    // `source` was resolved synchronously at handler entry, so this revision is
+    // fresh; the capture bails if a locked writer moved it before we re-read (an
+    // id-preserving import bumps `revision` via randomUUID(); a reset removes the
+    // record). `controlProviderNode` and the EVE provider are pure network — they
+    // never take `configMutationLock` — so the dispatch-outside-lock split has no
+    // reentrancy or deadlock.
+    const startRevision = source.revision;
     inFlightSourceIds.set(source.id, "control");
     let dispatched = false;
     try {
-      const secrets: InventorySourceSecrets = {};
-      for (const fieldId of source.secretFieldIds) {
-        const value = await vault.get(inventorySecretKey(source.id, fieldId));
-        if (value !== undefined) {
-          secrets[fieldId] = value;
+      const captured = await configMutationLock.runExclusive(async () => {
+        // Re-read the LIVE source inside the lock. A replace-import that swapped it
+        // (or a reset that removed it) commits under this same lock, so either it
+        // ran before us — caught here — or it queues behind us, and we captured a
+        // coherent snapshot first. Keep this callback SHORT: only the re-read and
+        // the vault reads, no network, no dispatch (that stays outside the lock).
+        const live = core.getInventorySource(source.id);
+        if (!live || live.revision !== startRevision) {
+          return undefined;
         }
+        const secrets: InventorySourceSecrets = {};
+        for (const fieldId of live.secretFieldIds) {
+          const value = await vault.get(inventorySecretKey(source.id, fieldId));
+          if (value !== undefined) {
+            secrets[fieldId] = value;
+          }
+        }
+        return { config: structuredClone(live.config), secrets };
+      });
+      if (!captured) {
+        void vscode.window.showInformationMessage(`"${source.name}" changed — try again in a moment.`);
+        return;
       }
       // P3-4 — controlNode runs login → detectEdition → action sequentially (up to
       // ~60s with a re-login), so without a progress UI the user sees nothing until
@@ -4634,7 +4673,7 @@ export function registerInventoryCommands(
         { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
         async () => {
           try {
-            await controlProviderNode(provider, source.config, secrets, origin.externalId, action);
+            await controlProviderNode(provider, captured.config, captured.secrets, origin.externalId, action);
             return true;
           } catch (err) {
             void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);

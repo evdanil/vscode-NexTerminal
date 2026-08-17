@@ -8449,6 +8449,79 @@ describe("inventoryCommands", () => {
       expect(mockShowErrorMessage).toHaveBeenCalled();
       expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
     });
+
+    // ── #85 P2 (Codex) — capture under configMutationLock, dispatch OUTSIDE it ──
+    // The per-source "control" claim above guards the SOURCE-SCOPED siblings
+    // (Edit/Remove/Sync each honour inFlightSourceIds). But the GLOBAL config
+    // mutations — an id-preserving replace-import and Delete All Data — DELIBERATELY
+    // bypass inFlightSourceIds and serialize ONLY through configMutationLock. So the
+    // secrets+config CAPTURE is taken INSIDE that lock (re-reading the live source and
+    // bailing if its revision moved), while the ~60s provider dispatch stays OUTSIDE
+    // it (the firm I/O-outside-lock invariant refreshStatus/sync also obey).
+
+    it("BAILS without dispatching when a locked writer (replace-import) supersedes the source between handler entry and the under-lock capture — the live revision no longer matches (⊘ dropping the revision guard dispatches against a source swapped out from under it, with a stale baseUrl)", async () => {
+      const { start, controlSpy, core, server } = await setup();
+      const realSource = core.getInventorySource("src-1")!;
+      // The first getInventorySource (handler entry) sees the real record; the
+      // capture's re-read INSIDE configMutationLock sees a DIFFERENT revision —
+      // exactly what an id-preserving replace-import that swapped the source would
+      // present (addOrUpdateInventorySource re-assigns revision via randomUUID()).
+      let calls = 0;
+      vi.spyOn(core, "getInventorySource").mockImplementation((id: string) => {
+        void id;
+        calls += 1;
+        return calls === 1 ? realSource : { ...realSource, revision: "superseded-revision" };
+      });
+      await start({ server });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+      expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(true);
+    });
+
+    it("takes the secrets+config CAPTURE inside configMutationLock — while an unrelated writer holds the lock, no vault read and no dispatch happen; once the lock frees, the capture proceeds and dispatches (⊘ capturing without the lock reads credentials mid-purge, racing Delete All Data's vault wipe)", async () => {
+      const { start, controlSpy, vault, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      // Hold configMutationLock with a gated writer — as completeReset (Delete All
+      // Data) or a replace-import would while purging/swapping under the lock.
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+      const held = configMutationLock.runExclusive(async () => {
+        await gate;
+      });
+      await Promise.resolve(); // let the gated writer actually acquire the lock
+
+      const inFlight = start({ server });
+      try {
+        // Give controlNode room to run up to (and queue behind) the held lock.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        // The lock is held → the capture is queued behind it → NO vault read, NO dispatch.
+        expect(vault.get).not.toHaveBeenCalled();
+        expect(controlSpy).not.toHaveBeenCalled();
+      } finally {
+        // Always free the shared configMutationLock singleton, even if an
+        // assertion above threw — otherwise a red run would wedge every later test.
+        releaseGate();
+        await held;
+        await inFlight;
+      }
+      // Release → the capture runs → the vault read happens → the dispatch proceeds.
+      expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "password"));
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+    });
+
+    it("revision STABLE across handler entry and the under-lock re-read → the capture succeeds and dispatch proceeds with the source's secrets, no 'changed' refusal (⊘ a spurious bail would refuse every ordinary control)", async () => {
+      const { start, controlSpy, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+      expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(false);
+    });
   });
 });
 
