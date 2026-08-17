@@ -694,6 +694,71 @@ describe("createEveNgProvider — folder walk", () => {
     }
   });
 
+  /**
+   * P1 (data-loss) — the last member of the containment hierarchy (envelope →
+   * node → lab → FOLDER). A malformed CHILD-FOLDER entry has no recoverable
+   * descendant identity: skipping it omits an UNKNOWN subtree of servers while
+   * the tree stays non-truncated, so computeSyncPlan prunes them. Same treatment
+   * as the malformed-lab case — FAIL the sync. The CRITICAL distinction is that
+   * only "malformed" fails; the LEGITIMATELY not-descendable entries (`..`,
+   * out-of-scope, visited, dot-segment) keep being skipped.
+   */
+  it("P1 — fails the sync on a non-object child-folder entry, rather than dropping its subtree (⊘ `continue` omits an unknown subtree and prunes its servers)", async () => {
+    for (const badFolder of [null, "F", 42]) {
+      const world: World = {
+        folders: { "/": { folders: [{ name: "Good", path: "/Good" }, badFolder as never], labs: [] }, "/Good": { labs: [{ file: "L.unl", path: "/Good/L.unl" }] } },
+        nodes: { "/Good/L.unl": { "1": node() } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      const err = await createEveNgProvider(fetchImpl)
+        .fetchInventory(CONFIG, SECRETS)
+        .catch((e: unknown) => e);
+      expect(err, `folder=${JSON.stringify(badFolder)}`).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, `folder=${JSON.stringify(badFolder)}`).toBe("protocol");
+    }
+  });
+
+  it("P1 — fails the sync on a child-folder entry that is a valid object with no usable `path` (⊘ an empty/blank path is silently skipped, dropping the subtree it should have named)", async () => {
+    for (const badFolder of [{ name: "x" }, { name: "x", path: "" }, { path: "   " }]) {
+      const world: World = {
+        folders: { "/": { folders: [{ name: "Good", path: "/Good" }, badFolder as never], labs: [] }, "/Good": { labs: [{ file: "L.unl", path: "/Good/L.unl" }] } },
+        nodes: { "/Good/L.unl": { "1": node() } }
+      };
+      const { fetchImpl } = makeWorld(world);
+      const err = await createEveNgProvider(fetchImpl)
+        .fetchInventory(CONFIG, SECRETS)
+        .catch((e: unknown) => e);
+      expect(err, `folder=${JSON.stringify(badFolder)}`).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind, `folder=${JSON.stringify(badFolder)}`).toBe("protocol");
+    }
+  });
+
+  it("P1 — does NOT fail on LEGITIMATELY non-descendable folder entries (`..`, out-of-scope, already-visited) — every EVE-NG listing carries `..`, so failing on these makes normal trees unsyncable (⊘ over-correcting turns the skip cases into sync failures)", async () => {
+    const world: World = {
+      folders: {
+        "/A": {
+          folders: [
+            { name: "..", path: "/" }, // the ubiquitous parent entry
+            { name: "escape", path: "/SECRET" }, // out-of-scope
+            { name: "A", path: "/A" }, // already-visited (the root itself)
+            { name: "Sub", path: "/A/Sub" } // a real descendable child
+          ],
+          labs: [{ file: "Top.unl", path: "/A/Top.unl" }]
+        },
+        "/A/Sub": { folders: [], labs: [{ file: "Deep.unl", path: "/A/Sub/Deep.unl" }] },
+        "/SECRET": { labs: [{ file: "Leak.unl", path: "/SECRET/Leak.unl" }] }
+      },
+      nodes: { "/A/Top.unl": { "1": node() }, "/A/Sub/Deep.unl": { "1": node() }, "/SECRET/Leak.unl": { "1": node() } }
+    };
+    const { fetchImpl, calls } = makeWorld(world);
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory({ ...CONFIG, rootFolder: "/A" }, SECRETS);
+    // Completed without throwing; descended only into the real child, and the
+    // out-of-scope subtree was never even requested.
+    expect(tree.devices.map((d) => d.externalId).sort()).toEqual(["/A/Sub/Deep.unl#1", "/A/Top.unl#1"]);
+    expect(calls.some((c) => c.url.includes("SECRET"))).toBe(false);
+    expect(tree.truncated).toBeFalsy();
+  });
+
   it("MAJOR-1(b) — refuses a folder child path containing a `..` segment BEFORE requesting it, so `new URL` cannot collapse it to a different origin path after the guard approved it (⊘ isWithin runs on the pre-normalized path — `/A/../../secret` startsWith `/A/`, passes, then the fetch lands on /api/secret with the cookie)", async () => {
     const world: World = {
       folders: {

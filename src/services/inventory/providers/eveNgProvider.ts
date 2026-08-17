@@ -656,6 +656,29 @@ class EveApiClient {
           return !hasDotSegment(childPath) && isWithin(childPath, root) && !visited.has(childPath);
         };
 
+        // P1 (data-loss) — the last member of the containment hierarchy
+        // (envelope → node → lab → FOLDER), and it fails the sync for the SAME
+        // reason the malformed-lab case does: a folder we cannot descend into
+        // (a non-object entry, or an object with no usable `path`) hides an
+        // UNKNOWN subtree of servers, and skipping it would prune every one of
+        // them while the tree stays non-truncated. The ASYMMETRY, documented
+        // here as on the lab and node sites: only MALFORMED fails. The
+        // LEGITIMATELY not-descendable entries below — the `..` parent every
+        // listing carries, an out-of-scope path (MAJOR-1a), an already-visited
+        // path (cycle guard), a dot-segment path (MAJOR-1b) — are NOT malformed
+        // and keep being skipped, because failing on `..` would make every
+        // normal EVE-NG tree unsyncable.
+        const isMalformedFolder = (rawFolder: unknown): boolean =>
+          !isObject(rawFolder) || str((rawFolder as Record<string, unknown>).path) === "";
+        for (const rawFolder of listing.folders) {
+          if (isMalformedFolder(rawFolder)) {
+            throw new InventoryProviderError(
+              "protocol",
+              `EVE-NG returned a malformed child-folder entry under "${path}" (not an object, or no usable path). Failing the sync rather than risk pruning that subtree's servers.`
+            );
+          }
+        }
+
         if (depth >= MAX_FOLDER_DEPTH) {
           // P2-2 — only mark truncated when a GENUINELY descendable child
           // remains below the cap. Counting `folders.length` treated the
