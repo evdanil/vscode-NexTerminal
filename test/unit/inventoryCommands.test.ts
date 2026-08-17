@@ -13,6 +13,7 @@ import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/n
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import {
   computeProviderFingerprint,
+  InventoryProviderError,
   inventorySecretKey,
   type InventoryProvider,
   type InventorySourceConfig,
@@ -36,6 +37,7 @@ const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
 const mockShowErrorMessage = vi.fn();
 const mockExecuteCommand = vi.fn();
+const mockWithProgress = vi.fn((_opts: unknown, task: (...a: unknown[]) => unknown) => task());
 const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
 const mockWebviewOpen = vi.fn();
@@ -55,7 +57,7 @@ vi.mock("vscode", () => ({
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
-    withProgress: (_opts: unknown, task: (...a: unknown[]) => unknown) => task(),
+    withProgress: (...args: unknown[]) => mockWithProgress(...(args as [unknown, (...a: unknown[]) => unknown])),
     showTextDocument: (...args: unknown[]) => mockShowTextDocument(...args)
   },
   workspace: {
@@ -8293,6 +8295,39 @@ describe("inventoryCommands", () => {
       expect(msg).toContain("EVE-NG refused the start");
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
       expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    it("P3-4 — wraps the dispatch in withProgress so the '{Starting|Stopping} \"name\"…' title shows DURING the ~60s call, then still dispatches and refreshes (⊘ no withProgress leaves the user staring at a silent UI for the whole login→detect→action sequence)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(mockWithProgress).toHaveBeenCalled();
+      const opts = mockWithProgress.mock.calls[0][0] as { title?: string; location?: unknown };
+      expect(opts.title).toContain("R1");
+      expect(opts.title).toMatch(/starting/i);
+      // The dispatch and refresh still happen through the wrapped task.
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+    });
+
+    it("P3-4 — the success toast is HONEST about the status lag rather than phrased as if the request were about to be sent (⊘ 'Starting \"R1\"…' after the API already returned misreports the timing)", async () => {
+      const { start, server } = await setup();
+      await start({ server });
+      const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(info).toMatch(/sent/i);
+      expect(info).toMatch(/refresh lab status/i);
+    });
+
+    it("M2 — a classified InventoryProviderError surfaces through describeInventoryError, so the failure toast carries the classified prefix (⊘ a bare err.message drops the 'Authentication failed:' classification every other inventory failure shows)", async () => {
+      const { start, server } = await setup({
+        controlNode: vi.fn(async () => {
+          throw new InventoryProviderError("auth", "EVE-NG rejected the credentials");
+        })
+      });
+      await start({ server });
+      const msg = mockShowErrorMessage.mock.calls[0]?.[0] as string;
+      expect(msg).toContain("R1");
+      expect(msg).toContain("Authentication failed:");
+      expect(msg).toContain("EVE-NG rejected the credentials");
     });
 
     it("resolves the server from a bare source-less arg via core.getServer when the tree item carries the record id (⊘ a handler that only reads a string id misses the tree-item object VS Code actually passes)", async () => {

@@ -4602,14 +4602,36 @@ export function registerInventoryCommands(
         secrets[fieldId] = value;
       }
     }
-    try {
-      await controlProviderNode(provider, source.config, secrets, origin.externalId, action);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${detail}`);
+    // P3-4 — controlNode runs login → detectEdition → action sequentially (up to
+    // ~60s with a re-login), so without a progress UI the user sees nothing until
+    // it all resolves. Wrap the dispatch so the title shows DURING the call
+    // (mirrors serverCommands' "Connecting to …" and the "Testing connection to
+    // …" above). M2 — a FAILURE surfaces through describeInventoryError (the
+    // provider throws classified InventoryProviderErrors), matching every other
+    // inventory failure toast, rather than a bare err.message.
+    const verb = action === "start" ? "Starting" : "Stopping";
+    const dispatched = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
+      async () => {
+        try {
+          await controlProviderNode(provider, source.config, secrets, origin.externalId, action);
+          return true;
+        } catch (err) {
+          void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);
+          return false;
+        }
+      }
+    );
+    if (!dispatched) {
       return;
     }
-    void vscode.window.showInformationMessage(`${action === "start" ? "Starting" : "Stopping"} "${server.name}"…`);
+    // HONEST completion toast — the API has already returned by now, but the node
+    // boots over seconds so the lab status lags. Say that, rather than phrasing it
+    // as if the request were about to be sent.
+    const sent = action === "start" ? "Start" : "Stop";
+    void vscode.window.showInformationMessage(
+      `${sent} sent to "${server.name}" — lab status will catch up on the next Refresh Lab Status.`
+    );
     // Best-effort, NOT awaited — the node takes seconds to boot, so the status
     // will lag this refresh by a poll or two, which is expected.
     void vscode.commands.executeCommand("nexus.inventory.refreshStatus", source.id);
