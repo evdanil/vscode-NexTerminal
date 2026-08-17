@@ -467,6 +467,12 @@ class EveApiClient {
     let requests = 0;
     let truncated = false;
     let depthCapped = false;
+    // MAJOR-1(a) — labs (and folders) the server reported OUTSIDE the Root
+    // Folder subtree, or bearing a dot-segment. Counted, not silently dropped:
+    // a scope violation is a hostile/misconfigured response worth surfacing,
+    // but it is NOT a cap, so it must not set `truncated` (that would disable
+    // pruning of the in-scope servers that legitimately disappeared).
+    let outOfScope = 0;
 
     while (queue.length > 0) {
       const next: typeof queue = [];
@@ -484,8 +490,17 @@ class EveApiClient {
 
         for (const rawLab of listing.labs) {
           if (!isObject(rawLab)) continue;
-          const labPath = str(rawLab.path) || joinPath(path, str(rawLab.file));
+          const labPath = normalizeFolderPath(str(rawLab.path) || joinPath(path, str(rawLab.file)));
           if (!labPath.toLowerCase().endsWith(".unl")) continue;
+          // MAJOR-1(a)/(b) — confine the lab path with the SAME boundary check
+          // as folder edges, and reject dot-segments, before it is ever turned
+          // into a `/api/labs{labPath}/nodes` request. Skipping a lab hides
+          // devices, so this counts toward one aggregate warning rather than
+          // vanishing silently.
+          if (hasDotSegment(labPath) || !isWithin(labPath, root)) {
+            outOfScope++;
+            continue;
+          }
           if (!matchesFilter(labPath)) continue;
           if (labs.length >= MAX_LABS) {
             truncated = true;
@@ -503,17 +518,16 @@ class EveApiClient {
         }
         for (const rawFolder of listing.folders) {
           if (!isObject(rawFolder)) continue;
-          // ".." is the parent link every listing carries; following it walks
-          // straight back up. The visited set catches it too, but only after
-          // one wasted request per folder.
-          if (str(rawFolder.name) === "..") continue;
           const childPath = normalizeFolderPath(str(rawFolder.path));
           // NEVER LEAVE THE SUBTREE the user scoped with Root Folder. The
-          // listing's paths are server-supplied, and the ".." entry above is
-          // only the most common way one of them points at an ancestor — a
-          // crawl that follows any of them imports the whole EVE-NG server,
-          // which is exactly what Root Folder exists to prevent.
-          if (!isWithin(childPath, root) || visited.has(childPath)) continue;
+          // listing's paths are server-supplied. A dot-segment
+          // (`/A/../../secret`) is rejected outright — `new URL` would
+          // otherwise collapse it past `isWithin` into a request on a different
+          // path (MAJOR-1(b)); this also subsumes the old ".." parent-entry
+          // skip, whose path always points at an ancestor and so fails
+          // `isWithin` too. A visited path cannot be re-entered, so a cycle
+          // spelled with real folder names still terminates.
+          if (hasDotSegment(childPath) || !isWithin(childPath, root) || visited.has(childPath)) continue;
           visited.add(childPath);
           next.push({ path: childPath, depth: depth + 1 });
         }
@@ -526,6 +540,13 @@ class EveApiClient {
     }
     if (depthCapped) {
       warnings.push(`The EVE-NG folder tree is deeper than ${MAX_FOLDER_DEPTH} levels — folders below that depth were not scanned.`);
+    }
+    if (outOfScope > 0) {
+      warnings.push(
+        `${outOfScope} lab${outOfScope === 1 ? "" : "s"} the server reported outside the Root Folder ${
+          outOfScope === 1 ? "was" : "were"
+        } skipped.`
+      );
     }
     return { labs, truncated, warnings };
   }
@@ -576,6 +597,19 @@ function readSessionCookie(res: Response): string | undefined {
 /** Is `child` the root itself, or strictly beneath it? */
 function isWithin(child: string, root: string): boolean {
   return root === "/" || child === root || child.startsWith(`${root}/`);
+}
+
+/**
+ * MAJOR-1(b) — a `.` or `..` SEGMENT in a path. The `isWithin` boundary check
+ * runs on the LOGICAL path, but `new URL` collapses dot-segments AFTER that
+ * check when the request is built, so `/A/../../secret` (root `/A`) passes
+ * `isWithin` — it startsWith `/A/` — and then the fetch lands on `/api/secret`
+ * with the session cookie. Rejecting any path with a dot-segment before it is
+ * ever turned into a request closes that gap for both folder and lab paths;
+ * confinement then holds against the post-normalization path the fetch uses.
+ */
+function hasDotSegment(path: string): boolean {
+  return path.split("/").some((segment) => segment === "." || segment === "..");
 }
 
 function joinPath(folder: string, file: string): string {
@@ -716,6 +750,13 @@ async function fetchInventoryImpl(
 ): Promise<InventoryTree> {
   const client = makeClient(fetchImpl, config, secrets);
   const root = normalizeFolderPath(String(config.rootFolder ?? "/"));
+  // MAJOR-1(b) — a user-typed Root Folder is built into every folder request,
+  // so a `.`/`..` segment in it would be collapsed by `new URL` into a scope
+  // the user never named. Reject it up front with a clear message rather than
+  // silently scanning somewhere else.
+  if (hasDotSegment(root)) {
+    throw new InventoryProviderError("protocol", `Root Folder "${root}" must not contain "." or ".." path segments.`);
+  }
   const rootPrefix = root === "/" ? "" : root;
   const filter = str(config.filter).toLowerCase();
   // Absent means INCLUDED — `includeStopped` defaults to true (see the field),

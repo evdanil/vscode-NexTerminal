@@ -508,6 +508,66 @@ describe("createEveNgProvider — folder walk", () => {
     expect(tree.devices[0].folderPath).toBe("Mine");
     expect(calls.some((c) => c.url.endsWith("/api/folders/"))).toBe(false);
   });
+
+  /**
+   * MAJOR-1(a) — lab entries are server-supplied and were used verbatim. A
+   * hostile (or misconfigured) server can answer a request scoped to `/A/B`
+   * with a lab whose path is `/SECRET/Other.unl`; the crawl then fetches that
+   * lab's nodes — with the session cookie attached — and imports a device from
+   * outside the Root Folder the user set to bound the scan.
+   */
+  it("MAJOR-1(a) — refuses a lab whose path escapes the Root Folder subtree, warns, and never requests its nodes (⊘ using labs[].path verbatim imports a device from /SECRET on a request scoped to /A/B)", async () => {
+    const world: World = {
+      folders: { "/A/B": { labs: [{ file: "Other.unl", path: "/SECRET/Other.unl" }, { file: "Mine.unl", path: "/A/B/Mine.unl" }] } },
+      nodes: { "/SECRET/Other.unl": { "1": node() }, "/A/B/Mine.unl": { "1": node() } }
+    };
+    const { fetchImpl, calls } = makeWorld(world);
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory({ ...CONFIG, rootFolder: "/A/B" }, SECRETS);
+    expect(tree.devices.map((d) => d.externalId)).toEqual(["/A/B/Mine.unl#1"]);
+    expect(calls.some((c) => c.url.includes("SECRET"))).toBe(false);
+    expect((tree.warnings ?? []).some((w) => /outside the Root Folder/i.test(w))).toBe(true);
+    // A hostile out-of-scope lab is not a hard cap; pruning must stay enabled.
+    expect(tree.truncated).toBeFalsy();
+  });
+
+  it("MAJOR-1(b) — refuses a folder child path containing a `..` segment BEFORE requesting it, so `new URL` cannot collapse it to a different origin path after the guard approved it (⊘ isWithin runs on the pre-normalized path — `/A/../../secret` startsWith `/A/`, passes, then the fetch lands on /api/secret with the cookie)", async () => {
+    const world: World = {
+      folders: {
+        "/A": { folders: [{ name: "evil", path: "/A/../../secret" }], labs: [{ file: "Mine.unl", path: "/A/Mine.unl" }] },
+        "/secret": { labs: [{ file: "Leak.unl", path: "/secret/Leak.unl" }] }
+      },
+      nodes: { "/A/Mine.unl": { "1": node() }, "/secret/Leak.unl": { "1": node() } }
+    };
+    const { fetchImpl, calls } = makeWorld(world);
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory({ ...CONFIG, rootFolder: "/A" }, SECRETS);
+    expect(tree.devices.map((d) => d.externalId)).toEqual(["/A/Mine.unl#1"]);
+    // ⊘ The collapsed path must never be requested.
+    expect(calls.some((c) => new URL(c.url).pathname === "/api/secret")).toBe(false);
+    expect(calls.some((c) => new URL(c.url).pathname.includes("/secret"))).toBe(false);
+  });
+
+  it("MAJOR-1(b) — refuses a lab path containing a `..` segment before building the node request (⊘ `/A/../../../etc/x.unl` collapses to /api/labs/etc/x.unl/nodes, carrying the cookie off to an unintended path)", async () => {
+    const world: World = {
+      folders: { "/A": { labs: [{ file: "x.unl", path: "/A/../../../etc/x.unl" }, { file: "Mine.unl", path: "/A/Mine.unl" }] } },
+      nodes: { "/etc/x.unl": { "1": node() }, "/A/Mine.unl": { "1": node() } }
+    };
+    const { fetchImpl, calls } = makeWorld(world);
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory({ ...CONFIG, rootFolder: "/A" }, SECRETS);
+    expect(tree.devices.map((d) => d.externalId)).toEqual(["/A/Mine.unl#1"]);
+    expect(calls.some((c) => new URL(c.url).pathname.includes("/etc/"))).toBe(false);
+    expect((tree.warnings ?? []).some((w) => /outside the Root Folder/i.test(w))).toBe(true);
+  });
+
+  it("rejects a Root Folder that itself carries a `.`/`..` segment rather than letting `new URL` silently collapse it into an unintended scope (⊘ user config `/A/../secret` scans /secret without saying so)", async () => {
+    const world: World = { folders: { "/": {} }, nodes: {} };
+    const { fetchImpl } = makeWorld(world);
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory({ ...CONFIG, rootFolder: "/A/../secret" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+    expect((err as Error).message.toLowerCase()).toContain("root folder");
+  });
 });
 
 describe("createEveNgProvider — nodes", () => {
