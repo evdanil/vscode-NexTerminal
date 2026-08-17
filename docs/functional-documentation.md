@@ -355,6 +355,7 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexusFileExplorer`: remote file browser for the active connected server.
 - `nexusMacros`: terminal macros with optional custom keyboard shortcuts and auto-trigger state.
 - `nexusScripts`: script files, run state, and script view actions.
+- `nexusNetworkServers`: the TFTP and DHCP services, their configuration rows, live transfers/leases, and completed-transfer history. Collapsed by default.
 - `nexusSettings`: extension settings sidebar panel.
 
 ### 6.2 Commands
@@ -425,6 +426,15 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 - `nexus.script.openOutput`, `nexus.script.openDocs`, `nexus.script.openExamples`
 - `nexus.script.openScriptsFolder`, `nexus.script.revealInExplorer`
 - Drag-and-drop: drag a script row onto a folder to move it there (no command — the gesture is the only surface)
+
+**Network Servers:**
+- `nexus.networkServer.start`, `nexus.networkServer.stop`, `nexus.networkServer.restart`
+- `nexus.networkServer.quickAdjust` (Quick Settings — also the click action of a service row), `nexus.networkServer.edit` (full form; view title-bar gear)
+- `nexus.networkServer.inspectLogs` (reveal the **Nexus Network Servers** output channel)
+- `nexus.networkServer.tftp.cancelTransfer`, `nexus.networkServer.tftp.clearHistory`
+- `nexus.networkServer.profile.saveCurrent`, `nexus.networkServer.profile.apply`
+- `nexus.networkServer.profile.rename`, `nexus.networkServer.profile.duplicate`, `nexus.networkServer.profile.remove`
+- Start, Restart, Cancel Transfer, and Clear Transfer History are hidden from the Command Palette when the workspace is not trusted.
 
 **Files:**
 - `nexus.files.browse`, `nexus.files.open`
@@ -527,3 +537,103 @@ Author-and-run automation on top of any active SSH, Serial, or Local Shell sessi
 - **Open Scripts Folder** opens the scripts directory itself via `env.openExternal`, falling back to `revealFileInOS` only if that reports failure (a `file:` URI from a remote window resolves on the local machine) and to a message naming the path if neither works. The order matters and was wrong until 2.8.77: `revealFileInOS` is Electron's `showItemInFolder`, which reveals its argument *inside the containing folder*, so handed a directory it opens that directory's **parent** — `<workspace>/.nexus` for the default `.nexus/scripts`, or the extension's global-storage directory for the no-workspace fallback. Neither holds a script, and the command is called Open Scripts Folder.
 - **New Script** (`nexus.script.new`) accepts a `/`-separated path (e.g. `cisco/backup`) and creates any missing intermediate directories. **New Folder** (`nexus.script.newFolder`, view title bar or a folder's right-click menu) creates a real, empty directory; naming one that already exists is a no-op with an info message. Both commands, invoked from a folder's context menu, pre-seed that folder as a `folder/` prefix in the input box. A folder's context menu also offers **Reveal in Explorer**.
 - **Path validation** reuses the same folder-path grammar as macros and the Connectivity Hub (`src/utils/folderPaths.ts`: `normalizeFolderPath`, `MAX_FOLDER_DEPTH = 10`) for the directory portion of a New Script / New Folder path, and the pre-existing `/^[A-Za-z0-9._-]+$/` regex for the leaf script name. The two are validated separately and deliberately: the leaf regex alone would accept `..` as a whole segment (safe only because the pre-folders implementation forbade `/` entirely), so once `/` is allowed the directory segments must go through `normalizeFolderPath` — which rejects `.`, `..`, and depth beyond 10 — or a name like `../../../../home/you/startup` would resolve outside the scripts directory via `Uri.joinPath`. A `\` in the input is rejected outright with a message telling the user to use `/`.
+
+## 10. Embedded Network Servers (TFTP/DHCP)
+
+Serve files to lab hardware and hand it addresses from inside the editor — the two services a Zero-Touch Provisioning bench needs, without a separate daemon installed on the host.
+
+TFTP and DHCP are **fixed singletons, not user-created profiles**. There is exactly one of each, identified by its kind, and everything configurable lives in native VS Code settings under `nexus.networkServers.*` rather than in `ConfigRepository`; the only state Nexus tracks is runtime state (status, bound port, live transfers, leases, this run's transfer history). Starting either service requires a **trusted workspace**: the manifest hides Start/Restart from the Command Palette in Restricted Mode, and `NetworkServerManager.assertTrusted()` refuses every other invocation path (keybinding, tree item, another extension). Managing configuration is not gated — it binds no port and serves no file.
+
+### 10.1 Flow
+
+1. Open the **Network Servers** view in the Nexus sidebar. Both services render before either has ever run: configuration rows come straight from settings, so the root directory, pool, boot options, and static reservations are visible while the service is stopped.
+2. Click a service row (or run **Quick Settings**) to set the values a bench actually changes. **Open Full Settings** — the view title-bar gear — opens the webview form with every field, including the structured ones (ZTP boot options, vendor-specific TLVs, `MAC=IP` reservations) that a one-line input box cannot express.
+3. **Start Service** from the row's inline action. The service binds, the row turns green, and the runtime rows (Active Transfers / Active Leases) begin filling from daemon push updates.
+4. Settings are read at start, so edits made while a service is running do not take effect until **Restart Service**. Quick Settings offers that restart itself, once, when it closes after an actual edit.
+
+### 10.2 TFTP
+
+- **Root directory** (`nexus.networkServers.tftp.root`) defaults to `~/Nexus/tftp-root`, created on first start (system temp as a fallback). Every file beneath it is readable by any host that can reach the bound port.
+- **Path sandbox**: every filename arriving in an RRQ or WRQ goes through `PathGuard`, which strips leading slashes, resolves the path, and rejects anything that escapes the root — a `../../etc/passwd` filename fails with a TFTP error packet rather than a read. Parent directories are created recursively on write, which is what modern clients expect.
+- **Access mode**: read-only by default. `allowWrite` accepts WRQ uploads; TFTP has no authentication, so this exposes the root to anything that can reach the port.
+- **Port**: UDP 69 is privileged. If the bind is denied the service falls back to **1069** and logs a warning rather than failing to start.
+- **Live transfers** appear under *Active Transfers (n)* with direction (RRQ download / WRQ upload), filename, client, bytes transferred, percentage when the client negotiated `tsize`, and current speed. **Cancel Transfer** on a row aborts one in-flight transfer; from the Command Palette it picks from the transfers currently in the snapshot, or acts directly when there is only one.
+- **Client identity**: a bench full of switches all called `192.168.1.x` is hard to read, so a transfer's client is rendered once, daemon-side, as `hostname (ip)` when a PTR record resolves and as the bare IP when it does not — the same string in the sidebar rows, tooltips, history, and toasts. Reverse lookups are cached (5 minutes on success, 60 seconds on failure, so a device that registers its PTR shortly after booting is picked up), deduplicated per address while one is in flight, and bounded by a hard 2 s deadline. A transfer never waits on DNS; a name that arrives late simply rides the next runtime snapshot into the sidebar.
+- **History**: completed transfers accumulate under *History (n)* — file, client, and finish time, newest first, capped at the last 50. It is a sibling of *Active Transfers* rather than a section inside it, because a finished transfer is not a row you can cancel, and it is collapsed by default because a ZTP boot fills it with dozens of entries. It lives in memory only, is never persisted, and is cleared on every Start, Stop, and Restart — precisely so it can never be mistaken for an audit log. **Clear Transfer History** empties it manually.
+
+### 10.3 DHCP
+
+- Full DORA (DISCOVER → OFFER → REQUEST → ACK) on UDP 67, which is not configurable; a denied bind falls back to **1067**, which normal DHCP clients will not reach, and says so.
+- **Pool** (`rangeStart`/`rangeEnd`) defaults to `192.168.2.10`–`192.168.2.199`, with subnet `255.255.255.0`, gateway `192.168.2.1`, DNS `8.8.8.8`/`8.8.4.4`, and server id `192.168.2.1` when the settings are left blank. `leaseTimeSec` (option 51) is clamped to 60 seconds minimum and 7 days maximum. A subnet mask must have contiguous set bits.
+- **Static reservations** (`nexus.networkServers.dhcp.static`, a `MAC → IP` map) are honoured regardless of the pool and may sit inside or outside it. A malformed entry is ignored individually rather than discarding the whole map.
+- **Reservations are claimed at startup.** The underlying allocator picks the first pool address not already present in its lease state, and that scan never consults the reservation map — so until a reserved device happened to boot, its address was just another free slot, and whichever client DISCOVERed first walked away with it, leaving the reserved device to find its own address in use. Every reservation that falls inside the pool is therefore seeded as a placeholder at start (reservations outside the pool are skipped: they never compete with dynamic allocation). Seeding runs *after* persisted leases are restored, so a reservation outranks a stale dynamic lease on the same address, and it is idempotent, so a device that reboots keeps its bind history. The placeholders are not leases: they are excluded from *Active Leases*, from pool-utilisation figures, and from the persisted lease file.
+- **Leases survive a restart.** The lease table is written to `<globalStorage>/networkServers/dhcp-leases.json` — machine-scoped, because the bench network does not belong to whichever folder happens to be open — flushed when the service stops, restored on start, and reconciled against the current configuration so a lease no longer valid under a changed pool is dropped. The restore pre-loads the diff baseline, so restarting does not announce a fresh bind for every device that has not spoken since.
+- **Active Leases** rows show IP, MAC, hostname, `static`/`dynamic`, and time remaining. The *Lease Time* row carries pool utilisation beside it and flags a pool above 85% as nearly exhausted — a lab pool running out is the failure a user is least likely to guess from the symptom. **Static Leases** renders whether or not the service is running, so a reservation can be confirmed before the client asks for it.
+
+### 10.4 ZTP boot options
+
+The *Boot / ZTP* row appears only when at least one boot option is set; most labs hand out addresses and nothing else, and a permanent "not configured" row is noise.
+
+| Option | Setting | Purpose |
+|--------|---------|---------|
+| 66 | `dhcp.nextServer` | TFTP server name/address. The BOOTP `siaddr` header field is filled from `serverId` and is not separately configurable. |
+| 67 | `dhcp.bootFileName` | Boot file to fetch. |
+| 150 | `dhcp.tftpServerAddresses` | Cisco TFTP server list. |
+| 60 | `dhcp.vendorClassId` | Vendor-class filter — when set, options 66/67/150/43 are sent only to clients whose class matches. |
+| 43 | `dhcp.vendorSpecificOptions` | Vendor-specific TLVs, `[sub-option][length][value]` per RFC 2132 §8.4. |
+
+- **Auto-link** (`dhcp.autoLinkTftp`, on by default) fills options 66 and 150 from the address TFTP is bound to, so the two services agree without being configured twice. It is all-or-nothing: setting either field by hand turns the link off for both, and nothing is advertised when TFTP is bound to `0.0.0.0`, which is not an address a client can be told to fetch from. The sidebar shows the address that will actually be advertised, not the blank setting behind it.
+- The vendor-class match is trimmed and case-insensitive, but otherwise exact. It gates the boot options — a correctly configured boot server that reaches nothing is usually this — so the row calls the filter out, and the observed class is logged at debug level as `vendor-class="…"`. v1 supports a single global vendor class, not a set of per-vendor profiles; serving two vendors different boot files from one instance is out of scope.
+- Sub-option codes 1–254 are accepted (0 is PAD, 255 is END). Values are text unless prefixed `0x`, in which case they are written as raw bytes (`:`, `-`, and `_` separators are ignored). The encoded option is capped at 255 bytes; an entry that cannot be encoded is logged and skipped rather than failing the start.
+
+### 10.5 Quick Settings and auto-fill
+
+`nexus.networkServer.quickAdjust` is a keyboard-only loop over the settings that actually move — for TFTP: root, interface, port, access mode; for DHCP: interface, pool start, pool count, subnet mask, default gateway, lease time. Values are re-read on every pass, so the list reflects what was just saved even if `settings.json` is edited in another window mid-session, and everything is written to the **Global** target — these services bind ports on this machine, and scoping them to the open folder would make the same bench setup vanish in the next window.
+
+- The **interface** picker enumerates this machine's IPv4 addresses at open time, because a VPN coming up or a dock being unplugged changes the answer between one edit and the next. Loopback is filtered out unless nothing else remains. An address the setting holds that no NIC currently has is kept in the list and flagged rather than silently dropped, and the DHCP row names the interface that address belongs to and its current IP — an address a dropped VPN left behind looks perfectly valid and binds nothing.
+- **Pool Count** is asked for instead of an end address, and stored as the `rangeEnd` it implies, so a `settings.json` reader sees exactly the keys they always did. Moving **Pool Start** carries the count with it rather than silently resizing (or inverting) the pool.
+- **Smart auto-fill**: after a new pool start, Nexus offers the addresses that follow from it — the broadcast address the mask implies, the last usable address below it as the gateway, and that same address as the DNS server. The netmask in force is respected rather than assumed; only an unset mask falls back to /24, and a derivation that would place the gateway outside the subnet or onto its network address is not offered at all. The offer covers only values that are blank, or that a previous auto-fill wrote for the *previous* pool start — that is a stale suggestion, not a decision, and leaving it behind is how a move between lab subnets ends up advertising the old subnet's gateway. Anything typed by hand is left exactly as typed, and the prompt is skipped entirely when there is nothing safe to fill.
+- Only an actual change marks the service as needing a restart, so browsing the list never provokes the prompt. Escape and an unchanged value are both no-ops; an empty submit is a real edit that clears the key back to its packaged default.
+
+### 10.6 Configuration profiles
+
+A profile is a named snapshot of one service's settings that can be written back into those same settings later — save a bench setup once, restore it next week without retyping a pool. TFTP and DHCP keep independent lists (a bench swaps its address pool far more often than its file root). Profiles are configuration, not runtime: they persist through `ConfigRepository` and never touch the daemon, so applying one is exactly the write the form and the quick pick already perform, and a running service keeps serving what it started with until it is restarted. A DHCP profile stores the `autoLinkTftp` switch alongside the fields rather than the address the link resolved to — restoring the resolved address would silently freeze whatever the link happened to point at when the profile was saved. Save/Load sit at the bottom of Quick Settings; Rename, Duplicate, and Remove are Command Palette entries.
+
+### 10.7 Notifications and diagnostics
+
+- **Verbose Mode** (`nexus.networkServers.verboseMode`, off by default) gates the lifecycle and per-connection toasts. It is off because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day.
+- A failed Start/Stop/Restart is always reported regardless of the setting, and so is the outcome of an action the user pressed a button for (Cancel Transfer, Clear Transfer History) — including the no-op cases, since silence after a click reads as a broken command.
+- The **Nexus Network Servers** output channel records everything either way; **Inspect Logs** reveals it.
+- Failures are classified rather than passed through raw: `PrivilegedPortDenied`, `BindFailed` (address already in use), `DaemonNotReady`, `DaemonSpawnFailed`, `InvalidConfiguration`, `WorkspaceUntrusted`.
+
+### 10.8 Settings
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `nexus.networkServers.tftp.root` | string | *(`~/Nexus/tftp-root`)* | Served directory; created on first start |
+| `nexus.networkServers.tftp.interface` | string | *(all interfaces)* | IPv4 address to bind |
+| `nexus.networkServers.tftp.port` | number | `69` | UDP port; falls back to 1069 when privileged binding is denied |
+| `nexus.networkServers.tftp.allowWrite` | boolean | `false` | Accept WRQ uploads into the root |
+| `nexus.networkServers.dhcp.interface` | string | *(all interfaces)* | IPv4 address to bind |
+| `nexus.networkServers.dhcp.rangeStart` / `.rangeEnd` | string | `192.168.2.10` / `192.168.2.199` | Dynamic pool bounds |
+| `nexus.networkServers.dhcp.subnet` | string | `255.255.255.0` | Netmask handed to clients (option 1); set bits must be contiguous |
+| `nexus.networkServers.dhcp.gateway` | string | `192.168.2.1` | Default route (option 3) |
+| `nexus.networkServers.dhcp.dns` | string[] | `8.8.8.8`, `8.8.4.4` | DNS servers (option 6) |
+| `nexus.networkServers.dhcp.broadcast` | string | *(derived from subnet)* | Broadcast address (option 28) |
+| `nexus.networkServers.dhcp.leaseTimeSec` | number | `86400` | Lease duration (option 51); clamped 60 s – 7 days |
+| `nexus.networkServers.dhcp.serverId` | string | `192.168.2.1` | Server identifier (option 54), and the BOOTP `siaddr` value |
+| `nexus.networkServers.dhcp.bootFileName` | string | — | Boot file (option 67) |
+| `nexus.networkServers.dhcp.nextServer` | string | — | Boot server (option 66) |
+| `nexus.networkServers.dhcp.tftpServerAddresses` | string[] | — | Cisco TFTP servers (option 150) |
+| `nexus.networkServers.dhcp.autoLinkTftp` | boolean | `true` | Fill options 66/150 from the TFTP bind address while both are unset |
+| `nexus.networkServers.dhcp.vendorClassId` | string | — | Vendor-class filter (option 60) for the boot options |
+| `nexus.networkServers.dhcp.vendorSpecificOptions` | array | `[]` | Vendor-specific TLVs (option 43) |
+| `nexus.networkServers.dhcp.static` | object | `{}` | `MAC → IP` reservations |
+| `nexus.networkServers.verboseMode` | boolean | `false` | Lifecycle and per-connection notifications |
+
+### 10.9 Isolation
+
+- Both protocol engines run inside **one shared daemon child process** (`dist/services/networkServers/networkServerDaemon.js`), spawned by `NetworkServerDaemonHost` and driven by newline-delimited JSON-RPC over stdio — deliberately the same plumbing as the serial sidecar. A pipe never collides with a user's port and never triggers a firewall prompt; the lifecycle is coupled, since stdin EOF is the shutdown signal and SIGTERM escalates to SIGKILL, so UDP 69/67 are never left held by an orphan; and a fault in a protocol engine cannot take the extension host down with it.
+- The daemon has no `vscode` module, so the extension host keeps the three things it cannot do: reading settings, enforcing Workspace Trust, and fanning state out into `NexusCore` and the output channel.
+- The daemon pushes five event types — `ready`, `statusChange`, `log`, `runtimeUpdate`, and `connection`. Runtime refreshes are coalesced behind a 150 ms debounce, because TFTP emits an update on every progress tick and one RPC per tick would flood the pipe. A `connection` event is one push per edge, never per tick, so it can be surfaced to the user directly with no throttling of its own.
+- The tree renders exclusively from the `NexusCore` snapshot and never issues its own RPC: the manager already pushes runtime detail into the core, and a view that queried on expansion would duplicate that traffic and could hang the tree behind a timeout.
