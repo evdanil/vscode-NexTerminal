@@ -17,6 +17,7 @@ import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
+import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
@@ -1305,6 +1306,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
   const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
+  // LIVE STATUS (Phase 2) — opt-in poll of EVE-NG lab running status, gated on
+  // the Command Center being visible and nexus.inventory.statusPollSeconds > 0.
+  // Seeds from commandCenterView.visible up front (createTreeView never fires the
+  // visibility event at registration), re-arms/stops on the config change, and
+  // is disposed with the extension.
+  const inventoryStatusPoll = startInventoryStatusPoll({
+    view: commandCenterView,
+    getIntervalSeconds: () => Math.floor(readBoundedNumber("nexus.inventory", "statusPollSeconds", 0, 0, 3600)),
+    onDidChangeInterval: (listener) =>
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration("nexus.inventory.statusPollSeconds")) {
+          listener();
+        }
+      }),
+    fire: () => void vscode.commands.executeCommand("nexus.inventory.refreshStatus")
+  });
+  context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
