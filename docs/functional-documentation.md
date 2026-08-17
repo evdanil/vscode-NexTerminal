@@ -203,6 +203,16 @@ Each row carries `contextValue` `nexus.inventorySource`, which the four `view/it
 
 `SettingsTreeProvider` takes an optional `NexusCore` and `InventoryProviderRegistry` and refreshes on `core.onDidChange`, but ONLY when the inventory-source signature actually changes (MINOR-8) — a terminal or tunnel blink does not re-render the tree. It does not need a periodic refresh to keep the row labels accurate, because the row's last-sync stamp is absolute (`sourceDescriptionAbsolute`) rather than a relative age; a source edit or a new sync is exactly what changes the signature and re-renders. Subscriptions are released on dispose. `nexus.inventory.manage` is unchanged and remains the palette route in.
 
+### 4.4.7 Live lab status (running-lab highlight)
+
+EVE-NG sources can show which labs are **running**, live, on the Command Center tree. This is an EVE-NG-only affordance: it is driven by an optional provider capability, `InventoryProvider.fetchStatus`, that only the EVE-NG provider implements — NetBox (or any provider without it) simply shows no status.
+
+- **Refresh Lab Status** (`nexus.inventory.refreshStatus`) fetches every source's running/stopped state and applies it. It reuses the same login / folder-walk / node-fetch machinery `fetchInventory` does, but emits only status — no `includeStopped` filter (all nodes are reported; the tree decides what to show) and a fresh telnet console endpoint only for running nodes (parsed through the same helper the sync mapper uses, with the same loopback/`consoleHost` substitution). The command is read-only: it never mutates servers or secrets, only NexusCore's runtime `serverStatus` map. It skips providers with no `fetchStatus`, is non-fatal per source (one flaky lab box never aborts the sweep), and respects the per-source busy-guard so it never races an in-flight sync/edit/remove. Available from the palette and as a Command Center title action.
+- **The poll.** `nexus.inventory.statusPollSeconds` (a new **Inventory** settings category, default **0 = off**, range 0–3600) fires Refresh Lab Status every N seconds, but ONLY while the Command Center view is visible AND the interval is > 0 — there is no point refreshing a highlight nobody is looking at, and no reason to keep hitting a lab box while the panel is closed. The timer seeds from the view's current visibility (VS Code does not fire the visibility event at registration), re-arms/stops when the interval setting changes, and is disposed with the extension.
+- **What you see.** A running node's server row shows a **green running dot** and a `(running)` suffix; a stopped EVE node shows a dim dot; a non-EVE (no-status) server is unchanged. A **lab folder that directly contains at least one running node** gets a green **▶** badge, via a `FileDecorationProvider` (`src/ui/inventoryStatusDecorationProvider.ts`) matching a `nexus-status:` resourceUri the tree stamps on server and folder rows. Status is runtime-only — it is never persisted and re-fetched on demand or by the poll — and scoped strictly by source (a status maps onto a server only when that server exists and is owned by the reporting source), so one lab's refresh can never overwrite another's highlight.
+
+**BMC menu gating (task #27).** The two BMC actions — **Connect BMC Serial Console** (`nexus.server.connectBmcSol`) and **Open BMC Web Console** (`nexus.server.openBmcWebConsole`) — are now shown only on a server that actually has an `ipmiHost`. A server with a non-blank `ipmiHost` gets an `.ipmi` marker appended to its tree `contextValue` (`nexus.server.ipmi` / `nexus.serverConnected.ipmi`); the two BMC entries require `/^nexus\.server(Connected)?\.ipmi$/`, while every other server menu was broadened with an optional `(\.ipmi)?` so a BMC server keeps all its ordinary actions. Addressless-with-BMC servers correctly still show the BMC actions.
+
 ### 4.5 Port Forwarding
 1. Create tunnel profile with `Nexus: Add Tunnel`. Choose tunnel type from the dropdown:
    - **Local Forward (-L)**: local TCP listener forwards to a remote target through SSH.
@@ -416,6 +426,12 @@ After a session disconnects but before the terminal tab is closed, *Reset Termin
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `nexus.ui.showTreeDescriptions` | boolean | `true` | Show connection details beside items in the Connectivity Hub |
+
+### 5.8 Inventory
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `nexus.inventory.statusPollSeconds` | number | `0` | 0–3600 s | How often to refresh EVE-NG lab running status while the Command Center is visible. `0` disables polling (use **Refresh Lab Status** manually). EVE-NG only |
 
 ## 6. Commands and Views
 

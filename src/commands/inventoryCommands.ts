@@ -6,6 +6,7 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
+  fetchProviderStatus,
   InventoryProviderError,
   inventorySecretKey,
   inventorySourceValuesEqual,
@@ -2199,6 +2200,14 @@ export function registerInventoryCommands(
   // one-size-fits-all "is currently syncing" this used to be.
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
+  // LIVE STATUS (Phase 2) — monotonic status-refresh generation. Each
+  // refreshStatus sweep captures the value it bumps to; before applying any
+  // report it checks it still holds the latest generation, so a slow older
+  // sweep that resolves AFTER a newer one started drops its (now stale) apply
+  // rather than clobbering the fresher state. The poll's in-flight latch stops
+  // poll ticks from stacking; this covers poll-vs-manual and any residual race.
+  let statusRefreshGeneration = 0;
+
   /**
    * Shared Test-button handler for both the Add and Edit forms. Never throws
    * out to WebviewFormPanel — a bad/incomplete field value is reported as a
@@ -4365,6 +4374,95 @@ export function registerInventoryCommands(
     };
   }
 
+  /**
+   * LIVE STATUS (Phase 2) — refresh the running/stopped state of one source (by
+   * id) or ALL sources (no arg, the poll path). Read-only: it never mutates
+   * servers or secrets, only NexusCore's runtime status map. Per-source errors
+   * are non-fatal (the whole point of the visible poll is that a flaky lab box
+   * never nags), so the sweep continues past any single failure:
+   *  - a source whose provider has no `fetchStatus` is skipped (NetBox);
+   *  - a source currently claimed in `inFlightSourceIds` (an in-flight
+   *    sync/edit/remove) is skipped so this never races the vault read or
+   *    provider call that operation is making — refresh never CLAIMS the guard
+   *    itself, so it can never block a real operation and overlapping refreshes
+   *    stay harmless (fetchProviderStatus is idempotent);
+   *  - `fetchProviderStatus` swallows a throwing/ malformed provider answer into
+   *    `undefined`, and a vault read that rejects is caught here.
+   */
+  async function refreshStatus(sourceIdArg?: string, options?: { manual?: boolean }): Promise<void> {
+    const myGeneration = ++statusRefreshGeneration;
+    const targets = sourceIdArg
+      ? (() => {
+          const source = core.getInventorySource(sourceIdArg);
+          return source ? [source] : [];
+        })()
+      : core.getSnapshot().inventorySources;
+    // P3-7 — on the MANUAL path only, warn once if every source we actually
+    // tried failed to produce a report (all auth broken / unreachable). The
+    // poll path stays silent (a warning per tick would nag).
+    let attempted = 0;
+    let succeeded = 0;
+    for (const source of targets) {
+      // A newer sweep has started while this one was awaiting — stop applying
+      // stale results (last-STARTED-wins, so an older completion never
+      // overwrites a newer apply).
+      if (myGeneration !== statusRefreshGeneration) {
+        return;
+      }
+      if (inFlightSourceIds.get(source.id) !== undefined) {
+        continue; // busy with a sync/edit/remove — skip, don't race it
+      }
+      const provider = registry.get(source.providerId);
+      if (!provider || typeof provider.fetchStatus !== "function") {
+        continue; // provider gone or offers no status (e.g. NetBox)
+      }
+      // P2-1(b) — capture the source's incarnation as of THIS fetch. If Edit
+      // Source (or any write) changes the record while the fetch is in flight,
+      // the report was produced under a config the source no longer has, so its
+      // apply is dropped. Complements the global generation guard, which only
+      // orders sweeps against each other.
+      const startRevision = source.revision;
+      attempted++;
+      try {
+        const secrets: InventorySourceSecrets = {};
+        for (const fieldId of source.secretFieldIds) {
+          const value = await vault.get(inventorySecretKey(source.id, fieldId));
+          if (value !== undefined) {
+            secrets[fieldId] = value;
+          }
+        }
+        // fetchProviderStatus clones source.config internally (so the stored
+        // record is never mutated) and degrades every provider failure to
+        // undefined; secrets is a fresh local object, safe to pass as-is.
+        const report = await fetchProviderStatus(provider, source.config, secrets);
+        if (report) {
+          // A report (even an empty one) means the source was reachable — count
+          // it as a success for the total-failure warning regardless of whether
+          // the guards below actually apply it.
+          succeeded++;
+          // Re-check AFTER the (awaited) fetch, two guards:
+          //  - the global generation: a NEWER sweep may have started and applied
+          //    while this fetch was in flight (applying now would clobber it);
+          //  - this source's revision: an Edit Source may have superseded the
+          //    config this report was fetched under (P2-1b).
+          const currentSource = core.getInventorySource(source.id);
+          if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
+            core.applyInventoryStatus(source.id, report);
+          }
+        }
+      } catch {
+        // Non-fatal per source (e.g. a rejecting vault read) — continue the sweep.
+        continue;
+      }
+    }
+    // P3-7 — every attempted source failed to report: surface it, manual only.
+    if (options?.manual && attempted > 0 && succeeded === 0) {
+      void vscode.window.showWarningMessage(
+        "Could not refresh lab status from any inventory source — check the source's credentials and connectivity."
+      );
+    }
+  }
+
   function manageSources(): void {
     ManagementListPanel.open(core, inventorySourcesDescriptor());
   }
@@ -4381,6 +4479,13 @@ export function registerInventoryCommands(
     vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(resolveSourceIdArg(arg))),
+    // The poll fires with a `{ __poll: true }` marker so it stays silent on
+    // total failure; every other invocation (palette, title action, a tree row)
+    // is the MANUAL path and warns if every source failed.
+    vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => {
+      const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
+      return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
+    }),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
   ];
 }

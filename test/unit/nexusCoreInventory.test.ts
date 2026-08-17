@@ -6,6 +6,7 @@ import { validateInventorySource, validateServerConfig } from "../../src/utils/v
 import { mergeServerConfigFields, resolveBmcWebProtocol, serverConfigsEqual, serverOriginStampsEqual } from "../../src/models/config";
 import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
 import { computeProviderFingerprint, sourceConfigUnchanged, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
+import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 
 function makeSourceConfig(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -4577,5 +4578,343 @@ describe("serverOriginStampsEqual / mergeServerConfigFields — origin.syncedIpm
 
     expect(merged.ipmiHost).toBeUndefined();
     expect(merged.origin?.syncedIpmiHost).toBeUndefined();
+  });
+});
+
+/**
+ * LIVE STATUS (Phase 2) — NexusCore's runtime-only serverStatus map, keyed by
+ * serverId, exposed on the snapshot and never persisted. applyInventoryStatus
+ * maps a provider's externalId-keyed report onto owned servers via
+ * deterministicServerId, scopes strictly by source, drops entries the source no
+ * longer reports, and fires exactly one change.
+ */
+describe("NexusCore inventory status", () => {
+  function makeSyncedServer(id: string, sourceId: string, externalId: string): ServerConfig {
+    return {
+      id: deterministicServerId(sourceId, externalId),
+      name: id,
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId, externalId, syncedAt: 1 }
+    };
+  }
+
+  it("maps externalId→serverId, sets running/stopped on the snapshot, and fires onDidChange exactly once (⊘ keying the map by externalId would never resolve against the tree's serverIds)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s1 = makeSyncedServer("a", "source-1", "lab.unl#1");
+    const s2 = makeSyncedServer("b", "source-1", "lab.unl#2");
+    await core.addServersBatch([s1, s2]);
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running" }, "lab.unl#2": { state: "stopped" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(s1.id)).toBe("running");
+    expect(snap.serverStatus.get(s2.id)).toBe("stopped");
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("scopes by source: a status keyed to another source's device is dropped, and applying one source leaves another source's entries untouched (⊘ ignoring origin.sourceId lets one lab's refresh overwrite another's highlight via an externalId collision)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const owned = makeSyncedServer("a", "source-1", "dev#1");
+    const other = makeSyncedServer("b", "source-2", "dev#1");
+    await core.addServersBatch([owned, other]);
+
+    // Seed source-2's status first.
+    core.applyInventoryStatus("source-2", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(other.id)).toBe("running");
+
+    // source-1 reports the SAME externalId string. deterministicServerId(source-1,"dev#1")
+    // differs from source-2's serverId, and the server it resolves to IS owned by
+    // source-1 — so it sets source-1's server and does NOT touch source-2's.
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "stopped" } } });
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(owned.id)).toBe("stopped");
+    expect(snap.serverStatus.get(other.id)).toBe("running");
+  });
+
+  it("P2 (adoption): decorates an ADOPTED server whose ServerConfig.id was PRESERVED (id !== deterministicServerId(newSource, X)) by resolving via origin.externalId — while still covering a normal deterministic-id server and not touching another source's server (⊘ a deterministicServerId lookup misses every adopted node, so Refresh/poll never highlight them)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // Adopted (#82): Remove Source → Keep Servers, then re-add → Adopt Existing
+    // preserves the ORIGINAL id and stamps the NEW source in origin. So the id is
+    // NOT deterministicServerId("new-source", "adopted#1").
+    const adopted: ServerConfig = {
+      id: "preserved-original-id-abc123",
+      name: "adopted",
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "new-source", externalId: "adopted#1", syncedAt: 1 }
+    };
+    // Normal server owned by the same source: id === deterministicServerId(...).
+    const normal = makeSyncedServer("n", "new-source", "normal#1");
+    // Owned by a DIFFERENT source — must stay untouched.
+    const foreign = makeSyncedServer("f", "other-source", "x#1");
+    expect(adopted.id).not.toBe(deterministicServerId("new-source", "adopted#1"));
+    await core.addServersBatch([adopted, normal, foreign]);
+
+    core.applyInventoryStatus("new-source", {
+      contractVersion: 1,
+      statuses: {
+        "adopted#1": { state: "running" },
+        "normal#1": { state: "stopped" },
+        "x#1": { state: "running" }
+      }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get("preserved-original-id-abc123")).toBe("running"); // adopted decorated
+    expect(snap.serverStatus.get(normal.id)).toBe("stopped"); // deterministic still works
+    expect(snap.serverStatus.get(foreign.id)).toBeUndefined(); // other source untouched
+  });
+
+  it("P2 (truncation): a TRUNCATED report MERGES — a previously-running node absent from the partial report KEEPS its running status, while present entries still apply (⊘ clearing all prior entries under a capped report loses the decoration of every node beyond the cap)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-1", "dev#2");
+    await core.addServersBatch([a, b]);
+
+    // Complete report first: both running.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+    expect(core.getSnapshot().serverStatus.get(a.id)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(b.id)).toBe("running");
+
+    // A TRUNCATED report that only reached dev#2 (dev#1 is beyond the cap).
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#2": { state: "stopped" } },
+      truncated: true
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(a.id)).toBe("running"); // retained — merge, not clear
+    expect(snap.serverStatus.get(b.id)).toBe("stopped"); // present entry applied
+  });
+
+  it("P2 (truncation) DISCRIMINATOR: a NON-truncated report still CLEARS an absent node's status (an absent node in a complete report is genuinely removed — do not turn every apply into a merge) (⊘ merging a complete report leaves a pruned node highlighted forever)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-1", "dev#2");
+    await core.addServersBatch([a, b]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+
+    // Complete (non-truncated) report omitting dev#1 → dev#1 is gone.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#2": { state: "stopped" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false); // cleared — absent == removed
+    expect(snap.serverStatus.get(b.id)).toBe("stopped");
+  });
+
+  it("does not set a status for a serverId that resolves to no owned server (⊘ populating the map for a device the sync has not materialized leaves a stale highlight with nothing to hang it on)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "ghost#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.size).toBe(0);
+  });
+
+  it("P2-2: does NOT stamp status onto a server sitting at deterministicServerId(source-1, x) whose origin was STRIPPED (kept via Remove Source → Keep Servers) or belongs to another source (⊘ dropping the origin.sourceId ownership check lets a stale in-flight refresh re-light a detached server)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // The deterministic id still resolves — but ownership no longer does.
+    const detachedId = deterministicServerId("source-1", "dev#1");
+    const detached: ServerConfig = {
+      id: detachedId,
+      name: "kept",
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false
+      // origin ABSENT — the Keep-Servers strip removed it.
+    };
+    // A second server that resolves under source-1's namespace but is OWNED by source-2.
+    const foreign: ServerConfig = {
+      id: deterministicServerId("source-1", "dev#2"),
+      name: "foreign",
+      host: "10.0.0.10",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-2", externalId: "dev#2", syncedAt: 1 }
+    };
+    await core.addServersBatch([detached, foreign]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(detachedId)).toBe(false);
+    expect(snap.serverStatus.has(foreign.id)).toBe(false);
+    expect(snap.serverStatus.size).toBe(0);
+  });
+
+  it("drops an entry the source no longer reports on the next apply (⊘ retaining it shows a pruned/gone node as still running)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: {} });
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("clearInventoryStatus removes only that source's entries and fires a change", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-2", "dev#2");
+    await core.addServersBatch([a, b]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    core.applyInventoryStatus("source-2", { contractVersion: 1, statuses: { "dev#2": { state: "running" } } });
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    core.clearInventoryStatus("source-1");
+    expect(listener).toHaveBeenCalledTimes(1);
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false);
+    expect(snap.serverStatus.get(b.id)).toBe("running");
+  });
+
+  it("P2-3/P3-3: removeInventorySource ALONE clears the removed source's status and leaves other sources' entries (⊘ removing the clear from removeInventorySource strands a running highlight on a deleted source's servers)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1" }));
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-2", "dev#2");
+    await core.addServersBatch([a, b]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    core.applyInventoryStatus("source-2", { contractVersion: 1, statuses: { "dev#2": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(a.id)).toBe("running");
+
+    // NO pre-clear — removeInventorySource must do the clearing itself.
+    await core.removeInventorySource("source-1");
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false);
+    expect(snap.serverStatus.get(b.id)).toBe("running");
+  });
+
+  it("P3-4: removeServer drops that server's runtime status entry (⊘ a manual delete strands a running highlight keyed to a server that no longer exists)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    await core.removeServer(s1.id);
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("P3-4: applyInventorySyncPlan drops a pruned server's runtime status entry (⊘ a sync prune leaves a ghost running highlight behind)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const source = makeSourceConfig({ id: "source-1" });
+    await core.addOrUpdateInventorySource(source);
+    const persisted = core.getInventorySource("source-1")!;
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2000,
+      upsertServers: [],
+      removeServerIds: [s1.id],
+      folders: [],
+      expectedSource: persisted
+    });
+
+    expect(core.getServer(s1.id)).toBeUndefined();
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("P2-1a: editing a source's config clears its stale runtime status, but a no-op edit does NOT (⊘ keying status only by the stable sourceId keeps a report fetched under the OLD baseUrl/rootFolder/filter active after Edit Source changes it)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", config: { baseUrl: "http://a" } }));
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    // No-op edit — config unchanged — must NOT clear the status.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, config: { baseUrl: "http://a" } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    // Real config change (baseUrl) — the report fetched under the old config is
+    // no longer trustworthy, so the status is cleared.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, config: { baseUrl: "http://b" } });
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("P2-2: a sync apply that prunes a status-bearing server then FAILS its repo write restores BOTH the server and its runtime status on rollback (⊘ the rollback envelope restores server/sessions/folders/source but not status, so a failed save strands the highlight lost until another refresh — which may never come with polling off)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1" }));
+    const persisted = core.getInventorySource("source-1")!;
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("disk full"));
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 2000,
+        upsertServers: [],
+        removeServerIds: [s1.id],
+        folders: [],
+        expectedSource: persisted
+      })
+    ).rejects.toThrow("disk full");
+
+    // Rolled back: the server is back AND its running status is back with it.
+    expect(core.getServer(s1.id)).toBeDefined();
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+  });
+
+  it("does not fire a change when clearInventoryStatus has nothing to clear (⊘ an unconditional emit churns every tree on an unrelated source removal)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    core.clearInventoryStatus("source-1");
+    expect(listener).not.toHaveBeenCalled();
   });
 });

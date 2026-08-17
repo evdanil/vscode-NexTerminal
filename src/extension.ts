@@ -17,6 +17,8 @@ import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
+import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
+import { InventoryStatusDecorationProvider } from "./ui/inventoryStatusDecorationProvider";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { NexusCore } from "./core/nexusCore";
@@ -835,6 +837,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     dragAndDropController: nexusTreeProvider,
     showCollapseAll: true
   });
+  // LIVE STATUS (Phase 2) — the running-lab highlight. Registered globally; it
+  // decorates only the nexus-status: resourceUris the Command Center tree stamps
+  // on running servers and their lab folders. Fed the latest snapshot in
+  // syncViewsImmediate below.
+  const inventoryStatusDecoration = new InventoryStatusDecorationProvider();
+  context.subscriptions.push(vscode.window.registerFileDecorationProvider(inventoryStatusDecoration), inventoryStatusDecoration);
   void vscode.commands.executeCommand("setContext", "nexus.filterActive", false);
 
   const filterCommand = vscode.commands.registerCommand("nexus.filter", async () => {
@@ -1045,6 +1053,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     const snapshot = core.getSnapshot();
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
+    inventoryStatusDecoration.update(snapshot);
     const totalTunnels = snapshot.activeTunnels.length + snapshot.remoteTunnels.length;
     statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length + snapshot.activeLocalShellSessions.length} sessions, ${totalTunnels} tunnels`;
     if (snapshot.remoteTunnels.length > 0) {
@@ -1305,6 +1314,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
   const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
+  // LIVE STATUS (Phase 2) — opt-in poll of EVE-NG lab running status, gated on
+  // the Command Center being visible and nexus.inventory.statusPollSeconds > 0.
+  // Seeds from commandCenterView.visible up front (createTreeView never fires the
+  // visibility event at registration), re-arms/stops on the config change, and
+  // is disposed with the extension.
+  const inventoryStatusPoll = startInventoryStatusPoll({
+    view: commandCenterView,
+    getIntervalSeconds: () => Math.floor(readBoundedNumber("nexus.inventory", "statusPollSeconds", 0, 0, 3600)),
+    onDidChangeInterval: (listener) =>
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration("nexus.inventory.statusPollSeconds")) {
+          listener();
+        }
+      }),
+    // Return the thenable so the poll's in-flight latch can await the sweep.
+    // The `__poll` marker tells refreshStatus this is the background path, so it
+    // stays silent on total failure (the manual command warns instead).
+    fire: () => Promise.resolve(vscode.commands.executeCommand("nexus.inventory.refreshStatus", { __poll: true })).then(() => undefined)
+  });
+  context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());

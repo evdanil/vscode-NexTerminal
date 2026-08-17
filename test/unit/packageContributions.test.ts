@@ -123,7 +123,9 @@ describe("package contributions", () => {
     expect(menuCommands).toContain("nexus.tunnel.edit");
     expect(menuCommands).toContain("nexus.serial.edit");
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.sessionNode"))).toBe(true);
-    expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serverConnected"))).toBe(true);
+    // BMC gating (Phase 2) broadened the connected-server menus to a regex that
+    // also matches the .ipmi variant, so the assertion follows the new form.
+    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?$/"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
@@ -161,12 +163,12 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem == nexus.server",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem == nexus.server",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?$/",
         group: "0_connect@4"
       }),
       expect.objectContaining({
@@ -676,18 +678,157 @@ describe("package contributions", () => {
       }
     });
 
-    it("places them on server items UNCONDITIONALLY, matching the existing anchored contextValue regex", () => {
-      // B5 — the server item's `contextValue` is matched by ~15 anchored `when`
-      // regexes, so expressing "this server has a BMC" would mean a new variant
-      // and a rewrite of all of them. The standing rule is "pickers flag, menus
-      // don't hide": an unconfigured server gets an actionable refusal instead.
+    // BMC-menu gating (task #27, Phase 2) — the two BMC entries now require the
+    // `.ipmi` contextValue marker, so they show ONLY on a server that actually
+    // has an ipmiHost. Every OTHER server menu was broadened with an optional
+    // `(\.ipmi)?` so a BMC server keeps all its ordinary actions.
+    function viewItemRegex(when?: string): RegExp | null {
+      const m = /viewItem =~ \/(.+?)\/(?=\s|$)/.exec(when ?? "");
+      return m ? new RegExp(m[1]) : null;
+    }
+
+    it("gates both BMC entries on the .ipmi marker: shown for a server WITH ipmiHost, hidden for one without (⊘ offering BMC on a server with no ipmiHost is an action that can only fail)", () => {
       const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
       for (const id of ids) {
         const entry = menuItems.find((item) => item.command === id);
         expect(entry, id).toBeDefined();
-        expect(entry!.when).toBe("view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/");
         expect(entry!.group).toMatch(/^0_connect@/);
+        const re = viewItemRegex(entry!.when);
+        expect(re, id).not.toBeNull();
+        // The .ipmi variants match; the plain (no-BMC) contextValues do not.
+        expect(re!.test("nexus.server.ipmi"), id).toBe(true);
+        expect(re!.test("nexus.serverConnected.ipmi"), id).toBe(true);
+        expect(re!.test("nexus.server"), id).toBe(false);
+        expect(re!.test("nexus.serverConnected"), id).toBe(false);
       }
+    });
+
+    // P2-4 — AFFIRMATIVE per-entry table. For every server-scoped
+    // view/item/context entry, assert EXACTLY which of the four server
+    // contextValues it must and must-not match, driven off the real package.json.
+    // This kills the dangerous over-narrowing the one-directional check let
+    // through: shrinking nexus.server.edit to `.ipmi`-only (hiding Edit on every
+    // normal server) fails here, as does reverting any broadened entry to a
+    // base-only regex or dropping `.ipmi` off a BMC entry.
+    it("matches exactly the intended subset of {server, serverConnected, .ipmi variants} for each of the 20 server menus, and never a non-server contextValue (M10 dies)", () => {
+      const SERVER_VALUES = ["nexus.server", "nexus.serverConnected", "nexus.server.ipmi", "nexus.serverConnected.ipmi"];
+      const DISCONNECTED = ["nexus.server", "nexus.server.ipmi"];
+      const CONNECTED = ["nexus.serverConnected", "nexus.serverConnected.ipmi"];
+      const IPMI_ONLY = ["nexus.server.ipmi", "nexus.serverConnected.ipmi"];
+      const ALL_FOUR = SERVER_VALUES;
+      const NON_SERVER = [
+        "nexus.folder", "nexus.folderWithServers", "nexus.macro", "nexus.serialProfile",
+        "nexus.serialProfileConnected", "nexus.inventorySource", "nexus.sessionNode",
+        "nexus.localShellProfile", "nexus.localShellProfileConnected",
+        // near-misses that the `$` anchor must reject
+        "nexus.serverFoo", "nexus.server.ipmi.extra", "nexus.serverConnectedX"
+      ];
+
+      // command|group → the contextValues that entry MUST match (and only those).
+      const EXPECTED: Record<string, string[]> = {
+        "nexus.server.connect|inline": DISCONNECTED,
+        "nexus.server.testConnection|inline@2": DISCONNECTED,
+        "nexus.server.connect|inline@1": CONNECTED,
+        "nexus.server.disconnect|inline@2": CONNECTED,
+        "nexus.server.connect|0_connect": DISCONNECTED,
+        "nexus.server.runWithScript|0_connect@3": ALL_FOUR,
+        "nexus.server.runMacro|0_connect@5": ALL_FOUR,
+        "nexus.server.connectBmcSol|0_connect@6": IPMI_ONLY,
+        "nexus.server.openBmcWebConsole|0_connect@7": IPMI_ONLY,
+        "nexus.server.testConnection|0_connect@4": DISCONNECTED,
+        "nexus.server.connect|0_connect@1": CONNECTED,
+        "nexus.server.disconnect|0_connect@2": CONNECTED,
+        "nexus.server.edit|1_manage@1": ALL_FOUR,
+        "nexus.server.rename|1_manage@2": ALL_FOUR,
+        "nexus.server.duplicate|1_manage@3": ALL_FOUR,
+        "nexus.files.browse|1_manage@4": CONNECTED,
+        "nexus.server.deployKey|1_manage@5": ALL_FOUR,
+        "nexus.authProfile.applyToServer|1_manage@6": ALL_FOUR,
+        "nexus.server.copyInfo|2_clipboard": ALL_FOUR,
+        "nexus.server.remove|3_destructive": ALL_FOUR
+      };
+
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      // Every Command Center view/item/context entry whose viewItem clause targets
+      // a server contextValue (regex form — after Phase 2 no server menu uses `==`).
+      const serverMenus = menuItems.filter(
+        (m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem =~ /^nexus\\.server")
+      );
+
+      // No server menu may still pin an exact `== nexus.server[...]` (would miss .ipmi).
+      expect(menuItems.filter((m) => (m.when ?? "").includes("viewItem == nexus.server")).map((m) => m.command)).toEqual([]);
+
+      // The set of entries present must be EXACTLY the table's keys — a newly
+      // added server menu on the wrong form, or a missing one, fails here.
+      const presentKeys = serverMenus.map((m) => `${m.command}|${m.group}`).sort();
+      expect(presentKeys).toEqual(Object.keys(EXPECTED).sort());
+
+      for (const m of serverMenus) {
+        const key = `${m.command}|${m.group}`;
+        const expected = EXPECTED[key];
+        const re = viewItemRegex(m.when);
+        expect(re, key).not.toBeNull();
+        for (const value of SERVER_VALUES) {
+          expect(re!.test(value), `${key} vs ${value}`).toBe(expected.includes(value));
+        }
+        for (const value of NON_SERVER) {
+          expect(re!.test(value), `${key} must not match ${value}`).toBe(false);
+        }
+      }
+    });
+  });
+
+  describe("Live lab status (Phase 2)", () => {
+    it("contributes nexus.inventory.refreshStatus as a palette-invocable Nexus command", () => {
+      const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.refreshStatus");
+      expect(command).toBeDefined();
+      expect(command?.category).toBe("Nexus");
+      expect(command?.title).toBeTruthy();
+
+      const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+      const paletteEntry = paletteMenu.find((item) => item.command === "nexus.inventory.refreshStatus");
+      expect(paletteEntry).toBeDefined();
+      expect(paletteEntry?.when).not.toBe("false");
+    });
+
+    it("surfaces Refresh Lab Status as a Command Center title action (least-intrusive tree affordance)", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      const entry = titleMenuItems.find(
+        (item) => item.command === "nexus.inventory.refreshStatus" && item.when === "view == nexusCommandCenter"
+      );
+      expect(entry).toBeDefined();
+    });
+
+    it("does NOT add refreshStatus to the inventory-source row inline group, keeping those rows' four actions intact", () => {
+      const rowMenus = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexus.inventorySource") && (m.when ?? "").includes("nexusSettings")
+      );
+      expect(rowMenus.map((m) => m.command)).not.toContain("nexus.inventory.refreshStatus");
+    });
+
+    it("contributes nexus.inventory.statusPollSeconds as an integer setting defaulting to 0 (off), bounded 0..3600", () => {
+      // ⊘ registering it only in SETTINGS_META: VS Code's settings.json UI would
+      // not know the key, and the poll timer in extension.ts reads it via
+      // workspace.getConfiguration — an unregistered key returns undefined and the
+      // poll never arms.
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.inventory.statusPollSeconds"];
+      expect(prop).toBeDefined();
+      expect(prop?.type).toBe("integer");
+      expect(prop?.default).toBe(0);
+      expect(prop?.minimum).toBe(0);
+      expect(prop?.maximum).toBe(3600);
+      const description = prop?.markdownDescription || prop?.description || "";
+      expect(description).toMatch(/0 disables|0 = off|disables/i);
+    });
+
+    it("documents the live-status feature, the poll setting, and the BMC-menu gating in the functional docs and README", () => {
+      expect(functionalDocs).toContain("nexus.inventory.statusPollSeconds");
+      expect(functionalDocs).toMatch(/Refresh Lab Status/);
+      expect(functionalDocs).toMatch(/Live lab status/i);
+      // BMC-menu gating note.
+      expect(functionalDocs).toMatch(/ipmiHost/);
+      expect(functionalDocs).toMatch(/connectBmcSol|BMC menu gating/);
+      expect(readme).toMatch(/Refresh Lab Status/);
     });
   });
 

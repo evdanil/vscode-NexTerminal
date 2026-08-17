@@ -6,6 +6,7 @@ import { validateProviderShape } from "../../src/services/inventory/providerRegi
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import type { ServerConfig } from "../../src/models/config";
+import type { InventoryStatusReport } from "../../src/models/inventory";
 
 /**
  * EVE-NG's identity as a deployment — the same contract `netboxInstanceKey`
@@ -1531,5 +1532,91 @@ describe("EVE-NG → computeSyncPlan", () => {
     expect(server.origin?.syncedProtocol).toBe("telnet");
     expect(server.origin?.externalId).toBe("/ACME/Core.unl#3");
     expect(server.group).toBe("EVE/ACME/Core");
+  });
+});
+
+/**
+ * LIVE STATUS (Phase 2) — `fetchStatus` reports every node's running/stopped
+ * state keyed by the SAME externalId `fetchInventory` uses, so a status maps onto
+ * the server it belongs to. It reports ALL nodes (no includeStopped filter — the
+ * tree decides what to show), and only a RUNNING telnet node carries a fresh
+ * console endpoint.
+ */
+async function fetchStatus(world: World, config: Record<string, string | number | boolean> = {}): Promise<InventoryStatusReport> {
+  const { fetchImpl } = makeWorld(world);
+  const provider = createEveNgProvider(fetchImpl);
+  return provider.fetchStatus!({ ...CONFIG, ...config }, SECRETS);
+}
+
+describe("createEveNgProvider — fetchStatus", () => {
+  it("maps status 2 to running and everything else to stopped, keyed by `${lab.path}#${nodeId}` (⊘ a bare node id collapses every lab's node 1 onto one key; the wrong status field flips the whole highlight)", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node(), "2": node({ id: "2", status: 0, url: "" }) }));
+    expect(report.contractVersion).toBe(1);
+    expect(report.statuses["/Lab 1.unl#1"].state).toBe("running");
+    expect(report.statuses["/Lab 1.unl#2"].state).toBe("stopped");
+    expect(Object.keys(report.statuses).sort()).toEqual(["/Lab 1.unl#1", "/Lab 1.unl#2"]);
+  });
+
+  it("emits consoleHost/consolePort for a RUNNING telnet node, applying the same loopback→base-host substitution mapNode does (⊘ keeping 127.0.0.1 points the console at the user's own machine)", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node({ url: "telnet://127.0.0.1:32769" }) }));
+    expect(report.statuses["/Lab 1.unl#1"]).toEqual({ state: "running", consoleHost: "eve.example.com", consolePort: 32769 });
+  });
+
+  it("honours the consoleHost override on a running node exactly as the sync mapper does", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node({ url: "telnet://127.0.0.1:5001" }) }), { consoleHost: "nat.example.com" });
+    expect(report.statuses["/Lab 1.unl#1"]).toEqual({ state: "running", consoleHost: "nat.example.com", consolePort: 5001 });
+  });
+
+  it("omits console fields for a STOPPED node even when it still reports a telnet url (⊘ healing toward a stale port on a stopped node)", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node({ status: 0, url: "telnet://127.0.0.1:32769" }) }));
+    expect(report.statuses["/Lab 1.unl#1"]).toEqual({ state: "stopped" });
+    expect(report.statuses["/Lab 1.unl#1"].consolePort).toBeUndefined();
+  });
+
+  it("omits console fields for a running node with NO native telnet console (an HTML5/VNC console has no dialable port)", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node({ console: "vnc", url: "" }) }));
+    expect(report.statuses["/Lab 1.unl#1"]).toEqual({ state: "running" });
+  });
+
+  it("reports stopped nodes REGARDLESS of includeStopped — status is not a sync (⊘ reusing fetchInventory's includeStopped filter would hide a stopped lab's nodes from the tree)", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node({ status: 0, url: "" }) }), { includeStopped: false });
+    expect(report.statuses["/Lab 1.unl#1"].state).toBe("stopped");
+  });
+
+  it("reuses the login cookie on every folder/node request, exactly like fetchInventory (⊘ dropping the cookie 401s the very next call)", async () => {
+    const { fetchImpl, calls } = makeWorld(oneLabWorld({ "1": node() }));
+    await createEveNgProvider(fetchImpl).fetchStatus!(CONFIG, SECRETS);
+    const authed = calls.filter((c) => !c.url.endsWith("/api/auth/login"));
+    expect(authed.length).toBeGreaterThan(0);
+    expect(authed.every((c) => (c.headers.Cookie ?? "").includes(SESSION))).toBe(true);
+  });
+
+  it("maps a rejected login to an InventoryProviderError, same auth discipline as fetchInventory (⊘ letting a raw fetch/JSend error escape the refresh path)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path.endsWith("/api/auth/login")) return makeResponse(401, "denied");
+      return makeResponse(404, "not found");
+    }) as unknown as typeof fetch;
+    await expect(createEveNgProvider(fetchImpl).fetchStatus!(CONFIG, SECRETS)).rejects.toBeInstanceOf(InventoryProviderError);
+  });
+
+  it("sets truncated:true when the node scan hits the MAX_NODES cap, so a partial report is not mistaken for complete (⊘ an ordinary complete-looking report makes applyInventoryStatus clear decorations for every node beyond the cap)", async () => {
+    // One lab with more nodes than the 10 000-node cap. Numeric string keys
+    // iterate in numeric order, so the cap deterministically stops the scan
+    // partway and the report must carry the truncation signal.
+    const many: Record<string, unknown> = {};
+    for (let i = 0; i <= 10_000; i++) {
+      many[String(i)] = node({ id: String(i), status: 2 });
+    }
+    const report = await fetchStatus(oneLabWorld(many));
+    expect(report.truncated).toBe(true);
+    // The report is genuinely capped (fewer than the nodes offered).
+    expect(Object.keys(report.statuses).length).toBeLessThan(10_001);
+    expect(Object.keys(report.statuses).length).toBeGreaterThan(0);
+  });
+
+  it("does NOT mark a normal (under-cap) report truncated (⊘ flagging every report truncated turns each apply into a merge and never clears a genuinely-removed node)", async () => {
+    const report = await fetchStatus(oneLabWorld({ "1": node(), "2": node({ id: "2", status: 0, url: "" }) }));
+    expect(report.truncated).toBeFalsy();
   });
 });

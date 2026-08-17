@@ -96,6 +96,16 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (obj.instanceKey !== undefined && typeof obj.instanceKey !== "function") {
     throw new Error("Inventory provider instanceKey must be a function when present.");
   }
+  // LIVE STATUS (Phase 2) — the twin of the instanceKey clause. `fetchStatus` is
+  // OPTIONAL (a provider that only supplies inventory has none), but a
+  // non-function value under that name is an error, loudly rather than silently:
+  // a typo'd `fetchStatus` would otherwise be indistinguishable at runtime from a
+  // provider that never declared one, and the symptom — status refresh quietly
+  // never firing — is invisible until a user wonders why running labs are not
+  // highlighted.
+  if (obj.fetchStatus !== undefined && typeof obj.fetchStatus !== "function") {
+    throw new Error("Inventory provider fetchStatus must be a function when present.");
+  }
 }
 
 /**

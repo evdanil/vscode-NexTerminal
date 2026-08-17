@@ -2,9 +2,11 @@ import {
   InventoryProviderError,
   type InventoryConfigField,
   type InventoryDevice,
+  type InventoryDeviceStatus,
   type InventoryProvider,
   type InventorySourceSecrets,
   type InventorySourceValues,
+  type InventoryStatusReport,
   type InventoryTree
 } from "../../../models/inventory";
 
@@ -1073,6 +1075,73 @@ async function fetchInventoryImpl(
   return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
 }
 
+/**
+ * LIVE STATUS (Phase 2) — the running/stopped state of every node the source
+ * can see, keyed by the SAME `${lab.path}#${nodeId}` externalId `fetchInventory`
+ * uses, so a status maps onto the server it belongs to. Reuses the exact
+ * login / walkFolders / listNodes machinery `fetchInventory` does, under the same
+ * auth/cookie/timeout/error discipline, but emits ONLY status:
+ *  - NO `includeStopped` filter — this is not a sync; every node's status is
+ *    reported and the tree decides what to render;
+ *  - a fresh telnet console endpoint is emitted ONLY for a RUNNING node, parsed
+ *    through the same `resolveTelnetTarget` helper `mapNode` uses (loopback /
+ *    consoleHost substitution) so the two never drift. A stopped node — and a
+ *    running node with no native telnet console — carries no console fields.
+ */
+async function fetchStatusImpl(
+  fetchImpl: typeof fetch,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets
+): Promise<InventoryStatusReport> {
+  const client = makeClient(fetchImpl, config, secrets);
+  const root = normalizeFolderPath(String(config.rootFolder ?? "/"));
+  if (hasDotSegment(root)) {
+    throw new InventoryProviderError("protocol", `Root Folder "${root}" must not contain "." or ".." path segments.`);
+  }
+  const filter = str(config.filter).toLowerCase();
+  const consoleHost = str(config.consoleHost);
+
+  await client.login(FETCH_TIMEOUT_MS);
+  const walk = await client.walkFolders(root, (labPath) => !filter || labPath.toLowerCase().includes(filter), FETCH_TIMEOUT_MS);
+
+  const statuses: Record<string, InventoryDeviceStatus> = {};
+  let nodeCount = 0;
+  // TRUNCATION — a partial scan (the node cap here, or the folder/lab/budget
+  // caps inside walkFolders) must be signalled, so applyInventoryStatus MERGES
+  // this report rather than clearing the decorations of nodes it never reached.
+  // Same idiom fetchInventory uses.
+  let truncated = walk.truncated;
+  let nodesCapped = false;
+  for (const lab of walk.labs) {
+    if (nodesCapped) break;
+    const nodePairs = await client.listNodes(lab.path, FETCH_TIMEOUT_MS);
+    // MINOR-12 — the lab was deleted between the folder listing and this fetch;
+    // skip it, exactly as fetchInventory does.
+    if (nodePairs === NOT_FOUND) {
+      continue;
+    }
+    for (const [nodeId, raw] of nodePairs) {
+      if (nodeCount >= MAX_NODES) {
+        nodesCapped = true;
+        truncated = true;
+        break;
+      }
+      nodeCount++;
+      const running = Number(raw.status) === 2;
+      const status: InventoryDeviceStatus = { state: running ? "running" : "stopped" };
+      if (running) {
+        const target = resolveTelnetTarget(str(raw.console), str(raw.url), consoleHost, client.hostname);
+        if (target) {
+          status.consoleHost = target.host;
+          status.consolePort = target.port;
+        }
+      }
+      statuses[`${lab.path}#${nodeId}`] = status;
+    }
+  }
+  return { contractVersion: 1, statuses, truncated: truncated || undefined };
+}
+
 async function testConnectionImpl(fetchImpl: typeof fetch, config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
   const client = makeClient(fetchImpl, config, secrets);
   await client.login(TEST_CONNECTION_TIMEOUT_MS);
@@ -1103,6 +1172,9 @@ export function createEveNgProvider(fetchImpl: typeof fetch = fetch): InventoryP
     },
     fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree> {
       return fetchInventoryImpl(fetchImpl, config, secrets);
+    },
+    fetchStatus(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport> {
+      return fetchStatusImpl(fetchImpl, config, secrets);
     }
   };
 }

@@ -43,6 +43,14 @@ vi.mock("vscode", () => ({
       return this.value;
     }
   },
+  Uri: {
+    from: (components: { scheme: string; authority?: string; path?: string }) => ({
+      scheme: components.scheme,
+      authority: components.authority ?? "",
+      path: components.path ?? "",
+      toString: () => `${components.scheme}://${components.authority ?? ""}${components.path ?? ""}`
+    })
+  },
   workspace: {
     getConfiguration: vi.fn(() => ({ get: () => undefined }))
   }
@@ -1137,5 +1145,111 @@ describe("FolderTreeItem — parameterised contextValue/id (§4.10)", () => {
     // And critically: this contextValue must NOT match the six menu entries
     // gated on the unanchored /^nexus\.macro/ prefix (§4.10's actual bug).
     expect(/^nexus\.macro/.test(item.contextValue!)).toBe(false);
+  });
+});
+
+/**
+ * LIVE STATUS (Phase 2) — the running-lab affordances on the Command Center
+ * tree: a green running dot + " (running)" on a running server, a dim dot on a
+ * stopped EVE node, and the nexus-status: resourceUri that lets the decoration
+ * provider paint the ▶ badge. A server with no status (non-EVE) is unchanged.
+ */
+describe("ServerTreeItem inventory status affordance", () => {
+  function itemWithStatus(status: "running" | "stopped" | undefined): ServerTreeItem {
+    return new ServerTreeItem(makeServer({ id: "s1" }), false, undefined, true, undefined, undefined, undefined, undefined, status);
+  }
+
+  it("a running server gets a green dot and a ' (running)' description suffix (⊘ no affordance leaves the user unable to see which lab is up)", () => {
+    const item = itemWithStatus("running");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("charts.green");
+    expect(item.description).toContain("(running)");
+  });
+
+  it("a stopped EVE node gets a dim dot and NO '(running)' suffix (⊘ a green dot on a stopped node is a lie; a running suffix on a stopped node likewise)", () => {
+    const item = itemWithStatus("stopped");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("descriptionForeground");
+    expect(item.description).not.toContain("(running)");
+  });
+
+  it("a server with NO status keeps the plain connect icon and no status suffix (⊘ applying a status dot to a non-EVE server invents state it does not have)", () => {
+    const item = itemWithStatus(undefined);
+    expect((item.iconPath as { id: string }).id).toBe("debug-disconnect");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconQueued");
+    expect(item.description).not.toContain("(running)");
+  });
+
+  function connectedItemWithStatus(status: "running" | "stopped"): ServerTreeItem {
+    return new ServerTreeItem(makeServer({ id: "c" }), true, undefined, true, undefined, undefined, undefined, undefined, status);
+  }
+
+  it("P3-6: a CONNECTED running EVE node keeps its connected (plug) icon; the running state is carried by the '(running)' description, not by replacing the icon (⊘ swapping the plug for a status dot regresses the connected affordance)", () => {
+    const item = connectedItemWithStatus("running");
+    expect((item.iconPath as { id: string }).id).toBe("plug");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconPassed");
+    expect(item.description).toContain("(running)");
+  });
+
+  it("P3-6: a CONNECTED stopped EVE node keeps its connected icon and shows no dim dot and no '(running)' suffix", () => {
+    const item = connectedItemWithStatus("stopped");
+    expect((item.iconPath as { id: string }).id).toBe("plug");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconPassed");
+    expect(item.description).not.toContain("(running)");
+  });
+
+  it("threads status from the snapshot and stamps a nexus-status: resourceUri on both the running server and its lab folder (⊘ no resourceUri means the decoration provider can never match the row)", async () => {
+    const provider = new NexusTreeProvider({
+      onTunnelDropped: vi.fn(async () => {}),
+      onItemGroupChanged: vi.fn(async () => {}),
+      onFolderMoved: vi.fn(async () => {})
+    });
+    provider.setSnapshot({
+      servers: [makeServer({ id: "s1", group: "LabA" })],
+      tunnels: [],
+      serialProfiles: [],
+      localShellProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: ["LabA"],
+      authProfiles: [],
+      activitySessionIds: new Set(),
+      serverStatus: new Map([["s1", "running"]]),
+      focusedSessionId: undefined,
+      inventorySources: [],
+      deviceTemplates: [],
+      savedFilters: []
+    } as unknown as import("../../src/core/contracts").SessionSnapshot);
+
+    const roots = (await provider.getChildren()) as Array<FolderTreeItem>;
+    const folder = roots.find((i) => i instanceof FolderTreeItem) as FolderTreeItem & { resourceUri?: { scheme: string } };
+    expect(folder).toBeDefined();
+    expect(folder.resourceUri?.scheme).toBe("nexus-status");
+
+    const children = (await provider.getChildren(folder)) as Array<ServerTreeItem & { resourceUri?: { scheme: string } }>;
+    const serverItem = children.find((c) => c instanceof ServerTreeItem);
+    expect(serverItem).toBeDefined();
+    expect(serverItem!.resourceUri?.scheme).toBe("nexus-status");
+    expect((serverItem!.iconPath as { color: { id: string } }).color.id).toBe("charts.green");
+  });
+});
+
+/**
+ * BMC-menu gating (task #27, Phase 2) — a server with an ipmiHost gets an
+ * `.ipmi` marker appended to its contextValue so the two BMC menu entries can
+ * require it; the base string is UNCHANGED so every other server menu (matched
+ * by /^nexus\.server(Connected)?(\.ipmi)?$/) keeps working.
+ */
+describe("ServerTreeItem BMC ipmi contextValue marker", () => {
+  it("appends .ipmi when the server has a non-blank ipmiHost, for both connected states (⊘ no marker means the BMC entries cannot be gated per-server)", () => {
+    expect(new ServerTreeItem(makeServer({ id: "a", ipmiHost: "10.0.0.9" }), false).contextValue).toBe("nexus.server.ipmi");
+    expect(new ServerTreeItem(makeServer({ id: "b", ipmiHost: "10.0.0.9" }), true).contextValue).toBe("nexus.serverConnected.ipmi");
+  });
+
+  it("leaves the base contextValue untouched when ipmiHost is absent or blank (⊘ appending .ipmi to a non-BMC server would show BMC actions that can only fail)", () => {
+    expect(new ServerTreeItem(makeServer({ id: "a" }), false).contextValue).toBe("nexus.server");
+    expect(new ServerTreeItem(makeServer({ id: "b", ipmiHost: "   " }), false).contextValue).toBe("nexus.server");
+    expect(new ServerTreeItem(makeServer({ id: "c" }), true).contextValue).toBe("nexus.serverConnected");
   });
 });

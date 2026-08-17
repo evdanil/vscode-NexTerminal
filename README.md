@@ -174,6 +174,8 @@ Nodes with an HTML5/VNC console, and nodes that have no console address yet, are
 
 **Community edition is the certified target.** The client is edition-aware and works against Professional, but a Pro server adds a warning to every sync saying so: lab discovery and console mapping are validated against Community, and Pro's differences are not yet covered.
 
+**See which labs are running, live.** Run **Refresh Lab Status** (or set `nexus.inventory.statusPollSeconds` to poll while the Command Center is open) and running EVE-NG nodes get a green dot with a `(running)` tag, while the lab folder holding them lights up with a green ▶ — so an at-a-glance look at the tree tells you which labs are up.
+
 ### Apply a Device Template to Synced Servers
 
 A source's auth profile is one setting shared across every server it creates. A **device template** carries the rest: a proxy, a multiplexing choice, a legacy-algorithm toggle, session logging, and a BMC login (its own **IPMI Auth Profile** and **IPMI Gateway**) — a reusable bundle applied to matched devices so you don't set them on each synced server by hand.

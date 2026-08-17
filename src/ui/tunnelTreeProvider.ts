@@ -64,6 +64,7 @@ export class TunnelTreeProvider
     explicitGroups: [],
     authProfiles: [],
     activitySessionIds: new Set(),
+    serverStatus: new Map(),
     focusedSessionId: undefined,
     inventorySources: [],
     deviceTemplates: [],

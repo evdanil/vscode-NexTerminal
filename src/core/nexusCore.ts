@@ -15,7 +15,7 @@ import {
   type TunnelProfile,
   type TunnelRegistryEntry
 } from "../models/config";
-import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
+import { inventorySourceValuesEqual, sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
@@ -105,6 +105,14 @@ export class NexusCore {
   private readonly activeLocalShellSessions = new Map<string, ActiveLocalShellSession>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
+  // LIVE STATUS (Phase 2) — runtime-only running/stopped state per server,
+  // driven by applyInventoryStatus from a provider's fetchStatus report. NOT
+  // persisted (it dies with the window and is re-fetched on demand / poll).
+  // `serverStatusSource` records which source each entry came from, so a later
+  // apply for that source can drop the entries it no longer reports (including
+  // servers pruned or removed) without touching another source's entries.
+  private readonly serverStatus = new Map<string, "running" | "stopped">();
+  private readonly serverStatusSource = new Map<string, string>();
   private focusedSessionId: string | undefined = undefined;
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
@@ -199,6 +207,7 @@ export class NexusCore {
       explicitGroups: [...this.explicitGroups],
       authProfiles: [...this.authProfiles.values()],
       activitySessionIds: new Set(this.activitySessionIds),
+      serverStatus: new Map(this.serverStatus),
       focusedSessionId: this.focusedSessionId,
       inventorySources: [...this.inventorySources.values()],
       deviceTemplates: [...this.deviceTemplates.values()],
@@ -579,6 +588,13 @@ export class NexusCore {
   public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
     const hadPrevious = this.inventorySources.has(source.id);
     const previous = this.inventorySources.get(source.id);
+    // LIVE STATUS (Phase 2) — a change to the PROVIDER CONFIG (baseUrl,
+    // rootFolder, filter, …) invalidates any runtime status: the report was
+    // fetched under the old config, so nodes the new config excludes — or the
+    // old deployment's nodes entirely — must not keep a stale highlight. Detected
+    // by a real config-value change so a no-op edit (or a non-config edit like a
+    // rename) does not needlessly clear. Cleared AFTER the persist succeeds.
+    const configChanged = hadPrevious && previous !== undefined && !inventorySourceValuesEqual(previous.config, source.config);
     const withRevision: InventorySourceConfig = { ...source, revision: randomUUID() };
     this.inventorySources.set(source.id, withRevision);
     try {
@@ -590,6 +606,10 @@ export class NexusCore {
         this.inventorySources.delete(source.id);
       }
       throw error;
+    }
+    if (configChanged) {
+      // No separate emit — the emitChanged() below covers the status drop too.
+      this.dropInventoryStatusForSource(source.id);
     }
     this.emitChanged();
   }
@@ -641,6 +661,11 @@ export class NexusCore {
       }
       throw error;
     }
+    // LIVE STATUS (Phase 2) — the source is gone; drop any runtime status it
+    // owned so a removed source leaves no lingering running/stopped highlight.
+    // Shares clearInventoryStatus's loop; no extra emit since emitChanged()
+    // fires below regardless.
+    this.dropInventoryStatusForSource(id);
     this.emitChanged();
   }
 
@@ -1201,9 +1226,20 @@ export class NexusCore {
         }
       }
     }
+    // LIVE STATUS (Phase 2) — capture the runtime status entries this prune is
+    // about to drop, so a rejected persist below can restore them alongside the
+    // servers they belong to (the rollback envelope otherwise loses the
+    // running/stopped highlight even though the server itself comes back).
+    const droppedServerStatus = new Map<string, { state: "running" | "stopped"; source: string | undefined }>();
     for (const id of removeServerIds) {
+      const priorStatus = this.serverStatus.get(id);
+      if (priorStatus !== undefined) {
+        droppedServerStatus.set(id, { state: priorStatus, source: this.serverStatusSource.get(id) });
+      }
       this.servers.delete(id);
       this.removeServerSessions(id);
+      // A pruned server must not leave a ghost status entry (P3-4).
+      this.dropServerStatusEntry(id);
       batchWrittenServers.set(id, undefined);
     }
     for (const server of upsertServers) {
@@ -1850,6 +1886,19 @@ export class NexusCore {
           return depthA !== depthB ? depthA - depthB : idA.localeCompare(idB);
         }
       );
+      // LIVE STATUS (Phase 2) — restore a pruned server's runtime status
+      // entry when (and only when) the server itself is restored below, so the
+      // rollback leaves status and server consistent. A server left deleted (a
+      // concurrent recreation) keeps its status dropped.
+      const restoreDroppedStatus = (id: string): void => {
+        const dropped = droppedServerStatus.get(id);
+        if (dropped) {
+          this.serverStatus.set(id, dropped.state);
+          if (dropped.source !== undefined) {
+            this.serverStatusSource.set(id, dropped.source);
+          }
+        }
+      };
       for (const [id, priorServer] of orderedRemovedServerRestores) {
         if (this.servers.get(id) !== undefined) {
           continue; // something concurrent recreated this record — leave theirs.
@@ -1860,6 +1909,7 @@ export class NexusCore {
           // Sound chain (or nothing to judge): restore the captured pre-batch
           // record itself, byte-for-byte, exactly as before this fix.
           this.servers.set(id, priorServer);
+          restoreDroppedStatus(id);
           addSurvivingFolderChain(group);
           continue;
         }
@@ -1882,6 +1932,7 @@ export class NexusCore {
         const restored = cloneServerConfig(priorServer);
         restored.group = remappedGroup;
         this.servers.set(id, restored);
+        restoreDroppedStatus(id);
         addSurvivingFolderChain(remappedGroup);
       }
       // TOMBSTONE — a captured session that was genuinely torn down by
@@ -2143,6 +2194,8 @@ export class NexusCore {
 
   public async removeServer(serverId: string): Promise<void> {
     this.servers.delete(serverId);
+    // LIVE STATUS (Phase 2) — drop any runtime status keyed to the deleted server.
+    this.dropServerStatusEntry(serverId);
     // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 9, extracted to
     // the shared `clearGatewayReferencesTo` helper in round 10) — clear every
     // OTHER server's `ipmiGatewayServerId` that named the server just deleted,
@@ -2199,6 +2252,97 @@ export class NexusCore {
   public registerSession(session: ActiveSession): void {
     this.activeSessions.set(session.id, session);
     this.emitChanged();
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — apply one source's fetchStatus report onto the
+   * runtime serverStatus map. Each report entry is resolved to a server by its
+   * REAL origin identity — a server owned by this source (origin.sourceId ===
+   * sourceId) whose origin.externalId matches — which covers both a normal
+   * deterministic-id server and an ADOPTED one whose id was preserved (#82).
+   * Entries this source previously wrote but no longer reports —
+   * pruned nodes, removed servers — are dropped; entries owned by OTHER sources
+   * are untouched. One emitChanged() on the way out, like registerSession.
+   */
+  public applyInventoryStatus(sourceId: string, report: InventoryStatusReport): void {
+    // TRUNCATION — a COMPLETE report is authoritative: clear this source's prior
+    // entries first, then rebuild, so a node the source stops reporting (a
+    // stopped node is still present as "stopped", so absent == removed) drops
+    // out. A TRUNCATED report is PARTIAL — nodes beyond the provider's cap are
+    // merely absent, not gone — so we MERGE instead: skip the clear and retain
+    // the prior status of any entry not in this report, applying only what is
+    // present (present entries overwrite below, keeping serverStatusSource ===
+    // sourceId consistently for both retained and freshly-applied entries).
+    if (!report.truncated) {
+      for (const [serverId, owner] of [...this.serverStatusSource]) {
+        if (owner === sourceId) {
+          this.serverStatus.delete(serverId);
+          this.serverStatusSource.delete(serverId);
+        }
+      }
+    }
+    // Resolve report entries by the server's REAL origin identity, not by
+    // assuming `id === deterministicServerId(sourceId, externalId)`. Adoption
+    // (Keep Servers → re-add → Adopt Existing, #82) PRESERVES an adoptee's
+    // original id while stamping the NEW source into `origin`, so a deterministic
+    // lookup would miss every adopted node. Building the map from servers owned
+    // by this source (origin.sourceId === sourceId), keyed by origin.externalId,
+    // covers BOTH the deterministic (non-adopted) and the preserved-id (adopted)
+    // cases, and inherently keeps the source-ownership scoping.
+    const serverIdByExternalId = new Map<string, string>();
+    for (const server of this.servers.values()) {
+      if (server.origin?.sourceId === sourceId) {
+        serverIdByExternalId.set(server.origin.externalId, server.id);
+      }
+    }
+    for (const [externalId, deviceStatus] of Object.entries(report.statuses)) {
+      const serverId = serverIdByExternalId.get(externalId);
+      if (serverId !== undefined) {
+        this.serverStatus.set(serverId, deviceStatus.state);
+        this.serverStatusSource.set(serverId, sourceId);
+      }
+    }
+    this.emitChanged();
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — drop every status entry a source owns, WITHOUT
+   * emitting. Returns whether anything changed. Shared by clearInventoryStatus
+   * (which emits) and removeInventorySource (which emits once on its own way
+   * out), so the two never drift on the clearing rule.
+   */
+  /**
+   * LIVE STATUS (Phase 2) — drop a single server's runtime status entry, WITHOUT
+   * emitting. Called from every path that removes a server (manual delete, sync
+   * prune) so a gone server never strands a running/stopped highlight; the
+   * calling path's own emit covers the change.
+   */
+  private dropServerStatusEntry(serverId: string): void {
+    this.serverStatus.delete(serverId);
+    this.serverStatusSource.delete(serverId);
+  }
+
+  private dropInventoryStatusForSource(sourceId: string): boolean {
+    let changed = false;
+    for (const [serverId, owner] of [...this.serverStatusSource]) {
+      if (owner === sourceId) {
+        this.serverStatus.delete(serverId);
+        this.serverStatusSource.delete(serverId);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — drop every status entry a source owns (used on
+   * source removal). Silent when there was nothing to clear, so an unrelated
+   * source removal does not churn every tree.
+   */
+  public clearInventoryStatus(sourceId: string): void {
+    if (this.dropInventoryStatusForSource(sourceId)) {
+      this.emitChanged();
+    }
   }
 
   public registerSerialSession(session: ActiveSerialSession): void {
