@@ -783,6 +783,45 @@ describe("inventoryCommands", () => {
     });
   });
 
+  /**
+   * EVE-NG (Phase 1) — the Settings tree renders one row per source with
+   * inline Sync / Edit / Template Rules / Remove buttons. VS Code hands a
+   * `view/item/context` command the TREE ITEM, not a string, so a handler that
+   * only understands a string id falls through to the source picker — every
+   * inline button on every row would prompt "which source?" instead of acting
+   * on the row it is attached to.
+   */
+  describe("tree-item arguments", () => {
+    async function withTwoSources(): Promise<{ core: NexusCore; registry: InventoryProviderRegistry }> {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      // TWO sources, so the picker cannot auto-select and a fall-through is
+      // visible as a QuickPick rather than as the right source by luck.
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1", name: "First" }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-2", name: "Second" }));
+      return { core, registry };
+    }
+
+    it("editSource reads the source id off a tree item's `sourceId` (\u2298 a string-only handler opens the picker, so the inline Edit button never edits the row it is on)", async () => {
+      await withTwoSources();
+      await registeredCommands.get("nexus.inventory.editSource")!({ sourceId: "src-2" });
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      expect(latestFormCall().definition.fields.find((f) => "key" in f && f.key === "name")).toEqual(
+        expect.objectContaining({ value: "Second" })
+      );
+    });
+
+    it("still falls through to the picker for a menu object that names no source \u2014 a palette invocation must keep prompting", async () => {
+      await withTwoSources();
+      mockShowQuickPick.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.editSource")!({ label: "not a source row" });
+      expect(mockShowQuickPick).toHaveBeenCalled();
+    });
+  });
+
   describe("nexus.inventory.editSource", () => {
     it("F7 — a blank secret field keeps the previously saved vault value on Save, AND the Test button hydrates it from the vault before calling testConnection (kills blank overwriting the token)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());

@@ -43,6 +43,38 @@ describe("package contributions", () => {
     });
   });
 
+  /**
+   * EVE-NG (Phase 1) — the Settings tree's per-source rows. Without these
+   * entries the rows render but carry no actions, which is most of the point
+   * of showing them at all.
+   */
+  describe("inventory source row actions", () => {
+    const rowMenus = () =>
+      (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexus.inventorySource") && (m.when ?? "").includes("nexusSettings")
+      );
+
+    it("binds Sync / Edit / Template Rules / Remove inline on an inventory source row (\u2298 rows with no actions leave every operation behind the QuickPick hub they replace)", () => {
+      expect(rowMenus().map((m) => m.command).sort()).toEqual([
+        "nexus.deviceTemplate.editRules",
+        "nexus.inventory.editSource",
+        "nexus.inventory.removeSource",
+        "nexus.inventory.syncNow"
+      ]);
+    });
+
+    it("puts them in the `inline` group so they render as row buttons rather than hiding in the right-click menu", () => {
+      expect(rowMenus().every((m) => (m.group ?? "").startsWith("inline"))).toBe(true);
+    });
+
+    it("matches the row contextValue EXACTLY, so the group row and unrelated tree items never inherit these actions", () => {
+      for (const menu of rowMenus()) {
+        expect(menu.when).toContain("viewItem == nexus.inventorySource");
+      }
+      expect(rowMenus()).not.toHaveLength(0);
+    });
+  });
+
   it("includes serialport runtime dependency", () => {
     expect(packageJson.dependencies.serialport).toBeDefined();
   });

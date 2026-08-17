@@ -20,6 +20,8 @@ import {
   type InventoryTree
 } from "../models/inventory";
 import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
+// Shared with ui/settingsTreeProvider.ts so both surfaces describe a source identically.
+import { sourceDescription } from "../services/inventory/sourceDescription";
 import {
   computeSyncPlan,
   planToApplication,
@@ -291,23 +293,30 @@ function describeInventoryError(error: unknown): string {
  * text. Core's own message is NEVER changed by this — it's also asserted
  * verbatim by nexusCoreInventory.test.ts.
  */
+/**
+ * The source id a command invocation names, from any of the three shapes a
+ * `nexus.inventory.*` (or `nexus.deviceTemplate.editRules`) handler is called
+ * with: a bare id string (the manage hub), a tree item carrying `sourceId`
+ * (the Settings tree's per-source rows — VS Code hands `view/item/context`
+ * commands the ITEM, never a string), or nothing at all (the palette).
+ * `undefined` means "ask", which is the right answer for the last case and for
+ * any menu object that names no source.
+ */
+export function resolveSourceIdArg(arg: unknown): string | undefined {
+  if (typeof arg === "string") {
+    return arg;
+  }
+  if (arg !== null && typeof arg === "object") {
+    const sourceId = (arg as { sourceId?: unknown }).sourceId;
+    if (typeof sourceId === "string" && sourceId.length > 0) {
+      return sourceId;
+    }
+  }
+  return undefined;
+}
+
 function isSourceConfigMismatchError(error: unknown): boolean {
   return error instanceof Error && error.message.includes("configuration changed since the sync was computed");
-}
-
-function formatLastSync(source: InventorySourceConfig): string {
-  if (!source.lastSyncAt) return "never synced";
-  const minutes = Math.floor((Date.now() - source.lastSyncAt) / 60_000);
-  if (minutes < 1) return "synced just now";
-  if (minutes < 60) return `synced ${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `synced ${hours}h ago`;
-  return `synced ${Math.floor(hours / 24)}d ago`;
-}
-
-function sourceDescription(source: InventorySourceConfig, registry: InventoryProviderRegistry): string {
-  const providerLabel = registry.get(source.providerId)?.label ?? source.providerId;
-  return `${providerLabel} — ${formatLastSync(source)}`;
 }
 
 /** Auto-picks when exactly one source exists; warns and returns undefined when there are none. */
@@ -4362,12 +4371,16 @@ export function registerInventoryCommands(
 
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
-    // Same arg widening as syncNow's below: a menu/tree invocation hands the
-    // handler its context object, which must fall through to the picker
-    // rather than being read as a source id.
-    vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(typeof arg === "string" ? arg : undefined)),
-    vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(typeof arg === "string" ? arg : undefined)),
-    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(typeof arg === "string" ? arg : undefined)),
+    // Arg widening: these four run from the palette (no argument at all), from
+    // the manage hub (a source id string), and from the Settings tree's
+    // per-source rows — where VS Code hands a `view/item/context` command the
+    // TREE ITEM. Reading `sourceId` off it is what makes the inline buttons act
+    // on the row they are attached to; anything else still falls through to the
+    // picker, which is the correct behaviour for a palette invocation and for a
+    // menu object that names no source.
+    vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(resolveSourceIdArg(arg))),
+    vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(resolveSourceIdArg(arg))),
+    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
   ];
 }

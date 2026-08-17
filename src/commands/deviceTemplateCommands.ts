@@ -33,6 +33,7 @@ import { formValuesToProxy } from "./serverCommands";
 import { isDescendantOrSelf } from "../utils/folderPaths";
 import { naturalCompare } from "../utils/naturalCompare";
 import type { CommandContext } from "./types";
+import { resolveSourceIdArg } from "./inventoryCommands";
 
 /**
  * DEVICE TEMPLATES (issue #48 PR-T1b) — the user-visible surface on top of the
@@ -1001,8 +1002,11 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
 
     vscode.commands.registerCommand("nexus.deviceTemplate.manage", () => manageDeviceTemplates(ctx)),
 
+    // Same three invocation shapes the nexus.inventory.* handlers accept — see
+    // `resolveSourceIdArg`. The Settings tree's per-source rows carry this as
+    // an inline action, and VS Code hands it the TREE ITEM rather than an id.
     vscode.commands.registerCommand("nexus.deviceTemplate.editRules", (arg?: unknown) =>
-      editTemplateRules(ctx, registry, typeof arg === "string" ? arg : undefined)
+      editTemplateRules(ctx, registry, resolveSourceIdArg(arg))
     ),
 
     vscode.commands.registerCommand("nexus.deviceTemplate.applyToFolder", async (arg?: unknown) => {

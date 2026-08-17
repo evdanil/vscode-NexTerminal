@@ -1194,6 +1194,21 @@ describe("Edit Template Rules… flow (§7.2)", () => {
   }
   const editRules = () => registeredCommands.get("nexus.deviceTemplate.editRules")!("src-1");
 
+  // EVE-NG (Phase 1) — the Settings tree's per-source rows carry an inline
+  // "Template Rules" button, and VS Code hands a `view/item/context` command
+  // the TREE ITEM rather than a string.
+  it("reads the source id off a tree item's `sourceId` (\u2298 a string-only handler opens the source picker, so the inline button never edits the row it is on)", async () => {
+    const core = makeCore();
+    await seedSource(core, { id: "src-1", name: "First" });
+    await seedSource(core, { id: "src-2", name: "Second", authProfileId: "A" });
+    registerWithRegistry(core, regWith());
+    mockShowQuickPick.mockImplementationOnce(async (items: Array<{ floor?: boolean }>) => items.find((i) => i.floor));
+
+    await registeredCommands.get("nexus.deviceTemplate.editRules")!({ sourceId: "src-2" });
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.editSource", "src-2");
+  });
+
   it("the implicit floor row routes to editSource (UX-S4)", async () => {
     const core = makeCore();
     await seedSource(core, { authProfileId: "A" });

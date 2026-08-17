@@ -800,7 +800,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
-  const settingsTreeProvider = new SettingsTreeProvider();
+  // Core + registry so the Settings tree can render one row per inventory
+  // source (name, provider label, last sync) with inline actions, and refresh
+  // them on any core change.
+  const settingsTreeProvider = new SettingsTreeProvider(core, inventoryProviderRegistry);
   const savedCollapsed = context.globalState.get<string[]>(COLLAPSED_FOLDERS_KEY, []);
   nexusTreeProvider.loadCollapsedFolders(savedCollapsed);
   const collapsedFolderStatePersistence = createCollapsedFolderStatePersistence(

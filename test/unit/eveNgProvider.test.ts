@@ -710,6 +710,10 @@ describe("activation wiring", () => {
     expect(source).toMatch(/inventoryProviderRegistry\.register\(createEveNgProvider\(\)\);/);
   });
 
+  it("hands the Settings tree the core and the provider registry, without which its per-source rows are empty and never refresh", () => {
+    expect(source).toMatch(/new SettingsTreeProvider\(core, inventoryProviderRegistry\)/);
+  });
+
   it("imports the EVE-NG factory from the provider module", () => {
     expect(source).toMatch(/import \{ createEveNgProvider \} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
   });
