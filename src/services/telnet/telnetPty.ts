@@ -127,15 +127,6 @@ export class TelnetPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.sendToSocket(data);
   }
 
-  /**
-   * The raw-bytes door onto the same path, for callers that already hold encoded
-   * bytes. Exists so the 0xFF escape is reachable at all: a `string` is UTF-8
-   * encoded, and valid UTF-8 contains no 0xFF byte.
-   */
-  public writeProgrammaticBytes(data: Buffer): void {
-    this.sendToSocket(data);
-  }
-
   public resetTerminal(): void {
     if (this.disposed) return;
     this.writeEmitter.fire(CLEAR_VISIBLE_SCREEN);
@@ -246,7 +237,7 @@ export class TelnetPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.socket = undefined;
   }
 
-  private sendToSocket(data: string | Buffer): void {
+  private sendToSocket(data: string): void {
     if (this.disposed || this.disconnected || this.connectFailed || !this.connected) {
       return;
     }

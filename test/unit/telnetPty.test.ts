@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
 import { TelnetPty, type TelnetSocket, type TelnetSocketFactory } from "../../src/services/telnet/telnetPty";
 import { DO, IAC, OPT_ECHO, WILL } from "../../src/services/telnet/telnetProtocol";
 import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
@@ -263,6 +264,65 @@ describe("TelnetPty — connect lifecycle", () => {
     expect(onSessionClosed).toHaveBeenCalledTimes(1);
   });
 
+  // ⊘ M11 (review) — `failConnect` idempotency. Two socket errors before the
+  // connect completes is the ORDINARY shape of a failed connect on a dual-stack
+  // host (one per address family), so a missing re-entry guard shows the user
+  // two modal error toasts and writes the failure banner twice.
+  it("reports a failed connect exactly once however many socket errors arrive", () => {
+    const h = harness();
+    h.pty.open();
+    h.fake.emitError(new Error("EHOSTUNREACH"));
+    h.fake.emitError(new Error("ECONNREFUSED"));
+    h.fake.emitClose();
+
+    expect(h.callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
+    expect(rendered(h).match(/Connection failed/g)).toHaveLength(1);
+    expect(rendered(h).match(/Press any key to close/g)).toHaveLength(1);
+    expect(vi.mocked(vscode.window.showErrorMessage)).toHaveBeenCalledTimes(1);
+  });
+
+  // ⊘ M37 (review) — `markShuttingDown` re-entry. The deactivate sweep can reach
+  // a pty more than once (the subscription plus an explicit teardown), and
+  // without the guard the tab ends up with two farewell banners and a second
+  // socket destroy on an already-dead handle.
+  it("writes the farewell banner exactly once when markShuttingDown is called twice", () => {
+    const h = harness();
+    h.pty.open();
+    h.fake.emitConnect();
+    h.writes.length = 0;
+
+    h.pty.markShuttingDown("Nexus Terminal is shutting down.");
+    h.pty.markShuttingDown("Nexus Terminal is shutting down.");
+
+    expect(rendered(h).match(/Nexus Terminal is shutting down\./g)).toHaveLength(1);
+    expect(rendered(h).match(/Close this terminal and connect again/g)).toHaveLength(1);
+  });
+
+  // ⊘ M9 (review) — the `sendToSocket` disconnected guard. A macro or a script
+  // that keeps writing after the remote hung up would otherwise write to a
+  // destroyed socket; the guard is also what makes `writeProgrammatic`'s
+  // "silently no-ops if the session is disconnected" contract true
+  // (SessionPtyHandle, models/config.ts).
+  it("writes nothing to the socket once disconnected, from either input path", () => {
+    const h = harness();
+    h.pty.open();
+    h.fake.emitConnect();
+    h.fake.emitClose();
+    h.fake.writes.length = 0;
+
+    h.pty.writeProgrammatic("enable\r");
+    h.pty.handleInput("x");
+
+    expect(h.fake.writes).toHaveLength(0);
+  });
+
+  it("writes nothing to the socket before the connection is up", () => {
+    const h = harness();
+    h.pty.open();
+    h.pty.writeProgrammatic("too early\r");
+    expect(h.fake.writes).toHaveLength(0);
+  });
+
   it("surfaces a mid-session socket error and then disconnects", () => {
     const h = harness();
     h.pty.open();
@@ -383,20 +443,6 @@ describe("TelnetPty — input handling", () => {
     h.pty.handleInput("b");
 
     expect(Buffer.concat(h.fake.writes).toString("utf8")).toBe("b");
-  });
-
-  // ⊘ writeProgrammatic that writes the raw string lets a 0xFF byte in script
-  // output desynchronize the server's IAC parser.
-  it("escapes 0xFF in writeProgrammatic output", () => {
-    const h = harness();
-    h.pty.open();
-    h.fake.emitConnect();
-    h.fake.writes.length = 0;
-
-    h.pty.writeProgrammatic("x");
-    h.pty.writeProgrammaticBytes(Buffer.from([0x61, 0xff, 0x62]));
-
-    expect(sent(h)).toEqual([0x78, 0x61, IAC, IAC, 0x62]);
   });
 
   it("writeProgrammatic bypasses the input lock (scripts own it)", () => {

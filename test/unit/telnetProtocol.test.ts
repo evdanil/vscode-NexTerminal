@@ -11,6 +11,7 @@ import {
   SB,
   SE,
   TelnetNegotiator,
+  escapeIac,
   WILL,
   WONT
 } from "../../src/services/telnet/telnetProtocol";
@@ -91,6 +92,67 @@ describe("TelnetNegotiator — data-stream handling", () => {
     const payload = "héllo — 日本語 ✓";
     const { data } = feed(n, Buffer.concat([text(payload), bytes(IAC, WILL, OPT_SGA)]));
     expect(Buffer.from(data).toString("utf8")).toBe(payload);
+  });
+
+  // ⊘ MAJOR-1 (review) — THE UNBOUNDED-PAYLOAD DoS. Telnet is unauthenticated,
+  // so a server or an on-path attacker can open `IAC SB <opt>` and then stream
+  // forever: every byte was pushed into a `number[]` that nothing capped and
+  // nothing reset short of `IAC SE`, so the extension host died with nothing on
+  // screen. A cap is the only thing that fails this test — a parser that merely
+  // "ignores unknown subnegotiations" still accumulates the payload first.
+  it("abandons a subnegotiation whose payload runs past the cap, without growing without bound", () => {
+    const n = new TelnetNegotiator();
+    const cap = n.maxSubnegotiationBytes;
+    feed(n, bytes(IAC, SB, 99));
+    // Well past any real subnegotiation (TERMINAL-TYPE ≤ 40, NAWS is 4).
+    const flood = Buffer.alloc(200_000, 0x41);
+    const during = feed(n, flood);
+
+    // NOTHING is retained: the parser abandons at the cap and returns to the
+    // data state, so the bytes it could not use are STREAMED (rendered) rather
+    // than accumulated. The old parser held all 200_000 in a `number[]`.
+    expect(n.pendingSubnegotiationBytes).toBe(0);
+    expect(during.response).toEqual([]);
+    // Exactly the flood minus the bytes swallowed as payload before the cap
+    // tripped — proof it neither buffered them nor silently ate the stream.
+    expect(during.data).toHaveLength(flood.length - cap);
+
+    // …and the parser really is back in the data state, so ordinary output that
+    // follows still arrives.
+    expect(Buffer.from(feed(n, text("prompt> ")).data).toString("utf8")).toBe("prompt> ");
+  });
+
+  // ⊘ THE BENIGN WEDGE, the same bug's other face: a device that emits a
+  // truncated subnegotiation (no IAC SE) left the parser in `sb-payload`
+  // forever, silently discarding EVERY later byte — terminal, capture buffer,
+  // highlighting and scripts all went dark with no way back short of closing
+  // the tab. A parser that only caps memory but never leaves the state fails
+  // this one.
+  it("recovers the session when a device never terminates a subnegotiation", () => {
+    const n = new TelnetNegotiator();
+    feed(n, Buffer.concat([bytes(IAC, SB, OPT_TERMINAL_TYPE), Buffer.alloc(4096, 0x42)]));
+    // The parser is back in the data state, so the NEXT chunk renders normally
+    // instead of vanishing into a subnegotiation that never ends.
+    const after = feed(n, text("Router> "));
+    expect(Buffer.from(after.data).toString("utf8")).toBe("Router> ");
+  });
+
+  it("still answers a legitimately long-but-valid subnegotiation after an abandoned one", () => {
+    const n = new TelnetNegotiator({ terminalType: "vt100" });
+    feed(n, Buffer.concat([bytes(IAC, SB, 99), Buffer.alloc(4096, 0x43)]));
+    const { response } = feed(n, bytes(IAC, SB, OPT_TERMINAL_TYPE, 1, IAC, SE));
+    expect(response).toEqual([IAC, SB, OPT_TERMINAL_TYPE, 0, ...text("vt100"), IAC, SE]);
+  });
+
+  it("accepts a subnegotiation right at the cap", () => {
+    const n = new TelnetNegotiator();
+    const payload = Buffer.alloc(n.maxSubnegotiationBytes - 1, 0x01);
+    const { response } = feed(
+      n,
+      Buffer.concat([bytes(IAC, SB, OPT_TERMINAL_TYPE, 1), payload, bytes(IAC, SE)])
+    );
+    // Payload was `SEND` + filler, so it is still a well-formed TERMINAL-TYPE SEND.
+    expect(response.slice(0, 4)).toEqual([IAC, SB, OPT_TERMINAL_TYPE, 0]);
   });
 
   it("does not mistake a 0xFF byte inside a subnegotiation payload for IAC SE", () => {
@@ -339,13 +401,13 @@ describe("TelnetNegotiator — outgoing encoding", () => {
   // contains no 0xFF byte — which is exactly why the escape is applied to the
   // ENCODED bytes rather than to the source text.
   it("escapes an outgoing 0xFF byte as IAC IAC", () => {
-    const n = new TelnetNegotiator();
-    expect([...n.encodeOutgoing(bytes(0x61, 0xff, 0x62))]).toEqual([0x61, IAC, IAC, 0x62]);
+    expect([...escapeIac(bytes(0x61, 0xff, 0x62))]).toEqual([0x61, IAC, IAC, 0x62]);
+    expect([...escapeIac(bytes(IAC, IAC))]).toEqual([IAC, IAC, IAC, IAC]);
   });
 
-  it("leaves raw bytes otherwise untouched, newline translation included", () => {
-    const n = new TelnetNegotiator();
-    expect([...n.encodeOutgoing(bytes(0x0d))]).toEqual([0x0d]);
+  it("returns a buffer with nothing to escape unchanged, by reference", () => {
+    const clean = bytes(0x61, 0x0d, 0x62);
+    expect(escapeIac(clean)).toBe(clean);
   });
 
   it("translates a bare CR to the NVT newline CR LF", () => {

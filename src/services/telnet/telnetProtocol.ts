@@ -13,6 +13,15 @@
  * and asking for binary mode would only add a way for the two sides to disagree.
  * There is no authentication or encryption here because telnet has none; the use
  * case is lab gear and virtual-console servers on a trusted management network.
+ *
+ * KNOWN TRADE-OFF (MINOR-2, review) — a `CR` that ends a chunk is HELD until the
+ * next byte arrives, because `CR NUL` and `CR LF` mean different things and TCP
+ * is free to split the pair. The cost is that output ending in a bare `CR`
+ * renders one packet late. The alternative — flushing a pending `CR` at the end
+ * of every chunk — puts a stray `NUL` on screen every time a `CR LF` is split,
+ * which is common on a busy session, so the latency is the cheaper of the two.
+ * It is bounded in practice: a lone trailing `CR` only occurs when the peer has
+ * more to send, and the very next byte releases it.
  */
 
 /** Interpret As Command — the escape byte every telnet sequence starts with. */
@@ -39,6 +48,33 @@ const TTYPE_SEND = 1;
 const CR = 0x0d;
 const LF = 0x0a;
 const NUL = 0x00;
+
+/**
+ * MAJOR-1 (review) — hard cap on a single subnegotiation's payload.
+ *
+ * WHY IT EXISTS. The `sb-payload` state accumulates every non-IAC byte, and the
+ * only ways out were `IAC SE` or a malformed `IAC <x>`. Telnet is
+ * unauthenticated, so a hostile or merely broken peer could open `IAC SB <opt>`
+ * and stream forever: the array grew without bound until the extension host
+ * died, with nothing on screen to say why. The same missing bound had a benign
+ * face that was arguably worse — a device emitting a TRUNCATED subnegotiation
+ * left the parser in `sb-payload` permanently, silently discarding every later
+ * byte, so the terminal, the capture buffer, highlighting and any running script
+ * all went dark with no recovery short of closing the tab.
+ *
+ * WHY 128. Every subnegotiation this client answers is tiny: NAWS is exactly 4
+ * payload bytes and RFC 1091 bounds a terminal-type name at 40. 128 is generous
+ * for both while being far below any interesting allocation.
+ *
+ * WHAT HAPPENS AT THE CAP: the subnegotiation is ABANDONED and the parser
+ * returns to the data state — the same "abandon rather than swallow" escape the
+ * `sb-iac` malformed branch already takes, and deliberately not a
+ * discard-until-SE scan, which would keep a truncated subnegotiation wedged for
+ * as long as the peer kept talking. The bytes that follow are therefore rendered
+ * as ordinary output rather than eaten: noisy for one burst, but the session
+ * stays alive and nothing is hidden from the user.
+ */
+const MAX_SUBNEGOTIATION_BYTES = 128;
 
 const DEFAULT_TERMINAL_TYPE = "xterm-256color";
 const DEFAULT_COLUMNS = 80;
@@ -101,6 +137,32 @@ function pushEscaped(out: number[], byte: number): void {
   }
 }
 
+/**
+ * Escape every `0xFF` in an outbound buffer as `IAC IAC`, so a data byte can
+ * never be read by the peer as the start of a command (which would make it eat
+ * the two bytes after it).
+ *
+ * A SEPARATE EXPORTED FUNCTION rather than a branch inside `encodeOutgoing`,
+ * and the reason is worth stating plainly: `encodeOutgoing` takes a `string`,
+ * and a UTF-8 encode CANNOT produce a `0xFF` byte, so the escape is unreachable
+ * through it today. It is kept as defence-in-depth for any future byte-level
+ * writer, and it lives here so that invariant is directly testable instead of
+ * being guarded by a parameter overload nothing calls (MINOR-5, review).
+ *
+ * Returns the input unchanged — no copy — when there is nothing to escape,
+ * which is every ordinary keystroke.
+ */
+export function escapeIac(raw: Buffer): Buffer {
+  if (!raw.includes(IAC)) {
+    return raw;
+  }
+  const out: number[] = [];
+  for (const byte of raw) {
+    pushEscaped(out, byte);
+  }
+  return Buffer.from(out);
+}
+
 export class TelnetNegotiator {
   private readonly terminalType: string;
   private state: ParserState = "data";
@@ -130,6 +192,20 @@ export class TelnetNegotiator {
     this.terminalType = options.terminalType ?? DEFAULT_TERMINAL_TYPE;
     this.columns = clampDimension(options.initialColumns ?? DEFAULT_COLUMNS);
     this.rows = clampDimension(options.initialRows ?? DEFAULT_ROWS);
+  }
+
+  /** The per-subnegotiation payload cap this parser enforces. */
+  public get maxSubnegotiationBytes(): number {
+    return MAX_SUBNEGOTIATION_BYTES;
+  }
+
+  /**
+   * How many subnegotiation payload bytes are currently held. Never exceeds
+   * `maxSubnegotiationBytes`; exposed so the DoS bound is directly assertable
+   * rather than inferred from behaviour.
+   */
+  public get pendingSubnegotiationBytes(): number {
+    return this.sbPayload.length;
   }
 
   /**
@@ -181,6 +257,13 @@ export class TelnetNegotiator {
         case "sb-payload":
           if (byte === IAC) {
             this.state = "sb-iac";
+          } else if (this.sbPayload.length >= MAX_SUBNEGOTIATION_BYTES) {
+            // Over the cap — abandon this subnegotiation and resync to data
+            // (see MAX_SUBNEGOTIATION_BYTES). This byte is reprocessed AS DATA
+            // rather than dropped, so the escape swallows nothing.
+            this.sbPayload = [];
+            this.state = "data";
+            this.consumeDataByte(byte, data);
           } else {
             this.sbPayload.push(byte);
           }
@@ -224,28 +307,12 @@ export class TelnetNegotiator {
   }
 
   /**
-   * Encode outbound bytes: `0xFF` escaped as `IAC IAC` always, plus — for a
-   * `string`, i.e. keystrokes and script writes — NVT newline translation, since
-   * a network-OS console expects `CR LF` and a bare `CR` submits nothing on
-   * plenty of them.
-   *
-   * The escape is applied to the ENCODED bytes rather than the source text
-   * because it has to be: valid UTF-8 never contains 0xFF, so a `string` can
-   * only ever reach it through the `Buffer` overload.
+   * Encode outbound keystrokes / script writes: NVT newline translation (a
+   * network-OS console expects `CR LF`, and a bare `CR` submits nothing on
+   * plenty of them), UTF-8 encoding, then the `IAC IAC` escape.
    */
-  public encodeOutgoing(data: string | Buffer): Buffer {
-    const raw =
-      typeof data === "string"
-        ? Buffer.from(data.replace(/\r\n?/g, "\n").replace(/\n/g, "\r\n"), "utf8")
-        : data;
-    if (!raw.includes(IAC)) {
-      return raw;
-    }
-    const out: number[] = [];
-    for (const byte of raw) {
-      pushEscaped(out, byte);
-    }
-    return Buffer.from(out);
+  public encodeOutgoing(text: string): Buffer {
+    return escapeIac(Buffer.from(text.replace(/\r\n?/g, "\n").replace(/\n/g, "\r\n"), "utf8"));
   }
 
   /**
