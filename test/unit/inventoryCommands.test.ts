@@ -8981,6 +8981,117 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(applySpy).not.toHaveBeenCalled();
   });
 
+  /**
+   * TRUNCATED STATUS (follow-up 2) — `fetchStatus` sets `truncated` when the lab
+   * crawl hits its own time budget, and the report it returns then covers only
+   * the nodes it reached: every other node keeps whatever state it already had,
+   * which may be stale or `unknown`. Nothing used to read the flag, so a partial
+   * refresh looked exactly like a complete one.
+   *
+   * Surfaced on the MANUAL path ONLY, following the P3-7 total-failure precedent
+   * immediately below: the poll stays silent because a warning per tick nags.
+   */
+  describe("a truncated status report", () => {
+    const TRUNCATED = { ...REPORT, truncated: true as const };
+
+    it("warns on a MANUAL refresh, naming the source and what partial means (⊘ nothing reads `truncated`, so a refresh that reached half the lab is indistinguishable from a complete one and the user trusts stale node state)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Big Lab"');
+      expect(message).toMatch(/partial/i);
+      expect(message).toMatch(/time budget/i);
+      expect(message).toMatch(/Root Folder|Lab Filter/);
+    });
+
+    it("stays SILENT on the poll path (⊘ dropping the `manual` gate nags the user with this warning on every poll tick, forever, for a lab that is merely large)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => TRUNCATED);
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      // The `{ __poll: true }` marker is what the background poll passes.
+      await registeredCommands.get("nexus.inventory.refreshStatus")!({ __poll: true });
+
+      expect(fetchStatus).toHaveBeenCalledTimes(1); // the poll DID run
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not warn when the report is COMPLETE (⊘ dropping the `truncated` gate warns after every healthy manual refresh)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => REPORT) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not warn from a SUPERSEDED sweep — the report was never applied, so there is no partial status on screen to explain (⊘ warning from a sweep whose results were dropped blames the user's newer refresh on the older one's budget)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let call = 0;
+      const fetchStatus = vi.fn(async () => {
+        call += 1;
+        if (call === 1) {
+          // Sweep A (older): parks, then comes back TRUNCATED.
+          await firstGate;
+          return TRUNCATED;
+        }
+        // Sweep B (newer): a complete report, applied while A is still parked.
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweepA = cmd() as Promise<void>; // gen 1 — parks inside fetchStatus
+      await Promise.resolve();
+      await cmd(); // gen 2 — supersedes A
+      releaseFirst();
+      await sweepA;
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("emits ONE message for the whole sweep, naming every affected source (⊘ one showWarningMessage per source stacks a modal-ish pile of notifications on a multi-lab refresh)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Lab A"');
+      expect(message).toContain('"Lab B"');
+      expect(message).toContain("2 sources");
+    });
+  });
+
   it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

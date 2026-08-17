@@ -4404,6 +4404,14 @@ export function registerInventoryCommands(
     // poll path stays silent (a warning per tick would nag).
     let attempted = 0;
     let succeeded = 0;
+    // TRUNCATED STATUS (follow-up 2) — the sources whose report came back
+    // `truncated` AND was applied, by name, for one manual-only warning after the
+    // loop. `fetchStatus` sets the flag when the lab crawl hits its own time
+    // budget; the report then covers only the nodes it reached, so every other
+    // node keeps whatever state it already had — stale, or still `unknown`.
+    // Nothing read the flag before, so a partial refresh was indistinguishable
+    // from a complete one.
+    const truncatedSourceNames: string[] = [];
     for (const source of targets) {
       // A newer sweep has started while this one was awaiting — stop applying
       // stale results (last-STARTED-wins, so an older completion never
@@ -4459,6 +4467,16 @@ export function registerInventoryCommands(
           const currentSource = core.getInventorySource(source.id);
           if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
             core.applyInventoryStatus(source.id, report);
+            // TRUNCATED STATUS (follow-up 2) — collected INSIDE the apply guard,
+            // not on receipt of the report. The warning explains the status the
+            // user is now LOOKING AT, so a report the guards dropped (a superseded
+            // sweep, or a config edit mid-fetch) must not produce one: nothing
+            // partial reached the tree. This also makes the single-source
+            // supersede case silent, which the loop-top generation check alone
+            // cannot do — it only catches a supersede before the NEXT source.
+            if (report.truncated === true) {
+              truncatedSourceNames.push(source.name);
+            }
             // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
             // console-port reassignment onto sync-owned nodes, so the next
             // connect targets the live port. Separate from the pure status apply
@@ -4525,6 +4543,31 @@ export function registerInventoryCommands(
     if (options?.manual && attempted > 0 && succeeded === 0) {
       void vscode.window.showWarningMessage(
         "Could not refresh lab status from any inventory source — check the source's credentials and connectivity."
+      );
+    }
+    // TRUNCATED STATUS (follow-up 2) — a partial refresh leaves some nodes' state
+    // stale or `unknown`, which is indistinguishable from a confirmed state in the
+    // tree, so say so. MANUAL ONLY, exactly like the total-failure warning above
+    // and for the same reason: the poll fires on a timer, and a warning per tick
+    // would nag about a lab that is merely large.
+    //
+    // ONE message for the sweep, never one per source — a multi-lab refresh would
+    // otherwise stack a pile of notifications. Names up to three sources, in the
+    // spirit of the sync's own `namedExamples`.
+    //
+    // No guard is needed against this and the total-failure warning both firing:
+    // they are mutually exclusive by construction. A truncated report IS a report,
+    // so it increments `succeeded`, and the warning above requires
+    // `succeeded === 0`.
+    if (options?.manual && truncatedSourceNames.length > 0) {
+      const count = truncatedSourceNames.length;
+      const names = truncatedSourceNames.slice(0, 3).map((n) => `"${n}"`).join(", ");
+      const andMore = count > 3 ? ` and ${count - 3} more` : "";
+      const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
+      void vscode.window.showWarningMessage(
+        `${subject} — the lab crawl hit its time budget, so some nodes may be stale or still unknown. Narrow the ${
+          count === 1 ? "source's" : "sources'"
+        } Root Folder or Lab Filter, or run the refresh again.`
       );
     }
   }
