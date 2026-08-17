@@ -4584,6 +4584,17 @@ export function registerInventoryCommands(
       );
       return;
     }
+    // BUSY-GUARD (P3-2) — refuse BEFORE loading secrets when the source is
+    // mid-sync/edit/remove, mirroring refreshStatus's `inFlightSourceIds` check
+    // (~:4413). Without it a Start fired while the same source is being removed
+    // races the vault purge and dispatches with partial secrets naming a node
+    // whose source was just deleted; mid-edit it dispatches a stale
+    // `source.config` (old baseUrl). We do NOT take the config mutation lock —
+    // a control persists no servers — we only decline to race.
+    if (inFlightSourceIds.get(source.id) !== undefined) {
+      void vscode.window.showInformationMessage(`"${source.name}" is busy — try again in a moment.`);
+      return;
+    }
     const secrets: InventorySourceSecrets = {};
     for (const fieldId of source.secretFieldIds) {
       const value = await vault.get(inventorySecretKey(source.id, fieldId));

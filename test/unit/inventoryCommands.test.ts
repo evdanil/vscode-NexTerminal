@@ -8303,6 +8303,23 @@ describe("inventoryCommands", () => {
       expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
     });
 
+    it("REFUSES to dispatch while the node's source is BUSY (mid-sync/edit/remove) — mirrors refreshStatus's busy-guard so it never races the vault purge or a stale config (⊘ dispatching mid-remove loads partial secrets and names a node whose source was just deleted; mid-edit dispatches a stale baseUrl)", async () => {
+      const { start, controlSpy, server } = await setup();
+      // Open Edit Source on src-1 → it is marked busy ("edit") while the form
+      // stays open (the same technique refreshStatus's busy-guard test uses).
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      await start({ server });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(true);
+    });
+
+    it("DISPATCHES when the source is idle (⊘ a busy-guard that never releases would block every control forever)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+    });
+
     it("REFUSES a tree item whose server id is no longer in core — a server removed between render and click — instead of dispatching via its stale record (⊘ a `?? withServer.server` fallback fires a control at a just-deleted node's stale origin)", async () => {
       const { start, controlSpy } = await setup();
       // The tree item still carries a full, valid-looking record (origin + all),
