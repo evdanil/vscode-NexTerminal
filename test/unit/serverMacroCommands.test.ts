@@ -1397,7 +1397,40 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(status).toContain("No IPMI gateway is configured for Target — running locally");
   });
 
-  it("FALLS BACK to local when the gateway id is dangling (names no server in the snapshot)", async () => {
+  /**
+   * SAFETY (Codex P1) — a target that NAMES a gateway which is now unavailable
+   * (addressless after an inventory downgrade, or deleted so the id dangles) must
+   * ABORT, never fall back to a local terminal. Falling back injects the target's
+   * IPMI credentials into a LOCAL shell; for `ipmitool power off` an overlapping
+   * private address reachable locally can hit a DIFFERENT device. Distinct from a
+   * target with NO gateway configured (below), where local IS the configured route.
+   *
+   *  ⊘ collapse unavailable→local (today's resolver) — fires a local terminal, no
+   *    abort error → these fail
+   *  ⊘ abort when NO gateway configured — the "no gateway ⇒ run locally" case
+   *    below would abort → that case fails
+   */
+  it("ABORTS — no local terminal, nothing sent — when route:ipmiGateway but the configured gateway is ADDRESSLESS", async () => {
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "stopped-gw", host: "", addressless: true });
+    const ctx = routingContext({ servers: [target, gateway] });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    // Nothing ran anywhere — no local terminal (the unsafe fall-back), no session send.
+    expect(createdTerminals).toHaveLength(0);
+    // The user is told why, in an error — not a silent local fall-back with a note.
+    const err = showErrorMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(err).toContain("unavailable");
+    expect(err).toContain("Target");
+    // The old "running locally" fall-back note must NOT appear — that path is gone.
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).not.toContain("running locally");
+  });
+
+  it("ABORTS — no local terminal — when route:ipmiGateway but the gateway id is dangling/deleted (names no server)", async () => {
     const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "ghost" });
     const ctx = routingContext({ servers: [target] });
     await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
@@ -1405,9 +1438,11 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
 
     await runMacroOnServer(ctx, { server: target });
 
-    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals).toHaveLength(0);
+    const err = showErrorMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(err).toContain("unavailable");
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
-    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
+    expect(status).not.toContain("running locally");
   });
 
   it("treats an untrusted route ('IPMIGATEWAY') as local, on a gateway server", async () => {

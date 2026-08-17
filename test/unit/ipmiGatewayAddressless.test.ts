@@ -30,24 +30,56 @@ function ctxWith(servers: ServerConfig[]): CommandContext {
 }
 
 /**
- * ADDRESSLESS (Codex P1 review MINOR-2) — `resolveIpmiGatewayServer` is the ONE
- * read site for `ipmiGatewayServerId` on the run path. An addressless gateway
- * has no console to route ipmitool through, so it must resolve to "no reachable
- * gateway" (the same disposition a dangling id gets) — otherwise the run path
- * tries to connect to it, the addressless connect guard blocks the transport,
- * no session ever appears, and the flow hangs out the ~90s CONNECT_SESSION
- * timeout with a misleading "no session appeared".
+ * `resolveIpmiGatewayServer` is the ONE read site for `ipmiGatewayServerId` on the
+ * run path, and it keeps THREE dispositions distinct (Codex P1, safety):
+ *
+ *  - `none` — no gateway configured (id unset/self) → local IS the route.
+ *  - `unavailable` — a gateway IS configured but cannot be reached (MISSING, i.e.
+ *    the id dangles; or ADDRESSLESS, i.e. `host: ""` after inventory sync). The run
+ *    path must ABORT, never fall back to local.
+ *  - `server` — a reachable, addressed gateway to route through.
+ *
+ * Collapsing `unavailable` into `none`/undefined (the old behavior) is exactly the
+ * bug: the dispatch reads undefined as "run locally", so a gateway-routed IPMI
+ * command silently runs on THIS machine.
+ *
+ * The ADDRESSLESS case must also resolve FAST — as `unavailable`, never by handing
+ * back a host-less server that the run path would try to CONNECT to (the addressless
+ * guard blocks the transport, so the flow would hang out the ~90s CONNECT_SESSION
+ * timeout).
  */
-describe("resolveIpmiGatewayServer — addressless gateway", () => {
-  it("resolves an addressless gateway to undefined (run locally), never returning it for a connect attempt (⊘ returning the addressless server hangs the routed flow ~90s)", () => {
+describe("resolveIpmiGatewayServer — three dispositions", () => {
+  it("resolves an ADDRESSLESS gateway to { kind: 'unavailable', reason: 'addressless' }, never a connectable server (⊘ returning it as { kind:'server' } both hangs ~90s and lets the dispatch run locally)", () => {
     const target = server({ id: "t", ipmiGatewayServerId: "gw" });
     const gateway = server({ id: "gw", name: "stopped-gw", host: "", addressless: true });
-    expect(resolveIpmiGatewayServer(ctxWith([target, gateway]), target)).toBeUndefined();
+    expect(resolveIpmiGatewayServer(ctxWith([target, gateway]), target)).toEqual({
+      kind: "unavailable",
+      reason: "addressless"
+    });
   });
 
-  it("still resolves an addressed gateway normally (control — not a blanket refusal)", () => {
+  it("resolves a MISSING (dangling id, no such server) gateway to { kind: 'unavailable', reason: 'missing' } (⊘ collapsing to { kind:'none' } lets the dispatch run locally)", () => {
+    const target = server({ id: "t", ipmiGatewayServerId: "ghost" });
+    expect(resolveIpmiGatewayServer(ctxWith([target]), target)).toEqual({
+      kind: "unavailable",
+      reason: "missing"
+    });
+  });
+
+  it("resolves NO configured gateway (id unset) to { kind: 'none' } — local is the route (⊘ returning 'unavailable' here would wrongly abort a legitimate local run)", () => {
+    const target = server({ id: "t" });
+    expect(resolveIpmiGatewayServer(ctxWith([target]), target)).toEqual({ kind: "none" });
+  });
+
+  it("resolves a SELF-reference (id === own id) to { kind: 'none' } — treated as no gateway, local", () => {
+    const target = server({ id: "t", ipmiGatewayServerId: "t" });
+    expect(resolveIpmiGatewayServer(ctxWith([target]), target)).toEqual({ kind: "none" });
+  });
+
+  it("still resolves an addressed gateway to { kind: 'server' } normally (control — not a blanket refusal)", () => {
     const target = server({ id: "t", ipmiGatewayServerId: "gw" });
     const gateway = server({ id: "gw", name: "bastion", host: "10.0.0.9" });
-    expect(resolveIpmiGatewayServer(ctxWith([target, gateway]), target)?.id).toBe("gw");
+    const resolution = resolveIpmiGatewayServer(ctxWith([target, gateway]), target);
+    expect(resolution).toEqual({ kind: "server", server: gateway });
   });
 });
