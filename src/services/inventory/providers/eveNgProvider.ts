@@ -291,10 +291,16 @@ class EveApiClient {
     private readonly password: string
   ) {}
 
-  /** The host requests fall back to when EVE-NG reports a console on loopback. */
+  /**
+   * The host requests fall back to when EVE-NG reports a console on loopback.
+   * MINOR-4 — brackets stripped so an IPv6 base URL (`http://[::1]:8080`)
+   * yields `::1`, an address the telnet transport's `net.connect` can dial;
+   * `URL.hostname` keeps the brackets, and the reported-host side already
+   * strips them, so both sides must agree.
+   */
   public get hostname(): string {
     try {
-      return new URL(this.baseUrl).hostname;
+      return new URL(this.baseUrl).hostname.replace(/^\[|\]$/g, "");
     } catch {
       return "";
     }
@@ -661,15 +667,25 @@ function resolveTelnetTarget(consoleKind: string, rawUrl: string, consoleHost: s
   if (parsed.protocol !== "telnet:") {
     return undefined;
   }
-  const reported = parsed.hostname;
-  // The override wins over BOTH the reported host and the base URL host: it
-  // exists for the NAT case, where neither of those is reachable from here.
-  const host = consoleHost || (isHostLocalOnly(reported) ? baseHostname : reported.replace(/^\[|\]$/g, ""));
-  if (!host) {
+  // MINOR-3 — a malformed console URL (`telnet:1.2.3.4:9000` with no `//`,
+  // or `telnet://`) parses to an EMPTY hostname. Left to the loopback branch
+  // below, `isHostLocalOnly("")` is true and the EVE-NG host is substituted —
+  // minting a bogus endpoint pointed at port 23 of the EVE box. An empty host
+  // means we do not actually know where the console is, so: no endpoint.
+  const reported = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (!reported) {
     return undefined;
   }
+  // MINOR-3 — reject port 0 (and anything out of range) before deciding the
+  // host: a port-0 endpoint dials port 0, which never connects.
   const port = parsed.port ? Number(parsed.port) : 23;
   if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+    return undefined;
+  }
+  // The override wins over BOTH the reported host and the base URL host: it
+  // exists for the NAT case, where neither of those is reachable from here.
+  const host = consoleHost || (isHostLocalOnly(reported) ? baseHostname : reported);
+  if (!host) {
     return undefined;
   }
   return { host, port };
@@ -723,10 +739,15 @@ function mapNode(
  * The lab's own folder, made RELATIVE to the source's root folder, with the lab
  * name as the final segment — so every lab is a folder in the tree and the
  * source's `targetFolder` is not shadowed by a repeat of the root path.
+ *
+ * MINOR-2 — the prefix is stripped on a SEGMENT boundary (the dir must equal
+ * the root prefix or sit directly under it), not by raw `startsWith`, which
+ * would shave `/Cust` off `/CustXtra` and yield `Xtra/…`.
  */
-function labFolderPath(lab: EveLab, rootPrefix: string): string {
+export function labFolderPath(lab: EveLab, rootPrefix: string): string {
   const dir = lab.path.slice(0, lab.path.lastIndexOf("/"));
-  const relative = (dir.startsWith(rootPrefix) ? dir.slice(rootPrefix.length) : dir).replace(/^\/+/, "");
+  const withinRoot = rootPrefix !== "" && (dir === rootPrefix || dir.startsWith(`${rootPrefix}/`));
+  const relative = (withinRoot ? dir.slice(rootPrefix.length) : dir).replace(/^\/+/, "");
   return relative ? `${relative}/${lab.name}` : lab.name;
 }
 

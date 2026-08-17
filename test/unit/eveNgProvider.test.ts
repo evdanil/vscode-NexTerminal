@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { EVE_NG_PROVIDER_ID, createEveNgProvider, eveNgInstanceKey } from "../../src/services/inventory/providers/eveNgProvider";
+import { EVE_NG_PROVIDER_ID, createEveNgProvider, eveNgInstanceKey, labFolderPath } from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 
@@ -612,6 +612,28 @@ describe("createEveNgProvider — nodes", () => {
   });
 });
 
+/**
+ * MINOR-2 — `labFolderPath` stripped the root prefix with a raw `startsWith`,
+ * so a sibling folder sharing the prefix as a substring (`/CustXtra` vs
+ * `/Cust`) had the wrong number of characters shaved off. MAJOR-1's confinement
+ * now blocks such a lab from reaching this function through the public API, so
+ * it is exercised directly to keep the boundary honest.
+ */
+describe("labFolderPath", () => {
+  it("strips the root prefix on a SEGMENT boundary, not by raw string prefix (⊘ `/CustXtra` under root `/Cust` becomes `Xtra/L`, mangling the folder)", () => {
+    expect(labFolderPath({ path: "/Cust/ACME/Site.unl", name: "Site" }, "/Cust")).toBe("ACME/Site");
+    expect(labFolderPath({ path: "/CustXtra/L.unl", name: "L" }, "/Cust")).toBe("CustXtra/L");
+  });
+
+  it("places a lab sitting directly in the root at the root of the source's target folder", () => {
+    expect(labFolderPath({ path: "/Cust/Only.unl", name: "Only" }, "/Cust")).toBe("Only");
+  });
+
+  it("with an empty root prefix (whole-tree scan) keeps the absolute folder path, minus the leading slash", () => {
+    expect(labFolderPath({ path: "/A/B/Lab.unl", name: "Lab" }, "")).toBe("A/B/Lab");
+  });
+});
+
 describe("createEveNgProvider — device mapping", () => {
   it("builds externalId as `${labPath}#${nodeId}` so two labs' node 1 never collide (⊘ a bare node id makes every lab's node 1 the same device, and the sync collapses the whole server into one record)", async () => {
     const world: World = {
@@ -677,6 +699,39 @@ describe("createEveNgProvider — device mapping", () => {
     const consoleWarnings = (tree.warnings ?? []).filter((w) => w.includes("telnet console"));
     expect(consoleWarnings).toHaveLength(1);
     expect(consoleWarnings[0]).toContain("3");
+  });
+
+  /**
+   * MINOR-3 — a console URL with no usable host must mint NO endpoint. The
+   * failure mode is `new URL("telnet:1.2.3.4:9000")` (no `//`) and
+   * `new URL("telnet://")` both parsing to an EMPTY hostname, which
+   * `isHostLocalOnly("")` calls loopback and substitutes the EVE-NG host for —
+   * so the user gets a server pointed at port 23 of the EVE box, believing it
+   * is a node.
+   */
+  it("mints no endpoint for a console URL whose host is empty, and folds it into the aggregate no-console warning (⊘ empty host reads as loopback and points the server at the EVE box itself)", async () => {
+    const tree = await fetchTree(
+      oneLabWorld({
+        "1": node({ url: "telnet:1.2.3.4:9000" }), // no "//" — opaque, empty hostname
+        "2": node({ id: "2", name: "B", url: "telnet://" }),
+        "3": node({ id: "3", name: "C", url: "telnet://192.0.2.9:9000" })
+      })
+    );
+    expect(tree.devices.find((d) => d.externalId.endsWith("#1"))?.endpoints).toEqual([]);
+    expect(tree.devices.find((d) => d.externalId.endsWith("#2"))?.endpoints).toEqual([]);
+    expect(tree.devices.find((d) => d.externalId.endsWith("#3"))?.endpoints).toEqual([{ kind: "telnet", host: "192.0.2.9", port: 9000 }]);
+    expect((tree.warnings ?? []).filter((w) => w.includes("telnet console"))).toHaveLength(1);
+  });
+
+  it("mints no endpoint for a telnet console reported on port 0 (⊘ M18 — a port-0 endpoint dials port 0, which never connects)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node({ url: "telnet://192.0.2.9:0" }) }));
+    expect(tree.devices[0].endpoints).toEqual([]);
+  });
+
+  it("substitutes an IPv6 base-URL host WITHOUT brackets, so a loopback console maps to an address net.connect can dial (⊘ `new URL(...).hostname` keeps the brackets on `[::1]`, and the endpoint host is then unusable)", async () => {
+    const { fetchImpl } = makeWorld(oneLabWorld({ "1": node({ url: "telnet://127.0.0.1:32769" }) }));
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory({ ...CONFIG, baseUrl: "http://[2001:db8::5]:8080" }, SECRETS);
+    expect(tree.devices[0].endpoints[0].host).toBe("2001:db8::5");
   });
 
   it("names a blank-named node `node-<id>` instead of dropping it (⊘ dropping it for a cosmetic data problem prunes a server that still exists)", async () => {
