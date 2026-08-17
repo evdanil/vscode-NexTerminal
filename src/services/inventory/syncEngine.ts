@@ -1346,6 +1346,23 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         if (takesIpmiHost) {
           after.ipmiHost = mgmtHost;
         }
+        // AUTH 2b on DOWNGRADE (Fable P1-B) — the same keyless-profile rollback the
+        // addressed update runs (~2063) and the post-loop pass runs for skipped
+        // devices (~3123). This branch marks the device "decided", so the post-loop
+        // pass will NOT revisit it; without deciding the rollback HERE an owned
+        // placeholder linked to a keyless key profile would stay linked and
+        // unusable forever. Decided on `after` and mirroring the addressed path: a
+        // usable link rides forward (verdict "none"), a keyless one unlinks (and
+        // clears its stamp), and a server bringing its own key is retained.
+        const rolledBackProfileId = after.authProfileId;
+        const mappedRollback = decideSourceAuthRollback(after, unusableProfileIds);
+        if (mappedRollback === "unlink" && rolledBackProfileId !== undefined) {
+          after.authProfileId = undefined;
+          after.origin = { ...afterOrigin, syncedAuthProfileId: undefined };
+          bump(unlinkedByProfile, rolledBackProfileId);
+        } else if (mappedRollback === "retain-own-key" && rolledBackProfileId !== undefined) {
+          bump(retainedByProfile, rolledBackProfileId);
+        }
         // A targeted `changed` check (NOT `serverConfigsEqual`, which compares
         // `syncedAt` and would fire a no-op update on every sync of a stopped
         // node). The origin STAMPS — not `syncedAt` — decide the origin half. The
@@ -1360,6 +1377,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ownedForAddressless.ipmiHost !== after.ipmiHost ||
           ownedForAddressless.group !== after.group ||
           (ownedForAddressless.addressless ?? false) !== (after.addressless ?? false) ||
+          // AUTH 2b (Fable P1-B) — an unlink can be the ONLY change (a keyless link
+          // rolled back on a placeholder that is otherwise identical), so the
+          // authProfileId value joins the value half; its stamp rides the
+          // `serverOriginStampsEqual` line below.
+          ownedForAddressless.authProfileId !== after.authProfileId ||
           !proxyConfigsEqual(ownedForAddressless.proxy, after.proxy) ||
           ownedForAddressless.multiplexing !== after.multiplexing ||
           ownedForAddressless.legacyAlgorithms !== after.legacyAlgorithms ||

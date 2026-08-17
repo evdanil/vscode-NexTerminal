@@ -1591,7 +1591,7 @@ describe("computeSyncPlan — auth profile link", () => {
    * builds what is sent to the SSH server can tell a repaired record from a
    * plausible-looking one.
    */
-  it("ADDRESSLESS (Codex P1) — an owned server whose device goes no-primary DOWNGRADES to addressless and CARRIES its auth link forward (the keyless-key unlink is deferred to upgrade, when there is actually an address to connect to) — kills unlinking a server that cannot connect anyway", async () => {
+  it("ADDRESSLESS (Fable P1-B) — an owned server whose device goes no-primary DOWNGRADES to addressless (not pruned), applies the source rename, AND unlinks a keyless-key profile in the same pass — parity with the post-loop rollback that covers a skipped device", async () => {
     // "delete" rather than the fixture default, so a pass that mistook a
     // downgraded device for an absent one would DELETE this server.
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin", prunePolicy: "delete" });
@@ -1609,14 +1609,15 @@ describe("computeSyncPlan — auth profile link", () => {
 
     expect(plan.updates).toHaveLength(1);
     const after = plan.updates[0].after;
-    // Downgraded, not pruned; keeps its stamps (the spec's "keep the origin +
-    // stamps") — the link rides forward rather than being cleared here.
+    // Downgraded, not pruned.
     expect(plan.prunes).toHaveLength(0);
     expect(plan.adds).toHaveLength(0);
     expect(after.addressless).toBe(true);
     expect(after.host).toBe("");
-    expect(after.authProfileId).toBe("p1");
-    expect(after.origin?.syncedAuthProfileId).toBe("p1");
+    // P1-B — the keyless-key link is rolled back HERE, in the downgrade, exactly as
+    // the post-loop pass would have for a skipped device (it is not deferred).
+    expect(after.authProfileId).toBeUndefined();
+    expect(after.origin?.syncedAuthProfileId).toBeUndefined();
     // A full update: the source-side rename and folder are applied, syncedAt
     // advances (this sync DID decide the record).
     expect(after.name).toBe("renamed-at-source");
@@ -1624,7 +1625,7 @@ describe("computeSyncPlan — auth profile link", () => {
     expect(after.origin?.syncedAt).toBe(2000);
   });
 
-  it("ADDRESSLESS (Codex P1) — the deferred keyless-key unlink FIRES on the addressless→addressed UPGRADE, so the re-started server can open a connection again", async () => {
+  it("ADDRESSLESS — the keyless-key unlink ALSO fires on the addressless→addressed UPGRADE, so a placeholder that still carries a keyless link (e.g. one linked by hand) is repaired when it regains an address", async () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
     // The server as it sits AFTER a downgrade: addressless, still carrying the
     // keyless-key link.
@@ -1692,6 +1693,10 @@ describe("computeSyncPlan — auth profile link", () => {
 
   it("ADDRESSLESS (Codex P1) — an owned server is decided exactly ONCE when its no-primary device is reported twice: the first copy downgrades it, the second is a duplicate (kills a double update / double placeholder)", () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    // A USABLE profile (has a key file), so the link legitimately rides forward on
+    // the downgrade — this test is about the decided-once/duplicate handling, not
+    // the keyless rollback (P1-B covers that with a keyless profile).
+    const usableKeyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
 
     const plan = computeSyncPlan({
       source,
@@ -1700,15 +1705,74 @@ describe("computeSyncPlan — auth profile link", () => {
       tree: makeTree([makeDevice({ endpoints: [] }), makeDevice({ name: "core-sw-1-again" })]),
       currentServers: [previouslyLinkedServer()],
       now: 2000,
-      authProfile: KEYLESS_KEY_PROFILE
+      authProfile: usableKeyProfile
     });
 
     // Exactly one update for the one owned record — the addressless downgrade —
-    // and the link rides forward (not unlinked here; that defers to upgrade).
+    // and the usable link rides forward.
     expect(plan.updates).toHaveLength(1);
     expect(plan.updates[0].after.addressless).toBe(true);
     expect(plan.updates[0].after.authProfileId).toBe("p1");
     expect(plan.warnings).toContain('Duplicate device ID "device:1" — kept first ("core-sw-1").');
+  });
+
+  // P1-B (Fable) — the downgrade/stay addressless path marks the device "decided"
+  // (so the post-loop rollback pass skips it) but never ran the rollback itself, so
+  // an owned placeholder linked to a KEYLESS key profile stayed linked and unusable
+  // forever — a regression, since pre-PR a no-endpoint device fell through to the
+  // post-loop pass that unlinks exactly these. ⊘ Skipping decideSourceAuthRollback
+  // in the downgrade leaves the broken link in place with no unlink and no warning.
+  it("P1-B — a stay-addressless server linked to a KEYLESS key profile is UNLINKED in the downgrade path, exactly as the post-loop pass unlinks a skipped one", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]), // device:1 stays addressless
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.updates[0].after.origin?.syncedAuthProfileId).toBeUndefined();
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it is unlinked here so it can connect again; a later sync re-links it once the profile has a key file.`
+    );
+  });
+
+  it("P1-B — a stay-addressless server that brings its OWN key file is RETAINED, not unlinked, exactly as the addressed/skip paths retain it (⊘ an over-broad downgrade rollback unlinks a working keyless-profile+own-key pairing)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true, authType: "key", keyPath: "/keys/own_ed25519" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    // The link is kept (own key), and the retained clause is reported.
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.authProfileId).toBe("p1");
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile.`
+    );
+  });
+
+  it("P1-B control — a USABLE profile link rides forward on downgrade (⊘ running the rollback with the wrong unusable set would unlink a working link)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const usableKeyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: usableKeyProfile
+    });
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.authProfileId).toBe("p1");
+    expect(after.origin?.syncedAuthProfileId).toBe("p1");
   });
 
   it("AUTH 2b still leaves a server whose device is GONE from the fetch to the prune policy (kills a pass over every owned server, which would rewrite the credentials of a server the same plan reports as kept in place)", () => {

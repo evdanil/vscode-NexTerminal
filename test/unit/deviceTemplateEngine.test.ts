@@ -377,10 +377,10 @@ describe("device template auth cascade — §4.4", () => {
       expect(p.warnings.some((w) => w.includes("device template") && w.includes('"B"'))).toBe(true);
     }
 
-    // ADDRESSLESS (Codex P1) — variant: the device is present but endpoint-less
-    // this fetch, so its owned server DOWNGRADES to an addressless placeholder
-    // and carries the (keyless) link forward. The keyless-key unlink is deferred
-    // to the addressed upgrade, when there is actually a console to connect to.
+    // ADDRESSLESS (Fable P1-B) — variant: the device is present but endpoint-less
+    // this fetch, so its owned server DOWNGRADES to an addressless placeholder. The
+    // keyless-key link is rolled back IN the downgrade, exactly as the post-loop
+    // pass would for a skipped device — not deferred.
     const unmapped = plan({
       source: makeSource({ templateRules: [rule("tmpl-1")] }),
       devices: [makeDevice({ endpoints: [] })],
@@ -390,7 +390,8 @@ describe("device template auth cascade — §4.4", () => {
     });
     const uAfter = afterFor(unmapped, linkedB.id)!;
     expect(uAfter.addressless).toBe(true);
-    expect(uAfter.authProfileId).toBe("B");
+    expect(uAfter.authProfileId).toBeUndefined();
+    expect(uAfter.origin?.syncedAuthProfileId).toBeUndefined();
   });
 
   it("Fixture 14c — a RETAINED sync-owned link (its rule gone) to a now-keyless profile is rolled back; a hand link is NOT (kills a scan drawn only from current rules, and one that forgets to stay sync-owned)", () => {
@@ -474,13 +475,14 @@ describe("device template auth cascade — §4.4", () => {
     expect(mapped.adds.every((a) => a.authProfileId !== "S")).toBe(true);
     expect(mapped.warnings.some((w) => w.includes('"S"') && w.includes("servers this source creates"))).toBe(true);
 
-    // ADDRESSLESS (Codex P1): K has no endpoint → it DOWNGRADES to an addressless
-    // placeholder and carries the keyless link forward (unlink deferred to the
-    // addressed upgrade). X (own key, still mapped) is unaffected.
+    // ADDRESSLESS (Fable P1-B): K has no endpoint → it DOWNGRADES to an addressless
+    // placeholder and its keyless link is rolled back IN the downgrade (parity with
+    // the post-loop pass), not deferred. X (own key, still mapped) is unaffected.
     const addressless = runWith(true);
     const kAfter = afterFor(addressless, kId)!;
     expect(kAfter.addressless).toBe(true);
-    expect(kAfter.authProfileId).toBe("S");
+    expect(kAfter.authProfileId).toBeUndefined();
+    expect(kAfter.origin?.syncedAuthProfileId).toBeUndefined();
     expect((afterFor(addressless, xId) ?? X).authProfileId).toBe("S");
   });
 
