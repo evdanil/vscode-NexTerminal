@@ -58,6 +58,22 @@ describe("serverConfigsEqual — addressless", () => {
   });
 });
 
+describe("addressless export/import round-trip", () => {
+  it("survives a JSON round-trip (a backup) unchanged — still valid, still addressless (⊘ a validator that dropped the empty-host record silently loses it on the next reload)", () => {
+    const original = server({
+      addressless: true,
+      host: "",
+      port: 0,
+      origin: { sourceId: "src", externalId: "e1", syncedAt: 1 }
+    });
+    const roundTripped = JSON.parse(JSON.stringify(original)) as ServerConfig;
+    expect(validateServerConfig(roundTripped)).toBe(true);
+    expect(roundTripped.addressless).toBe(true);
+    expect(roundTripped.host).toBe("");
+    expect(serverConfigsEqual(original, roundTripped)).toBe(true);
+  });
+});
+
 describe("mergeServerConfigFields — addressless", () => {
   it("keeps a concurrent addressless flip on `current` rather than reverting it to `prior` (⊘ omitting the field silently reverts a downgrade the batch wrote)", () => {
     const prior = server({ addressless: false, host: "10.0.0.1" });

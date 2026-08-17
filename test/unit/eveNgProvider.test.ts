@@ -1446,6 +1446,47 @@ describe("activation wiring", () => {
  * server that comes out is dialable.
  */
 describe("EVE-NG → computeSyncPlan", () => {
+  /**
+   * ADDRESSLESS (Codex P1 on #82) — the whole placeholder lifecycle end to end:
+   * a stopped node (no console) syncs to an addressless server; when it is
+   * started (a telnet console appears) the SAME server upgrades in place to an
+   * addressed telnet server — same externalId, same deterministic id.
+   */
+  it("syncs a stopped node to an addressless server, then upgrades the SAME record to an addressed telnet server when it starts", async () => {
+    const source = {
+      id: "src-eve",
+      providerId: EVE_NG_PROVIDER_ID,
+      name: "Lab",
+      targetFolder: "EVE",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "admin",
+      config: CONFIG,
+      secretFieldIds: ["password"]
+    };
+    // Stopped Community node: status 0, no console url → endpoints: [].
+    const stoppedTree = await fetchTree(oneLabWorld({ "1": node({ status: 0, url: "" }) }), { includeStopped: true });
+    expect(() => validateInventoryTree(stoppedTree)).not.toThrow();
+    const plan1 = computeSyncPlan({ source, tree: stoppedTree, currentServers: [], now: 1_000 });
+    expect(plan1.adds).toHaveLength(1);
+    const placeholder = plan1.adds[0];
+    expect(placeholder.addressless).toBe(true);
+    expect(placeholder.host).toBe("");
+    expect(placeholder.origin?.externalId).toBe("/Lab 1.unl#1");
+
+    // The node is started: a native telnet console appears.
+    const startedTree = await fetchTree(oneLabWorld({ "1": node({ status: 2, url: "telnet://127.0.0.1:32769" }) }));
+    const plan2 = computeSyncPlan({ source, tree: startedTree, currentServers: [placeholder], now: 2_000 });
+    expect(plan2.adds).toHaveLength(0); // upgraded in place, not duplicated
+    expect(plan2.updates).toHaveLength(1);
+    const upgraded = plan2.updates[0].after;
+    expect(upgraded.id).toBe(placeholder.id);
+    expect(upgraded.addressless ?? false).toBe(false);
+    expect(upgraded.protocol).toBe("telnet");
+    expect(upgraded.host).toBe("eve.example.com");
+    expect(upgraded.port).toBe(32769);
+    expect(upgraded.origin?.externalId).toBe("/Lab 1.unl#1");
+  });
+
   it("turns a running lab node into a telnet server on the console's own port, stamped so a later hand-flip is respected", async () => {
     const tree = await fetchTree({
       folders: { "/": { folders: [{ name: "ACME", path: "/ACME" }] }, "/ACME": { labs: [{ file: "Core.unl", path: "/ACME/Core.unl" }] } },
