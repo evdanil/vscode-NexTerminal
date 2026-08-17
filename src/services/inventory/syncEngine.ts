@@ -569,7 +569,7 @@ function syncOwnsAltHost(current: string | undefined, stamp: string | undefined,
  * inherited too: an addressless placeholder's `host: ""` reads as absent, so its
  * upgrade fills from the device (row 1) rather than reading as a hand entry.
  */
-function syncOwnsHost(current: string | undefined, stamp: string | undefined, dev: string): boolean {
+export function syncOwnsHost(current: string | undefined, stamp: string | undefined, dev: string): boolean {
   const cur = current !== undefined && current.trim() === "" ? undefined : current;
   return cur === stamp || cur === dev;
 }
@@ -591,7 +591,7 @@ function syncOwnsHost(current: string | undefined, stamp: string | undefined, de
  * port (`>= 1`) or leaves it absent, exactly as `syncOwnsIpmiHost`'s stamp is
  * only ever a selected non-empty host.
  */
-function syncOwnsPort(current: number, stamp: number | undefined, dev: number): boolean {
+export function syncOwnsPort(current: number, stamp: number | undefined, dev: number): boolean {
   const cur = current === ADDRESSLESS_PORT ? undefined : current;
   return cur === stamp || cur === dev;
 }

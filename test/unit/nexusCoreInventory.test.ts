@@ -4987,3 +4987,156 @@ describe("NexusCore inventory status", () => {
     expect(listener).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PRIMARY HOST/PORT (task #29, the deferred D8) — `NexusCore.healSyncedConsolePorts`,
+ * the SEPARATE persisting step the status-refresh path runs right after the pure
+ * `applyInventoryStatus`. A provider that reassigns telnet console ports on node
+ * restart (EVE-NG Community) surfaces the live `consolePort` on each running
+ * node; the heal persists it onto a sync-owned telnet server so the next connect
+ * targets the live port. The gate is deliberately strict — telnet + running +
+ * not-addressless + reported-differs + SYNC-OWNS — because it writes persisted
+ * config, and a HAND-EDITED port must never be healed.
+ */
+describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
+  function telnetServer(
+    sourceId: string,
+    externalId: string,
+    over: { host?: string; port?: number; syncedHost?: string; syncedPort?: number; protocol?: "telnet" | undefined; addressless?: boolean } = {}
+  ): ServerConfig {
+    const host = over.host ?? "10.0.0.9";
+    const port = over.port ?? 32769;
+    return {
+      id: deterministicServerId(sourceId, externalId),
+      name: externalId,
+      host,
+      port,
+      protocol: "protocol" in over ? over.protocol : "telnet",
+      addressless: over.addressless,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: {
+        sourceId,
+        externalId,
+        syncedAt: 1,
+        // A genuinely sync-owned address unless the test overrides the stamps.
+        syncedHost: over.syncedHost ?? host,
+        syncedPort: over.syncedPort ?? port,
+        syncedProtocol: "telnet"
+      }
+    };
+  }
+
+  it("heals a running SYNC-OWNED telnet node whose console port was reassigned — persists the new port AND re-stamps syncedPort, with one change fired (⊘ leaving applyInventoryStatus to consume consolePort would never persist it — nothing consumes it today)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { host: "10.0.0.9", port: 32769 });
+    await core.addServersBatch([s]);
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consoleHost: "10.0.0.9", consolePort: 32800 } }
+    });
+
+    const after = core.getServer(s.id);
+    expect(after?.port).toBe(32800);
+    expect(after?.origin?.syncedPort).toBe(32800);
+    // Host unchanged (reported host equals persisted), and the stamp stays sync-owned.
+    expect(after?.host).toBe("10.0.0.9");
+    expect(after?.origin?.syncedHost).toBe("10.0.0.9");
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("NEVER heals a HAND-EDITED port — the sync-ownership gate (⊘ dropping the syncOwnsPort gate overwrites a port the user set by hand)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // The sync last wrote 32769; the user hand-edited the port to 5000.
+    const s = telnetServer("source-1", "lab.unl#1", { port: 5000, syncedPort: 32769 });
+    await core.addServersBatch([s]);
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32800 } }
+    });
+
+    const after = core.getServer(s.id);
+    expect(after?.port).toBe(5000); // untouched
+    expect(after?.origin?.syncedPort).toBe(32769); // stamp untouched
+    // Nothing healed ⇒ no persisted write, no emit.
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("does NOT heal a STOPPED node even if it carries a console port (⊘ dropping the state === running gate heals a node whose reported port is meaningless)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    await core.addServersBatch([s]);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "stopped", consolePort: 32800 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(32769);
+  });
+
+  it("does NOT heal an SSH node (⊘ dropping the telnet gate heals a node whose port is an ssh port, not a reassignable console port)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // protocol undefined ⇒ ssh; a sync-owned address so ONLY the telnet gate stops the heal.
+    const s = telnetServer("source-1", "lab.unl#1", { host: "10.0.0.9", port: 22, protocol: undefined, syncedPort: 22 });
+    await core.addServersBatch([s]);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 830 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(22);
+  });
+
+  it("does NOT heal an ADDRESSLESS node (⊘ dropping the addressless gate writes a console port onto a placeholder that has no console)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { host: "", port: 0, addressless: true, syncedHost: undefined, syncedPort: undefined });
+    await core.addServersBatch([s]);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consoleHost: "10.0.0.9", consolePort: 32800 } }
+    });
+    const after = core.getServer(s.id);
+    expect(after?.port).toBe(0);
+    expect(after?.addressless).toBe(true);
+  });
+
+  it("respects the truncated-merge — only entries PRESENT in the report are considered (⊘ healing beyond the report would touch a node the partial scan never reached)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    const b = telnetServer("source-1", "lab.unl#2", { port: 32770 });
+    await core.addServersBatch([a, b]);
+    // A truncated report that only reached lab.unl#1.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32800 } },
+      truncated: true
+    });
+    expect(core.getServer(a.id)?.port).toBe(32800); // present ⇒ healed
+    expect(core.getServer(b.id)?.port).toBe(32770); // absent ⇒ untouched
+  });
+
+  it("does not heal when the reported port EQUALS the persisted one (⊘ an unconditional write churns a persist + emit every refresh on every unchanged node)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    await core.addServersBatch([s]);
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32769 } }
+    });
+    expect(listener).not.toHaveBeenCalled();
+  });
+});

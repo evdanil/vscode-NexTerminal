@@ -4448,6 +4448,12 @@ export function registerInventoryCommands(
           const currentSource = core.getInventorySource(source.id);
           if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
             core.applyInventoryStatus(source.id, report);
+            // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
+            // console-port reassignment onto sync-owned nodes, so the next
+            // connect targets the live port. Separate from the pure status apply
+            // above and non-fatal per source: a rejecting write must not abort the
+            // sweep, and the heal only ever affects the NEXT connect.
+            await core.healSyncedConsolePorts(source.id, report);
           }
         }
       } catch {

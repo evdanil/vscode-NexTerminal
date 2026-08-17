@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   cloneServerConfig,
   mergeServerConfigFields,
+  resolveServerProtocol,
   serverConfigsEqual,
   templatedHasAnyStamp,
   type ActiveLocalShellSession,
@@ -16,6 +17,12 @@ import {
   type TunnelRegistryEntry
 } from "../models/config";
 import { inventorySourceValuesEqual, sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
+// PRIMARY HOST/PORT (task #29) — the telnet port-heal reuses the sync engine's
+// OWN ownership predicates rather than a local copy, so the "only heal what the
+// sync owns" rule can never drift from the sync's own write rule. This is a
+// runtime import into syncEngine; the reverse edge (syncEngine → nexusCore) is
+// type-only, so there is no runtime cycle.
+import { syncOwnsHost, syncOwnsPort } from "../services/inventory/syncEngine";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
@@ -2303,6 +2310,100 @@ export class NexusCore {
       }
     }
     this.emitChanged();
+  }
+
+  /**
+   * PRIMARY HOST/PORT (task #29, the deferred D8) — heal a source's TELNET
+   * console addresses from its `fetchStatus` report. A provider (EVE-NG
+   * Community) that reassigns console ports on node restart surfaces the current
+   * `consoleHost`/`consolePort` on each RUNNING node; this persists them onto the
+   * owned server so the NEXT connect targets the live port instead of the stale
+   * one. `applyInventoryStatus` stays PURE (runtime maps only) — this is the
+   * SEPARATE, persisting step the refresh path runs right after it.
+   *
+   * Heals ONLY where every one of these holds, and the gate is deliberately
+   * strict because it WRITES persisted config:
+   *  - the node is `state: "running"` and the report carries a fresh
+   *    `consoleHost`/`consolePort` (a stopped node reports none);
+   *  - the owned server resolves via the SAME origin identity
+   *    `applyInventoryStatus` uses (`origin.sourceId === sourceId`, keyed by
+   *    `origin.externalId`) — covers adopted, preserved-id servers too;
+   *  - the server is TELNET and NOT addressless (an ssh node or a placeholder is
+   *    never a console-port node to heal);
+   *  - the reported host/port DIFFER from the persisted ones (nothing to do
+   *    otherwise); AND
+   *  - the sync OWNS them — `syncOwnsHost`/`syncOwnsPort` against
+   *    `origin.syncedHost`/`syncedPort`, the sync engine's OWN predicates, so a
+   *    HAND-EDITED port is NEVER healed (the whole reason this is gated and not a
+   *    blanket overwrite). When a value is healed its stamp is advanced with it,
+   *    exactly as the sync's own write would.
+   *
+   * Respects the truncated-merge: only entries PRESENT in the report are
+   * considered, so a partial report never touches the nodes it did not reach.
+   * Batches every heal into one persisted write and one `emitChanged`, via
+   * `addServersBatch`, to avoid an emit storm across a lab's worth of nodes. An
+   * already-open telnet terminal keeps its port — the heal affects the NEXT
+   * connect, which is the only place a reassigned port matters.
+   */
+  public async healSyncedConsolePorts(sourceId: string, report: InventoryStatusReport): Promise<void> {
+    // The SAME origin lookup applyInventoryStatus builds (owned-by-this-source,
+    // keyed by externalId) — reused rather than duplicated so the two can never
+    // resolve a report entry to different servers.
+    const serverIdByExternalId = new Map<string, string>();
+    for (const server of this.servers.values()) {
+      if (server.origin?.sourceId === sourceId) {
+        serverIdByExternalId.set(server.origin.externalId, server.id);
+      }
+    }
+    const healed: ServerConfig[] = [];
+    for (const [externalId, deviceStatus] of Object.entries(report.statuses)) {
+      if (deviceStatus.state !== "running") {
+        continue;
+      }
+      const reportedHost = deviceStatus.consoleHost;
+      const reportedPort = deviceStatus.consolePort;
+      if (reportedHost === undefined && reportedPort === undefined) {
+        continue;
+      }
+      const serverId = serverIdByExternalId.get(externalId);
+      if (serverId === undefined) {
+        continue;
+      }
+      const server = this.servers.get(serverId);
+      if (server === undefined || server.origin === undefined) {
+        continue;
+      }
+      if (resolveServerProtocol(server) !== "telnet" || server.addressless === true) {
+        continue;
+      }
+      // Each half heals only when the reported value DIFFERS from the persisted
+      // one AND the sync owns it — a hand-edited host/port fails `syncOwns*` and
+      // is left exactly as the user set it.
+      const healHost =
+        reportedHost !== undefined &&
+        reportedHost !== server.host &&
+        syncOwnsHost(server.host, server.origin.syncedHost, reportedHost);
+      const healPort =
+        reportedPort !== undefined &&
+        reportedPort !== server.port &&
+        syncOwnsPort(server.port, server.origin.syncedPort, reportedPort);
+      if (!healHost && !healPort) {
+        continue;
+      }
+      const next = cloneServerConfig(server);
+      if (healHost && reportedHost !== undefined && next.origin !== undefined) {
+        next.host = reportedHost;
+        next.origin.syncedHost = reportedHost;
+      }
+      if (healPort && reportedPort !== undefined && next.origin !== undefined) {
+        next.port = reportedPort;
+        next.origin.syncedPort = reportedPort;
+      }
+      healed.push(next);
+    }
+    // addServersBatch is the existing one-save/one-emit batch primitive, and it
+    // early-returns on an empty list, so no separate guard is needed.
+    await this.addServersBatch(healed);
   }
 
   /**
