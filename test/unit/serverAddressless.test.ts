@@ -43,6 +43,26 @@ describe("validateServerConfig — addressless", () => {
     expect(validateServerConfig(server())).toBe(true);
     expect(validateServerConfig(server({ addressless: false }))).toBe(true);
   });
+
+  // P2-b (Codex) — addressless relaxes host NON-EMPTINESS and port VALIDITY, NOT
+  // the underlying TYPES. A missing/non-string host or a non-numeric port must
+  // still FAIL even with addressless:true, because a downstream `host.toLowerCase()`
+  // (inventory sync, tree filtering) throws on a hand-edited or malformed backup
+  // that slipped a non-string through. ⊘ A blanket `addressless || …` short-circuit
+  // skips the type check entirely and admits these.
+  it("still REJECTS a non-string host even when addressless (⊘ the relaxation drops the type check, so `host.toLowerCase()` throws downstream)", () => {
+    expect(validateServerConfig({ ...server(), addressless: true, host: undefined } as never)).toBe(false);
+    expect(validateServerConfig({ ...server(), addressless: true, host: 42 } as never)).toBe(false);
+  });
+
+  it("still REJECTS a non-numeric port even when addressless (⊘ the relaxation drops the type check)", () => {
+    expect(validateServerConfig({ ...server(), addressless: true, host: "", port: "x" } as never)).toBe(false);
+  });
+
+  it("accepts an addressless server whose host is the empty string and whose port is the sentinel OR absent", () => {
+    expect(validateServerConfig(server({ addressless: true, host: "", port: 0 }))).toBe(true);
+    expect(validateServerConfig({ ...server({ addressless: true, host: "" }), port: undefined } as never)).toBe(true);
+  });
 });
 
 describe("serverConfigsEqual — addressless", () => {

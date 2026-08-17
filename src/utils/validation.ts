@@ -285,8 +285,15 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     !(
       isNonEmptyString(obj.id) &&
       isNonEmptyString(obj.name) &&
-      (addressless || isNonEmptyString(obj.host)) &&
-      (addressless || isValidPort(obj.port)) &&
+      // P2-b (Codex) — addressless relaxes host NON-EMPTINESS and port VALIDITY,
+      // never the underlying TYPES. `host` must still be a string (empty allowed
+      // only when addressless) and `port` must still be a number when present
+      // (the sentinel `0`, or absent). A non-string host or non-numeric port must
+      // FAIL even with addressless:true, or a downstream `host.toLowerCase()`
+      // (inventory sync, tree filtering) throws on a malformed backup that a
+      // blanket short-circuit would have admitted.
+      (addressless ? typeof obj.host === "string" : isNonEmptyString(obj.host)) &&
+      (addressless ? obj.port === undefined || typeof obj.port === "number" : isValidPort(obj.port)) &&
       // TELNET (Phase 0) — the ONE field this feature relaxes. Telnet has no
       // protocol-level login: the user logs in at the device's own prompt, in
       // the terminal, so the server form never collects a username for a telnet
