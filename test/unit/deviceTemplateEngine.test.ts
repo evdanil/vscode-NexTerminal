@@ -2172,3 +2172,75 @@ describe("Round 10 — GATEWAY PART 2 handles a KEPT server's detached formerlyS
     ).toBe(true);
   });
 });
+
+/**
+ * ADDRESSLESS + TEMPLATES (Codex P2-a) — an addressless placeholder (no ssh/telnet
+ * primary, e.g. a redfish/IPMI-only device) must still flow through the per-device
+ * template cascade. The OOB-oriented fields it holds (ipmiAuthProfileId,
+ * ipmiGatewayServerId) don't need a console address, so a template that sets them
+ * must take effect on the placeholder immediately, under the SAME templated-stamp
+ * ownership the addressed path uses. Before the fix the addressless branch
+ * `continue`d before the cascade ever ran, so these never applied.
+ */
+describe("addressless placeholders flow through the template cascade (P2-a)", () => {
+  it("(a) a NEW addressless redfish device gets the template's ipmiAuthProfileId + ipmiGatewayServerId, stamped (⊘ the addressless branch continues before the cascade, so the placeholder is created with neither)", () => {
+    const GW_ID = deterministicServerId("source-1", "device:gw");
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [
+        makeDevice({ externalId: "device:redfish", name: "bmc-only", endpoints: [{ kind: "redfish", host: "10.9.9.9" }] }),
+        makeDevice({ externalId: "device:gw", name: "gw", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] }) // live gateway target
+      ],
+      templates: [
+        template({
+          ipmiAuthProfileId: { mode: "override", value: "ap-bmc" },
+          ipmiGatewayServerId: { mode: "override", value: GW_ID }
+        })
+      ],
+      authProfiles: [authProfile("ap-bmc")]
+    });
+    const added = p.adds.find((s) => s.origin?.externalId === "device:redfish")!;
+    expect(added.addressless).toBe(true);
+    expect(added.host).toBe("");
+    expect(added.ipmiAuthProfileId).toBe("ap-bmc");
+    expect(added.ipmiGatewayServerId).toBe(GW_ID);
+    expect(added.origin?.templated?.ipmiAuthProfileId).toBe("ap-bmc");
+    expect(added.origin?.templated?.ipmiGatewayServerId).toBe(GW_ID);
+  });
+
+  it("(b) an EXISTING addressless server receives a CHANGED template value under the stamp (⊘ the downgrade/stay path skips the matrix, so a later template change never reaches the placeholder)", () => {
+    const before = ownedServer(
+      { host: "", port: 0, addressless: true, ipmiAuthProfileId: "ap-old" },
+      { templated: { ipmiAuthProfileId: "ap-old" }, syncedProtocol: undefined } // sync-owned: value === stamp
+    );
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] })], // device:1 stays addressless
+      servers: [before],
+      templates: [template({ ipmiAuthProfileId: { mode: "override", value: "ap-new" } })],
+      authProfiles: [authProfile("ap-old"), authProfile("ap-new")]
+    });
+    expect(p.updates).toHaveLength(1);
+    const after = p.updates[0].after;
+    expect(after.addressless).toBe(true);
+    expect(after.ipmiAuthProfileId).toBe("ap-new");
+    expect(after.origin?.templated?.ipmiAuthProfileId).toBe("ap-new");
+  });
+
+  it("(c) a HAND-EDITED templated field on an addressless server is NOT stomped by a template override (⊘ applying the value regardless of the stamp overwrites the user's edit)", () => {
+    const before = ownedServer(
+      { host: "", port: 0, addressless: true, ipmiAuthProfileId: "ap-hand" },
+      { templated: undefined, syncedProtocol: undefined } // hand value, NO stamp (row 7)
+    );
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] })],
+      servers: [before],
+      templates: [template({ ipmiAuthProfileId: { mode: "override", value: "ap-tmpl" } })],
+      authProfiles: [authProfile("ap-hand"), authProfile("ap-tmpl")]
+    });
+    const after = p.updates[0]?.after ?? before;
+    expect(after.ipmiAuthProfileId).toBe("ap-hand");
+    expect(after.origin?.templated?.ipmiAuthProfileId).toBeUndefined();
+  });
+});

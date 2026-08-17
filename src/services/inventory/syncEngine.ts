@@ -1216,6 +1216,44 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // a swallow for malformed data (a bad name or a bad port stays skipped).
       const ownedForAddressless = ownedByExternalId.get(device.externalId);
       const addresslessGroup = resolveDeviceGroup(device);
+      // DEVICE TEMPLATES on ADDRESSLESS (Codex P2-a) — the per-device cascade runs
+      // for a placeholder too, so a template's OOB-oriented fields (ipmiAuthProfileId
+      // / ipmiGatewayServerId) take effect immediately and the console-inert ones
+      // (proxy/multiplexing/legacyAlgorithms/logSession) are applied under their
+      // templated stamps for when it later upgrades to addressed. Computed here (not
+      // hoisted above the branch) so the invalid-port skip below never runs it —
+      // each device runs the cascade in exactly ONE branch. The SSH auth winner
+      // (`authProfileId`) is deliberately NOT applied: it is not a templated-stamp
+      // field, it is inert without a console, and the addressed update path fills it
+      // on upgrade. Only the templated fields flow, via `applyTemplateMatrix`.
+      const addresslessCascade = selectFieldWinners(device, prepared, source.authProfileId);
+      for (const w of addresslessCascade.warnings) {
+        warnings.push(w);
+      }
+      for (const rid of addresslessCascade.matchedRuleIds) {
+        matchedRuleIds.add(rid);
+      }
+      const addresslessComposed = composeDesiredFields(
+        addresslessCascade.winners,
+        {
+          hasServer: (jumpHostId) => liveServerIds.has(jumpHostId),
+          proxyTemplateName: addresslessCascade.proxyTemplateName,
+          sourceName: source.name
+        },
+        {
+          hasAuthProfile: (pid) => resolveAuthProfileById(pid) !== undefined,
+          hasServer: (sid) => liveServerIds.has(sid),
+          ipmiAuthProfileTemplateName: addresslessCascade.provenance.ipmiAuthProfileId?.templateName,
+          ipmiGatewayServerTemplateName: addresslessCascade.provenance.ipmiGatewayServerId?.templateName,
+          sourceName: source.name
+        }
+      );
+      for (const w of addresslessComposed.warnings) {
+        pushDedupTemplateWarning(w);
+      }
+      const addresslessDesired = addresslessComposed.desired;
+      const addresslessProxyTemplateName = addresslessCascade.proxyTemplateName;
+      const addresslessGatewayTemplateName = addresslessCascade.provenance.ipmiGatewayServerId?.templateName;
       if (ownedForAddressless) {
         // DOWNGRADE / stay-addressless. Decided here so the post-loop rollback
         // pass does not touch this server a second time.
@@ -1241,20 +1279,41 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesIpmiHost =
           mgmtHost !== undefined &&
           syncOwnsIpmiHost(ownedForAddressless.ipmiHost, ownedForAddressless.origin?.syncedIpmiHost, mgmtHost);
+        // DEVICE TEMPLATES (Codex P2-a) — the same matrix the addressed update runs,
+        // against the placeholder's own id for the §5.3 self-proxy check. Its
+        // `values` are the field writes, its `templated` the carried-forward stamp
+        // record; a hand-edited templated field is left untouched (row 4/7).
+        const templateMatrix = applyTemplateMatrix(ownedForAddressless, addresslessDesired, {
+          targetServerId: ownedForAddressless.id,
+          targetServerName: device.name,
+          proxyTemplateName: addresslessProxyTemplateName,
+          ipmiGatewayTemplateName: addresslessGatewayTemplateName
+        });
+        for (const w of templateMatrix.warnings) {
+          warnings.push(w);
+        }
+        if (templateMatrix.values.proxy !== undefined && addresslessProxyTemplateName !== undefined) {
+          proxyTemplateNameByServerId.set(ownedForAddressless.id, addresslessProxyTemplateName);
+        }
+        if (templateMatrix.values.ipmiGatewayServerId !== undefined && addresslessGatewayTemplateName !== undefined) {
+          ipmiGatewayTemplateNameByServerId.set(ownedForAddressless.id, addresslessGatewayTemplateName);
+        }
         const afterOrigin: ServerOrigin = {
           ...ownedForAddressless.origin,
           sourceId: source.id,
           externalId: device.externalId,
           syncedAt: now,
           syncedInstanceKey: providerInstanceKey,
-          // Username/auth/alt/template stamps and their values are carried forward
-          // VERBATIM by the `...ownedForAddressless` spread below. `protocol`
-          // follows its ownership decision above; `ipmiHost` follows its own,
-          // refreshed only where this sync writes the value (the `takesIpmiHost`
-          // line below) and otherwise carried forward — including as `undefined`,
-          // which keeps a hand entry hands-off (matrix row 5).
+          // Username/auth/alt stamps and their values are carried forward VERBATIM
+          // by the `...ownedForAddressless` spread below. `protocol` follows its
+          // ownership decision above; `ipmiHost` follows its own, refreshed only
+          // where this sync writes the value (the `takesIpmiHost` line below) and
+          // otherwise carried forward — including as `undefined`, which keeps a hand
+          // entry hands-off (matrix row 5). `templated` is the matrix's carried
+          // stamp record (writes folded in), same as the addressed update path.
           syncedProtocol: takesProtocol ? undefined : ownedForAddressless.origin?.syncedProtocol,
-          syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedForAddressless.origin?.syncedIpmiHost
+          syncedIpmiHost: takesIpmiHost ? mgmtHost : ownedForAddressless.origin?.syncedIpmiHost,
+          templated: templateMatrix.templated
         };
         const after: ServerConfig = {
           ...ownedForAddressless,
@@ -1263,12 +1322,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           port: ADDRESSLESS_PORT,
           addressless: true,
           group: addresslessGroup,
+          // The template field writes (proxy/multiplexing/legacyAlgorithms/logSession
+          // /ipmiAuthProfileId/ipmiGatewayServerId) on exactly the rows the matrix
+          // owns; a field it did not write is preserved by the spread above.
+          ...templateMatrix.values,
           origin: afterOrigin
         };
         if (afterProtocol === undefined) {
           delete after.protocol;
         } else {
           after.protocol = afterProtocol;
+        }
+        // §5.3 REPAIR — the matrix found a template-owned self-proxy and asks for its
+        // removal (the stamp is already dropped from `templated`), so both the proxy
+        // removal and the stamp change show in the `changed` comparison below.
+        if (templateMatrix.clearProxy) {
+          delete after.proxy;
         }
         // The value half of the `ipmiHost` decision, on exactly the rows
         // `syncOwnsIpmiHost` answered yes for — a conditional assignment (not a
@@ -1279,7 +1348,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         }
         // A targeted `changed` check (NOT `serverConfigsEqual`, which compares
         // `syncedAt` and would fire a no-op update on every sync of a stopped
-        // node). The origin STAMPS — not `syncedAt` — decide the origin half.
+        // node). The origin STAMPS — not `syncedAt` — decide the origin half. The
+        // template value fields join the value half (the matrix can move any of
+        // them on an otherwise-unchanged placeholder); their stamps ride the
+        // `serverOriginStampsEqual` line, exactly as the addressed update path does.
         const changed =
           ownedForAddressless.name !== after.name ||
           ownedForAddressless.host !== after.host ||
@@ -1288,6 +1360,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ownedForAddressless.ipmiHost !== after.ipmiHost ||
           ownedForAddressless.group !== after.group ||
           (ownedForAddressless.addressless ?? false) !== (after.addressless ?? false) ||
+          !proxyConfigsEqual(ownedForAddressless.proxy, after.proxy) ||
+          ownedForAddressless.multiplexing !== after.multiplexing ||
+          ownedForAddressless.legacyAlgorithms !== after.legacyAlgorithms ||
+          ownedForAddressless.logSession !== after.logSession ||
+          ownedForAddressless.ipmiAuthProfileId !== after.ipmiAuthProfileId ||
+          ownedForAddressless.ipmiGatewayServerId !== after.ipmiGatewayServerId ||
           !serverOriginStampsEqual(ownedForAddressless.origin, after.origin);
         if (changed) {
           updates.push({ before: ownedForAddressless, after });
@@ -1316,6 +1394,25 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           );
           continue;
         }
+        // DEVICE TEMPLATES (Codex P2-a) — the add matrix, against this fresh id for
+        // the §5.3 self-proxy check, exactly as the addressed add path runs it. A
+        // fresh record has nothing to protect, so `undefined` owned server ⇒ the
+        // template's values are written and stamped verbatim.
+        const addMatrix = applyTemplateMatrix(undefined, addresslessDesired, {
+          targetServerId: addresslessId,
+          targetServerName: device.name,
+          proxyTemplateName: addresslessProxyTemplateName,
+          ipmiGatewayTemplateName: addresslessGatewayTemplateName
+        });
+        for (const w of addMatrix.warnings) {
+          warnings.push(w);
+        }
+        if (addMatrix.values.proxy !== undefined && addresslessProxyTemplateName !== undefined) {
+          proxyTemplateNameByServerId.set(addresslessId, addresslessProxyTemplateName);
+        }
+        if (addMatrix.values.ipmiGatewayServerId !== undefined && addresslessGatewayTemplateName !== undefined) {
+          ipmiGatewayTemplateNameByServerId.set(addresslessId, addresslessGatewayTemplateName);
+        }
         addresslessAdded.push(device.name);
         adds.push({
           id: addresslessId,
@@ -1327,6 +1424,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           authType: "agent",
           isHidden: false,
           group: addresslessGroup,
+          // DEVICE TEMPLATES (Codex P2-a) — the non-auth template field values this
+          // fresh placeholder starts with (ipmiAuthProfileId / ipmiGatewayServerId
+          // active now; proxy/multiplexing/legacyAlgorithms/logSession inert until it
+          // upgrades). Absent when the template sets none of them.
+          ...addMatrix.values,
           // OOB (Codex P2) — a placeholder with no console address can still have
           // a BMC one: a BMC web-console / locally-executed IPMI needs no primary
           // console address. A fresh record has nothing to protect, so no matrix —
@@ -1343,7 +1445,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
             // included) so every LATER sync has the ownership question already
             // answered — matrix row 1, exactly as the addressed add path stamps it.
             syncedIpmiHost: mgmtHost,
-            syncedProtocol: undefined
+            syncedProtocol: undefined,
+            // The template stamps for the non-auth fields written above, so every
+            // LATER sync has the ownership question already answered. Absent when
+            // the template set none of them.
+            templated: addMatrix.templated
           }
         });
         if (addresslessGroup !== undefined) {
