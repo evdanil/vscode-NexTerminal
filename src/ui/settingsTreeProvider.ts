@@ -149,9 +149,11 @@ export class InventorySourceItem extends vscode.TreeItem {
     // Keyed on by the four `view/item/context` inline entries in package.json.
     this.contextValue = "nexus.inventorySource";
     this.tooltip = `${name} — ${description}`;
-    // The id is passed as a STRING because that is what the command handler
-    // reads; handing it the tree item would fall through to the source picker,
-    // so clicking any row would prompt rather than edit the row clicked.
+    // A click carries the source id as the command argument, so the editor
+    // opens on THIS source directly rather than re-prompting. `resolveSourceIdArg`
+    // (commands/inventoryCommands.ts) accepts either form — this string, or the
+    // tree item itself via its `sourceId` — so the inline menu actions, which
+    // receive the item, resolve to the same source.
     this.command = { command: "nexus.inventory.editSource", title: "Edit Inventory Source", arguments: [sourceId] };
   }
 }
@@ -167,6 +169,8 @@ export class SettingsTreeProvider
   private readonly configListener: vscode.Disposable;
   /** NexusCore's onDidChange returns an unsubscribe function, not a Disposable. */
   private readonly coreListener?: () => void;
+  /** MINOR-8 — the inventory-relevant slice of the last snapshot, so an unrelated core event does not re-render. */
+  private lastInventorySignature: string;
 
   /**
    * `core` and `providerRegistry` are OPTIONAL so the provider stays
@@ -180,9 +184,23 @@ export class SettingsTreeProvider
     private readonly core?: NexusCore,
     private readonly providerRegistry?: InventoryProviderRegistry
   ) {
-    // Source rows carry a relative "synced N ago" description and a name that
-    // an edit can change, so any core mutation re-renders them.
-    this.coreListener = core?.onDidChange(() => this.onDidChangeTreeDataEmitter.fire(undefined));
+    this.lastInventorySignature = this.inventorySignature();
+    // MINOR-8 — `NexusCore.onDidChange` is the whole-state firehose (it fires on
+    // every terminal/tunnel/session blink), but the only rows this provider
+    // renders from core are the inventory sources. Re-render ONLY when that
+    // slice actually changed, so an idle session with active terminals does not
+    // re-run `getChildren` — a `getConfiguration` read per value row — many
+    // times a second. The signature covers exactly the fields the rows show
+    // (id, name, provider, last sync), so a sync's `lastSyncAt` bump refreshes
+    // the "synced N ago" label while an unrelated event does not.
+    this.coreListener = core?.onDidChange(() => {
+      const signature = this.inventorySignature();
+      if (signature === this.lastInventorySignature) {
+        return;
+      }
+      this.lastInventorySignature = signature;
+      this.onDidChangeTreeDataEmitter.fire(undefined);
+    });
     this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
       const affected = SETTINGS_META.some(
         (m) => event.affectsConfiguration(`${m.section}.${m.key}`)
@@ -201,6 +219,12 @@ export class SettingsTreeProvider
 
   public refresh(): void {
     this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  /** MINOR-8 — exactly the inventory-source fields the rows render, as a comparable string. */
+  private inventorySignature(): string {
+    const sources = this.core?.getSnapshot().inventorySources ?? [];
+    return JSON.stringify(sources.map((s) => [s.id, s.name, s.providerId, s.lastSyncAt ?? 0]));
   }
 
   public getTreeItem(element: SettingsTreeItem): vscode.TreeItem {

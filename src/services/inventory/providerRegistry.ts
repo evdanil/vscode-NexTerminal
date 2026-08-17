@@ -42,6 +42,13 @@ export function validateProviderShape(provider: unknown): asserts provider is In
     if (typeof f.type !== "string" || !VALID_FIELD_TYPES.has(f.type as InventoryConfigFieldType)) {
       throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid type "${String(f.type)}".`);
     }
+    // MINOR-14 (EVE-NG review) — `defaultValue` is part of the field contract
+    // (the Add form seeds a boolean field from it). A non-boolean value would be
+    // silently coerced by the form's `=== true` read, so a documented default of
+    // "yes" becomes an unchecked box — reject it at the boundary.
+    if (f.defaultValue !== undefined && typeof f.defaultValue !== "boolean") {
+      throw new Error(`Inventory provider configFields entry "${f.id}" has a non-boolean defaultValue.`);
+    }
     if (f.type === "select") {
       if (!Array.isArray(f.options) || f.options.length === 0) {
         throw new Error(`Inventory provider configFields entry "${f.id}" of type "select" must declare a non-empty options array.`);

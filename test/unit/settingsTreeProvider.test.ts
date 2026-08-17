@@ -413,7 +413,7 @@ describe("SettingsTreeProvider", () => {
       expect((children[0] as InventorySourceItem).description).toBe("acme-cmdb \u2014 never synced");
     });
 
-    it("opens the editor on click and carries the source id in an argument the command actually reads (\u2298 passing the tree item itself falls through to the source picker, so clicking any row prompts instead of editing THAT one)", () => {
+    it("opens the editor on click and carries the source id as the command argument, so the click edits THIS source rather than re-prompting (\u2298 an argument-less command falls through to the source picker)", () => {
       const [row] = groupChildren(providerWithSources([{ id: "s1", providerId: "eve-ng", name: "Lab" }])) as InventorySourceItem[];
       expect(row.sourceId).toBe("s1");
       expect(row.command).toEqual({
@@ -429,13 +429,33 @@ describe("SettingsTreeProvider", () => {
       expect((row.iconPath as { id: string }).id).toBe("server-environment");
     });
 
-    it("refreshes when core state changes, so a sync or a removal is reflected without reopening the view", () => {
-      const { core, fire } = makeCore([]);
+    it("refreshes when the inventory sources change, so a sync or a removal is reflected without reopening the view", () => {
+      const sources: FakeSource[] = [{ id: "s1", providerId: "eve-ng", name: "Lab" }];
+      const { core, fire } = makeCore(sources);
       const provider = new SettingsTreeProvider(core as never, fakeRegistry as never);
       const listener = vi.fn();
       provider.onDidChangeTreeData(listener);
+      // A source's lastSyncAt is stamped by a sync — a real inventory change.
+      sources[0] = { ...sources[0], lastSyncAt: 123 };
       fire();
       expect(listener).toHaveBeenCalledWith(undefined);
+    });
+
+    /**
+     * MINOR-8 — the provider must NOT re-render on every unrelated core event.
+     * Subscribing to the whole `onDidChange` firehose meant a terminal or tunnel
+     * blink re-ran `getChildren` (a `getConfiguration` read per settings value
+     * row) many times a second while idle.
+     */
+    it("does NOT refresh when a core event leaves the inventory sources unchanged (⊘ firing on every core event re-renders the whole tree on each terminal/tunnel blink)", () => {
+      const sources: FakeSource[] = [{ id: "s1", providerId: "eve-ng", name: "Lab", lastSyncAt: 5 }];
+      const { core, fire } = makeCore(sources);
+      const provider = new SettingsTreeProvider(core as never, fakeRegistry as never);
+      const listener = vi.fn();
+      provider.onDidChangeTreeData(listener);
+      fire(); // unrelated core change; sources identical
+      fire();
+      expect(listener).not.toHaveBeenCalled();
     });
 
     it("unsubscribes from core on dispose (\u2298 an un-disposed listener fires into a dead emitter for the rest of the session)", () => {
