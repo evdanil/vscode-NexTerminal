@@ -106,6 +106,15 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (obj.fetchStatus !== undefined && typeof obj.fetchStatus !== "function") {
     throw new Error("Inventory provider fetchStatus must be a function when present.");
   }
+  // NODE CONTROL (Phase 4) — the twin of the fetchStatus clause. `controlNode`
+  // is OPTIONAL (only EVE-NG implements node start/stop), but a non-function
+  // value under that name is an error, loudly rather than silently: a typo'd
+  // `controlNode` would otherwise be indistinguishable at runtime from a
+  // provider that never declared one, and the symptom — Start/Stop quietly doing
+  // nothing — is invisible until a user wonders why a node never boots.
+  if (obj.controlNode !== undefined && typeof obj.controlNode !== "function") {
+    throw new Error("Inventory provider controlNode must be a function when present.");
+  }
 }
 
 /**
