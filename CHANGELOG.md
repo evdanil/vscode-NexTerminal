@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.8.188] — 2026-08-17
+
+### Added
+
+- **Telnet, as a protocol on the servers you already have.** A **Protocol** dropdown on the server profile switches a connection between SSH (the default, and what every existing profile stays on) and raw telnet — for console servers, virtual-lab consoles, and the gear that still offers nothing else. It is a per-server switch, not a second kind of profile: choose Telnet and the credential fields hide themselves, because **telnet has no login of its own** — you authenticate at the device's own prompt, in the terminal, and Nexus never prompts for a password or touches the credential vault on a telnet connect. Telnet is cleartext and unauthenticated by design; use it on a management network you trust. Nexus speaks the negotiation properly rather than dumping bytes at the socket: it accepts the server's echo and suppress-go-ahead offers, answers terminal type with `xterm-256color`, and reports the window size on every resize, so full-screen tools and line editing behave — including at widths where the size byte collides with the protocol's own escape byte, the classic place hand-rolled telnet breaks. Sequences split across packets, embedded `0xFF` bytes and `CR NUL` line endings are all handled, and the client never gets into a negotiation loop with a server that answers everything.
+- **A telnet tab is a first-class Nexus terminal.** Highlighting, the scrollback capture buffer, Reset / Clear Scrollback / Copy All, auto-trigger macros, session transcripts and the activity indicator all work exactly as they do on SSH, and the session shows in the Connectivity Hub like any other. Scripts get a new `@target-type telnet`; `ssh` and `telnet` are deliberately separate, so a script written to expect an SSH login is never fired at a telnet console by mistake. Terminals left stranded by an extension-host reload are reported for telnet tabs too.
+- **NetBox (and any inventory provider) can now describe telnet consoles.** The inventory contract gains a `telnet` endpoint kind: a device whose only usable endpoint is telnet syncs to a telnet server, on port 23 rather than 22. A device offering **both** ssh and telnet maps to SSH, whatever order the endpoints are listed in — where both exist there is no case for choosing the one without authentication, file transfer or tunnelling. If you switch a synced server's protocol by hand, later syncs leave your choice alone; a device that genuinely changes transport at the source is still followed. Devices that offer neither are still skipped, and now say so in those words.
+
+### Changed
+
+- **SSH-only features refuse a telnet server up front, by name.** File browsing (SFTP), port forwarding — including dragging a tunnel profile onto the server — Test Connection and Deploy SSH Key all name the feature and the server instead of reaching for an SSH connection and surfacing a raw handshake error several seconds later, against a port that is answering perfectly well.
+
 ## [2.8.187] — 2026-08-16
 
 ### Fixed
