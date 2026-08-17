@@ -18,6 +18,7 @@ import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { SshPty } from "../../src/services/ssh/sshPty";
+import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -42,6 +43,10 @@ const mockAddOutputObserver = vi.fn((_observer: unknown) => ({ dispose: vi.fn() 
 
 vi.mock("../../src/services/ssh/sshPty", () => ({
   SshPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
+}));
+
+vi.mock("../../src/services/telnet/telnetPty", () => ({
+  TelnetPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
 }));
 
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
@@ -4138,5 +4143,110 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
     expect(finalSecret).toBeUndefined();
+  });
+});
+
+describe("telnet connect path", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  function connectTelnet(overrides: Partial<ServerConfig> = {}) {
+    const server = makeServer({ protocol: "telnet", username: "", port: 2001, ...overrides });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+    return { ctx, server, run: () => registeredCommands.get("nexus.server.connect")!("srv-1") };
+  }
+
+  // ⊘ THE POINT OF THE BRANCH. A connect path that still built an SshPty for a
+  // telnet server would prompt for a password, touch the vault, and then hand
+  // an SSH handshake to a port that speaks telnet.
+  it("builds a TelnetPty and never an SshPty", async () => {
+    const { run } = connectTelnet();
+    await run();
+
+    expect(TelnetPty).toHaveBeenCalledTimes(1);
+    expect(SshPty).not.toHaveBeenCalled();
+  });
+
+  it("still builds an SshPty for an ordinary server", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(SshPty).toHaveBeenCalledTimes(1);
+    expect(TelnetPty).not.toHaveBeenCalled();
+  });
+
+  it("names the terminal 'Nexus Telnet: {name}' and registers it with the terminal registry", async () => {
+    const registry = { register: vi.fn() };
+    const server = makeServer({ protocol: "telnet", username: "" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx as any).terminalRegistry = registry;
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(vscode.window.createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "Nexus Telnet: Server 1" })
+    );
+    expect(registry.register).toHaveBeenCalledTimes(1);
+  });
+
+  it("registers an ActiveSession under the telnet terminal name so scripts can target it", async () => {
+    const { ctx, run } = connectTelnet();
+    await run();
+
+    const callbacks = vi.mocked(TelnetPty).mock.calls[0][1] as unknown as {
+      onSessionOpened(sessionId: string): void;
+    };
+    callbacks.onSessionOpened("telnet-session-1");
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "telnet-session-1",
+        serverId: "srv-1",
+        terminalName: "Nexus Telnet: Server 1"
+      })
+    );
+  });
+
+  it("passes the server's host and port through to the pty", async () => {
+    const { run } = connectTelnet({ host: "192.0.2.9", port: 5001 });
+    await run();
+
+    expect(vi.mocked(TelnetPty).mock.calls[0][0]).toEqual(
+      expect.objectContaining({ host: "192.0.2.9", port: 5001, protocol: "telnet" })
+    );
+  });
+});
+
+describe("SSH-only commands against a telnet server", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  // ⊘ Unguarded, this reached `sftpService.connect`, which opens an SSH
+  // connection to a telnet port and surfaces a raw handshake error several
+  // seconds later — naming a port that is answering perfectly well.
+  it("refuses Test Connection with a clear message instead of an SSH handshake error", async () => {
+    const server = makeServer({ protocol: "telnet", username: "" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("not available for telnet servers")
+    );
   });
 });

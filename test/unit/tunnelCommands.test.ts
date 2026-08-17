@@ -3,7 +3,8 @@ import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { ActiveTunnel, TunnelProfile, TunnelRegistryEntry } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
-import { registerTunnelCommands } from "../../src/commands/tunnelCommands";
+import { registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCommands";
+import type { ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -417,5 +418,69 @@ describe("nexus.tunnel.remove — the disclosure is re-checked under the lock (R
       'Tunnel "Tunnel 1" changed while the confirmation was open — nothing was removed. ' +
         "Remove it again to review the current details."
     ]);
+  });
+});
+
+describe("startTunnel — telnet servers", () => {
+  function telnetServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "srv-telnet",
+      name: "eve-r1",
+      host: "10.0.0.1",
+      port: 23,
+      username: "",
+      authType: "password",
+      isHidden: false,
+      protocol: "telnet",
+      ...overrides
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  // ⊘ THE SINGLE CHOKEPOINT. Every route into starting a tunnel — the command,
+  // the tree's drag-and-drop of a tunnel profile onto a server, the auto-start
+  // sweep on connect, the edit-then-restart path — funnels through this
+  // function, so a guard placed anywhere else leaves the others reaching for an
+  // SSH connection a telnet server cannot supply.
+  it("refuses to start against a telnet server and touches neither the pool nor the manager", async () => {
+    const ctx = await setupContext([makeTunnel()]);
+    const start = vi.fn();
+    const connect = vi.fn();
+
+    await startTunnel(
+      ctx.core,
+      { start } as never,
+      { connect } as never,
+      makeTunnel(),
+      telnetServer(),
+      "isolated"
+    );
+
+    expect(start).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Port forwarding is not available for telnet servers")
+    );
+  });
+
+  it("does not refuse an ordinary SSH server", async () => {
+    const ctx = await setupContext([makeTunnel()]);
+    const start = vi.fn(async () => {});
+
+    await startTunnel(
+      ctx.core,
+      { start } as never,
+      { connect: vi.fn() } as never,
+      makeTunnel(),
+      telnetServer({ protocol: undefined, port: 22 }),
+      "isolated"
+    );
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(1);
   });
 });

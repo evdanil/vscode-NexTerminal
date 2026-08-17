@@ -11,11 +11,13 @@ import {
   effectiveServerUsername,
   formOfferedServerCredentials,
   mergeServerConfigFields,
+  resolveServerProtocol,
   serverConfigsEqual
 } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
+import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
@@ -40,6 +42,7 @@ import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { configMutationLock } from "../services/configMutationLock";
+import { telnetUnsupportedMessage } from "../utils/protocolGuards";
 
 export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -900,9 +903,130 @@ export interface ConnectServerOptions {
   onConnectFailed?: (message: string) => void;
 }
 
+/**
+ * TELNET (Phase 0) — the telnet half of `connectServer`, split out rather than
+ * threaded through the SSH one because almost nothing is shared: no auth factory
+ * (so no password prompt and no vault read), no OSC 7 / cwd tracking, no SFTP
+ * auto-open and no auto-start tunnels — every one of those is SSH machinery.
+ *
+ * What IS shared is everything the terminal layer sees: the same
+ * `TerminalRegistry.register` call, the same `NexusCore.registerSession`
+ * bookkeeping under an `ActiveSession`, the same macro observer binding and the
+ * same activity-indicator wiring. That is what makes a telnet tab behave
+ * identically to an SSH one for highlighting, tab commands, macros and scripts.
+ */
+async function connectTelnetServer(
+  ctx: CommandContext,
+  server: ServerConfig,
+  options: ConnectServerOptions
+): Promise<void> {
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Connecting to ${server.name}...`,
+      cancellable: false
+    },
+    async () => {
+      const terminalName = `Nexus Telnet: ${server.name}`;
+      let terminalRef: vscode.Terminal | undefined;
+      let ptyRef: TelnetPty | undefined;
+      const triggerObserver = ctx.macroAutoTrigger.createObserver(
+        (text) => ptyRef?.handleInput(text),
+        () => ctx.focusedTerminal === terminalRef,
+        undefined,
+        server.id
+      );
+      const terminalType = vscode.workspace
+        .getConfiguration("nexus.ssh")
+        .get<string>("terminalType", "xterm-256color");
+      const pty = new TelnetPty(
+        server,
+        {
+          onSessionOpened: (sessionId) => {
+            ctx.core.registerSession({
+              id: sessionId,
+              serverId: server.id,
+              terminalName,
+              startedAt: Date.now(),
+              pty: ptyRef
+            });
+            ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
+            if (terminalRef) {
+              ctx.sessionTerminals.set(sessionId, terminalRef);
+            }
+            if (ptyRef) {
+              ctx.activityIndicators.set(sessionId, ptyRef);
+            }
+            if (vscode.window.activeTerminal === terminalRef) {
+              ctx.core.setFocusedSession(sessionId);
+            }
+          },
+          onSessionClosed: (sessionId) => {
+            ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
+            if (terminalRef) {
+              removeTerminal(server.id, terminalRef, ctx.terminalsByServer);
+            }
+          },
+          onDisconnected: (sessionId) => {
+            ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
+            // The terminal stays alive holding the press-any-key notice, so its
+            // `terminalsByServer` entry is deliberately kept — `onSessionClosed`
+            // clears it when the tab actually goes away.
+          },
+          onConnectFailed: (_sessionId, message) => {
+            options.onConnectFailed?.(message);
+          },
+          onDataReceived: (sessionId) => {
+            if (terminalRef && ctx.focusedTerminal !== terminalRef) {
+              ctx.core.markSessionActivity(sessionId);
+              ptyRef?.setActivityIndicator(true);
+            }
+          }
+        },
+        ctx.loggerFactory.create("terminal", server.id),
+        {
+          transcript: createSessionTranscript(
+            ctx.sessionLogDir,
+            server.name,
+            server.logSession ?? getDefaultSessionTranscriptsEnabled(),
+            getTranscriptRotationOptions(ctx)
+          ),
+          highlighter: ctx.highlighter,
+          outputObserver: triggerObserver,
+          terminalType
+        }
+      );
+      ptyRef = pty;
+      const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+      const terminal = vscode.window.createTerminal({
+        name: terminalName,
+        pty,
+        iconPath: new vscode.ThemeIcon("server"),
+        color: new vscode.ThemeColor("terminal.ansiCyan"),
+        location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+      });
+      terminalRef = terminal;
+      ctx.terminalRegistry?.register(terminal, pty);
+      addTerminal(server.id, terminal, ctx.terminalsByServer);
+      ctx.focusedTerminal = terminal;
+      terminal.show();
+    }
+  );
+}
+
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
+    return;
+  }
+  // TELNET (Phase 0) — branch BEFORE anything auth-shaped runs. A telnet server
+  // must never reach `SilentAuthSshFactory`: no password prompt, no vault read.
+  if (resolveServerProtocol(server) === "telnet") {
+    await connectTelnetServer(ctx, server, options);
     return;
   }
   const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
@@ -1082,6 +1206,14 @@ function formatSshDiagnosticDetails(server: ServerConfig, diagnostic: Connection
 async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
+    return;
+  }
+  // TELNET (Phase 0) — this opens an SSH connection and reports its handshake.
+  // Against a telnet server it would report a raw ssh2 error naming a port that
+  // is answering perfectly well; say the real reason instead.
+  const unsupported = telnetUnsupportedMessage(server, "Test Connection");
+  if (unsupported) {
+    void vscode.window.showWarningMessage(unsupported);
     return;
   }
 
@@ -1979,6 +2111,13 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     vscode.commands.registerCommand("nexus.server.deployKey", async (arg?: unknown) => {
       const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
       if (!server) {
+        return;
+      }
+      // TELNET (Phase 0) — there is no authorized_keys on the far side of a
+      // telnet session, and the deploy itself runs over SSH.
+      const unsupported = telnetUnsupportedMessage(server, "Deploy SSH Key");
+      if (unsupported) {
+        void vscode.window.showWarningMessage(unsupported);
         return;
       }
 
