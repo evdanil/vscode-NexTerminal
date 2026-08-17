@@ -5021,8 +5021,14 @@ describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
         externalId,
         syncedAt: 1,
         // A genuinely sync-owned address unless the test overrides the stamps.
-        syncedHost: over.syncedHost ?? host,
-        syncedPort: over.syncedPort ?? port,
+        // P2-4 (review) — `'x' in over` NOT `over.x ??`, so a test passing an
+        // EXPLICIT `undefined` (a real addressless placeholder, whose add writes
+        // `syncedHost: undefined`) gets an ABSENT stamp rather than the default
+        // host/port. The old `??` coerced explicit-undefined into "" / the port,
+        // making `syncOwnsHost`/`syncOwnsPort` fail for the WRONG reason and
+        // shielding the addressless-gate mutant.
+        syncedHost: "syncedHost" in over ? over.syncedHost : host,
+        syncedPort: "syncedPort" in over ? over.syncedPort : port,
         syncedProtocol: "telnet"
       }
     };
@@ -5096,18 +5102,27 @@ describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
     expect(core.getServer(s.id)?.port).toBe(22);
   });
 
-  it("does NOT heal an ADDRESSLESS node (⊘ dropping the addressless gate writes a console port onto a placeholder that has no console)", async () => {
+  it("does NOT heal an ADDRESSLESS node (⊘ dropping the `|| server.addressless === true` gate writes a console port onto a placeholder that has no console — M15b)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
+    // A REAL placeholder: host "", port 0, and — per the addressless add — its
+    // address stamps ABSENT (the fixed helper honors explicit undefined). With
+    // absent stamps, syncOwnsPort(0, undefined, port) reads the sentinel 0 as the
+    // fill-in row, so ONLY the addressless gate stops the heal.
     const s = telnetServer("source-1", "lab.unl#1", { host: "", port: 0, addressless: true, syncedHost: undefined, syncedPort: undefined });
     await core.addServersBatch([s]);
+    // A PORT-ONLY report (no consoleHost): healing it onto the placeholder would
+    // leave host "" (still a VALID addressless record), so the write-site
+    // validateServerConfig defense does NOT catch it — the addressless gate is the
+    // SOLE guard, and dropping it persists port 32800 onto a still-addressless node.
     await core.healSyncedConsolePorts("source-1", {
       contractVersion: 1,
-      statuses: { "lab.unl#1": { state: "running", consoleHost: "10.0.0.9", consolePort: 32800 } }
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32800 } }
     });
     const after = core.getServer(s.id);
     expect(after?.port).toBe(0);
     expect(after?.addressless).toBe(true);
+    expect(after?.origin?.syncedPort).toBeUndefined();
   });
 
   it("respects the truncated-merge — only entries PRESENT in the report are considered (⊘ healing beyond the report would touch a node the partial scan never reached)", async () => {
