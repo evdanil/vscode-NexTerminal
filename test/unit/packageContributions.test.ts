@@ -703,25 +703,76 @@ describe("package contributions", () => {
       }
     });
 
-    it("keeps every OTHER server-scoped menu working for BOTH the plain and the .ipmi contextValue, and leaves no brittle == match (⊘ appending .ipmi without broadening the base menus silently drops edit/rename/connect/etc for a BMC server)", () => {
-      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
-      // No server-row menu may pin an exact `== nexus.server[...]` — that would
-      // miss the .ipmi variant. (Substring catches both nexus.server and
-      // nexus.serverConnected exact matches.)
-      const brittle = menuItems.filter((m) => (m.when ?? "").includes("viewItem == nexus.server"));
-      expect(brittle.map((m) => m.command)).toEqual([]);
+    // P2-4 — AFFIRMATIVE per-entry table. For every server-scoped
+    // view/item/context entry, assert EXACTLY which of the four server
+    // contextValues it must and must-not match, driven off the real package.json.
+    // This kills the dangerous over-narrowing the one-directional check let
+    // through: shrinking nexus.server.edit to `.ipmi`-only (hiding Edit on every
+    // normal server) fails here, as does reverting any broadened entry to a
+    // base-only regex or dropping `.ipmi` off a BMC entry.
+    it("matches exactly the intended subset of {server, serverConnected, .ipmi variants} for each of the 20 server menus, and never a non-server contextValue (M10 dies)", () => {
+      const SERVER_VALUES = ["nexus.server", "nexus.serverConnected", "nexus.server.ipmi", "nexus.serverConnected.ipmi"];
+      const DISCONNECTED = ["nexus.server", "nexus.server.ipmi"];
+      const CONNECTED = ["nexus.serverConnected", "nexus.serverConnected.ipmi"];
+      const IPMI_ONLY = ["nexus.server.ipmi", "nexus.serverConnected.ipmi"];
+      const ALL_FOUR = SERVER_VALUES;
+      const NON_SERVER = [
+        "nexus.folder", "nexus.folderWithServers", "nexus.macro", "nexus.serialProfile",
+        "nexus.serialProfileConnected", "nexus.inventorySource", "nexus.sessionNode",
+        "nexus.localShellProfile", "nexus.localShellProfileConnected",
+        // near-misses that the `$` anchor must reject
+        "nexus.serverFoo", "nexus.server.ipmi.extra", "nexus.serverConnectedX"
+      ];
 
-      const serverScoped = menuItems.filter(
-        (m) => !ids.includes(m.command) && /viewItem =~ \/\^nexus\\\.server/.test(m.when ?? "")
+      // command|group → the contextValues that entry MUST match (and only those).
+      const EXPECTED: Record<string, string[]> = {
+        "nexus.server.connect|inline": DISCONNECTED,
+        "nexus.server.testConnection|inline@2": DISCONNECTED,
+        "nexus.server.connect|inline@1": CONNECTED,
+        "nexus.server.disconnect|inline@2": CONNECTED,
+        "nexus.server.connect|0_connect": DISCONNECTED,
+        "nexus.server.runWithScript|0_connect@3": ALL_FOUR,
+        "nexus.server.runMacro|0_connect@5": ALL_FOUR,
+        "nexus.server.connectBmcSol|0_connect@6": IPMI_ONLY,
+        "nexus.server.openBmcWebConsole|0_connect@7": IPMI_ONLY,
+        "nexus.server.testConnection|0_connect@4": DISCONNECTED,
+        "nexus.server.connect|0_connect@1": CONNECTED,
+        "nexus.server.disconnect|0_connect@2": CONNECTED,
+        "nexus.server.edit|1_manage@1": ALL_FOUR,
+        "nexus.server.rename|1_manage@2": ALL_FOUR,
+        "nexus.server.duplicate|1_manage@3": ALL_FOUR,
+        "nexus.files.browse|1_manage@4": CONNECTED,
+        "nexus.server.deployKey|1_manage@5": ALL_FOUR,
+        "nexus.authProfile.applyToServer|1_manage@6": ALL_FOUR,
+        "nexus.server.copyInfo|2_clipboard": ALL_FOUR,
+        "nexus.server.remove|3_destructive": ALL_FOUR
+      };
+
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      // Every Command Center view/item/context entry whose viewItem clause targets
+      // a server contextValue (regex form — after Phase 2 no server menu uses `==`).
+      const serverMenus = menuItems.filter(
+        (m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem =~ /^nexus\\.server")
       );
-      expect(serverScoped.length).toBeGreaterThan(0);
-      for (const m of serverScoped) {
+
+      // No server menu may still pin an exact `== nexus.server[...]` (would miss .ipmi).
+      expect(menuItems.filter((m) => (m.when ?? "").includes("viewItem == nexus.server")).map((m) => m.command)).toEqual([]);
+
+      // The set of entries present must be EXACTLY the table's keys — a newly
+      // added server menu on the wrong form, or a missing one, fails here.
+      const presentKeys = serverMenus.map((m) => `${m.command}|${m.group}`).sort();
+      expect(presentKeys).toEqual(Object.keys(EXPECTED).sort());
+
+      for (const m of serverMenus) {
+        const key = `${m.command}|${m.group}`;
+        const expected = EXPECTED[key];
         const re = viewItemRegex(m.when);
-        expect(re, m.command).not.toBeNull();
-        for (const base of ["nexus.server", "nexus.serverConnected"]) {
-          if (re!.test(base)) {
-            expect(re!.test(`${base}.ipmi`), `${m.command} should also match ${base}.ipmi`).toBe(true);
-          }
+        expect(re, key).not.toBeNull();
+        for (const value of SERVER_VALUES) {
+          expect(re!.test(value), `${key} vs ${value}`).toBe(expected.includes(value));
+        }
+        for (const value of NON_SERVER) {
+          expect(re!.test(value), `${key} must not match ${value}`).toBe(false);
         }
       }
     });
