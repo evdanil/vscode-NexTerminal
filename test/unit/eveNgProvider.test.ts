@@ -2442,6 +2442,12 @@ describe("createEveNgProvider — certificate errors name the option", () => {
     }
   });
 
+  it("reads the hint table by OWN member only, so an inherited name is not a certificate hint (⊘ TLS_CERT_HINTS[code] answers `constructor` with a function and the message becomes whatever calling it returns)", async () => {
+    for (const code of ["constructor", "toString", "hasOwnProperty", "__proto__", "valueOf"]) {
+      expect(await messageFor(code)).toBe(`Could not reach 10.0.0.5: ${code}.`);
+    }
+  });
+
   it("still reports a timeout as a timeout — an abort has no code and must not be swept into the certificate branch", async () => {
     const timesOut = (async () => {
       throw new DOMException("timed out", "TimeoutError");

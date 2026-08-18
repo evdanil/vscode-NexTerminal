@@ -339,7 +339,13 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
     const cause = (err as { cause?: { code?: string } }).cause;
     const code = cause?.code ?? (err as { code?: string }).code;
     if (code) {
-      const certHint = TLS_CERT_HINTS[code];
+      // OWN member only. A plain object literal answers `code` values like
+      // "constructor"/"toString" with an INHERITED function, and the branch
+      // below would then call it and build a message out of whatever came back.
+      // No real node code is spelled that way, but the guard costs one call and
+      // this codebase already draws the same line elsewhere (`hasOwnProperty`
+      // in ui/formDefinitions.ts).
+      const certHint = Object.prototype.hasOwnProperty.call(TLS_CERT_HINTS, code) ? TLS_CERT_HINTS[code] : undefined;
       if (certHint) {
         // The raw code stays in the tail: it is what makes the failure
         // searchable and diagnosable once the sentence has done its job.

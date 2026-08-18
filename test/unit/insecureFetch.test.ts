@@ -4,6 +4,7 @@ import type { IncomingMessage } from "node:http";
 import type { RequestOptions } from "node:https";
 import { describe, expect, it } from "vitest";
 import {
+  INSECURE_FETCH_BACKSTOP_TIMEOUT_MS,
   INSECURE_FETCH_MAX_BODY_BYTES,
   createInsecureHttpsFetch,
   type HttpsRequestFn
@@ -31,8 +32,12 @@ interface FakeRequest extends EventEmitter {
   ended: boolean;
   destroyed: boolean;
   written: string | undefined;
+  /** What the adapter armed as its backstop, and the handler it armed. */
+  timeoutMs: number | undefined;
+  fireTimeout(): void;
   end(body?: string): void;
   destroy(err?: Error): void;
+  setTimeout(ms: number, cb: () => void): FakeRequest;
 }
 
 interface Recorder {
@@ -59,6 +64,16 @@ function recorder(): Recorder {
     req.destroy = (): void => {
       req.destroyed = true;
     };
+    // A real ClientRequest carries setTimeout; the fake records what the adapter
+    // armed so the backstop can be asserted and fired deterministically.
+    let onTimeout: (() => void) | undefined;
+    req.timeoutMs = undefined;
+    req.setTimeout = (ms: number, cb: () => void): FakeRequest => {
+      req.timeoutMs = ms;
+      onTimeout = cb;
+      return req;
+    };
+    req.fireTimeout = (): void => onTimeout?.();
     calls.push({ options, req });
     callbacks.push(callback);
     return req as unknown as ReturnType<HttpsRequestFn>;
@@ -255,6 +270,55 @@ describe("createInsecureHttpsFetch — response", () => {
 // ---------------------------------------------------------------------------
 // Abort — the error NAME is load-bearing
 // ---------------------------------------------------------------------------
+
+/**
+ * A5 — THE BACKSTOP. Every caller inside this extension passes an
+ * `AbortSignal`, so nothing in the provider can hang today; but this is an
+ * EXPORTED, general-purpose function, and without an intrinsic timeout a call
+ * made without a signal against a peer that accepts the connection and then
+ * never answers waits forever — on an UNVERIFIED socket, which is the one place
+ * "the peer is well-behaved" is least safe to assume.
+ */
+describe("createInsecureHttpsFetch — backstop timeout", () => {
+  it("arms a request timeout even when the caller passes NO signal (⊘ without it a signal-less call against a peer that accepts and never answers never settles)", async () => {
+    const { rec, promise } = issue("https://eve.example.com/api/status");
+    await tick();
+    expect(rec.calls[0].req.timeoutMs).toBe(INSECURE_FETCH_BACKSTOP_TIMEOUT_MS);
+    rec.calls[0].req.fireTimeout();
+    const err = await promise.then(
+      () => undefined,
+      (e: unknown) => e
+    );
+    // Named TimeoutError so `mapNetworkError` reports it as a timeout rather
+    // than as an unexplained network failure.
+    expect((err as Error).name).toBe("TimeoutError");
+    expect(rec.calls[0].req.destroyed).toBe(true);
+  });
+
+  it("is a BACKSTOP, not the policy: it sits well past the provider's own per-request timeouts so a caller's signal always wins", () => {
+    expect(INSECURE_FETCH_BACKSTOP_TIMEOUT_MS).toBeGreaterThan(120_000);
+  });
+
+  it("leaves the SIGNAL path's semantics untouched — an abort still rejects with the signal's own reason, not the backstop's error", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    const { rec, promise } = issue("https://eve.example.com/api/status", { signal: controller.signal });
+    await tick();
+    expect(rec.calls[0].req.timeoutMs).toBe(INSECURE_FETCH_BACKSTOP_TIMEOUT_MS);
+    controller.abort(reason);
+    await expect(promise).rejects.toBe(reason);
+  });
+
+  it("cannot overwrite an already-settled response — a timeout that fires after the body arrived is ignored", async () => {
+    const { rec, promise } = issue("https://eve.example.com/api/status");
+    await tick();
+    rec.respond(0, { body: '{"status":"success"}' });
+    const res = await promise;
+    expect(res.status).toBe(200);
+    rec.calls[0].req.fireTimeout();
+    await expect(res.text()).resolves.toBe('{"status":"success"}');
+  });
+});
 
 describe("createInsecureHttpsFetch — abort", () => {
   it("rejects with the SIGNAL'S OWN REASON, so a TimeoutError stays a TimeoutError (⊘ rejecting a generic Error makes raw() read a crawl-deadline abort as a network failure and discard the whole crawl)", async () => {

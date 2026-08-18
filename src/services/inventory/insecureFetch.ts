@@ -44,6 +44,26 @@ export type HttpsRequestFn = (options: RequestOptions, callback: (res: IncomingM
  */
 export const INSECURE_FETCH_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
+/**
+ * INTRINSIC BACKSTOP — the longest this adapter will wait on a SILENT peer when
+ * the caller supplied no `AbortSignal` of its own.
+ *
+ * Every caller inside this extension does pass a signal (`EveApiClient.raw()`
+ * sets one on every request), so this never fires in the provider. But this is
+ * an exported, general-purpose function, and without it a signal-less call
+ * against a peer that completes the handshake and then says nothing waits
+ * forever — on a socket whose peer is UNVERIFIED by construction, which is the
+ * last place to assume good behaviour.
+ *
+ * Deliberately far past the provider's own per-request timeouts (20s) and its
+ * whole-crawl deadline (120s), so a caller's signal always decides first and
+ * this only ever catches the case where nothing else would. It is node's socket
+ * INACTIVITY timeout, so it bounds silence, not total duration — a caller that
+ * needs a total-duration cap passes a signal, which is exactly what the
+ * provider does.
+ */
+export const INSECURE_FETCH_BACKSTOP_TIMEOUT_MS = 180_000;
+
 /** Thrown for anything outside the supported surface — always by this name, never silently handled. */
 class InsecureFetchUnsupported extends Error {
   public constructor(message: string) {
@@ -323,6 +343,21 @@ export function createInsecureHttpsFetch(requestImpl: HttpsRequestFn = httpsRequ
           });
         }
       );
+
+      // INTRINSIC BACKSTOP — see INSECURE_FETCH_BACKSTOP_TIMEOUT_MS. Rejects
+      // BEFORE destroy() for the same reason the abort path does: the
+      // ECONNRESET that destroy raises then hits the already-settled guard
+      // instead of overwriting the reason. Named TimeoutError so
+      // `mapNetworkError` reports it as a timeout rather than as an
+      // unexplained network failure.
+      req.setTimeout(INSECURE_FETCH_BACKSTOP_TIMEOUT_MS, () => {
+        const timeout = new Error(
+          `The insecure-TLS transport gave up on ${url.host} after ${INSECURE_FETCH_BACKSTOP_TIMEOUT_MS}ms with no response.`
+        );
+        timeout.name = "TimeoutError";
+        fail(timeout);
+        req.destroy();
+      });
 
       // The node error object is passed through UNWRAPPED: `mapNetworkError`
       // reads `err.code` (DEPTH_ZERO_SELF_SIGNED_CERT, ERR_TLS_CERT_ALTNAME_INVALID,
