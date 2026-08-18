@@ -2564,7 +2564,12 @@ describe("createEveNgProvider — a sync run with verification off discloses it"
       { baseUrl: "http://eve.example.com", allowInsecureTls: true }
     ]) {
       const tree = await provider().fetchInventory({ ...CONFIG, ...config }, SECRETS);
-      expect((tree.warnings ?? []).some((w) => w.includes("certificate"))).toBe(false);
+      // Asserted against the CONSTANT, not a substring like "certificate": the
+      // warning capitalises the word in both places it uses it, so a
+      // case-sensitive substring search matches nothing and the assertion holds
+      // even when the warning IS wrongly emitted — which made this test pass
+      // against an unconditional `warnings.push(...)`.
+      expect(tree.warnings ?? []).not.toContain(EVE_NG_INSECURE_TLS_WARNING);
     }
   });
 });
