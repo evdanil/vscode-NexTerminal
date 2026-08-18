@@ -4728,10 +4728,19 @@ export function registerInventoryCommands(
           //    that picture is newer than this report. R4 (follow-up #43 review)
           //    — the epoch was already re-checked before the heal below; the
           //    apply needs it too now that a sync writes status at all, and it
-          //    is the only one of the three that catches a sync (a sync changes
-          //    neither the sweep generation nor `source.revision`). Dropping the
-          //    apply loses nothing: the sync that bumped the epoch left the
-          //    source's status current by definition.
+          //    is the only one of the three that catches a ROUTINE sync (which
+          //    changes neither the sweep generation nor `source.revision` — a
+          //    sync that RESTAMPS the provider fingerprint does mint a fresh
+          //    revision and is caught one check earlier). Dropping the
+          //    apply usually loses nothing: the sync that bumped the epoch
+          //    applied its own status, leaving the source's picture newer than
+          //    this one — EXCEPT where that sync's own report was ABSENT or
+          //    MALFORMED, since the plan apply bumps the epoch either way while
+          //    `applyFetchedStatus` writes nothing. There this report is dropped
+          //    for a newer picture that never landed and status stays stale for
+          //    one poll tick. Self-healing on the next refresh or sync, and
+          //    dropping is still the conservative direction, so the guard stays
+          //    as it is.
           const currentSource = core.getInventorySource(source.id);
           if (
             myGeneration === statusRefreshGeneration &&
