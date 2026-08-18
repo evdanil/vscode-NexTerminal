@@ -600,6 +600,34 @@ describe("createEveNgProvider — an expired session (HTTP 412 + JSend unauthori
   });
 
   /**
+   * THE CONSTRAINT ON ANY CHEAP PRE-FILTER. The predicate parses the body to
+   * decide, and the parse is skipped when a scan of the raw text rules the
+   * question out — so that scan has to admit EVERY shape the parsed envelope
+   * would say yes to. These two are the ones a plain
+   * `text.includes("unauthorized")` would drop on the floor: the in-envelope
+   * status CODE with no such word anywhere, and the word in another case.
+   */
+  it("re-logs in on an in-envelope `code:401` whose text never contains the word unauthorized (\u2298 a raw-text pre-filter keyed on that word alone stops recognising EVE-NG's in-envelope 401 and the crawl dies where it used to recover)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: { code: 401, status: "fail", message: "Session no longer valid." }
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  it("re-logs in when the envelope's status word is capitalised (\u2298 a case-SENSITIVE pre-filter misses `\"status\":\"Unauthorized\"`, which the predicate itself case-folds and accepts)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: { code: 412, status: "Unauthorized", message: "Session timed out." }
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  /**
    * `authedGet` and `authedRequest` are two copies of the same retry, and the
    * node-control path uses the second one. A fix applied to one of them leaves
    * Start/Stop failing on exactly the server that reported the bug.

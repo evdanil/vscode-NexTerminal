@@ -409,6 +409,23 @@ function parseEnvelope(text: string, url: URL): JSendEnvelope {
  */
 const SESSION_EXPIRED_SUBCODE = /\(90001\)/;
 
+/**
+ * The raw-text pre-filter for `unauthorizedEnvelope` — see the note there. Every
+ * alternative mirrors one branch of `envelopeSaysUnauthorized`:
+ *   `unauthorized`        — the status word, matched case-insensitively because
+ *                           the predicate case-folds it before comparing;
+ *   `(90001)`             — the sub-code, in the same parenthesised form;
+ *   `"code": 401 | 403`   — the in-envelope status code, which is the one signal
+ *                           that need not put any word in the body. The literal
+ *                           JSON spelling is what a parseable envelope must
+ *                           contain (whitespace aside); a body that reaches the
+ *                           parsed check by some other spelling — `4.01e2`, a
+ *                           \u-escaped key — is not a shape EVE-NG emits, and the
+ *                           consequence would be one missed silent re-login, the
+ *                           behaviour before that retry existed.
+ */
+const MAYBE_UNAUTHORIZED_BODY = /unauthorized|\(90001\)|"code"\s*:\s*40[13]\b/i;
+
 function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; message?: unknown }): boolean {
   // A SUCCESS envelope is never an expired session, whatever else it says. The
   // sub-code below is a regex over free text, so a successful reply that happens
@@ -443,6 +460,23 @@ function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; 
  * one as an expired session would burn a re-login on every such failure.
  */
 function unauthorizedEnvelope(text: string): Record<string, unknown> | undefined {
+  // HOT PATH — this predicate runs on EVERY crawl response, and the body it is
+  // handed is a full node/lab listing on the large inventories this feature
+  // exists to serve. Parsing all of it to ask a question whose answer is almost
+  // always no doubled the JSON work of a sync (`unwrap` parses the same text
+  // again), so a raw scan rules the question out first. One pass, no allocation
+  // — no `toLowerCase()` copy of a multi-megabyte body.
+  //
+  // A PRE-FILTER, NOT THE DECIDER: everything that gets past it is still parsed
+  // and judged by `envelopeSaysUnauthorized` exactly as before, so a body that
+  // merely mentions the word (a proxy's HTML error page) is still refused. What
+  // this must never do is drop a body the parsed envelope WOULD have accepted,
+  // which is why all three of the predicate's signals appear here — the status
+  // word in any case, the parenthesised sub-code, and the in-envelope 401/403
+  // that carries no such word at all.
+  if (!MAYBE_UNAUTHORIZED_BODY.test(text)) {
+    return undefined;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
