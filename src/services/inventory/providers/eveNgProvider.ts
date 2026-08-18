@@ -410,6 +410,15 @@ function parseEnvelope(text: string, url: URL): JSendEnvelope {
 const SESSION_EXPIRED_SUBCODE = /\(90001\)/;
 
 function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; message?: unknown }): boolean {
+  // A SUCCESS envelope is never an expired session, whatever else it says. The
+  // sub-code below is a regex over free text, so a successful reply that happens
+  // to mention those digits parenthesised would otherwise be read as an expiry —
+  // discarding a response that WORKED, spending a login, and re-issuing the
+  // request. On `authedRequest` that request is a node start/stop PUT, so the
+  // cost of getting this wrong is a repeated mutation, not a wasted round trip.
+  if (str(envelope.status).toLowerCase() === "success") {
+    return false;
+  }
   // The status word EVE-NG actually sends, read the way every other envelope
   // field here is read — trimmed and case-folded, because it comes off the wire.
   if (str(envelope.status).toLowerCase() === "unauthorized") {

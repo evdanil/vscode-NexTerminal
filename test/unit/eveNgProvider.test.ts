@@ -626,6 +626,62 @@ describe("createEveNgProvider — an expired session (HTTP 412 + JSend unauthori
   });
 
   /**
+   * THE OTHER DIRECTION, and the one that costs something when it goes wrong: a
+   * SUCCESS envelope is never an expired session, whatever its message happens
+   * to contain. The sub-code match is a regex over free text, so a server that
+   * mentions those digits parenthesised in a perfectly successful reply — a
+   * ticket number, a version, an id — would otherwise have its response DISCARDED
+   * and the request re-issued after a pointless re-login.
+   */
+  it("does NOT re-login on a SUCCESSFUL response whose message happens to contain (90001) — a success envelope is never an expired session (\u2298 testing the sub-code without excluding `status:\"success\"` throws away a good response and pays for a login to fetch it again)", async () => {
+    let logins = 0;
+    let nodeCalls = 0;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") {
+        logins++;
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}-${logins}`]);
+      }
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "6.2.0-20-pro" }));
+      if (path.startsWith("/api/folders")) {
+        return makeResponse(200, jsend({ folders: [], labs: [{ file: "L.unl", path: "/L.unl" }] }));
+      }
+      nodeCalls++;
+      return makeResponse(200, jsend({ "1": node() }, { message: "Nodes fetched from lab (90001)." }));
+    }) as unknown as typeof fetch;
+
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins).toBe(1);
+    // The response was USED, not thrown away and asked for a second time.
+    expect(nodeCalls).toBe(1);
+  });
+
+  /**
+   * The same guard on the path where re-issuing is not merely wasteful:
+   * `authedRequest` carries node Start/Stop, so treating a successful reply as an
+   * expired session re-sends a MUTATING request.
+   */
+  it("does NOT re-issue a node action whose success envelope contains (90001) (\u2298 without the success guard a start/stop that WORKED is sent a second time, on the strength of digits in its own confirmation message)", async () => {
+    let logins = 0;
+    let actions = 0;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") {
+        logins++;
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}-${logins}`]);
+      }
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "6.2.0-20-pro" }));
+      actions++;
+      return makeResponse(200, jsend(null, { message: "Node started (90001)." }));
+    }) as unknown as typeof fetch;
+
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab 1.unl#1", "start");
+    expect(actions).toBe(1);
+    expect(logins).toBe(1);
+  });
+
+  /**
    * The envelope can also arrive on an HTTP 200 — EVE-NG answers some refusals
    * that way (the login path already relies on it). Classified by what the
    * envelope says, not by the status line that carried it.
