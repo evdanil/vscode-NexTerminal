@@ -3295,6 +3295,20 @@ export function registerInventoryCommands(
       const applyFetchedStatus = (): void => {
         if (fetchedStatus) {
           core.applyInventoryStatus(source.id, fetchedStatus);
+          // R3 (follow-up #43 review) — THE SECOND APPLIER. `refreshStatus`
+          // records the sweep generation that last applied status for a source
+          // and only warns "this source's lab status is partial" while its own
+          // apply is still the newest one. That record exists precisely so a
+          // later COMPLETE apply invalidates an earlier partial claim — but a
+          // sync belongs to no sweep and does not bump `source.revision`, so
+          // without this line a truncated claim collected before the sync would
+          // still match at warning time and the user would be told to narrow a
+          // Root Folder for a tree this sync has just brought fully current.
+          // DELETING the entry (rather than writing some generation of our own)
+          // is the minimal shape: the filter is `get(id) !== myGeneration`, and
+          // a missing entry fails it for every sweep, which is exactly the claim
+          // this apply supersedes.
+          statusAppliedGeneration.delete(source.id);
         }
       };
 
@@ -4628,13 +4642,26 @@ export function registerInventoryCommands(
           // it as a success for the total-failure warning regardless of whether
           // the guards below actually apply it.
           succeeded++;
-          // Re-check AFTER the (awaited) fetch, two guards:
+          // Re-check AFTER the (awaited) fetch, three guards:
           //  - the global generation: a NEWER sweep may have started and applied
           //    while this fetch was in flight (applying now would clobber it);
           //  - this source's revision: an Edit Source may have superseded the
-          //    config this report was fetched under (P2-1b).
+          //    config this report was fetched under (P2-1b);
+          //  - this source's MUTATION EPOCH: a syncNow that completed while this
+          //    fetch was outstanding applied its OWN status for the source, and
+          //    that picture is newer than this report. R4 (follow-up #43 review)
+          //    — the epoch was already re-checked before the heal below; the
+          //    apply needs it too now that a sync writes status at all, and it
+          //    is the only one of the three that catches a sync (a sync changes
+          //    neither the sweep generation nor `source.revision`). Dropping the
+          //    apply loses nothing: the sync that bumped the epoch left the
+          //    source's status current by definition.
           const currentSource = core.getInventorySource(source.id);
-          if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
+          if (
+            myGeneration === statusRefreshGeneration &&
+            currentSource?.revision === startRevision &&
+            core.getSourceMutationEpoch(source.id) === startEpoch
+          ) {
             core.applyInventoryStatus(source.id, report);
             // R4 (review) — record WHOSE apply the tree is now showing for this
             // source, for every report and not only truncated ones (see the map's

@@ -9351,6 +9351,74 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(mockShowWarningMessage).not.toHaveBeenCalled();
     });
 
+    /**
+     * R3 (follow-up #43 review) — the SAME staleness, through the SECOND
+     * applier. A completed sync now applies status too, and it is not a sweep:
+     * it changes neither the generation counter nor `source.revision`, so
+     * nothing the two live checks read moves. If the sync leaves the generation
+     * record alone, a truncated claim collected before it still matches at the
+     * warning exit and the user is told to narrow the Root Folder of a lab tree
+     * the sync has just brought fully current.
+     */
+    it("does NOT warn about a source whose truncated status a completed SYNC has since replaced with a complete one (⊘ leaving the sync's apply out of the generation record lets a slow refresh claim partial status about a tree that is now fully current)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        // The sweep parks here, holding its collected "Lab A", while the sync
+        // for Lab A runs to completion over the top of it.
+        bEntered();
+        await bGate;
+        return REPORT;
+      });
+      // A nothing-to-change sync that still carries a COMPLETE status report —
+      // the ordinary shape of a re-sync of a settled lab.
+      const fetchInventory = vi.fn(
+        async (): Promise<InventoryTree> => ({ contractVersion: 1, devices: [], status: { contractVersion: 1, statuses: { "dev#1": { state: "running" } } } })
+      );
+      const provider = makeProvider({ fetchStatus, fetchInventory });
+      registry.register(provider);
+      // The provider declares `apiToken` required, so syncNow refuses before it
+      // fetches unless the vault has it.
+      registerInventoryCommands(core, registry, makeVault({ [inventorySecretKey("a", "apiToken")]: "tok" }), makeTeardown());
+      // FINGERPRINT PRE-STAMPED, deliberately. A source with none is stamped
+      // after its first successful sync, and that stamp goes through
+      // addOrUpdateInventorySource — which MINTS A NEW REVISION, so the warning's
+      // revision check would suppress the message for a reason that has nothing
+      // to do with the record this test is about. With it already stamped, a
+      // routine sync touches only lastSyncAt/managedFolders and leaves `revision`
+      // alone (asserted below), which is exactly the case R3 describes.
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" }, providerFingerprint: computeProviderFingerprint(provider) }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" }, providerFingerprint: computeProviderFingerprint(provider) }));
+
+      const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>; // gen 1 applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      const revisionBefore = core.getInventorySource("a")!.revision;
+      await registeredCommands.get("nexus.inventory.syncNow")!("a");
+      // The sweep's OTHER live check must not be what suppresses the warning.
+      expect(core.getInventorySource("a")!.revision).toBe(revisionBefore);
+      // The fixture really did apply, and applied a COMPLETE report — the whole
+      // point of this interleaving.
+      expect(applySpy).toHaveBeenCalledTimes(1);
+      expect(applySpy.mock.calls[0][0]).toBe("a");
+      expect(applySpy.mock.calls[0][1].truncated).toBeFalsy();
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
     it("emits ONE message for the whole sweep, naming every affected source (⊘ one showWarningMessage per source stacks a modal-ish pile of notifications on a multi-lab refresh)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -9388,6 +9456,64 @@ describe("nexus.inventory.refreshStatus", () => {
         'Lab status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the sources\' Root Folder or Lab Filter to bring the lab tree inside the crawl\'s limits.'
       );
     });
+  });
+
+  /**
+   * R4 (follow-up #43 review) — a refresh whose fetch STRADDLED a completed
+   * sync. `startEpoch` is captured before the fetch and was already re-checked
+   * before `healSyncedConsolePorts`; the apply needs it too now that a sync
+   * writes status of its own. Neither of the other two guards catches a sync: it
+   * starts no sweep and bumps no `revision`.
+   */
+  it("does NOT apply a report whose fetch straddled a COMPLETED sync for the same source — the sync's status is newer (⊘ guarding only the sweep generation and the source revision lets a report fetched before the sync repaint the state the sync just established)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const parked = new Promise<void>((resolve) => { entered = resolve; });
+    const fetchStatus = vi.fn(async () => {
+      entered();
+      await gate;
+      // Fetched BEFORE the sync below and resolved after it: stale by the time
+      // it lands, and it disagrees with the sync about the node.
+      return { contractVersion: 1 as const, statuses: { "dev#1": { state: "stopped" as const } } };
+    });
+    const fetchInventory = vi.fn(
+      async (): Promise<InventoryTree> => ({
+        contractVersion: 1,
+        devices: [{ externalId: "dev#1", name: "R1", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }],
+        status: { contractVersion: 1, statuses: { "dev#1": { state: "running" } } }
+      })
+    );
+    const provider = makeProvider({ fetchStatus, fetchInventory });
+    registry.register(provider);
+    registerInventoryCommands(core, registry, makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" }), makeTeardown());
+    // Fingerprint pre-stamped so the sync does not restamp it: a restamp mints a
+    // fresh revision, and the apply's revision guard would then drop the stale
+    // report for a reason that has nothing to do with the epoch this test is
+    // about. Asserted below.
+    await core.addOrUpdateInventorySource(makeSource({ providerFingerprint: computeProviderFingerprint(provider) }));
+
+    const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await parked;
+
+    // The sync commits: it persists a server (bumping the source's mutation
+    // epoch) and applies its own, newer status.
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    const revisionBefore = core.getInventorySource("src-1")!.revision;
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getInventorySource("src-1")!.revision).toBe(revisionBefore); // the OTHER guard is not what drops the report
+    const serverId = deterministicServerId("src-1", "dev#1");
+    expect(core.getSnapshot().serverStatus.get(serverId)).toBe("running"); // the fixture really did land a sync
+
+    release();
+    await sweep;
+
+    expect(core.getSnapshot().serverStatus.get(serverId)).toBe("running"); // not repainted "stopped" by the stale report
   });
 
   it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {
