@@ -1,5 +1,8 @@
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
+  NETBOX_INSECURE_TLS_WARNING,
   NETBOX_PROVIDER_ID,
   DEFAULT_FOLDER_TEMPLATE,
   createNetboxProvider,
@@ -7,7 +10,12 @@ import {
   stripCidr,
   renderFolderTemplate
 } from "../../src/services/inventory/providers/netboxProvider";
+import { createInsecureHttpsFetch } from "../../src/services/inventory/insecureFetch";
+import { redirectNotFollowedMessage } from "../../src/services/inventory/certificateHints";
+import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { deviceMatchesFilter, parseTemplateFilter } from "../../src/services/inventory/templateApply";
+import { InventoryProviderError, type InventoryConfigField } from "../../src/models/inventory";
+import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
   const text = typeof body === "string" ? body : JSON.stringify(body);
@@ -119,7 +127,17 @@ describe("createNetboxProvider", () => {
   it("has the expected id and a stable config field order (drives sequential add-source prompts)", () => {
     const provider = createNetboxProvider(vi.fn() as unknown as typeof fetch);
     expect(provider.id).toBe(NETBOX_PROVIDER_ID);
-    expect(provider.configFields.map((f) => f.id)).toEqual(["baseUrl", "apiToken", "filter", "folderTemplate", "includeVms", "primaryIpFamily"]);
+    expect(provider.configFields.map((f) => f.id)).toEqual([
+      "baseUrl",
+      "apiToken",
+      "filter",
+      "folderTemplate",
+      "includeVms",
+      "primaryIpFamily",
+      // INSECURE TLS — appended LAST on purpose: the order is part of the
+      // provider fingerprint and drives the sequential add-source prompts.
+      "allowInsecureTls"
+    ]);
     expect(provider.configFields.find((f) => f.id === "apiToken")?.type).toBe("password");
   });
 
@@ -1060,5 +1078,476 @@ describe("createNetboxProvider", () => {
       expect(vm.attributes!.rack).toBeUndefined();
       expect(vm.attributes!.location).toBeUndefined();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INSECURE TLS — the same per-source opt-in EVE-NG shipped in 2.8.190, and the
+// question that actually matters: which transport a given config selects.
+// ---------------------------------------------------------------------------
+
+/**
+ * Self-hosted NetBox is commonly behind a self-signed certificate, or reached by
+ * IP address with a certificate that never listed it, and this provider used the
+ * same plain injected `fetch` EVE-NG used — so it failed the same way, with the
+ * same unexplained OpenSSL code and no way to say "yes, I know, connect anyway".
+ *
+ * The transport itself is NOT a second implementation: `insecureFetch.ts` was
+ * written provider-agnostic for EVE-NG and is reused as-is (see there for why
+ * `NODE_TLS_REJECT_UNAUTHORIZED` is not an option in a shared extension host).
+ *
+ * The tests that matter here are the NEGATIVE ones: an opted-out source and an
+ * `http:` source must never reach the insecure transport.
+ */
+describe("createNetboxProvider — allowInsecureTls field", () => {
+  const field = (): InventoryConfigField => {
+    const found = createNetboxProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "allowInsecureTls");
+    expect(found).toBeDefined();
+    return found!;
+  };
+
+  it("is an OPTIONAL boolean that starts OFF, and is drawn behind the Advanced disclosure (⊘ a defaultValue of true silently turns certificate verification off for every new source)", () => {
+    const f = field();
+    expect(f.type).toBe("boolean");
+    expect(f.required).not.toBe(true);
+    expect(f.defaultValue).toBe(false);
+    expect(f.advanced).toBe(true);
+  });
+
+  /**
+   * The wording diverges from EVE-NG's here, and deliberately: what travels over
+   * a NetBox connection is an API TOKEN, not a password. Naming a password would
+   * be describing an exposure this user does not have while leaving the one they
+   * do have unnamed — and the token is the more dangerous of the two to leak,
+   * being a bearer credential that no second factor stands behind.
+   */
+  it("names THE API TOKEN as what crosses the unverified connection, not a password (⊘ borrowing EVE-NG's password wording describes an exposure NetBox users do not have and hides the bearer token they do)", () => {
+    const hint = String(field().description ?? "").toLowerCase();
+    expect(hint).toMatch(/api token/);
+    expect(hint).not.toMatch(/password/);
+    expect(hint).toMatch(/intercept|unauthenticated|not verified|unverified/);
+    expect(hint).toMatch(/trust|http base url|no effect/);
+  });
+
+  it("is appended LAST, so no existing field changes position (⊘ inserting it mid-list reorders the sequential add-source prompts and re-asks for values against the wrong labels)", () => {
+    const ids = createNetboxProvider(vi.fn() as unknown as typeof fetch).configFields.map((f) => f.id);
+    expect(ids[ids.length - 1]).toBe("allowInsecureTls");
+  });
+
+  it("still passes the provider-shape validation the registry runs, with the new field in place", () => {
+    expect(() => validateProviderShape(createNetboxProvider(vi.fn() as unknown as typeof fetch))).not.toThrow();
+  });
+});
+
+describe("createNetboxProvider — insecure TLS transport selection", () => {
+  /** An empty but well-formed NetBox that answers every endpoint. */
+  function world(): { impl: typeof fetch; calls: { url: string; init?: RequestInit }[] } {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const impl = async (url: string, init?: RequestInit): Promise<unknown> => {
+      calls.push({ url: String(url), init });
+      if (String(url).includes("/api/status/")) return makeResponse(200, { "netbox-version": "4.1.0" });
+      return makeResponse(200, { count: 0, results: [] });
+    };
+    return { impl: impl as unknown as typeof fetch, calls };
+  }
+
+  function probes(): {
+    standard: ReturnType<typeof world>;
+    insecure: ReturnType<typeof world>;
+    provider: ReturnType<typeof createNetboxProvider>;
+  } {
+    const standard = world();
+    const insecure = world();
+    return { standard, insecure, provider: createNetboxProvider(standard.impl, insecure.impl) };
+  }
+
+  const SECRETS = { apiToken: "tok" };
+
+  it("uses the insecure transport — and ONLY it — for an https source that opted in", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls).toHaveLength(0);
+  });
+
+  it("NEVER uses it for a source that did not opt in, however the certificate would have failed (⊘ selecting on the URL scheme alone turns verification off for every https source)", async () => {
+    for (const config of [{ baseUrl: "https://10.0.0.5", allowInsecureTls: false }, { baseUrl: "https://10.0.0.5" }]) {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory(config, SECRETS);
+      expect(standard.calls.length).toBeGreaterThan(0);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  });
+
+  it("NEVER uses it for an http source, where relaxing certificate checks means nothing and the adapter would refuse the URL anyway (⊘ selecting on the opt-in alone breaks every plain-http source the moment the box is ticked)", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ baseUrl: "http://netbox.example.com", allowInsecureTls: true }, SECRETS);
+    expect(standard.calls.length).toBeGreaterThan(0);
+    expect(insecure.calls).toHaveLength(0);
+  });
+
+  it("decides per CONFIG, not per provider — one registry serves every source, so two sources on one provider must get different transports", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    await provider.fetchInventory({ baseUrl: "https://netbox.example.com" }, SECRETS);
+    // Compare the parsed HOST, not a URL prefix: `startsWith("https://netbox.example.com")`
+    // is also satisfied by `https://netbox.example.com.evil.net/…`, so the assertion
+    // would hold even if a request went somewhere else entirely.
+    expect(insecure.calls.every((c) => new URL(c.url).host === "10.0.0.5")).toBe(true);
+    expect(standard.calls.every((c) => new URL(c.url).host === "netbox.example.com")).toBe(true);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls.length).toBeGreaterThan(0);
+  });
+
+  it("routes BOTH entry points through the same decision (⊘ one path built without the selector connects with verification ON and the user's source works from the tree but not from Test Connection, or the reverse)", async () => {
+    const opted = { baseUrl: "https://10.0.0.5", allowInsecureTls: true };
+    const runs: ((p: ReturnType<typeof createNetboxProvider>) => Promise<unknown>)[] = [
+      (p) => p.fetchInventory(opted, SECRETS),
+      (p) => p.testConnection(opted, SECRETS)
+    ];
+    for (const run of runs) {
+      const { standard, insecure, provider } = probes();
+      await run(provider).catch(() => undefined);
+      expect(insecure.calls.length).toBeGreaterThan(0);
+      expect(standard.calls).toHaveLength(0);
+    }
+  });
+
+  it("normalizes the scheme before deciding, so an uppercase HTTPS:// base URL is still https (⊘ a raw startsWith('https:') check reads HTTPS:// as plain http and silently ignores the opt-in)", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ baseUrl: "HTTPS://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls).toHaveLength(0);
+  });
+
+  /**
+   * THE STRICTNESS IS LOAD-BEARING (EVE-NG A4, same finding). The negative cases
+   * above only cover `false` and absent, so the mutation `if
+   * (!config.allowInsecureTls)` would pass every one of them. The string "true"
+   * is reachable — a restored backup, or a hand-edited globalState, stores
+   * whatever it holds — and under that mutation it turns certificate
+   * verification OFF for a source whose owner never ticked a box.
+   */
+  it.each([["true"], ["false"], [1], [0], ["0"], ["yes"], [{}]])(
+    "treats a NON-boolean %o as no opt-in at all and keeps the standard transport (⊘ a truthiness test turns verification off for a value the form can never produce)",
+    async (value) => {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory({ baseUrl: "https://10.0.0.5", allowInsecureTls: value as unknown as boolean }, SECRETS);
+      expect(standard.calls.length).toBeGreaterThan(0);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  );
+
+  /** The URL-parse `catch` is OBSERVABLE, not dead: `new URL("https:")` throws. */
+  it.each(["https:", "https:/"])(
+    "falls back to the STANDARD transport for the unparseable base URL %o, even with the box ticked (⊘ a catch that returns the insecure transport relaxes TLS on a URL nobody could parse)",
+    async (baseUrl) => {
+      const { insecure, provider } = probes();
+      await provider.fetchInventory({ baseUrl, allowInsecureTls: true }, SECRETS).catch(() => undefined);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  );
+
+  /**
+   * THE ADAPTER'S OWN PRECONDITION. `insecureFetch` REFUSES any redirect mode
+   * other than `"manual"` — it never follows a redirect, and accepting `follow`
+   * while not following would be a silent lie. NetBox's requests did not set one
+   * (the platform `fetch` default is `follow`), so an opted-in source would have
+   * had every single request rejected by the adapter before a socket opened.
+   */
+  it("asks the insecure transport for redirect: \"manual\", which is the only mode it accepts (⊘ leaving the default makes every request on an opted-in source fail inside the adapter, before it reaches the server)", async () => {
+    const { insecure, provider } = probes();
+    await provider.fetchInventory({ baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    for (const call of insecure.calls) {
+      expect(call.init?.redirect).toBe("manual");
+    }
+  });
+
+  /**
+   * …and NOT on the standard transport. Every existing NetBox source runs there,
+   * some behind a reverse proxy that redirects; turning redirect-following off
+   * for them would be a behaviour change nobody asked for, delivered as an
+   * unexplained HTTP 301 protocol error.
+   */
+  it("leaves the STANDARD transport's redirect handling exactly as it was (⊘ setting manual globally breaks every existing source behind a redirecting proxy, which is not what a new opt-in is allowed to do)", async () => {
+    const { standard, provider } = probes();
+    await provider.fetchInventory({ baseUrl: "https://netbox.example.com" }, SECRETS);
+    expect(standard.calls.length).toBeGreaterThan(0);
+    for (const call of standard.calls) {
+      expect(call.init?.redirect).toBeUndefined();
+    }
+  });
+
+  it("defaults the second argument to the real node:https adapter, so a provider built the way activate() builds it is not silently transport-less", () => {
+    expect(() => createNetboxProvider(vi.fn() as unknown as typeof fetch)).not.toThrow();
+  });
+});
+
+/**
+ * DISCLOSURE AFTER THE FACT (EVE-NG A2, same reasoning). `allowInsecureTls` is
+ * read once, at transport selection, and would otherwise never be heard from
+ * again — so a source ticked for a lab box and later repointed at a production
+ * NetBox keeps sending the API token over an unauthenticated connection with
+ * nothing on screen saying so. It is also the answer to a restored backup
+ * enabling the flag: the import trust boundary is already broad, so the
+ * proportionate response is disclosure, not another gate.
+ */
+describe("createNetboxProvider — a sync run with verification off discloses it", () => {
+  const SECRETS = { apiToken: "tok" };
+
+  function provider(): ReturnType<typeof createNetboxProvider> {
+    const impl = (async (url: string) =>
+      String(url).includes("/api/status/")
+        ? makeResponse(200, { "netbox-version": "4.1.0" })
+        : makeResponse(200, {
+            count: 1,
+            results: [{ id: 1, name: "dev-1", primary_ip: { address: "10.0.0.1/24" }, site: { name: "Sydney" } }]
+          })) as unknown as typeof fetch;
+    return createNetboxProvider(impl, impl);
+  }
+
+  it("warns EXACTLY ONCE that this source's certificate is not verified, naming the option and the API-token exposure (⊘ a sync that silently ran unauthenticated — the whole point of the disclosure)", async () => {
+    const tree = await provider().fetchInventory({ baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect((tree.warnings ?? []).filter((w) => w === NETBOX_INSECURE_TLS_WARNING)).toHaveLength(1);
+    // The two clauses that must survive any later rewording: the option the user
+    // can turn back off, and what is actually crossing the unverified connection.
+    expect(NETBOX_INSECURE_TLS_WARNING).toContain("Allow a Self-Signed or Mismatched Certificate");
+    expect(NETBOX_INSECURE_TLS_WARNING.toLowerCase()).toContain("api token");
+  });
+
+  it("says NOTHING for a source that is actually verifying its certificate (⊘ an unconditional warning trains the user to ignore the one that means something)", async () => {
+    for (const config of [
+      { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
+      { baseUrl: "https://10.0.0.5" },
+      // Ticked but http: the selector keeps the standard transport, so nothing
+      // was relaxed and there is nothing to disclose.
+      { baseUrl: "http://netbox.example.com", allowInsecureTls: true }
+    ]) {
+      const tree = await provider().fetchInventory(config, SECRETS);
+      // Asserted against the CONSTANT, not a substring like "certificate": the
+      // warning capitalises the word in both places it uses it, so a
+      // case-sensitive substring search matches nothing and the assertion holds
+      // even when the warning IS wrongly emitted.
+      expect(tree.warnings ?? []).not.toContain(NETBOX_INSECURE_TLS_WARNING);
+    }
+  });
+});
+
+/**
+ * The error a user actually hits BEFORE they know the option exists. NetBox's
+ * `mapNetworkError` echoed the bare node code (`Could not reach 10.0.0.5:
+ * DEPTH_ZERO_SELF_SIGNED_CERT.`), which names the problem in a vocabulary the
+ * user did not choose and offers no remedy. The sentence comes from the SHARED
+ * table (`services/inventory/certificateHints.ts`), so NetBox cannot fall behind
+ * EVE-NG as codes are added to it.
+ */
+describe("createNetboxProvider — certificate errors name the option", () => {
+  function failsWith(code: string, viaCause = false): typeof fetch {
+    return (async () => {
+      const err = new Error("fetch failed");
+      if (viaCause) {
+        (err as { cause?: unknown }).cause = Object.assign(new Error(code), { code });
+      } else {
+        (err as { code?: string }).code = code;
+      }
+      throw err;
+    }) as unknown as typeof fetch;
+  }
+
+  async function messageFor(code: string, viaCause = false): Promise<string> {
+    const err = await createNetboxProvider(failsWith(code, viaCause))
+      .testConnection({ baseUrl: "https://10.0.0.5" }, { apiToken: "tok" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as InventoryProviderError).kind).toBe("network");
+    return (err as Error).message;
+  }
+
+  const CERT_CODES = [
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "CERT_HAS_EXPIRED",
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "CERT_NOT_YET_VALID"
+  ];
+
+  it.each(CERT_CODES)(
+    "names the option, and the host, instead of leaving %s to speak for itself (⊘ dropping the mapping restores the bare code, which is the state the user was stuck in)",
+    async (code) => {
+      const message = await messageFor(code);
+      expect(message).toContain("10.0.0.5");
+      expect(message).toContain("Allow a Self-Signed or Mismatched Certificate");
+      expect(message).toContain(ADVANCED_SECTION_LABEL);
+      expect(message).not.toBe(`Could not reach 10.0.0.5: ${code}.`);
+    }
+  );
+
+  it.each(CERT_CODES)("keeps %s itself in the message tail, because the code is what makes the failure diagnosable", async (code) => {
+    expect(await messageFor(code)).toContain(code);
+  });
+
+  it("says API TOKEN where EVE-NG says password — that is what NetBox sends over the unverified connection (⊘ a shared sentence that hard-codes one provider's credential misdescribes the other's exposure)", async () => {
+    const message = (await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).toLowerCase();
+    expect(message).toContain("api token");
+    expect(message).not.toContain("password");
+  });
+
+  it("does NOT claim NetBox ships a self-signed certificate by default, which is EVE-NG's situation and not NetBox's (⊘ a shared table that keeps one provider's aside states something untrue about the other)", async () => {
+    expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).not.toContain("ships by default");
+  });
+
+  it("reads the code out of `cause` too — undici puts it there, and node:https puts it on the error itself", async () => {
+    expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT", true)).toContain("Allow a Self-Signed or Mismatched Certificate");
+  });
+
+  it("leaves every NON-certificate code's wording exactly as it was (⊘ a greedy match rewrites ECONNREFUSED into advice about certificates)", async () => {
+    for (const code of ["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "ECONNRESET", "CERT_SOMETHING_NEW"]) {
+      expect(await messageFor(code)).toBe(`Could not reach 10.0.0.5: ${code}.`);
+    }
+  });
+
+  it("reads the hint table by OWN member only, so an inherited name is not a certificate hint (⊘ the table answers `constructor` with a function and the message becomes whatever calling it returns)", async () => {
+    for (const code of ["constructor", "toString", "hasOwnProperty", "__proto__", "valueOf"]) {
+      expect(await messageFor(code)).toBe(`Could not reach 10.0.0.5: ${code}.`);
+    }
+  });
+
+  it("still reports a timeout as a timeout — an abort has no code and must not be swept into the certificate branch", async () => {
+    const timesOut = (async () => {
+      throw new DOMException("timed out", "TimeoutError");
+    }) as unknown as typeof fetch;
+    const err = await createNetboxProvider(timesOut)
+      .testConnection({ baseUrl: "https://10.0.0.5" }, { apiToken: "tok" })
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toBe("Connection to 10.0.0.5 timed out.");
+  });
+
+  it("names the option by its EXACT form label (⊘ a hint pointing at a control the user cannot find by that name is worse than the bare OpenSSL code it replaced)", async () => {
+    const label = createNetboxProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "allowInsecureTls")!.label;
+    expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).toContain(label);
+  });
+});
+
+/**
+ * THE SECOND WALL a user hits on the way through the certificate opt-in. The
+ * insecure transport cannot follow a redirect — the adapter refuses any mode but
+ * `"manual"` — so a host that canonicalises a trailing slash answered the sync
+ * with `failed with HTTP 301: ` and an empty body. Having just been sent here by
+ * our own certificate message, the user gets a second dead end that names
+ * neither cause nor remedy.
+ */
+describe("createNetboxProvider — a 3xx on the transport that cannot follow it", () => {
+  const SECRETS = { apiToken: "tok" };
+  const OPTED_IN = { baseUrl: "https://10.0.0.5", allowInsecureTls: true };
+
+  function redirects(status: number, location?: string): typeof fetch {
+    return (async () => ({
+      status,
+      text: async () => "",
+      headers: { get: (name: string) => (name.toLowerCase() === "location" ? (location ?? null) : null) }
+    })) as unknown as typeof fetch;
+  }
+
+  /**
+   * The SAME implementation is installed as both transports, so the only thing
+   * that varies between these cases is which one the config selects — the
+   * wording difference cannot come from the responses differing.
+   */
+  async function messageFor(impl: typeof fetch, config: Record<string, unknown> = OPTED_IN): Promise<string> {
+    const err = await createNetboxProvider(impl, impl)
+      .testConnection(config, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    return (err as Error).message;
+  }
+
+  it("explains the redirect and names the address the server pointed at, which is the base URL the source should have (⊘ dropping the branch restores `failed with HTTP 301: ` with nothing after the colon — the state the user was stuck in)", async () => {
+    const message = await messageFor(redirects(301, "https://netbox.example.com/api/status/"));
+    expect(message).toContain("301");
+    expect(message).toContain("does not follow redirects");
+    expect(message.toLowerCase()).toContain("base url");
+    expect(message).toContain("https://netbox.example.com/api/status/");
+  });
+
+  it("says the server named no Location when it sent none, rather than promising an address it never gives (⊘ interpolating an absent header prints `undefined` as the address to use)", async () => {
+    const message = await messageFor(redirects(302));
+    expect(message).toContain("does not follow redirects");
+    expect(message).not.toContain("undefined");
+    expect(message).toContain("no Location");
+  });
+
+  it("uses the SAME sentence EVE-NG uses — one shared module, so the two providers cannot explain the same dead end differently (⊘ a copied sentence drifts the moment one of them is reworded)", async () => {
+    const message = await messageFor(redirects(301, "https://netbox.example.com/api/status/"));
+    expect(message).toContain(redirectNotFollowedMessage("https://netbox.example.com/api/status/"));
+  });
+
+  it("leaves a 3xx on the STANDARD transport worded exactly as it always was — that transport DOES follow redirects, so advice about not following them would be wrong there (⊘ applying the branch to both transports tells every existing source something untrue about its own connection)", async () => {
+    const message = await messageFor(redirects(301, "https://netbox.example.com/api/status/"), { baseUrl: "https://10.0.0.5" });
+    expect(message).toBe("NetBox request to https://10.0.0.5/api/status/ failed with HTTP 301: ");
+  });
+});
+
+/**
+ * THE END-TO-END SEAM. Every test above stubs the insecure transport with a spy,
+ * which proves the SELECTION is right and nothing about whether the requests
+ * NetBox builds are ones the real adapter will accept.
+ *
+ * That gap is not theoretical: `insecureFetch` refuses a request whose redirect
+ * mode is not `"manual"`, refuses a non-string body, and refuses a `Request`
+ * object — and NetBox's requests were written years before it existed. So this
+ * runs an actual sync through the REAL `createInsecureHttpsFetch`, with only its
+ * `node:https` seam faked, and asserts a device comes out the other end.
+ */
+describe("createNetboxProvider — a real sync over the real insecure adapter", () => {
+  it("completes a sync through createInsecureHttpsFetch itself, with certificate verification off (⊘ the adapter rejects NetBox's request shape and every opted-in source fails before a socket opens — invisible to a test that stubs the transport)", async () => {
+    const seen: { rejectUnauthorized: unknown; path: unknown }[] = [];
+    const requestImpl = ((options: { rejectUnauthorized?: unknown; path?: unknown }, callback: (res: unknown) => void) => {
+      seen.push({ rejectUnauthorized: options.rejectUnauthorized, path: options.path });
+      const body = String(options.path).includes("/api/status/")
+        ? JSON.stringify({ "netbox-version": "4.1.0" })
+        : JSON.stringify({
+            count: 1,
+            results: [{ id: 1, name: "dev-1", primary_ip: { address: "10.0.0.1/24" }, site: { name: "Sydney" } }]
+          });
+      const res = Readable.from([Buffer.from(body, "utf8")]) as Readable & {
+        statusCode?: number;
+        statusMessage?: string;
+        headers?: Record<string, string>;
+      };
+      res.statusCode = 200;
+      res.statusMessage = "OK";
+      res.headers = { "content-type": "application/json" };
+      // Delivered asynchronously, as node does — the adapter attaches its
+      // listeners after `request()` returns.
+      setTimeout(() => callback(res), 0);
+      const req = new EventEmitter() as EventEmitter & {
+        end: () => void;
+        destroy: () => void;
+        setTimeout: (ms: number, cb: () => void) => unknown;
+      };
+      req.end = (): void => undefined;
+      req.destroy = (): void => undefined;
+      req.setTimeout = (): unknown => req;
+      return req;
+    }) as unknown as Parameters<typeof createInsecureHttpsFetch>[0];
+
+    const refuse = (async () => {
+      throw new Error("the standard transport must not be used by an opted-in https source");
+    }) as unknown as typeof fetch;
+
+    const provider = createNetboxProvider(refuse, createInsecureHttpsFetch(requestImpl));
+    const tree = await provider.fetchInventory({ baseUrl: "https://10.0.0.5", allowInsecureTls: true }, { apiToken: "tok" });
+
+    expect(tree.devices).toHaveLength(1);
+    expect(tree.devices[0].name).toBe("dev-1");
+    expect(tree.warnings ?? []).toContain(NETBOX_INSECURE_TLS_WARNING);
+    // The whole point of the transport: every request went out with
+    // certificate verification turned off, on sockets this call owns.
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((s) => s.rejectUnauthorized === false)).toBe(true);
   });
 });

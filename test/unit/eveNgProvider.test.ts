@@ -159,13 +159,18 @@ import { InventoryProviderError, type InventoryTree } from "../../src/models/inv
 
 const SESSION = "s3ss10n";
 
-function makeResponse(status: number, body: unknown, setCookie: string[] = []): unknown {
+function makeResponse(status: number, body: unknown, setCookie: string[] = [], location?: string): unknown {
   const text = typeof body === "string" ? body : JSON.stringify(body);
   return {
     status,
     text: async () => text,
     headers: {
-      get: (name: string) => (name.toLowerCase() === "set-cookie" ? (setCookie[0] ?? null) : null),
+      get: (name: string) => {
+        const header = name.toLowerCase();
+        if (header === "set-cookie") return setCookie[0] ?? null;
+        if (header === "location") return location ?? null;
+        return null;
+      },
       getSetCookie: () => setCookie
     }
   };
@@ -460,6 +465,330 @@ describe("createEveNgProvider — login and session", () => {
       .catch((e: unknown) => e);
     expect((err as InventoryProviderError).kind).toBe("protocol");
     expect((err as Error).message.toLowerCase()).toContain("cookie");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SESSION EXPIRY — the signal EVE-NG actually sends, which is not 401.
+// ---------------------------------------------------------------------------
+
+/**
+ * REPORTED FROM PRODUCTION. A real EVE-NG 6.2.0-20 Professional server with
+ * ~660 nodes died partway through a crawl:
+ *
+ *   EVE-NG request to …/api/labs/EVE-NG%20Labs/SDWAN%20VXLANv1.unl/nodes failed
+ *   with HTTP 412: {"code":412,"status":"unauthorized",
+ *                   "message":"User is not authenticated or session timed out (90001)."}
+ *
+ * The next attempt worked, because it began with a fresh login. The single
+ * silent re-login was already there and is the right shape — but every place
+ * that decided "is this an auth failure?" tested the HTTP status alone, and
+ * EVE-NG does not send 401 for an expired session. It sends 412 with a JSend
+ * envelope that says `unauthorized` in words.
+ *
+ * So the decision is keyed on THE ENVELOPE, not on the number 412. That
+ * distinction is the whole test set below: 412 is also EVE-NG's ordinary
+ * "precondition failed", and blanket-retrying it would paper over real errors
+ * with an extra login and then report the same failure anyway.
+ */
+describe("createEveNgProvider — an expired session (HTTP 412 + JSend unauthorized)", () => {
+  /** EVE-NG's own body, verbatim from the report. */
+  const EXPIRED = { code: 412, status: "unauthorized", message: "User is not authenticated or session timed out (90001)." };
+
+  /**
+   * A crawl in which the FIRST node fetch fails with `failure` and every later
+   * one succeeds — the mid-crawl shape of the report, where the session aged
+   * out partway through a long walk.
+   */
+  function crawlFailingOnceWith(failure: { status: number; body: unknown }): { fetchImpl: typeof fetch; logins: () => number } {
+    let logins = 0;
+    let nodeCalls = 0;
+    const impl = async (input: string): Promise<unknown> => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") {
+        logins++;
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}-${logins}`]);
+      }
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "6.2.0-20-pro" }));
+      if (path.startsWith("/api/folders")) {
+        return makeResponse(200, jsend({ folders: [], labs: [{ file: "L.unl", path: "/L.unl" }] }));
+      }
+      nodeCalls++;
+      if (nodeCalls === 1) return makeResponse(failure.status, failure.body);
+      return makeResponse(200, jsend({ "1": node() }));
+    };
+    return { fetchImpl: impl as unknown as typeof fetch, logins: () => logins };
+  }
+
+  it("re-logs in ONCE and finishes the crawl when a mid-crawl request comes back 412 + `status:\"unauthorized\"` (⊘ checking the HTTP status alone misses EVE-NG's real session-expiry signal, and a long sync dies partway through — the reported bug)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({ status: 412, body: EXPIRED });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    // The crawl COMPLETED: the lab's node was mapped, not lost.
+    expect(tree.devices).toHaveLength(1);
+    // Exactly one EXTRA login — the initial one plus the silent renewal.
+    expect(logins()).toBe(2);
+  });
+
+  it("does NOT retry a 412 that is an ordinary precondition failure, and surfaces it exactly as before (⊘ blanket-retrying every 412 spends a re-login on a real error and then reports it anyway, hiding the cause behind a credential round trip)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: { code: 412, status: "fail", message: "Cannot start node: the lab is locked." }
+    });
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+    expect((err as Error).message).toContain("412");
+    // THE MUTATION GUARD. A blanket 412 retry still surfaces this error (the
+    // second attempt fails the same way), so only the login count can tell the
+    // two implementations apart: one login, never two.
+    expect(logins()).toBe(1);
+  });
+
+  it("still re-logs in on a plain HTTP 401, which is what it always did (⊘ replacing the status check with the envelope check trades one missed signal for another)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({ status: 401, body: "session expired" });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  it("surfaces a SECOND consecutive expiry instead of logging in again (⊘ retrying per failure rather than once turns a server that always answers unauthorized into an unbounded login loop against the lab box)", async () => {
+    let logins = 0;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") {
+        logins++;
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}-${logins}`]);
+      }
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "6.2.0-20-pro" }));
+      return makeResponse(412, EXPIRED);
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    // Reported as what it is — the session could not be established, not an
+    // unexplained protocol failure at an arbitrary status code.
+    expect((err as InventoryProviderError).kind).toBe("auth");
+    expect(logins).toBe(2);
+  });
+
+  /**
+   * The sub-code is the other half of the signal, and the half that survives a
+   * reworded `status`. Matched in its parenthesised form only, so a message
+   * that merely contains the digits somewhere is not swept in.
+   */
+  it("recognises the 90001 sub-code even when the envelope's `status` is not the word unauthorized (⊘ keying on the status word alone misses an install that reports the same expiry as a plain failure)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: { code: 412, status: "fail", message: "User is not authenticated or session timed out (90001)." }
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  it("is not fooled by a body that is not JSON at all, or by one whose envelope says nothing about authentication (⊘ a substring search for \"unauthorized\" in the raw text retries on a 500 whose HTML error page happens to use the word)", async () => {
+    for (const body of [
+      "<html><body>412 Precondition Failed — unauthorized proxy configuration</body></html>",
+      { code: 412, status: "fail", message: "Precondition failed." },
+      { code: 412, status: "error", message: "Node 90001 could not be started." }
+    ]) {
+      const { fetchImpl, logins } = crawlFailingOnceWith({ status: 412, body });
+      await createEveNgProvider(fetchImpl)
+        .fetchInventory(CONFIG, SECRETS)
+        .catch(() => undefined);
+      expect(logins()).toBe(1);
+    }
+  });
+
+  /**
+   * THE CONSTRAINT ON ANY CHEAP PRE-FILTER. The predicate parses the body to
+   * decide, and the parse is skipped when a scan of the raw text rules the
+   * question out — so that scan has to admit EVERY shape the parsed envelope
+   * would say yes to. These two are the ones a plain
+   * `text.includes("unauthorized")` would drop on the floor: the in-envelope
+   * status CODE with no such word anywhere, and the word in another case.
+   */
+  it("re-logs in on an in-envelope `code:401` whose text never contains the word unauthorized (\u2298 a raw-text pre-filter keyed on that word alone stops recognising EVE-NG's in-envelope 401 and the crawl dies where it used to recover)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: { code: 401, status: "fail", message: "Session no longer valid." }
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  it("re-logs in when the envelope's status word is capitalised (\u2298 a case-SENSITIVE pre-filter misses `\"status\":\"Unauthorized\"`, which the predicate itself case-folds and accepts)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: { code: 412, status: "Unauthorized", message: "Session timed out." }
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  /**
+   * THE TWO SPELLINGS THAT PROVE A RAW-TEXT SCAN CANNOT ANSWER THIS QUESTION.
+   * JSON has more than one way to write the same value, and only the PARSER
+   * knows which ones are equal: `"\u0075nauthorized"` is the string
+   * "unauthorized" with no such substring in the body, and `4.01e2` is the
+   * number 401 with no such digits in the body. A pre-filter that decides by
+   * scanning the text therefore skips the parse on bodies the predicate would
+   * have accepted, and the silent re-login never fires — which is the
+   * production bug this whole block exists to prevent, back again for any
+   * server that spells its envelope either way. The decision must be made on
+   * the PARSED value, not on the characters that encoded it.
+   */
+  it("re-logs in when the status word is \\u-escaped in the JSON — `\"\\u0075nauthorized\"` (⊘ a raw-text pre-filter finds no such substring, skips the parse, and the expired session is surfaced as a hard error instead of being recovered)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: '{"code":412,"status":"\\u0075nauthorized","message":"Session timed out."}'
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    // Recovered: one silent re-login, and the crawl went on to map the node.
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  it("re-logs in when the in-envelope code is written in exponent form — `4.01e2`, which IS 401 (⊘ a raw-text pre-filter matching the literal digits 401 misses it, and the crawl dies where it used to recover)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: '{"code":4.01e2,"status":"fail","message":"Session no longer valid."}'
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  /**
+   * `authedGet` and `authedRequest` are two copies of the same retry, and the
+   * node-control path uses the second one. A fix applied to one of them leaves
+   * Start/Stop failing on exactly the server that reported the bug.
+   */
+  it("applies the same recovery to the node-control path, which goes through authedRequest rather than authedGet (⊘ fixing one of the two copies leaves Start/Stop broken on the very server that reported this)", async () => {
+    let logins = 0;
+    let actions = 0;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") {
+        logins++;
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}-${logins}`]);
+      }
+      // Community, so the action is a GET to the node-action endpoint.
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "5.0.1-13" }));
+      actions++;
+      if (actions === 1) return makeResponse(412, EXPIRED);
+      return makeResponse(200, jsend(null));
+    }) as unknown as typeof fetch;
+
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab 1.unl#1", "start");
+    expect(logins).toBe(2);
+    expect(actions).toBe(2);
+  });
+
+  /**
+   * THE OTHER DIRECTION, and the one that costs something when it goes wrong: a
+   * SUCCESS envelope is never an expired session, whatever its message happens
+   * to contain. The sub-code match is a regex over free text, so a server that
+   * mentions those digits parenthesised in a perfectly successful reply — a
+   * ticket number, a version, an id — would otherwise have its response DISCARDED
+   * and the request re-issued after a pointless re-login.
+   */
+  it("does NOT re-login on a SUCCESSFUL response whose message happens to contain (90001) — a success envelope is never an expired session (\u2298 testing the sub-code without excluding `status:\"success\"` throws away a good response and pays for a login to fetch it again)", async () => {
+    let logins = 0;
+    let nodeCalls = 0;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") {
+        logins++;
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}-${logins}`]);
+      }
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "6.2.0-20-pro" }));
+      if (path.startsWith("/api/folders")) {
+        return makeResponse(200, jsend({ folders: [], labs: [{ file: "L.unl", path: "/L.unl" }] }));
+      }
+      nodeCalls++;
+      return makeResponse(200, jsend({ "1": node() }, { message: "Nodes fetched from lab (90001)." }));
+    }) as unknown as typeof fetch;
+
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins).toBe(1);
+    // The response was USED, not thrown away and asked for a second time.
+    expect(nodeCalls).toBe(1);
+  });
+
+  /**
+   * The same guard on the path where re-issuing is not merely wasteful:
+   * `authedRequest` carries node Start/Stop, so treating a successful reply as an
+   * expired session re-sends a MUTATING request.
+   */
+  it("does NOT re-issue a node action whose success envelope contains (90001) (\u2298 without the success guard a start/stop that WORKED is sent a second time, on the strength of digits in its own confirmation message)", async () => {
+    let logins = 0;
+    let actions = 0;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") {
+        logins++;
+        return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}-${logins}`]);
+      }
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "6.2.0-20-pro" }));
+      actions++;
+      return makeResponse(200, jsend(null, { message: "Node started (90001)." }));
+    }) as unknown as typeof fetch;
+
+    await createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab 1.unl#1", "start");
+    expect(actions).toBe(1);
+    expect(logins).toBe(1);
+  });
+
+  /**
+   * The envelope can also arrive on an HTTP 200 — EVE-NG answers some refusals
+   * that way (the login path already relies on it). Classified by what the
+   * envelope says, not by the status line that carried it.
+   */
+  it("maps a 200 response whose envelope says `unauthorized` to `auth` rather than to an unexplained protocol error (⊘ a status-code-only reading calls an authentication failure a malformed response)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "5.0.1-13" }));
+      return makeResponse(200, EXPIRED);
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("auth");
+  });
+
+  /**
+   * The message in that envelope is SERVER-CONTROLLED text on a failed request,
+   * and it lands in a notification and the log. Every sibling echo bounds it
+   * (`throwForStatus` slices both of its own); this one did not, so a megabyte of
+   * message from a proxy or a wedged server went through whole.
+   */
+  it("bounds the echoed envelope message like its siblings do, rather than pasting the whole server-supplied string into the error (\u2298 an unbounded echo puts however much the server sent into a notification)", async () => {
+    const long = "A".repeat(5000);
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "5.0.1-13" }));
+      return makeResponse(200, { code: 412, status: "unauthorized", message: long });
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("auth");
+    // The same 200-character bound the sibling branch applies — enough to
+    // identify the failure, not the whole body.
+    expect((err as Error).message).toContain("A".repeat(200));
+    expect((err as Error).message).not.toContain("A".repeat(201));
   });
 });
 
@@ -1733,6 +2062,63 @@ describe("createEveNgProvider — error mapping", () => {
     expect(redirects.every((r) => r === "manual")).toBe(true);
   });
 
+  /**
+   * THE JOURNEY THIS CLOSES. Every EVE-NG request is sent `redirect: "manual"`,
+   * so a 3xx is a dead end — and it was reported as `failed with HTTP 301: `
+   * with an empty body after the colon, which says nothing about what happened
+   * or what to do. A host that canonicalises a trailing slash, or a reverse
+   * proxy that rewrites the path, produces exactly that. The answer is usually
+   * sitting in the `Location` header we already have in hand.
+   */
+  it("explains a 3xx instead of reporting a bare status code — the connection does not follow redirects, and the Location IS the base URL the source should name (\u2298 dropping the branch restores `failed with HTTP 301: ` with nothing after the colon)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      return makeResponse(301, "", [], "https://eve.lab.example/api/status");
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+    const message = (err as Error).message;
+    expect(message).toContain("301");
+    expect(message).toContain("does not follow redirects");
+    expect(message.toLowerCase()).toContain("base url");
+    // The address the server named, which is the answer the user needs.
+    expect(message).toContain("https://eve.lab.example/api/status");
+  });
+
+  it("says the server named no Location when it did not, rather than trailing off after the word `to` (\u2298 interpolating an absent header prints `undefined` as the address to use)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      return makeResponse(302, "");
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    const message = (err as Error).message;
+    expect(message).toContain("does not follow redirects");
+    expect(message).not.toContain("undefined");
+    expect(message).toContain("no Location");
+  });
+
+  it("bounds an absurd Location, which is unverified server-supplied text like every other echo here (\u2298 an unbounded header echo puts however much the server sent into a notification)", async () => {
+    const long = `https://eve.lab.example/${"a".repeat(5000)}`;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      return makeResponse(301, "", [], long);
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).not.toContain("a".repeat(300));
+  });
+
   it("MINOR-5 — treats a 3xx as a protocol error rather than success (⊘ no EVE-NG endpoint legitimately redirects; following one is how the crawl leaves the origin)", async () => {
     const fetchImpl = (async (input: string) => {
       if (new URL(input).pathname.endsWith("/api/auth/login")) return makeResponse(302, "", [`unetlab_session=${SESSION}`]);
@@ -2382,7 +2768,12 @@ describe("createEveNgProvider — a sync run with verification off discloses it"
       { baseUrl: "http://eve.example.com", allowInsecureTls: true }
     ]) {
       const tree = await provider().fetchInventory({ ...CONFIG, ...config }, SECRETS);
-      expect((tree.warnings ?? []).some((w) => w.includes("certificate"))).toBe(false);
+      // Asserted against the CONSTANT, not a substring like "certificate": the
+      // warning capitalises the word in both places it uses it, so a
+      // case-sensitive substring search matches nothing and the assertion holds
+      // even when the warning IS wrongly emitted — which made this test pass
+      // against an unconditional `warnings.push(...)`.
+      expect(tree.warnings ?? []).not.toContain(EVE_NG_INSECURE_TLS_WARNING);
     }
   });
 });
@@ -2431,6 +2822,21 @@ describe("createEveNgProvider — certificate errors name the option", () => {
 
   it.each(CERT_CODES)("keeps %s itself in the message tail, because the code is what makes the failure diagnosable", async (code) => {
     expect(await messageFor(code)).toContain(code);
+  });
+
+  /**
+   * THE EXTRACTION GUARD. The code→cause table and the "turn on <option>" sentence
+   * builder moved out to `services/inventory/certificateHints.ts` so NetBox could
+   * use the same one instead of copying it. EVE-NG's wording had to survive that
+   * move BYTE FOR BYTE — including the self-signed clause, which is
+   * EVE-NG-specific and is the part a generic shared table would quietly drop.
+   * Every other test here matches on fragments, so all of them would still pass
+   * against a subtly reworded sentence.
+   */
+  it("says the WHOLE self-signed sentence exactly as it did before the hint table was shared with NetBox (⊘ a shared table that generalises the wording drops \"which EVE-NG ships by default\" — the clause that tells the user a stock install is supposed to look like this)", async () => {
+    expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).toBe(
+      "10.0.0.5 presented a self-signed certificate, which EVE-NG ships by default. To connect anyway, turn on \u201cAllow a Self-Signed or Mismatched Certificate\u201d in this source's Advanced options \u2014 that skips certificate checks for this source only, and the EVE-NG password is then sent over an unverified connection. (DEPTH_ZERO_SELF_SIGNED_CERT)"
+    );
   });
 
   it("reads the code out of `cause` too — undici puts it there, and node:https puts it on the error itself", async () => {

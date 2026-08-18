@@ -1,4 +1,5 @@
 import { ADVANCED_SECTION_LABEL } from "../../../ui/formTypes";
+import { certificateFailureMessage, redirectNotFollowedMessage, type CertificateHintContext } from "../certificateHints";
 import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
@@ -297,38 +298,22 @@ class CrawlDeadlineExceeded extends Error {
 }
 
 /**
- * The TLS verification failures a lab EVE-NG box actually produces, and what to
- * say about each. Node reports these as opaque OpenSSL identifiers; echoed
- * verbatim (`Could not reach 10.0.0.5: DEPTH_ZERO_SELF_SIGNED_CERT.`) they name
- * the problem in a vocabulary the user never chose and offer no remedy — which
- * is exactly how someone gets stuck rather than merely refused.
+ * INSECURE TLS — what this provider contributes to the SHARED certificate-hint
+ * sentence (`services/inventory/certificateHints.ts`). The table of codes and the
+ * "turn on <option> in this source's <section>" builder are one copy for every
+ * provider that offers the opt-in; only the three provider-specific parts are
+ * named here.
  *
- * A CLOSED set, not a prefix match: `ECONNREFUSED` and any future
- * `CERT_`-shaped code that is NOT a verification failure must keep today's
- * wording rather than be swept into advice about certificates.
- *
- * The altname case is worded separately on purpose. It is the common shape of
- * this failure — a home server addressed by IP, holding a certificate that
- * never listed that IP — and calling it "not trusted" would be wrong: the
- * certificate may be signed perfectly well and simply issued for another name.
+ * `selfSignedNote` earns its place: EVE-NG SHIPS a self-signed certificate by
+ * default, so saying so is what tells the user this is the expected state of a
+ * stock install rather than something being wrong with their server.
  */
-const TLS_CERT_HINTS: Record<string, (host: string) => string> = {
-  DEPTH_ZERO_SELF_SIGNED_CERT: (host) => `${host} presented a self-signed certificate, which EVE-NG ships by default.`,
-  SELF_SIGNED_CERT_IN_CHAIN: (host) => `${host} presented a certificate signed by an authority this machine does not trust.`,
-  UNABLE_TO_VERIFY_LEAF_SIGNATURE: (host) => `${host} presented a certificate whose signature could not be verified — usually an incomplete chain.`,
-  ERR_TLS_CERT_ALTNAME_INVALID: (host) =>
-    `${host} presented a certificate that does not cover this address — the usual case when the server is reached by IP address rather than by the name on its certificate.`,
-  CERT_HAS_EXPIRED: (host) => `${host} presented an expired certificate.`,
-  // A private CA whose intermediate the server does not serve — the shape right
-  // behind self-signed/altname in a homelab, and worded as its own case because
-  // the certificate may be signed perfectly well by an authority this machine
-  // simply cannot reach the issuer of.
-  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: (host) =>
-    `${host} presented a certificate whose issuer is not held by this machine — the usual case for a private certificate authority whose chain the server does not serve.`,
-  // The clock-skew twin of CERT_HAS_EXPIRED: a lab box with a dead RTC issues a
-  // certificate dated in the future. Saying "expired" here would send the user
-  // to reissue a certificate that is fine.
-  CERT_NOT_YET_VALID: (host) => `${host} presented a certificate that is not yet valid — usually a clock that is wrong on one end or the other.`
+const EVE_NG_CERT_HINT_CONTEXT: CertificateHintContext = {
+  optionLabel: ALLOW_INSECURE_TLS_LABEL,
+  sectionLabel: ADVANCED_SECTION_LABEL,
+  // The clause the user is actually agreeing to; it must not be softened.
+  exposureNoun: "the EVE-NG password",
+  selfSignedNote: ", which EVE-NG ships by default"
 };
 
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
@@ -340,20 +325,11 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
     const cause = (err as { cause?: { code?: string } }).cause;
     const code = cause?.code ?? (err as { code?: string }).code;
     if (code) {
-      // OWN member only. A plain object literal answers `code` values like
-      // "constructor"/"toString" with an INHERITED function, and the branch
-      // below would then call it and build a message out of whatever came back.
-      // No real node code is spelled that way, but the guard costs one call and
-      // this codebase already draws the same line elsewhere (`hasOwnProperty`
-      // in ui/formDefinitions.ts).
-      const certHint = Object.prototype.hasOwnProperty.call(TLS_CERT_HINTS, code) ? TLS_CERT_HINTS[code] : undefined;
-      if (certHint) {
-        // The raw code stays in the tail: it is what makes the failure
-        // searchable and diagnosable once the sentence has done its job.
-        return new InventoryProviderError(
-          "network",
-          `${certHint(host)} To connect anyway, turn on \u201c${ALLOW_INSECURE_TLS_LABEL}\u201d in this source's ${ADVANCED_SECTION_LABEL} \u2014 that skips certificate checks for this source only, and the EVE-NG password is then sent over an unverified connection. (${code})`
-        );
+      // A TLS verification failure gets the shared sentence naming the opt-in;
+      // every other code keeps the wording it has always had.
+      const certMessage = certificateFailureMessage(code, host, EVE_NG_CERT_HINT_CONTEXT);
+      if (certMessage) {
+        return new InventoryProviderError("network", certMessage);
       }
       return new InventoryProviderError("network", `Could not reach ${host}: ${code}.`);
     }
@@ -362,9 +338,32 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   return new InventoryProviderError("network", `Could not reach ${host}: ${String(err)}`);
 }
 
-function throwForStatus(status: number, text: string, url: URL): never {
+function throwForStatus(status: number, text: string, parsed: ParsedBody, url: URL, location?: string): never {
   if (status === 401 || status === 403) {
     throw new InventoryProviderError("auth", `EVE-NG rejected the credentials (HTTP ${status}) at ${url}.`);
+  }
+  // SESSION EXPIRY — the status line is not the whole answer. EVE-NG refuses an
+  // unauthenticated request with HTTP 412 and says so only in the body (see
+  // `envelopeSaysUnauthorized`), and reaching here means the silent re-login has
+  // already had its one attempt. Reporting that as an unexplained `protocol`
+  // failure at an odd status code sends the user looking at the wrong thing.
+  const unauthorized = unauthorizedEnvelope(parsed);
+  if (unauthorized) {
+    throw new InventoryProviderError(
+      "auth",
+      `EVE-NG refused ${url} as unauthenticated (HTTP ${status}): ${str(unauthorized.message).slice(0, BODY_SLICE) || "no message"}`
+    );
+  }
+  // A REDIRECT IS A DEAD END HERE, and the body that would normally explain the
+  // failure is empty on a 3xx — so `failed with HTTP 301: ` said nothing at all.
+  // Every EVE-NG request is sent `redirect: "manual"` (see `raw`), on either
+  // transport, so this holds whether or not the source opted out of certificate
+  // verification. The shared sentence names the `Location`, which is the answer.
+  if (status >= 300 && status < 400) {
+    throw new InventoryProviderError(
+      "protocol",
+      `EVE-NG request to ${url} failed with HTTP ${status}: ${redirectNotFollowedMessage(location)}`
+    );
   }
   throw new InventoryProviderError("protocol", `EVE-NG request to ${url} failed with HTTP ${status}: ${text.slice(0, BODY_SLICE)}`);
 }
@@ -383,25 +382,151 @@ interface JSendEnvelope {
   data?: unknown;
 }
 
-function parseEnvelope(text: string, url: URL): JSendEnvelope {
-  let parsed: unknown;
+/**
+ * A RESPONSE BODY, PARSED EXACTLY ONCE. The box is present when the body was
+ * JSON (`json` is then whatever it parsed to, `null` included) and `undefined`
+ * when it was not JSON at all — the two answers `JSON.parse` gives, separated
+ * so that a body which legitimately parses to `undefined`-looking values cannot
+ * be confused with one that failed to parse.
+ *
+ * WHY IT EXISTS. Three places ask a question about the same body: the
+ * session-expiry predicate (`unauthorizedEnvelope`), the envelope reader
+ * (`parseEnvelope` via `unwrap`) and the error mapper (`throwForStatus`).
+ * Each used to run its own `JSON.parse`, so a crawl response — a full node
+ * listing, megabytes on the inventories this feature exists to serve — was
+ * parsed two or three times over. The parse now happens once, in `raw`, and
+ * every one of those three reads the SAME value.
+ *
+ * The alternative that was tried and removed was a raw-text pre-filter in front
+ * of the expiry predicate. It cannot work: JSON has many spellings of one value
+ * (`"\u0075nauthorized"` IS "unauthorized"; `4.01e2` IS 401), only the parser
+ * knows which, and a scan that misses one silently drops a body the predicate
+ * would have accepted — which is exactly the expired-session failure this file
+ * fixes. Sharing the parse removes the duplicated work AND the question.
+ */
+type ParsedBody = { readonly json: unknown } | undefined;
+
+/** `JSON.parse` once, with failure reported as `undefined` rather than a throw. */
+function parseBodyOnce(text: string): ParsedBody {
   try {
-    parsed = JSON.parse(text);
+    return { json: JSON.parse(text) as unknown };
   } catch {
+    return undefined;
+  }
+}
+
+function parseEnvelope(body: ParsedBody, url: URL): JSendEnvelope {
+  if (body === undefined) {
     // MINOR-7 — the body is attacker-influenced (a proxy's HTML error page,
     // say) and is NOT echoed into the message, matching NetBox's parse error.
     throw new InventoryProviderError("protocol", `Response from ${url} is not EVE-NG JSON — is the base URL correct?`);
   }
+  const parsed = body.json;
   if (!isObject(parsed) || !isString(parsed.status)) {
     throw new InventoryProviderError("protocol", `Response from ${url} is not an EVE-NG API envelope — is the base URL correct?`);
   }
   return parsed as unknown as JSendEnvelope;
 }
 
+/**
+ * EVE-NG'S ACTUAL SESSION-EXPIRY SIGNAL — reported from production (EVE-NG
+ * 6.2.0-20 Professional, ~660 nodes). A crawl died partway through on:
+ *
+ *   HTTP 412 {"code":412,"status":"unauthorized",
+ *             "message":"User is not authenticated or session timed out (90001)."}
+ *
+ * and the very next attempt succeeded, because it began with a fresh login. The
+ * single silent re-login below was already there and is the right shape; what was
+ * missing is that EVE-NG DOES NOT SAY 401 when a session ages out. It answers
+ * 412 and puts the real answer in the JSend body.
+ *
+ * So the question is "does the ENVELOPE say unauthorized?" — never "is the status
+ * 412?". 412 is a general precondition failure that EVE-NG also uses for ordinary
+ * refusals, and blanket-retrying it would spend a login on a real error and then
+ * report that same error one round trip later, no clearer than before.
+ *
+ * The sub-code is matched in its PARENTHESISED form only, so a message that
+ * merely contains those digits (a node id, a byte count) is not read as an
+ * expired session.
+ */
+const SESSION_EXPIRED_SUBCODE = /\(90001\)/;
+
+function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; message?: unknown }): boolean {
+  // A SUCCESS envelope is never an expired session, whatever else it says. The
+  // sub-code below is a regex over free text, so a successful reply that happens
+  // to mention those digits parenthesised would otherwise be read as an expiry —
+  // discarding a response that WORKED, spending a login, and re-issuing the
+  // request. On `authedRequest` that request is a node start/stop PUT, so the
+  // cost of getting this wrong is a repeated mutation, not a wasted round trip.
+  if (str(envelope.status).toLowerCase() === "success") {
+    return false;
+  }
+  // The status word EVE-NG actually sends, read the way every other envelope
+  // field here is read — trimmed and case-folded, because it comes off the wire.
+  if (str(envelope.status).toLowerCase() === "unauthorized") {
+    return true;
+  }
+  // The IN-ENVELOPE status code, which some endpoints answer with on an HTTP 200
+  // (M36). It lives in this one predicate so `unwrap` and the silent re-login ask
+  // exactly the same question rather than two that can drift.
+  if (envelope.code === 401 || envelope.code === 403) {
+    return true;
+  }
+  return SESSION_EXPIRED_SUBCODE.test(str(envelope.message));
+}
+
+/**
+ * The `Location` header, or `undefined`. Defensive about `headers` for the same
+ * reason `readSessionCookie` is: the injected `fetch` is a seam, and a
+ * Response-alike that answers no headers must not throw here on the error path.
+ */
+function readLocation(res: Response): string | undefined {
+  const headers = res.headers as unknown as { get?: (name: string) => string | null } | undefined;
+  const value = typeof headers?.get === "function" ? headers.get("location") : null;
+  return value ?? undefined;
+}
+
+/**
+ * The same question against a whole response: the envelope when the body parsed
+ * as one and says unauthorized, `undefined` otherwise — so the caller that needs
+ * the message has it without parsing again.
+ *
+ * Decided on the PARSED body, never on the characters that encoded it: a proxy's
+ * HTML error page is not an EVE-NG envelope whatever words it happens to
+ * contain, and — the other direction — an envelope that spells its status word
+ * or its code unusually is still that envelope.
+ */
+function unauthorizedEnvelope(body: ParsedBody): Record<string, unknown> | undefined {
+  const parsed = body?.json;
+  return isObject(parsed) && envelopeSaysUnauthorized(parsed) ? parsed : undefined;
+}
+
+/**
+ * ONE decision, asked by BOTH `authedGet` and `authedRequest` — the two copies of
+ * the silent re-login. Kept in one place because split across them, one would
+ * eventually learn a signal the other did not, and Start/Stop would go on failing
+ * on exactly the server whose sync had just been fixed.
+ */
+function isExpiredSessionResponse(status: number, body: ParsedBody): boolean {
+  return status === 401 || status === 403 || unauthorizedEnvelope(body) !== undefined;
+}
+
 interface RawResponse {
   status: number;
   text: string;
+  /**
+   * The body parsed ONCE, by `raw` — see `ParsedBody`. Carried on the response
+   * so the expiry predicate, `unwrap` and `throwForStatus` all read the same
+   * value instead of each running `JSON.parse` over the same text.
+   */
+  parsed: ParsedBody;
   url: URL;
+  /**
+   * The response's `Location`, when it sent one. Captured on every response
+   * rather than only on a 3xx, because the caller that reports the failure
+   * (`unwrap` → `throwForStatus`) no longer holds the `Response` itself.
+   */
+  location?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -491,7 +616,7 @@ class EveApiClient {
     }
   }
 
-  private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string }> {
+  private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string; parsed: ParsedBody }> {
     let res: Response;
     // WALL-CLOCK DEADLINE (#84 P2-2) — cap this request's timeout by the REMAINING
     // crawl budget, so a request issued just before the deadline (or a re-login
@@ -548,7 +673,9 @@ class EveApiClient {
       }
       text = "";
     }
-    return { res, text };
+    // THE ONE PARSE. Everything downstream — the expiry predicate, `unwrap`,
+    // `throwForStatus` — reads this value rather than parsing the text again.
+    return { res, text, parsed: parseBodyOnce(text) };
   }
 
   /**
@@ -563,7 +690,7 @@ class EveApiClient {
    */
   public async login(timeoutMs: number): Promise<void> {
     const url = this.buildUrl("/api/auth/login");
-    const { res, text } = await this.raw(
+    const { res, text, parsed } = await this.raw(
       url,
       {
         method: "POST",
@@ -573,9 +700,9 @@ class EveApiClient {
       timeoutMs
     );
     if (res.status < 200 || res.status >= 300) {
-      throwForStatus(res.status, text, url);
+      throwForStatus(res.status, text, parsed, url, readLocation(res));
     }
-    const envelope = parseEnvelope(text, url);
+    const envelope = parseEnvelope(parsed, url);
     if (envelope.status !== "success") {
       // A rejected password is HTTP 200 + `status: "fail"`. Anything non-success
       // on the LOGIN endpoint is a credential problem by definition, so it maps
@@ -611,11 +738,11 @@ class EveApiClient {
    */
   public async authedGet(path: string, timeoutMs: number): Promise<RawResponse> {
     const url = this.buildUrl(path);
-    const send = async (): Promise<{ res: Response; text: string }> =>
+    const send = async (): Promise<{ res: Response; text: string; parsed: ParsedBody }> =>
       this.raw(url, { headers: { Cookie: `unetlab_session=${this.session ?? ""}`, Accept: "application/json" } }, timeoutMs);
 
-    let { res, text } = await send();
-    if (res.status === 401 || res.status === 403) {
+    let { res, text, parsed } = await send();
+    if (isExpiredSessionResponse(res.status, parsed)) {
       // WALL-CLOCK DEADLINE (#84 P2-2) — the silent re-login is TWO more requests
       // (login + retry). Once the crawl deadline has passed, skip it and surface
       // the 401: retrying would run the crawl a full re-login+retry past the
@@ -623,12 +750,12 @@ class EveApiClient {
       // crawl. (When the deadline is merely NEAR, the retry still runs but each of
       // its requests is bounded by the remaining budget in `raw` above.)
       if (this.crawlDeadline !== undefined && Date.now() >= this.crawlDeadline) {
-        return { status: res.status, text, url };
+        return { status: res.status, text, parsed, url, location: readLocation(res) };
       }
       await this.login(timeoutMs);
-      ({ res, text } = await send());
+      ({ res, text, parsed } = await send());
     }
-    return { status: res.status, text, url };
+    return { status: res.status, text, parsed, url, location: readLocation(res) };
   }
 
   /**
@@ -641,7 +768,7 @@ class EveApiClient {
    */
   public async authedRequest(method: string, path: string, body?: unknown, timeoutMs: number = FETCH_TIMEOUT_MS): Promise<RawResponse> {
     const url = this.buildUrl(path);
-    const send = async (): Promise<{ res: Response; text: string }> =>
+    const send = async (): Promise<{ res: Response; text: string; parsed: ParsedBody }> =>
       this.raw(
         url,
         {
@@ -656,15 +783,15 @@ class EveApiClient {
         timeoutMs
       );
 
-    let { res, text } = await send();
-    if (res.status === 401 || res.status === 403) {
+    let { res, text, parsed } = await send();
+    if (isExpiredSessionResponse(res.status, parsed)) {
       // Same single-retry discipline as authedGet — one re-login, never a loop
       // against the lab server. (No crawl deadline is armed on the control path,
       // so the deadline short-circuit authedGet carries is simply inert here.)
       await this.login(timeoutMs);
-      ({ res, text } = await send());
+      ({ res, text, parsed } = await send());
     }
-    return { status: res.status, text, url };
+    return { status: res.status, text, parsed, url, location: readLocation(res) };
   }
 
   /** `authedGet` plus the 2xx + JSend-success checks — the normal path. */
@@ -1041,12 +1168,18 @@ class EveApiClient {
 /** 2xx + JSend `status: "success"`, or the mapped error for whatever went wrong. */
 function unwrap(raw: RawResponse): unknown {
   if (raw.status < 200 || raw.status >= 300) {
-    throwForStatus(raw.status, raw.text, raw.url);
+    throwForStatus(raw.status, raw.text, raw.parsed, raw.url, raw.location);
   }
-  const envelope = parseEnvelope(raw.text, raw.url);
+  const envelope = parseEnvelope(raw.parsed, raw.url);
   if (envelope.status !== "success") {
-    if (envelope.code === 401 || envelope.code === 403) {
-      throw new InventoryProviderError("auth", `EVE-NG refused ${raw.url}: ${str(envelope.message) || envelope.status}`);
+    // SESSION EXPIRY — the same predicate the silent re-login uses, so a 200 that
+    // carries an unauthorized envelope is reported as `auth` rather than as a
+    // malformed response.
+    if (envelopeSaysUnauthorized(envelope)) {
+      // BOUNDED like every sibling echo (`throwForStatus` slices both of its
+      // own): the message is server-supplied text on a failed request and ends
+      // up in a notification.
+      throw new InventoryProviderError("auth", `EVE-NG refused ${raw.url}: ${str(envelope.message).slice(0, BODY_SLICE) || envelope.status}`);
     }
     throw new InventoryProviderError(
       "protocol",

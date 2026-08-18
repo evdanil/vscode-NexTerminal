@@ -1,3 +1,6 @@
+import { ADVANCED_SECTION_LABEL } from "../../../ui/formTypes";
+import { certificateFailureMessage, redirectNotFollowedMessage, type CertificateHintContext } from "../certificateHints";
+import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
   type InventoryConfigField,
@@ -18,6 +21,36 @@ const TEST_CONNECTION_TIMEOUT_MS = 10_000;
 // F11 — Nexus owns pagination; a user-supplied filter that also sets these would
 // silently fight our own offset math (or leak `brief` mode past what the mapper expects).
 const RESERVED_FILTER_KEYS = new Set(["limit", "offset", "brief"]);
+
+/**
+ * INSECURE TLS — ONE definition of the option's name, used both as the config
+ * field's label and inside the certificate-error hint that tells the user to go
+ * turn it on. A message naming an option the form does not show is worse than
+ * the bare OpenSSL code it replaced, so the two cannot be allowed to drift.
+ *
+ * Word-for-word EVE-NG's label: it is the same option, doing the same thing, and
+ * a user with both kinds of source should not have to learn it twice.
+ */
+const ALLOW_INSECURE_TLS_LABEL = "Allow a Self-Signed or Mismatched Certificate";
+
+/**
+ * INSECURE TLS — what a sync that RAN with certificate verification off says
+ * about itself, on the `tree.warnings` channel that reaches the sync plan.
+ *
+ * The opt-in is read once, at transport selection, and would otherwise never be
+ * heard from again — so a source ticked for a lab NetBox and later repointed at
+ * a production one keeps sending the API token over an unauthenticated
+ * connection with nothing on screen saying so. (Same answer for a restored
+ * backup that enables the flag: an import can already add telnet servers,
+ * proxies and jump hosts, so the proportionate response is disclosure, not
+ * another gate.)
+ *
+ * Names the option so it can be found and turned back off, and names the API
+ * TOKEN because that — not a password — is what NetBox puts on the wire, and it
+ * is a bearer credential with no second factor behind it.
+ */
+export const NETBOX_INSECURE_TLS_WARNING =
+  `Certificate verification is off for this source (\u201c${ALLOW_INSECURE_TLS_LABEL}\u201d) \u2014 the connection is encrypted but unauthenticated, and the NetBox API token is sent over it.`;
 
 const NETBOX_CONFIG_FIELDS: InventoryConfigField[] = [
   {
@@ -76,6 +109,33 @@ const NETBOX_CONFIG_FIELDS: InventoryConfigField[] = [
     ],
     description:
       "Which address to import when a device has both IPv4 and IPv6 primary IPs. Automatic uses NetBox's own primary IP (IPv6 when both exist). Prefer options fall back to the primary IP when the device has no address in that family. The out-of-band (BMC) address is never affected."
+  },
+  {
+    // INSECURE TLS — the opt-in that makes a self-signed or IP-addressed
+    // self-hosted NetBox reachable at all. Default OFF and behind the Advanced
+    // disclosure: it turns a safety default off, so it must be a deliberate act
+    // rather than something a user finds themselves next to while typing a base
+    // URL.
+    //
+    // APPENDED LAST so no existing field changes position. The field list is
+    // part of the provider fingerprint (`computeProviderFingerprint`,
+    // models/inventory.ts) — its ids, labels, types, required flags and ORDER
+    // are hashed and stamped onto every source at save time — so adding this
+    // field makes every EXISTING NetBox source prompt once to re-confirm handing
+    // the registrant its saved credentials, exactly as EVE-NG sources did in
+    // 2.8.190. That is a one-time, user-visible event, and the reason the
+    // position is chosen rather than convenient.
+    id: "allowInsecureTls",
+    label: ALLOW_INSECURE_TLS_LABEL,
+    type: "boolean",
+    required: false,
+    defaultValue: false,
+    advanced: true,
+    // Same voice as EVE-NG's, with the credential corrected: what NetBox sends
+    // is an API TOKEN, not a password. That clause is the part that must not be
+    // softened — it is what the user is actually agreeing to send.
+    description:
+      "Connects over https without checking the server's certificate. The traffic is encrypted but unauthenticated, so anything on the network path can intercept it \u2014 including the NetBox API token, which is sent on every request and is a bearer credential. Reasonable for a self-hosted NetBox on a network you trust; not for one reachable from outside it. Has no effect on an http base URL, which is not encrypted at all."
   }
 ];
 
@@ -253,6 +313,28 @@ export function netboxInstanceKey(config: InventorySourceValues): string | undef
   return `${parsed.protocol}//${parsed.host}${path}`;
 }
 
+/**
+ * INSECURE TLS — what this provider contributes to the SHARED certificate-hint
+ * sentence (`services/inventory/certificateHints.ts`). The table of codes and the
+ * "turn on <option> in this source's <section>" builder are one copy for every
+ * provider that offers the opt-in; only the provider-specific parts are named
+ * here.
+ *
+ * No `selfSignedNote`: EVE-NG ships a self-signed certificate by DEFAULT and
+ * says so, which is what tells that user a stock install is supposed to look
+ * like this. NetBox does not terminate TLS itself at all — the certificate comes
+ * from whatever reverse proxy the operator put in front of it — so borrowing
+ * that clause would state something untrue.
+ */
+const NETBOX_CERT_HINT_CONTEXT: CertificateHintContext = {
+  optionLabel: ALLOW_INSECURE_TLS_LABEL,
+  sectionLabel: ADVANCED_SECTION_LABEL,
+  // NOT "password": NetBox authenticates with an API token, sent on every
+  // request. Naming a password would describe an exposure this user does not
+  // have while leaving the one they do have unnamed.
+  exposureNoun: "the NetBox API token"
+};
+
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   const host = url.host || url.toString();
   if (err instanceof Error) {
@@ -262,6 +344,12 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
     const cause = (err as { cause?: { code?: string } }).cause;
     const code = cause?.code ?? (err as { code?: string }).code;
     if (code) {
+      // A TLS verification failure gets the shared sentence naming the opt-in;
+      // every other code keeps the wording it has always had.
+      const certMessage = certificateFailureMessage(code, host, NETBOX_CERT_HINT_CONTEXT);
+      if (certMessage) {
+        return new InventoryProviderError("network", certMessage);
+      }
       return new InventoryProviderError("network", `Could not reach ${host}: ${code}.`);
     }
     return new InventoryProviderError("network", `Could not reach ${host}: ${err.message}`);
@@ -269,13 +357,25 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   return new InventoryProviderError("network", `Could not reach ${host}: ${String(err)}`);
 }
 
-function throwForStatus(status: number, text: string, url: URL): never {
+function throwForStatus(res: RawResponse, url: URL): never {
+  const { status } = res;
   if (status === 401 || status === 403) {
     throw new InventoryProviderError("auth", `NetBox rejected the API token (HTTP ${status}) at ${url}.`);
   }
+  // A REDIRECT THIS CONNECTION CANNOT TAKE, and a 3xx body is empty — so the
+  // message was `failed with HTTP 301: ` and stopped there. Only on the transport
+  // that does not follow redirects: the standard one DOES follow them (every
+  // existing source runs there, some behind a redirecting proxy), and telling
+  // that user their connection refuses redirects would be false.
+  if (res.redirectNotFollowed && status >= 300 && status < 400) {
+    throw new InventoryProviderError(
+      "protocol",
+      `NetBox request to ${url} failed with HTTP ${status}: ${redirectNotFollowedMessage(res.location)}`
+    );
+  }
   throw new InventoryProviderError(
     "protocol",
-    `NetBox request to ${url} failed with HTTP ${status}: ${text.slice(0, 200)}`
+    `NetBox request to ${url} failed with HTTP ${status}: ${res.text.slice(0, 200)}`
   );
 }
 
@@ -290,13 +390,102 @@ function parseJsonOrThrow(text: string, url: URL): unknown {
 interface RawResponse {
   status: number;
   text: string;
+  /**
+   * TRUE only on the transport that cannot follow a redirect (the insecure one —
+   * see `NetboxTransport`). Carried on the response rather than re-derived where
+   * the error is built, so the explanation can never claim a redirect went
+   * unfollowed on the transport that would have followed it.
+   */
+  redirectNotFollowed: boolean;
+  /** The response's `Location`, when it sent one — the address the base URL should name. */
+  location?: string;
 }
 
-async function rawGet(fetchImpl: typeof fetch, url: URL, token: string, timeoutMs: number): Promise<RawResponse> {
+/**
+ * INSECURE TLS — the two transports one provider instance holds.
+ *
+ * `standard` is the injected global `fetch`, untouched, and is what every source
+ * has always used. `insecure` is the `node:https` adapter with certificate
+ * verification off (`services/inventory/insecureFetch.ts`) — the SAME
+ * provider-agnostic transport EVE-NG uses, not a second implementation.
+ */
+export interface NetboxTransports {
+  standard: typeof fetch;
+  insecure: typeof fetch;
+}
+
+/**
+ * The transport a request is actually sent with, plus the one `init` member that
+ * differs between the two.
+ *
+ * WHY THE REDIRECT MODE TRAVELS WITH THE TRANSPORT, unlike EVE-NG (where every
+ * request has always set `redirect: "manual"` and this distinction does not
+ * arise): the insecure adapter REFUSES any mode other than `"manual"` — it never
+ * follows a redirect, and accepting `"follow"` while not following would be a
+ * silent lie — so an opted-in source that left the default would have every
+ * request rejected inside the adapter before a socket opened.
+ *
+ * It is NOT set on the standard transport. Every existing NetBox source runs
+ * there, some behind a reverse proxy that redirects; turning redirect-following
+ * off for them would be a behaviour change nobody asked for, delivered as an
+ * unexplained HTTP 301. A new opt-in may change what happens for sources that
+ * take it, and nothing else.
+ */
+interface NetboxTransport {
+  fetch: typeof fetch;
+  redirect?: "manual";
+}
+
+/**
+ * BOTH conditions, ANDed, decided PER CONFIG rather than per provider — one
+ * registry instance serves every NetBox source, so the choice cannot be baked in
+ * at construction:
+ *
+ *  (a) the source explicitly opted in (`=== true`, never a truthiness test: the
+ *      form stores a real boolean, and an absent field must read as off);
+ *  (b) the URL is `https:` — relaxing certificate checks on plain http means
+ *      nothing, and the adapter would refuse the URL outright, so an http source
+ *      with the box ticked must keep working exactly as before.
+ *
+ * The scheme is read off `normalizeBaseUrl` + `new URL`, which lower-cases it,
+ * rather than off the raw string: `HTTPS://…` is https.
+ */
+export function netboxRunsWithoutCertificateVerification(config: InventorySourceValues): boolean {
+  if (config.allowInsecureTls !== true) {
+    return false;
+  }
+  try {
+    return new URL(normalizeBaseUrl(String(config.baseUrl ?? ""))).protocol === "https:";
+  } catch {
+    // An unparseable base URL cannot be https, and must not be answered by
+    // turning verification off. The fetch path reports it properly.
+    return false;
+  }
+}
+
+/**
+ * ONE decision, asked twice: which transport to connect with, and whether the
+ * sync has to disclose that it ran unverified (`NETBOX_INSECURE_TLS_WARNING`).
+ * Both read the predicate above rather than each re-deriving the conditions — a
+ * disclosure that could disagree with the transport actually used would be worse
+ * than none, and identity-comparing the returned transport cannot tell the two
+ * apart when a caller injects the same function as both.
+ */
+export function selectNetboxTransport(transports: NetboxTransports, config: InventorySourceValues): NetboxTransport {
+  return netboxRunsWithoutCertificateVerification(config)
+    ? { fetch: transports.insecure, redirect: "manual" }
+    : { fetch: transports.standard };
+}
+
+async function rawGet(transport: NetboxTransport, url: URL, token: string, timeoutMs: number): Promise<RawResponse> {
   let res: Response;
   try {
-    res = await fetchImpl(url.toString(), {
+    res = await transport.fetch(url.toString(), {
       headers: { Authorization: `Token ${token}`, Accept: "application/json" },
+      // Present only on the insecure transport — see `NetboxTransport`. Spread
+      // so the standard path's `init` stays byte-identical to what it has always
+      // sent, rather than gaining an explicit `redirect: undefined`.
+      ...(transport.redirect ? { redirect: transport.redirect } : {}),
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (err) {
@@ -308,15 +497,20 @@ async function rawGet(fetchImpl: typeof fetch, url: URL, token: string, timeoutM
   } catch {
     text = "";
   }
-  return { status: res.status, text };
+  // Defensive about `headers` for the same reason the rest of this module is
+  // about the injected `fetch`: a Response-alike that answers none must not throw
+  // here, on the error path.
+  const headers = res.headers as unknown as { get?: (name: string) => string | null } | undefined;
+  const location = (typeof headers?.get === "function" ? headers.get("location") : null) ?? undefined;
+  return { status: res.status, text, redirectNotFollowed: transport.redirect === "manual", location };
 }
 
-async function netboxGetJson(fetchImpl: typeof fetch, url: URL, token: string, timeoutMs: number): Promise<unknown> {
-  const { status, text } = await rawGet(fetchImpl, url, token, timeoutMs);
-  if (status < 200 || status >= 300) {
-    throwForStatus(status, text, url);
+async function netboxGetJson(transport: NetboxTransport, url: URL, token: string, timeoutMs: number): Promise<unknown> {
+  const raw = await rawGet(transport, url, token, timeoutMs);
+  if (raw.status < 200 || raw.status >= 300) {
+    throwForStatus(raw, url);
   }
-  return parseJsonOrThrow(text, url);
+  return parseJsonOrThrow(raw.text, url);
 }
 
 interface PagedResult {
@@ -398,7 +592,7 @@ interface CapState {
  * first-page count.
  */
 async function fetchAllPages(
-  fetchImpl: typeof fetch,
+  transport: NetboxTransport,
   baseUrl: string,
   path: string,
   token: string,
@@ -423,7 +617,7 @@ async function fetchAllPages(
       url.searchParams.append(key, value);
     }
 
-    const page = validatePagedShape(await netboxGetJson(fetchImpl, url, token, timeoutMs), url);
+    const page = validatePagedShape(await netboxGetJson(transport, url, token, timeoutMs), url);
     if (firstPageCount === undefined) {
       firstPageCount = page.count;
     } else if (page.count !== firstPageCount) {
@@ -755,9 +949,9 @@ function mapEntry(
   };
 }
 
-async function testConnectionImpl(fetchImpl: typeof fetch, baseUrl: string, token: string): Promise<void> {
+async function testConnectionImpl(transport: NetboxTransport, baseUrl: string, token: string): Promise<void> {
   const statusUrl = new URL(`${baseUrl}/api/status/`);
-  const primary = await rawGet(fetchImpl, statusUrl, token, TEST_CONNECTION_TIMEOUT_MS);
+  const primary = await rawGet(transport, statusUrl, token, TEST_CONNECTION_TIMEOUT_MS);
   if (primary.status >= 200 && primary.status < 300) {
     parseJsonOrThrow(primary.text, statusUrl);
     return;
@@ -769,21 +963,22 @@ async function testConnectionImpl(fetchImpl: typeof fetch, baseUrl: string, toke
     const devicesUrl = new URL(`${baseUrl}/api/dcim/devices/`);
     devicesUrl.searchParams.set("limit", "1");
     devicesUrl.searchParams.set("brief", "true");
-    const fallback = await rawGet(fetchImpl, devicesUrl, token, TEST_CONNECTION_TIMEOUT_MS);
+    const fallback = await rawGet(transport, devicesUrl, token, TEST_CONNECTION_TIMEOUT_MS);
     if (fallback.status >= 200 && fallback.status < 300) {
       parseJsonOrThrow(fallback.text, devicesUrl);
       return;
     }
-    throwForStatus(fallback.status, fallback.text, devicesUrl);
+    throwForStatus(fallback, devicesUrl);
   }
-  throwForStatus(primary.status, primary.text, statusUrl);
+  throwForStatus(primary, statusUrl);
 }
 
 async function fetchInventoryImpl(
-  fetchImpl: typeof fetch,
+  transports: NetboxTransports,
   config: InventorySourceValues,
   secrets: InventorySourceSecrets
 ): Promise<InventoryTree> {
+  const transport = selectNetboxTransport(transports, config);
   const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
   const token = secrets.apiToken ?? "";
   const template =
@@ -792,11 +987,18 @@ async function fetchInventoryImpl(
   const primaryIpFamily = parsePrimaryIpFamily(config.primaryIpFamily);
 
   const warnings: string[] = [];
+  // INSECURE TLS — this sync ran with certificate verification OFF, so it says
+  // so, on the same channel as every other thing the user needs to know about
+  // the run. Read from the SAME predicate the transport was chosen with, so the
+  // disclosure can never disagree with what actually happened on the wire.
+  if (netboxRunsWithoutCertificateVerification(config)) {
+    warnings.push(NETBOX_INSECURE_TLS_WARNING);
+  }
   const filterParams = parseFilter(typeof config.filter === "string" ? config.filter : "", warnings);
   const capState: CapState = { remaining: HARD_CAP, capped: false, reportedTotal: 0 };
 
   const rawDevices = await fetchAllPages(
-    fetchImpl,
+    transport,
     baseUrl,
     "/api/dcim/devices/",
     token,
@@ -812,7 +1014,7 @@ async function fetchInventoryImpl(
   const rawVms =
     includeVms && !vmsSkippedByCap
       ? await fetchAllPages(
-          fetchImpl,
+          transport,
           baseUrl,
           "/api/virtualization/virtual-machines/",
           token,
@@ -856,7 +1058,17 @@ async function fetchInventoryImpl(
   return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
 }
 
-export function createNetboxProvider(fetchImpl: typeof fetch = fetch): InventoryProvider {
+/**
+ * INSECURE TLS — the insecure transport is a SECOND injectable so a test can
+ * assert which one a given config selects, rather than inferring it. Default
+ * construction does no I/O and opens no socket, so building it eagerly here
+ * costs nothing even for the (usual) source that never selects it.
+ */
+export function createNetboxProvider(
+  fetchImpl: typeof fetch = fetch,
+  insecureFetchImpl: typeof fetch = createInsecureHttpsFetch()
+): InventoryProvider {
+  const transports: NetboxTransports = { standard: fetchImpl, insecure: insecureFetchImpl };
   return {
     id: NETBOX_PROVIDER_ID,
     label: "NetBox",
@@ -871,10 +1083,10 @@ export function createNetboxProvider(fetchImpl: typeof fetch = fetch): Inventory
     async testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
       const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
       const token = secrets.apiToken ?? "";
-      await testConnectionImpl(fetchImpl, baseUrl, token);
+      await testConnectionImpl(selectNetboxTransport(transports, config), baseUrl, token);
     },
     fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree> {
-      return fetchInventoryImpl(fetchImpl, config, secrets);
+      return fetchInventoryImpl(transports, config, secrets);
     }
   };
 }
