@@ -2261,3 +2261,95 @@ describe("createEveNgProvider — insecure TLS transport selection", () => {
     expect(() => createEveNgProvider(vi.fn() as unknown as typeof fetch)).not.toThrow();
   });
 });
+
+/**
+ * INSECURE TLS — the error a user actually hits BEFORE they know the option
+ * exists. `mapNetworkError` used to echo the bare node code
+ * (`Could not reach 10.0.0.5: DEPTH_ZERO_SELF_SIGNED_CERT.`), which names the
+ * problem in a vocabulary the user did not choose and offers no remedy — which
+ * is why the person who reported this was stuck rather than merely refused.
+ */
+describe("createEveNgProvider — certificate errors name the option", () => {
+  /** A transport that fails exactly the way node fails a TLS verification. */
+  function failsWith(code: string, viaCause = false): typeof fetch {
+    return (async () => {
+      const err = new Error("fetch failed");
+      if (viaCause) {
+        (err as { cause?: unknown }).cause = Object.assign(new Error(code), { code });
+      } else {
+        (err as { code?: string }).code = code;
+      }
+      throw err;
+    }) as unknown as typeof fetch;
+  }
+
+  async function messageFor(code: string, viaCause = false): Promise<string> {
+    const err = await createEveNgProvider(failsWith(code, viaCause))
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as InventoryProviderError).kind).toBe("network");
+    return (err as Error).message;
+  }
+
+  const CERT_CODES = [
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "CERT_HAS_EXPIRED"
+  ];
+
+  it.each(CERT_CODES)("names the option, and the host, instead of leaving %s to speak for itself (⊘ dropping the mapping restores the bare code, which is the state the user was stuck in)", async (code) => {
+    const message = await messageFor(code);
+    expect(message).toContain("10.0.0.5");
+    expect(message).toContain("Allow a Self-Signed or Mismatched Certificate");
+    expect(message).not.toBe(`Could not reach 10.0.0.5: ${code}.`);
+  });
+
+  it.each(CERT_CODES)("keeps %s itself in the message tail, because the code is what makes the failure diagnosable", async (code) => {
+    expect(await messageFor(code)).toContain(code);
+  });
+
+  it("reads the code out of `cause` too — undici puts it there, and node:https puts it on the error itself", async () => {
+    const message = await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT", true);
+    expect(message).toContain("Allow a Self-Signed or Mismatched Certificate");
+  });
+
+  it("calls out THE IP CASE for an altname mismatch specifically — a certificate that does not list the IP is the common shape of this failure and reads as unrelated otherwise", async () => {
+    const message = (await messageFor("ERR_TLS_CERT_ALTNAME_INVALID")).toLowerCase();
+    expect(message).toMatch(/ip address|address/);
+    // The self-signed wording would be actively misleading here: the cert may be
+    // perfectly well signed and simply issued for a different name.
+    expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).not.toBe(await messageFor("ERR_TLS_CERT_ALTNAME_INVALID"));
+  });
+
+  it("leaves every NON-certificate code's wording exactly as it was (⊘ a greedy match rewrites ECONNREFUSED into advice about certificates)", async () => {
+    for (const code of ["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "ECONNRESET", "CERT_SOMETHING_NEW"]) {
+      expect(await messageFor(code)).toBe(`Could not reach 10.0.0.5: ${code}.`);
+    }
+  });
+
+  it("still reports a timeout as a timeout — an abort has no code and must not be swept into the certificate branch", async () => {
+    const timesOut = (async () => {
+      throw new DOMException("timed out", "TimeoutError");
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(timesOut)
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toBe("Connection to 10.0.0.5 timed out.");
+  });
+});
+
+describe("createEveNgProvider — the certificate hint and the field agree", () => {
+  it("names the option by its EXACT form label (⊘ a hint pointing at a control the user cannot find by that name is worse than the bare OpenSSL code it replaced)", async () => {
+    const label = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "allowInsecureTls")!.label;
+    const failing = (async () => {
+      throw Object.assign(new Error("fetch failed"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" });
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(failing)
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toContain(label);
+  });
+});

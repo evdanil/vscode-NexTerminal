@@ -42,6 +42,14 @@ export const EVE_NG_PRO_WARNING =
   "EVE-NG Professional detected — Pro support is preliminary in this version; lab discovery and console mapping are validated against Community edition.";
 
 /**
+ * INSECURE TLS — ONE definition of the option's name, used both as the config
+ * field's label and inside the certificate-error hint that tells the user to go
+ * turn it on. A message naming an option the form does not show is worse than
+ * the bare OpenSSL code it replaced, so the two cannot be allowed to drift.
+ */
+const ALLOW_INSECURE_TLS_LABEL = "Allow a Self-Signed or Mismatched Certificate";
+
+/**
  * THE CONFIG FIELD LIST IS PART OF THE PROVIDER FINGERPRINT
  * (`computeProviderFingerprint`, models/inventory.ts): its ids, labels, types,
  * required flags and ORDER are hashed and stamped onto every source at save
@@ -119,7 +127,7 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
     // act rather than something a user finds themselves next to while typing a
     // base URL. Appended LAST so no existing field changes position.
     id: "allowInsecureTls",
-    label: "Allow a Self-Signed or Mismatched Certificate",
+    label: ALLOW_INSECURE_TLS_LABEL,
     type: "boolean",
     required: false,
     defaultValue: false,
@@ -270,6 +278,31 @@ class CrawlDeadlineExceeded extends Error {
   }
 }
 
+/**
+ * The TLS verification failures a lab EVE-NG box actually produces, and what to
+ * say about each. Node reports these as opaque OpenSSL identifiers; echoed
+ * verbatim (`Could not reach 10.0.0.5: DEPTH_ZERO_SELF_SIGNED_CERT.`) they name
+ * the problem in a vocabulary the user never chose and offer no remedy — which
+ * is exactly how someone gets stuck rather than merely refused.
+ *
+ * A CLOSED set, not a prefix match: `ECONNREFUSED` and any future
+ * `CERT_`-shaped code that is NOT a verification failure must keep today's
+ * wording rather than be swept into advice about certificates.
+ *
+ * The altname case is worded separately on purpose. It is the common shape of
+ * this failure — a home server addressed by IP, holding a certificate that
+ * never listed that IP — and calling it "not trusted" would be wrong: the
+ * certificate may be signed perfectly well and simply issued for another name.
+ */
+const TLS_CERT_HINTS: Record<string, (host: string) => string> = {
+  DEPTH_ZERO_SELF_SIGNED_CERT: (host) => `${host} presented a self-signed certificate, which EVE-NG ships by default.`,
+  SELF_SIGNED_CERT_IN_CHAIN: (host) => `${host} presented a certificate signed by an authority this machine does not trust.`,
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: (host) => `${host} presented a certificate whose signature could not be verified — usually an incomplete chain.`,
+  ERR_TLS_CERT_ALTNAME_INVALID: (host) =>
+    `${host} presented a certificate that does not cover this address — the usual case when the server is reached by IP address rather than by the name on its certificate.`,
+  CERT_HAS_EXPIRED: (host) => `${host} presented an expired certificate.`
+};
+
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   const host = url.host || url.toString();
   if (err instanceof Error) {
@@ -279,6 +312,15 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
     const cause = (err as { cause?: { code?: string } }).cause;
     const code = cause?.code ?? (err as { code?: string }).code;
     if (code) {
+      const certHint = TLS_CERT_HINTS[code];
+      if (certHint) {
+        // The raw code stays in the tail: it is what makes the failure
+        // searchable and diagnosable once the sentence has done its job.
+        return new InventoryProviderError(
+          "network",
+          `${certHint(host)} To connect anyway, turn on \u201c${ALLOW_INSECURE_TLS_LABEL}\u201d in this source's Advanced settings \u2014 that skips certificate checks for this source only, and the EVE-NG password is then sent over an unverified connection. (${code})`
+        );
+      }
       return new InventoryProviderError("network", `Could not reach ${host}: ${code}.`);
     }
     return new InventoryProviderError("network", `Could not reach ${host}: ${err.message}`);
