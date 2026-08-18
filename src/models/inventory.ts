@@ -90,16 +90,21 @@ export interface InventoryTree {
    * ⇒ the sync changes no status.
    *
    * WHY THE PROVIDER DECLARES IT. Only the provider knows whether the picture it
-   * just collected is COMPLETE — the crawl may have been capped, and a config
-   * switch (EVE-NG's `Include Stopped Nodes`) can exclude a whole class of node
-   * from the fetch. That completeness is exactly what `truncated` on the report
-   * encodes, and it decides whether `NexusCore.applyInventoryStatus` MERGES the
-   * report or CLEARS-then-applies it. A caller reconstructing the flag from the
-   * device list alone could not tell "absent because gone" from "absent because
-   * never asked for".
+   * just collected is COMPLETE — the crawl may have been capped, or a config
+   * switch may have excluded a whole class of node from the fetch. That
+   * completeness is exactly what `truncated` on the report encodes, and it
+   * decides whether `NexusCore.applyInventoryStatus` MERGES the report or
+   * CLEARS-then-applies it. A caller reconstructing the flag from the device
+   * list alone could not tell "absent because gone" from "absent because never
+   * asked for".
    *
-   * KEYED BY THE SAME `externalId` the devices carry, so the same
-   * origin lookup resolves both. Entries carry `state` only: the fetched console
+   * KEYED BY THE SAME `externalId` the devices carry, so the same origin lookup
+   * resolves both — but the report is NOT required to describe the same node set
+   * as `devices`, and EVE-NG's deliberately does not: it reports every node the
+   * crawl reached, including the stopped ones `Include Stopped Nodes` keeps out
+   * of `devices`, so a node that stops is reported as `stopped` instead of
+   * quietly keeping its last known state. An entry that resolves to no server is
+   * ignored by the apply. Entries carry `state` only: the fetched console
    * endpoints already flow through the sync plan under the normal ownership
    * rules, so setting `consoleHost`/`consolePort` here would write the same
    * address twice under two different rules — and `healSyncedConsolePorts`, the

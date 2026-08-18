@@ -1316,6 +1316,20 @@ function isNodeRunning(raw: Record<string, unknown>): boolean {
   return Number(raw.status) === 2;
 }
 
+/**
+ * The device identity for one lab node — `<lab path>#<node id>` — in ONE place,
+ * because `mapNode` (which stamps it onto the device) and `fetchInventory`'s
+ * status loop (which keys the status report by it) must agree exactly. The
+ * status loop cannot call `mapNode` to learn it: it also runs for nodes the
+ * `Include Stopped Nodes` filter drops, which are deliberately never mapped to a
+ * device. A second interpolation would let the two drift silently — a status
+ * entry that resolves to no server looks exactly like a node that is simply
+ * absent — so both call this instead.
+ */
+function nodeExternalId(labPath: string, nodeId: string): string {
+  return `${labPath}#${nodeId}`;
+}
+
 function mapNode(
   nodeId: string,
   raw: Record<string, unknown>,
@@ -1356,7 +1370,7 @@ function mapNode(
     // adds. EVE-NG exposes no lab-stable GUID to key on, so this churn (prune +
     // re-add, losing per-server hand edits and credentials on a lab rename) is a
     // known limitation rather than a bug.
-    externalId: `${lab.path}#${nodeId}`,
+    externalId: nodeExternalId(lab.path, nodeId),
     name,
     folderPath: labFolderPath(lab, rootPrefix),
     // No endpoint when the node has no usable telnet console — the sync engine
@@ -1491,12 +1505,20 @@ async function fetchInventoryImpl(
 
   const devices: InventoryDevice[] = [];
   // LIVE STATUS ON A SYNC (follow-up #42) — the running/stopped picture this
-  // crawl already has in hand, filled in lockstep with `devices` (same key, same
-  // loop, same skips) so the two can never describe different node sets. NO
-  // second round trip and no `fetchStatus` call: `mapNode` reads the very same
-  // `raw.status` field, and re-fetching it would double every sync's request
-  // count to learn what the response already said. `state` ONLY — see the
-  // `InventoryTree.status` contract for why the console fields stay off it.
+  // crawl already has in hand. NO second round trip and no `fetchStatus` call:
+  // `mapNode` reads the very same `raw.status` field, and re-fetching it would
+  // double every sync's request count to learn what the response already said.
+  // `state` ONLY — see the `InventoryTree.status` contract for why the console
+  // fields stay off it.
+  //
+  // Filled from the UNFILTERED node list — every node the crawl actually
+  // reached, including the ones `Include Stopped Nodes` keeps out of `devices`.
+  // A node that stops is exactly the case that matters: with the filter on it
+  // vanishes from `devices` (and the tree orphans its server), and if it also
+  // vanished from here the report would have to be marked partial, the apply
+  // would MERGE, and the server would keep reading `running` forever with
+  // nothing left to correct it. The crawl already knows the answer one line
+  // before the filter throws the node away; this records it.
   const statuses: Record<string, InventoryDeviceStatus> = {};
   let goneLabs = 0;
   let nodesCapped = false;
@@ -1535,7 +1557,15 @@ async function fetchInventoryImpl(
       // `raw` is guaranteed an object — `listNodes` fails the sync on any
       // non-object node value (P1-a). A valid object with no telnet console is
       // still mapped (to an endpoint-less, i.e. addressless, device).
-      if (!includeStopped && Number(raw.status) !== 2) {
+      const running = isNodeRunning(raw);
+      // BEFORE the `Include Stopped Nodes` filter, and keyed through the same
+      // `nodeExternalId` helper `mapNode` stamps onto the device, so a status
+      // entry always names the identity its device has (or would have had).
+      // Entries for nodes that never became devices are harmless:
+      // `applyInventoryStatus` resolves each entry against the servers THIS
+      // source owns and silently ignores every entry that resolves to none.
+      statuses[nodeExternalId(lab.path, nodeId)] = { state: running ? "running" : "stopped" };
+      if (!includeStopped && !running) {
         continue;
       }
       if (devices.length >= MAX_NODES) {
@@ -1550,12 +1580,7 @@ async function fetchInventoryImpl(
       // engine's addressless line: one sync, two lines, intersecting sets of
       // nodes. The engine owns that disclosure now — it is the only layer that
       // knows whether each node became a placeholder this run or already was one.
-      const device = mapNode(nodeId, raw, lab, rootPrefix, consoleHost, client.hostname);
-      devices.push(device);
-      // Keyed off the DEVICE's own externalId rather than a second
-      // `${lab.path}#${nodeId}` interpolation, so the status and the device it
-      // belongs to cannot drift apart if that identity ever changes.
-      statuses[device.externalId] = { state: isNodeRunning(raw) ? "running" : "stopped" };
+      devices.push(mapNode(nodeId, raw, lab, rootPrefix, consoleHost, client.hostname));
     }
   }
 
@@ -1574,29 +1599,19 @@ async function fetchInventoryImpl(
       `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the EVE-NG crawl exceeded its time limit and later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`
     );
   }
-  // LIVE STATUS ON A SYNC (follow-up #42) — TWO independent reasons this
-  // picture is PARTIAL, and either one must set `truncated`, because
-  // `applyInventoryStatus` MERGES a truncated report and CLEARS-then-applies a
-  // complete one:
+  // LIVE STATUS ON A SYNC (follow-up #42) — the report is PARTIAL for exactly
+  // ONE reason, because `applyInventoryStatus` MERGES a truncated report and
+  // CLEARS-then-applies a complete one: THE CRAWL WAS TRUNCATED (a cap, the
+  // budget, or the wall-clock deadline). Nodes past the stopping point were
+  // never fetched, so their absence says nothing about them and clearing would
+  // reset every one of them to `unknown`.
   //
-  //  1. THE CRAWL WAS TRUNCATED (`truncated` above — a cap, the budget, or the
-  //     wall-clock deadline). Nodes past the stopping point were never fetched,
-  //     so their absence says nothing about them. Clearing would reset every one
-  //     of them to `unknown`.
-  //
-  //  2. `Include Stopped Nodes` IS OFF. The filter above drops every non-running
-  //     node BEFORE it is emitted, so an absent entry means "not asked for",
-  //     which is not the "no longer known" a complete report's absence asserts.
-  //     Clearing here would be actively destructive: `fetchStatus` (which has no
-  //     such filter) reports stopped nodes correctly, so a Refresh Lab Status
-  //     establishes their real state — and the very next sync would wipe it back
-  //     to `unknown`. Merging keeps it, and the refresh/poll is what corrects it
-  //     when it changes.
-  //
-  // The CRAWL's own `truncated` is left alone in both cases: (2) is a
-  // deliberately narrowed fetch, not an unfinished one, and setting the tree
-  // flag would disable pruning for a source configured exactly as the user asked.
-  const statusTruncated = truncated || !includeStopped;
+  // `Include Stopped Nodes` is deliberately NOT a second reason: `statuses` is
+  // built from the unfiltered node list above, so the setting narrows `devices`
+  // and nothing else. A complete crawl therefore clear-then-applies, and a node
+  // that stopped since the last sync is reported as `stopped` rather than
+  // keeping its old `running` decoration with nothing left to correct it.
+  const statusTruncated = truncated;
   return {
     contractVersion: 1,
     devices,
@@ -1692,7 +1707,7 @@ async function fetchStatusImpl(
           status.consolePort = target.port;
         }
       }
-      statuses[`${lab.path}#${nodeId}`] = status;
+      statuses[nodeExternalId(lab.path, nodeId)] = status;
     }
   }
   return { contractVersion: 1, statuses, truncated: truncated || undefined };

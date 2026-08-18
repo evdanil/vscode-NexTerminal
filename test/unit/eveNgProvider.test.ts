@@ -12,6 +12,8 @@ import { validateProviderShape } from "../../src/services/inventory/providerRegi
 import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { ServerConfig } from "../../src/models/config";
 import { computeProviderFingerprint, type InventoryConfigField, type InventoryStatusReport } from "../../src/models/inventory";
 
@@ -1595,7 +1597,10 @@ describe("createEveNgProvider — fetchInventory reports lab status on the tree"
       "/Lab 1.unl#2": { state: "stopped" },
       "/Lab 1.unl#3": { state: "stopped" }
     });
-    // Every device the tree emits has a status, and nothing else does.
+    // With `Include Stopped Nodes` at its default (ON) nothing is filtered out,
+    // so the two node sets coincide exactly: every device has a status and
+    // nothing else does. (When the filter is OFF, `statuses` is deliberately the
+    // wider set — see the stopped-nodes test below.)
     expect(Object.keys(tree.status!.statuses).sort()).toEqual(tree.devices.map((d) => d.externalId).sort());
   });
 
@@ -1634,11 +1639,18 @@ describe("createEveNgProvider — fetchInventory reports lab status on the tree"
     expect(tree.status?.truncated).toBe(true);
   });
 
-  it("marks the report TRUNCATED when `Include Stopped Nodes` is OFF, even on a complete crawl — an absent node then means 'not asked for', not 'gone' (⊘ a complete-looking report wipes a stopped node's real state to unknown on every sync, undoing the refresh that established it)", async () => {
+  it("reports the stopped nodes `Include Stopped Nodes` keeps OUT of `devices`, on a report that stays COMPLETE (⊘ building `statuses` from the filtered list makes a node that stopped merely absent, so the merge leaves its server reading `running` forever)", async () => {
     const tree = await fetchTree(oneLabWorld({ "1": node({ status: 2 }), "2": node({ id: "2", status: 0, url: "" }) }), { includeStopped: false });
     expect(tree.truncated).toBeFalsy(); // the CRAWL was complete — pruning stays enabled
+    // The filter still narrows the DEVICES exactly as before — only `statuses` widened.
     expect(tree.devices.map((d) => d.externalId)).toEqual(["/Lab 1.unl#1"]);
-    expect(tree.status?.truncated).toBe(true);
+    expect(tree.status?.statuses).toEqual({
+      "/Lab 1.unl#1": { state: "running" },
+      "/Lab 1.unl#2": { state: "stopped" }
+    });
+    // COMPLETE, so `applyInventoryStatus` clear-then-applies and the stopped
+    // node's `stopped` overwrites whatever an earlier sync recorded for it.
+    expect(tree.status?.truncated).toBeFalsy();
   });
 
   it("still validates as an InventoryTree with the status attached (⊘ a validator that rejects the new member fails every EVE-NG sync at the provider boundary)", async () => {
@@ -2306,6 +2318,65 @@ describe("EVE-NG → computeSyncPlan", () => {
     expect(upgraded.port).toBe(32769);
     expect(upgraded.origin?.externalId).toBe("/Lab 1.unl#1");
   });
+
+  /**
+   * THE STOPPED-NODE HOLE (follow-up #43). With `Include Stopped Nodes` OFF the
+   * filter drops a node that stops BEFORE it can become a device, so the sync
+   * orphans (or keeps) its server. If the status report were built from that
+   * same filtered list the node would be merely ABSENT from it — and an absent
+   * entry in a report the provider then had to mark partial means "no news", so
+   * `applyInventoryStatus` MERGES and the server keeps reading `running` with
+   * nothing left to correct it (`fetchStatus` is palette-only). Real provider,
+   * real sync plan, real core.
+   */
+  for (const prunePolicy of ["orphan", "keep"] as const) {
+    it(`with \`Include Stopped Nodes\` OFF and prune policy \`${prunePolicy}\`, a node that STOPS between syncs reads \`stopped\` after the next sync (⊘ building the status report from the FILTERED node list makes the stopped node merely ABSENT from it, and this server stays painted \`running\` forever)`, async () => {
+      const source = {
+        id: "src-eve",
+        providerId: EVE_NG_PROVIDER_ID,
+        name: "Lab",
+        targetFolder: "EVE",
+        prunePolicy,
+        defaultUsername: "admin",
+        config: CONFIG,
+        secretFieldIds: ["password"]
+      };
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+
+      // SYNC 1 — both nodes running, so both survive the filter and become servers.
+      const tree1 = await fetchTree(
+        oneLabWorld({ "1": node(), "2": node({ id: "2", name: "R2", url: "telnet://127.0.0.1:32770" }) }),
+        { includeStopped: false }
+      );
+      const plan1 = computeSyncPlan({ source, tree: tree1, currentServers: [], now: 1_000 });
+      await core.addServersBatch(plan1.adds);
+      core.applyInventoryStatus(source.id, tree1.status!);
+      const r2Id = deterministicServerId(source.id, "/Lab 1.unl#2");
+      expect(core.getSnapshot().serverStatus.get(r2Id)).toBe("running");
+
+      // SYNC 2 — R2 has been STOPPED in EVE-NG. The filter keeps it out of
+      // `devices`, so the plan prunes its server under the source's policy.
+      const tree2 = await fetchTree(
+        oneLabWorld({ "1": node(), "2": node({ id: "2", name: "R2", status: 0, url: "" }) }),
+        { includeStopped: false }
+      );
+      expect(tree2.devices.map((d) => d.externalId)).toEqual(["/Lab 1.unl#1"]);
+      const plan2 = computeSyncPlan({ source, tree: tree2, currentServers: [...plan1.adds], now: 2_000 });
+      expect(plan2.prunes.map((p) => p.policy)).toEqual([prunePolicy]);
+      const pruned = plan2.prunes[0];
+      const survivor = pruned.policy === "orphan" ? pruned.after : pruned.server;
+      // Both policies KEEP the record and its origin, which is exactly why the
+      // status entry still resolves to it.
+      expect(survivor.origin?.sourceId).toBe(source.id);
+      expect(survivor.id).toBe(r2Id);
+      await core.addServersBatch([survivor]);
+
+      core.applyInventoryStatus(source.id, tree2.status!);
+
+      expect(core.getSnapshot().serverStatus.get(r2Id)).toBe("stopped");
+    });
+  }
 
   it("turns a running lab node into a telnet server on the console's own port, stamped so a later hand-flip is respected", async () => {
     const tree = await fetchTree({
