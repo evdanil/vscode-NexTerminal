@@ -9182,6 +9182,26 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(message).toContain('"Lab B"');
       expect(message).toContain("2 sources");
     });
+    it("names only the first three of FOUR truncated sources and counts the rest, with a plural possessive (\u2298 the 3-name cap and the \u2018and N more\u2019 count are only ever exercised at 1 and 2 sources, so an off-by-one in either \u2014 or a slice that drops a name \u2014 ships unnoticed)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      for (const key of ["a", "b", "c", "d"]) {
+        await core.addOrUpdateInventorySource(makeSource({ id: key, name: `Lab ${key.toUpperCase()}`, config: { host: key } }));
+      }
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      // Asserted WHOLE, not by substring: the cap, the remainder count and the
+      // possessive are each one edit away from being wrong, and only the exact
+      // sentence pins all three at once. "Lab D" is named nowhere.
+      expect(String(mockShowWarningMessage.mock.calls[0][0])).toBe(
+        'Lab status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the lab crawl hit its time budget, so some nodes may be stale or still unknown. Narrow the sources\' Root Folder or Lab Filter, or run the refresh again.'
+      );
+    });
   });
 
   it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {

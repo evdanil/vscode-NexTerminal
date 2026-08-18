@@ -751,6 +751,25 @@ describe("computeSyncPlan — adds", () => {
         ]);
       });
 
+      it("BOTH GROUPS, plural ADDED half — the added half pluralises on its own count, not on the already-half's (\u2298 every other BOTH case has exactly 1 added, so a hardcoded singular arm there says '2 was added without one' and no test notices)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "fresh-a", endpoints: [] }),
+            makeDevice({ externalId: "device:3", name: "fresh-b", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1")],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(2);
+        // The mirror of the case above: 2 added / 1 already, where that one is
+        // 1 added / 2 already. Between them every arm of the BOTH branch is read.
+        expect(addresslessLines(plan)).toEqual([
+          '3 devices have no console address yet — 2 were added without one and 1 was already a placeholder (e.g. "fresh-a", "fresh-b", "core-sw-1").'
+        ]);
+      });
+
       it("ALREADY-PLACEHOLDER ONLY — the line must NOT claim anything was added this run (⊘ reusing the added-only sentence tells the user N placeholders were created by a sync that created none)", () => {
         const plan = computeSyncPlan({
           source: makeSource(),
