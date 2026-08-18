@@ -474,6 +474,49 @@ describe("inventorySourceFormDefinition", () => {
     });
   });
 
+  /**
+   * INSECURE TLS (EVE-NG) — `InventoryConfigField.advanced`. A provider field
+   * that relaxes a safety default belongs behind the form's Advanced
+   * disclosure, and until this existed a provider had no way to say so: every
+   * config field rendered at the top level regardless of how rarely it should
+   * be touched.
+   */
+  describe("advanced provider config fields", () => {
+    const withAdvanced = (advanced?: boolean): InventoryProvider => ({
+      ...fakeProvider,
+      configFields: [
+        { id: "allowInsecureTls", label: "Allow Insecure TLS", type: "boolean", advanced },
+        { id: "baseUrl", label: "Base URL", type: "string", advanced: advanced === undefined ? undefined : false }
+      ]
+    });
+
+    it("puts a provider field declared advanced BEHIND the Advanced disclosure (\u2298 dropping the flag renders a certificate-verification switch beside the base URL, at the top of the form)", () => {
+      const definition = withAdvanced(true);
+      expect(keyedField(inventorySourceFormDefinition(definition), "cfg_allowInsecureTls").advanced).toBe(true);
+      expect(keyedField(inventorySourceFormDefinition(definition), "cfg_baseUrl").advanced).toBe(false);
+    });
+
+    it("leaves a field that declares nothing exactly where it was — every existing provider field is byte-identical", () => {
+      expect(keyedField(inventorySourceFormDefinition(withAdvanced(undefined)), "cfg_allowInsecureTls").advanced).toBeUndefined();
+    });
+
+    it("carries the flag through every field TYPE, not just the boolean branch it was added for", () => {
+      const provider: InventoryProvider = {
+        ...fakeProvider,
+        configFields: [
+          { id: "t", label: "T", type: "string", advanced: true },
+          { id: "p", label: "P", type: "password", advanced: true },
+          { id: "n", label: "N", type: "number", advanced: true },
+          { id: "s", label: "S", type: "select", advanced: true, options: [{ label: "A", value: "a" }] }
+        ]
+      };
+      const definition = inventorySourceFormDefinition(provider);
+      for (const id of ["t", "p", "n", "s"]) {
+        expect(keyedField(definition, `cfg_${id}`).advanced).toBe(true);
+      }
+    });
+  });
+
   // EVE-NG (Phase 1) — the Target Folder placeholder is an EXAMPLE shown on
   // every provider's source form, so it must not read as an instruction to
   // name a folder after one specific provider.

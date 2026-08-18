@@ -1,3 +1,4 @@
+import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
   type InventoryConfigField,
@@ -57,11 +58,12 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
     required: true,
     placeholder: "http://eve.example.com",
     // The HTTPS caveat lives here rather than only in the docs because the
-    // symptom is an opaque `fetch failed` that never mentions certificates:
-    // the extension host's fetch has no per-source trust store to relax, and
-    // EVE-NG ships a self-signed certificate by default.
+    // symptom is otherwise an opaque certificate code that never names a
+    // remedy, and EVE-NG ships a self-signed certificate by default. It used
+    // to say self-signed HTTPS was unsupported; `allowInsecureTls` below made
+    // that false, so it points there instead of telling the user to give up.
     description:
-      "The EVE-NG web UI address; a trailing slash is fine. Self-signed HTTPS is not supported — use http or a trusted certificate."
+      "The EVE-NG web UI address; a trailing slash is fine. If it is https with EVE-NG's own self-signed certificate, see \u201cAllow a Self-Signed or Mismatched Certificate\u201d under Advanced."
   },
   { id: "username", label: "Username", type: "string", required: true, placeholder: "admin" },
   {
@@ -109,6 +111,24 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
     required: false,
     placeholder: "eve.example.com",
     description: "Host to use for telnet consoles when EVE-NG reports an address you cannot reach (NAT, port forwarding)."
+  },
+  {
+    // INSECURE TLS — the opt-in that makes a self-signed or IP-addressed
+    // EVE-NG box reachable at all. Default OFF and behind the Advanced
+    // disclosure: it turns a safety default off, so it must be a deliberate
+    // act rather than something a user finds themselves next to while typing a
+    // base URL. Appended LAST so no existing field changes position.
+    id: "allowInsecureTls",
+    label: "Allow a Self-Signed or Mismatched Certificate",
+    type: "boolean",
+    required: false,
+    defaultValue: false,
+    advanced: true,
+    // Voice matches the telnet cleartext hint: state the exposure, say where it
+    // is reasonable, stop. The password clause is the part that must not be
+    // softened — it is what the user is actually agreeing to send.
+    description:
+      "Connects over https without checking the server's certificate. The traffic is encrypted but unauthenticated, so anything on the network path can intercept it \u2014 including the EVE-NG username and password, which are sent over that connection. Reasonable for a lab box on a network you trust; not for one reachable from outside it. Has no effect on an http base URL, which is not encrypted at all."
   }
 ];
 
@@ -1145,9 +1165,50 @@ export function labFolderPath(lab: EveLab, rootPrefix: string): string {
 // Provider
 // ---------------------------------------------------------------------------
 
-function makeClient(fetchImpl: typeof fetch, config: InventorySourceValues, secrets: InventorySourceSecrets): EveApiClient {
+/**
+ * INSECURE TLS — the two transports one provider instance holds, and the
+ * decision between them.
+ *
+ * `standard` is the injected global `fetch`, untouched, and is what every
+ * source has always used. `insecure` is the `node:https` adapter with
+ * certificate verification off (`services/inventory/insecureFetch.ts`).
+ */
+export interface EveNgTransports {
+  standard: typeof fetch;
+  insecure: typeof fetch;
+}
+
+/**
+ * BOTH conditions, ANDed, decided PER CONFIG rather than per provider — one
+ * registry instance serves every EVE-NG source, so the choice cannot be baked
+ * in at construction:
+ *
+ *  (a) the source explicitly opted in (`=== true`, never a truthiness test:
+ *      the form stores a real boolean, and an absent field must read as off);
+ *  (b) the URL is `https:` — relaxing certificate checks on plain http means
+ *      nothing, and the adapter would refuse the URL outright, so an http
+ *      source with the box ticked must keep working exactly as before.
+ *
+ * The scheme is read off `normalizeBaseUrl` + `new URL`, which lower-cases it,
+ * rather than off the raw string: `HTTPS://…` is https.
+ */
+export function selectEveNgTransport(transports: EveNgTransports, config: InventorySourceValues): typeof fetch {
+  if (config.allowInsecureTls !== true) {
+    return transports.standard;
+  }
+  try {
+    return new URL(normalizeBaseUrl(String(config.baseUrl ?? ""))).protocol === "https:"
+      ? transports.insecure
+      : transports.standard;
+  } catch {
+    // An unparseable base URL cannot be https. `buildUrl` reports it properly.
+    return transports.standard;
+  }
+}
+
+function makeClient(transports: EveNgTransports, config: InventorySourceValues, secrets: InventorySourceSecrets): EveApiClient {
   return new EveApiClient(
-    fetchImpl,
+    selectEveNgTransport(transports, config),
     normalizeBaseUrl(String(config.baseUrl ?? "")),
     String(config.username ?? ""),
     secrets.password ?? ""
@@ -1155,11 +1216,11 @@ function makeClient(fetchImpl: typeof fetch, config: InventorySourceValues, secr
 }
 
 async function fetchInventoryImpl(
-  fetchImpl: typeof fetch,
+  transports: EveNgTransports,
   config: InventorySourceValues,
   secrets: InventorySourceSecrets
 ): Promise<InventoryTree> {
-  const client = makeClient(fetchImpl, config, secrets);
+  const client = makeClient(transports, config, secrets);
   const root = normalizeFolderPath(String(config.rootFolder ?? "/"));
   // MAJOR-1(b) — a user-typed Root Folder is built into every folder request,
   // so a `.`/`..` segment in it would be collapsed by `new URL` into a scope
@@ -1280,11 +1341,11 @@ async function fetchInventoryImpl(
  *    running node with no native telnet console — carries no console fields.
  */
 async function fetchStatusImpl(
-  fetchImpl: typeof fetch,
+  transports: EveNgTransports,
   config: InventorySourceValues,
   secrets: InventorySourceSecrets
 ): Promise<InventoryStatusReport> {
-  const client = makeClient(fetchImpl, config, secrets);
+  const client = makeClient(transports, config, secrets);
   const root = normalizeFolderPath(String(config.rootFolder ?? "/"));
   if (hasDotSegment(root)) {
     throw new InventoryProviderError("protocol", `Root Folder "${root}" must not contain "." or ".." path segments.`);
@@ -1375,7 +1436,7 @@ async function fetchStatusImpl(
  * (`controlProviderNode`) then PROPAGATES it to the user, unlike the status path.
  */
 async function controlNodeImpl(
-  fetchImpl: typeof fetch,
+  transports: EveNgTransports,
   config: InventorySourceValues,
   secrets: InventorySourceSecrets,
   externalId: string,
@@ -1391,7 +1452,7 @@ async function controlNodeImpl(
     );
   }
 
-  const client = makeClient(fetchImpl, config, secrets);
+  const client = makeClient(transports, config, secrets);
   await client.login(FETCH_TIMEOUT_MS);
   const edition = await client.detectEdition(FETCH_TIMEOUT_MS);
   const nodeActionPath = `/api/labs${encodePath(labPath)}/nodes/${encodeURIComponent(nodeId)}/${action}`;
@@ -1409,8 +1470,8 @@ async function controlNodeImpl(
   unwrap(await client.authedRequest("GET", nodeActionPath, undefined, FETCH_TIMEOUT_MS));
 }
 
-async function testConnectionImpl(fetchImpl: typeof fetch, config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
-  const client = makeClient(fetchImpl, config, secrets);
+async function testConnectionImpl(transports: EveNgTransports, config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
+  const client = makeClient(transports, config, secrets);
   await client.login(TEST_CONNECTION_TIMEOUT_MS);
   const status = await client.authedGet("/api/status", TEST_CONNECTION_TIMEOUT_MS);
   // ONLY a 404 falls back — the endpoint is absent on an older build. An auth
@@ -1425,7 +1486,17 @@ async function testConnectionImpl(fetchImpl: typeof fetch, config: InventorySour
   unwrap(await client.authedGet("/api/folders/", TEST_CONNECTION_TIMEOUT_MS));
 }
 
-export function createEveNgProvider(fetchImpl: typeof fetch = fetch): InventoryProvider {
+/**
+ * INSECURE TLS — the insecure transport is a SECOND injectable so a test can
+ * assert which one a given config selects, rather than inferring it. Default
+ * construction does no I/O and opens no socket, so building it eagerly here
+ * costs nothing even for the (usual) source that never selects it.
+ */
+export function createEveNgProvider(
+  fetchImpl: typeof fetch = fetch,
+  insecureFetchImpl: typeof fetch = createInsecureHttpsFetch()
+): InventoryProvider {
+  const transports: EveNgTransports = { standard: fetchImpl, insecure: insecureFetchImpl };
   return {
     id: EVE_NG_PROVIDER_ID,
     label: "EVE-NG",
@@ -1435,13 +1506,13 @@ export function createEveNgProvider(fetchImpl: typeof fetch = fetch): InventoryP
       return eveNgInstanceKey(config);
     },
     testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void> {
-      return testConnectionImpl(fetchImpl, config, secrets);
+      return testConnectionImpl(transports, config, secrets);
     },
     fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree> {
-      return fetchInventoryImpl(fetchImpl, config, secrets);
+      return fetchInventoryImpl(transports, config, secrets);
     },
     fetchStatus(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport> {
-      return fetchStatusImpl(fetchImpl, config, secrets);
+      return fetchStatusImpl(transports, config, secrets);
     },
     controlNode(
       config: InventorySourceValues,
@@ -1449,7 +1520,7 @@ export function createEveNgProvider(fetchImpl: typeof fetch = fetch): InventoryP
       externalId: string,
       action: "start" | "stop"
     ): Promise<void> {
-      return controlNodeImpl(fetchImpl, config, secrets, externalId, action);
+      return controlNodeImpl(transports, config, secrets, externalId, action);
     }
   };
 }

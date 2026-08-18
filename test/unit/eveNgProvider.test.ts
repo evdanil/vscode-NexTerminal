@@ -6,7 +6,7 @@ import { validateProviderShape } from "../../src/services/inventory/providerRegi
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import type { ServerConfig } from "../../src/models/config";
-import type { InventoryStatusReport } from "../../src/models/inventory";
+import type { InventoryConfigField, InventoryStatusReport } from "../../src/models/inventory";
 
 /**
  * EVE-NG's identity as a deployment — the same contract `netboxInstanceKey`
@@ -102,7 +102,11 @@ describe("createEveNgProvider — shape", () => {
       "rootFolder",
       "filter",
       "includeStopped",
-      "consoleHost"
+      "consoleHost",
+      // INSECURE TLS — appended LAST on purpose: the order is part of the
+      // provider fingerprint, and adding the field at the end keeps every
+      // existing field where the user last saw it.
+      "allowInsecureTls"
     ]);
   });
 
@@ -122,9 +126,12 @@ describe("createEveNgProvider — shape", () => {
     expect(provider.configFields.find((f) => f.id === "filter")?.type).toBe("string");
   });
 
-  it("warns in the baseUrl description that self-signed HTTPS is unsupported (the failure is otherwise an opaque fetch error)", () => {
+  it("still raises the certificate question in the baseUrl description, but now POINTS AT THE OPTION rather than declaring the setup unsupported (the failure is otherwise an opaque certificate code with no named remedy)", () => {
     const provider = createEveNgProvider(vi.fn() as unknown as typeof fetch);
-    expect(provider.configFields.find((f) => f.id === "baseUrl")?.description?.toLowerCase()).toContain("self-signed");
+    const description = provider.configFields.find((f) => f.id === "baseUrl")?.description?.toLowerCase() ?? "";
+    expect(description).toContain("self-signed");
+    expect(description).toContain("certificate");
+    expect(description).not.toContain("not supported");
   });
 
   it("declares the attribute keys its devices actually carry, so a template rule filter on an unknown key is caught at save time", () => {
@@ -2131,5 +2138,126 @@ describe("createEveNgProvider — controlNode", () => {
     await expect(createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start")).rejects.toBeInstanceOf(
       InventoryProviderError
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INSECURE TLS — the per-source opt-in and, more importantly, which transport
+// a given config selects.
+// ---------------------------------------------------------------------------
+
+/**
+ * A home EVE-NG box at an IP address with a self-signed certificate fails two
+ * checks at once (self-signed, AND a certificate that does not list the IP),
+ * and until this option existed the provider had no way to accept it. The
+ * insecure transport is scoped rather than global — see
+ * `src/services/inventory/insecureFetch.ts` for why
+ * `NODE_TLS_REJECT_UNAUTHORIZED` is not an option in a shared extension host.
+ *
+ * The tests that matter here are the NEGATIVE ones: an opted-out source and an
+ * `http:` source must never reach the insecure transport.
+ */
+describe("createEveNgProvider — allowInsecureTls field", () => {
+  const field = (): InventoryConfigField => {
+    const found = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "allowInsecureTls");
+    expect(found).toBeDefined();
+    return found!;
+  };
+
+  it("is an OPTIONAL boolean that starts OFF, and is drawn behind the Advanced disclosure (⊘ a defaultValue of true silently turns certificate verification off for every new source)", () => {
+    const f = field();
+    expect(f.type).toBe("boolean");
+    expect(f.required).not.toBe(true);
+    expect(f.defaultValue).toBe(false);
+    expect(f.advanced).toBe(true);
+  });
+
+  it("says plainly, in its hint, that verification is off and that THE EVE-NG PASSWORD travels over the unverified connection (⊘ a hint that only says 'allows self-signed certificates' hides what the user is agreeing to)", () => {
+    const hint = String(field().description ?? "").toLowerCase();
+    expect(hint).toMatch(/password/);
+    expect(hint).toMatch(/intercept|unauthenticated|not verified|unverified/);
+    expect(hint).toMatch(/trust|lab/);
+  });
+
+  it("stops the base URL hint claiming self-signed HTTPS is unsupported, which this option makes false (⊘ leaving it tells the user to give up on the exact setup that now works)", () => {
+    const baseUrl = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "baseUrl");
+    expect(String(baseUrl?.description ?? "")).not.toMatch(/not supported/i);
+  });
+
+  it("still passes the provider-shape validation the registry runs, with the new field in place", () => {
+    expect(() => validateProviderShape(createEveNgProvider(vi.fn() as unknown as typeof fetch))).not.toThrow();
+  });
+});
+
+describe("createEveNgProvider — insecure TLS transport selection", () => {
+  const WORLD: World = { folders: { "/": { labs: [] } } };
+
+  function probes(): { standard: ReturnType<typeof makeWorld>; insecure: ReturnType<typeof makeWorld>; provider: ReturnType<typeof createEveNgProvider> } {
+    const standard = makeWorld(WORLD);
+    const insecure = makeWorld(WORLD);
+    return { standard, insecure, provider: createEveNgProvider(standard.fetchImpl, insecure.fetchImpl) };
+  }
+
+  it("uses the insecure transport — and ONLY it — for an https source that opted in", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls).toHaveLength(0);
+  });
+
+  it("NEVER uses it for a source that did not opt in, however the certificate would have failed (⊘ selecting on the URL scheme alone turns verification off for every https source)", async () => {
+    for (const config of [
+      { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
+      { baseUrl: "https://10.0.0.5" }
+    ]) {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory({ ...CONFIG, ...config }, SECRETS);
+      expect(standard.calls.length).toBeGreaterThan(0);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  });
+
+  it("NEVER uses it for an http source, where relaxing certificate checks means nothing and the adapter would refuse the URL anyway (⊘ selecting on the opt-in alone breaks every plain-http source the moment the box is ticked)", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "http://eve.example.com", allowInsecureTls: true }, SECRETS);
+    expect(standard.calls.length).toBeGreaterThan(0);
+    expect(insecure.calls).toHaveLength(0);
+  });
+
+  it("decides per CONFIG, not per provider — one registry serves every source, so two sources on one provider must get different transports", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "https://eve.example.com" }, SECRETS);
+    expect(insecure.calls.every((c) => c.url.startsWith("https://10.0.0.5"))).toBe(true);
+    expect(standard.calls.every((c) => c.url.startsWith("https://eve.example.com"))).toBe(true);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls.length).toBeGreaterThan(0);
+  });
+
+  it("routes EVERY entry point through the same decision, not just the sync (⊘ one path built without the selector connects with verification ON and the user's source works from the tree but not from Test Connection, or the reverse)", async () => {
+    const opted = { ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true };
+    const runs: ((p: ReturnType<typeof createEveNgProvider>) => Promise<unknown>)[] = [
+      (p) => p.fetchInventory(opted, SECRETS),
+      (p) => p.testConnection(opted, SECRETS),
+      (p) => p.fetchStatus!(opted, SECRETS),
+      (p) => p.controlNode!(opted, SECRETS, "/Lab 1.unl#1", "start")
+    ];
+    for (const run of runs) {
+      const { standard, insecure, provider } = probes();
+      await run(provider).catch(() => undefined);
+      expect(insecure.calls.length).toBeGreaterThan(0);
+      expect(standard.calls).toHaveLength(0);
+    }
+  });
+
+  it("normalizes the scheme before deciding, so an uppercase HTTPS:// base URL is still https (⊘ a raw startsWith('https:') check reads HTTPS:// as plain http and silently ignores the opt-in)", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "HTTPS://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls).toHaveLength(0);
+  });
+
+  it("defaults the second argument to the real node:https adapter, so a provider built the way activate() builds it is not silently transport-less", () => {
+    expect(() => createEveNgProvider(vi.fn() as unknown as typeof fetch)).not.toThrow();
   });
 });

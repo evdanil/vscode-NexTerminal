@@ -1350,7 +1350,8 @@ function inventoryConfigFieldDescriptor(
       label: field.label,
       required: field.required && !hasSaved,
       placeholder: hasSaved ? "Leave empty to keep the saved value" : field.placeholder,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   if (field.type === "boolean") {
@@ -1367,7 +1368,8 @@ function inventoryConfigFieldDescriptor(
       value: Object.prototype.hasOwnProperty.call(existingConfig, field.id)
         ? existingConfig[field.id] === true
         : field.defaultValue === true,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   if (field.type === "select") {
@@ -1389,7 +1391,8 @@ function inventoryConfigFieldDescriptor(
       label: field.label,
       options,
       value,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   if (field.type === "number") {
@@ -1408,7 +1411,8 @@ function inventoryConfigFieldDescriptor(
       step: "any",
       placeholder: field.placeholder,
       value: typeof existing === "number" ? existing : undefined,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   const existing = existingConfig[field.id];
@@ -1419,7 +1423,8 @@ function inventoryConfigFieldDescriptor(
     required: field.required,
     placeholder: field.placeholder,
     value: existing !== undefined ? String(existing) : "",
-    hint: field.description
+    hint: field.description,
+    advanced: field.advanced
   };
 }
 
