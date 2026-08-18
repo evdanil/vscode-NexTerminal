@@ -633,6 +633,39 @@ describe("createEveNgProvider — an expired session (HTTP 412 + JSend unauthori
   });
 
   /**
+   * THE TWO SPELLINGS THAT PROVE A RAW-TEXT SCAN CANNOT ANSWER THIS QUESTION.
+   * JSON has more than one way to write the same value, and only the PARSER
+   * knows which ones are equal: `"\u0075nauthorized"` is the string
+   * "unauthorized" with no such substring in the body, and `4.01e2` is the
+   * number 401 with no such digits in the body. A pre-filter that decides by
+   * scanning the text therefore skips the parse on bodies the predicate would
+   * have accepted, and the silent re-login never fires — which is the
+   * production bug this whole block exists to prevent, back again for any
+   * server that spells its envelope either way. The decision must be made on
+   * the PARSED value, not on the characters that encoded it.
+   */
+  it("re-logs in when the status word is \\u-escaped in the JSON — `\"\\u0075nauthorized\"` (⊘ a raw-text pre-filter finds no such substring, skips the parse, and the expired session is surfaced as a hard error instead of being recovered)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: '{"code":412,"status":"\\u0075nauthorized","message":"Session timed out."}'
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    // Recovered: one silent re-login, and the crawl went on to map the node.
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  it("re-logs in when the in-envelope code is written in exponent form — `4.01e2`, which IS 401 (⊘ a raw-text pre-filter matching the literal digits 401 misses it, and the crawl dies where it used to recover)", async () => {
+    const { fetchImpl, logins } = crawlFailingOnceWith({
+      status: 412,
+      body: '{"code":4.01e2,"status":"fail","message":"Session no longer valid."}'
+    });
+    const tree = await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(logins()).toBe(2);
+  });
+
+  /**
    * `authedGet` and `authedRequest` are two copies of the same retry, and the
    * node-control path uses the second one. A fix applied to one of them leaves
    * Start/Stop failing on exactly the server that reported the bug.

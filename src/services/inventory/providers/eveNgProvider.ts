@@ -338,7 +338,7 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   return new InventoryProviderError("network", `Could not reach ${host}: ${String(err)}`);
 }
 
-function throwForStatus(status: number, text: string, url: URL, location?: string): never {
+function throwForStatus(status: number, text: string, parsed: ParsedBody, url: URL, location?: string): never {
   if (status === 401 || status === 403) {
     throw new InventoryProviderError("auth", `EVE-NG rejected the credentials (HTTP ${status}) at ${url}.`);
   }
@@ -347,7 +347,7 @@ function throwForStatus(status: number, text: string, url: URL, location?: strin
   // `envelopeSaysUnauthorized`), and reaching here means the silent re-login has
   // already had its one attempt. Reporting that as an unexplained `protocol`
   // failure at an odd status code sends the user looking at the wrong thing.
-  const unauthorized = unauthorizedEnvelope(text);
+  const unauthorized = unauthorizedEnvelope(parsed);
   if (unauthorized) {
     throw new InventoryProviderError(
       "auth",
@@ -382,15 +382,46 @@ interface JSendEnvelope {
   data?: unknown;
 }
 
-function parseEnvelope(text: string, url: URL): JSendEnvelope {
-  let parsed: unknown;
+/**
+ * A RESPONSE BODY, PARSED EXACTLY ONCE. The box is present when the body was
+ * JSON (`json` is then whatever it parsed to, `null` included) and `undefined`
+ * when it was not JSON at all — the two answers `JSON.parse` gives, separated
+ * so that a body which legitimately parses to `undefined`-looking values cannot
+ * be confused with one that failed to parse.
+ *
+ * WHY IT EXISTS. Three places ask a question about the same body: the
+ * session-expiry predicate (`unauthorizedEnvelope`), the envelope reader
+ * (`parseEnvelope` via `unwrap`) and the error mapper (`throwForStatus`).
+ * Each used to run its own `JSON.parse`, so a crawl response — a full node
+ * listing, megabytes on the inventories this feature exists to serve — was
+ * parsed two or three times over. The parse now happens once, in `raw`, and
+ * every one of those three reads the SAME value.
+ *
+ * The alternative that was tried and removed was a raw-text pre-filter in front
+ * of the expiry predicate. It cannot work: JSON has many spellings of one value
+ * (`"\u0075nauthorized"` IS "unauthorized"; `4.01e2` IS 401), only the parser
+ * knows which, and a scan that misses one silently drops a body the predicate
+ * would have accepted — which is exactly the expired-session failure this file
+ * fixes. Sharing the parse removes the duplicated work AND the question.
+ */
+type ParsedBody = { readonly json: unknown } | undefined;
+
+/** `JSON.parse` once, with failure reported as `undefined` rather than a throw. */
+function parseBodyOnce(text: string): ParsedBody {
   try {
-    parsed = JSON.parse(text);
+    return { json: JSON.parse(text) as unknown };
   } catch {
+    return undefined;
+  }
+}
+
+function parseEnvelope(body: ParsedBody, url: URL): JSendEnvelope {
+  if (body === undefined) {
     // MINOR-7 — the body is attacker-influenced (a proxy's HTML error page,
     // say) and is NOT echoed into the message, matching NetBox's parse error.
     throw new InventoryProviderError("protocol", `Response from ${url} is not EVE-NG JSON — is the base URL correct?`);
   }
+  const parsed = body.json;
   if (!isObject(parsed) || !isString(parsed.status)) {
     throw new InventoryProviderError("protocol", `Response from ${url} is not an EVE-NG API envelope — is the base URL correct?`);
   }
@@ -420,23 +451,6 @@ function parseEnvelope(text: string, url: URL): JSendEnvelope {
  */
 const SESSION_EXPIRED_SUBCODE = /\(90001\)/;
 
-/**
- * The raw-text pre-filter for `unauthorizedEnvelope` — see the note there. Every
- * alternative mirrors one branch of `envelopeSaysUnauthorized`:
- *   `unauthorized`        — the status word, matched case-insensitively because
- *                           the predicate case-folds it before comparing;
- *   `(90001)`             — the sub-code, in the same parenthesised form;
- *   `"code": 401 | 403`   — the in-envelope status code, which is the one signal
- *                           that need not put any word in the body. The literal
- *                           JSON spelling is what a parseable envelope must
- *                           contain (whitespace aside); a body that reaches the
- *                           parsed check by some other spelling — `4.01e2`, a
- *                           \u-escaped key — is not a shape EVE-NG emits, and the
- *                           consequence would be one missed silent re-login, the
- *                           behaviour before that retry existed.
- */
-const MAYBE_UNAUTHORIZED_BODY = /unauthorized|\(90001\)|"code"\s*:\s*40[13]\b/i;
-
 function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; message?: unknown }): boolean {
   // A SUCCESS envelope is never an expired session, whatever else it says. The
   // sub-code below is a regex over free text, so a successful reply that happens
@@ -462,15 +476,6 @@ function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; 
 }
 
 /**
- * The same question against a RAW body: the envelope when it parses as one and
- * says unauthorized, `undefined` otherwise — so the caller that needs the
- * message does not parse a second time.
- *
- * Deliberately NOT a substring search over the text: a proxy's HTML error page
- * is not an EVE-NG envelope whatever words it happens to contain, and treating
- * one as an expired session would burn a re-login on every such failure.
- */
-/**
  * The `Location` header, or `undefined`. Defensive about `headers` for the same
  * reason `readSessionCookie` is: the injected `fetch` is a seam, and a
  * Response-alike that answers no headers must not throw here on the error path.
@@ -481,30 +486,18 @@ function readLocation(res: Response): string | undefined {
   return value ?? undefined;
 }
 
-function unauthorizedEnvelope(text: string): Record<string, unknown> | undefined {
-  // HOT PATH — this predicate runs on EVERY crawl response, and the body it is
-  // handed is a full node/lab listing on the large inventories this feature
-  // exists to serve. Parsing all of it to ask a question whose answer is almost
-  // always no doubled the JSON work of a sync (`unwrap` parses the same text
-  // again), so a raw scan rules the question out first. One pass, no allocation
-  // — no `toLowerCase()` copy of a multi-megabyte body.
-  //
-  // A PRE-FILTER, NOT THE DECIDER: everything that gets past it is still parsed
-  // and judged by `envelopeSaysUnauthorized` exactly as before, so a body that
-  // merely mentions the word (a proxy's HTML error page) is still refused. What
-  // this must never do is drop a body the parsed envelope WOULD have accepted,
-  // which is why all three of the predicate's signals appear here — the status
-  // word in any case, the parenthesised sub-code, and the in-envelope 401/403
-  // that carries no such word at all.
-  if (!MAYBE_UNAUTHORIZED_BODY.test(text)) {
-    return undefined;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
+/**
+ * The same question against a whole response: the envelope when the body parsed
+ * as one and says unauthorized, `undefined` otherwise — so the caller that needs
+ * the message has it without parsing again.
+ *
+ * Decided on the PARSED body, never on the characters that encoded it: a proxy's
+ * HTML error page is not an EVE-NG envelope whatever words it happens to
+ * contain, and — the other direction — an envelope that spells its status word
+ * or its code unusually is still that envelope.
+ */
+function unauthorizedEnvelope(body: ParsedBody): Record<string, unknown> | undefined {
+  const parsed = body?.json;
   return isObject(parsed) && envelopeSaysUnauthorized(parsed) ? parsed : undefined;
 }
 
@@ -514,13 +507,19 @@ function unauthorizedEnvelope(text: string): Record<string, unknown> | undefined
  * eventually learn a signal the other did not, and Start/Stop would go on failing
  * on exactly the server whose sync had just been fixed.
  */
-function isExpiredSessionResponse(status: number, text: string): boolean {
-  return status === 401 || status === 403 || unauthorizedEnvelope(text) !== undefined;
+function isExpiredSessionResponse(status: number, body: ParsedBody): boolean {
+  return status === 401 || status === 403 || unauthorizedEnvelope(body) !== undefined;
 }
 
 interface RawResponse {
   status: number;
   text: string;
+  /**
+   * The body parsed ONCE, by `raw` — see `ParsedBody`. Carried on the response
+   * so the expiry predicate, `unwrap` and `throwForStatus` all read the same
+   * value instead of each running `JSON.parse` over the same text.
+   */
+  parsed: ParsedBody;
   url: URL;
   /**
    * The response's `Location`, when it sent one. Captured on every response
@@ -617,7 +616,7 @@ class EveApiClient {
     }
   }
 
-  private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string }> {
+  private async raw(url: URL, init: RequestInit, timeoutMs: number): Promise<{ res: Response; text: string; parsed: ParsedBody }> {
     let res: Response;
     // WALL-CLOCK DEADLINE (#84 P2-2) — cap this request's timeout by the REMAINING
     // crawl budget, so a request issued just before the deadline (or a re-login
@@ -674,7 +673,9 @@ class EveApiClient {
       }
       text = "";
     }
-    return { res, text };
+    // THE ONE PARSE. Everything downstream — the expiry predicate, `unwrap`,
+    // `throwForStatus` — reads this value rather than parsing the text again.
+    return { res, text, parsed: parseBodyOnce(text) };
   }
 
   /**
@@ -689,7 +690,7 @@ class EveApiClient {
    */
   public async login(timeoutMs: number): Promise<void> {
     const url = this.buildUrl("/api/auth/login");
-    const { res, text } = await this.raw(
+    const { res, text, parsed } = await this.raw(
       url,
       {
         method: "POST",
@@ -699,9 +700,9 @@ class EveApiClient {
       timeoutMs
     );
     if (res.status < 200 || res.status >= 300) {
-      throwForStatus(res.status, text, url, readLocation(res));
+      throwForStatus(res.status, text, parsed, url, readLocation(res));
     }
-    const envelope = parseEnvelope(text, url);
+    const envelope = parseEnvelope(parsed, url);
     if (envelope.status !== "success") {
       // A rejected password is HTTP 200 + `status: "fail"`. Anything non-success
       // on the LOGIN endpoint is a credential problem by definition, so it maps
@@ -737,11 +738,11 @@ class EveApiClient {
    */
   public async authedGet(path: string, timeoutMs: number): Promise<RawResponse> {
     const url = this.buildUrl(path);
-    const send = async (): Promise<{ res: Response; text: string }> =>
+    const send = async (): Promise<{ res: Response; text: string; parsed: ParsedBody }> =>
       this.raw(url, { headers: { Cookie: `unetlab_session=${this.session ?? ""}`, Accept: "application/json" } }, timeoutMs);
 
-    let { res, text } = await send();
-    if (isExpiredSessionResponse(res.status, text)) {
+    let { res, text, parsed } = await send();
+    if (isExpiredSessionResponse(res.status, parsed)) {
       // WALL-CLOCK DEADLINE (#84 P2-2) — the silent re-login is TWO more requests
       // (login + retry). Once the crawl deadline has passed, skip it and surface
       // the 401: retrying would run the crawl a full re-login+retry past the
@@ -749,12 +750,12 @@ class EveApiClient {
       // crawl. (When the deadline is merely NEAR, the retry still runs but each of
       // its requests is bounded by the remaining budget in `raw` above.)
       if (this.crawlDeadline !== undefined && Date.now() >= this.crawlDeadline) {
-        return { status: res.status, text, url, location: readLocation(res) };
+        return { status: res.status, text, parsed, url, location: readLocation(res) };
       }
       await this.login(timeoutMs);
-      ({ res, text } = await send());
+      ({ res, text, parsed } = await send());
     }
-    return { status: res.status, text, url, location: readLocation(res) };
+    return { status: res.status, text, parsed, url, location: readLocation(res) };
   }
 
   /**
@@ -767,7 +768,7 @@ class EveApiClient {
    */
   public async authedRequest(method: string, path: string, body?: unknown, timeoutMs: number = FETCH_TIMEOUT_MS): Promise<RawResponse> {
     const url = this.buildUrl(path);
-    const send = async (): Promise<{ res: Response; text: string }> =>
+    const send = async (): Promise<{ res: Response; text: string; parsed: ParsedBody }> =>
       this.raw(
         url,
         {
@@ -782,15 +783,15 @@ class EveApiClient {
         timeoutMs
       );
 
-    let { res, text } = await send();
-    if (isExpiredSessionResponse(res.status, text)) {
+    let { res, text, parsed } = await send();
+    if (isExpiredSessionResponse(res.status, parsed)) {
       // Same single-retry discipline as authedGet — one re-login, never a loop
       // against the lab server. (No crawl deadline is armed on the control path,
       // so the deadline short-circuit authedGet carries is simply inert here.)
       await this.login(timeoutMs);
-      ({ res, text } = await send());
+      ({ res, text, parsed } = await send());
     }
-    return { status: res.status, text, url, location: readLocation(res) };
+    return { status: res.status, text, parsed, url, location: readLocation(res) };
   }
 
   /** `authedGet` plus the 2xx + JSend-success checks — the normal path. */
@@ -1167,9 +1168,9 @@ class EveApiClient {
 /** 2xx + JSend `status: "success"`, or the mapped error for whatever went wrong. */
 function unwrap(raw: RawResponse): unknown {
   if (raw.status < 200 || raw.status >= 300) {
-    throwForStatus(raw.status, raw.text, raw.url, raw.location);
+    throwForStatus(raw.status, raw.text, raw.parsed, raw.url, raw.location);
   }
-  const envelope = parseEnvelope(raw.text, raw.url);
+  const envelope = parseEnvelope(raw.parsed, raw.url);
   if (envelope.status !== "success") {
     // SESSION EXPIRY — the same predicate the silent re-login uses, so a 200 that
     // carries an unauthorized envelope is reported as `auth` rather than as a
