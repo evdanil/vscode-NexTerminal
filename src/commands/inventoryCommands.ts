@@ -4423,6 +4423,15 @@ export function registerInventoryCommands(
     // lab that is merely large. ONE message for the sweep, never one per source —
     // a multi-lab refresh would otherwise stack a pile of notifications. Names up
     // to three sources, in the spirit of the sync's own `namedExamples`.
+    //
+    // CAUSE-NEUTRAL (Codex P2) — `truncated` is set by the wall-clock deadline
+    // AND by every size cap (nodes, labs, folder listings, depth), so naming the
+    // time budget is wrong for a lab tree that simply exceeds a cap — and
+    // "run it again" is actively bad advice there, because a cap is deterministic
+    // and truncates identically next time. The remedy that works for BOTH causes
+    // is a narrower crawl, so that is the only one offered. Propagating the real
+    // reason out of the provider would let this be specific again; the report
+    // contract carries no reason field today.
     const warnIfTruncated = (): void => {
       if (options?.manual !== true || truncatedSourceNames.length === 0) {
         return;
@@ -4432,9 +4441,9 @@ export function registerInventoryCommands(
       const andMore = count > 3 ? ` and ${count - 3} more` : "";
       const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
       void vscode.window.showWarningMessage(
-        `${subject} — the lab crawl hit its time budget, so some nodes may be stale or still unknown. Narrow the ${
+        `${subject} — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the ${
           count === 1 ? "source's" : "sources'"
-        } Root Folder or Lab Filter, or run the refresh again.`
+        } Root Folder or Lab Filter to bring the lab tree inside the crawl's limits.`
       );
     };
     for (const source of targets) {

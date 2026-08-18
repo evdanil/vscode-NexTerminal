@@ -9008,7 +9008,7 @@ describe("nexus.inventory.refreshStatus", () => {
       const message = String(mockShowWarningMessage.mock.calls[0][0]);
       expect(message).toContain('"Big Lab"');
       expect(message).toMatch(/partial/i);
-      expect(message).toMatch(/time budget/i);
+      expect(message).toMatch(/stopped before it covered everything/i);
       expect(message).toMatch(/Root Folder|Lab Filter/);
     });
 
@@ -9199,7 +9199,7 @@ describe("nexus.inventory.refreshStatus", () => {
       // possessive are each one edit away from being wrong, and only the exact
       // sentence pins all three at once. "Lab D" is named nowhere.
       expect(String(mockShowWarningMessage.mock.calls[0][0])).toBe(
-        'Lab status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the lab crawl hit its time budget, so some nodes may be stale or still unknown. Narrow the sources\' Root Folder or Lab Filter, or run the refresh again.'
+        'Lab status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the sources\' Root Folder or Lab Filter to bring the lab tree inside the crawl\'s limits.'
       );
     });
   });
