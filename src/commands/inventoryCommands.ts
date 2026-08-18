@@ -224,13 +224,29 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
  * sync's own apply never changes revision, so this still matches on the
  * ordinary, non-racy path.
  */
+/**
+ * F5, shared — is the record currently holding `snapshot.id` still the SAME
+ * INCARNATION `snapshot` names? `sourceConfigUnchanged` is revision-based once
+ * both sides carry a revision (see its doc) and `addOrUpdateInventorySource`
+ * mints a fresh revision on every write, so an edit — or a replace-mode import /
+ * complete reset that removed the source and re-added one under the same id —
+ * fails it, while the sync's own lastSyncAt-only bump does not. The name is
+ * compared separately because the comparator does not cover it. Used by the
+ * best-effort restamp and by the sync's status apply, which must not land on a
+ * different incarnation for exactly the same reason.
+ */
+function isSameSourceIncarnation(core: NexusCore, snapshot: InventorySourceConfig): boolean {
+  const current = core.getInventorySource(snapshot.id);
+  return current !== undefined && sourceConfigUnchanged(current, snapshot) && current.name === snapshot.name;
+}
+
 async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapshot: InventorySourceConfig, fingerprint: string): Promise<void> {
   await configMutationLock.runExclusive(async (): Promise<void> => {
     const current = core.getInventorySource(syncSnapshot.id);
     if (!current || current.providerFingerprint === fingerprint) {
       return;
     }
-    if (!sourceConfigUnchanged(current, syncSnapshot) || current.name !== syncSnapshot.name) {
+    if (!isSameSourceIncarnation(core, syncSnapshot)) {
       return;
     }
     try {
@@ -3282,18 +3298,43 @@ export function registerInventoryCommands(
        * before the apply, a device this sync has just created matches nothing and
        * its status would be silently dropped.
        *
-       * NO NEW CONCURRENCY GUARD. The whole of `syncNow` runs while this source
-       * is claimed in `inFlightSourceIds`, so no other sync/edit/remove can be
-       * mid-flight against it and `refreshStatus` skips it entirely; and the
-       * locked attempt that just committed re-verified `sourceConfigUnchanged`
-       * against the record it applied to, so this tree — and therefore this
-       * status — provably belongs to the source as it now stands. It is called
-       * OUTSIDE `configMutationLock`, like the fingerprint restamp beside it,
-       * because it is a pure runtime-map update (no persistence) and the lock's
-       * rule is that nothing joins it that does not need it.
+       * `inFlightSourceIds` claims this source for the whole of `syncNow`, so no
+       * other sync/edit/remove races it and `refreshStatus` skips it — but the
+       * latch does not cover a config IMPORT or a complete reset, which replace
+       * every record (this source included, id reused) without consulting it.
+       * Both queue on `configMutationLock`, so one can be waiting the moment this
+       * sync's own locked attempt releases; the apply is keyed by `source.id`
+       * alone, and applied to a replacement incarnation it would overwrite the new
+       * source's runtime status and clear its `statusAppliedGeneration` entry.
+       *
+       * Two things keep it on its own incarnation:
+       *  1. CALLED FIRST, immediately after the locked attempt that committed and
+       *     BEFORE the best-effort restamp beside it. The restamp takes its own
+       *     `configMutationLock` acquisition — a real `await` on a lock a queued
+       *     import may already hold — so anything after it can resume into a
+       *     replaced source. Nothing awaits between the commit and this call now.
+       *  2. REVALIDATED ANYWAY, mirroring what `refreshStatus` does before its own
+       *     apply. `runExclusive` resolving is itself a scheduling boundary, so
+       *     "no await in between" is not a proof; the caller passes the incarnation
+       *     it applied against and the MUTATION EPOCH as of the end of its locked
+       *     section — captured INSIDE the lock, after the plan apply that bumps it,
+       *     which is what distinguishes this sync's own commit (epoch matches) from
+       *     somebody else's server write landing afterwards (it does not). Capturing
+       *     before the commit would never match; capturing after the lock released
+       *     would fold a racing writer's bump into the baseline and always match.
+       *     The epoch alone does not see a source record REPLACED (removal and
+       *     re-add mutate no servers), so the incarnation is compared too — the
+       *     same `sourceConfigUnchanged` + name check the restamp uses.
+       *
+       * Still called OUTSIDE `configMutationLock`: it is a pure runtime-map update
+       * (no persistence) and the lock's rule is that nothing joins it that does not
+       * need it.
        */
-      const applyFetchedStatus = (): void => {
+      const applyFetchedStatus = (committed: { source: InventorySourceConfig; mutationEpoch: number }): void => {
         if (fetchedStatus) {
+          if (core.getSourceMutationEpoch(source.id) !== committed.mutationEpoch || !isSameSourceIncarnation(core, committed.source)) {
+            return;
+          }
           core.applyInventoryStatus(source.id, fetchedStatus);
           // R3 (follow-up #43 review) — THE SECOND APPLIER. `refreshStatus`
           // records the sweep generation that last applied status for a source
@@ -3367,7 +3408,15 @@ export function registerInventoryCommands(
         // source config race (or any persist failure) here must produce a
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
-          | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number; source: InventorySourceConfig }
+          | {
+              kind: "done";
+              plan: InventorySyncPlan;
+              removedEmptyFolderCount: number;
+              source: InventorySourceConfig;
+              // The source's mutation epoch as of the END of this locked section
+              // — the anchor `applyFetchedStatus` re-checks against. See its doc.
+              mutationEpoch: number;
+            }
           | {
               kind: "not-empty";
               plan: InventorySyncPlan;
@@ -3434,7 +3483,16 @@ export function registerInventoryCommands(
             // against), not the outer `source` captured before this sync
             // started, is what the post-lock restamp below must compare
             // against.
-            return { kind: "done", plan: recomputed, removedEmptyFolderCount: applyResult.removedEmptyFolderCount, source: freshSource };
+            return {
+              kind: "done",
+              plan: recomputed,
+              removedEmptyFolderCount: applyResult.removedEmptyFolderCount,
+              source: freshSource,
+              // Read INSIDE the lock, after the apply that bumped it: everything
+              // this sync itself did is already folded in, and no other locked
+              // writer can have run yet.
+              mutationEpoch: core.getSourceMutationEpoch(freshSource.id)
+            };
           } catch (error) {
             // The apply did NOT commit (or a stale-secret delete failed) — the old
             // proxy config is still live and needs its password; put back what we
@@ -3454,18 +3512,23 @@ export function registerInventoryCommands(
         if (fastPathResult.kind === "abort") return;
         if (fastPathResult.kind === "done") {
           const donePlan = fastPathResult.plan;
-          // ITEM A — the sync (a no-op apply, but still a successful one)
-          // has now committed; restamp outside the lock just released above.
-          if (fingerprintToStamp) {
-            await restampProviderFingerprintBestEffort(core, fastPathResult.source, fingerprintToStamp);
-          }
           // LIVE STATUS ON A SYNC (follow-up #42) — a nothing-to-change sync is
           // still a COMPLETED sync: it applied a (empty) plan, it bumped
           // lastSyncAt, and the status it fetched is exactly as current as the
           // confirm path's. This is also the ORDINARY shape of a re-sync of a
           // settled lab, so leaving it out would mean the status only ever
           // updates on the syncs that happen to change something.
-          applyFetchedStatus();
+          //
+          // BEFORE the restamp, not after: the restamp awaits its own
+          // `configMutationLock` acquisition, and a replace-mode import queued on
+          // that lock runs to completion inside the await (see
+          // `applyFetchedStatus`).
+          applyFetchedStatus(fastPathResult);
+          // ITEM A — the sync (a no-op apply, but still a successful one)
+          // has now committed; restamp outside the lock just released above.
+          if (fingerprintToStamp) {
+            await restampProviderFingerprintBestEffort(core, fastPathResult.source, fingerprintToStamp);
+          }
           // ITEM B — surfaced only when nonzero, appended to the same toast.
           const emptyFolderNote =
             fastPathResult.removedEmptyFolderCount > 0
@@ -3861,6 +3924,9 @@ export function registerInventoryCommands(
             // against (`freshSource`, read inside this same locked attempt),
             // for the post-lock restamp below to compare against.
             source: InventorySourceConfig;
+            // The source's mutation epoch as of the END of this locked section
+            // — the anchor `applyFetchedStatus` re-checks against. See its doc.
+            mutationEpoch: number;
           };
 
       for (;;) {
@@ -4324,7 +4390,12 @@ export function registerInventoryCommands(
             recreatedCount: recreatedIds.size,
             teardownFailureCount: teardownFailedIds.size,
             removedEmptyFolderCount: applyResult.removedEmptyFolderCount,
-            source: freshSource
+            source: freshSource,
+            // Read INSIDE the lock, at the very end of the section that
+            // committed: this sync's own apply has already bumped it and no
+            // other locked writer can have run yet, so a later mismatch names
+            // somebody else's write.
+            mutationEpoch: core.getSourceMutationEpoch(freshSource.id)
           };
         });
 
@@ -4337,6 +4408,19 @@ export function registerInventoryCommands(
           continue;
         }
 
+        // LIVE STATUS ON A SYNC (follow-up #42) — AFTER the apply committed
+        // (`attempt.kind === "success"` is the only way here), so every server
+        // this plan just created is already in the core and can resolve its own
+        // status entry. Every earlier exit — abort, retry, a declined preview, a
+        // failed fetch — returns or loops without reaching this line, which is
+        // what makes "a sync that did not apply changes no status" true by
+        // construction rather than by a condition that could drift.
+        //
+        // BEFORE the restamp, not after: the restamp awaits its own
+        // `configMutationLock` acquisition, and a replace-mode import queued on
+        // that lock runs to completion inside the await (see
+        // `applyFetchedStatus`).
+        applyFetchedStatus(attempt);
         // ITEM A — the sync has now committed successfully; restamp as a
         // separate, non-nested locked write outside the attempt's own
         // (already-resolved) lock acquisition. F5 — compared against
@@ -4345,14 +4429,6 @@ export function registerInventoryCommands(
         if (fingerprintToStamp) {
           await restampProviderFingerprintBestEffort(core, attempt.source, fingerprintToStamp);
         }
-        // LIVE STATUS ON A SYNC (follow-up #42) — AFTER the apply committed
-        // (`attempt.kind === "success"` is the only way here), so every server
-        // this plan just created is already in the core and can resolve its own
-        // status entry. Every earlier exit — abort, retry, a declined preview, a
-        // failed fetch — returns or loops without reaching this line, which is
-        // what makes "a sync that did not apply changes no status" true by
-        // construction rather than by a condition that could drift.
-        applyFetchedStatus();
 
         const finalPlan = attempt.finalPlan;
         const deletedCount = finalPlan.prunes.filter((p) => p.policy === "delete").length;

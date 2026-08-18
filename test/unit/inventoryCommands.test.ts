@@ -9877,4 +9877,154 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
     expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
   });
+
+  /**
+   * THE APPLY BELONGS TO ONE INCARNATION OF ONE SOURCE. `inFlightSourceIds`
+   * keeps other syncs/edits/removes off this source for the whole command, but a
+   * replace-mode config import (and a complete reset) consults no such latch —
+   * it only queues on `configMutationLock`. So it can be waiting the moment the
+   * sync's own locked attempt releases, replace the source and its servers under
+   * the same id, and leave the sync holding a report keyed by `source.id` alone.
+   *
+   * The three tests below cover the two halves of the fix (the apply runs before
+   * the restamp's own lock acquisition; it revalidates anyway) and the ordering
+   * rule neither half may break.
+   */
+  const FLIPPED = {
+    ...eveTree(),
+    status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" as const }, "/L.unl#2": { state: "running" as const } } }
+  };
+
+  /**
+   * The replace phase of `importMergeReplaceLocked`, driven directly: drop every
+   * server, drop the source record, then re-add a source under the SAME id and
+   * one id-preserving server owned by it. Nothing here takes
+   * `configMutationLock` (no NexusCore method does), so it can be run from
+   * inside the lock spy without recursing.
+   */
+  async function replaceSourceIncarnation(core: NexusCore): Promise<void> {
+    for (const server of core.getSnapshot().servers) {
+      await core.removeServer(server.id);
+    }
+    await core.removeInventorySource("src-1");
+    await core.addOrUpdateInventorySource(makeSource({ name: "Imported Lab", targetFolder: "Imported" }));
+    await core.addOrUpdateServer(
+      makeServer({
+        id: RUNNING_ID,
+        name: "imported-r1",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "/L.unl#1", syncedAt: 1 }
+      })
+    );
+  }
+
+  /**
+   * Runs `inject` in the gap between the sync's own locked attempt resolving and
+   * the caller resuming — i.e. exactly where a queued lock waiter runs. The
+   * empty-plan fast path takes two acquisitions (the apply, then the restamp),
+   * and `n` picks which one to land behind.
+   */
+  async function syncWithInjectionAfterAcquisition(n: number, sync: (id: string) => unknown, inject: () => Promise<void>): Promise<void> {
+    let acquisitions = 0;
+    const originalRunExclusive = configMutationLock.runExclusive.bind(configMutationLock);
+    const spy = vi.spyOn(configMutationLock, "runExclusive").mockImplementation(async (fn: () => Promise<unknown>) => {
+      acquisitions++;
+      const mine = acquisitions;
+      const result = await originalRunExclusive(fn as () => Promise<unknown>);
+      if (mine === n) {
+        await inject();
+      }
+      return result;
+    });
+    try {
+      await sync("src-1");
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("skips the apply when a replace-mode import replaced the source in the gap between the commit and the apply (⊘ applying a report keyed by source.id alone paints THIS sync's picture onto the replacement's servers and clears the replacement's own status bookkeeping)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+
+    // A nothing-to-change re-sync carrying a FLIPPED picture, with the import
+    // landing the instant the sync's own lock acquisition resolves.
+    await syncWithInjectionAfterAcquisition(1, reregister(core, FLIPPED), () => replaceSourceIncarnation(core));
+
+    // The replacement really is in place...
+    expect(core.getInventorySource("src-1")?.name).toBe("Imported Lab");
+    expect(core.getServer(RUNNING_ID)?.name).toBe("imported-r1");
+    // ...and nothing repainted its runtime status. (Removing the old servers
+    // dropped every entry, so a stale apply is the only thing that could put one
+    // back — it would resolve `/L.unl#1` onto the re-added server and stamp the
+    // pre-replacement crawl's `stopped` on it.)
+    expect(core.getSnapshot().serverStatus.size).toBe(0);
+  });
+
+  /**
+   * The epoch half, driven directly. No shipping writer can currently bump this
+   * source's epoch inside the window — `inFlightSourceIds` keeps a second sync
+   * out and makes `refreshStatus` skip the source (and its heal re-checks the
+   * same latch), and the replace-mode import above mutates servers without ever
+   * bumping it. So this is defence in depth, and it is deliberate: the refresh
+   * path already re-checks the epoch before its apply, and the sync path having
+   * a WEAKER rule than the refresh path is precisely the asymmetry that produced
+   * this bug in the first place.
+   */
+  it("skips the apply when a server-mutating write for the SAME source landed in that gap, even though the source record is untouched (⊘ checking only the record's incarnation lets a completed write for this source be repainted with the pre-write picture)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1");
+
+    await syncWithInjectionAfterAcquisition(1, reregister(core, FLIPPED), async () => {
+      // A sync apply for src-1 that changes no server: it bumps the source's
+      // mutation epoch and its lastSyncAt, and — a spread onto the same record —
+      // leaves the revision, and so the incarnation check, alone.
+      await core.applyInventorySyncPlan({
+        sourceId: "src-1",
+        syncedAt: Date.now(),
+        upsertServers: [],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: core.getInventorySource("src-1")!
+      });
+    });
+
+    // The record is still the same incarnation, so only the epoch can have
+    // caught this — and the flipped picture was NOT applied.
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("applies the status BEFORE the fingerprint restamp, so no await separates the commit from the apply (⊘ restamping first opens a full lock acquisition — the window a queued replace-mode import runs in — between the two)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1");
+    // The first sync stamped the fingerprint; clear it so the next sync restamps.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("src-1")!, providerFingerprint: undefined });
+
+    const order: string[] = [];
+    const applied = core.applyInventoryStatus.bind(core);
+    vi.spyOn(core, "applyInventoryStatus").mockImplementation((sourceId, report) => {
+      order.push("status");
+      applied(sourceId, report);
+    });
+    const saved = core.addOrUpdateInventorySource.bind(core);
+    vi.spyOn(core, "addOrUpdateInventorySource").mockImplementation(async (updated) => {
+      // Only the restamp writes a fingerprint — the apply's own lastSyncAt bump
+      // does not go through this method at all.
+      if (updated.providerFingerprint !== undefined) {
+        order.push("restamp");
+      }
+      return saved(updated);
+    });
+
+    await reregister(core, FLIPPED)("src-1");
+
+    expect(order).toEqual(["status", "restamp"]);
+    expect(core.getInventorySource("src-1")?.providerFingerprint).toBeDefined(); // the restamp still ran
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("stopped"); // ...and the status still landed
+  });
 });
