@@ -86,6 +86,11 @@ describe.skipIf(!certs)("insecure-TLS transport against a real self-signed HTTPS
         });
         return;
       }
+      if (req.url === "/hang") {
+        // Deliberately never answered: the abort test must win the race against
+        // the response every time, not merely usually.
+        return;
+      }
       if (req.url === "/redirect") {
         res.writeHead(302, { Location: "https://elsewhere.example.com/" });
         res.end("");
@@ -147,11 +152,12 @@ describe.skipIf(!certs)("insecure-TLS transport against a real self-signed HTTPS
     expect(res.headers.get("location")).toBe("https://elsewhere.example.com/");
   });
 
-  it("still fails, with an AbortSignal.timeout's own TimeoutError, when the deadline expires mid-request", async () => {
-    const err = await createInsecureHttpsFetch()(`${origin}/api/status`, { redirect: "manual", signal: AbortSignal.timeout(0) }).then(
+  it("still fails, with an AbortSignal.timeout's own TimeoutError, when the deadline expires mid-request against a server that never answers", async () => {
+    const err = await createInsecureHttpsFetch()(`${origin}/hang`, { redirect: "manual", signal: AbortSignal.timeout(100) }).then(
       () => undefined,
       (e: unknown) => e
     );
+    expect(err).toBeInstanceOf(Error);
     expect((err as Error).name).toBe("TimeoutError");
   });
 
