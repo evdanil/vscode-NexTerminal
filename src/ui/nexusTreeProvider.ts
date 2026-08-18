@@ -9,6 +9,19 @@ import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
 import { serverStatusUri, folderStatusUri } from "./inventoryStatusDecorationProvider";
 
 export class FolderTreeItem extends vscode.TreeItem {
+  /**
+   * PER-SOURCE SYNC (follow-up #43) — the inventory source this folder is the
+   * `targetFolder` of, set by `NexusTreeProvider.makeFolderItem` only when
+   * EXACTLY ONE source targets it. It is what makes the row's inline sync icon
+   * act on that source: `resolveSourceIdArg` (commands/inventoryCommands.ts)
+   * already reads `arg.sourceId` off the tree item VS Code hands a
+   * `view/item/context` command, so this needs no command-layer change at all.
+   *
+   * Left `undefined` everywhere else — a folder no source targets, a folder two
+   * sources share (ambiguous, so no icon), and every Macros-view folder.
+   */
+  public sourceId?: string;
+
   public constructor(
     public readonly folderPath: string,
     displayName: string,
@@ -588,7 +601,52 @@ export class NexusTreeProvider
     // server. Set only on Command Center folders (this method) — the Macros
     // view builds its own FolderTreeItems and must not inherit lab highlights.
     item.resourceUri = folderStatusUri(path);
+    // PER-SOURCE SYNC (follow-up #43) — set HERE, alongside the resourceUri and
+    // for the same reason: this is the one construction site for Command Center
+    // folder rows, so the Macros view (which builds its own FolderTreeItems with
+    // an explicit contextValue) cannot inherit either.
+    //
+    // THE MARKER IS AN OPTIONAL SUFFIX on whichever base value the row already
+    // has, exactly as `.eveRunning`/`.eveStopped` suffix a server's — so the
+    // `nexus.folder` / `nexus.folderWithServers` distinction survives it and
+    // every existing folder menu entry keeps matching (their `when` regexes were
+    // widened with the same optional group). Appending, rather than replacing,
+    // is what keeps a marked folder's connect/rename/remove actions.
+    const syncSourceId = this.soleSourceTargeting(path);
+    if (syncSourceId !== undefined) {
+      item.sourceId = syncSourceId;
+      item.contextValue = `${item.contextValue}.syncSource`;
+    }
     return item;
+  }
+
+  /**
+   * PER-SOURCE SYNC (follow-up #43) — the id of the inventory source this folder
+   * is the `targetFolder` of, or `undefined` when that is not exactly one source.
+   *
+   * COUNTED, never `find`/`some`. Two sources can legitimately share a target
+   * folder, and there is no defensible answer to "which one does this icon
+   * sync?" — a first-match implementation would silently pick whichever the
+   * snapshot happens to list first and sync the wrong source on every click. So
+   * an ambiguous folder gets no icon and the user goes through Settings, which
+   * names both.
+   *
+   * An EQUALITY test, not a descendant test: the icon belongs on the folder the
+   * source syncs INTO, not on every lab folder underneath it, each of which
+   * would otherwise claim to sync the whole source. `targetFolder: ""` (root)
+   * matches nothing, because no folder row has an empty path — root is the
+   * absence of a row, so there is simply nowhere to put the icon.
+   */
+  private soleSourceTargeting(path: string): string | undefined {
+    let found: string | undefined;
+    let count = 0;
+    for (const source of this.snapshot.inventorySources) {
+      if (source.targetFolder === path) {
+        count++;
+        found = source.id;
+      }
+    }
+    return count === 1 ? found : undefined;
   }
 
   private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {

@@ -683,6 +683,22 @@ describe("MacroTreeProvider — hierarchical folders (§4.3, §4.4)", () => {
     expect(testStore.getAll()[folderChildren[0].index].name).toBe("InFolder");
   });
 
+  /**
+   * PER-SOURCE SYNC ON THE FOLDER ROW (follow-up #43) — the Macros view REUSES
+   * `FolderTreeItem`, so anything the Command Center stamps onto a folder row
+   * has to be stamped at the Command Center's construction site and nowhere
+   * else. A `.syncSource` marker leaking here would put an inventory Sync icon
+   * on a macro folder, and a `sourceId` would give it a source to sync.
+   */
+  it("a Macros-view folder carries neither the .syncSource marker nor a sourceId — inventory markers belong to the Command Center's folder rows only (\u2298 stamping the marker inside FolderTreeItem itself, rather than at the Command Center construction site, hangs an inventory sync icon on macro folders)", async () => {
+    await testStore.save([{ name: "InFolder", text: "f1", group: "Cisco" }]);
+
+    const folder = findFolder(provider.getChildren(), "Cisco");
+
+    expect(folder.contextValue).toBe("nexus.folder.macros");
+    expect(folder.sourceId).toBeUndefined();
+  });
+
   it("folders sort by naturalComparePath; macros keep array order (root)", async () => {
     const macros: TerminalMacro[] = [
       { name: "Zebra", text: "t" },

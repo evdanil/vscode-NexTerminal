@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox and EVE-NG inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.190",
+  "version": "2.8.191",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -975,11 +975,6 @@
           "group": "1_manage@4"
         },
         {
-          "command": "nexus.inventory.refreshStatus",
-          "when": "view == nexusCommandCenter",
-          "group": "1_manage@5"
-        },
-        {
           "command": "nexus.tunnel.add",
           "when": "view == nexusTunnels",
           "group": "navigation@1"
@@ -1258,42 +1253,47 @@
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "inline@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "inline@2"
         },
         {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "group": "inline@3"
+        },
+        {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.group.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.group.add",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.profile.add",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.authProfile.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@4"
         },
         {
@@ -1318,12 +1318,17 @@
         },
         {
           "command": "nexus.deviceTemplate.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@5"
         },
         {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "group": "1_manage@6"
+        },
+        {
           "command": "nexus.group.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "3_destructive"
         },
         {

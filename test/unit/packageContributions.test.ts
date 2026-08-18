@@ -827,6 +827,153 @@ describe("package contributions", () => {
     });
   });
 
+
+  /**
+   * PER-SOURCE SYNC ON THE FOLDER ROW (follow-up #43) — the `.syncSource` marker
+   * is an OPTIONAL SUFFIX on a Command Center folder's contextValue, the same
+   * shape `.eveRunning`/`.eveStopped` take on a server's. That only works if
+   * every existing folder `when` clause tolerates it: an entry left on the old
+   * `== nexus.folderWithServers` or the old `/^nexus\.folder(WithServers)?$/`
+   * would silently vanish from exactly the folders this feature marks — a lab's
+   * root folder losing Connect, Rename and Remove.
+   *
+   * The table below is the whole contract, and it is checked in BOTH directions:
+   * every ordinary folder entry must match all four folder values, and the new
+   * inline sync entry must match ONLY the two marked ones.
+   */
+  describe("Folder contextValue markers (follow-up #43)", () => {
+    function viewItemRegexFor(when?: string): RegExp | null {
+      const m = /viewItem =~ \/(.+?)\/(?=\s|$)/.exec(when ?? "");
+      return m ? new RegExp(m[1]) : null;
+    }
+
+    const FOLDER_VALUES = ["nexus.folder", "nexus.folderWithServers", "nexus.folder.syncSource", "nexus.folderWithServers.syncSource"];
+    // Intent-driven, not copied from the regexes under test.
+    const MARKED = FOLDER_VALUES.filter((v) => v.endsWith(".syncSource"));
+    const WITH_SERVERS = FOLDER_VALUES.filter((v) => v.startsWith("nexus.folderWithServers"));
+
+    // Values NO Command Center folder entry may match. `nexus.folder.macros` is
+    // the one that matters most: the Macros view reuses FolderTreeItem with its
+    // own contextValue, and a marker group loose enough to swallow it would put
+    // Connect/Rename/Sync onto macro folders.
+    const NON_FOLDER = [
+      "nexus.folder.macros",
+      "nexus.scriptFolder",
+      "nexus.server",
+      "nexus.inventorySource",
+      // near-misses the anchors must reject
+      "nexus.folderX",
+      "nexus.folder.syncSourceX",
+      "nexus.folderWithServers.syncSource.extra",
+      "nexus.folder.macros.syncSource"
+    ];
+
+    it("every Command Center folder menu entry tolerates the optional .syncSource marker, and none of them matches a Macros/Scripts folder (⊘ leaving one matcher un-widened strips that action from every source-target folder)", () => {
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      const folderMenus = menuItems.filter(
+        (m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem =~ /^nexus\\.folder")
+      );
+      expect(folderMenus.length).toBeGreaterThan(0);
+      // No COMMAND CENTER folder entry may still pin an exact `== nexus.folder…`
+      // — that form cannot carry the marker at all. (The Macros view's entries
+      // legitimately keep theirs; they are pinned to `nexus.folder.macros`,
+      // asserted separately below.)
+      expect(
+        menuItems
+          .filter((m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem == nexus.folder"))
+          .map((m) => m.command)
+      ).toEqual([]);
+
+      // command|group → the folder values that entry MUST match, and only those.
+      const EXPECTED: Record<string, string[]> = {
+        "nexus.group.connect|inline@1": WITH_SERVERS,
+        "nexus.group.disconnect|inline@2": WITH_SERVERS,
+        "nexus.inventory.syncNow|inline@3": MARKED,
+        "nexus.inventory.syncNow|1_manage@6": MARKED,
+        "nexus.group.connect|0_connect@1": WITH_SERVERS,
+        "nexus.group.disconnect|0_connect@2": WITH_SERVERS,
+        "nexus.group.rename|1_manage@1": FOLDER_VALUES,
+        "nexus.group.add|1_manage@2": FOLDER_VALUES,
+        "nexus.profile.add|1_manage@3": FOLDER_VALUES,
+        "nexus.authProfile.applyToFolder|1_manage@4": FOLDER_VALUES,
+        "nexus.deviceTemplate.applyToFolder|1_manage@5": FOLDER_VALUES,
+        "nexus.group.remove|3_destructive": FOLDER_VALUES
+      };
+      expect(folderMenus.map((m) => `${m.command}|${m.group}`).sort()).toEqual(Object.keys(EXPECTED).sort());
+
+      for (const m of folderMenus) {
+        const key = `${m.command}|${m.group}`;
+        const re = viewItemRegexFor(m.when);
+        expect(re, key).not.toBeNull();
+        for (const value of FOLDER_VALUES) {
+          expect(re!.test(value), `${key} vs ${value}`).toBe(EXPECTED[key].includes(value));
+        }
+        for (const value of NON_FOLDER) {
+          expect(re!.test(value), `${key} must not match ${value}`).toBe(false);
+        }
+      }
+    });
+
+    it("the folder sync action reuses nexus.inventory.syncNow with its $(sync) icon and sits AFTER the two connection actions in the inline row (⊘ a second command, or an ordinal before connect/disconnect, reshuffles icons users already know)", () => {
+      const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.syncNow");
+      expect(command?.icon).toBe("$(sync)");
+      const entries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter")
+      );
+      expect(entries.some((m) => m.group === "inline@3")).toBe(true);
+    });
+
+    /**
+     * The inline icon is HOVER-ONLY discoverability. Every other folder action
+     * — Connect and Disconnect included, which are contributed TWICE for exactly
+     * this reason — is also reachable by right-click, so the one action a marked
+     * folder was marked FOR must be too.
+     *
+     * `1_manage`, last: a sync is not a connection action (it opens no session,
+     * and it marks folders with no direct servers at all, where `0_connect` is
+     * empty), and `1_manage` already holds the bulk record-rewriting actions
+     * (Apply Auth Profile, Apply Device Template) that, like a sync, rewrite the
+     * servers UNDER the folder rather than the folder itself. Appending at @6
+     * leaves every-folder ordinals @1..@5 untouched, so a marked folder adds a
+     * row at the end of the management band instead of displacing anything.
+     */
+    it("also contributes Sync Inventory Now to the right-click menu, last in 1_manage, on the same marked-folder matcher as the inline icon (⊘ inline-only leaves the row's whole reason for existing on hover)", () => {
+      const contextEntries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter") && !(m.group ?? "").startsWith("inline")
+      );
+      expect(contextEntries).toHaveLength(1);
+      const entry = contextEntries[0];
+      expect(entry.group).toBe("1_manage@6");
+      // Strictly after every action an UNMARKED folder already shows in the
+      // group, so the marker only ever appends.
+      const manageOrdinals = (packageJson.contributes.menus["view/item/context"] ?? [])
+        .filter(
+          (m) =>
+            (m.when ?? "").includes("nexusCommandCenter") &&
+            (m.when ?? "").includes("viewItem =~ /^nexus\\.folder") &&
+            (m.group ?? "").startsWith("1_manage@") &&
+            m.command !== "nexus.inventory.syncNow"
+        )
+        .map((m) => Number((m.group ?? "").split("@")[1]));
+      expect(manageOrdinals.length).toBeGreaterThan(0);
+      expect(Math.max(...manageOrdinals)).toBeLessThan(6);
+      // The same matcher the inline icon uses: marked folders only, and never a
+      // Macros folder. (The EXPECTED table above checks this exhaustively; this
+      // asserts the two entries cannot drift apart.)
+      const inlineEntry = (packageJson.contributes.menus["view/item/context"] ?? []).find(
+        (m) => m.command === "nexus.inventory.syncNow" && m.group === "inline@3"
+      );
+      expect(entry.when).toBe(inlineEntry?.when);
+    });
+
+    it("keeps the Macros view's own folder entries pinned to nexus.folder.macros, untouched by the widening (⊘ a shared matcher would cross the two views' folder rows)", () => {
+      const macroFolderMenus = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexusMacros") && (m.when ?? "").includes("nexus.folder")
+      );
+      expect(macroFolderMenus.length).toBeGreaterThan(0);
+      expect(macroFolderMenus.every((m) => (m.when ?? "").includes("viewItem == nexus.folder.macros"))).toBe(true);
+    });
+  });
   describe("Live lab status (Phase 2)", () => {
     it("contributes nexus.inventory.refreshStatus as a palette-invocable Nexus command", () => {
       const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.refreshStatus");
@@ -840,12 +987,25 @@ describe("package contributions", () => {
       expect(paletteEntry?.when).not.toBe("false");
     });
 
-    it("surfaces Refresh Lab Status as a Command Center title action (least-intrusive tree affordance)", () => {
+    /**
+     * FOLLOW-UP #42 — Refresh Lab Status is GONE from the Command Center's `...`
+     * menu. A sync now brings lab status current by itself, so a second,
+     * non-standard entry sitting permanently in the hub's menu — visible even to
+     * a user with no EVE-NG source at all — was buying nothing. The command
+     * itself stays, on the Command Palette, for a status-only refresh between
+     * syncs.
+     */
+    it("does NOT put Refresh Lab Status in the Command Center title menu — a sync refreshes lab status, so the standalone entry does not earn a permanent seat there (⊘ leaving it shows a non-standard action to every user, EVE-NG source or not)", () => {
       const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
-      const entry = titleMenuItems.find(
-        (item) => item.command === "nexus.inventory.refreshStatus" && item.when === "view == nexusCommandCenter"
+      expect(titleMenuItems.filter((item) => item.command === "nexus.inventory.refreshStatus")).toHaveLength(0);
+      // The COMMAND and its palette entry are deliberately untouched — this
+      // removed a menu seat, not the feature.
+      expect(packageJson.contributes.commands.some((item) => item.command === "nexus.inventory.refreshStatus")).toBe(true);
+      const paletteEntry = (packageJson.contributes.menus.commandPalette ?? []).find(
+        (item) => item.command === "nexus.inventory.refreshStatus"
       );
-      expect(entry).toBeDefined();
+      expect(paletteEntry).toBeDefined();
+      expect(paletteEntry?.when).not.toBe("false");
     });
 
     it("does NOT add refreshStatus to the inventory-source row inline group, keeping those rows' four actions intact", () => {
@@ -878,6 +1038,61 @@ describe("package contributions", () => {
       expect(functionalDocs).toMatch(/ipmiHost/);
       expect(functionalDocs).toMatch(/connectBmcSol|BMC menu gating/);
       expect(readme).toMatch(/Refresh Lab Status/);
+    });
+
+    it("documents that a completed sync now updates lab status, and stops telling the user to click a title-bar button that is gone (\u2298 docs that still describe the removed menu seat send the user hunting for it)", () => {
+      expect(functionalDocs).toMatch(/A completed sync updates every EVE-NG node's running\/stopped state/);
+      // The status report is built from the UNFILTERED node list, so
+      // `Include Stopped Nodes` never makes it partial. The report's OWN
+      // raw-node cap does — a claim of a different kind ("we stopped looking, so
+      // absence proves nothing"), which the docs have to name as such rather
+      // than let it collapse back into the retired filter rule.
+      expect(functionalDocs).toMatch(/counted over the RAW nodes reached, not the devices kept/);
+      expect(functionalDocs).toMatch(/`Include Stopped Nodes` is deliberately NOT one of those stopping points/);
+      // The retired rule — the FILTER as a reason the report is partial — must
+      // not come back in either of the wordings that carried it.
+      expect(functionalDocs).not.toMatch(/marks it `truncated` for \*\*two\*\* reasons/);
+      expect(functionalDocs).not.toMatch(/\*\*Include Stopped Nodes is off\*\*/);
+      // ...and "exactly one reason" is no longer true either.
+      expect(functionalDocs).not.toMatch(/marks it `truncated` for exactly \*\*one\*\* reason/);
+      expect(functionalDocs).not.toMatch(/Available from the palette and as a Command Center title action/);
+      expect(readme).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
+    });
+
+    /**
+     * A sync CAN mint a fresh `revision`: the fingerprint restamp (first sync of
+     * a source with none stored, or one past a confirmed provider change) writes
+     * through `addOrUpdateInventorySource`, the only place a live record's
+     * revision is ever minted. The docs claimed the epoch was the ONLY apply
+     * check a sync moves — true of a routine sync, false in general, and the
+     * kind of absolute a later reader would build on.
+     */
+    it("does not claim a sync NEVER mints a revision — the fingerprint restamp does, and the docs name it (\u2298 the absolute reads as a guarantee the restamp path breaks)", () => {
+      expect(functionalDocs).not.toMatch(/the epoch is the only one of the apply's three checks that a sync moves/);
+      expect(functionalDocs).toMatch(/A sync that RESTAMPS the provider fingerprint is the exception/);
+      // Both sentences say the same thing: the qualification is "routine", and
+      // "routine" is defined rather than assumed.
+      expect(functionalDocs).toMatch(/one that does not restamp the provider fingerprint/);
+      expect(functionalDocs).not.toMatch(/A sync belongs to no sweep, and a routine sync touches only/);
+    });
+
+    /**
+     * The claim the sync's apply invalidates is "this source's status is
+     * PARTIAL", so only a COMPLETE apply makes it false. The docs used to say
+     * the sync's apply deletes the entry, full stop — which describes a sync
+     * whose own report is truncated silencing a warning that is still true of
+     * the screen the user is looking at. And the raw-node status cap, the one
+     * stopping point that deliberately leaves the tree's `truncated` alone, now
+     * has to name itself rather than rely on anything downstream noticing.
+     */
+    it("says the sync's apply invalidates the partial-status claim only when its OWN report is complete, and that the raw-node status cap warns for itself (\u2298 documenting an unconditional deletion teaches the silent-partial behaviour as intended, \u2298 leaving the cap undocumented leaves it looking like the silent stopping point it was)", () => {
+      expect(functionalDocs).toMatch(/but only when the report that sync just applied is itself COMPLETE/);
+      expect(functionalDocs).toMatch(/The deletion is WITHHELD when the sync's own report is truncated/);
+      // The unconditional wording, which said the sync's apply deletes the entry
+      // full stop, must not come back.
+      expect(functionalDocs).not.toMatch(/the \*\*sync's\*\* apply DELETES the source's entry\. A sync belongs to no sweep/);
+      expect(functionalDocs).toMatch(/the cap \*\*pushes its own sync warning\*\*/);
+      expect(functionalDocs).toMatch(/suppressed when the crawl was already truncated/);
     });
   });
 
