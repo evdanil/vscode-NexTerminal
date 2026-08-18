@@ -827,6 +827,109 @@ describe("package contributions", () => {
     });
   });
 
+
+  /**
+   * PER-SOURCE SYNC ON THE FOLDER ROW (follow-up #43) — the `.syncSource` marker
+   * is an OPTIONAL SUFFIX on a Command Center folder's contextValue, the same
+   * shape `.eveRunning`/`.eveStopped` take on a server's. That only works if
+   * every existing folder `when` clause tolerates it: an entry left on the old
+   * `== nexus.folderWithServers` or the old `/^nexus\.folder(WithServers)?$/`
+   * would silently vanish from exactly the folders this feature marks — a lab's
+   * root folder losing Connect, Rename and Remove.
+   *
+   * The table below is the whole contract, and it is checked in BOTH directions:
+   * every ordinary folder entry must match all four folder values, and the new
+   * inline sync entry must match ONLY the two marked ones.
+   */
+  describe("Folder contextValue markers (follow-up #43)", () => {
+    function viewItemRegexFor(when?: string): RegExp | null {
+      const m = /viewItem =~ \/(.+?)\/(?=\s|$)/.exec(when ?? "");
+      return m ? new RegExp(m[1]) : null;
+    }
+
+    const FOLDER_VALUES = ["nexus.folder", "nexus.folderWithServers", "nexus.folder.syncSource", "nexus.folderWithServers.syncSource"];
+    // Intent-driven, not copied from the regexes under test.
+    const MARKED = FOLDER_VALUES.filter((v) => v.endsWith(".syncSource"));
+    const WITH_SERVERS = FOLDER_VALUES.filter((v) => v.startsWith("nexus.folderWithServers"));
+
+    // Values NO Command Center folder entry may match. `nexus.folder.macros` is
+    // the one that matters most: the Macros view reuses FolderTreeItem with its
+    // own contextValue, and a marker group loose enough to swallow it would put
+    // Connect/Rename/Sync onto macro folders.
+    const NON_FOLDER = [
+      "nexus.folder.macros",
+      "nexus.scriptFolder",
+      "nexus.server",
+      "nexus.inventorySource",
+      // near-misses the anchors must reject
+      "nexus.folderX",
+      "nexus.folder.syncSourceX",
+      "nexus.folderWithServers.syncSource.extra",
+      "nexus.folder.macros.syncSource"
+    ];
+
+    it("every Command Center folder menu entry tolerates the optional .syncSource marker, and none of them matches a Macros/Scripts folder (⊘ leaving one matcher un-widened strips that action from every source-target folder)", () => {
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      const folderMenus = menuItems.filter(
+        (m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem =~ /^nexus\\.folder")
+      );
+      expect(folderMenus.length).toBeGreaterThan(0);
+      // No COMMAND CENTER folder entry may still pin an exact `== nexus.folder…`
+      // — that form cannot carry the marker at all. (The Macros view's entries
+      // legitimately keep theirs; they are pinned to `nexus.folder.macros`,
+      // asserted separately below.)
+      expect(
+        menuItems
+          .filter((m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem == nexus.folder"))
+          .map((m) => m.command)
+      ).toEqual([]);
+
+      // command|group → the folder values that entry MUST match, and only those.
+      const EXPECTED: Record<string, string[]> = {
+        "nexus.group.connect|inline@1": WITH_SERVERS,
+        "nexus.group.disconnect|inline@2": WITH_SERVERS,
+        "nexus.inventory.syncNow|inline@3": MARKED,
+        "nexus.group.connect|0_connect@1": WITH_SERVERS,
+        "nexus.group.disconnect|0_connect@2": WITH_SERVERS,
+        "nexus.group.rename|1_manage@1": FOLDER_VALUES,
+        "nexus.group.add|1_manage@2": FOLDER_VALUES,
+        "nexus.profile.add|1_manage@3": FOLDER_VALUES,
+        "nexus.authProfile.applyToFolder|1_manage@4": FOLDER_VALUES,
+        "nexus.deviceTemplate.applyToFolder|1_manage@5": FOLDER_VALUES,
+        "nexus.group.remove|3_destructive": FOLDER_VALUES
+      };
+      expect(folderMenus.map((m) => `${m.command}|${m.group}`).sort()).toEqual(Object.keys(EXPECTED).sort());
+
+      for (const m of folderMenus) {
+        const key = `${m.command}|${m.group}`;
+        const re = viewItemRegexFor(m.when);
+        expect(re, key).not.toBeNull();
+        for (const value of FOLDER_VALUES) {
+          expect(re!.test(value), `${key} vs ${value}`).toBe(EXPECTED[key].includes(value));
+        }
+        for (const value of NON_FOLDER) {
+          expect(re!.test(value), `${key} must not match ${value}`).toBe(false);
+        }
+      }
+    });
+
+    it("the folder sync action reuses nexus.inventory.syncNow with its $(sync) icon and sits AFTER the two connection actions in the inline row (⊘ a second command, or an ordinal before connect/disconnect, reshuffles icons users already know)", () => {
+      const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.syncNow");
+      expect(command?.icon).toBe("$(sync)");
+      const entry = (packageJson.contributes.menus["view/item/context"] ?? []).find(
+        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter")
+      );
+      expect(entry?.group).toBe("inline@3");
+    });
+
+    it("keeps the Macros view's own folder entries pinned to nexus.folder.macros, untouched by the widening (⊘ a shared matcher would cross the two views' folder rows)", () => {
+      const macroFolderMenus = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexusMacros") && (m.when ?? "").includes("nexus.folder")
+      );
+      expect(macroFolderMenus.length).toBeGreaterThan(0);
+      expect(macroFolderMenus.every((m) => (m.when ?? "").includes("viewItem == nexus.folder.macros"))).toBe(true);
+    });
+  });
   describe("Live lab status (Phase 2)", () => {
     it("contributes nexus.inventory.refreshStatus as a palette-invocable Nexus command", () => {
       const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.refreshStatus");

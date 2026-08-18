@@ -1253,42 +1253,47 @@
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "inline@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "inline@2"
         },
         {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "group": "inline@3"
+        },
+        {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.group.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.group.add",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.profile.add",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.authProfile.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@4"
         },
         {
@@ -1313,12 +1318,12 @@
         },
         {
           "command": "nexus.deviceTemplate.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@5"
         },
         {
           "command": "nexus.group.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "3_destructive"
         },
         {

@@ -120,6 +120,7 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -148,6 +149,7 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -175,6 +177,7 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -208,6 +211,7 @@ describe("NexusTreeProvider folder collapse state", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -287,6 +291,7 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -324,6 +329,7 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -368,6 +374,7 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -449,6 +456,7 @@ function emptySnapshot() {
     remoteTunnels: [] as any[],
     explicitGroups: [] as string[],
     authProfiles: [] as any[],
+    inventorySources: [] as any[],
     activitySessionIds: new Set(),
     focusedSessionId: undefined as string | undefined
   };
@@ -1433,5 +1441,82 @@ describe("ServerTreeItem stopped description suffix", () => {
   it("appends NEITHER suffix for a node with no status (⊘ a state suffix on a non-status server invents state it lacks)", () => {
     expect(desc(undefined)).not.toContain("(running)");
     expect(desc(undefined)).not.toContain("(stopped)");
+  });
+});
+
+/**
+ * PER-SOURCE SYNC ON THE FOLDER ROW (follow-up #43) — a Command Center folder
+ * that is EXACTLY ONE inventory source's `targetFolder` carries an inline sync
+ * action for that source, so syncing one source does not mean opening Settings.
+ * The row advertises it with a `.syncSource` marker on its `contextValue` and
+ * carries the source id the command needs.
+ *
+ * "EXACTLY ONE" is the whole rule: two sources sharing a target folder make the
+ * icon ambiguous (which one would it sync?), so the marker is withheld rather
+ * than guessed at.
+ */
+describe("NexusTreeProvider — the inline sync action on a source's target folder", () => {
+  function source(id: string, targetFolder: string, name = id) {
+    return { id, providerId: "eve-ng", name, targetFolder, prunePolicy: "orphan", defaultUsername: "admin", config: {}, secretFieldIds: [] };
+  }
+
+  function foldersOf(servers: ServerConfig[], inventorySources: unknown[]): Map<string, FolderTreeItem> {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers, inventorySources } as any);
+    const found = new Map<string, FolderTreeItem>();
+    const walk = (parent: FolderTreeItem | undefined): void => {
+      for (const child of provider.getChildren(parent) as FolderTreeItem[]) {
+        if (child instanceof FolderTreeItem) {
+          found.set(child.folderPath, child);
+          walk(child);
+        }
+      }
+    };
+    walk(undefined);
+    return found;
+  }
+
+  it("marks the folder a single source targets, and hangs that source's id on the row so the command receives it (⊘ no marker means no inline icon at all, and no sourceId means the icon opens a picker instead of syncing the source the user clicked)", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab" })], [source("src-1", "Lab", "My Lab")]);
+    const lab = folders.get("Lab")!;
+    expect(lab.contextValue).toBe("nexus.folderWithServers.syncSource");
+    expect(lab.sourceId).toBe("src-1");
+  });
+
+  it("marks a source's target folder that holds no servers directly, keeping the folder/folderWithServers distinction intact (⊘ a marker shape that only composes with one of the two silently drops the icon from every lab-tree parent folder)", () => {
+    // "Lab" is an ancestor only — its servers live in "Lab/Site".
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab/Site" })], [source("src-1", "Lab")]);
+    expect(folders.get("Lab")!.contextValue).toBe("nexus.folder.syncSource");
+    expect(folders.get("Lab")!.sourceId).toBe("src-1");
+  });
+
+  it("marks NEITHER when two sources share one targetFolder — ambiguous, so no guess (⊘ a `find`/`some` implementation picks whichever source is listed first and syncs the wrong one, silently, forever)", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Shared" })], [source("src-1", "Shared", "A"), source("src-2", "Shared", "B")]);
+    expect(folders.get("Shared")!.contextValue).toBe("nexus.folderWithServers");
+    expect(folders.get("Shared")!.sourceId).toBeUndefined();
+  });
+
+  it("leaves an UNRELATED folder, and a folder NESTED INSIDE a target, unmarked (⊘ a descendant test instead of an equality test puts a sync icon on every lab folder under the target, each claiming to sync the whole source)", () => {
+    const folders = foldersOf(
+      [makeServer({ id: "s1", group: "Lab/Inner" }), makeServer({ id: "s2", group: "Elsewhere" })],
+      [source("src-1", "Lab")]
+    );
+    expect(folders.get("Lab")!.contextValue).toBe("nexus.folder.syncSource");
+    expect(folders.get("Lab/Inner")!.contextValue).toBe("nexus.folderWithServers");
+    expect(folders.get("Lab/Inner")!.sourceId).toBeUndefined();
+    expect(folders.get("Elsewhere")!.contextValue).toBe("nexus.folderWithServers");
+    expect(folders.get("Elsewhere")!.sourceId).toBeUndefined();
+  });
+
+  it("marks NOTHING for a source targeting the ROOT (`targetFolder: \"\"`) — there is no folder row to host the icon, and no error either (⊘ an empty-string match would mark whichever folder compares equal to it, or throw)", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab" }), makeServer({ id: "s2" })], [source("src-1", "")]);
+    expect([...folders.values()].every((f) => f.sourceId === undefined)).toBe(true);
+    expect([...folders.values()].every((f) => !String(f.contextValue).includes("syncSource"))).toBe(true);
+  });
+
+  it("does not mark a source whose targetFolder names a folder that does not exist in the tree (nothing to do — no row, no error)", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab" })], [source("src-1", "Not/Here")]);
+    expect(folders.has("Not/Here")).toBe(false);
+    expect(folders.get("Lab")!.contextValue).toBe("nexus.folderWithServers");
   });
 });
