@@ -1653,6 +1653,50 @@ describe("createEveNgProvider — fetchInventory reports lab status on the tree"
     expect(tree.status?.truncated).toBeFalsy();
   });
 
+  /**
+   * The map is built BEFORE the `Include Stopped Nodes` filter, so it cannot be
+   * bounded by the device cap: `devices` stops growing the moment the filter
+   * starts dropping nodes, and a source of 50 000 stopped nodes would build a
+   * 50 000-entry map while reporting itself complete. `statuses` therefore has
+   * its own cap, counted over RAW nodes exactly as `fetchStatus` counts them.
+   */
+  it("caps `statuses` on RAW nodes reached and marks the REPORT partial, while the crawl runs on and still imports the running nodes past the cap (⊘ capping on `devices` leaves the map unbounded whenever the filter is on, ⊘ breaking the loop at the cap drops running nodes this source imports today, ⊘ marking the TREE truncated disables pruning for a device list that is complete)", async () => {
+    // 10 050 raw nodes, only the FIRST and the LAST running: with the filter on,
+    // `devices` never reaches 2 while `statuses` would otherwise reach 10 050.
+    const nodes: Record<string, unknown> = {};
+    for (let i = 1; i <= 10_050; i++) {
+      nodes[String(i)] = node({ id: String(i), name: `R${i}`, status: i === 1 || i === 10_050 ? 2 : 0, url: "telnet://127.0.0.1:32769" });
+    }
+    const tree = await fetchTree(oneLabWorld(nodes), { includeStopped: false });
+
+    // The crawl was NOT cut short — both running nodes were imported, exactly as
+    // before this cap existed.
+    expect(tree.devices.map((d) => d.externalId)).toEqual(["/Lab 1.unl#1", "/Lab 1.unl#10050"]);
+    // ...and the device list is complete, so pruning stays enabled.
+    expect(tree.truncated).toBeFalsy();
+    // The map stopped at the cap (integer-like keys iterate in ascending order,
+    // so the entries kept are nodes 1..10 000).
+    expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(10_000);
+    expect(tree.status?.statuses["/Lab 1.unl#1"]).toEqual({ state: "running" });
+    expect(tree.status?.statuses["/Lab 1.unl#10050"]).toBeUndefined();
+    // PARTIAL — an imported device with no entry is precisely the case where
+    // absence must not be read as "nothing is known", so the apply MERGES.
+    expect(tree.status?.truncated).toBe(true);
+  });
+
+  it("with `Include Stopped Nodes` ON the raw cap trips on the very node the device cap does, so that source's tree is byte-for-byte what it was (⊘ a raw cap that fires earlier truncates a device list the released behaviour imported in full)", async () => {
+    const nodes: Record<string, unknown> = {};
+    for (let i = 1; i <= 10_050; i++) {
+      nodes[String(i)] = node({ id: String(i), name: `R${i}` });
+    }
+    const tree = await fetchTree(oneLabWorld(nodes), { includeStopped: true });
+
+    expect(tree.devices).toHaveLength(10_000);
+    expect(tree.truncated).toBe(true); // the DEVICE cap, unchanged
+    expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(10_000);
+    expect(tree.status?.truncated).toBe(true);
+  });
+
   // FORWARD-COMPATIBILITY GUARD, not a regression test, and labelled honestly:
   // `validateInventoryTree` ignores members it does not know about, so this
   // passed identically before `status` existed. It exists to fail the day the

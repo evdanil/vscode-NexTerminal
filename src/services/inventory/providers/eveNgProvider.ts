@@ -1519,7 +1519,16 @@ async function fetchInventoryImpl(
   // would MERGE, and the server would keep reading `running` forever with
   // nothing left to correct it. The crawl already knows the answer one line
   // before the filter throws the node away; this records it.
+  //
+  // BOUNDED ON RAW NODES, the way `fetchStatusImpl` bounds its own map. The
+  // device cap below counts `devices`, which only grows for nodes that survive
+  // the filter — so with `Include Stopped Nodes` OFF a source of 50 000 stopped
+  // nodes would write 50 000 status entries and never reach a cap at all. This
+  // counter advances for EVERY raw node instead, so the map is bounded no matter
+  // what the filter admits.
   const statuses: Record<string, InventoryDeviceStatus> = {};
+  let rawNodes = 0;
+  let statusCapped = false;
   let goneLabs = 0;
   let nodesCapped = false;
   let deadlineHit = false;
@@ -1564,7 +1573,18 @@ async function fetchInventoryImpl(
       // Entries for nodes that never became devices are harmless:
       // `applyInventoryStatus` resolves each entry against the servers THIS
       // source owns and silently ignores every entry that resolves to none.
-      statuses[nodeExternalId(lab.path, nodeId)] = { state: running ? "running" : "stopped" };
+      //
+      // The raw-node cap stops the MAP, not the crawl: `devices` has its own cap
+      // below and the wall-clock deadline already bounds the crawl's time, so
+      // cutting the loop short here would import fewer devices than the same
+      // source imports today. Past the cap the report is marked partial and
+      // nothing more is recorded.
+      if (rawNodes >= MAX_NODES) {
+        statusCapped = true;
+      } else {
+        rawNodes++;
+        statuses[nodeExternalId(lab.path, nodeId)] = { state: running ? "running" : "stopped" };
+      }
       if (!includeStopped && !running) {
         continue;
       }
@@ -1599,23 +1619,37 @@ async function fetchInventoryImpl(
       `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the EVE-NG crawl exceeded its time limit and later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`
     );
   }
-  // LIVE STATUS ON A SYNC (follow-up #42) — the report is PARTIAL for exactly
-  // ONE reason, because `applyInventoryStatus` MERGES a truncated report and
-  // CLEARS-then-applies a complete one: THE CRAWL WAS TRUNCATED (a cap, the
-  // budget, or the wall-clock deadline). Nodes past the stopping point were
-  // never fetched, so their absence says nothing about them and clearing would
-  // reset every one of them to `unknown`.
+  // LIVE STATUS ON A SYNC (follow-up #42) — the report is PARTIAL only where
+  // THIS CRAWL STOPPED LOOKING, because `applyInventoryStatus` MERGES a
+  // truncated report and CLEARS-then-applies a complete one. Two stopping
+  // points reach that state, and they are the same kind of claim:
+  //  - THE CRAWL WAS TRUNCATED (a cap, the budget, or the wall-clock deadline):
+  //    later nodes were never fetched at all;
+  //  - THE STATUS MAP HIT ITS RAW-NODE CAP: the crawl went on collecting
+  //    devices, but stopped recording state for the nodes past it.
+  // In both, an absent entry means "we never looked", so clearing would reset
+  // nodes nobody examined to `unknown` and merging is the right apply.
   //
-  // `Include Stopped Nodes` is deliberately NOT a second reason: `statuses` is
-  // built from the unfiltered node list above, so the setting narrows `devices`
-  // and nothing else. A complete crawl therefore clear-then-applies, and a node
-  // that stopped since the last sync is reported as `stopped` rather than
-  // keeping its old `running` decoration with nothing left to correct it.
-  const statusTruncated = truncated;
+  // `Include Stopped Nodes` is deliberately NOT one of them, and the difference
+  // is the whole point: a cap says "we stopped looking, so absence proves
+  // nothing", while the filter says "we looked, decided, and deliberately left
+  // it out of `devices`". `statuses` is built from the unfiltered node list
+  // above, so the setting narrows `devices` and nothing else. A complete crawl
+  // therefore clear-then-applies, and a node that stopped since the last sync is
+  // reported as `stopped` rather than keeping its old `running` decoration with
+  // nothing left to correct it — which is exactly what merging on the FILTER
+  // would have cost.
+  const statusTruncated = truncated || statusCapped;
   return {
     contractVersion: 1,
     devices,
     warnings,
+    // The TREE's own `truncated` deliberately ignores `statusCapped`: the raw-node
+    // cap says nothing about whether `devices` is complete (with the filter ON the
+    // device cap trips on the same node anyway; with it OFF the crawl runs to the
+    // end and imports every running node), and setting the tree flag would disable
+    // pruning — stranding servers for labs that really were deleted — for a source
+    // whose device list is fine.
     truncated: truncated || undefined,
     status: { contractVersion: 1, statuses, truncated: statusTruncated || undefined }
   };
