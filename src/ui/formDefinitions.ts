@@ -1350,7 +1350,8 @@ function inventoryConfigFieldDescriptor(
       label: field.label,
       required: field.required && !hasSaved,
       placeholder: hasSaved ? "Leave empty to keep the saved value" : field.placeholder,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   if (field.type === "boolean") {
@@ -1367,7 +1368,8 @@ function inventoryConfigFieldDescriptor(
       value: Object.prototype.hasOwnProperty.call(existingConfig, field.id)
         ? existingConfig[field.id] === true
         : field.defaultValue === true,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   if (field.type === "select") {
@@ -1389,7 +1391,8 @@ function inventoryConfigFieldDescriptor(
       label: field.label,
       options,
       value,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   if (field.type === "number") {
@@ -1408,7 +1411,8 @@ function inventoryConfigFieldDescriptor(
       step: "any",
       placeholder: field.placeholder,
       value: typeof existing === "number" ? existing : undefined,
-      hint: field.description
+      hint: field.description,
+      advanced: field.advanced
     };
   }
   const existing = existingConfig[field.id];
@@ -1419,7 +1423,8 @@ function inventoryConfigFieldDescriptor(
     required: field.required,
     placeholder: field.placeholder,
     value: existing !== undefined ? String(existing) : "",
-    hint: field.description
+    hint: field.description,
+    advanced: field.advanced
   };
 }
 
@@ -1695,9 +1700,19 @@ export function inventorySourceFormDefinition(
     linkedProfile
   );
 
+  // INSECURE TLS (A5) — a source that ALREADY has an advanced switch turned on
+  // opens with the disclosure expanded. The section exists to keep a
+  // rarely-touched control out of the way, not to hide one that is currently in
+  // effect: reopening a source running without certificate verification must
+  // not look identical to reopening one that verifies. Gated on the fields the
+  // disclosure actually hides, and on a stored `true` — a new source, or one
+  // that never turned anything on, gets the collapsed section exactly as before.
+  const advancedFieldOn = provider.configFields.some((field) => field.advanced === true && existingConfig[field.id] === true);
+
   return {
     title: `${isEdit ? "Edit" : "Add"} Inventory Source (${provider.label})`,
     testable: true,
+    ...(advancedFieldOn ? { expandAdvanced: true } : {}),
     fields: [
       { type: "text", key: "name", label: "Name", required: true, value: seed?.name ?? provider.label },
       {

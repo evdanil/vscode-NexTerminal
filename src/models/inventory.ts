@@ -174,6 +174,21 @@ export interface InventoryConfigField {
    * so it is not a change a user needs to re-confirm credentials over.
    */
   defaultValue?: boolean;
+  /**
+   * INSECURE TLS (EVE-NG) — render this field behind the source form's
+   * ADVANCED disclosure rather than at the top level. Presentation only, and
+   * deliberately NOT part of `computeProviderFingerprint`: where a field is
+   * drawn changes nothing about what a source is configured with, so it is not
+   * a change a user should be asked to re-confirm credentials over.
+   *
+   * Exists for `allowInsecureTls`, a switch that turns a safety default OFF for
+   * one source. It has to be reachable, and it should not sit beside the base
+   * URL as though it were an ordinary part of naming the server.
+   *
+   * Absent behaves exactly as before (top level), so every field that ships
+   * today is byte-identical.
+   */
+  advanced?: boolean;
 }
 
 export type InventorySourceValues = Record<string, string | number | boolean>; // secrets NEVER here

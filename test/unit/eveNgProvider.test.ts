@@ -1,12 +1,19 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { EVE_NG_PROVIDER_ID, createEveNgProvider, eveNgInstanceKey, labFolderPath } from "../../src/services/inventory/providers/eveNgProvider";
+import {
+  EVE_NG_INSECURE_TLS_WARNING,
+  EVE_NG_PROVIDER_ID,
+  createEveNgProvider,
+  eveNgInstanceKey,
+  labFolderPath
+} from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
+import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import type { ServerConfig } from "../../src/models/config";
-import type { InventoryStatusReport } from "../../src/models/inventory";
+import { computeProviderFingerprint, type InventoryConfigField, type InventoryStatusReport } from "../../src/models/inventory";
 
 /**
  * EVE-NG's identity as a deployment — the same contract `netboxInstanceKey`
@@ -102,7 +109,11 @@ describe("createEveNgProvider — shape", () => {
       "rootFolder",
       "filter",
       "includeStopped",
-      "consoleHost"
+      "consoleHost",
+      // INSECURE TLS — appended LAST on purpose: the order is part of the
+      // provider fingerprint, and adding the field at the end keeps every
+      // existing field where the user last saw it.
+      "allowInsecureTls"
     ]);
   });
 
@@ -122,9 +133,12 @@ describe("createEveNgProvider — shape", () => {
     expect(provider.configFields.find((f) => f.id === "filter")?.type).toBe("string");
   });
 
-  it("warns in the baseUrl description that self-signed HTTPS is unsupported (the failure is otherwise an opaque fetch error)", () => {
+  it("still raises the certificate question in the baseUrl description, but now POINTS AT THE OPTION rather than declaring the setup unsupported (the failure is otherwise an opaque certificate code with no named remedy)", () => {
     const provider = createEveNgProvider(vi.fn() as unknown as typeof fetch);
-    expect(provider.configFields.find((f) => f.id === "baseUrl")?.description?.toLowerCase()).toContain("self-signed");
+    const description = provider.configFields.find((f) => f.id === "baseUrl")?.description?.toLowerCase() ?? "";
+    expect(description).toContain("self-signed");
+    expect(description).toContain("certificate");
+    expect(description).not.toContain("not supported");
   });
 
   it("declares the attribute keys its devices actually carry, so a template rule filter on an unknown key is caught at save time", () => {
@@ -2131,5 +2145,377 @@ describe("createEveNgProvider — controlNode", () => {
     await expect(createEveNgProvider(fetchImpl).controlNode!(CONFIG, SECRETS, "/Lab.unl#1", "start")).rejects.toBeInstanceOf(
       InventoryProviderError
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INSECURE TLS — the per-source opt-in and, more importantly, which transport
+// a given config selects.
+// ---------------------------------------------------------------------------
+
+/**
+ * A home EVE-NG box at an IP address with a self-signed certificate fails two
+ * checks at once (self-signed, AND a certificate that does not list the IP),
+ * and until this option existed the provider had no way to accept it. The
+ * insecure transport is scoped rather than global — see
+ * `src/services/inventory/insecureFetch.ts` for why
+ * `NODE_TLS_REJECT_UNAUTHORIZED` is not an option in a shared extension host.
+ *
+ * The tests that matter here are the NEGATIVE ones: an opted-out source and an
+ * `http:` source must never reach the insecure transport.
+ */
+describe("createEveNgProvider — allowInsecureTls field", () => {
+  const field = (): InventoryConfigField => {
+    const found = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "allowInsecureTls");
+    expect(found).toBeDefined();
+    return found!;
+  };
+
+  it("is an OPTIONAL boolean that starts OFF, and is drawn behind the Advanced disclosure (⊘ a defaultValue of true silently turns certificate verification off for every new source)", () => {
+    const f = field();
+    expect(f.type).toBe("boolean");
+    expect(f.required).not.toBe(true);
+    expect(f.defaultValue).toBe(false);
+    expect(f.advanced).toBe(true);
+  });
+
+  it("says plainly, in its hint, that verification is off and that THE EVE-NG PASSWORD travels over the unverified connection (⊘ a hint that only says 'allows self-signed certificates' hides what the user is agreeing to)", () => {
+    const hint = String(field().description ?? "").toLowerCase();
+    expect(hint).toMatch(/password/);
+    expect(hint).toMatch(/intercept|unauthenticated|not verified|unverified/);
+    expect(hint).toMatch(/trust|lab/);
+  });
+
+  it("stops the base URL hint claiming self-signed HTTPS is unsupported, which this option makes false (⊘ leaving it tells the user to give up on the exact setup that now works)", () => {
+    const baseUrl = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "baseUrl");
+    expect(String(baseUrl?.description ?? "")).not.toMatch(/not supported/i);
+  });
+
+  it("still passes the provider-shape validation the registry runs, with the new field in place", () => {
+    expect(() => validateProviderShape(createEveNgProvider(vi.fn() as unknown as typeof fetch))).not.toThrow();
+  });
+
+  /**
+   * A5 — `advanced` is PRESENTATION ONLY, and `computeProviderFingerprint`
+   * excludes it. True today by projection, but nothing pinned it: adding
+   * `advanced` to that projection failed no test. It must stay out — the
+   * fingerprint gates a MODAL asking the user to re-confirm handing a
+   * re-registered provider their saved credentials, and moving a field behind a
+   * disclosure changes nothing about what a source is configured with. A
+   * spurious credential prompt is exactly how that modal stops being read.
+   */
+  it("keeps `advanced` OUT of the provider fingerprint — two shapes differing only in where a field is drawn hash the same (⊘ projecting `advanced` makes a purely visual change re-prompt every existing source for its credentials)", () => {
+    const fields = (advanced: boolean | undefined): InventoryConfigField[] => [
+      { id: "baseUrl", label: "EVE-NG Base URL", type: "string", required: true },
+      { id: "allowInsecureTls", label: "Allow a Self-Signed or Mismatched Certificate", type: "boolean", required: false, advanced }
+    ];
+    expect(computeProviderFingerprint({ label: "EVE-NG", configFields: fields(true) })).toBe(
+      computeProviderFingerprint({ label: "EVE-NG", configFields: fields(undefined) })
+    );
+    // …and the projection is not simply inert: a change that IS material still moves the hash.
+    expect(computeProviderFingerprint({ label: "EVE-NG", configFields: fields(true) })).not.toBe(
+      computeProviderFingerprint({ label: "EVE-NG", configFields: [...fields(true), { id: "extra", label: "Extra", type: "string" }] })
+    );
+  });
+});
+
+describe("createEveNgProvider — insecure TLS transport selection", () => {
+  const WORLD: World = { folders: { "/": { labs: [] } } };
+
+  function probes(): { standard: ReturnType<typeof makeWorld>; insecure: ReturnType<typeof makeWorld>; provider: ReturnType<typeof createEveNgProvider> } {
+    const standard = makeWorld(WORLD);
+    const insecure = makeWorld(WORLD);
+    return { standard, insecure, provider: createEveNgProvider(standard.fetchImpl, insecure.fetchImpl) };
+  }
+
+  it("uses the insecure transport — and ONLY it — for an https source that opted in", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls).toHaveLength(0);
+  });
+
+  it("NEVER uses it for a source that did not opt in, however the certificate would have failed (⊘ selecting on the URL scheme alone turns verification off for every https source)", async () => {
+    for (const config of [
+      { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
+      { baseUrl: "https://10.0.0.5" }
+    ]) {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory({ ...CONFIG, ...config }, SECRETS);
+      expect(standard.calls.length).toBeGreaterThan(0);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  });
+
+  it("NEVER uses it for an http source, where relaxing certificate checks means nothing and the adapter would refuse the URL anyway (⊘ selecting on the opt-in alone breaks every plain-http source the moment the box is ticked)", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "http://eve.example.com", allowInsecureTls: true }, SECRETS);
+    expect(standard.calls.length).toBeGreaterThan(0);
+    expect(insecure.calls).toHaveLength(0);
+  });
+
+  it("decides per CONFIG, not per provider — one registry serves every source, so two sources on one provider must get different transports", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "https://eve.example.com" }, SECRETS);
+    // Compare the parsed HOST, not a URL prefix. `startsWith("https://eve.example.com")`
+    // is also satisfied by `https://eve.example.com.example.net/…`, so the assertion
+    // would hold even if a request went somewhere else entirely — and CodeQL flags
+    // the shape for exactly that reason (js/incomplete-url-substring-sanitization).
+    expect(insecure.calls.every((c) => new URL(c.url).host === "10.0.0.5")).toBe(true);
+    expect(standard.calls.every((c) => new URL(c.url).host === "eve.example.com")).toBe(true);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls.length).toBeGreaterThan(0);
+  });
+
+  it("routes EVERY entry point through the same decision, not just the sync (⊘ one path built without the selector connects with verification ON and the user's source works from the tree but not from Test Connection, or the reverse)", async () => {
+    const opted = { ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true };
+    const runs: ((p: ReturnType<typeof createEveNgProvider>) => Promise<unknown>)[] = [
+      (p) => p.fetchInventory(opted, SECRETS),
+      (p) => p.testConnection(opted, SECRETS),
+      (p) => p.fetchStatus!(opted, SECRETS),
+      (p) => p.controlNode!(opted, SECRETS, "/Lab 1.unl#1", "start")
+    ];
+    for (const run of runs) {
+      const { standard, insecure, provider } = probes();
+      await run(provider).catch(() => undefined);
+      expect(insecure.calls.length).toBeGreaterThan(0);
+      expect(standard.calls).toHaveLength(0);
+    }
+  });
+
+  it("normalizes the scheme before deciding, so an uppercase HTTPS:// base URL is still https (⊘ a raw startsWith('https:') check reads HTTPS:// as plain http and silently ignores the opt-in)", async () => {
+    const { standard, insecure, provider } = probes();
+    await provider.fetchInventory({ ...CONFIG, baseUrl: "HTTPS://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(insecure.calls.length).toBeGreaterThan(0);
+    expect(standard.calls).toHaveLength(0);
+  });
+
+  /**
+   * A4 — THE STRICTNESS IS LOAD-BEARING, and was unpinned: the negative cases
+   * above only cover `false` and absent, so the mutation `if
+   * (!config.allowInsecureTls)` passed every provider test. The string "true" is
+   * reachable — a restored backup, or a hand-edited globalState, stores whatever
+   * it holds — and under that mutation it turns certificate verification OFF for
+   * a source whose owner never ticked a box.
+   */
+  it.each([["true"], ["false"], [1], [0], ["0"], ["yes"], [{}]])(
+    "treats a NON-boolean %o as no opt-in at all and keeps the standard transport (⊘ a truthiness test turns verification off for a value the form can never produce)",
+    async (value) => {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory(
+        { ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: value as unknown as boolean },
+        SECRETS
+      );
+      expect(standard.calls.length).toBeGreaterThan(0);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  );
+
+  /**
+   * A4 — the URL-parse `catch` is OBSERVABLE, not dead: `new URL("https:")`
+   * throws, so a base URL of `https:` or `https:/` with the box ticked reaches
+   * it. The mutation `catch { return transports.insecure }` survived everything.
+   * A base URL nothing can be parsed out of cannot have been proven https, so it
+   * must not be answered by turning verification off.
+   */
+  it.each(["https:", "https:/"])(
+    "falls back to the STANDARD transport for the unparseable base URL %o, even with the box ticked (⊘ a catch that returns the insecure transport relaxes TLS on a URL nobody could parse)",
+    async (baseUrl) => {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory({ ...CONFIG, baseUrl, allowInsecureTls: true }, SECRETS).catch(() => undefined);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  );
+
+  it("defaults the second argument to the real node:https adapter, so a provider built the way activate() builds it is not silently transport-less", () => {
+    expect(() => createEveNgProvider(vi.fn() as unknown as typeof fetch)).not.toThrow();
+  });
+});
+
+/**
+ * INSECURE TLS — the error a user actually hits BEFORE they know the option
+ * exists. `mapNetworkError` used to echo the bare node code
+ * (`Could not reach 10.0.0.5: DEPTH_ZERO_SELF_SIGNED_CERT.`), which names the
+ * problem in a vocabulary the user did not choose and offers no remedy — which
+ * is why the person who reported this was stuck rather than merely refused.
+ */
+/**
+ * A2 — DISCLOSURE AFTER THE FACT. `allowInsecureTls` is read once, at transport
+ * selection, and then never surfaces again: a source whose base URL was later
+ * repointed from a lab box at a remote (or production) EVE-NG keeps shipping the
+ * password over an unauthenticated channel, and nothing in the plan, the tree or
+ * the sync summary says so. It is also the answer to a restored backup enabling
+ * the flag silently — the import trust boundary is already broad (a backup can
+ * add telnet servers, proxies and jump hosts), so the fix is DISCLOSURE, not a
+ * new gate: the first sync says out loud that verification is off.
+ *
+ * Rides the same `tree.warnings` channel the Pro-preliminary warning uses, so it
+ * reaches the sync plan the same way. `fetchStatus` has no warnings channel
+ * (`InventoryStatusReport` carries `statuses` + `truncated` only), so the sync
+ * path is where this belongs.
+ */
+describe("createEveNgProvider — a sync run with verification off discloses it", () => {
+  const WORLD: World = { folders: { "/": { labs: [{ file: "A.unl", path: "/A.unl" }, { file: "B.unl", path: "/B.unl" }] } }, nodes: { "/A.unl": { "1": node() }, "/B.unl": { "1": node() } } };
+
+  /** Both transports stubbed, so an opted-in https config never opens a real socket. */
+  function provider(): ReturnType<typeof createEveNgProvider> {
+    return createEveNgProvider(makeWorld(WORLD).fetchImpl, makeWorld(WORLD).fetchImpl);
+  }
+
+  it("warns EXACTLY ONCE that this source's certificate is not verified, naming the option and the password exposure (⊘ a sync that silently ran unauthenticated — the whole point of the disclosure)", async () => {
+    const tree = await provider().fetchInventory({ ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(tree.devices).toHaveLength(2);
+    expect((tree.warnings ?? []).filter((w) => w === EVE_NG_INSECURE_TLS_WARNING)).toHaveLength(1);
+    // The two clauses that must survive any later rewording: the option the user
+    // can turn back off, and what is actually crossing the unverified connection.
+    expect(EVE_NG_INSECURE_TLS_WARNING).toContain("Allow a Self-Signed or Mismatched Certificate");
+    expect(EVE_NG_INSECURE_TLS_WARNING.toLowerCase()).toContain("password");
+  });
+
+  it("says NOTHING for a source that is actually verifying its certificate (⊘ an unconditional warning trains the user to ignore the one that means something)", async () => {
+    for (const config of [
+      { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
+      { baseUrl: "https://10.0.0.5" },
+      // Ticked but http: the selector keeps the standard transport, so nothing
+      // was relaxed and there is nothing to disclose.
+      { baseUrl: "http://eve.example.com", allowInsecureTls: true }
+    ]) {
+      const tree = await provider().fetchInventory({ ...CONFIG, ...config }, SECRETS);
+      expect((tree.warnings ?? []).some((w) => w.includes("certificate"))).toBe(false);
+    }
+  });
+});
+
+describe("createEveNgProvider — certificate errors name the option", () => {
+  /** A transport that fails exactly the way node fails a TLS verification. */
+  function failsWith(code: string, viaCause = false): typeof fetch {
+    return (async () => {
+      const err = new Error("fetch failed");
+      if (viaCause) {
+        (err as { cause?: unknown }).cause = Object.assign(new Error(code), { code });
+      } else {
+        (err as { code?: string }).code = code;
+      }
+      throw err;
+    }) as unknown as typeof fetch;
+  }
+
+  async function messageFor(code: string, viaCause = false): Promise<string> {
+    const err = await createEveNgProvider(failsWith(code, viaCause))
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as InventoryProviderError).kind).toBe("network");
+    return (err as Error).message;
+  }
+
+  const CERT_CODES = [
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "CERT_HAS_EXPIRED",
+    // A3 — the two shapes the set was short of, both of which the option fixes
+    // identically to the five above.
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "CERT_NOT_YET_VALID"
+  ];
+
+  it.each(CERT_CODES)("names the option, and the host, instead of leaving %s to speak for itself (⊘ dropping the mapping restores the bare code, which is the state the user was stuck in)", async (code) => {
+    const message = await messageFor(code);
+    expect(message).toContain("10.0.0.5");
+    expect(message).toContain("Allow a Self-Signed or Mismatched Certificate");
+    expect(message).not.toBe(`Could not reach 10.0.0.5: ${code}.`);
+  });
+
+  it.each(CERT_CODES)("keeps %s itself in the message tail, because the code is what makes the failure diagnosable", async (code) => {
+    expect(await messageFor(code)).toContain(code);
+  });
+
+  it("reads the code out of `cause` too — undici puts it there, and node:https puts it on the error itself", async () => {
+    const message = await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT", true);
+    expect(message).toContain("Allow a Self-Signed or Mismatched Certificate");
+  });
+
+  it("explains the PRIVATE-CA case in its own terms — a chain this machine cannot complete is not a self-signed certificate, and the homelab shape right after self-signed/altname (⊘ borrowing the self-signed sentence describes a certificate the user does not have)", async () => {
+    const message = await messageFor("UNABLE_TO_GET_ISSUER_CERT_LOCALLY");
+    // Anchored on the hint's own sentence shape, not merely on a word the bare
+    // OpenSSL code happens to contain — otherwise the unmapped fallback
+    // ("Could not reach 10.0.0.5: UNABLE_TO_GET_ISSUER_CERT_LOCALLY.") satisfies
+    // a /issuer/ match and the test proves nothing.
+    expect(message).toMatch(/^10\.0\.0\.5 presented /);
+    expect(message.toLowerCase()).toMatch(/issuer|authority|chain/);
+    expect(message).not.toBe(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT"));
+  });
+
+  it("explains NOT-YET-VALID as the clock case, distinctly from expired — the lab box with a dead RTC (⊘ collapsing the two tells someone whose certificate is fine that it expired)", async () => {
+    const message = await messageFor("CERT_NOT_YET_VALID");
+    expect(message).toMatch(/^10\.0\.0\.5 presented /);
+    expect(message.toLowerCase()).toMatch(/not yet valid|clock/);
+    expect(message).not.toBe(await messageFor("CERT_HAS_EXPIRED"));
+  });
+
+  it("calls out THE IP CASE for an altname mismatch specifically — a certificate that does not list the IP is the common shape of this failure and reads as unrelated otherwise", async () => {
+    const message = (await messageFor("ERR_TLS_CERT_ALTNAME_INVALID")).toLowerCase();
+    expect(message).toMatch(/ip address|address/);
+    // The self-signed wording would be actively misleading here: the cert may be
+    // perfectly well signed and simply issued for a different name.
+    expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).not.toBe(await messageFor("ERR_TLS_CERT_ALTNAME_INVALID"));
+  });
+
+  it("leaves every NON-certificate code's wording exactly as it was (⊘ a greedy match rewrites ECONNREFUSED into advice about certificates)", async () => {
+    for (const code of ["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "ECONNRESET", "CERT_SOMETHING_NEW"]) {
+      expect(await messageFor(code)).toBe(`Could not reach 10.0.0.5: ${code}.`);
+    }
+  });
+
+  it("reads the hint table by OWN member only, so an inherited name is not a certificate hint (⊘ TLS_CERT_HINTS[code] answers `constructor` with a function and the message becomes whatever calling it returns)", async () => {
+    for (const code of ["constructor", "toString", "hasOwnProperty", "__proto__", "valueOf"]) {
+      expect(await messageFor(code)).toBe(`Could not reach 10.0.0.5: ${code}.`);
+    }
+  });
+
+  it("still reports a timeout as a timeout — an abort has no code and must not be swept into the certificate branch", async () => {
+    const timesOut = (async () => {
+      throw new DOMException("timed out", "TimeoutError");
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(timesOut)
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toBe("Connection to 10.0.0.5 timed out.");
+  });
+});
+
+describe("createEveNgProvider — the certificate hint and the field agree", () => {
+  it("names the option by its EXACT form label (⊘ a hint pointing at a control the user cannot find by that name is worse than the bare OpenSSL code it replaced)", async () => {
+    const label = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "allowInsecureTls")!.label;
+    const failing = (async () => {
+      throw Object.assign(new Error("fetch failed"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" });
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(failing)
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toContain(label);
+  });
+
+  /**
+   * A5 — WORDING DRIFT. The hint said "Advanced settings", the form renders
+   * "Advanced options", and the base-URL description said "under Advanced":
+   * three names for one disclosure, in messages whose whole job is to send
+   * someone to a control they have not found yet. Pinned against the SAME
+   * constant the form's summary is rendered from, so they cannot drift again.
+   */
+  it("names the disclosure exactly as the form draws it, in both the hint and the base-URL description (⊘ 'Advanced settings' sends the user looking for a section no form has)", async () => {
+    const provider = createEveNgProvider(vi.fn() as unknown as typeof fetch);
+    const failing = (async () => {
+      throw Object.assign(new Error("fetch failed"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" });
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(failing)
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toContain(ADVANCED_SECTION_LABEL);
+    expect((err as Error).message).not.toContain("Advanced settings");
+    expect(String(provider.configFields.find((f) => f.id === "baseUrl")?.description ?? "")).toContain(ADVANCED_SECTION_LABEL);
   });
 });

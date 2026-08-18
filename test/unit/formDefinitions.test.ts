@@ -474,6 +474,81 @@ describe("inventorySourceFormDefinition", () => {
     });
   });
 
+  /**
+   * INSECURE TLS (EVE-NG) — `InventoryConfigField.advanced`. A provider field
+   * that relaxes a safety default belongs behind the form's Advanced
+   * disclosure, and until this existed a provider had no way to say so: every
+   * config field rendered at the top level regardless of how rarely it should
+   * be touched.
+   */
+  describe("advanced provider config fields", () => {
+    const withAdvanced = (advanced?: boolean): InventoryProvider => ({
+      ...fakeProvider,
+      configFields: [
+        { id: "allowInsecureTls", label: "Allow Insecure TLS", type: "boolean", advanced },
+        { id: "baseUrl", label: "Base URL", type: "string", advanced: advanced === undefined ? undefined : false }
+      ]
+    });
+
+    it("puts a provider field declared advanced BEHIND the Advanced disclosure (\u2298 dropping the flag renders a certificate-verification switch beside the base URL, at the top of the form)", () => {
+      const definition = withAdvanced(true);
+      expect(keyedField(inventorySourceFormDefinition(definition), "cfg_allowInsecureTls").advanced).toBe(true);
+      expect(keyedField(inventorySourceFormDefinition(definition), "cfg_baseUrl").advanced).toBe(false);
+    });
+
+    /**
+     * A5 — reopening a source that has an advanced field TURNED ON showed that
+     * setting collapsed: for `allowInsecureTls` that means a source running
+     * without certificate verification looks, on open, exactly like one that is
+     * not. The disclosure exists to keep a rarely-touched switch out of the way,
+     * not to hide one that is currently in effect.
+     */
+    const seedConfig = (config: Record<string, string | number | boolean>) => ({
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "",
+      config,
+      secretFieldIds: []
+    });
+
+    it("OPENS the Advanced disclosure when a source already has an advanced field turned on (⊘ a source running with certificate verification off opens looking identical to one that is not)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ allowInsecureTls: true })).expandAdvanced).toBe(true);
+    });
+
+    it("leaves it CLOSED when the advanced field is off, absent, or the source is new (⊘ expanding unconditionally defeats the disclosure for every source that never touched it)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ allowInsecureTls: false })).expandAdvanced).not.toBe(true);
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({})).expandAdvanced).not.toBe(true);
+      expect(inventorySourceFormDefinition(withAdvanced(true)).expandAdvanced).not.toBe(true);
+    });
+
+    it("ignores a NON-advanced field's value — only what the disclosure actually hides can open it (⊘ any stored true anywhere pops the section open)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ baseUrl: "https://10.0.0.5" })).expandAdvanced).not.toBe(true);
+    });
+
+    it("leaves a field that declares nothing exactly where it was — every existing provider field is byte-identical", () => {
+      expect(keyedField(inventorySourceFormDefinition(withAdvanced(undefined)), "cfg_allowInsecureTls").advanced).toBeUndefined();
+    });
+
+    it("carries the flag through every field TYPE, not just the boolean branch it was added for", () => {
+      const provider: InventoryProvider = {
+        ...fakeProvider,
+        configFields: [
+          { id: "t", label: "T", type: "string", advanced: true },
+          { id: "p", label: "P", type: "password", advanced: true },
+          { id: "n", label: "N", type: "number", advanced: true },
+          { id: "s", label: "S", type: "select", advanced: true, options: [{ label: "A", value: "a" }] }
+        ]
+      };
+      const definition = inventorySourceFormDefinition(provider);
+      for (const id of ["t", "p", "n", "s"]) {
+        expect(keyedField(definition, `cfg_${id}`).advanced).toBe(true);
+      }
+    });
+  });
+
   // EVE-NG (Phase 1) — the Target Folder placeholder is an EXAMPLE shown on
   // every provider's source form, so it must not read as an instruction to
   // name a folder after one specific provider.

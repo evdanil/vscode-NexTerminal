@@ -1,4 +1,4 @@
-import type { FormDefinition, FormFieldDescriptor, VisibleWhen } from "./formTypes";
+import { ADVANCED_SECTION_LABEL, type FormDefinition, type FormFieldDescriptor, type VisibleWhen } from "./formTypes";
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
@@ -233,7 +233,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   const basicFieldsHtml = basicFields.map(renderField).join("\n");
   const advancedFieldsHtml = advancedFields.length > 0
     ? `<details class="advanced-fields"${definition.expandAdvanced ? " open" : ""}>
-      <summary>Advanced options</summary>
+      <summary>${ADVANCED_SECTION_LABEL}</summary>
       ${advancedFields.map(renderField).join("\n      ")}
     </details>`
     : "";
