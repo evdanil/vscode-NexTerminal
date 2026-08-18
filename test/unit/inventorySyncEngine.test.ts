@@ -806,6 +806,60 @@ describe("computeSyncPlan — adds", () => {
         expect(addresslessLines(plan)).toEqual([]);
       });
 
+      /**
+       * R4 (review) — the `blanksAddress &&` half of the stay-addressless guard.
+       * Without it the guard is just `addressless === true` and this record is
+       * reported as "remains a placeholder", when the sync in fact decided it is
+       * NOT one: a hand edit to either half of the address makes the sync stop
+       * owning the address, so it preserves what the user typed instead of
+       * blanking it, and `blanksAddress` is false.
+       *
+       * DEFENSIVE, not a supported flow — but not unreachable either. The edit
+       * form clears the flag the moment a host is typed and export drops
+       * addressless records, so no UI produces this. A hand-edited `globalState`
+       * does: note the fixture is `host: ""` with a hand-typed PORT, which is the
+       * only shape of this state that survives the store. `validateServerConfig`
+       * demands `host === ""` whenever `addressless === true` (validation.ts:310),
+       * so `addressless: true` beside a hand-typed HOST is rejected on load and
+       * never reaches the engine at all. Asserted below, so the premise fails
+       * loudly if that rule ever changes.
+       *
+       * (This fixture also lands on the pre-existing #82-class storage hazard in
+       * the else-branch — deliberately not asserted here; it is not this line's
+       * business and needs its own change.)
+       */
+      it("a placeholder carrying a HAND-EDITED PORT is not reported as a standing placeholder — the sync preserved the hand edit, so it no longer calls the record one (\u2298 keying the guard on the `addressless` flag alone reports a record the very same sync just decided to treat as addressed)", () => {
+        const handEdited: ServerConfig = {
+          id: deterministicServerId("source-1", "device:1"),
+          name: "core-sw-1",
+          host: "",
+          port: 2222, // typed straight into the stored record, over the ADDRESSLESS_PORT sentinel
+          username: "admin",
+          authType: "agent",
+          isHidden: false,
+          group: "NetBox",
+          addressless: true,
+          // No syncedPort stamp: the sync never owned a port here, so the
+          // hand-typed one is a user value it must preserve.
+          origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+        };
+        // The premise: this record really does survive the store and reach the engine.
+        expect(validateServerConfig(handEdited)).toBe(true);
+        // ...whereas the same flag beside a hand-typed HOST does not.
+        expect(validateServerConfig({ ...handEdited, host: "10.9.9.9" })).toBe(false);
+
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] })]),
+          currentServers: [handEdited],
+          now: 5000
+        });
+
+        expect(addresslessLines(plan)).toEqual([]);
+        // Nor the downgrade line — it shares the same `blanksAddress` gate.
+        expect(plan.warnings.filter((w) => /downgraded to a placeholder/.test(w))).toEqual([]);
+      });
+
       it("a DOWNGRADE is NOT folded into this line — it keeps its own separate warning (⊘ lumping downgrades in with the standing placeholders reports 'was already a placeholder' about a server that had a working address until this sync)", () => {
         const plan = computeSyncPlan({
           source: makeSource(),

@@ -1534,6 +1534,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // says it already was one before, so a real downgrade (previously
         // ADDRESSED) and a hand-typed address the sync PRESERVED (`blanksAddress`
         // false, the record stays addressed) both fall outside it.
+        //
+        // R4 (review) — that second case, and so the `blanksAddress &&` half, is
+        // DEFENSIVE: it is not load-bearing for any supported flow, and a reader
+        // should not go looking for the UI that produces it. `addressless === true`
+        // beside a hand edit cannot be reached through the extension — the edit
+        // form clears the flag as soon as a host is typed, and export drops
+        // addressless records. It CAN be reached from a hand-edited `globalState`,
+        // but only in one shape: `validateServerConfig` requires `host === ""`
+        // whenever the flag is true, so a hand-typed HOST is rejected on load and
+        // only a hand-typed PORT survives to get here. Keep the half anyway —
+        // without it such a record is reported as a standing placeholder by the
+        // very sync that just decided to treat it as addressed.
         if (blanksAddress && ownedForAddressless.addressless === true) {
           addresslessAlreadyPlaceholder.push(device.name);
         }
