@@ -1058,6 +1058,23 @@ describe("package contributions", () => {
       expect(functionalDocs).not.toMatch(/Available from the palette and as a Command Center title action/);
       expect(readme).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
     });
+
+    /**
+     * A sync CAN mint a fresh `revision`: the fingerprint restamp (first sync of
+     * a source with none stored, or one past a confirmed provider change) writes
+     * through `addOrUpdateInventorySource`, the only place a live record's
+     * revision is ever minted. The docs claimed the epoch was the ONLY apply
+     * check a sync moves — true of a routine sync, false in general, and the
+     * kind of absolute a later reader would build on.
+     */
+    it("does not claim a sync NEVER mints a revision — the fingerprint restamp does, and the docs name it (\u2298 the absolute reads as a guarantee the restamp path breaks)", () => {
+      expect(functionalDocs).not.toMatch(/the epoch is the only one of the apply's three checks that a sync moves/);
+      expect(functionalDocs).toMatch(/A sync that RESTAMPS the provider fingerprint is the exception/);
+      // Both sentences say the same thing: the qualification is "routine", and
+      // "routine" is defined rather than assumed.
+      expect(functionalDocs).toMatch(/one that does not restamp the provider fingerprint/);
+      expect(functionalDocs).not.toMatch(/A sync belongs to no sweep, and a routine sync touches only/);
+    });
   });
 
   it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
