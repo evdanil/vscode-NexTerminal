@@ -159,13 +159,18 @@ import { InventoryProviderError, type InventoryTree } from "../../src/models/inv
 
 const SESSION = "s3ss10n";
 
-function makeResponse(status: number, body: unknown, setCookie: string[] = []): unknown {
+function makeResponse(status: number, body: unknown, setCookie: string[] = [], location?: string): unknown {
   const text = typeof body === "string" ? body : JSON.stringify(body);
   return {
     status,
     text: async () => text,
     headers: {
-      get: (name: string) => (name.toLowerCase() === "set-cookie" ? (setCookie[0] ?? null) : null),
+      get: (name: string) => {
+        const header = name.toLowerCase();
+        if (header === "set-cookie") return setCookie[0] ?? null;
+        if (header === "location") return location ?? null;
+        return null;
+      },
       getSetCookie: () => setCookie
     }
   };
@@ -2022,6 +2027,63 @@ describe("createEveNgProvider — error mapping", () => {
     await createEveNgProvider(fetchImpl).fetchInventory(CONFIG, SECRETS);
     expect(redirects.length).toBeGreaterThan(1);
     expect(redirects.every((r) => r === "manual")).toBe(true);
+  });
+
+  /**
+   * THE JOURNEY THIS CLOSES. Every EVE-NG request is sent `redirect: "manual"`,
+   * so a 3xx is a dead end — and it was reported as `failed with HTTP 301: `
+   * with an empty body after the colon, which says nothing about what happened
+   * or what to do. A host that canonicalises a trailing slash, or a reverse
+   * proxy that rewrites the path, produces exactly that. The answer is usually
+   * sitting in the `Location` header we already have in hand.
+   */
+  it("explains a 3xx instead of reporting a bare status code — the connection does not follow redirects, and the Location IS the base URL the source should name (\u2298 dropping the branch restores `failed with HTTP 301: ` with nothing after the colon)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      return makeResponse(301, "", [], "https://eve.lab.example/api/status");
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+    const message = (err as Error).message;
+    expect(message).toContain("301");
+    expect(message).toContain("does not follow redirects");
+    expect(message.toLowerCase()).toContain("base url");
+    // The address the server named, which is the answer the user needs.
+    expect(message).toContain("https://eve.lab.example/api/status");
+  });
+
+  it("says the server named no Location when it did not, rather than trailing off after the word `to` (\u2298 interpolating an absent header prints `undefined` as the address to use)", async () => {
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      return makeResponse(302, "");
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    const message = (err as Error).message;
+    expect(message).toContain("does not follow redirects");
+    expect(message).not.toContain("undefined");
+    expect(message).toContain("no Location");
+  });
+
+  it("bounds an absurd Location, which is unverified server-supplied text like every other echo here (\u2298 an unbounded header echo puts however much the server sent into a notification)", async () => {
+    const long = `https://eve.lab.example/${"a".repeat(5000)}`;
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      return makeResponse(301, "", [], long);
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).not.toContain("a".repeat(300));
   });
 
   it("MINOR-5 — treats a 3xx as a protocol error rather than success (⊘ no EVE-NG endpoint legitimately redirects; following one is how the crawl leaves the origin)", async () => {

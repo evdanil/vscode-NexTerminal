@@ -1,5 +1,5 @@
 import { ADVANCED_SECTION_LABEL } from "../../../ui/formTypes";
-import { certificateFailureMessage, type CertificateHintContext } from "../certificateHints";
+import { certificateFailureMessage, redirectNotFollowedMessage, type CertificateHintContext } from "../certificateHints";
 import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
@@ -357,13 +357,25 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   return new InventoryProviderError("network", `Could not reach ${host}: ${String(err)}`);
 }
 
-function throwForStatus(status: number, text: string, url: URL): never {
+function throwForStatus(res: RawResponse, url: URL): never {
+  const { status } = res;
   if (status === 401 || status === 403) {
     throw new InventoryProviderError("auth", `NetBox rejected the API token (HTTP ${status}) at ${url}.`);
   }
+  // A REDIRECT THIS CONNECTION CANNOT TAKE, and a 3xx body is empty — so the
+  // message was `failed with HTTP 301: ` and stopped there. Only on the transport
+  // that does not follow redirects: the standard one DOES follow them (every
+  // existing source runs there, some behind a redirecting proxy), and telling
+  // that user their connection refuses redirects would be false.
+  if (res.redirectNotFollowed && status >= 300 && status < 400) {
+    throw new InventoryProviderError(
+      "protocol",
+      `NetBox request to ${url} failed with HTTP ${status}: ${redirectNotFollowedMessage(res.location)}`
+    );
+  }
   throw new InventoryProviderError(
     "protocol",
-    `NetBox request to ${url} failed with HTTP ${status}: ${text.slice(0, 200)}`
+    `NetBox request to ${url} failed with HTTP ${status}: ${res.text.slice(0, 200)}`
   );
 }
 
@@ -378,6 +390,15 @@ function parseJsonOrThrow(text: string, url: URL): unknown {
 interface RawResponse {
   status: number;
   text: string;
+  /**
+   * TRUE only on the transport that cannot follow a redirect (the insecure one —
+   * see `NetboxTransport`). Carried on the response rather than re-derived where
+   * the error is built, so the explanation can never claim a redirect went
+   * unfollowed on the transport that would have followed it.
+   */
+  redirectNotFollowed: boolean;
+  /** The response's `Location`, when it sent one — the address the base URL should name. */
+  location?: string;
 }
 
 /**
@@ -476,15 +497,20 @@ async function rawGet(transport: NetboxTransport, url: URL, token: string, timeo
   } catch {
     text = "";
   }
-  return { status: res.status, text };
+  // Defensive about `headers` for the same reason the rest of this module is
+  // about the injected `fetch`: a Response-alike that answers none must not throw
+  // here, on the error path.
+  const headers = res.headers as unknown as { get?: (name: string) => string | null } | undefined;
+  const location = (typeof headers?.get === "function" ? headers.get("location") : null) ?? undefined;
+  return { status: res.status, text, redirectNotFollowed: transport.redirect === "manual", location };
 }
 
 async function netboxGetJson(transport: NetboxTransport, url: URL, token: string, timeoutMs: number): Promise<unknown> {
-  const { status, text } = await rawGet(transport, url, token, timeoutMs);
-  if (status < 200 || status >= 300) {
-    throwForStatus(status, text, url);
+  const raw = await rawGet(transport, url, token, timeoutMs);
+  if (raw.status < 200 || raw.status >= 300) {
+    throwForStatus(raw, url);
   }
-  return parseJsonOrThrow(text, url);
+  return parseJsonOrThrow(raw.text, url);
 }
 
 interface PagedResult {
@@ -942,9 +968,9 @@ async function testConnectionImpl(transport: NetboxTransport, baseUrl: string, t
       parseJsonOrThrow(fallback.text, devicesUrl);
       return;
     }
-    throwForStatus(fallback.status, fallback.text, devicesUrl);
+    throwForStatus(fallback, devicesUrl);
   }
-  throwForStatus(primary.status, primary.text, statusUrl);
+  throwForStatus(primary, statusUrl);
 }
 
 async function fetchInventoryImpl(

@@ -11,6 +11,7 @@ import {
   renderFolderTemplate
 } from "../../src/services/inventory/providers/netboxProvider";
 import { createInsecureHttpsFetch } from "../../src/services/inventory/insecureFetch";
+import { redirectNotFollowedMessage } from "../../src/services/inventory/certificateHints";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { deviceMatchesFilter, parseTemplateFilter } from "../../src/services/inventory/templateApply";
 import { InventoryProviderError, type InventoryConfigField } from "../../src/models/inventory";
@@ -1428,6 +1429,65 @@ describe("createNetboxProvider — certificate errors name the option", () => {
   it("names the option by its EXACT form label (⊘ a hint pointing at a control the user cannot find by that name is worse than the bare OpenSSL code it replaced)", async () => {
     const label = createNetboxProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === "allowInsecureTls")!.label;
     expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).toContain(label);
+  });
+});
+
+/**
+ * THE SECOND WALL a user hits on the way through the certificate opt-in. The
+ * insecure transport cannot follow a redirect — the adapter refuses any mode but
+ * `"manual"` — so a host that canonicalises a trailing slash answered the sync
+ * with `failed with HTTP 301: ` and an empty body. Having just been sent here by
+ * our own certificate message, the user gets a second dead end that names
+ * neither cause nor remedy.
+ */
+describe("createNetboxProvider — a 3xx on the transport that cannot follow it", () => {
+  const SECRETS = { apiToken: "tok" };
+  const OPTED_IN = { baseUrl: "https://10.0.0.5", allowInsecureTls: true };
+
+  function redirects(status: number, location?: string): typeof fetch {
+    return (async () => ({
+      status,
+      text: async () => "",
+      headers: { get: (name: string) => (name.toLowerCase() === "location" ? (location ?? null) : null) }
+    })) as unknown as typeof fetch;
+  }
+
+  /**
+   * The SAME implementation is installed as both transports, so the only thing
+   * that varies between these cases is which one the config selects — the
+   * wording difference cannot come from the responses differing.
+   */
+  async function messageFor(impl: typeof fetch, config: Record<string, unknown> = OPTED_IN): Promise<string> {
+    const err = await createNetboxProvider(impl, impl)
+      .testConnection(config, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    return (err as Error).message;
+  }
+
+  it("explains the redirect and names the address the server pointed at, which is the base URL the source should have (⊘ dropping the branch restores `failed with HTTP 301: ` with nothing after the colon — the state the user was stuck in)", async () => {
+    const message = await messageFor(redirects(301, "https://netbox.example.com/api/status/"));
+    expect(message).toContain("301");
+    expect(message).toContain("does not follow redirects");
+    expect(message.toLowerCase()).toContain("base url");
+    expect(message).toContain("https://netbox.example.com/api/status/");
+  });
+
+  it("says the server named no Location when it sent none, rather than promising an address it never gives (⊘ interpolating an absent header prints `undefined` as the address to use)", async () => {
+    const message = await messageFor(redirects(302));
+    expect(message).toContain("does not follow redirects");
+    expect(message).not.toContain("undefined");
+    expect(message).toContain("no Location");
+  });
+
+  it("uses the SAME sentence EVE-NG uses — one shared module, so the two providers cannot explain the same dead end differently (⊘ a copied sentence drifts the moment one of them is reworded)", async () => {
+    const message = await messageFor(redirects(301, "https://netbox.example.com/api/status/"));
+    expect(message).toContain(redirectNotFollowedMessage("https://netbox.example.com/api/status/"));
+  });
+
+  it("leaves a 3xx on the STANDARD transport worded exactly as it always was — that transport DOES follow redirects, so advice about not following them would be wrong there (⊘ applying the branch to both transports tells every existing source something untrue about its own connection)", async () => {
+    const message = await messageFor(redirects(301, "https://netbox.example.com/api/status/"), { baseUrl: "https://10.0.0.5" });
+    expect(message).toBe("NetBox request to https://10.0.0.5/api/status/ failed with HTTP 301: ");
   });
 });
 

@@ -1,5 +1,5 @@
 import { ADVANCED_SECTION_LABEL } from "../../../ui/formTypes";
-import { certificateFailureMessage, type CertificateHintContext } from "../certificateHints";
+import { certificateFailureMessage, redirectNotFollowedMessage, type CertificateHintContext } from "../certificateHints";
 import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
@@ -338,7 +338,7 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
   return new InventoryProviderError("network", `Could not reach ${host}: ${String(err)}`);
 }
 
-function throwForStatus(status: number, text: string, url: URL): never {
+function throwForStatus(status: number, text: string, url: URL, location?: string): never {
   if (status === 401 || status === 403) {
     throw new InventoryProviderError("auth", `EVE-NG rejected the credentials (HTTP ${status}) at ${url}.`);
   }
@@ -352,6 +352,17 @@ function throwForStatus(status: number, text: string, url: URL): never {
     throw new InventoryProviderError(
       "auth",
       `EVE-NG refused ${url} as unauthenticated (HTTP ${status}): ${str(unauthorized.message).slice(0, BODY_SLICE) || "no message"}`
+    );
+  }
+  // A REDIRECT IS A DEAD END HERE, and the body that would normally explain the
+  // failure is empty on a 3xx — so `failed with HTTP 301: ` said nothing at all.
+  // Every EVE-NG request is sent `redirect: "manual"` (see `raw`), on either
+  // transport, so this holds whether or not the source opted out of certificate
+  // verification. The shared sentence names the `Location`, which is the answer.
+  if (status >= 300 && status < 400) {
+    throw new InventoryProviderError(
+      "protocol",
+      `EVE-NG request to ${url} failed with HTTP ${status}: ${redirectNotFollowedMessage(location)}`
     );
   }
   throw new InventoryProviderError("protocol", `EVE-NG request to ${url} failed with HTTP ${status}: ${text.slice(0, BODY_SLICE)}`);
@@ -459,6 +470,17 @@ function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; 
  * is not an EVE-NG envelope whatever words it happens to contain, and treating
  * one as an expired session would burn a re-login on every such failure.
  */
+/**
+ * The `Location` header, or `undefined`. Defensive about `headers` for the same
+ * reason `readSessionCookie` is: the injected `fetch` is a seam, and a
+ * Response-alike that answers no headers must not throw here on the error path.
+ */
+function readLocation(res: Response): string | undefined {
+  const headers = res.headers as unknown as { get?: (name: string) => string | null } | undefined;
+  const value = typeof headers?.get === "function" ? headers.get("location") : null;
+  return value ?? undefined;
+}
+
 function unauthorizedEnvelope(text: string): Record<string, unknown> | undefined {
   // HOT PATH — this predicate runs on EVERY crawl response, and the body it is
   // handed is a full node/lab listing on the large inventories this feature
@@ -500,6 +522,12 @@ interface RawResponse {
   status: number;
   text: string;
   url: URL;
+  /**
+   * The response's `Location`, when it sent one. Captured on every response
+   * rather than only on a 3xx, because the caller that reports the failure
+   * (`unwrap` → `throwForStatus`) no longer holds the `Response` itself.
+   */
+  location?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +699,7 @@ class EveApiClient {
       timeoutMs
     );
     if (res.status < 200 || res.status >= 300) {
-      throwForStatus(res.status, text, url);
+      throwForStatus(res.status, text, url, readLocation(res));
     }
     const envelope = parseEnvelope(text, url);
     if (envelope.status !== "success") {
@@ -721,12 +749,12 @@ class EveApiClient {
       // crawl. (When the deadline is merely NEAR, the retry still runs but each of
       // its requests is bounded by the remaining budget in `raw` above.)
       if (this.crawlDeadline !== undefined && Date.now() >= this.crawlDeadline) {
-        return { status: res.status, text, url };
+        return { status: res.status, text, url, location: readLocation(res) };
       }
       await this.login(timeoutMs);
       ({ res, text } = await send());
     }
-    return { status: res.status, text, url };
+    return { status: res.status, text, url, location: readLocation(res) };
   }
 
   /**
@@ -762,7 +790,7 @@ class EveApiClient {
       await this.login(timeoutMs);
       ({ res, text } = await send());
     }
-    return { status: res.status, text, url };
+    return { status: res.status, text, url, location: readLocation(res) };
   }
 
   /** `authedGet` plus the 2xx + JSend-success checks — the normal path. */
@@ -1139,7 +1167,7 @@ class EveApiClient {
 /** 2xx + JSend `status: "success"`, or the mapped error for whatever went wrong. */
 function unwrap(raw: RawResponse): unknown {
   if (raw.status < 200 || raw.status >= 300) {
-    throwForStatus(raw.status, raw.text, raw.url);
+    throwForStatus(raw.status, raw.text, raw.url, raw.location);
   }
   const envelope = parseEnvelope(raw.text, raw.url);
   if (envelope.status !== "success") {

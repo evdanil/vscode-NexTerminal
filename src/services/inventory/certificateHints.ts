@@ -100,3 +100,38 @@ export function certificateFailureMessage(code: string, host: string, ctx: Certi
     `that skips certificate checks for this source only, and ${ctx.exposureNoun} is then sent over an unverified connection. (${code})`
   );
 }
+
+/**
+ * Ceiling on the echoed `Location`. It is a header from a peer this transport
+ * does not verify, and it lands in a notification, so it is bounded like every
+ * other body echo in the providers (`BODY_SLICE` there is the same 200).
+ */
+const LOCATION_SLICE = 200;
+
+/**
+ * THE OTHER FAILURE THE OPT-IN LEADS TO, and the reason it lives beside the
+ * certificate table rather than in one provider.
+ *
+ * The journey is a single line: a user hits `DEPTH_ZERO_SELF_SIGNED_CERT`, is
+ * told by the message above to tick the box, ticks it — and the next sync dies
+ * on `failed with HTTP 301: ` with nothing after the colon. The insecure
+ * transport does not follow redirects (it refuses any mode but `"manual"`, and
+ * EVE-NG has always sent every request that way), so a host that canonicalises a
+ * trailing slash or a proxy that rewrites the path is a dead end. Nothing in the
+ * bare status code says that, and the certificate message that sent the user
+ * here would otherwise be the last thing that made sense to them.
+ *
+ * The `Location` is included because it IS the answer: it names the address the
+ * base URL should have been. When the response carried none, say so rather than
+ * ending on a promise of an address that never arrives.
+ *
+ * Reads as the tail of the provider's existing `… failed with HTTP 301: `
+ * sentence, which is why it opens lower-case.
+ */
+export function redirectNotFollowedMessage(location: string | undefined): string {
+  const target = typeof location === "string" ? location.trim().slice(0, LOCATION_SLICE) : "";
+  const where = target
+    ? ` — the server named ${target}.`
+    : ", though the response carried no Location header to name it.";
+  return `the server answered with a redirect and this connection does not follow redirects. Set this source's base URL to the address it redirects to${where}`;
+}
