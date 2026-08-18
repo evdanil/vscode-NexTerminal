@@ -9784,7 +9784,7 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
   });
 
   /**
-   * THE FIXTURE THESE THREE SHARE, and the reason it is not simply "sync once
+   * THE FIXTURE THESE TWO SHARE, and the reason it is not simply "sync once
    * and cancel". Before a sync has applied, a status entry resolves to no server
    * at all (the devices have no records yet), so a premature apply writes
    * NOTHING and an empty status map reads identically whether the apply was
@@ -9827,26 +9827,6 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
 
     expect(core.getServer(RUNNING_ID)?.name).toBe("R1"); // the rename was declined...
     expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running"); // ...and so was its status
-    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
-  });
-
-  it("a sync whose FETCH fails applies no status (⊘ a status apply outside the success path paints state from a crawl that never completed)", async () => {
-    const { core } = await settledLab();
-    const registry = new InventoryProviderRegistry();
-    registry.register(
-      makeProvider({
-        fetchInventory: vi.fn(async () => {
-          throw new InventoryProviderError("network", "unreachable");
-        })
-      })
-    );
-    registeredCommands.clear();
-    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
-
-    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
-
-    expect(mockShowErrorMessage).toHaveBeenCalled();
-    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
     expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
   });
 

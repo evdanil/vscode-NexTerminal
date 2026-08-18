@@ -1508,13 +1508,19 @@ describe("NexusTreeProvider — the inline sync action on a source's target fold
     expect(folders.get("Elsewhere")!.sourceId).toBeUndefined();
   });
 
-  it("marks NOTHING for a source targeting the ROOT (`targetFolder: \"\"`) — there is no folder row to host the icon, and no error either (⊘ an empty-string match would mark whichever folder compares equal to it, or throw)", () => {
+  it("marks NOTHING for a source targeting the ROOT (`targetFolder: \"\"`) — there is no folder row to host the icon (⊘ a `startsWith` prefix match instead of an equality test makes the empty string match EVERY folder path in the tree, so a root-targeted source stamps a sync icon on all of them)", () => {
     const folders = foldersOf([makeServer({ id: "s1", group: "Lab" }), makeServer({ id: "s2" })], [source("src-1", "")]);
     expect([...folders.values()].every((f) => f.sourceId === undefined)).toBe(true);
     expect([...folders.values()].every((f) => !String(f.contextValue).includes("syncSource"))).toBe(true);
   });
 
-  it("does not mark a source whose targetFolder names a folder that does not exist in the tree (nothing to do — no row, no error)", () => {
+  // NOT A REGRESSION GUARD, and labelled honestly as such: no plausible
+  // implementation of the "exactly one source targets this path" rule fails
+  // this, because there is no row to fail on. It documents the tolerance — a
+  // targetFolder naming nothing is a no-op rather than an error — and would
+  // catch a future version that materialises a phantom folder row purely to
+  // host the icon.
+  it("tolerates a targetFolder that names no folder in the tree: nothing marked, no row invented, nothing thrown", () => {
     const folders = foldersOf([makeServer({ id: "s1", group: "Lab" })], [source("src-1", "Not/Here")]);
     expect(folders.has("Not/Here")).toBe(false);
     expect(folders.get("Lab")!.contextValue).toBe("nexus.folderWithServers");

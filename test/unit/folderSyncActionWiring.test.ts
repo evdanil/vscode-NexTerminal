@@ -118,8 +118,16 @@ describe("the folder row's inline sync action reaches nexus.inventory.syncNow wi
     expect(resolveSourceIdArg(row)).toBe("src-1");
   });
 
-  it("resolves to `undefined` — 'ask me' — for a folder no single source targets, which is the correct answer for a row that carries no inline icon anyway (⊘ a stale id left on an ambiguous row would sync a source the user never picked)", () => {
-    expect(resolveSourceIdArg(folderRow("Lab", [source("src-1", "Shared"), source("src-2", "Shared")]))).toBeUndefined();
+  it("resolves to `undefined` — 'ask me' — for an AMBIGUOUS folder that TWO sources target, so a click cannot sync whichever the snapshot happens to list first (⊘ `find`/`some` instead of a count stamps the first source's id on the row and silently syncs the wrong lab on every click)", () => {
+    // BOTH sources target the folder the row is actually built for — the row is
+    // keyed by the server's group, so pointing them at some other name would
+    // make this the "no source targets this folder" case all over again and the
+    // ambiguity would never be exercised.
+    expect(resolveSourceIdArg(folderRow("Lab", [source("src-1", "Lab"), source("src-2", "Lab")]))).toBeUndefined();
+  });
+
+  it("resolves to `undefined` for a folder NO source targets (⊘ a stale id left on an unrelated row would sync a source the user never picked)", () => {
+    expect(resolveSourceIdArg(folderRow("Lab", [source("src-1", "Shared")]))).toBeUndefined();
     expect(resolveSourceIdArg(folderRow("Lab", []))).toBeUndefined();
   });
 });

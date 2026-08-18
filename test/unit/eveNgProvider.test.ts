@@ -1653,7 +1653,12 @@ describe("createEveNgProvider — fetchInventory reports lab status on the tree"
     expect(tree.status?.truncated).toBeFalsy();
   });
 
-  it("still validates as an InventoryTree with the status attached (⊘ a validator that rejects the new member fails every EVE-NG sync at the provider boundary)", async () => {
+  // FORWARD-COMPATIBILITY GUARD, not a regression test, and labelled honestly:
+  // `validateInventoryTree` ignores members it does not know about, so this
+  // passed identically before `status` existed. It exists to fail the day the
+  // validator is tightened to reject unknown members without also being taught
+  // about `status` — which would fail every EVE-NG sync at the provider boundary.
+  it("still validates as an InventoryTree with the status attached", async () => {
     const tree = await fetchTree(oneLabWorld({ "1": node() }));
     expect(() => validateInventoryTree(tree)).not.toThrow();
   });
