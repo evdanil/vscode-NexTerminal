@@ -2258,8 +2258,12 @@ describe("createEveNgProvider — insecure TLS transport selection", () => {
     const { standard, insecure, provider } = probes();
     await provider.fetchInventory({ ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
     await provider.fetchInventory({ ...CONFIG, baseUrl: "https://eve.example.com" }, SECRETS);
-    expect(insecure.calls.every((c) => c.url.startsWith("https://10.0.0.5"))).toBe(true);
-    expect(standard.calls.every((c) => c.url.startsWith("https://eve.example.com"))).toBe(true);
+    // Compare the parsed HOST, not a URL prefix. `startsWith("https://eve.example.com")`
+    // is also satisfied by `https://eve.example.com.example.net/…`, so the assertion
+    // would hold even if a request went somewhere else entirely — and CodeQL flags
+    // the shape for exactly that reason (js/incomplete-url-substring-sanitization).
+    expect(insecure.calls.every((c) => new URL(c.url).host === "10.0.0.5")).toBe(true);
+    expect(standard.calls.every((c) => new URL(c.url).host === "eve.example.com")).toBe(true);
     expect(insecure.calls.length).toBeGreaterThan(0);
     expect(standard.calls.length).toBeGreaterThan(0);
   });
