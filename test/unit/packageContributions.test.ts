@@ -999,10 +999,18 @@ describe("package contributions", () => {
     it("documents that a completed sync now updates lab status, and stops telling the user to click a title-bar button that is gone (\u2298 docs that still describe the removed menu seat send the user hunting for it)", () => {
       expect(functionalDocs).toMatch(/A completed sync updates every EVE-NG node's running\/stopped state/);
       // The status report is built from the UNFILTERED node list, so
-      // `Include Stopped Nodes` no longer makes it partial — the docs must not
-      // still describe the rule the code dropped.
-      expect(functionalDocs).toMatch(/`Include Stopped Nodes` is deliberately NOT a second reason/);
+      // `Include Stopped Nodes` never makes it partial. The report's OWN
+      // raw-node cap does — a claim of a different kind ("we stopped looking, so
+      // absence proves nothing"), which the docs have to name as such rather
+      // than let it collapse back into the retired filter rule.
+      expect(functionalDocs).toMatch(/counted over the RAW nodes reached, not the devices kept/);
+      expect(functionalDocs).toMatch(/`Include Stopped Nodes` is deliberately NOT one of those stopping points/);
+      // The retired rule — the FILTER as a reason the report is partial — must
+      // not come back in either of the wordings that carried it.
       expect(functionalDocs).not.toMatch(/marks it `truncated` for \*\*two\*\* reasons/);
+      expect(functionalDocs).not.toMatch(/\*\*Include Stopped Nodes is off\*\*/);
+      // ...and "exactly one reason" is no longer true either.
+      expect(functionalDocs).not.toMatch(/marks it `truncated` for exactly \*\*one\*\* reason/);
       expect(functionalDocs).not.toMatch(/Available from the palette and as a Command Center title action/);
       expect(readme).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
     });
