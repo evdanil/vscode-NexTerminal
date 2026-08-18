@@ -1700,9 +1700,19 @@ export function inventorySourceFormDefinition(
     linkedProfile
   );
 
+  // INSECURE TLS (A5) — a source that ALREADY has an advanced switch turned on
+  // opens with the disclosure expanded. The section exists to keep a
+  // rarely-touched control out of the way, not to hide one that is currently in
+  // effect: reopening a source running without certificate verification must
+  // not look identical to reopening one that verifies. Gated on the fields the
+  // disclosure actually hides, and on a stored `true` — a new source, or one
+  // that never turned anything on, gets the collapsed section exactly as before.
+  const advancedFieldOn = provider.configFields.some((field) => field.advanced === true && existingConfig[field.id] === true);
+
   return {
     title: `${isEdit ? "Edit" : "Add"} Inventory Source (${provider.label})`,
     testable: true,
+    ...(advancedFieldOn ? { expandAdvanced: true } : {}),
     fields: [
       { type: "text", key: "name", label: "Name", required: true, value: seed?.name ?? provider.label },
       {

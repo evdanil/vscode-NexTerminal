@@ -496,6 +496,38 @@ describe("inventorySourceFormDefinition", () => {
       expect(keyedField(inventorySourceFormDefinition(definition), "cfg_baseUrl").advanced).toBe(false);
     });
 
+    /**
+     * A5 — reopening a source that has an advanced field TURNED ON showed that
+     * setting collapsed: for `allowInsecureTls` that means a source running
+     * without certificate verification looks, on open, exactly like one that is
+     * not. The disclosure exists to keep a rarely-touched switch out of the way,
+     * not to hide one that is currently in effect.
+     */
+    const seedConfig = (config: Record<string, string | number | boolean>) => ({
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "",
+      config,
+      secretFieldIds: []
+    });
+
+    it("OPENS the Advanced disclosure when a source already has an advanced field turned on (⊘ a source running with certificate verification off opens looking identical to one that is not)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ allowInsecureTls: true })).expandAdvanced).toBe(true);
+    });
+
+    it("leaves it CLOSED when the advanced field is off, absent, or the source is new (⊘ expanding unconditionally defeats the disclosure for every source that never touched it)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ allowInsecureTls: false })).expandAdvanced).not.toBe(true);
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({})).expandAdvanced).not.toBe(true);
+      expect(inventorySourceFormDefinition(withAdvanced(true)).expandAdvanced).not.toBe(true);
+    });
+
+    it("ignores a NON-advanced field's value — only what the disclosure actually hides can open it (⊘ any stored true anywhere pops the section open)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ baseUrl: "https://10.0.0.5" })).expandAdvanced).not.toBe(true);
+    });
+
     it("leaves a field that declares nothing exactly where it was — every existing provider field is byte-identical", () => {
       expect(keyedField(inventorySourceFormDefinition(withAdvanced(undefined)), "cfg_allowInsecureTls").advanced).toBeUndefined();
     });
