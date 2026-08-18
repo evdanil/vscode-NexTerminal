@@ -9419,6 +9419,86 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
     });
 
+    /**
+     * THE OTHER HALF OF R3, and the one the unconditional deletion got wrong.
+     * The sync's apply invalidates the sweep's collected claim, but that claim
+     * is "this source's status is PARTIAL" — and only a COMPLETE apply makes it
+     * false. A sync that applies a TRUNCATED report of its own has left exactly
+     * the state the warning describes on screen, so dropping the source from the
+     * warning tells the user nothing about a status that really is partial.
+     *
+     * Both shapes of a partial sync report are covered, because they reach the
+     * bookkeeping through the same field: the raw-node STATUS CAP alone (the
+     * device list is complete, so the TREE is not truncated) and a truncated
+     * CRAWL (both flags set).
+     */
+    for (const shape of [
+      { label: "the raw-node status cap alone (the tree itself is complete)", treeTruncated: undefined },
+      { label: "a truncated crawl", treeTruncated: true as const }
+    ]) {
+      it(`STILL warns when the completed SYNC's own status report is ALSO truncated — ${shape.label} (\u2298 invalidating the sweep's claim on every sync, complete or not, drops the source from the warning while its status is still partial and nothing else will say so)`, async () => {
+        const core = new NexusCore(new InMemoryConfigRepository());
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+
+        let releaseB!: () => void;
+        const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+        let bEntered!: () => void;
+        const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+        const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+          if (config.host === "a") {
+            return TRUNCATED;
+          }
+          // The sweep parks here holding its collected "Lab A" while the sync of
+          // Lab A runs to completion over the top of it.
+          bEntered();
+          await bGate;
+          return REPORT;
+        });
+        const fetchInventory = vi.fn(
+          async (): Promise<InventoryTree> => ({
+            contractVersion: 1,
+            devices: [],
+            truncated: shape.treeTruncated,
+            status: { contractVersion: 1, truncated: true, statuses: { "dev#1": { state: "running" } } }
+          })
+        );
+        const provider = makeProvider({ fetchStatus, fetchInventory });
+        registry.register(provider);
+        registerInventoryCommands(core, registry, makeVault({ [inventorySecretKey("a", "apiToken")]: "tok" }), makeTeardown());
+        // Fingerprint pre-stamped for the same reason as the test above: a
+        // restamping sync mints a fresh revision, and the warning's revision
+        // check would then suppress the message for an unrelated reason.
+        await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" }, providerFingerprint: computeProviderFingerprint(provider) }));
+        await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" }, providerFingerprint: computeProviderFingerprint(provider) }));
+
+        const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>; // gen 1 applies Lab A truncated, then parks in Lab B's fetch
+        await bParked;
+
+        const applySpy = vi.spyOn(core, "applyInventoryStatus");
+        const revisionBefore = core.getInventorySource("a")!.revision;
+        // A truncated TREE carries plan warnings, and syncNow chains .then() onto
+        // that toast — the default `vi.fn()` returns undefined. Only the calls
+        // matching /partial/ are inspected below, so this affects nothing else.
+        mockShowWarningMessage.mockResolvedValue(undefined);
+        await registeredCommands.get("nexus.inventory.syncNow")!("a");
+        // The sweep's other live checks must not be what decides this test.
+        expect(core.getInventorySource("a")!.revision).toBe(revisionBefore);
+        // The sync really did apply, and applied a TRUNCATED report — the whole
+        // premise of the interleaving.
+        expect(applySpy).toHaveBeenCalledTimes(1);
+        expect(applySpy.mock.calls[0][0]).toBe("a");
+        expect(applySpy.mock.calls[0][1].truncated).toBe(true);
+
+        releaseB();
+        await sweep; // gen 1 reaches its post-loop warning exit
+
+        const partial = mockShowWarningMessage.mock.calls.filter((c) => /partial/i.test(String(c[0])));
+        expect(partial).toHaveLength(1);
+        expect(String(partial[0][0])).toContain('"Lab A"');
+      });
+    }
+
     it("emits ONE message for the whole sweep, naming every affected source (⊘ one showWarningMessage per source stacks a modal-ish pile of notifications on a multi-lab refresh)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();

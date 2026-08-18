@@ -3349,7 +3349,21 @@ export function registerInventoryCommands(
           // is the minimal shape: the filter is `get(id) !== myGeneration`, and
           // a missing entry fails it for every sweep, which is exactly the claim
           // this apply supersedes.
-          statusAppliedGeneration.delete(source.id);
+          //
+          // ONLY WHEN THIS SYNC'S OWN REPORT IS COMPLETE (review). The
+          // claim being invalidated is "this source's status is partial", and
+          // only a COMPLETE apply makes that claim false. A sync whose own
+          // `fetchedStatus` is truncated — the crawl stopped short, or the
+          // raw-node status cap tripped — has just applied a partial status of
+          // its own, so an earlier sweep's warning is STILL TRUE about the
+          // screen the user is looking at. Deleting there would drop that source
+          // from the sweep's warning and leave a partial status with nothing to
+          // explain it, which is the silent-partial failure this whole record
+          // exists to prevent. The APPLY above happens either way; only the
+          // invalidation is conditional.
+          if (!fetchedStatus.truncated) {
+            statusAppliedGeneration.delete(source.id);
+          }
         }
       };
 
