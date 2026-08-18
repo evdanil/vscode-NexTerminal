@@ -1,7 +1,13 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { EVE_NG_PROVIDER_ID, createEveNgProvider, eveNgInstanceKey, labFolderPath } from "../../src/services/inventory/providers/eveNgProvider";
+import {
+  EVE_NG_INSECURE_TLS_WARNING,
+  EVE_NG_PROVIDER_ID,
+  createEveNgProvider,
+  eveNgInstanceKey,
+  labFolderPath
+} from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
@@ -2269,6 +2275,53 @@ describe("createEveNgProvider — insecure TLS transport selection", () => {
  * problem in a vocabulary the user did not choose and offers no remedy — which
  * is why the person who reported this was stuck rather than merely refused.
  */
+/**
+ * A2 — DISCLOSURE AFTER THE FACT. `allowInsecureTls` is read once, at transport
+ * selection, and then never surfaces again: a source whose base URL was later
+ * repointed from a lab box at a remote (or production) EVE-NG keeps shipping the
+ * password over an unauthenticated channel, and nothing in the plan, the tree or
+ * the sync summary says so. It is also the answer to a restored backup enabling
+ * the flag silently — the import trust boundary is already broad (a backup can
+ * add telnet servers, proxies and jump hosts), so the fix is DISCLOSURE, not a
+ * new gate: the first sync says out loud that verification is off.
+ *
+ * Rides the same `tree.warnings` channel the Pro-preliminary warning uses, so it
+ * reaches the sync plan the same way. `fetchStatus` has no warnings channel
+ * (`InventoryStatusReport` carries `statuses` + `truncated` only), so the sync
+ * path is where this belongs.
+ */
+describe("createEveNgProvider — a sync run with verification off discloses it", () => {
+  const WORLD: World = { folders: { "/": { labs: [{ file: "A.unl", path: "/A.unl" }, { file: "B.unl", path: "/B.unl" }] } }, nodes: { "/A.unl": { "1": node() }, "/B.unl": { "1": node() } } };
+
+  /** Both transports stubbed, so an opted-in https config never opens a real socket. */
+  function provider(): ReturnType<typeof createEveNgProvider> {
+    return createEveNgProvider(makeWorld(WORLD).fetchImpl, makeWorld(WORLD).fetchImpl);
+  }
+
+  it("warns EXACTLY ONCE that this source's certificate is not verified, naming the option and the password exposure (⊘ a sync that silently ran unauthenticated — the whole point of the disclosure)", async () => {
+    const tree = await provider().fetchInventory({ ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: true }, SECRETS);
+    expect(tree.devices).toHaveLength(2);
+    expect((tree.warnings ?? []).filter((w) => w === EVE_NG_INSECURE_TLS_WARNING)).toHaveLength(1);
+    // The two clauses that must survive any later rewording: the option the user
+    // can turn back off, and what is actually crossing the unverified connection.
+    expect(EVE_NG_INSECURE_TLS_WARNING).toContain("Allow a Self-Signed or Mismatched Certificate");
+    expect(EVE_NG_INSECURE_TLS_WARNING.toLowerCase()).toContain("password");
+  });
+
+  it("says NOTHING for a source that is actually verifying its certificate (⊘ an unconditional warning trains the user to ignore the one that means something)", async () => {
+    for (const config of [
+      { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
+      { baseUrl: "https://10.0.0.5" },
+      // Ticked but http: the selector keeps the standard transport, so nothing
+      // was relaxed and there is nothing to disclose.
+      { baseUrl: "http://eve.example.com", allowInsecureTls: true }
+    ]) {
+      const tree = await provider().fetchInventory({ ...CONFIG, ...config }, SECRETS);
+      expect((tree.warnings ?? []).some((w) => w.includes("certificate"))).toBe(false);
+    }
+  });
+});
+
 describe("createEveNgProvider — certificate errors name the option", () => {
   /** A transport that fails exactly the way node fails a TLS verification. */
   function failsWith(code: string, viaCause = false): typeof fetch {

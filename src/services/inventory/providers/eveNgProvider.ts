@@ -50,6 +50,23 @@ export const EVE_NG_PRO_WARNING =
 const ALLOW_INSECURE_TLS_LABEL = "Allow a Self-Signed or Mismatched Certificate";
 
 /**
+ * INSECURE TLS — what a sync that RAN with certificate verification off says
+ * about itself, on the same `tree.warnings` channel as the Pro warning above.
+ *
+ * The opt-in is read once, at transport selection, and would otherwise never be
+ * heard from again — so a source ticked for a lab box and later repointed at a
+ * remote EVE-NG keeps sending the password over an unauthenticated connection
+ * with nothing on screen saying so. (Same answer for a restored backup that
+ * enables the flag: an import can already add telnet servers, proxies and jump
+ * hosts, so the proportionate response is disclosure, not another gate.)
+ *
+ * Names the option so it can be found and turned back off, and names the
+ * password because that is the part the user is actually exposed on.
+ */
+export const EVE_NG_INSECURE_TLS_WARNING =
+  `Certificate verification is off for this source (\u201c${ALLOW_INSECURE_TLS_LABEL}\u201d) \u2014 the connection is encrypted but unauthenticated, and the EVE-NG password is sent over it.`;
+
+/**
  * THE CONFIG FIELD LIST IS PART OF THE PROVIDER FINGERPRINT
  * (`computeProviderFingerprint`, models/inventory.ts): its ids, labels, types,
  * required flags and ORDER are hashed and stamped onto every source at save
@@ -1234,18 +1251,28 @@ export interface EveNgTransports {
  * The scheme is read off `normalizeBaseUrl` + `new URL`, which lower-cases it,
  * rather than off the raw string: `HTTPS://…` is https.
  */
-export function selectEveNgTransport(transports: EveNgTransports, config: InventorySourceValues): typeof fetch {
+export function eveNgRunsWithoutCertificateVerification(config: InventorySourceValues): boolean {
   if (config.allowInsecureTls !== true) {
-    return transports.standard;
+    return false;
   }
   try {
-    return new URL(normalizeBaseUrl(String(config.baseUrl ?? ""))).protocol === "https:"
-      ? transports.insecure
-      : transports.standard;
+    return new URL(normalizeBaseUrl(String(config.baseUrl ?? ""))).protocol === "https:";
   } catch {
     // An unparseable base URL cannot be https. `buildUrl` reports it properly.
-    return transports.standard;
+    return false;
   }
+}
+
+/**
+ * ONE decision, asked twice: which transport to connect with, and whether the
+ * sync has to disclose that it ran unverified (`EVE_NG_INSECURE_TLS_WARNING`).
+ * Both read the predicate above rather than each re-deriving the conditions —
+ * a disclosure that could disagree with the transport actually used would be
+ * worse than none, and identity-comparing the returned transport cannot tell
+ * the two apart when a caller injects the same function as both.
+ */
+export function selectEveNgTransport(transports: EveNgTransports, config: InventorySourceValues): typeof fetch {
+  return eveNgRunsWithoutCertificateVerification(config) ? transports.insecure : transports.standard;
 }
 
 function makeClient(transports: EveNgTransports, config: InventorySourceValues, secrets: InventorySourceSecrets): EveApiClient {
@@ -1285,6 +1312,12 @@ async function fetchInventoryImpl(
   const deadline = Date.now() + CRAWL_DEADLINE_MS;
   client.setCrawlDeadline(deadline); // #84 P2-2 — bound every crawl request by the remaining budget
   await client.login(FETCH_TIMEOUT_MS);
+
+  // INSECURE TLS — this sync ran with certificate verification OFF, so it says
+  // so, on the same channel and at the same moment as the Pro warning below.
+  if (eveNgRunsWithoutCertificateVerification(config)) {
+    warnings.push(EVE_NG_INSECURE_TLS_WARNING);
+  }
 
   if ((await client.detectEdition(FETCH_TIMEOUT_MS)) === "pro") {
     warnings.push(EVE_NG_PRO_WARNING);
