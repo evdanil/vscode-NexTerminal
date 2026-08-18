@@ -12,7 +12,7 @@ import { validateProviderShape } from "../../src/services/inventory/providerRegi
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import type { ServerConfig } from "../../src/models/config";
-import type { InventoryConfigField, InventoryStatusReport } from "../../src/models/inventory";
+import { computeProviderFingerprint, type InventoryConfigField, type InventoryStatusReport } from "../../src/models/inventory";
 
 /**
  * EVE-NG's identity as a deployment — the same contract `netboxInstanceKey`
@@ -2192,6 +2192,29 @@ describe("createEveNgProvider — allowInsecureTls field", () => {
 
   it("still passes the provider-shape validation the registry runs, with the new field in place", () => {
     expect(() => validateProviderShape(createEveNgProvider(vi.fn() as unknown as typeof fetch))).not.toThrow();
+  });
+
+  /**
+   * A5 — `advanced` is PRESENTATION ONLY, and `computeProviderFingerprint`
+   * excludes it. True today by projection, but nothing pinned it: adding
+   * `advanced` to that projection failed no test. It must stay out — the
+   * fingerprint gates a MODAL asking the user to re-confirm handing a
+   * re-registered provider their saved credentials, and moving a field behind a
+   * disclosure changes nothing about what a source is configured with. A
+   * spurious credential prompt is exactly how that modal stops being read.
+   */
+  it("keeps `advanced` OUT of the provider fingerprint — two shapes differing only in where a field is drawn hash the same (⊘ projecting `advanced` makes a purely visual change re-prompt every existing source for its credentials)", () => {
+    const fields = (advanced: boolean | undefined): InventoryConfigField[] => [
+      { id: "baseUrl", label: "EVE-NG Base URL", type: "string", required: true },
+      { id: "allowInsecureTls", label: "Allow a Self-Signed or Mismatched Certificate", type: "boolean", required: false, advanced }
+    ];
+    expect(computeProviderFingerprint({ label: "EVE-NG", configFields: fields(true) })).toBe(
+      computeProviderFingerprint({ label: "EVE-NG", configFields: fields(undefined) })
+    );
+    // …and the projection is not simply inert: a change that IS material still moves the hash.
+    expect(computeProviderFingerprint({ label: "EVE-NG", configFields: fields(true) })).not.toBe(
+      computeProviderFingerprint({ label: "EVE-NG", configFields: [...fields(true), { id: "extra", label: "Extra", type: "string" }] })
+    );
   });
 });
 
