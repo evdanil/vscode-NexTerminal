@@ -975,11 +975,6 @@
           "group": "1_manage@4"
         },
         {
-          "command": "nexus.inventory.refreshStatus",
-          "when": "view == nexusCommandCenter",
-          "group": "1_manage@5"
-        },
-        {
           "command": "nexus.tunnel.add",
           "when": "view == nexusTunnels",
           "group": "navigation@1"

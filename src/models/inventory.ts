@@ -83,6 +83,34 @@ export interface InventoryTree {
   // computeSyncPlan skips the prune phase entirely: a capped fetch must never
   // be mistaken for "these devices no longer exist at the source".
   truncated?: boolean;
+  /**
+   * LIVE STATUS ON A SYNC (follow-up #42) — the source's live device state as of
+   * THIS fetch, when the provider can supply it for free; consumed by the sync so
+   * a completed sync leaves lab state current without a separate refresh. Absent
+   * ⇒ the sync changes no status.
+   *
+   * WHY THE PROVIDER DECLARES IT. Only the provider knows whether the picture it
+   * just collected is COMPLETE — the crawl may have been capped, and a config
+   * switch (EVE-NG's `Include Stopped Nodes`) can exclude a whole class of node
+   * from the fetch. That completeness is exactly what `truncated` on the report
+   * encodes, and it decides whether `NexusCore.applyInventoryStatus` MERGES the
+   * report or CLEARS-then-applies it. A caller reconstructing the flag from the
+   * device list alone could not tell "absent because gone" from "absent because
+   * never asked for".
+   *
+   * KEYED BY THE SAME `externalId` the devices carry, so the same
+   * origin lookup resolves both. Entries carry `state` only: the fetched console
+   * endpoints already flow through the sync plan under the normal ownership
+   * rules, so setting `consoleHost`/`consolePort` here would write the same
+   * address twice under two different rules — and `healSyncedConsolePorts`, the
+   * consumer of those fields, is not on this path at all.
+   *
+   * NOT VALIDATED BY `validateInventoryTree` — deliberately. A malformed status
+   * from a third-party provider must not abort a sync whose DEVICES are fine, so
+   * the sync runs it through `validateInventoryStatusReport` instead and degrades
+   * a bad one to "no status update", exactly as `fetchProviderStatus` does.
+   */
+  status?: InventoryStatusReport;
 }
 
 /**

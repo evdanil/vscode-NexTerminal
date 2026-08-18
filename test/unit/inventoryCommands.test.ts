@@ -9430,3 +9430,291 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(applySpy.mock.calls.every((c) => c[1].statuses["dev#1"].state === "running")).toBe(true);
   });
 });
+
+/**
+ * LIVE STATUS ON A SYNC (follow-up #42) — a completed sync now applies the
+ * status picture the provider handed back on `InventoryTree.status`, so an
+ * EVE-NG sync leaves lab state current without a separate Refresh Lab Status.
+ * The provider decides whether that picture is COMPLETE (`status.truncated`);
+ * `NexusCore.applyInventoryStatus` merges a truncated one and clears-then-
+ * applies a complete one, and this command is only responsible for handing it
+ * over on the paths where a sync actually applied.
+ */
+describe("nexus.inventory.syncNow — the sync applies the fetched lab status", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
+    // A truncated fetch carries plan warnings, and syncNow chains .then() onto
+    // the warning toast — a bare vi.fn() returning undefined would throw there.
+    mockShowWarningMessage.mockResolvedValue(undefined);
+  });
+
+  /**
+   * The provider's required `apiToken` must be in the vault or syncNow refuses
+   * before it ever fetches. Covers both source ids the NetBox test uses.
+   */
+  const VAULT = () => makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok", [inventorySecretKey("src-2", "apiToken")]: "tok" });
+
+  /** The two devices every test here syncs, and the ids they land on. */
+  const RUNNING_ID = deterministicServerId("src-1", "/L.unl#1");
+  const STOPPED_ID = deterministicServerId("src-1", "/L.unl#2");
+
+  function eveTree(overrides: Partial<InventoryTree> = {}): InventoryTree {
+    return {
+      contractVersion: 1,
+      devices: [
+        { externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] },
+        { externalId: "/L.unl#2", name: "R2", endpoints: [{ kind: "telnet", host: "10.0.0.2", port: 32770 }] }
+      ],
+      status: {
+        contractVersion: 1,
+        statuses: { "/L.unl#1": { state: "running" }, "/L.unl#2": { state: "stopped" } }
+      },
+      ...overrides
+    };
+  }
+
+  async function makeWorld(tree: InventoryTree | (() => Promise<InventoryTree>), source = makeSource()) {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: typeof tree === "function" ? vi.fn(tree) : vi.fn(async () => tree) }));
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(source);
+    return { core, sync: registeredCommands.get("nexus.inventory.syncNow")! };
+  }
+
+  /** Re-point the registered commands at a provider returning a DIFFERENT tree. */
+  function reregister(core: NexusCore, tree: InventoryTree): (id: string) => unknown {
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: vi.fn(async () => tree) }));
+    registeredCommands.clear();
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    return registeredCommands.get("nexus.inventory.syncNow")! as (id: string) => unknown;
+  }
+
+  it("leaves every synced server's status matching the node state the fetch reported (⊘ dropping the applyInventoryStatus call leaves a freshly-synced lab with NO status at all, so the tree shows nothing and Start/Stop stays hidden until a separate refresh)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+    await sync("src-1");
+
+    expect(core.getSnapshot().servers.map((s) => s.id).sort()).toEqual([RUNNING_ID, STOPPED_ID].sort());
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("applies the status on a NOTHING-TO-CHANGE sync too — that path applies an (empty) plan and completes, and its status is just as fresh (⊘ wiring the apply only into the confirm path leaves the common re-sync of an unchanged lab unable to refresh a single node)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1"); // first sync creates the servers
+
+    // Second sync: same devices, nothing to change — but node 1 has since
+    // STOPPED and node 2 has STARTED. No "Apply" is queued, because a
+    // nothing-to-change plan takes the fast path and shows no confirm modal.
+    const sync2 = reregister(core, {
+      ...eveTree(),
+      status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
+    });
+    await sync2("src-1");
+
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("stopped");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("running");
+  });
+
+  it("a provider that supplies NO tree.status (NetBox) changes no status — and specifically does not WIPE the status an EVE source already had (⊘ applying an empty report unconditionally blanks every EVE node's state the moment an unrelated NetBox source syncs)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ id: "eve", fetchInventory: vi.fn(async () => eveTree()) }));
+    registry.register(
+      makeProvider({
+        id: "netbox",
+        // A NetBox-shaped tree: devices, no `status` member at all.
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:9", name: "nb-1", endpoints: [{ kind: "ssh" as const, host: "10.9.0.9", port: 22 }] }]
+        }))
+      })
+    );
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", providerId: "eve", name: "Lab" }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-2", providerId: "netbox", name: "NetBox", targetFolder: "NB" }));
+
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+    // The NetBox sync landed (its server exists) and the EVE lab's status survived it.
+    expect(core.getSnapshot().servers.some((s) => s.origin?.sourceId === "src-2")).toBe(true);
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("a TRUNCATED report MERGES: a node absent from the partial fetch keeps the state it already had (⊘ handing the same report over as COMPLETE clears every unreached node back to unknown, which reads on the tree as 'never refreshed')", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1"); // both nodes known: #1 running, #2 stopped
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+
+    // A second, TRUNCATED crawl that only reached node 1. `truncated` on the
+    // TREE too, so the plan skips pruning and node 2's server survives.
+    const sync2 = reregister(core, {
+      contractVersion: 1,
+      truncated: true,
+      devices: [{ externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] }],
+      status: { contractVersion: 1, truncated: true, statuses: { "/L.unl#1": { state: "running" } } }
+    });
+    await sync2("src-1");
+
+    expect(core.getSnapshot().servers.some((s) => s.id === STOPPED_ID)).toBe(true);
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped"); // retained, not cleared
+  });
+
+  it("a COMPLETE report CLEARS first: a node the source stopped reporting drops out of the status map instead of lingering (⊘ merging unconditionally leaves a vanished node's state painted on a server the sync deliberately kept)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: vi.fn(async () => eveTree()) }));
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    // "keep" so node 2's server survives its device vanishing and the only thing
+    // that can change is the status entry.
+    await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "keep" }));
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+
+    // Node 2 is gone from the source, and the crawl was COMPLETE.
+    const sync2 = reregister(core, {
+      contractVersion: 1,
+      devices: [{ externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] }],
+      status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "running" } } }
+    });
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync2("src-1");
+
+    expect(core.getSnapshot().servers.some((s) => s.id === STOPPED_ID)).toBe(true);
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.has(STOPPED_ID)).toBe(false);
+  });
+
+  /**
+   * THE FIXTURE THESE THREE SHARE, and the reason it is not simply "sync once
+   * and cancel". Before a sync has applied, a status entry resolves to no server
+   * at all (the devices have no records yet), so a premature apply writes
+   * NOTHING and an empty status map reads identically whether the apply was
+   * correctly withheld or merely futile. So: sync once for real, so both nodes
+   * exist with a known state; then run a SECOND sync that would flip both states
+   * and fail. Only a status apply on a path that did not commit can move them.
+   */
+  async function settledLab(): Promise<{ core: NexusCore; flipped: InventoryTree }> {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: vi.fn(async () => eveTree()) }));
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+    // A renamed node makes the second plan non-empty, so it reaches the preview
+    // modal rather than the nothing-to-do fast path.
+    return {
+      core,
+      flipped: {
+        contractVersion: 1,
+        devices: [
+          { externalId: "/L.unl#1", name: "R1-renamed", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] },
+          { externalId: "/L.unl#2", name: "R2", endpoints: [{ kind: "telnet", host: "10.0.0.2", port: 32770 }] }
+        ],
+        status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
+      }
+    };
+  }
+
+  it("a sync the user CANCELS at the preview applies no status (⊘ applying the report as soon as the fetch returns makes the tree assert a lab state the user just declined to import)", async () => {
+    const { core, flipped } = await settledLab();
+    const sync2 = reregister(core, flipped);
+    mockShowInformationMessage.mockResolvedValueOnce(undefined); // Esc on the preview
+
+    await sync2("src-1");
+
+    expect(core.getServer(RUNNING_ID)?.name).toBe("R1"); // the rename was declined...
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running"); // ...and so was its status
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("a sync whose FETCH fails applies no status (⊘ a status apply outside the success path paints state from a crawl that never completed)", async () => {
+    const { core } = await settledLab();
+    const registry = new InventoryProviderRegistry();
+    registry.register(
+      makeProvider({
+        fetchInventory: vi.fn(async () => {
+          throw new InventoryProviderError("network", "unreachable");
+        })
+      })
+    );
+    registeredCommands.clear();
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+    expect(mockShowErrorMessage).toHaveBeenCalled();
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("a sync whose APPLY is rejected (the source record changed under it) applies no status (⊘ applying status for a plan that never committed decorates servers the sync did not write)", async () => {
+    const { core, flipped } = await settledLab();
+    const sync2 = reregister(core, flipped);
+    vi.spyOn(core, "applyInventorySyncPlan").mockRejectedValue(new Error("Inventory source configuration changed since the sync was computed"));
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+    await sync2("src-1");
+
+    expect(mockShowErrorMessage).toHaveBeenCalled();
+    expect(core.getServer(RUNNING_ID)?.name).toBe("R1"); // nothing committed...
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running"); // ...including the status
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+  it("a malformed provider status degrades to NO status update rather than failing the sync — the devices were fine (⊘ validating it as part of the tree aborts an otherwise-good sync over one bad status entry, and skipping validation entirely lets a garbage report reach the core)", async () => {
+    const { core, sync } = await makeWorld(eveTree({ status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "on fire" } } } as never }));
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+    await sync("src-1");
+
+    expect(core.getSnapshot().servers).toHaveLength(2); // the sync itself succeeded
+    // NOT CALLED AT ALL, rather than called with an empty report: a rejected
+    // report is "no news", and handing an empty one over would CLEAR every entry
+    // this source owns — the exact wipe the NetBox case must also avoid.
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(core.getSnapshot().serverStatus.size).toBe(0);
+  });
+
+  it("a status-less fetch leaves that SAME source's existing status untouched — an absent report is 'no news', not 'nothing is running' (⊘ applying an empty report unconditionally wipes on the source's OWN next sync the state a Refresh Lab Status had just established)", async () => {
+    const statusless: InventoryTree = { contractVersion: 1, devices: eveTree().devices };
+    const { core, sync } = await makeWorld(statusless);
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1"); // creates both servers; the tree carries no status
+
+    // A Refresh Lab Status has since established their real state.
+    core.applyInventoryStatus("src-1", {
+      contractVersion: 1,
+      statuses: { "/L.unl#1": { state: "running" }, "/L.unl#2": { state: "stopped" } }
+    });
+
+    // Re-sync the same status-less tree — nothing to change, and nothing to say
+    // about status either.
+    await reregister(core, statusless)("src-1");
+
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+});

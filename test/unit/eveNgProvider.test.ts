@@ -1579,6 +1579,75 @@ describe("createEveNgProvider — hard caps", () => {
 });
 
 /**
+ * LIVE STATUS ON A SYNC (follow-up #42) — `fetchInventory` already computes each
+ * node's running/stopped state (it renders as the `status` display attribute), so
+ * it now hands that picture back on `InventoryTree.status` and a completed sync
+ * applies it. No second round trip: the sync IS the crawl.
+ */
+describe("createEveNgProvider — fetchInventory reports lab status on the tree", () => {
+  it("emits one status entry per emitted node, keyed by the SAME externalId the device carries, running/stopped mapped exactly as the device attribute is (⊘ no status on the tree leaves a completed sync unable to update the lab highlight at all)", async () => {
+    const tree = await fetchTree(
+      oneLabWorld({ "1": node({ status: 2 }), "2": node({ id: "2", name: "R2", status: 0, url: "" }), "3": node({ id: "3", name: "R3", status: 3 }) })
+    );
+    expect(tree.status?.contractVersion).toBe(1);
+    expect(tree.status?.statuses).toEqual({
+      "/Lab 1.unl#1": { state: "running" },
+      "/Lab 1.unl#2": { state: "stopped" },
+      "/Lab 1.unl#3": { state: "stopped" }
+    });
+    // Every device the tree emits has a status, and nothing else does.
+    expect(Object.keys(tree.status!.statuses).sort()).toEqual(tree.devices.map((d) => d.externalId).sort());
+  });
+
+  it("carries `state` ONLY — never consoleHost/consolePort (⊘ emitting them writes the same console address twice under two different ownership rules, and healSyncedConsolePorts is not even on the sync path)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node({ url: "telnet://127.0.0.1:32769" }) }));
+    expect(tree.status?.statuses["/Lab 1.unl#1"]).toEqual({ state: "running" });
+    expect(tree.status?.statuses["/Lab 1.unl#1"].consoleHost).toBeUndefined();
+    expect(tree.status?.statuses["/Lab 1.unl#1"].consolePort).toBeUndefined();
+  });
+
+  it("leaves the report NON-truncated for a complete crawl with stopped nodes included, so the apply CLEARS-then-applies and a node the source stopped reporting drops out (⊘ marking every report truncated retains status for nodes that are genuinely gone, forever)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node({ status: 2 }), "2": node({ id: "2", status: 0, url: "" }) }), { includeStopped: true });
+    expect(tree.truncated).toBeFalsy();
+    // Both halves, so the assertion cannot pass on an ABSENT report (whose
+    // `truncated` is falsy for the trivial reason that there is no report).
+    expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(2);
+    expect(tree.status?.truncated).toBeFalsy();
+  });
+
+  it("marks the report TRUNCATED when the CRAWL was truncated, so the apply MERGES and a node the crawl never reached keeps its prior state (⊘ a complete-looking report resets every unreached node to unknown)", async () => {
+    // A depth-capped walk: cheaper than the 10 000-node cap and it still carries
+    // a real lab, so the tree has devices AND `truncated`.
+    const root = "/A";
+    const folders: Record<string, FolderListing> = {};
+    let p = root;
+    for (let d = 1; d <= 12; d++) {
+      const child = `${p}/d${d}`;
+      folders[p] = { folders: [{ name: `d${d}`, path: child }] };
+      p = child;
+    }
+    folders[p] = { folders: [{ name: "deeper", path: `${p}/deeper` }] };
+    folders[root] = { folders: [{ name: "d1", path: `${root}/d1` }], labs: [{ file: "L.unl", path: "/A/L.unl" }] };
+    const tree = await fetchTree({ folders, nodes: { "/A/L.unl": { "1": node() } } }, { rootFolder: root });
+    expect(tree.truncated).toBe(true);
+    expect(tree.devices).toHaveLength(1);
+    expect(tree.status?.truncated).toBe(true);
+  });
+
+  it("marks the report TRUNCATED when `Include Stopped Nodes` is OFF, even on a complete crawl — an absent node then means 'not asked for', not 'gone' (⊘ a complete-looking report wipes a stopped node's real state to unknown on every sync, undoing the refresh that established it)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node({ status: 2 }), "2": node({ id: "2", status: 0, url: "" }) }), { includeStopped: false });
+    expect(tree.truncated).toBeFalsy(); // the CRAWL was complete — pruning stays enabled
+    expect(tree.devices.map((d) => d.externalId)).toEqual(["/Lab 1.unl#1"]);
+    expect(tree.status?.truncated).toBe(true);
+  });
+
+  it("still validates as an InventoryTree with the status attached (⊘ a validator that rejects the new member fails every EVE-NG sync at the provider boundary)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node() }));
+    expect(() => validateInventoryTree(tree)).not.toThrow();
+  });
+});
+
+/**
  * WALL-CLOCK CRAWL DEADLINE (task #30) — the crawl is bounded in real time as
  * well as by the request/lab/node/depth caps: a tree well within every cap but
  * served by a slow EVE-NG box can still take minutes. The deadline is driven by

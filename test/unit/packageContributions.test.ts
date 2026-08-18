@@ -840,12 +840,25 @@ describe("package contributions", () => {
       expect(paletteEntry?.when).not.toBe("false");
     });
 
-    it("surfaces Refresh Lab Status as a Command Center title action (least-intrusive tree affordance)", () => {
+    /**
+     * FOLLOW-UP #42 — Refresh Lab Status is GONE from the Command Center's `...`
+     * menu. A sync now brings lab status current by itself, so a second,
+     * non-standard entry sitting permanently in the hub's menu — visible even to
+     * a user with no EVE-NG source at all — was buying nothing. The command
+     * itself stays, on the Command Palette, for a status-only refresh between
+     * syncs.
+     */
+    it("does NOT put Refresh Lab Status in the Command Center title menu — a sync refreshes lab status, so the standalone entry does not earn a permanent seat there (⊘ leaving it shows a non-standard action to every user, EVE-NG source or not)", () => {
       const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
-      const entry = titleMenuItems.find(
-        (item) => item.command === "nexus.inventory.refreshStatus" && item.when === "view == nexusCommandCenter"
+      expect(titleMenuItems.filter((item) => item.command === "nexus.inventory.refreshStatus")).toHaveLength(0);
+      // The COMMAND and its palette entry are deliberately untouched — this
+      // removed a menu seat, not the feature.
+      expect(packageJson.contributes.commands.some((item) => item.command === "nexus.inventory.refreshStatus")).toBe(true);
+      const paletteEntry = (packageJson.contributes.menus.commandPalette ?? []).find(
+        (item) => item.command === "nexus.inventory.refreshStatus"
       );
-      expect(entry).toBeDefined();
+      expect(paletteEntry).toBeDefined();
+      expect(paletteEntry?.when).not.toBe("false");
     });
 
     it("does NOT add refreshStatus to the inventory-source row inline group, keeping those rows' four actions intact", () => {
@@ -878,6 +891,13 @@ describe("package contributions", () => {
       expect(functionalDocs).toMatch(/ipmiHost/);
       expect(functionalDocs).toMatch(/connectBmcSol|BMC menu gating/);
       expect(readme).toMatch(/Refresh Lab Status/);
+    });
+
+    it("documents that a completed sync now updates lab status, and stops telling the user to click a title-bar button that is gone (\u2298 docs that still describe the removed menu seat send the user hunting for it)", () => {
+      expect(functionalDocs).toMatch(/A completed sync updates every EVE-NG node's running\/stopped state/);
+      expect(functionalDocs).toMatch(/Include Stopped Nodes is off/);
+      expect(functionalDocs).not.toMatch(/Available from the palette and as a Command Center title action/);
+      expect(readme).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
     });
   });
 

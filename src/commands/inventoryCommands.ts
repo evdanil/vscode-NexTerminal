@@ -13,6 +13,7 @@ import {
   inventorySourceValuesEqual,
   resolveProviderInstanceKey,
   sourceConfigUnchanged,
+  validateInventoryStatusReport,
   type InventoryConfigField,
   type InventoryPrunePolicy,
   type InventoryProvider,
@@ -3255,6 +3256,48 @@ export function registerInventoryCommands(
         return;
       }
 
+      /**
+       * LIVE STATUS ON A SYNC (follow-up #42) — the running/stopped picture this
+       * fetch came back with, if the provider supplies one (`InventoryTree
+       * .status`; EVE-NG does, NetBox does not). `undefined` — an absent report,
+       * or a malformed one — means this sync changes NO status, which is what
+       * keeps a NetBox sync from blanking an EVE source's decorations.
+       *
+       * VALIDATED HERE, not in `validateInventoryTree`, and DEGRADED rather than
+       * thrown: the devices of this fetch are already proven good, so a
+       * third-party provider's quirky status entry must not abort a sync that
+       * would otherwise apply cleanly. Same discipline (and the same validator)
+       * as `fetchProviderStatus` on the refresh path — one definition of "a
+       * usable status report", so the two paths cannot disagree about one.
+       *
+       * Computed ONCE here, off the same `tree` object every plan below is
+       * computed from, so the status applied on the success paths can only ever
+       * be the one belonging to the fetch that was actually applied.
+       */
+      const fetchedStatus = validateInventoryStatusReport(tree.status);
+      /**
+       * Handed to the core ONLY from a path where the plan was actually applied,
+       * and only AFTER that apply: the report is keyed by `externalId`, which
+       * `applyInventoryStatus` resolves through the servers this source owns —
+       * before the apply, a device this sync has just created matches nothing and
+       * its status would be silently dropped.
+       *
+       * NO NEW CONCURRENCY GUARD. The whole of `syncNow` runs while this source
+       * is claimed in `inFlightSourceIds`, so no other sync/edit/remove can be
+       * mid-flight against it and `refreshStatus` skips it entirely; and the
+       * locked attempt that just committed re-verified `sourceConfigUnchanged`
+       * against the record it applied to, so this tree — and therefore this
+       * status — provably belongs to the source as it now stands. It is called
+       * OUTSIDE `configMutationLock`, like the fingerprint restamp beside it,
+       * because it is a pure runtime-map update (no persistence) and the lock's
+       * rule is that nothing joins it that does not need it.
+       */
+      const applyFetchedStatus = (): void => {
+        if (fetchedStatus) {
+          core.applyInventoryStatus(source.id, fetchedStatus);
+        }
+      };
+
       // PAIRING RULE (see resolveSourceAuthProfile) — resolved immediately
       // before the call it feeds, against `source`, and reassigned in lockstep
       // with `plan` at every point below where `plan` itself is reassigned
@@ -3402,6 +3445,13 @@ export function registerInventoryCommands(
           if (fingerprintToStamp) {
             await restampProviderFingerprintBestEffort(core, fastPathResult.source, fingerprintToStamp);
           }
+          // LIVE STATUS ON A SYNC (follow-up #42) — a nothing-to-change sync is
+          // still a COMPLETED sync: it applied a (empty) plan, it bumped
+          // lastSyncAt, and the status it fetched is exactly as current as the
+          // confirm path's. This is also the ORDINARY shape of a re-sync of a
+          // settled lab, so leaving it out would mean the status only ever
+          // updates on the syncs that happen to change something.
+          applyFetchedStatus();
           // ITEM B — surfaced only when nonzero, appended to the same toast.
           const emptyFolderNote =
             fastPathResult.removedEmptyFolderCount > 0
@@ -4281,6 +4331,14 @@ export function registerInventoryCommands(
         if (fingerprintToStamp) {
           await restampProviderFingerprintBestEffort(core, attempt.source, fingerprintToStamp);
         }
+        // LIVE STATUS ON A SYNC (follow-up #42) — AFTER the apply committed
+        // (`attempt.kind === "success"` is the only way here), so every server
+        // this plan just created is already in the core and can resolve its own
+        // status entry. Every earlier exit — abort, retry, a declined preview, a
+        // failed fetch — returns or loops without reaching this line, which is
+        // what makes "a sync that did not apply changes no status" true by
+        // construction rather than by a condition that could drift.
+        applyFetchedStatus();
 
         const finalPlan = attempt.finalPlan;
         const deletedCount = finalPlan.prunes.filter((p) => p.policy === "delete").length;
