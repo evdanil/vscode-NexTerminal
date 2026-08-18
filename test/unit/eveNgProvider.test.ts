@@ -1139,7 +1139,14 @@ describe("createEveNgProvider — device mapping", () => {
     // so a sync showed two lines about intersecting sets of nodes. The engine owns
     // the disclosure now: it is the only layer that knows whether each of these
     // became a placeholder this run or already was one.
-    expect((tree.warnings ?? []).filter((w) => w.includes("telnet console"))).toEqual([]);
+    //
+    // R6 (review) — asserted as NO warnings at all, matching the NetBox twin,
+    // rather than filtering for the old wording. A filter on "telnet console"
+    // only forbids the sentence that was deleted: a re-introduced aggregate
+    // phrased any other way ("3 nodes have no console URL and were imported
+    // without an endpoint.") would slip past it, and no engine test would catch
+    // it either, since the engine suites never run through this provider.
+    expect(tree.warnings ?? []).toEqual([]);
   });
 
   /**
@@ -1163,8 +1170,9 @@ describe("createEveNgProvider — device mapping", () => {
     expect(tree.devices.find((d) => d.externalId.endsWith("#3"))?.endpoints).toEqual([{ kind: "telnet", host: "192.0.2.9", port: 9000 }]);
     // No provider-side addressless aggregate (follow-up 1) — the endpoint
     // suppression above is this test's subject, and the sync engine reports the
-    // two endpoint-less nodes.
-    expect((tree.warnings ?? []).filter((w) => w.includes("telnet console"))).toEqual([]);
+    // two endpoint-less nodes. Asserted strictly (R6): see the note on the
+    // sibling above for why a wording-specific filter is not enough.
+    expect(tree.warnings ?? []).toEqual([]);
   });
 
   it("mints no endpoint for a telnet console reported on port 0 (⊘ M18 — a port-0 endpoint dials port 0, which never connects)", async () => {
