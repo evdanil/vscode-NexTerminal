@@ -366,6 +366,18 @@ function throwForStatus(status: number, text: string, url: URL): never {
   if (status === 401 || status === 403) {
     throw new InventoryProviderError("auth", `EVE-NG rejected the credentials (HTTP ${status}) at ${url}.`);
   }
+  // SESSION EXPIRY — the status line is not the whole answer. EVE-NG refuses an
+  // unauthenticated request with HTTP 412 and says so only in the body (see
+  // `envelopeSaysUnauthorized`), and reaching here means the silent re-login has
+  // already had its one attempt. Reporting that as an unexplained `protocol`
+  // failure at an odd status code sends the user looking at the wrong thing.
+  const unauthorized = unauthorizedEnvelope(text);
+  if (unauthorized) {
+    throw new InventoryProviderError(
+      "auth",
+      `EVE-NG refused ${url} as unauthenticated (HTTP ${status}): ${str(unauthorized.message).slice(0, BODY_SLICE) || "no message"}`
+    );
+  }
   throw new InventoryProviderError("protocol", `EVE-NG request to ${url} failed with HTTP ${status}: ${text.slice(0, BODY_SLICE)}`);
 }
 
@@ -396,6 +408,73 @@ function parseEnvelope(text: string, url: URL): JSendEnvelope {
     throw new InventoryProviderError("protocol", `Response from ${url} is not an EVE-NG API envelope — is the base URL correct?`);
   }
   return parsed as unknown as JSendEnvelope;
+}
+
+/**
+ * EVE-NG'S ACTUAL SESSION-EXPIRY SIGNAL — reported from production (EVE-NG
+ * 6.2.0-20 Professional, ~660 nodes). A crawl died partway through on:
+ *
+ *   HTTP 412 {"code":412,"status":"unauthorized",
+ *             "message":"User is not authenticated or session timed out (90001)."}
+ *
+ * and the very next attempt succeeded, because it began with a fresh login. The
+ * single silent re-login below was already there and is the right shape; what was
+ * missing is that EVE-NG DOES NOT SAY 401 when a session ages out. It answers
+ * 412 and puts the real answer in the JSend body.
+ *
+ * So the question is "does the ENVELOPE say unauthorized?" — never "is the status
+ * 412?". 412 is a general precondition failure that EVE-NG also uses for ordinary
+ * refusals, and blanket-retrying it would spend a login on a real error and then
+ * report that same error one round trip later, no clearer than before.
+ *
+ * The sub-code is matched in its PARENTHESISED form only, so a message that
+ * merely contains those digits (a node id, a byte count) is not read as an
+ * expired session.
+ */
+const SESSION_EXPIRED_SUBCODE = /\(90001\)/;
+
+function envelopeSaysUnauthorized(envelope: { code?: unknown; status?: unknown; message?: unknown }): boolean {
+  // The status word EVE-NG actually sends, read the way every other envelope
+  // field here is read — trimmed and case-folded, because it comes off the wire.
+  if (str(envelope.status).toLowerCase() === "unauthorized") {
+    return true;
+  }
+  // The IN-ENVELOPE status code, which some endpoints answer with on an HTTP 200
+  // (M36). It lives in this one predicate so `unwrap` and the silent re-login ask
+  // exactly the same question rather than two that can drift.
+  if (envelope.code === 401 || envelope.code === 403) {
+    return true;
+  }
+  return SESSION_EXPIRED_SUBCODE.test(str(envelope.message));
+}
+
+/**
+ * The same question against a RAW body: the envelope when it parses as one and
+ * says unauthorized, `undefined` otherwise — so the caller that needs the
+ * message does not parse a second time.
+ *
+ * Deliberately NOT a substring search over the text: a proxy's HTML error page
+ * is not an EVE-NG envelope whatever words it happens to contain, and treating
+ * one as an expired session would burn a re-login on every such failure.
+ */
+function unauthorizedEnvelope(text: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  return isObject(parsed) && envelopeSaysUnauthorized(parsed) ? parsed : undefined;
+}
+
+/**
+ * ONE decision, asked by BOTH `authedGet` and `authedRequest` — the two copies of
+ * the silent re-login. Kept in one place because split across them, one would
+ * eventually learn a signal the other did not, and Start/Stop would go on failing
+ * on exactly the server whose sync had just been fixed.
+ */
+function isExpiredSessionResponse(status: number, text: string): boolean {
+  return status === 401 || status === 403 || unauthorizedEnvelope(text) !== undefined;
 }
 
 interface RawResponse {
@@ -615,7 +694,7 @@ class EveApiClient {
       this.raw(url, { headers: { Cookie: `unetlab_session=${this.session ?? ""}`, Accept: "application/json" } }, timeoutMs);
 
     let { res, text } = await send();
-    if (res.status === 401 || res.status === 403) {
+    if (isExpiredSessionResponse(res.status, text)) {
       // WALL-CLOCK DEADLINE (#84 P2-2) — the silent re-login is TWO more requests
       // (login + retry). Once the crawl deadline has passed, skip it and surface
       // the 401: retrying would run the crawl a full re-login+retry past the
@@ -657,7 +736,7 @@ class EveApiClient {
       );
 
     let { res, text } = await send();
-    if (res.status === 401 || res.status === 403) {
+    if (isExpiredSessionResponse(res.status, text)) {
       // Same single-retry discipline as authedGet — one re-login, never a loop
       // against the lab server. (No crawl deadline is armed on the control path,
       // so the deadline short-circuit authedGet carries is simply inert here.)
@@ -1045,7 +1124,10 @@ function unwrap(raw: RawResponse): unknown {
   }
   const envelope = parseEnvelope(raw.text, raw.url);
   if (envelope.status !== "success") {
-    if (envelope.code === 401 || envelope.code === 403) {
+    // SESSION EXPIRY — the same predicate the silent re-login uses, so a 200 that
+    // carries an unauthorized envelope is reported as `auth` rather than as a
+    // malformed response.
+    if (envelopeSaysUnauthorized(envelope)) {
       throw new InventoryProviderError("auth", `EVE-NG refused ${raw.url}: ${str(envelope.message) || envelope.status}`);
     }
     throw new InventoryProviderError(
