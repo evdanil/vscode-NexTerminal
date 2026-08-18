@@ -998,7 +998,11 @@ describe("package contributions", () => {
 
     it("documents that a completed sync now updates lab status, and stops telling the user to click a title-bar button that is gone (\u2298 docs that still describe the removed menu seat send the user hunting for it)", () => {
       expect(functionalDocs).toMatch(/A completed sync updates every EVE-NG node's running\/stopped state/);
-      expect(functionalDocs).toMatch(/Include Stopped Nodes is off/);
+      // The status report is built from the UNFILTERED node list, so
+      // `Include Stopped Nodes` no longer makes it partial — the docs must not
+      // still describe the rule the code dropped.
+      expect(functionalDocs).toMatch(/`Include Stopped Nodes` is deliberately NOT a second reason/);
+      expect(functionalDocs).not.toMatch(/marks it `truncated` for \*\*two\*\* reasons/);
       expect(functionalDocs).not.toMatch(/Available from the palette and as a Command Center title action/);
       expect(readme).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
     });
