@@ -2615,6 +2615,21 @@ describe("createEveNgProvider — certificate errors name the option", () => {
     expect(await messageFor(code)).toContain(code);
   });
 
+  /**
+   * THE EXTRACTION GUARD. The code→cause table and the "turn on <option>" sentence
+   * builder moved out to `services/inventory/certificateHints.ts` so NetBox could
+   * use the same one instead of copying it. EVE-NG's wording had to survive that
+   * move BYTE FOR BYTE — including the self-signed clause, which is
+   * EVE-NG-specific and is the part a generic shared table would quietly drop.
+   * Every other test here matches on fragments, so all of them would still pass
+   * against a subtly reworded sentence.
+   */
+  it("says the WHOLE self-signed sentence exactly as it did before the hint table was shared with NetBox (⊘ a shared table that generalises the wording drops \"which EVE-NG ships by default\" — the clause that tells the user a stock install is supposed to look like this)", async () => {
+    expect(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT")).toBe(
+      "10.0.0.5 presented a self-signed certificate, which EVE-NG ships by default. To connect anyway, turn on \u201cAllow a Self-Signed or Mismatched Certificate\u201d in this source's Advanced options \u2014 that skips certificate checks for this source only, and the EVE-NG password is then sent over an unverified connection. (DEPTH_ZERO_SELF_SIGNED_CERT)"
+    );
+  });
+
   it("reads the code out of `cause` too — undici puts it there, and node:https puts it on the error itself", async () => {
     const message = await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT", true);
     expect(message).toContain("Allow a Self-Signed or Mismatched Certificate");

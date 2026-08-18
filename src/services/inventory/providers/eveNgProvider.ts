@@ -1,4 +1,5 @@
 import { ADVANCED_SECTION_LABEL } from "../../../ui/formTypes";
+import { certificateFailureMessage, type CertificateHintContext } from "../certificateHints";
 import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
@@ -297,38 +298,22 @@ class CrawlDeadlineExceeded extends Error {
 }
 
 /**
- * The TLS verification failures a lab EVE-NG box actually produces, and what to
- * say about each. Node reports these as opaque OpenSSL identifiers; echoed
- * verbatim (`Could not reach 10.0.0.5: DEPTH_ZERO_SELF_SIGNED_CERT.`) they name
- * the problem in a vocabulary the user never chose and offer no remedy — which
- * is exactly how someone gets stuck rather than merely refused.
+ * INSECURE TLS — what this provider contributes to the SHARED certificate-hint
+ * sentence (`services/inventory/certificateHints.ts`). The table of codes and the
+ * "turn on <option> in this source's <section>" builder are one copy for every
+ * provider that offers the opt-in; only the three provider-specific parts are
+ * named here.
  *
- * A CLOSED set, not a prefix match: `ECONNREFUSED` and any future
- * `CERT_`-shaped code that is NOT a verification failure must keep today's
- * wording rather than be swept into advice about certificates.
- *
- * The altname case is worded separately on purpose. It is the common shape of
- * this failure — a home server addressed by IP, holding a certificate that
- * never listed that IP — and calling it "not trusted" would be wrong: the
- * certificate may be signed perfectly well and simply issued for another name.
+ * `selfSignedNote` earns its place: EVE-NG SHIPS a self-signed certificate by
+ * default, so saying so is what tells the user this is the expected state of a
+ * stock install rather than something being wrong with their server.
  */
-const TLS_CERT_HINTS: Record<string, (host: string) => string> = {
-  DEPTH_ZERO_SELF_SIGNED_CERT: (host) => `${host} presented a self-signed certificate, which EVE-NG ships by default.`,
-  SELF_SIGNED_CERT_IN_CHAIN: (host) => `${host} presented a certificate signed by an authority this machine does not trust.`,
-  UNABLE_TO_VERIFY_LEAF_SIGNATURE: (host) => `${host} presented a certificate whose signature could not be verified — usually an incomplete chain.`,
-  ERR_TLS_CERT_ALTNAME_INVALID: (host) =>
-    `${host} presented a certificate that does not cover this address — the usual case when the server is reached by IP address rather than by the name on its certificate.`,
-  CERT_HAS_EXPIRED: (host) => `${host} presented an expired certificate.`,
-  // A private CA whose intermediate the server does not serve — the shape right
-  // behind self-signed/altname in a homelab, and worded as its own case because
-  // the certificate may be signed perfectly well by an authority this machine
-  // simply cannot reach the issuer of.
-  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: (host) =>
-    `${host} presented a certificate whose issuer is not held by this machine — the usual case for a private certificate authority whose chain the server does not serve.`,
-  // The clock-skew twin of CERT_HAS_EXPIRED: a lab box with a dead RTC issues a
-  // certificate dated in the future. Saying "expired" here would send the user
-  // to reissue a certificate that is fine.
-  CERT_NOT_YET_VALID: (host) => `${host} presented a certificate that is not yet valid — usually a clock that is wrong on one end or the other.`
+const EVE_NG_CERT_HINT_CONTEXT: CertificateHintContext = {
+  optionLabel: ALLOW_INSECURE_TLS_LABEL,
+  sectionLabel: ADVANCED_SECTION_LABEL,
+  // The clause the user is actually agreeing to; it must not be softened.
+  exposureNoun: "the EVE-NG password",
+  selfSignedNote: ", which EVE-NG ships by default"
 };
 
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
@@ -340,20 +325,11 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
     const cause = (err as { cause?: { code?: string } }).cause;
     const code = cause?.code ?? (err as { code?: string }).code;
     if (code) {
-      // OWN member only. A plain object literal answers `code` values like
-      // "constructor"/"toString" with an INHERITED function, and the branch
-      // below would then call it and build a message out of whatever came back.
-      // No real node code is spelled that way, but the guard costs one call and
-      // this codebase already draws the same line elsewhere (`hasOwnProperty`
-      // in ui/formDefinitions.ts).
-      const certHint = Object.prototype.hasOwnProperty.call(TLS_CERT_HINTS, code) ? TLS_CERT_HINTS[code] : undefined;
-      if (certHint) {
-        // The raw code stays in the tail: it is what makes the failure
-        // searchable and diagnosable once the sentence has done its job.
-        return new InventoryProviderError(
-          "network",
-          `${certHint(host)} To connect anyway, turn on \u201c${ALLOW_INSECURE_TLS_LABEL}\u201d in this source's ${ADVANCED_SECTION_LABEL} \u2014 that skips certificate checks for this source only, and the EVE-NG password is then sent over an unverified connection. (${code})`
-        );
+      // A TLS verification failure gets the shared sentence naming the opt-in;
+      // every other code keeps the wording it has always had.
+      const certMessage = certificateFailureMessage(code, host, EVE_NG_CERT_HINT_CONTEXT);
+      if (certMessage) {
+        return new InventoryProviderError("network", certMessage);
       }
       return new InventoryProviderError("network", `Could not reach ${host}: ${code}.`);
     }
