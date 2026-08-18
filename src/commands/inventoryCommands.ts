@@ -4424,7 +4424,7 @@ export function registerInventoryCommands(
     // from a complete one.
     // Entries carry the source ID as well as the name: the name is what the
     // message renders, the id is what `warnIfTruncated` filters by.
-    const truncatedSources: { id: string; name: string }[] = [];
+    const truncatedSources: { id: string; name: string; revision: string | undefined }[] = [];
     // TRUNCATED STATUS (follow-up 2; R3 review) — ONE renderer, because this
     // warning has TWO exits: the normal end of the sweep, and the supersede bail
     // inside the loop below. Written twice they would drift; written once they
@@ -4467,9 +4467,16 @@ export function registerInventoryCommands(
       //
       //  1. A NEWER sweep re-applied this source — its status is on screen now,
       //     not ours. The generation record settles that.
-      //  2. The source was REMOVED mid-sweep, so there is nothing left to be
-      //     partial about — and naming it would tell the user to narrow the Root
-      //     Folder of something they just deleted.
+      //  2. The source is no longer the RECORD we applied to. Removed mid-sweep,
+      //     so there is nothing left to be partial about — naming it would tell
+      //     the user to narrow the Root Folder of something they just deleted —
+      //     or removed and RECREATED under the same id, which a replace-mode
+      //     import does: the replacement is a different incarnation with a fresh
+      //     revision, its status was cleared with the record we applied to, and
+      //     it displays nothing partial to explain. An id-existence test passes
+      //     that impostor, so the revision captured at apply time is what the
+      //     live record must still match. This is the same incarnation rule the
+      //     apply guard above already enforces before it writes anything.
       //
       // (2) is checked by READING THE LIVE STATE rather than by trusting removals
       // to notify us. `removeSource` here does delete its entry, but it is not the
@@ -4478,9 +4485,18 @@ export function registerInventoryCommands(
       // reach this closure-local map. A future fourth path could not either. The
       // live read is immune to all of them by construction, which a growing list
       // of notification call sites would not be.
-      const live = truncatedSources.filter(
-        (s) => statusAppliedGeneration.get(s.id) === myGeneration && core.getInventorySource(s.id) !== undefined
-      );
+      const live = truncatedSources.filter((s) => {
+        if (statusAppliedGeneration.get(s.id) !== myGeneration) {
+          return false;
+        }
+        // BOTH halves, deliberately. `revision` is optional (older records are
+        // backfilled at load), so `getInventorySource(id)?.revision === captured`
+        // alone would read a REMOVED legacy source — `undefined?.revision` is
+        // `undefined`, and so was its captured revision — as a match, and warn
+        // about a source that is gone.
+        const liveSource = core.getInventorySource(s.id);
+        return liveSource !== undefined && liveSource.revision === s.revision;
+      });
       if (live.length === 0) {
         return;
       }
@@ -4575,7 +4591,7 @@ export function registerInventoryCommands(
             // supersede case silent, which the loop-top generation check alone
             // cannot do — it only catches a supersede before the NEXT source.
             if (report.truncated === true) {
-              truncatedSources.push({ id: source.id, name: source.name });
+              truncatedSources.push({ id: source.id, name: source.name, revision: startRevision });
             }
             // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
             // console-port reassignment onto sync-owned nodes, so the next

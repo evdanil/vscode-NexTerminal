@@ -9264,6 +9264,53 @@ describe("nexus.inventory.refreshStatus", () => {
     });
 
     /**
+     * The id survives, the RECORD does not. A replace-mode config import removes
+     * a source and re-adds it under the same id, which mints a fresh revision and
+     * clears the status the old record displayed. An existence test passes that
+     * impostor — same id, still there — so the warning would explain a partial
+     * status on a replacement that is showing none.
+     */
+    it("does NOT warn when the source was removed and RECREATED under the same id mid-sweep, as a replace-mode import does (⊘ testing only that the id still exists accepts a different incarnation, whose status was cleared with the record we actually applied to)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+      const originalRevision = core.getInventorySource("a")!.revision;
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // Replace-mode import: drop the record, put one back under the SAME id.
+      await core.removeInventorySource("a");
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      const replacement = core.getInventorySource("a");
+      expect(replacement).toBeDefined();                          // the id is back...
+      expect(replacement!.revision).not.toBe(originalRevision);   // ...as a different incarnation
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
      * R3 (review), the other half of the bail decision: why the bail is a
      * `return` and not a `break`. `break` would fall through to the TOTAL-FAILURE
      * warning, whose `succeeded === 0` is meant to say "every source failed" —
