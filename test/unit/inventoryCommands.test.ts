@@ -9180,7 +9180,7 @@ describe("nexus.inventory.refreshStatus", () => {
      * still named in the warning and they are told to narrow the Root Folder of
      * something that no longer exists.
      */
-    it("does NOT warn about a source the user REMOVED after its truncated report was applied (⊘ leaving the removed source's generation entry behind names a source that is no longer in the tree and tells the user to go narrow its Root Folder)", async () => {
+    it("does NOT warn about a source the user REMOVED after its truncated report was applied (⊘ warning from the collected list without re-reading the live sources names a source that is no longer in the tree and tells the user to go narrow its Root Folder)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -9210,6 +9210,52 @@ describe("nexus.inventory.refreshStatus", () => {
       mockShowWarningMessage.mockResolvedValueOnce("Remove");
       await registeredCommands.get("nexus.inventory.removeSource")!("a");
       expect(core.getInventorySource("a")).toBeUndefined(); // the fixture really did remove it
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * The SAME staleness, through a remover that cannot maintain the map. The
+     * test above removes the source via `nexus.inventory.removeSource`, which
+     * deletes its own generation entry. But Reset and a replace-mode config
+     * import drop sources by calling `core.removeInventorySource` DIRECTLY
+     * (configCommands.ts) — they never touch this command module's closure-local
+     * map, and neither would any future removal path. So the warning cannot rely
+     * on being told; it re-reads the live source list at the moment it warns.
+     */
+    it("does NOT warn about a source removed by a path that never maintains the generation map — e.g. Reset or a replace-mode import calling core directly (⊘ trusting removers to invalidate the entry covers only the one removal path that was taught to, and names a source that Reset deleted)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // NOT through removeSource: straight to the core, exactly as completeReset
+      // and a replace-mode import do. Nothing informs the generation map.
+      await core.removeInventorySource("a");
+      expect(core.getInventorySource("a")).toBeUndefined();
 
       releaseB();
       await sweep; // gen 1 reaches its post-loop warning exit

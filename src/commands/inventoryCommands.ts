@@ -2834,14 +2834,6 @@ export function registerInventoryCommands(
           return { ok: false };
         }
 
-        // R4 (review) — the record is gone, so drop its status-generation entry
-        // too. Not only leak hygiene: the entry keeps an in-flight sweep's
-        // truncation claim ALIVE for a source that is no longer in the tree, so
-        // the sweep would name it and send the user off to narrow the Root Folder
-        // of something they just deleted. Safe against a replace-mode import
-        // recreating this id afterwards — the entry would describe the DEAD
-        // incarnation, and a missing entry only ever suppresses a warning.
-        statusAppliedGeneration.delete(source.id);
 
         // FINDING 1 — the source record is gone for good now, so record
         // removal can no longer race server disposition. `expectedSource:
@@ -4470,7 +4462,25 @@ export function registerInventoryCommands(
       // Correct too when the newer sweep is ALSO truncated: it collected the
       // source itself and warns with its own accurate message, so suppressing the
       // older claim removes a duplicate rather than losing information.
-      const live = truncatedSources.filter((s) => statusAppliedGeneration.get(s.id) === myGeneration);
+      // STILL THIS SWEEP'S, AND STILL THERE (Codex P2 ×2). Two independent ways a
+      // collected claim goes stale between the apply and the warning:
+      //
+      //  1. A NEWER sweep re-applied this source — its status is on screen now,
+      //     not ours. The generation record settles that.
+      //  2. The source was REMOVED mid-sweep, so there is nothing left to be
+      //     partial about — and naming it would tell the user to narrow the Root
+      //     Folder of something they just deleted.
+      //
+      // (2) is checked by READING THE LIVE STATE rather than by trusting removals
+      // to notify us. `removeSource` here does delete its entry, but it is not the
+      // only remover: `completeReset` and a replace-mode config import drop
+      // sources by calling core directly (configCommands.ts), and they cannot
+      // reach this closure-local map. A future fourth path could not either. The
+      // live read is immune to all of them by construction, which a growing list
+      // of notification call sites would not be.
+      const live = truncatedSources.filter(
+        (s) => statusAppliedGeneration.get(s.id) === myGeneration && core.getInventorySource(s.id) !== undefined
+      );
       if (live.length === 0) {
         return;
       }
