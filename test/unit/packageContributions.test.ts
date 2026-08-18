@@ -1075,6 +1075,25 @@ describe("package contributions", () => {
       expect(functionalDocs).toMatch(/one that does not restamp the provider fingerprint/);
       expect(functionalDocs).not.toMatch(/A sync belongs to no sweep, and a routine sync touches only/);
     });
+
+    /**
+     * The claim the sync's apply invalidates is "this source's status is
+     * PARTIAL", so only a COMPLETE apply makes it false. The docs used to say
+     * the sync's apply deletes the entry, full stop — which describes a sync
+     * whose own report is truncated silencing a warning that is still true of
+     * the screen the user is looking at. And the raw-node status cap, the one
+     * stopping point that deliberately leaves the tree's `truncated` alone, now
+     * has to name itself rather than rely on anything downstream noticing.
+     */
+    it("says the sync's apply invalidates the partial-status claim only when its OWN report is complete, and that the raw-node status cap warns for itself (\u2298 documenting an unconditional deletion teaches the silent-partial behaviour as intended, \u2298 leaving the cap undocumented leaves it looking like the silent stopping point it was)", () => {
+      expect(functionalDocs).toMatch(/but only when the report that sync just applied is itself COMPLETE/);
+      expect(functionalDocs).toMatch(/The deletion is WITHHELD when the sync's own report is truncated/);
+      // The unconditional wording, which said the sync's apply deletes the entry
+      // full stop, must not come back.
+      expect(functionalDocs).not.toMatch(/the \*\*sync's\*\* apply DELETES the source's entry\. A sync belongs to no sweep/);
+      expect(functionalDocs).toMatch(/the cap \*\*pushes its own sync warning\*\*/);
+      expect(functionalDocs).toMatch(/suppressed when the crawl was already truncated/);
+    });
   });
 
   it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
