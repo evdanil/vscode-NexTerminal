@@ -317,7 +317,17 @@ const TLS_CERT_HINTS: Record<string, (host: string) => string> = {
   UNABLE_TO_VERIFY_LEAF_SIGNATURE: (host) => `${host} presented a certificate whose signature could not be verified — usually an incomplete chain.`,
   ERR_TLS_CERT_ALTNAME_INVALID: (host) =>
     `${host} presented a certificate that does not cover this address — the usual case when the server is reached by IP address rather than by the name on its certificate.`,
-  CERT_HAS_EXPIRED: (host) => `${host} presented an expired certificate.`
+  CERT_HAS_EXPIRED: (host) => `${host} presented an expired certificate.`,
+  // A private CA whose intermediate the server does not serve — the shape right
+  // behind self-signed/altname in a homelab, and worded as its own case because
+  // the certificate may be signed perfectly well by an authority this machine
+  // simply cannot reach the issuer of.
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: (host) =>
+    `${host} presented a certificate whose issuer is not held by this machine — the usual case for a private certificate authority whose chain the server does not serve.`,
+  // The clock-skew twin of CERT_HAS_EXPIRED: a lab box with a dead RTC issues a
+  // certificate dated in the future. Saying "expired" here would send the user
+  // to reissue a certificate that is fine.
+  CERT_NOT_YET_VALID: (host) => `${host} presented a certificate that is not yet valid — usually a clock that is wrong on one end or the other.`
 };
 
 function mapNetworkError(err: unknown, url: URL): InventoryProviderError {

@@ -2350,7 +2350,11 @@ describe("createEveNgProvider — certificate errors name the option", () => {
     "SELF_SIGNED_CERT_IN_CHAIN",
     "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
     "ERR_TLS_CERT_ALTNAME_INVALID",
-    "CERT_HAS_EXPIRED"
+    "CERT_HAS_EXPIRED",
+    // A3 — the two shapes the set was short of, both of which the option fixes
+    // identically to the five above.
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "CERT_NOT_YET_VALID"
   ];
 
   it.each(CERT_CODES)("names the option, and the host, instead of leaving %s to speak for itself (⊘ dropping the mapping restores the bare code, which is the state the user was stuck in)", async (code) => {
@@ -2367,6 +2371,24 @@ describe("createEveNgProvider — certificate errors name the option", () => {
   it("reads the code out of `cause` too — undici puts it there, and node:https puts it on the error itself", async () => {
     const message = await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT", true);
     expect(message).toContain("Allow a Self-Signed or Mismatched Certificate");
+  });
+
+  it("explains the PRIVATE-CA case in its own terms — a chain this machine cannot complete is not a self-signed certificate, and the homelab shape right after self-signed/altname (⊘ borrowing the self-signed sentence describes a certificate the user does not have)", async () => {
+    const message = await messageFor("UNABLE_TO_GET_ISSUER_CERT_LOCALLY");
+    // Anchored on the hint's own sentence shape, not merely on a word the bare
+    // OpenSSL code happens to contain — otherwise the unmapped fallback
+    // ("Could not reach 10.0.0.5: UNABLE_TO_GET_ISSUER_CERT_LOCALLY.") satisfies
+    // a /issuer/ match and the test proves nothing.
+    expect(message).toMatch(/^10\.0\.0\.5 presented /);
+    expect(message.toLowerCase()).toMatch(/issuer|authority|chain/);
+    expect(message).not.toBe(await messageFor("DEPTH_ZERO_SELF_SIGNED_CERT"));
+  });
+
+  it("explains NOT-YET-VALID as the clock case, distinctly from expired — the lab box with a dead RTC (⊘ collapsing the two tells someone whose certificate is fine that it expired)", async () => {
+    const message = await messageFor("CERT_NOT_YET_VALID");
+    expect(message).toMatch(/^10\.0\.0\.5 presented /);
+    expect(message.toLowerCase()).toMatch(/not yet valid|clock/);
+    expect(message).not.toBe(await messageFor("CERT_HAS_EXPIRED"));
   });
 
   it("calls out THE IP CASE for an altname mismatch specifically — a certificate that does not list the IP is the common shape of this failure and reads as unrelated otherwise", async () => {
