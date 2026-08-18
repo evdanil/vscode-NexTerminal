@@ -73,26 +73,6 @@ export interface InventoryDevice {
   attributes?: Record<string, string | string[]>;
 }
 
-/**
- * Does this device offer a CONSOLE address at all? The boolean twin of
- * `selectPrimaryEndpoint` (services/inventory/syncEngine.ts): true for exactly
- * the devices that selector can map onto `ServerConfig.host`/`port` — an `ssh`
- * endpoint, else a `telnet` one, each with a NON-EMPTY host — and false for the
- * devices the engine therefore creates as ADDRESSLESS placeholders.
- *
- * It lives here, beside `InventoryEndpointKind`, because it is the vocabulary a
- * PROVIDER needs to describe its own fetch ("N devices have no usable console
- * address") without duplicating — or drifting from — the engine's rule. Keyed on
- * the CONNECTABLE kinds, never on `endpoints.length`: `redfish` / `ipmi-sol` /
- * `url` are all real endpoints that reach no console, so a BMC-only device has
- * endpoints and still has no address.
- *
- * KEEP IN STEP with `selectPrimaryEndpoint`: a console kind added there is a
- * console kind here.
- */
-export function hasConsoleEndpoint(device: Pick<InventoryDevice, "endpoints">): boolean {
-  return device.endpoints.some((e) => (e.kind === "ssh" || e.kind === "telnet") && e.host.length > 0);
-}
 
 export interface InventoryTree {
   contractVersion: 1;
@@ -144,6 +124,11 @@ export interface InventoryStatusReport {
   // applyInventoryStatus MERGES a truncated report (retaining prior status for
   // absent entries) rather than clearing-then-applying (which treats an absent
   // node as removed). Absent/false ⇒ a complete report.
+  //
+  // CONSUMED BY `refreshStatus` (commands/inventoryCommands.ts): a truncated
+  // report that is APPLIED names its source in one manual-only warning, because
+  // the merge above leaves the unreached nodes showing stale (or `unknown`) state
+  // and nothing else on screen would say so. The poll path stays silent.
   truncated?: boolean;
 }
 

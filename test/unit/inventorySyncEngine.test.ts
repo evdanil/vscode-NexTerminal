@@ -657,6 +657,245 @@ describe("computeSyncPlan — adds", () => {
       expect(plan.unchangedCount).toBe(1);
     });
 
+    /**
+     * ONE ADDRESSLESS LINE (follow-up 1) — the sync owns the whole addressless
+     * disclosure now. Both providers used to push their OWN aggregate covering
+     * every addressless row in the fetch, while the engine pushed a second line
+     * covering only the placeholders it ADDED, so a sync showed two lines about
+     * overlapping sets of devices. The engine is the only layer that knows the
+     * OUTCOME (added now vs already a placeholder), so it emits the single line
+     * and the providers emit none.
+     *
+     * `addressless` here is about the DEVICE's console address, never about a
+     * downgrade: a previously-ADDRESSED server that lost its address keeps its
+     * own separate warning (the P2-3 line above) — losing an address is a
+     * different event from never having had one.
+     */
+    describe("the single addressless line", () => {
+      /** A device that is already an addressless placeholder owned by this source. */
+      function ownedPlaceholder(externalId: string, name: string): ServerConfig {
+        return makeOwnedServer({
+          id: deterministicServerId("source-1", externalId),
+          name,
+          host: "",
+          port: 0,
+          addressless: true,
+          origin: { sourceId: "source-1", externalId, syncedAt: 1000, syncedProtocol: undefined }
+        });
+      }
+
+      /** Every warning that speaks about devices having no console address. */
+      function addresslessLines(plan: InventorySyncPlan): string[] {
+        return plan.warnings.filter((w) => w.includes("no console address yet"));
+      }
+
+      it("ADDS ONLY — keeps today's sentence verbatim, so the common case does not regress (⊘ rewording the added-only branch churns the line every user already reads)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "fresh-a", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "fresh-b", endpoints: [] })
+          ]),
+          currentServers: [],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(2);
+        expect(addresslessLines(plan)).toEqual([
+          '2 devices have no console address yet and were added without one (e.g. "fresh-a", "fresh-b").'
+        ]);
+      });
+
+      it("ADDS ONLY, singular — one device reads in the singular throughout (⊘ a hardcoded plural says '1 devices ... were added')", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice({ name: "lonely", endpoints: [] })]),
+          currentServers: [],
+          now: 5000
+        });
+        expect(addresslessLines(plan)).toEqual([
+          '1 device has no console address yet and was added without one (e.g. "lonely").'
+        ]);
+      });
+
+      it("BOTH GROUPS — ONE line giving the total AND the split, covering the placeholder that was already one (⊘ counting only `addresslessAdded` under-reports the total and hides the standing placeholders — the very gap the deleted provider aggregates used to cover)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          // device:1 matches an existing placeholder and stays one (unchanged);
+          // device:2 is new and is added as a placeholder this run.
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "fresh-node", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1")],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(1);
+        expect(addresslessLines(plan)).toEqual([
+          '2 devices have no console address yet — 1 was added without one and 1 was already a placeholder (e.g. "fresh-node", "core-sw-1").'
+        ]);
+      });
+
+      it("BOTH GROUPS, plural halves — each half of the split carries its own singular/plural (⊘ one shared plural flag mangles '2 were added ... 1 were already placeholders')", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "edge-sw-2", endpoints: [] }),
+            makeDevice({ externalId: "device:3", name: "fresh-node", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1"), ownedPlaceholder("device:2", "edge-sw-2")],
+          now: 5000
+        });
+        expect(addresslessLines(plan)).toEqual([
+          '3 devices have no console address yet — 1 was added without one and 2 were already placeholders (e.g. "fresh-node", "core-sw-1", "edge-sw-2").'
+        ]);
+      });
+
+      it("BOTH GROUPS, plural ADDED half — the added half pluralises on its own count, not on the already-half's (\u2298 every other BOTH case has exactly 1 added, so a hardcoded singular arm there says '2 was added without one' and no test notices)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "fresh-a", endpoints: [] }),
+            makeDevice({ externalId: "device:3", name: "fresh-b", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1")],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(2);
+        // The mirror of the case above: 2 added / 1 already, where that one is
+        // 1 added / 2 already. Between them every arm of the BOTH branch is read.
+        expect(addresslessLines(plan)).toEqual([
+          '3 devices have no console address yet — 2 were added without one and 1 was already a placeholder (e.g. "fresh-a", "fresh-b", "core-sw-1").'
+        ]);
+      });
+
+      it("ALREADY-PLACEHOLDER ONLY — the line must NOT claim anything was added this run (⊘ reusing the added-only sentence tells the user N placeholders were created by a sync that created none)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] })]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1")],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(0);
+        expect(plan.unchangedCount).toBe(1);
+        expect(addresslessLines(plan)).toEqual([
+          '1 device has no console address yet and remains a placeholder (e.g. "core-sw-1").'
+        ]);
+        expect(addresslessLines(plan)[0]).not.toContain("added");
+      });
+
+      it("ALREADY-PLACEHOLDER ONLY, plural (⊘ a singular-only branch says '2 devices ... remains a placeholder')", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "edge-sw-2", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1"), ownedPlaceholder("device:2", "edge-sw-2")],
+          now: 5000
+        });
+        expect(addresslessLines(plan)).toEqual([
+          '2 devices have no console address yet and remain placeholders (e.g. "core-sw-1", "edge-sw-2").'
+        ]);
+      });
+
+      it("counts a stay-addressless server the sync UPDATED, not just the untouched ones — the count must span both the changed and the no-change branch (⊘ counting only in the `else` branch drops every renamed placeholder from the line)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          // Renamed at the source, so this stay-addressless server IS an update.
+          tree: makeTree([makeDevice({ externalId: "device:1", name: "renamed", endpoints: [] })]),
+          currentServers: [ownedPlaceholder("device:1", "old-name")],
+          now: 5000
+        });
+        expect(plan.updates).toHaveLength(1);
+        expect(addresslessLines(plan)).toEqual([
+          '1 device has no console address yet and remains a placeholder (e.g. "renamed").'
+        ]);
+      });
+
+      it("NEITHER — an ordinary addressed device produces NO addressless line at all (⊘ an unconditional push adds a '0 devices' line to every healthy sync)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice()]),
+          currentServers: [],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(1);
+        expect(addresslessLines(plan)).toEqual([]);
+      });
+
+      /**
+       * R4 (review) — the `blanksAddress &&` half of the stay-addressless guard.
+       * Without it the guard is just `addressless === true` and this record is
+       * reported as "remains a placeholder", when the sync in fact decided it is
+       * NOT one: a hand edit to either half of the address makes the sync stop
+       * owning the address, so it preserves what the user typed instead of
+       * blanking it, and `blanksAddress` is false.
+       *
+       * DEFENSIVE, not a supported flow — but not unreachable either. The edit
+       * form clears the flag the moment a host is typed and export drops
+       * addressless records, so no UI produces this. A hand-edited `globalState`
+       * does: note the fixture is `host: ""` with a hand-typed PORT, which is the
+       * only shape of this state that survives the store. `validateServerConfig`
+       * demands `host === ""` whenever `addressless === true` (validation.ts:310),
+       * so `addressless: true` beside a hand-typed HOST is rejected on load and
+       * never reaches the engine at all. Asserted below, so the premise fails
+       * loudly if that rule ever changes.
+       *
+       * (This fixture also lands on the pre-existing #82-class storage hazard in
+       * the else-branch — deliberately not asserted here; it is not this line's
+       * business and needs its own change.)
+       */
+      it("a placeholder carrying a HAND-EDITED PORT is not reported as a standing placeholder — the sync preserved the hand edit, so it no longer calls the record one (\u2298 keying the guard on the `addressless` flag alone reports a record the very same sync just decided to treat as addressed)", () => {
+        const handEdited: ServerConfig = {
+          id: deterministicServerId("source-1", "device:1"),
+          name: "core-sw-1",
+          host: "",
+          port: 2222, // typed straight into the stored record, over the ADDRESSLESS_PORT sentinel
+          username: "admin",
+          authType: "agent",
+          isHidden: false,
+          group: "NetBox",
+          addressless: true,
+          // No syncedPort stamp: the sync never owned a port here, so the
+          // hand-typed one is a user value it must preserve.
+          origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+        };
+        // The premise: this record really does survive the store and reach the engine.
+        expect(validateServerConfig(handEdited)).toBe(true);
+        // ...whereas the same flag beside a hand-typed HOST does not.
+        expect(validateServerConfig({ ...handEdited, host: "10.9.9.9" })).toBe(false);
+
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] })]),
+          currentServers: [handEdited],
+          now: 5000
+        });
+
+        expect(addresslessLines(plan)).toEqual([]);
+        // Nor the downgrade line — it shares the same `blanksAddress` gate.
+        expect(plan.warnings.filter((w) => /downgraded to a placeholder/.test(w))).toEqual([]);
+      });
+
+      it("a DOWNGRADE is NOT folded into this line — it keeps its own separate warning (⊘ lumping downgrades in with the standing placeholders reports 'was already a placeholder' about a server that had a working address until this sync)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          // Previously ADDRESSED (the default fixture owns 10.0.0.1) and the
+          // device lost its console this fetch — a downgrade, not a stay.
+          tree: makeTree([makeDevice({ endpoints: [] })]),
+          currentServers: [makeOwnedServer()],
+          now: 5000
+        });
+        expect(plan.updates).toHaveLength(1);
+        expect(plan.updates[0].after.addressless).toBe(true);
+        // The downgrade line, and ONLY the downgrade line.
+        expect(addresslessLines(plan)).toEqual([]);
+        expect(plan.warnings.filter((w) => /downgraded to a placeholder/.test(w))).toHaveLength(1);
+      });
+    });
+
     it("P1-C — a new addressless device from a KEYLESS source profile carries NO link (⊘ writing a keyless winner stamps a link no server can satisfy)", () => {
       const keyless: AuthProfile = { id: "p1", name: "Shared Key", username: "svc", authType: "key" };
       const plan = computeSyncPlan({

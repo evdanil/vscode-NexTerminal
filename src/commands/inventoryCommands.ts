@@ -2210,6 +2210,16 @@ export function registerInventoryCommands(
   // poll ticks from stacking; this covers poll-vs-manual and any residual race.
   let statusRefreshGeneration = 0;
 
+  // TRUNCATED STATUS (follow-up 2; R4 review) — which sweep generation last
+  // APPLIED status for each source id. The generation counter above orders
+  // sweeps; this records the outcome per source, which is what the truncation
+  // warning needs: a sweep may only claim a source's status is partial while
+  // its own truncated apply is still the newest one for that source. Written on
+  // EVERY apply, not just truncated ones — a later COMPLETE apply is precisely
+  // what has to invalidate an earlier truncated claim. Entries are dropped when
+  // the source is removed (see removeSource).
+  const statusAppliedGeneration = new Map<string, number>();
+
   /**
    * Shared Test-button handler for both the Add and Edit forms. Never throws
    * out to WebviewFormPanel — a bad/incomplete field value is reported as a
@@ -2823,6 +2833,7 @@ export function registerInventoryCommands(
           }
           return { ok: false };
         }
+
 
         // FINDING 1 — the source record is gone for good now, so record
         // removal can no longer race server disposition. `expectedSource:
@@ -4404,11 +4415,119 @@ export function registerInventoryCommands(
     // poll path stays silent (a warning per tick would nag).
     let attempted = 0;
     let succeeded = 0;
+    // TRUNCATED STATUS (follow-up 2) — the sources whose report came back
+    // `truncated` AND was applied, by name, for one manual-only warning after the
+    // loop. `fetchStatus` sets the flag when the lab crawl hits its own time
+    // budget; the report then covers only the nodes it reached, so every other
+    // node keeps whatever state it already had — stale, or still `unknown`.
+    // Nothing read the flag before, so a partial refresh was indistinguishable
+    // from a complete one.
+    // Entries carry the source ID as well as the name: the name is what the
+    // message renders, the id is what `warnIfTruncated` filters by.
+    const truncatedSources: { id: string; name: string; revision: string | undefined }[] = [];
+    // TRUNCATED STATUS (follow-up 2; R3 review) — ONE renderer, because this
+    // warning has TWO exits: the normal end of the sweep, and the supersede bail
+    // inside the loop below. Written twice they would drift; written once they
+    // cannot. It is self-gating (manual-only, and silent with nothing collected),
+    // so both call sites are an unconditional call.
+    //
+    // MANUAL ONLY, exactly like the total-failure warning and for the same
+    // reason: the poll fires on a timer, and a warning per tick would nag about a
+    // lab that is merely large. ONE message for the sweep, never one per source —
+    // a multi-lab refresh would otherwise stack a pile of notifications. Names up
+    // to three sources, in the spirit of the sync's own `namedExamples`.
+    //
+    // CAUSE-NEUTRAL (Codex P2) — `truncated` is set by the wall-clock deadline
+    // AND by every size cap (nodes, labs, folder listings, depth), so naming the
+    // time budget is wrong for a lab tree that simply exceeds a cap — and
+    // "run it again" is actively bad advice there, because a cap is deterministic
+    // and truncates identically next time. The remedy that works for BOTH causes
+    // is a narrower crawl, so that is the only one offered. Propagating the real
+    // reason out of the provider would let this be specific again; the report
+    // contract carries no reason field today.
+    const warnIfTruncated = (): void => {
+      if (options?.manual !== true || truncatedSources.length === 0) {
+        return;
+      }
+      // R4 (Codex P2) — a STALE CLAIM guard, and the reason the collected entries
+      // carry ids. Applying a truncated report earns the right to say so only
+      // while that apply is still what the tree shows. A NEWER sweep that applied
+      // a COMPLETE report for the same source (very much the expected shape: this
+      // sweep is slow because the lab is big, and the user refreshed again) has
+      // replaced the partial status with a full one, so naming that source here
+      // describes a screen the user is no longer looking at and sends them to
+      // narrow a Root Folder that no longer needs narrowing. Drop those and warn
+      // about what is left, staying silent if that is nothing.
+      //
+      // Correct too when the newer sweep is ALSO truncated: it collected the
+      // source itself and warns with its own accurate message, so suppressing the
+      // older claim removes a duplicate rather than losing information.
+      // STILL THIS SWEEP'S, AND STILL THERE (Codex P2 ×2). Two independent ways a
+      // collected claim goes stale between the apply and the warning:
+      //
+      //  1. A NEWER sweep re-applied this source — its status is on screen now,
+      //     not ours. The generation record settles that.
+      //  2. The source is no longer the RECORD we applied to. Removed mid-sweep,
+      //     so there is nothing left to be partial about — naming it would tell
+      //     the user to narrow the Root Folder of something they just deleted —
+      //     or removed and RECREATED under the same id, which a replace-mode
+      //     import does: the replacement is a different incarnation with a fresh
+      //     revision, its status was cleared with the record we applied to, and
+      //     it displays nothing partial to explain. An id-existence test passes
+      //     that impostor, so the revision captured at apply time is what the
+      //     live record must still match. This is the same incarnation rule the
+      //     apply guard above already enforces before it writes anything.
+      //
+      // (2) is checked by READING THE LIVE STATE rather than by trusting removals
+      // to notify us. `removeSource` here does delete its entry, but it is not the
+      // only remover: `completeReset` and a replace-mode config import drop
+      // sources by calling core directly (configCommands.ts), and they cannot
+      // reach this closure-local map. A future fourth path could not either. The
+      // live read is immune to all of them by construction, which a growing list
+      // of notification call sites would not be.
+      const live = truncatedSources.filter((s) => {
+        if (statusAppliedGeneration.get(s.id) !== myGeneration) {
+          return false;
+        }
+        // BOTH halves, deliberately. `revision` is optional (older records are
+        // backfilled at load), so `getInventorySource(id)?.revision === captured`
+        // alone would read a REMOVED legacy source — `undefined?.revision` is
+        // `undefined`, and so was its captured revision — as a match, and warn
+        // about a source that is gone.
+        const liveSource = core.getInventorySource(s.id);
+        return liveSource !== undefined && liveSource.revision === s.revision;
+      });
+      if (live.length === 0) {
+        return;
+      }
+      const count = live.length;
+      const names = live.slice(0, 3).map((s) => `"${s.name}"`).join(", ");
+      const andMore = count > 3 ? ` and ${count - 3} more` : "";
+      const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
+      void vscode.window.showWarningMessage(
+        `${subject} — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the ${
+          count === 1 ? "source's" : "sources'"
+        } Root Folder or Lab Filter to bring the lab tree inside the crawl's limits.`
+      );
+    };
     for (const source of targets) {
       // A newer sweep has started while this one was awaiting — stop applying
       // stale results (last-STARTED-wins, so an older completion never
       // overwrites a newer apply).
       if (myGeneration !== statusRefreshGeneration) {
+        // R3 (review) — but NOT silently, if this sweep already APPLIED a
+        // truncated report. Silence-on-supersede is right only while nothing
+        // reached the tree; here an earlier source's partial status is on screen
+        // and returning past the post-loop warning would leave it unexplained
+        // (the superseding sweep is often targeted at ONE source, so it covers
+        // neither that source nor its truncation).
+        //
+        // Deliberately a warn-then-`return` rather than a `break`: a `break`
+        // would also drop the sweep into the TOTAL-FAILURE warning below, whose
+        // `succeeded === 0` means "every source failed" — false on a bail, where
+        // it only means every source TRIED SO FAR failed. That warning needs a
+        // complete sweep to mean anything, so it stays suppressed here.
+        warnIfTruncated();
         return;
       }
       if (inFlightSourceIds.get(source.id) !== undefined) {
@@ -4459,6 +4578,21 @@ export function registerInventoryCommands(
           const currentSource = core.getInventorySource(source.id);
           if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
             core.applyInventoryStatus(source.id, report);
+            // R4 (review) — record WHOSE apply the tree is now showing for this
+            // source, for every report and not only truncated ones (see the map's
+            // note above). Set immediately after the apply, inside the same
+            // guard, so it can never claim an apply that was dropped.
+            statusAppliedGeneration.set(source.id, myGeneration);
+            // TRUNCATED STATUS (follow-up 2) — collected INSIDE the apply guard,
+            // not on receipt of the report. The warning explains the status the
+            // user is now LOOKING AT, so a report the guards dropped (a superseded
+            // sweep, or a config edit mid-fetch) must not produce one: nothing
+            // partial reached the tree. This also makes the single-source
+            // supersede case silent, which the loop-top generation check alone
+            // cannot do — it only catches a supersede before the NEXT source.
+            if (report.truncated === true) {
+              truncatedSources.push({ id: source.id, name: source.name, revision: startRevision });
+            }
             // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
             // console-port reassignment onto sync-owned nodes, so the next
             // connect targets the live port. Separate from the pure status apply
@@ -4527,6 +4661,16 @@ export function registerInventoryCommands(
         "Could not refresh lab status from any inventory source — check the source's credentials and connectivity."
       );
     }
+    // TRUNCATED STATUS (follow-up 2) — a partial refresh leaves some nodes' state
+    // stale or `unknown`, which is indistinguishable from a confirmed state in the
+    // tree, so say so. The wording, the manual-only gate and the one-message rule
+    // live in `warnIfTruncated` above, shared with the supersede bail.
+    //
+    // No guard is needed against this and the total-failure warning both firing:
+    // they are mutually exclusive by construction. A truncated report IS a report,
+    // so it increments `succeeded`, and the warning above requires
+    // `succeeded === 0`.
+    warnIfTruncated();
   }
 
   function manageSources(): void {

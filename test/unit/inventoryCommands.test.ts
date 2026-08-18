@@ -8981,6 +8981,415 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(applySpy).not.toHaveBeenCalled();
   });
 
+  /**
+   * TRUNCATED STATUS (follow-up 2) — `fetchStatus` sets `truncated` when the lab
+   * crawl hits its own time budget, and the report it returns then covers only
+   * the nodes it reached: every other node keeps whatever state it already had,
+   * which may be stale or `unknown`. Nothing used to read the flag, so a partial
+   * refresh looked exactly like a complete one.
+   *
+   * Surfaced on the MANUAL path ONLY, following the P3-7 total-failure precedent
+   * immediately below: the poll stays silent because a warning per tick nags.
+   */
+  describe("a truncated status report", () => {
+    const TRUNCATED = { ...REPORT, truncated: true as const };
+
+    it("warns on a MANUAL refresh, naming the source and what partial means (⊘ nothing reads `truncated`, so a refresh that reached half the lab is indistinguishable from a complete one and the user trusts stale node state)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Big Lab"');
+      expect(message).toMatch(/partial/i);
+      expect(message).toMatch(/stopped before it covered everything/i);
+      expect(message).toMatch(/Root Folder|Lab Filter/);
+    });
+
+    it("stays SILENT on the poll path (⊘ dropping the `manual` gate nags the user with this warning on every poll tick, forever, for a lab that is merely large)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => TRUNCATED);
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      // The `{ __poll: true }` marker is what the background poll passes.
+      await registeredCommands.get("nexus.inventory.refreshStatus")!({ __poll: true });
+
+      expect(fetchStatus).toHaveBeenCalledTimes(1); // the poll DID run
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not warn when the report is COMPLETE (⊘ dropping the `truncated` gate warns after every healthy manual refresh)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => REPORT) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not warn from a SUPERSEDED sweep — the report was never applied, so there is no partial status on screen to explain (⊘ warning from a sweep whose results were dropped blames the user's newer refresh on the older one's budget)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let call = 0;
+      const fetchStatus = vi.fn(async () => {
+        call += 1;
+        if (call === 1) {
+          // Sweep A (older): parks, then comes back TRUNCATED.
+          await firstGate;
+          return TRUNCATED;
+        }
+        // Sweep B (newer): a complete report, applied while A is still parked.
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweepA = cmd() as Promise<void>; // gen 1 — parks inside fetchStatus
+      await Promise.resolve();
+      await cmd(); // gen 2 — supersedes A
+      releaseFirst();
+      await sweepA;
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    /**
+     * R3 (review) — the COMPLEMENT of the test above, and the case its comment
+     * got wrong. Silence-on-supersede is correct only while NOTHING was applied.
+     * A multi-source sweep can be superseded AFTER an earlier source's truncated
+     * report already passed the apply guard: that source's partial status IS on
+     * screen, and the loop-top generation check then `return`s straight past the
+     * post-loop warning, so nothing ever explains it. The superseding sweep is
+     * typically targeted (the node-control path fires one for a single source),
+     * so it does not cover the earlier source either.
+     */
+    it("STILL warns when the supersede lands AFTER an earlier source's truncated report was APPLIED — that partial status is on screen and nothing else will explain it (\u2298 bailing out of the loop skips the post-loop warning, so a user looking at Lab A's half-finished status is told nothing)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      // Lab A truncates; Lab B (which this sweep never reaches) would not.
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => (config.host === "a" ? TRUNCATED : REPORT));
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      // Supersede from INSIDE Lab A's apply, which is exactly the real shape:
+      // the node-control path fires `void executeCommand("...refreshStatus",
+      // source.id)` un-awaited, and refreshStatus bumps the generation
+      // SYNCHRONOUSLY on entry. So gen 1 has already applied Lab A's partial
+      // status when gen 2 starts, and bails at the loop top before Lab B.
+      let superseding: Promise<void> | undefined;
+      const applied = core.applyInventoryStatus.bind(core);
+      vi.spyOn(core, "applyInventoryStatus").mockImplementation((sourceId, report) => {
+        applied(sourceId, report);
+        if (sourceId === "a" && superseding === undefined) {
+          superseding = cmd("b") as Promise<void>;
+        }
+      });
+
+      await cmd();
+      await superseding;
+
+      expect(superseding).toBeDefined(); // the fixture really did supersede mid-sweep
+      expect(fetchStatus).toHaveBeenCalledTimes(2); // Lab A on gen 1, Lab B on gen 2 \u2014 gen 1 never reached B
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Lab A"');
+      expect(message).toMatch(/partial/i);
+      // And ONLY the truncation warning. The total-failure warning must stay
+      // suppressed on a bail: "every source failed" is a claim only a COMPLETE
+      // sweep can make, and here Lab A in fact succeeded.
+      expect(message).not.toMatch(/from any inventory source/i);
+    });
+
+    /**
+     * R4 (Codex P2) — a hazard introduced by the R3 fix directly above. Its
+     * justification is "that partial status is on screen", which holds only
+     * until something NEWER replaces it. A newer sweep that applies a COMPLETE
+     * report for the same source makes the older sweep's claim false: the tree
+     * now shows complete status for it, and warning anyway sends the user off to
+     * narrow a Root Folder that no longer needs narrowing.
+     *
+     * So the collected entries are filtered at the warning exits by WHICH sweep
+     * generation last applied status for each source; only sources whose most
+     * recent apply is still this sweep's survive.
+     */
+    it("does NOT warn about a source whose truncated status a NEWER sweep has already REPLACED with a complete report (⊘ collecting names without recording which sweep last applied each source lets a slow gen 1 claim partial status the tree no longer shows)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      let aCalls = 0;
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          aCalls += 1;
+          return aCalls === 1 ? TRUNCATED : REPORT; // gen 1 partial; gen 2 complete
+        }
+        // Gen 1 parks here, holding its collected "Lab A", while gen 2 runs to
+        // completion over the top of it.
+        bEntered();
+        await bGate;
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweepA = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+      await cmd("a"); // gen 2 — a COMPLETE report for Lab A, applied over gen 1's partial one
+      releaseB();
+      await sweepA; // gen 1 runs out of sources and reaches its post-loop warning exit
+
+      expect(aCalls).toBe(2); // the fixture really did re-fetch and re-apply Lab A
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    /**
+     * R4 hygiene — the per-source generation entry outlives the source itself
+     * unless removal drops it. That is not just a leak: the entry keeps the
+     * sweep's truncation claim alive, so a source the user REMOVED mid-sweep is
+     * still named in the warning and they are told to narrow the Root Folder of
+     * something that no longer exists.
+     */
+    it("does NOT warn about a source the user REMOVED after its truncated report was applied (⊘ warning from the collected list without re-reading the live sources names a source that is no longer in the tree and tells the user to go narrow its Root Folder)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // Lab A owns no servers, so its confirm offers the single "Remove" button.
+      mockShowWarningMessage.mockResolvedValueOnce("Remove");
+      await registeredCommands.get("nexus.inventory.removeSource")!("a");
+      expect(core.getInventorySource("a")).toBeUndefined(); // the fixture really did remove it
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * The SAME staleness, through a remover that cannot maintain the map. The
+     * test above removes the source via `nexus.inventory.removeSource`, which
+     * deletes its own generation entry. But Reset and a replace-mode config
+     * import drop sources by calling `core.removeInventorySource` DIRECTLY
+     * (configCommands.ts) — they never touch this command module's closure-local
+     * map, and neither would any future removal path. So the warning cannot rely
+     * on being told; it re-reads the live source list at the moment it warns.
+     */
+    it("does NOT warn about a source removed by a path that never maintains the generation map — e.g. Reset or a replace-mode import calling core directly (⊘ trusting removers to invalidate the entry covers only the one removal path that was taught to, and names a source that Reset deleted)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // NOT through removeSource: straight to the core, exactly as completeReset
+      // and a replace-mode import do. Nothing informs the generation map.
+      await core.removeInventorySource("a");
+      expect(core.getInventorySource("a")).toBeUndefined();
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * The id survives, the RECORD does not. A replace-mode config import removes
+     * a source and re-adds it under the same id, which mints a fresh revision and
+     * clears the status the old record displayed. An existence test passes that
+     * impostor — same id, still there — so the warning would explain a partial
+     * status on a replacement that is showing none.
+     */
+    it("does NOT warn when the source was removed and RECREATED under the same id mid-sweep, as a replace-mode import does (⊘ testing only that the id still exists accepts a different incarnation, whose status was cleared with the record we actually applied to)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+      const originalRevision = core.getInventorySource("a")!.revision;
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // Replace-mode import: drop the record, put one back under the SAME id.
+      await core.removeInventorySource("a");
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      const replacement = core.getInventorySource("a");
+      expect(replacement).toBeDefined();                          // the id is back...
+      expect(replacement!.revision).not.toBe(originalRevision);   // ...as a different incarnation
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * R3 (review), the other half of the bail decision: why the bail is a
+     * `return` and not a `break`. `break` would fall through to the TOTAL-FAILURE
+     * warning, whose `succeeded === 0` is meant to say "every source failed" —
+     * true only of a COMPLETE sweep. On a bail it means merely "every source
+     * tried SO FAR failed", and the sources never reached might all be healthy.
+     */
+    it("does NOT fire the total-failure warning from a sweep that bailed on supersede before trying every source (\u2298 a `break` instead of a `return` runs the post-loop total-failure check on a half-finished sweep and reports a total outage from one failed source)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const cmdRef: { fire?: () => Promise<void> } = {};
+      let superseding: Promise<void> | undefined;
+      // Lab A fails outright (no report \u2014 attempted 1, succeeded 0) and the
+      // supersede lands during its fetch, so gen 1 bails at the loop top before
+      // ever trying Lab B.
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          superseding ??= cmdRef.fire!();
+          throw new Error("auth failed");
+        }
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      cmdRef.fire = () => cmd("b") as Promise<void>;
+
+      await cmd();
+      await superseding;
+
+      expect(superseding).toBeDefined();
+      expect(fetchStatus).toHaveBeenCalledTimes(2); // Lab A on gen 1, Lab B on gen 2 only
+      // Nothing at all: no truncation was applied, and the failure count is not a
+      // verdict this incomplete sweep is entitled to deliver.
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("emits ONE message for the whole sweep, naming every affected source (⊘ one showWarningMessage per source stacks a modal-ish pile of notifications on a multi-lab refresh)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Lab A"');
+      expect(message).toContain('"Lab B"');
+      expect(message).toContain("2 sources");
+    });
+    it("names only the first three of FOUR truncated sources and counts the rest, with a plural possessive (\u2298 the 3-name cap and the \u2018and N more\u2019 count are only ever exercised at 1 and 2 sources, so an off-by-one in either \u2014 or a slice that drops a name \u2014 ships unnoticed)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      for (const key of ["a", "b", "c", "d"]) {
+        await core.addOrUpdateInventorySource(makeSource({ id: key, name: `Lab ${key.toUpperCase()}`, config: { host: key } }));
+      }
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      // Asserted WHOLE, not by substring: the cap, the remainder count and the
+      // possessive are each one edit away from being wrong, and only the exact
+      // sentence pins all three at once. "Lab D" is named nowhere.
+      expect(String(mockShowWarningMessage.mock.calls[0][0])).toBe(
+        'Lab status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the sources\' Root Folder or Lab Filter to bring the lab tree inside the crawl\'s limits.'
+      );
+    });
+  });
+
   it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

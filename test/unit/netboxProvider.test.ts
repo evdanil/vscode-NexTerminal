@@ -7,7 +7,6 @@ import {
   stripCidr,
   renderFolderTemplate
 } from "../../src/services/inventory/providers/netboxProvider";
-import { hasConsoleEndpoint } from "../../src/models/inventory";
 import { deviceMatchesFilter, parseTemplateFilter } from "../../src/services/inventory/templateApply";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
@@ -402,7 +401,7 @@ describe("createNetboxProvider", () => {
   });
 
   describe("device/VM mapping", () => {
-    it("(FIX 1) still emits devices without a name or without a primary IP into the tree — with empty endpoints — instead of dropping them, while still aggregating one warning (kills host: undefined AND kills drop-at-mapper causing the sync engine to prune their owned servers)", async () => {
+    it("(FIX 1) still emits devices without a name or without a primary IP into the tree — with empty endpoints — instead of dropping them (kills host: undefined AND kills drop-at-mapper causing the sync engine to prune their owned servers)", async () => {
       const fetchImpl = vi.fn(async () =>
         makeResponse(200, {
           count: 3,
@@ -425,23 +424,26 @@ describe("createNetboxProvider", () => {
       expect(byExternalId.get("device:1")?.endpoints).toHaveLength(1);
       expect(byExternalId.get("device:2")?.endpoints).toEqual([]);
       expect(byExternalId.get("device:3")?.endpoints).toEqual([]);
-      // ROUND-3 CORRECTION — this pinned "2" while the count was keyed on
-      // `hasConsoleEndpoint(mapped)`, which is NAME-coupled: device:2 has a
-      // perfectly good `primary_ip` and is endpoint-less only because its name is
-      // empty, so counting it made the warning's number (and its sentence) false.
-      // Only device:3 genuinely has no address in NetBox.
-      expect(tree.warnings).toEqual(["1 device has no usable SSH or telnet address in NetBox."]);
+      // ONE ADDRESSLESS LINE (follow-up 1) — the provider says NOTHING about
+      // addressless rows any more. It used to push its own aggregate here ("1
+      // device has no usable SSH or telnet address in NetBox."), which overlapped
+      // the sync engine's own addressless line and showed the user two lines about
+      // intersecting sets of devices. The engine owns the whole disclosure now:
+      // only it knows whether a device became a placeholder this run or already
+      // was one, and device:2 (a usable address, an empty name) is reported by the
+      // engine under the reason that actually stops it — the missing name.
+      expect(tree.warnings).toEqual([]);
     });
 
-    it("(ROUND 3) a row with a valid primary IP but an EMPTY NAME is NOT counted in the no-console-address warning (kills the name-coupled count, which reports 2 here and claims NetBox holds no address for a row whose address it holds)", async () => {
+    it("(ROUND 3) a row with a valid primary IP but an EMPTY NAME still emits NO endpoints, and the provider emits no addressless aggregate about it (⊘ re-adding a provider-side count double-reports this row — once as addressless, once as the engine's empty-name skip)", async () => {
       const fetchImpl = vi.fn(async () =>
         makeResponse(200, {
           count: 2,
           results: [
             // Usable address; only the NAME is missing. The sync engine reports
             // this row on its own ("N devices had an empty name and were
-            // skipped"), and NetBox does hold an SSH address for it — so this
-            // warning, which speaks only about addresses, must not count it.
+            // skipped"), and NetBox does hold an SSH address for it — this was the
+            // exact row the deleted provider aggregate kept getting wrong.
             { id: 1, name: "", primary_ip: { address: "10.0.0.2/24" } },
             { id: 2, name: "genuinely-addressless", primary_ip: null }
           ]
@@ -451,10 +453,10 @@ describe("createNetboxProvider", () => {
 
       const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
 
-      expect(tree.warnings).toEqual(["1 device has no usable SSH or telnet address in NetBox."]);
-      // Endpoint SUPPRESSION for the nameless row is unchanged — decoupling the
-      // COUNT from the name must not start emitting endpoints for rows the
-      // engine will skip anyway.
+      expect(tree.warnings).toEqual([]);
+      // Endpoint SUPPRESSION for the nameless row is unchanged — dropping the
+      // provider's count must not start emitting endpoints for rows the engine
+      // will skip anyway.
       expect(tree.devices.find((d) => d.externalId === "device:1")?.endpoints).toEqual([]);
     });
 
@@ -547,14 +549,14 @@ describe("createNetboxProvider", () => {
       expect(byName.get("real-oob")!.endpoints).toContainEqual({ kind: "redfish", host: "10.9.9.9" });
     });
 
-    it("(OOB) a device with an oob_ip but NO primary IP carries the redfish endpoint alone AND is still counted in the no-console-address warning (kills the stale `endpoints.length === 0` predicate, which silently drops exactly these devices out of the warning)", async () => {
+    it("(OOB) a device with an oob_ip but NO primary IP carries the redfish endpoint alone, and the fetch reports no addressless aggregate of its own (⊘ a BMC-only device silently losing its redfish endpoint; ⊘ the provider re-reporting addressless rows the engine already covers)", async () => {
       const fetchImpl = vi.fn(async () =>
         makeResponse(200, {
           count: 2,
           results: [
             { id: 1, name: "bmc-only", primary_ip: null, oob_ip: { address: "10.9.9.9/24" } },
-            // A second, ordinary unmappable device so the warning's COUNT is the
-            // thing under test: the broken predicate reports 1 here, not 2.
+            // A second, ordinary unmappable device: two addressless rows, and
+            // STILL no provider warning about them.
             { id: 2, name: "nothing-at-all", primary_ip: null }
           ]
         })
@@ -566,12 +568,13 @@ describe("createNetboxProvider", () => {
       const byExternalId = new Map(tree.devices.map((d) => [d.externalId, d]));
       expect(byExternalId.get("device:1")?.endpoints).toEqual([{ kind: "redfish", host: "10.9.9.9" }]);
       expect(byExternalId.get("device:2")?.endpoints).toEqual([]);
-      // CORRECTED STRING (Codex P1 on PR #86) — the old assertion pinned
-      // "2 devices without a primary IP were skipped.", which stopped being true
-      // when these devices started syncing as addressless placeholders instead of
-      // being dropped. The provider now reports what it OBSERVED in NetBox and
-      // leaves the outcome to the engine's own aggregate.
-      expect(tree.warnings).toEqual(["2 devices have no usable SSH or telnet address in NetBox."]);
+      // ONE ADDRESSLESS LINE (follow-up 1) — this assertion has tracked the
+      // shrinking of the provider's role twice: first "2 devices without a
+      // primary IP were skipped." (untrue once they became placeholders), then
+      // "2 devices have no usable SSH or telnet address in NetBox." (true, but a
+      // second line about the same devices the engine already reports). The
+      // provider's job is the TREE; the addressless disclosure is the engine's.
+      expect(tree.warnings).toEqual([]);
     });
 
     it("(OOB) VMs never get a management endpoint, even when the payload carries oob_ip (kills applying the device-only field to the VM branch)", async () => {
@@ -1057,41 +1060,5 @@ describe("createNetboxProvider", () => {
       expect(vm.attributes!.rack).toBeUndefined();
       expect(vm.attributes!.location).toBeUndefined();
     });
-  });
-});
-
-/**
- * The predicate behind the provider's no-console-address warning (Codex P2 on
- * PR #86). It must mean "no CONNECTABLE console endpoint" — exactly what the
- * sync engine's `selectPrimaryEndpoint` decides addressless on: an `ssh`
- * endpoint, else a `telnet` one, each with a non-empty host. Keyed on "no ssh
- * endpoint" it reports a device that syncs perfectly well as a TELNET server as
- * having no address.
- *
- * Exercised at the predicate rather than through a NetBox payload DELIBERATELY:
- * `mapEntry` emits only `ssh` (primary + alternate) and `redfish` (`oob_ip`)
- * endpoints, so no NetBox response can put a telnet endpoint on the tree today
- * and the telnet case is unreachable from this provider's own fetch path. The
- * inconsistency lives in the shared notion — which EVE-NG devices, and any
- * third-party provider emitting telnet, do reach.
- */
-describe("hasConsoleEndpoint", () => {
-  it("a TELNET-only device HAS a console address (kills the ssh-only predicate, which counts a device that syncs as a telnet server as having none)", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "telnet", host: "10.0.0.9", port: 5001 }] })).toBe(true);
-  });
-
-  it("an ssh device has one, and a device with no endpoints at all has none", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] })).toBe(true);
-    expect(hasConsoleEndpoint({ endpoints: [] })).toBe(false);
-  });
-
-  it("an out-of-band address is NOT a console address (kills `endpoints.length > 0`, which would read a BMC-only device as reachable)", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] })).toBe(false);
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "url", host: "10.9.9.9" }] })).toBe(false);
-  });
-
-  it("an EMPTY host is no address, on either console kind (matches the engine's own non-empty-host rule rather than trusting the kind alone)", () => {
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "ssh", host: "" }] })).toBe(false);
-    expect(hasConsoleEndpoint({ endpoints: [{ kind: "telnet", host: "" }] })).toBe(false);
   });
 });
