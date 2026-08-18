@@ -1,3 +1,4 @@
+import { ADVANCED_SECTION_LABEL } from "../../../ui/formTypes";
 import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
@@ -88,7 +89,7 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
     // to say self-signed HTTPS was unsupported; `allowInsecureTls` below made
     // that false, so it points there instead of telling the user to give up.
     description:
-      "The EVE-NG web UI address; a trailing slash is fine. If it is https with EVE-NG's own self-signed certificate, see \u201cAllow a Self-Signed or Mismatched Certificate\u201d under Advanced."
+      `The EVE-NG web UI address; a trailing slash is fine. If it is https with EVE-NG's own self-signed certificate, see \u201c${ALLOW_INSECURE_TLS_LABEL}\u201d under ${ADVANCED_SECTION_LABEL}.`
   },
   { id: "username", label: "Username", type: "string", required: true, placeholder: "admin" },
   {
@@ -351,7 +352,7 @@ function mapNetworkError(err: unknown, url: URL): InventoryProviderError {
         // searchable and diagnosable once the sentence has done its job.
         return new InventoryProviderError(
           "network",
-          `${certHint(host)} To connect anyway, turn on \u201c${ALLOW_INSECURE_TLS_LABEL}\u201d in this source's Advanced settings \u2014 that skips certificate checks for this source only, and the EVE-NG password is then sent over an unverified connection. (${code})`
+          `${certHint(host)} To connect anyway, turn on \u201c${ALLOW_INSECURE_TLS_LABEL}\u201d in this source's ${ADVANCED_SECTION_LABEL} \u2014 that skips certificate checks for this source only, and the EVE-NG password is then sent over an unverified connection. (${code})`
         );
       }
       return new InventoryProviderError("network", `Could not reach ${host}: ${code}.`);

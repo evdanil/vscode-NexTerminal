@@ -1,3 +1,12 @@
+/**
+ * The NAME of the form's advanced disclosure, as the user reads it on screen —
+ * one definition, because messages elsewhere send people to it by name
+ * ("turn on X under …"), and a message naming a section no form draws is worse
+ * than one that names no section at all. `renderFormHtml` renders the summary
+ * from this; `expandAdvanced` below opens it.
+ */
+export const ADVANCED_SECTION_LABEL = "Advanced options";
+
 export interface VisibleWhenCondition {
   field: string;
   value: string | string[];

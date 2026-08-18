@@ -9,6 +9,7 @@ import {
   labFolderPath
 } from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
+import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 import { computeSyncPlan, validateInventoryTree } from "../../src/services/inventory/syncEngine";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import type { ServerConfig } from "../../src/models/config";
@@ -2492,5 +2493,25 @@ describe("createEveNgProvider — the certificate hint and the field agree", () 
       .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
       .catch((e: unknown) => e);
     expect((err as Error).message).toContain(label);
+  });
+
+  /**
+   * A5 — WORDING DRIFT. The hint said "Advanced settings", the form renders
+   * "Advanced options", and the base-URL description said "under Advanced":
+   * three names for one disclosure, in messages whose whole job is to send
+   * someone to a control they have not found yet. Pinned against the SAME
+   * constant the form's summary is rendered from, so they cannot drift again.
+   */
+  it("names the disclosure exactly as the form draws it, in both the hint and the base-URL description (⊘ 'Advanced settings' sends the user looking for a section no form has)", async () => {
+    const provider = createEveNgProvider(vi.fn() as unknown as typeof fetch);
+    const failing = (async () => {
+      throw Object.assign(new Error("fetch failed"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" });
+    }) as unknown as typeof fetch;
+    const err = await createEveNgProvider(failing)
+      .testConnection({ ...CONFIG, baseUrl: "https://10.0.0.5" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toContain(ADVANCED_SECTION_LABEL);
+    expect((err as Error).message).not.toContain("Advanced settings");
+    expect(String(provider.configFields.find((f) => f.id === "baseUrl")?.description ?? "")).toContain(ADVANCED_SECTION_LABEL);
   });
 });
