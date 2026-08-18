@@ -1113,7 +1113,10 @@ function unwrap(raw: RawResponse): unknown {
     // carries an unauthorized envelope is reported as `auth` rather than as a
     // malformed response.
     if (envelopeSaysUnauthorized(envelope)) {
-      throw new InventoryProviderError("auth", `EVE-NG refused ${raw.url}: ${str(envelope.message) || envelope.status}`);
+      // BOUNDED like every sibling echo (`throwForStatus` slices both of its
+      // own): the message is server-supplied text on a failed request and ends
+      // up in a notification.
+      throw new InventoryProviderError("auth", `EVE-NG refused ${raw.url}: ${str(envelope.message).slice(0, BODY_SLICE) || envelope.status}`);
     }
     throw new InventoryProviderError(
       "protocol",

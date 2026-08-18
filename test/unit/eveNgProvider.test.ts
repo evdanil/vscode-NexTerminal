@@ -699,6 +699,31 @@ describe("createEveNgProvider — an expired session (HTTP 412 + JSend unauthori
       .catch((e: unknown) => e);
     expect((err as InventoryProviderError).kind).toBe("auth");
   });
+
+  /**
+   * The message in that envelope is SERVER-CONTROLLED text on a failed request,
+   * and it lands in a notification and the log. Every sibling echo bounds it
+   * (`throwForStatus` slices both of its own); this one did not, so a megabyte of
+   * message from a proxy or a wedged server went through whole.
+   */
+  it("bounds the echoed envelope message like its siblings do, rather than pasting the whole server-supplied string into the error (\u2298 an unbounded echo puts however much the server sent into a notification)", async () => {
+    const long = "A".repeat(5000);
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/api/auth/login") return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
+      if (path === "/api/status") return makeResponse(200, jsend({ version: "5.0.1-13" }));
+      return makeResponse(200, { code: 412, status: "unauthorized", message: long });
+    }) as unknown as typeof fetch;
+
+    const err = await createEveNgProvider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("auth");
+    // The same 200-character bound the sibling branch applies — enough to
+    // identify the failure, not the whole body.
+    expect((err as Error).message).toContain("A".repeat(200));
+    expect((err as Error).message).not.toContain("A".repeat(201));
+  });
 });
 
 const PRO_WARNING =
