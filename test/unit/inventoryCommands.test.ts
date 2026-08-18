@@ -9649,7 +9649,7 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("running");
   });
 
-  it("a provider that supplies NO tree.status (NetBox) changes no status — and specifically does not WIPE the status an EVE source already had (⊘ applying an empty report unconditionally blanks every EVE node's state the moment an unrelated NetBox source syncs)", async () => {
+  it("a provider that supplies NO tree.status (NetBox) does not reach applyInventoryStatus at all (⊘ handing an empty report over on its behalf is a COMPLETE report saying 'nothing is known any more', which clears every entry THAT source owns)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
     const registry = new InventoryProviderRegistry();
@@ -9672,11 +9672,65 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
     expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
 
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
     mockShowInformationMessage.mockResolvedValueOnce("Apply");
     await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
 
-    // The NetBox sync landed (its server exists) and the EVE lab's status survived it.
+    // The NetBox sync landed (its server exists) and said NOTHING about status.
+    // NOT CALLED AT ALL, rather than called with an empty report: an absent
+    // report is "no news", and an empty COMPLETE one asserts "nothing is known",
+    // which would clear src-2's own entries. (It could not touch src-1's either
+    // way — see the source-scoping test below for that, which is a property of
+    // `applyInventoryStatus`, not of this guard.)
     expect(core.getSnapshot().servers.some((s) => s.origin?.sourceId === "src-2")).toBe(true);
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  /**
+   * R5 (follow-up #43 review) — what ACTUALLY stops one source's sync from
+   * blanking another's decorations is `applyInventoryStatus`'s SCOPING, not the
+   * fact that NetBox supplies no status: the clear loop drops only entries whose
+   * recorded owner is this `sourceId`, and the report is resolved only against
+   * servers with `origin.sourceId === sourceId`. So the case worth testing is
+   * the one the absent-report test cannot reach — a second source that DOES hand
+   * over a full, complete report.
+   */
+  it("a second source's COMPLETE report clears only ITS OWN entries — the first source's decorations survive intact (⊘ a clear loop that drops every entry regardless of owner lets any source's sync blank every other source's lab highlight)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ id: "eve", fetchInventory: vi.fn(async () => eveTree()) }));
+    registry.register(
+      makeProvider({
+        id: "eve2",
+        fetchInventory: vi.fn(
+          async (): Promise<InventoryTree> => ({
+            contractVersion: 1,
+            devices: [{ externalId: "/O.unl#1", name: "O1", endpoints: [{ kind: "telnet" as const, host: "10.9.0.9", port: 32769 }] }],
+            // COMPLETE (no `truncated`), so the apply CLEARS before it applies —
+            // the only shape that can wipe anything at all.
+            status: { contractVersion: 1, statuses: { "/O.unl#1": { state: "running" } } }
+          })
+        )
+      })
+    );
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", providerId: "eve", name: "Lab" }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-2", providerId: "eve2", name: "Other Lab", targetFolder: "Other" }));
+
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+    // src-2's own entry landed — so the clear-then-apply really did run...
+    expect(core.getSnapshot().serverStatus.get(deterministicServerId("src-2", "/O.unl#1"))).toBe("running");
+    // ...and it left src-1's two entries exactly where they were.
     expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
     expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
   });
