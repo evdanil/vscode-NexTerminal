@@ -4412,11 +4412,49 @@ export function registerInventoryCommands(
     // Nothing read the flag before, so a partial refresh was indistinguishable
     // from a complete one.
     const truncatedSourceNames: string[] = [];
+    // TRUNCATED STATUS (follow-up 2; R3 review) — ONE renderer, because this
+    // warning has TWO exits: the normal end of the sweep, and the supersede bail
+    // inside the loop below. Written twice they would drift; written once they
+    // cannot. It is self-gating (manual-only, and silent with nothing collected),
+    // so both call sites are an unconditional call.
+    //
+    // MANUAL ONLY, exactly like the total-failure warning and for the same
+    // reason: the poll fires on a timer, and a warning per tick would nag about a
+    // lab that is merely large. ONE message for the sweep, never one per source —
+    // a multi-lab refresh would otherwise stack a pile of notifications. Names up
+    // to three sources, in the spirit of the sync's own `namedExamples`.
+    const warnIfTruncated = (): void => {
+      if (options?.manual !== true || truncatedSourceNames.length === 0) {
+        return;
+      }
+      const count = truncatedSourceNames.length;
+      const names = truncatedSourceNames.slice(0, 3).map((n) => `"${n}"`).join(", ");
+      const andMore = count > 3 ? ` and ${count - 3} more` : "";
+      const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
+      void vscode.window.showWarningMessage(
+        `${subject} — the lab crawl hit its time budget, so some nodes may be stale or still unknown. Narrow the ${
+          count === 1 ? "source's" : "sources'"
+        } Root Folder or Lab Filter, or run the refresh again.`
+      );
+    };
     for (const source of targets) {
       // A newer sweep has started while this one was awaiting — stop applying
       // stale results (last-STARTED-wins, so an older completion never
       // overwrites a newer apply).
       if (myGeneration !== statusRefreshGeneration) {
+        // R3 (review) — but NOT silently, if this sweep already APPLIED a
+        // truncated report. Silence-on-supersede is right only while nothing
+        // reached the tree; here an earlier source's partial status is on screen
+        // and returning past the post-loop warning would leave it unexplained
+        // (the superseding sweep is often targeted at ONE source, so it covers
+        // neither that source nor its truncation).
+        //
+        // Deliberately a warn-then-`return` rather than a `break`: a `break`
+        // would also drop the sweep into the TOTAL-FAILURE warning below, whose
+        // `succeeded === 0` means "every source failed" — false on a bail, where
+        // it only means every source TRIED SO FAR failed. That warning needs a
+        // complete sweep to mean anything, so it stays suppressed here.
+        warnIfTruncated();
         return;
       }
       if (inFlightSourceIds.get(source.id) !== undefined) {
@@ -4547,29 +4585,14 @@ export function registerInventoryCommands(
     }
     // TRUNCATED STATUS (follow-up 2) — a partial refresh leaves some nodes' state
     // stale or `unknown`, which is indistinguishable from a confirmed state in the
-    // tree, so say so. MANUAL ONLY, exactly like the total-failure warning above
-    // and for the same reason: the poll fires on a timer, and a warning per tick
-    // would nag about a lab that is merely large.
-    //
-    // ONE message for the sweep, never one per source — a multi-lab refresh would
-    // otherwise stack a pile of notifications. Names up to three sources, in the
-    // spirit of the sync's own `namedExamples`.
+    // tree, so say so. The wording, the manual-only gate and the one-message rule
+    // live in `warnIfTruncated` above, shared with the supersede bail.
     //
     // No guard is needed against this and the total-failure warning both firing:
     // they are mutually exclusive by construction. A truncated report IS a report,
     // so it increments `succeeded`, and the warning above requires
     // `succeeded === 0`.
-    if (options?.manual && truncatedSourceNames.length > 0) {
-      const count = truncatedSourceNames.length;
-      const names = truncatedSourceNames.slice(0, 3).map((n) => `"${n}"`).join(", ");
-      const andMore = count > 3 ? ` and ${count - 3} more` : "";
-      const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
-      void vscode.window.showWarningMessage(
-        `${subject} — the lab crawl hit its time budget, so some nodes may be stale or still unknown. Narrow the ${
-          count === 1 ? "source's" : "sources'"
-        } Root Folder or Lab Filter, or run the refresh again.`
-      );
-    }
+    warnIfTruncated();
   }
 
   function manageSources(): void {

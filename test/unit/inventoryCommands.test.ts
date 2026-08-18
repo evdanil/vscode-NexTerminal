@@ -9073,6 +9073,98 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(mockShowWarningMessage).not.toHaveBeenCalled();
     });
 
+    /**
+     * R3 (review) — the COMPLEMENT of the test above, and the case its comment
+     * got wrong. Silence-on-supersede is correct only while NOTHING was applied.
+     * A multi-source sweep can be superseded AFTER an earlier source's truncated
+     * report already passed the apply guard: that source's partial status IS on
+     * screen, and the loop-top generation check then `return`s straight past the
+     * post-loop warning, so nothing ever explains it. The superseding sweep is
+     * typically targeted (the node-control path fires one for a single source),
+     * so it does not cover the earlier source either.
+     */
+    it("STILL warns when the supersede lands AFTER an earlier source's truncated report was APPLIED — that partial status is on screen and nothing else will explain it (\u2298 bailing out of the loop skips the post-loop warning, so a user looking at Lab A's half-finished status is told nothing)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      // Lab A truncates; Lab B (which this sweep never reaches) would not.
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => (config.host === "a" ? TRUNCATED : REPORT));
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      // Supersede from INSIDE Lab A's apply, which is exactly the real shape:
+      // the node-control path fires `void executeCommand("...refreshStatus",
+      // source.id)` un-awaited, and refreshStatus bumps the generation
+      // SYNCHRONOUSLY on entry. So gen 1 has already applied Lab A's partial
+      // status when gen 2 starts, and bails at the loop top before Lab B.
+      let superseding: Promise<void> | undefined;
+      const applied = core.applyInventoryStatus.bind(core);
+      vi.spyOn(core, "applyInventoryStatus").mockImplementation((sourceId, report) => {
+        applied(sourceId, report);
+        if (sourceId === "a" && superseding === undefined) {
+          superseding = cmd("b") as Promise<void>;
+        }
+      });
+
+      await cmd();
+      await superseding;
+
+      expect(superseding).toBeDefined(); // the fixture really did supersede mid-sweep
+      expect(fetchStatus).toHaveBeenCalledTimes(2); // Lab A on gen 1, Lab B on gen 2 \u2014 gen 1 never reached B
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Lab A"');
+      expect(message).toMatch(/partial/i);
+      // And ONLY the truncation warning. The total-failure warning must stay
+      // suppressed on a bail: "every source failed" is a claim only a COMPLETE
+      // sweep can make, and here Lab A in fact succeeded.
+      expect(message).not.toMatch(/from any inventory source/i);
+    });
+
+    /**
+     * R3 (review), the other half of the bail decision: why the bail is a
+     * `return` and not a `break`. `break` would fall through to the TOTAL-FAILURE
+     * warning, whose `succeeded === 0` is meant to say "every source failed" —
+     * true only of a COMPLETE sweep. On a bail it means merely "every source
+     * tried SO FAR failed", and the sources never reached might all be healthy.
+     */
+    it("does NOT fire the total-failure warning from a sweep that bailed on supersede before trying every source (\u2298 a `break` instead of a `return` runs the post-loop total-failure check on a half-finished sweep and reports a total outage from one failed source)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const cmdRef: { fire?: () => Promise<void> } = {};
+      let superseding: Promise<void> | undefined;
+      // Lab A fails outright (no report \u2014 attempted 1, succeeded 0) and the
+      // supersede lands during its fetch, so gen 1 bails at the loop top before
+      // ever trying Lab B.
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          superseding ??= cmdRef.fire!();
+          throw new Error("auth failed");
+        }
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      cmdRef.fire = () => cmd("b") as Promise<void>;
+
+      await cmd();
+      await superseding;
+
+      expect(superseding).toBeDefined();
+      expect(fetchStatus).toHaveBeenCalledTimes(2); // Lab A on gen 1, Lab B on gen 2 only
+      // Nothing at all: no truncation was applied, and the failure count is not a
+      // verdict this incomplete sweep is entitled to deliver.
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
     it("emits ONE message for the whole sweep, naming every affected source (⊘ one showWarningMessage per source stacks a modal-ish pile of notifications on a multi-lab refresh)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
