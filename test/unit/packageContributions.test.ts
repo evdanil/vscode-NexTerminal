@@ -889,6 +889,7 @@ describe("package contributions", () => {
         "nexus.group.connect|inline@1": WITH_SERVERS,
         "nexus.group.disconnect|inline@2": WITH_SERVERS,
         "nexus.inventory.syncNow|inline@3": MARKED,
+        "nexus.inventory.syncNow|1_manage@6": MARKED,
         "nexus.group.connect|0_connect@1": WITH_SERVERS,
         "nexus.group.disconnect|0_connect@2": WITH_SERVERS,
         "nexus.group.rename|1_manage@1": FOLDER_VALUES,
@@ -916,10 +917,53 @@ describe("package contributions", () => {
     it("the folder sync action reuses nexus.inventory.syncNow with its $(sync) icon and sits AFTER the two connection actions in the inline row (⊘ a second command, or an ordinal before connect/disconnect, reshuffles icons users already know)", () => {
       const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.syncNow");
       expect(command?.icon).toBe("$(sync)");
-      const entry = (packageJson.contributes.menus["view/item/context"] ?? []).find(
+      const entries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
         (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter")
       );
-      expect(entry?.group).toBe("inline@3");
+      expect(entries.some((m) => m.group === "inline@3")).toBe(true);
+    });
+
+    /**
+     * The inline icon is HOVER-ONLY discoverability. Every other folder action
+     * — Connect and Disconnect included, which are contributed TWICE for exactly
+     * this reason — is also reachable by right-click, so the one action a marked
+     * folder was marked FOR must be too.
+     *
+     * `1_manage`, last: a sync is not a connection action (it opens no session,
+     * and it marks folders with no direct servers at all, where `0_connect` is
+     * empty), and `1_manage` already holds the bulk record-rewriting actions
+     * (Apply Auth Profile, Apply Device Template) that, like a sync, rewrite the
+     * servers UNDER the folder rather than the folder itself. Appending at @6
+     * leaves every-folder ordinals @1..@5 untouched, so a marked folder adds a
+     * row at the end of the management band instead of displacing anything.
+     */
+    it("also contributes Sync Inventory Now to the right-click menu, last in 1_manage, on the same marked-folder matcher as the inline icon (⊘ inline-only leaves the row's whole reason for existing on hover)", () => {
+      const contextEntries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter") && !(m.group ?? "").startsWith("inline")
+      );
+      expect(contextEntries).toHaveLength(1);
+      const entry = contextEntries[0];
+      expect(entry.group).toBe("1_manage@6");
+      // Strictly after every action an UNMARKED folder already shows in the
+      // group, so the marker only ever appends.
+      const manageOrdinals = (packageJson.contributes.menus["view/item/context"] ?? [])
+        .filter(
+          (m) =>
+            (m.when ?? "").includes("nexusCommandCenter") &&
+            (m.when ?? "").includes("viewItem =~ /^nexus\\.folder") &&
+            (m.group ?? "").startsWith("1_manage@") &&
+            m.command !== "nexus.inventory.syncNow"
+        )
+        .map((m) => Number((m.group ?? "").split("@")[1]));
+      expect(manageOrdinals.length).toBeGreaterThan(0);
+      expect(Math.max(...manageOrdinals)).toBeLessThan(6);
+      // The same matcher the inline icon uses: marked folders only, and never a
+      // Macros folder. (The EXPECTED table above checks this exhaustively; this
+      // asserts the two entries cannot drift apart.)
+      const inlineEntry = (packageJson.contributes.menus["view/item/context"] ?? []).find(
+        (m) => m.command === "nexus.inventory.syncNow" && m.group === "inline@3"
+      );
+      expect(entry.when).toBe(inlineEntry?.when);
     });
 
     it("keeps the Macros view's own folder entries pinned to nexus.folder.macros, untouched by the widening (⊘ a shared matcher would cross the two views' folder rows)", () => {

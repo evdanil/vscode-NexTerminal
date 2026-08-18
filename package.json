@@ -1322,6 +1322,11 @@
           "group": "1_manage@5"
         },
         {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "group": "1_manage@6"
+        },
+        {
           "command": "nexus.group.remove",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "3_destructive"
