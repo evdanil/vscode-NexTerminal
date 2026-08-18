@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createInsecureHttpsFetch } from "../../src/services/inventory/insecureFetch";
+import { createEveNgProvider } from "../../src/services/inventory/providers/eveNgProvider";
 
 /**
  * THE ONE THING A STUBBED `https.request` CANNOT PROVE: that
@@ -167,5 +168,61 @@ describe.skipIf(!certs)("insecure-TLS transport against a real self-signed HTTPS
       (e: unknown) => e
     );
     expect((err as { code?: string }).code).toBe("ECONNREFUSED");
+  });
+});
+
+/**
+ * A1 — THE PRODUCTION WIRING ITSELF. `extension.ts` builds the provider as
+ * `createEveNgProvider()`, and every unit test builds it with BOTH transports
+ * injected, so the whole feature in production rests on the default second
+ * parameter (`insecureFetchImpl = createInsecureHttpsFetch()`) — a default that
+ * no unit test can observe, because a test that injects a probe replaces it.
+ *
+ * ⊘ THE MUTATION THIS EXISTS TO KILL: `insecureFetchImpl: typeof fetch =
+ * fetchImpl`. Every unit test still passes, and the shipped extension answers a
+ * ticked checkbox with DEPTH_ZERO_SELF_SIGNED_CERT — the exact blocked state the
+ * option was added to end. Only a provider built the way `activate()` builds it,
+ * driven at a real self-signed server, can catch that.
+ */
+describe.skipIf(!certs)("createEveNgProvider, wired the way activate() wires it", () => {
+  let server: Server;
+  let origin: string;
+
+  beforeAll(async () => {
+    server = createServer({ key: certs!.key, cert: certs!.cert }, (req, res) => {
+      if (req.url === "/api/auth/login") {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": ["unetlab_session=s3ss10n; Path=/; HttpOnly"]
+        });
+        res.end(JSON.stringify({ code: 200, status: "success", message: "logged in", data: null }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code: 200, status: "success", message: "", data: { version: "5.0.1-13" } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    origin = `https://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("connects to a real self-signed server with ONE argument and the box ticked, so the DEFAULT insecure transport is proven wired (⊘ insecureFetchImpl = fetchImpl)", async () => {
+    const provider = createEveNgProvider(fetch);
+    await expect(
+      provider.testConnection({ baseUrl: origin, username: "admin", allowInsecureTls: true }, { password: "pw" })
+    ).resolves.toBeUndefined();
+  });
+
+  it("and the SAME one-argument provider still refuses that server with the box unticked, naming the option — selection, not a transport swapped in wholesale", async () => {
+    const provider = createEveNgProvider(fetch);
+    const err = await provider.testConnection({ baseUrl: origin, username: "admin" }, { password: "pw" }).then(
+      () => undefined,
+      (e: unknown) => e
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("Allow a Self-Signed or Mismatched Certificate");
   });
 });
