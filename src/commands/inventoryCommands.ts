@@ -2210,6 +2210,16 @@ export function registerInventoryCommands(
   // poll ticks from stacking; this covers poll-vs-manual and any residual race.
   let statusRefreshGeneration = 0;
 
+  // TRUNCATED STATUS (follow-up 2; R4 review) — which sweep generation last
+  // APPLIED status for each source id. The generation counter above orders
+  // sweeps; this records the outcome per source, which is what the truncation
+  // warning needs: a sweep may only claim a source's status is partial while
+  // its own truncated apply is still the newest one for that source. Written on
+  // EVERY apply, not just truncated ones — a later COMPLETE apply is precisely
+  // what has to invalidate an earlier truncated claim. Entries are dropped when
+  // the source is removed (see removeSource).
+  const statusAppliedGeneration = new Map<string, number>();
+
   /**
    * Shared Test-button handler for both the Add and Edit forms. Never throws
    * out to WebviewFormPanel — a bad/incomplete field value is reported as a
@@ -2823,6 +2833,15 @@ export function registerInventoryCommands(
           }
           return { ok: false };
         }
+
+        // R4 (review) — the record is gone, so drop its status-generation entry
+        // too. Not only leak hygiene: the entry keeps an in-flight sweep's
+        // truncation claim ALIVE for a source that is no longer in the tree, so
+        // the sweep would name it and send the user off to narrow the Root Folder
+        // of something they just deleted. Safe against a replace-mode import
+        // recreating this id afterwards — the entry would describe the DEAD
+        // incarnation, and a missing entry only ever suppresses a warning.
+        statusAppliedGeneration.delete(source.id);
 
         // FINDING 1 — the source record is gone for good now, so record
         // removal can no longer race server disposition. `expectedSource:
@@ -4411,7 +4430,9 @@ export function registerInventoryCommands(
     // node keeps whatever state it already had — stale, or still `unknown`.
     // Nothing read the flag before, so a partial refresh was indistinguishable
     // from a complete one.
-    const truncatedSourceNames: string[] = [];
+    // Entries carry the source ID as well as the name: the name is what the
+    // message renders, the id is what `warnIfTruncated` filters by.
+    const truncatedSources: { id: string; name: string }[] = [];
     // TRUNCATED STATUS (follow-up 2; R3 review) — ONE renderer, because this
     // warning has TWO exits: the normal end of the sweep, and the supersede bail
     // inside the loop below. Written twice they would drift; written once they
@@ -4433,11 +4454,28 @@ export function registerInventoryCommands(
     // reason out of the provider would let this be specific again; the report
     // contract carries no reason field today.
     const warnIfTruncated = (): void => {
-      if (options?.manual !== true || truncatedSourceNames.length === 0) {
+      if (options?.manual !== true || truncatedSources.length === 0) {
         return;
       }
-      const count = truncatedSourceNames.length;
-      const names = truncatedSourceNames.slice(0, 3).map((n) => `"${n}"`).join(", ");
+      // R4 (Codex P2) — a STALE CLAIM guard, and the reason the collected entries
+      // carry ids. Applying a truncated report earns the right to say so only
+      // while that apply is still what the tree shows. A NEWER sweep that applied
+      // a COMPLETE report for the same source (very much the expected shape: this
+      // sweep is slow because the lab is big, and the user refreshed again) has
+      // replaced the partial status with a full one, so naming that source here
+      // describes a screen the user is no longer looking at and sends them to
+      // narrow a Root Folder that no longer needs narrowing. Drop those and warn
+      // about what is left, staying silent if that is nothing.
+      //
+      // Correct too when the newer sweep is ALSO truncated: it collected the
+      // source itself and warns with its own accurate message, so suppressing the
+      // older claim removes a duplicate rather than losing information.
+      const live = truncatedSources.filter((s) => statusAppliedGeneration.get(s.id) === myGeneration);
+      if (live.length === 0) {
+        return;
+      }
+      const count = live.length;
+      const names = live.slice(0, 3).map((s) => `"${s.name}"`).join(", ");
       const andMore = count > 3 ? ` and ${count - 3} more` : "";
       const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
       void vscode.window.showWarningMessage(
@@ -4514,6 +4552,11 @@ export function registerInventoryCommands(
           const currentSource = core.getInventorySource(source.id);
           if (myGeneration === statusRefreshGeneration && currentSource?.revision === startRevision) {
             core.applyInventoryStatus(source.id, report);
+            // R4 (review) — record WHOSE apply the tree is now showing for this
+            // source, for every report and not only truncated ones (see the map's
+            // note above). Set immediately after the apply, inside the same
+            // guard, so it can never claim an apply that was dropped.
+            statusAppliedGeneration.set(source.id, myGeneration);
             // TRUNCATED STATUS (follow-up 2) — collected INSIDE the apply guard,
             // not on receipt of the report. The warning explains the status the
             // user is now LOOKING AT, so a report the guards dropped (a superseded
@@ -4522,7 +4565,7 @@ export function registerInventoryCommands(
             // supersede case silent, which the loop-top generation check alone
             // cannot do — it only catches a supersede before the NEXT source.
             if (report.truncated === true) {
-              truncatedSourceNames.push(source.name);
+              truncatedSources.push({ id: source.id, name: source.name });
             }
             // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
             // console-port reassignment onto sync-owned nodes, so the next
