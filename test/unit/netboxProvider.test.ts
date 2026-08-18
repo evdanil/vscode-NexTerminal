@@ -1062,19 +1062,3 @@ describe("createNetboxProvider", () => {
     });
   });
 });
-
-/**
- * The predicate behind the provider's no-console-address warning (Codex P2 on
- * PR #86). It must mean "no CONNECTABLE console endpoint" — exactly what the
- * sync engine's `selectPrimaryEndpoint` decides addressless on: an `ssh`
- * endpoint, else a `telnet` one, each with a non-empty host. Keyed on "no ssh
- * endpoint" it reports a device that syncs perfectly well as a TELNET server as
- * having no address.
- *
- * Exercised at the predicate rather than through a NetBox payload DELIBERATELY:
- * `mapEntry` emits only `ssh` (primary + alternate) and `redfish` (`oob_ip`)
- * endpoints, so no NetBox response can put a telnet endpoint on the tree today
- * and the telnet case is unreachable from this provider's own fetch path. The
- * inconsistency lives in the shared notion — which EVE-NG devices, and any
- * third-party provider emitting telnet, do reach.
- */
