@@ -1619,6 +1619,36 @@ async function fetchInventoryImpl(
       `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the EVE-NG crawl exceeded its time limit and later labs' nodes were not imported. Narrow the Root Folder or the Lab Filter.`
     );
   }
+  // THE RAW-NODE STATUS CAP SAYS SO TOO (review). Without this the cap was the
+  // one stopping point in this crawl with no user-visible sign anywhere: it
+  // deliberately does not set the TREE's `truncated` (see below), the sync plan
+  // renders nothing for it, and the refresh sweep's partial-status warning only
+  // ever fires for a sweep of its own. A sync could therefore leave half the
+  // lab's running/stopped picture unrecorded and say nothing at all.
+  //
+  // ITS OWN SENTENCE, not the `nodesCapped` one: that message says later nodes
+  // were NOT IMPORTED, which is false here — the crawl ran on and imported them,
+  // it only stopped RECORDING STATE past the cap.
+  //
+  // SUPPRESSED WHEN THE CRAWL WAS TRUNCATED, for three reasons that agree:
+  //  1. `nodesCapped` IMPLIES `statusCapped` — `devices` cannot reach MAX_NODES
+  //     without MAX_NODES raw nodes having gone by first, and the raw check runs
+  //     ahead of the device check on the node that trips it. So every
+  //     device-capped crawl would otherwise emit two sentences about the SAME
+  //     10 000-node boundary with the same remedy: the duplication the one-
+  //     deadline-warning rule above exists to avoid.
+  //  2. Every other path that sets `truncated` (the walk's budget/deadline/lab/
+  //     depth caps, and the node-phase deadline) has already pushed a warning
+  //     naming a stopping point and this same remedy. The status is partial there
+  //     for that reason, already stated.
+  //  3. This message's own claim — the lab and node LISTS are complete, only the
+  //     live state past the cap is missing — is true exactly when the crawl was
+  //     not truncated. Beside a truncation warning it would contradict it.
+  if (statusCapped && !truncated) {
+    warnings.push(
+      `Live status stopped after ${MAX_NODES} nodes — the lab and node lists are complete, but the running/stopped state of the nodes past that limit was not recorded. Narrow the Root Folder or the Lab Filter.`
+    );
+  }
   // LIVE STATUS ON A SYNC (follow-up #42) — the report is PARTIAL only where
   // THIS CRAWL STOPPED LOOKING, because `applyInventoryStatus` MERGES a
   // truncated report and CLEARS-then-applies a complete one. Two stopping

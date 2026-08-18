@@ -1697,6 +1697,59 @@ describe("createEveNgProvider — fetchInventory reports lab status on the tree"
     expect(tree.status?.truncated).toBe(true);
   });
 
+  /**
+   * THE CAP HAS TO SAY SO. Every other stopping point in this crawl pushes a
+   * warning; the raw-node status cap used to push none, and it is the one that
+   * deliberately leaves the TREE's `truncated` alone — so a sync could record
+   * half a lab's running/stopped picture with no sign of it anywhere: no plan
+   * warning, no tree flag, and the refresh sweep only ever warns for a sweep of
+   * its own.
+   */
+  it("WARNS that live status stopped at the cap, without claiming nodes went unimported (\u2298 the cap is silent, so a sync that recorded state for half the lab looks exactly like a complete one, \u2298 reusing the device-cap sentence tells the user nodes were dropped when the crawl imported every one of them)", async () => {
+    const nodes: Record<string, unknown> = {};
+    for (let i = 1; i <= 10_050; i++) {
+      nodes[String(i)] = node({ id: String(i), name: `R${i}`, status: i === 1 || i === 10_050 ? 2 : 0, url: "telnet://127.0.0.1:32769" });
+    }
+    const tree = await fetchTree(oneLabWorld(nodes), { includeStopped: false });
+
+    // The premise: the status map was capped while the crawl itself was not.
+    expect(tree.status?.truncated).toBe(true);
+    expect(tree.truncated).toBeFalsy();
+
+    const capWarning = tree.warnings?.filter((w) => /live status/i.test(w)) ?? [];
+    expect(capWarning).toHaveLength(1);
+    expect(capWarning[0]).toContain("10000 nodes");
+    expect(capWarning[0]).toMatch(/running\/stopped state/);
+    expect(capWarning[0]).toMatch(/Narrow the Root Folder or the Lab Filter/);
+    // NOT the device-cap claim: those nodes WERE imported (both running ones are
+    // in `devices` above), so "later labs' nodes were not imported" would be a
+    // false statement about this crawl.
+    expect(tree.warnings?.some((w) => /were not imported/.test(w))).toBe(false);
+  });
+
+  it("stays quiet about live status on an ordinary under-cap crawl (\u2298 pushing the cap warning unconditionally nags every healthy sync about a limit it never came near)", async () => {
+    const tree = await fetchTree(oneLabWorld({ "1": node(), "2": node({ id: "2", status: 0, url: "" }) }), { includeStopped: false });
+
+    expect(tree.status?.truncated).toBeFalsy();
+    expect(tree.warnings?.some((w) => /live status/i.test(w))).toBe(false);
+  });
+
+  it("does NOT add a second sentence when the DEVICE cap already named the same 10 000-node boundary (\u2298 warning on `statusCapped` alone emits two messages about one stopping point on every device-capped sync \u2014 and the second one contradicts the first by calling the node list complete)", async () => {
+    const nodes: Record<string, unknown> = {};
+    for (let i = 1; i <= 10_050; i++) {
+      nodes[String(i)] = node({ id: String(i), name: `R${i}` });
+    }
+    // With the filter ON the two caps trip on the very same node, so `truncated`
+    // and the status cap are both set and the device-cap sentence is already
+    // there with the same remedy.
+    const tree = await fetchTree(oneLabWorld(nodes), { includeStopped: true });
+
+    expect(tree.truncated).toBe(true);
+    expect(tree.status?.truncated).toBe(true);
+    expect(tree.warnings?.filter((w) => /Stopped after 10000 nodes/.test(w))).toHaveLength(1);
+    expect(tree.warnings?.some((w) => /live status/i.test(w))).toBe(false);
+  });
+
   // FORWARD-COMPATIBILITY GUARD, not a regression test, and labelled honestly:
   // `validateInventoryTree` ignores members it does not know about, so this
   // passed identically before `status` existed. It exists to fail the day the
