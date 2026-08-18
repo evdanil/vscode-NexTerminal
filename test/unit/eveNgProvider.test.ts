@@ -2263,6 +2263,43 @@ describe("createEveNgProvider — insecure TLS transport selection", () => {
     expect(standard.calls).toHaveLength(0);
   });
 
+  /**
+   * A4 — THE STRICTNESS IS LOAD-BEARING, and was unpinned: the negative cases
+   * above only cover `false` and absent, so the mutation `if
+   * (!config.allowInsecureTls)` passed every provider test. The string "true" is
+   * reachable — a restored backup, or a hand-edited globalState, stores whatever
+   * it holds — and under that mutation it turns certificate verification OFF for
+   * a source whose owner never ticked a box.
+   */
+  it.each([["true"], ["false"], [1], [0], ["0"], ["yes"], [{}]])(
+    "treats a NON-boolean %o as no opt-in at all and keeps the standard transport (⊘ a truthiness test turns verification off for a value the form can never produce)",
+    async (value) => {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory(
+        { ...CONFIG, baseUrl: "https://10.0.0.5", allowInsecureTls: value as unknown as boolean },
+        SECRETS
+      );
+      expect(standard.calls.length).toBeGreaterThan(0);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  );
+
+  /**
+   * A4 — the URL-parse `catch` is OBSERVABLE, not dead: `new URL("https:")`
+   * throws, so a base URL of `https:` or `https:/` with the box ticked reaches
+   * it. The mutation `catch { return transports.insecure }` survived everything.
+   * A base URL nothing can be parsed out of cannot have been proven https, so it
+   * must not be answered by turning verification off.
+   */
+  it.each(["https:", "https:/"])(
+    "falls back to the STANDARD transport for the unparseable base URL %o, even with the box ticked (⊘ a catch that returns the insecure transport relaxes TLS on a URL nobody could parse)",
+    async (baseUrl) => {
+      const { standard, insecure, provider } = probes();
+      await provider.fetchInventory({ ...CONFIG, baseUrl, allowInsecureTls: true }, SECRETS).catch(() => undefined);
+      expect(insecure.calls).toHaveLength(0);
+    }
+  );
+
   it("defaults the second argument to the real node:https adapter, so a provider built the way activate() builds it is not silently transport-less", () => {
     expect(() => createEveNgProvider(vi.fn() as unknown as typeof fetch)).not.toThrow();
   });
