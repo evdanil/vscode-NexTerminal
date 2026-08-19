@@ -190,6 +190,51 @@ describe("validateProviderShape", () => {
     ).not.toThrow();
   });
 
+  /**
+   * REVIEW L3 — the same boundary that already rejects a non-boolean
+   * `defaultValue` for exactly this class of typo said nothing about `min`/`max`,
+   * and this is a PUBLIC API third-party providers register through.
+   *
+   * Two malformed shapes, both silent today:
+   *  - `min > max` declares a field NO value can ever save — the collection-side
+   *    re-check rejects everything, and the rendered input's native bounds do the
+   *    same, so the source simply cannot be created and nothing says why;
+   *  - a NON-NUMBER (or NaN) `min` makes that re-check silently INERT — `numeric
+   *    < min` is false when `min` is NaN, so the bound the provider documented is
+   *    not enforced at all — while still rendering into the HTML `min` attribute,
+   *    where the browser reads it as no bound either.
+   */
+  it("rejects a min greater than its max (⊘ a transposed pair declares a field no value can ever save, and the user only ever sees the save refused)", () => {
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "poll", label: "Poll", type: "number", min: 3600, max: 0 }] }))
+    ).toThrow(/"poll".*min.*max/i);
+  });
+
+  it("rejects a non-numeric or non-finite min/max (⊘ a NaN or string bound makes the collection-side re-check inert — `numeric < min` is false against NaN — while still rendering as the input's min attribute)", () => {
+    for (const bad of ["0" as never, Number.NaN, Number.POSITIVE_INFINITY, null as never]) {
+      expect(() =>
+        validateProviderShape(makeProvider({ configFields: [{ id: "poll", label: "Poll", type: "number", min: bad }] }))
+      ).toThrow(/"poll".*min/i);
+      expect(() =>
+        validateProviderShape(makeProvider({ configFields: [{ id: "poll", label: "Poll", type: "number", max: bad }] }))
+      ).toThrow(/"poll".*max/i);
+    }
+  });
+
+  it("accepts every well-formed bound: both, either alone, neither, and an equal pair (a single permitted value is odd but coherent)", () => {
+    const ok = (field: Record<string, unknown>): void => {
+      expect(() =>
+        validateProviderShape(makeProvider({ configFields: [{ id: "poll", label: "Poll", type: "number", ...field } as never] }))
+      ).not.toThrow();
+    };
+    ok({ min: 0, max: 3600 });
+    ok({ min: 0 });
+    ok({ max: 3600 });
+    ok({});
+    ok({ min: 5, max: 5 });
+    ok({ min: -10, max: 0 }); // negative bounds are a provider's business
+  });
+
   // SELECT OPTIONS VALIDATION (PR #64 Codex review round 1, P2 — issue #48 PR-E).
   // `type:"select"` reached VALID_FIELD_TYPES without any check on `options`, so a
   // third-party provider could register a select with no/empty/malformed options —
