@@ -36,7 +36,8 @@ vi.mock("vscode", () => ({
 import {
   RETIRED_STATUS_POLL_KEY,
   RETIRED_STATUS_POLL_SECTION,
-  migrateGlobalStatusPollSetting
+  migrateGlobalStatusPollSetting,
+  type StatusPollMigrationResult
 } from "../../src/services/inventory/statusPollSettingMigration";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { NexusCore } from "../../src/core/nexusCore";
@@ -350,6 +351,76 @@ describe("migrateGlobalStatusPollSetting", () => {
     await holder;
     await migration;
     expect(pollOf(core, "eve-1")).toBe(45);
+  });
+
+  /**
+   * The candidate list is computed from a snapshot taken OUTSIDE
+   * `configMutationLock`, so by the time the migration's own locked section
+   * runs, a lock-holding writer — a replace-mode config import, a complete
+   * reset, an inventory command — may have moved every record underneath it.
+   * The re-read inside the lock is what makes the write land on the record it
+   * was decided for; these pin it in each direction it can go wrong.
+   */
+  describe("the in-lock re-read", () => {
+    /** Runs `mutate` while holding configMutationLock, with the migration queued behind it. */
+    async function withQueuedMigration(
+      core: NexusCore,
+      mutate: () => Promise<void>
+    ): Promise<StatusPollMigrationResult> {
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const holder = configMutationLock.runExclusive(async () => {
+        await held;
+        await mutate();
+      });
+      const migration = migrate(core); // captures its candidates, then queues on the lock
+      await Promise.resolve();
+      await Promise.resolve();
+      release();
+      await holder;
+      return migration;
+    }
+
+    it("skips a candidate REMOVED while the migration waited on the lock (⊘ writing the stale snapshot back through addOrUpdateInventorySource RESURRECTS a source a reset or a replace-mode import had just deleted)", async () => {
+      state.inspected = { globalValue: 45 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+
+      const result = await withQueuedMigration(core, () => core.removeInventorySource("eve-1"));
+
+      expect(result.applied).toEqual([]);
+      expect(core.getInventorySource("eve-1")).toBeUndefined();
+    });
+
+    it("skips a candidate that ANSWERED the field while the migration waited on the lock (⊘ trusting the snapshot overwrites the interval the user just chose with the migrated one)", async () => {
+      state.inspected = { globalValue: 45 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+
+      const result = await withQueuedMigration(core, async () => {
+        const live = core.getInventorySource("eve-1")!;
+        await core.addOrUpdateInventorySource({ ...live, config: { statusPollSeconds: 10 } });
+      });
+
+      expect(result.applied).toEqual([]);
+      expect(pollOf(core, "eve-1")).toBe(10);
+    });
+
+    it("skips a candidate whose id was recreated as a DIFFERENT PROVIDER while the migration waited on the lock (⊘ re-checking existence and answered-ness but not the provider lands an EVE-NG-only field in a NetBox source's config and bumps its revision)", async () => {
+      state.inspected = { globalValue: 45 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+
+      // A replace-mode import queues on the same lock and can delete-and-recreate
+      // a source id under a different provider — the same-id incarnation hazard
+      // `isSameSourceIncarnation` re-validates everywhere else.
+      const result = await withQueuedMigration(core, async () => {
+        await core.removeInventorySource("eve-1");
+        await core.addOrUpdateInventorySource(makeSource("eve-1", "netbox"));
+      });
+
+      expect(result.applied).toEqual([]);
+      const replacement = core.getInventorySource("eve-1");
+      expect(replacement?.providerId).toBe("netbox"); // the fixture really did swap it
+      expect(replacement?.config).toEqual({});
+    });
   });
 
   it("never throws out of activation when the settings read itself blows up (⊘ an unguarded migration takes the whole extension down on a corrupt configuration)", async () => {

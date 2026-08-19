@@ -177,8 +177,15 @@ export async function migrateGlobalStatusPollSetting(
           for (const candidate of candidates) {
             // Re-read inside the lock: the snapshot was taken outside it, and
             // the record may have been removed or answered since.
+            //
+            // INCLUDING THE PROVIDER (review L1). A replace-mode import queues on
+            // this same lock and can delete-and-recreate a source id as a
+            // DIFFERENT provider, so existence and answered-ness alone would land
+            // an EVE-NG-only field in (say) a NetBox source's config and bump its
+            // revision for it. Same-id recreation is the incarnation hazard this
+            // codebase re-validates for everywhere else (`isSameSourceIncarnation`).
             const live = core.getInventorySource(candidate.id);
-            if (!live || live.config[EVE_NG_STATUS_POLL_FIELD_ID] !== undefined) {
+            if (!live || live.providerId !== EVE_NG_PROVIDER_ID || live.config[EVE_NG_STATUS_POLL_FIELD_ID] !== undefined) {
               continue;
             }
             await core.addOrUpdateInventorySource({
