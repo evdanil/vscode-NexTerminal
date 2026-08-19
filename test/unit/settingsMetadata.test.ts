@@ -3,7 +3,7 @@ import { formatSettingValueForTree, CATEGORY_DESCRIPTIONS, CATEGORY_ICONS, SETTI
 
 describe("CATEGORY_ICONS", () => {
   it("has an icon for every category", () => {
-    const expectedCategories = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts", "inventory"];
+    const expectedCategories = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"];
     for (const cat of expectedCategories) {
       expect(CATEGORY_ICONS[cat]).toBeDefined();
       expect(typeof CATEGORY_ICONS[cat]).toBe("string");
@@ -12,31 +12,36 @@ describe("CATEGORY_ICONS", () => {
 });
 
 /**
- * LIVE STATUS (Phase 2) — the new Inventory settings category and its first
- * setting. Being in SETTINGS_META gives the poll-interval a Settings-panel row
- * and Reset All coverage automatically (SETTINGS_KEYS derives from this list),
- * so ⊘ registering it only in package.json would leave it invisible in the
- * in-extension Settings page and silently dropped from config export/import.
+ * PER-SOURCE LAB STATUS POLL — the Inventory settings CATEGORY is gone, along
+ * with the one setting it ever held. `nexus.inventory.statusPollSeconds` was
+ * a single global cadence for a per-source concern, and only EVE-NG sources
+ * report status at all; the interval now lives on the EVE-NG source itself.
+ *
+ * These are pins of an ABSENCE, and they are not decorative. The settings TREE
+ * renders one row per CATEGORY_ORDER entry whether or not any setting carries
+ * that category, so a category left behind after its last setting is removed
+ * shows the user an Inventory row that opens onto nothing.
  */
-describe("Inventory settings category (Phase 2)", () => {
-  it("registers the inventory category across ORDER/LABELS/ICONS/DESCRIPTIONS", async () => {
+describe("Inventory settings category (retired)", () => {
+  it("no longer registers the inventory category anywhere (⊘ leaving it in CATEGORY_ORDER puts an empty Inventory row in the settings tree, and in the settings page's own section list)", async () => {
     const { CATEGORY_ORDER, CATEGORY_LABELS, CATEGORY_ICONS, CATEGORY_DESCRIPTIONS } = await import("../../src/ui/settingsMetadata");
-    expect(CATEGORY_ORDER).toContain("inventory");
-    expect(CATEGORY_LABELS.inventory).toBe("Inventory");
-    expect(typeof CATEGORY_ICONS.inventory).toBe("string");
-    expect(CATEGORY_ICONS.inventory.length).toBeGreaterThan(0);
-    expect(CATEGORY_DESCRIPTIONS.inventory).toBeTruthy();
+    expect(CATEGORY_ORDER).not.toContain("inventory");
+    expect(CATEGORY_LABELS.inventory).toBeUndefined();
+    expect(CATEGORY_ICONS.inventory).toBeUndefined();
+    expect(CATEGORY_DESCRIPTIONS.inventory).toBeUndefined();
   });
 
-  it("exposes nexus.inventory.statusPollSeconds with default 0 (off) and the documented bounds", () => {
-    const meta = SETTINGS_META.find((item) => item.section === "nexus.inventory" && item.key === "statusPollSeconds");
-    expect(meta).toBeDefined();
-    expect(meta?.category).toBe("inventory");
-    expect(meta?.type).toBe("number");
-    expect(meta?.default).toBe(0);
-    expect(meta?.min).toBe(0);
-    expect(meta?.max).toBe(3600);
-    expect(meta?.unit).toBe("seconds");
+  it("no longer exposes nexus.inventory.statusPollSeconds, and holds no other nexus.inventory setting (⊘ leaving it in SETTINGS_META keeps a dead key on the settings page, in Reset All and in every config export)", () => {
+    expect(SETTINGS_META.find((item) => item.section === "nexus.inventory" && item.key === "statusPollSeconds")).toBeUndefined();
+    expect(SETTINGS_META.filter((item) => item.section === "nexus.inventory")).toEqual([]);
+    expect(SETTINGS_META.filter((item) => item.category === "inventory")).toEqual([]);
+  });
+
+  it("keeps every REMAINING category populated, which is the invariant the removal has to preserve (⊘ removing a setting and leaving its category is the same bug in a different place)", async () => {
+    const { CATEGORY_ORDER } = await import("../../src/ui/settingsMetadata");
+    for (const category of CATEGORY_ORDER) {
+      expect(SETTINGS_META.some((item) => item.category === category), category).toBe(true);
+    }
   });
 });
 

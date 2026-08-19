@@ -3787,14 +3787,6 @@
           "order": 30,
           "markdownDescription": "Timeout in seconds for commands sent to the serial port sidecar process."
         },
-        "nexus.inventory.statusPollSeconds": {
-          "type": "integer",
-          "default": 0,
-          "minimum": 0,
-          "maximum": 3600,
-          "order": 10,
-          "markdownDescription": "How often (in seconds) to refresh EVE-NG lab running status while the Command Center is visible. `0` disables polling — use the **Refresh Lab Status** command manually. Only EVE-NG sources report status."
-        },
         "nexus.scripts.path": {
           "type": "string",
           "default": ".nexus/scripts",
