@@ -49,6 +49,25 @@ export interface InventoryStatusPollSource {
   intervalSeconds: number;
 }
 
+/** What `fire` is told about the tick it is being called for. */
+export interface InventoryStatusPollFireOptions {
+  /**
+   * TRUE only on this source's not-running → running transition fire (poll
+   * enabled, source added, view shown) — the one tick with nothing behind it:
+   * the source has no status on screen yet, and the next tick is a whole period
+   * away, up to an hour.
+   *
+   * It matters to the caller because the refresh it performs is allowed to
+   * REFUSE a source that is mid-sync/edit/remove/control, silently. A routine
+   * tick that is refused costs one period; the ARM tick that is refused costs
+   * everything the arm fire exists to buy, so the refresh remembers a refused
+   * arm tick and makes good on it when the claim clears (see `refreshStatus` in
+   * `commands/inventoryCommands.ts`). The scheduler is the only layer that
+   * knows which tick is which, so it is the layer that says.
+   */
+  arm: boolean;
+}
+
 export interface InventoryStatusPollOptions {
   view: VisibilityAwareView;
   /**
@@ -67,7 +86,7 @@ export interface InventoryStatusPollOptions {
    * latch awaits it so a slow sweep is never allowed to stack a second one for
    * the same source.
    */
-  fire: (sourceId: string) => void | Promise<void>;
+  fire: (sourceId: string, options: InventoryStatusPollFireOptions) => void | Promise<void>;
 }
 
 /** Live scheduling state for one source. `timer === undefined` means "not running". */
@@ -98,11 +117,11 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): {
     }
   };
 
-  const tick = (id: string, schedule: SourceSchedule): void => {
+  const tick = (id: string, schedule: SourceSchedule, arm: boolean): void => {
     if (schedule.inFlight) {
       return; // a prior sweep of THIS source is still running — do not stack another
     }
-    const result = options.fire(id);
+    const result = options.fire(id, { arm });
     // Latch only while a real (pending) sweep is outstanding: a fire that
     // returns a thenable (the executeCommand path / a gated test) holds the
     // latch until it settles; a synchronous fire needs no latch at all.
@@ -166,14 +185,16 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): {
         // honours the latch, so a source re-armed while its previous sweep is
         // outstanding does not double-fire.
         schedule.seconds = seconds;
-        tick(id, schedule);
-        schedule.timer = setInterval(() => tick(id, schedule!), seconds * 1000);
+        // The ARM tick, announced as one: it is the fire that must not simply be
+        // dropped if the refresh refuses it (see `InventoryStatusPollFireOptions.arm`).
+        tick(id, schedule, true);
+        schedule.timer = setInterval(() => tick(id, schedule!, false), seconds * 1000);
       } else if (schedule.seconds !== seconds) {
         // A period change REPLACES this source's timer with one at the current
         // period — never layers a second one on top — and does NOT re-fire.
         clearInterval(schedule.timer);
         schedule.seconds = seconds;
-        schedule.timer = setInterval(() => tick(id, schedule!), seconds * 1000);
+        schedule.timer = setInterval(() => tick(id, schedule!, false), seconds * 1000);
       }
       // Unchanged period, already running: deliberately left alone. Re-arming it
       // would restart its phase every time an UNRELATED source was edited, so a

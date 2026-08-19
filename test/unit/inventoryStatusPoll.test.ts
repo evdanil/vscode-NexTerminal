@@ -161,6 +161,36 @@ describe("startInventoryStatusPoll", () => {
     expect(firedIds(fire)).toEqual(["old"]);
   });
 
+  /**
+   * REVIEW D6 — the arm fire is the one tick that cannot simply be missed: it
+   * exists because a source that has just started polling (enabled, added, view
+   * shown) has NO status on screen at all, and the alternative to firing now is
+   * waiting a whole period, up to an hour. The refresh it calls is allowed to
+   * REFUSE a source that is mid-sync/edit/remove/control, and the refusal is
+   * silent — so the caller has to be able to tell the arm fire apart from a
+   * routine one in order to make good on it later. The scheduler is the only
+   * layer that knows which tick is which, so it says so.
+   */
+  it("marks the not-running → running fire as the ARM tick, and every periodic tick as not (⊘ without it the refresh cannot tell the one fire that must not be lost from the ones another will follow in a period)", () => {
+    const view = makeView(true);
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+    const fire = vi.fn();
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+
+    expect(fire.mock.calls).toEqual([["a", { arm: true }]]);
+    fire.mockClear();
+
+    vi.advanceTimersByTime(90_000);
+    expect(fire.mock.calls).toEqual([["a", { arm: false }], ["a", { arm: false }], ["a", { arm: false }]]);
+    fire.mockClear();
+
+    // A hide/show cycle is a fresh not-running → running transition, so that
+    // fire is an arm tick again.
+    view.emit(false);
+    view.emit(true);
+    expect(fire.mock.calls).toEqual([["a", { arm: true }]]);
+  });
+
   it("replaces a source's timer on an interval change WITHOUT a fresh immediate fire (⊘ firing on every config event turns a settings edit into a refresh storm)", () => {
     const view = makeView(true);
     const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);

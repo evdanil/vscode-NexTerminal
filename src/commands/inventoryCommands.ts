@@ -2240,6 +2240,56 @@ export function registerInventoryCommands(
   // one-size-fits-all "is currently syncing" this used to be.
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
+  /**
+   * REVIEW D6 — sources whose POLL ARM TICK was refused because they were busy,
+   * and which therefore still owe that refresh.
+   *
+   * The arm tick is the poll's not-running → running fire (polling enabled, a
+   * source added, the view shown). It exists because the alternative is sitting
+   * on no status at all for a whole period — up to an hour. `refreshStatus`
+   * skips a source that is mid-sync/edit/remove/control, silently, and the
+   * commonest way to ARM a source is an Edit Source save: that save fires
+   * `core.onDidChange` synchronously while the edit still holds this source's
+   * claim (it is released when the form is disposed), so the arm tick lands
+   * squarely inside the busy window and was simply lost. The scheduler had
+   * armed the timer and believed it had fired; nothing re-evaluated when the
+   * claim cleared. Turning polling on appeared to do nothing.
+   *
+   * The fix is one piece of state, here, where BOTH facts already live — the
+   * claim, and the knowledge that a refresh was refused. `releaseSourceClaim`
+   * makes good on it the moment the claim clears, so the outcome is
+   * deterministic rather than "some later event will re-evaluate", and it
+   * covers every `SourceBusyReason` because it hooks the release itself rather
+   * than any one command.
+   *
+   * ROUTINE ticks are deliberately NOT owed: another one follows in a period,
+   * and a deferred routine refresh would mean an extra lab crawl after every
+   * sync (which already applies fresh status itself) and every node control
+   * (which fires its own refresh). Only the fire with nothing behind it is
+   * remembered.
+   */
+  const armRefreshOwed = new Set<string>();
+
+  /**
+   * The ONE way a busy claim is dropped (review D6). Releasing is what makes an
+   * owed arm refresh runnable, so the two are the same step — a `delete` that
+   * bypasses this would silently reintroduce the swallow it exists to fix.
+   *
+   * The retry is re-flagged as an arm tick on purpose: if it is itself refused
+   * (another command claimed the source in between) it goes back into the owed
+   * set and runs on THAT release instead. So it self-heals, and it never
+   * retries on a timer.
+   */
+  const releaseSourceClaim = (sourceId: string): void => {
+    inFlightSourceIds.delete(sourceId);
+    if (armRefreshOwed.delete(sourceId)) {
+      // Not awaited: a release happens inside `finally` blocks and dispose
+      // listeners, which must not wait on a lab crawl — the same shape as the
+      // poll's own un-awaited fire.
+      void refreshStatus(sourceId, { manual: false, armTick: true });
+    }
+  };
+
   // LIVE STATUS (Phase 2) — monotonic status-refresh generation, PER SOURCE.
   // Each refreshStatus invocation claims a fresh generation for every source it
   // targets; before applying that source's report it checks it still holds the
@@ -2558,7 +2608,7 @@ export function registerInventoryCommands(
         }
         if (!releasedInFlight) {
           releasedInFlight = true;
-          inFlightSourceIds.delete(source.id);
+          releaseSourceClaim(source.id);
         }
       })();
       return releasing;
@@ -3240,7 +3290,7 @@ export function registerInventoryCommands(
         `Inventory source "${source.name}" removed.${skippedNote}${recreatedNote}${teardownFailureNote}`
       );
     } finally {
-      inFlightSourceIds.delete(source.id);
+      releaseSourceClaim(source.id);
     }
   }
 
@@ -4554,7 +4604,7 @@ export function registerInventoryCommands(
         return;
       }
     } finally {
-      inFlightSourceIds.delete(source.id);
+      releaseSourceClaim(source.id);
     }
   }
 
@@ -4632,11 +4682,26 @@ export function registerInventoryCommands(
    *    sync/edit/remove) is skipped so this never races the vault read or
    *    provider call that operation is making — refresh never CLAIMS the guard
    *    itself, so it can never block a real operation and overlapping refreshes
-   *    stay harmless (fetchProviderStatus is idempotent);
+   *    stay harmless (fetchProviderStatus is idempotent). A skip is silent, and
+   *    for a routine caller that is right: a poll tick will come round again,
+   *    and a manual sweep is one click. `armTick` is the exception — see
+   *    `armRefreshOwed`;
    *  - `fetchProviderStatus` swallows a throwing/ malformed provider answer into
    *    `undefined`, and a vault read that rejects is caught here.
    */
-  async function refreshStatus(sourceIdArg?: string, options?: { manual?: boolean }): Promise<void> {
+  async function refreshStatus(
+    sourceIdArg?: string,
+    options?: {
+      manual?: boolean;
+      /**
+       * This invocation is the poll's ARM tick for `sourceIdArg` — the one fire
+       * that has nothing behind it (review D6). If the busy guard refuses the
+       * source, the refresh is REMEMBERED in `armRefreshOwed` and re-run when
+       * the claim clears, rather than lost until the next period.
+       */
+      armTick?: boolean;
+    }
+  ): Promise<void> {
     const targets = sourceIdArg
       ? (() => {
           const source = core.getInventorySource(sourceIdArg);
@@ -4773,6 +4838,13 @@ export function registerInventoryCommands(
         continue;
       }
       if (inFlightSourceIds.get(source.id) !== undefined) {
+        // REVIEW D6 — a refused ARM tick is owed, not lost: `releaseSourceClaim`
+        // runs it as soon as this claim (whatever its reason) clears. Recording
+        // it is all that happens here; racing the operation holding the claim is
+        // exactly what the skip exists to prevent.
+        if (options?.armTick === true) {
+          armRefreshOwed.add(source.id);
+        }
         continue; // busy with a sync/edit/remove — skip, don't race it
       }
       const provider = registry.get(source.providerId);
@@ -5105,7 +5177,7 @@ export function registerInventoryCommands(
         }
       );
     } finally {
-      inFlightSourceIds.delete(source.id);
+      releaseSourceClaim(source.id);
     }
     if (!dispatched) {
       return;
@@ -5139,7 +5211,12 @@ export function registerInventoryCommands(
     // is the MANUAL path and warns if every source failed.
     vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => {
       const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
-      return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
+      // `__armTick` rides the same argument object as `__poll` and carries the
+      // scheduler's own answer to "is this the not-running → running fire?"
+      // (review D6). Only the poll sets it; a manual refresh is never owed,
+      // because the user can see it happen and can click it again.
+      const isArmTick = isPoll && (arg as { __armTick?: unknown }).__armTick === true;
+      return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll, armTick: isArmTick });
     }),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources),
     // NODE CONTROL (Phase 4) — gated in package.json to EVE-origin servers by

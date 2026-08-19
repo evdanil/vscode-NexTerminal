@@ -1364,8 +1364,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // takes a source id, and `resolveSourceIdArg` reads it off the argument
     // object), and the `__poll` marker tells it this is the background path, so
     // it stays silent on total failure (the manual command warns instead).
-    fire: (sourceId) =>
-      Promise.resolve(vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })).then(() => undefined)
+    // `__armTick` tells refreshStatus which fire this is (review D6): the
+    // not-running → running one has nothing behind it, so if the source is busy
+    // when it lands, the refresh is owed and re-run when the claim clears
+    // instead of waiting a whole period. Routine ticks carry `false` and are
+    // simply skipped, as they always were.
+    fire: (sourceId, { arm }) =>
+      Promise.resolve(
+        vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true, __armTick: arm })
+      ).then(() => undefined)
   });
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
