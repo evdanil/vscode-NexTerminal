@@ -137,7 +137,24 @@ const DEFAULT_SCRIPTS_RELATIVE_PATH = ".nexus/scripts";
 const EXTRA_IMPORT_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal.highlighting", key: "rules" },
   { section: "nexus.scripts", key: "defaultTimeout" },
-  { section: "nexus.scripts", key: "maxRuntimeMs" }
+  { section: "nexus.scripts", key: "maxRuntimeMs" },
+  // RETIRED (2.8.191) — the global lab-status poll interval, whose value now
+  // lives on each EVE-NG source's own Lab Status Poll Interval field. Carried
+  // here for the same reason the legacy script-timeout key above is: an export
+  // taken BEFORE the retirement still holds the user's interval, and import
+  // drops every key outside SETTINGS_KEY_SET silently and uncounted — the same
+  // silent loss the activation migration exists to prevent. Imported into
+  // Global, where `migrateGlobalStatusPollSetting` reads it on the next
+  // activation and moves it onto the sources.
+  //
+  // Which is a fresh-machine guarantee, deliberately: on a machine whose
+  // migration has already run, its durable `globalState` marker (see that
+  // module) makes the next activation a no-op and the key simply stays dead in
+  // settings. Clearing the marker from here would re-open the hole the marker
+  // closed — a user who turned polling off by blanking the field, then restored
+  // an old settings export, would have the interval written back onto the
+  // source they switched off.
+  { section: "nexus.inventory", key: "statusPollSeconds" }
 ];
 
 // Derived from SETTINGS_META (single source of truth for contributed settings) plus the
@@ -183,7 +200,16 @@ const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingVali
   "nexus.scripts.maxRuntimeMs": (value) =>
     validBoundedNumber(value, 0, MAX_SCRIPT_RUNTIME_MS) ? { ok: true, value } : { ok: false },
   "nexus.scripts.defaultTimeout": (value) =>
-    validBoundedNumber(value, 100, MAX_SCRIPT_WAIT_TIMEOUT_MS) ? { ok: true, value } : { ok: false }
+    validBoundedNumber(value, 100, MAX_SCRIPT_WAIT_TIMEOUT_MS) ? { ok: true, value } : { ok: false },
+  // The retired key has no SETTINGS_META entry to validate against, so it needs
+  // its own clause here — without one the generic fallback rejects it as an
+  // "Unknown Nexus setting" and the carry above would never land. Bounded
+  // exactly as the retired setting itself was (0..3600 seconds), so a
+  // hand-edited or corrupt export is skipped and COUNTED rather than written
+  // through into settings for the migration to coerce into something the user
+  // never chose.
+  "nexus.inventory.statusPollSeconds": (value) =>
+    validBoundedNumber(value, 0, 3600) ? { ok: true, value } : { ok: false }
 };
 
 function readSettings(): Record<string, unknown> {

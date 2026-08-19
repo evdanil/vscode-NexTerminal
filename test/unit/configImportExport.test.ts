@@ -695,6 +695,49 @@ describe("config import command (legacy)", () => {
     }
   );
 
+  /**
+   * REVIEW L2 — `nexus.inventory.statusPollSeconds` was RETIRED (its value now
+   * lives on each EVE-NG source's own Lab Status Poll Interval field), so it is
+   * no longer contributed and no longer in SETTINGS_META. Import drops every key
+   * outside SETTINGS_KEY_SET silently and uncounted, which means an export taken
+   * BEFORE the retirement, restored on a fresh machine, lost the user's interval
+   * with no message — the same loss the activation migration exists to prevent.
+   *
+   * `EXTRA_IMPORT_KEYS` is the mechanism that exists for exactly this (see how
+   * the legacy `nexus.scripts.defaultTimeout` ms key is carried and converted).
+   * Carried into Global, the activation migration then picks it up and moves it
+   * onto the sources.
+   */
+  it.each(["merge", "replace"] as const)(
+    "carries the RETIRED inventory poll interval in from an older export so the activation migration can move it onto the sources, in %s mode (⊘ dropping it as an unknown key loses the interval silently — the very loss the migration exists to prevent)",
+    async (mode) => {
+      const exportData = makeExportData({
+        exportType: "backup",
+        settings: {
+          "nexus.inventory.statusPollSeconds": 45
+        }
+      });
+      await runImport(exportData, mode);
+
+      expect(configStore.get("nexus.inventory.statusPollSeconds")).toBe(45);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+        "1 imported Nexus setting had an invalid value and was skipped."
+      );
+    }
+  );
+
+  it("skips an out-of-range or non-numeric retired poll interval rather than storing it (⊘ carrying a key with no validator at all lets a hand-edited 99999 or \"45\" through into settings, where the migration coerces it to something the user never chose)", async () => {
+    for (const bad of [99_999, -1, "45", Number.NaN]) {
+      configStore.clear();
+      mockShowWarningMessage.mockClear();
+      await runImport(makeExportData({ settings: { "nexus.inventory.statusPollSeconds": bad } }));
+      expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        "1 imported Nexus setting had an invalid value and was skipped."
+      );
+    }
+  });
+
   it("skips unsafe imported highlighting rules", async () => {
     const exportData = makeExportData({
       settings: {
