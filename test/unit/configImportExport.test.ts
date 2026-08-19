@@ -141,6 +141,7 @@ import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import { inventorySecretKey, type InventorySourceConfig } from "../../src/models/inventory";
+import { EVE_NG_PROVIDER_ID, EVE_NG_STATUS_POLL_FIELD_ID } from "../../src/services/inventory/providers/eveNgProvider";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
@@ -696,46 +697,129 @@ describe("config import command (legacy)", () => {
   );
 
   /**
-   * REVIEW L2 — `nexus.inventory.statusPollSeconds` was RETIRED (its value now
-   * lives on each EVE-NG source's own Lab Status Poll Interval field), so it is
-   * no longer contributed and no longer in SETTINGS_META. Import drops every key
-   * outside SETTINGS_KEY_SET silently and uncounted, which means an export taken
-   * BEFORE the retirement, restored on a fresh machine, lost the user's interval
-   * with no message — the same loss the activation migration exists to prevent.
+   * REVIEW L2 / C2 — `nexus.inventory.statusPollSeconds` was RETIRED (its value
+   * now lives on each EVE-NG source's own Lab Status Poll Interval field), so it
+   * is no longer contributed and no longer in SETTINGS_META. Import drops every
+   * key outside SETTINGS_KEY_SET silently and uncounted, which means an export
+   * taken BEFORE the retirement, restored on a fresh machine, lost the user's
+   * interval with no message — the same loss the activation migration exists to
+   * prevent. `EXTRA_IMPORT_KEYS` is what stops that drop.
    *
-   * `EXTRA_IMPORT_KEYS` is the mechanism that exists for exactly this (see how
-   * the legacy `nexus.scripts.defaultTimeout` ms key is carried and converted).
-   * Carried into Global, the activation migration then picks it up and moves it
-   * onto the sources.
+   * The FIRST attempt then wrote the key into settings and left the rest to the
+   * activation migration. That is unreachable by construction: the extension
+   * must ACTIVATE before its own import command can run, and an activation that
+   * finds no key marks the migration done, so the restored key is read by
+   * nobody — polling stays off and a stale key is all the import achieves. The
+   * carry therefore happens HERE, during the import, onto the sources this run
+   * created — and the key is never written to settings at all.
    */
-  it.each(["merge", "replace"] as const)(
-    "carries the RETIRED inventory poll interval in from an older export so the activation migration can move it onto the sources, in %s mode (⊘ dropping it as an unknown key loses the interval silently — the very loss the migration exists to prevent)",
-    async (mode) => {
-      const exportData = makeExportData({
-        exportType: "backup",
-        settings: {
-          "nexus.inventory.statusPollSeconds": 45
-        }
-      });
-      await runImport(exportData, mode);
+  describe("the retired lab-status poll interval", () => {
+    const eveSource = (id: string, overrides: Partial<InventorySourceConfig> = {}) =>
+      makeInventorySource({ id, providerId: EVE_NG_PROVIDER_ID, name: id, config: {}, secretFieldIds: [], ...overrides });
 
-      expect(configStore.get("nexus.inventory.statusPollSeconds")).toBe(45);
+    const pollOf = (id: string): unknown => core.getInventorySource(id)?.config[EVE_NG_STATUS_POLL_FIELD_ID];
+
+    it.each(["merge", "replace"] as const)(
+      "carries the interval from an older export onto the EVE-NG sources that import created, and never writes the dead key back into settings, in %s mode (⊘ storing the key and leaving it to the activation migration carries nothing: that migration already ran and marked itself done before this command could exist, so polling stays off and only a stale key lands)",
+      async (mode) => {
+        const exportData = makeExportData({
+          exportType: "backup",
+          inventorySources: [eveSource("eve-1"), eveSource("eve-2"), makeInventorySource({ id: "nb-1", secretFieldIds: [] })],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        });
+
+        await runImport(exportData, mode);
+
+        expect(pollOf("eve-1")).toBe(45);
+        expect(pollOf("eve-2")).toBe(45);
+        // A NetBox source has no such field and reports no status at all.
+        expect(core.getInventorySource("nb-1")?.config[EVE_NG_STATUS_POLL_FIELD_ID]).toBeUndefined();
+        expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+        expect(mockConfigUpdate).not.toHaveBeenCalledWith("nexus.inventory", "statusPollSeconds", expect.anything());
+        expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+          "1 imported Nexus setting had an invalid value and was skipped."
+        );
+      }
+    );
+
+    it("does NOT re-arm a source that was already on this machine, whose interval the user had blanked (⊘ applying the carried value to every EVE-NG source turns polling back on for the one source its owner deliberately switched off — the exact harm the activation migration's durable marker exists to prevent)", async () => {
+      // Already here, field blanked: `formValuesToProviderConfig` stores NO key
+      // for an empty number field, so it looks exactly like one that never
+      // answered. Merge mode skips the same id in the payload, so this record
+      // is not one the import created.
+      await core.addOrUpdateInventorySource(eveSource("eve-local"));
+      const revision = core.getInventorySource("eve-local")?.revision;
+
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [eveSource("eve-local", { name: "from the backup" }), eveSource("eve-new")],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        }),
+        "merge"
+      );
+
+      expect(pollOf("eve-local")).toBeUndefined();
+      expect(core.getInventorySource("eve-local")?.revision).toBe(revision);
+      // The source this run DID create still gets it.
+      expect(pollOf("eve-new")).toBe(45);
+    });
+
+    it("never overwrites an imported source that already answered the field — an explicit 0 included (⊘ writing over the payload's own value replaces a per-source interval the user chose in a later release with a global one they retired)", async () => {
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [
+            eveSource("explicit-off", { config: { [EVE_NG_STATUS_POLL_FIELD_ID]: 0 } }),
+            eveSource("explicit-on", { config: { [EVE_NG_STATUS_POLL_FIELD_ID]: 10 } }),
+            eveSource("unanswered")
+          ],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        })
+      );
+
+      expect(pollOf("explicit-off")).toBe(0);
+      expect(pollOf("explicit-on")).toBe(10);
+      expect(pollOf("unanswered")).toBe(45);
+    });
+
+    it("carries a 0 onto nothing — it was the shipped default and it polled nothing (⊘ writing the 0 answers the field on every imported source, so the user's own blank-means-off default is replaced by a stored 0 and every later carry is blocked)", async () => {
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [eveSource("eve-1")],
+          settings: { "nexus.inventory.statusPollSeconds": 0 }
+        })
+      );
+
+      expect(core.getInventorySource("eve-1")?.config).toEqual({});
+      expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
       expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
         "1 imported Nexus setting had an invalid value and was skipped."
       );
-    }
-  );
+    });
 
-  it("skips an out-of-range or non-numeric retired poll interval rather than storing it (⊘ carrying a key with no validator at all lets a hand-edited 99999 or \"45\" through into settings, where the migration coerces it to something the user never chose)", async () => {
-    for (const bad of [99_999, -1, "45", Number.NaN]) {
-      configStore.clear();
-      mockShowWarningMessage.mockClear();
-      await runImport(makeExportData({ settings: { "nexus.inventory.statusPollSeconds": bad } }));
-      expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
-      expect(mockShowWarningMessage).toHaveBeenCalledWith(
-        "1 imported Nexus setting had an invalid value and was skipped."
-      );
-    }
+    it("skips an out-of-range or non-numeric interval, counting it, and carries nothing (⊘ a key with no validator at all lets a hand-edited 99999 or \"45\" through to be coerced into a number the user never chose, silently and uncounted)", async () => {
+      for (const bad of [99_999, -1, "45", Number.NaN]) {
+        configStore.clear();
+        mockShowWarningMessage.mockClear();
+        await core.removeInventorySource("eve-1");
+
+        await runImport(
+          makeExportData({
+            exportType: "backup",
+            inventorySources: [eveSource("eve-1")],
+            settings: { "nexus.inventory.statusPollSeconds": bad }
+          })
+        );
+
+        expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+        expect(pollOf("eve-1")).toBeUndefined();
+        expect(mockShowWarningMessage).toHaveBeenCalledWith(
+          "1 imported Nexus setting had an invalid value and was skipped."
+        );
+      }
+    });
   });
 
   it("skips unsafe imported highlighting rules", async () => {
