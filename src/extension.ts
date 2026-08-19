@@ -344,7 +344,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // The status poll below does not have to wait for it either: a source it
   // writes fires NexusCore's change event, which is exactly what re-evaluates
   // the schedule.
-  void migrateGlobalStatusPollSetting(core);
+  //
+  // `globalState` carries its "already ran" marker, which is what makes it
+  // one-time even when the settings clear cannot be written (review M1).
+  void migrateGlobalStatusPollSetting(core, context.globalState);
 
   terminalOutputTraceEnabled = readTerminalOutputTrace();
   const loggerFactory = new TerminalLoggerFactory(

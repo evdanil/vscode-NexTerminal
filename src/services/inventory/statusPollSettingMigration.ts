@@ -12,7 +12,24 @@ import {
 export const RETIRED_STATUS_POLL_SECTION = "nexus.inventory";
 export const RETIRED_STATUS_POLL_KEY = "statusPollSeconds";
 
+/**
+ * The durable "this already ran" record, in `globalState`. It lives OUTSIDE the
+ * user's settings file on purpose: the whole point is that it survives a clear
+ * that could not be written (see the idempotence note on the function below).
+ */
+export const STATUS_POLL_MIGRATION_DONE_KEY = "nexus.inventory.statusPollSettingMigrated";
+
 export type StatusPollSettingScope = "global" | "workspace" | "workspaceFolder";
+
+/**
+ * The slice of `vscode.ExtensionContext.globalState` this needs — declared
+ * structurally so the unit tests can hand it a Map and so nothing here depends
+ * on a Memento's other members.
+ */
+export interface StatusPollMigrationMarkerStore {
+  get(key: string): boolean | undefined;
+  update(key: string, value: boolean): Thenable<void>;
+}
 
 export interface StatusPollMigrationResult {
   /** The old value, after the retired setting's own coercion. Absent when the key was not set. */
@@ -76,13 +93,29 @@ function coerceRetiredValue(raw: unknown): number {
  *    polled nothing; writing a 0 onto every source would only churn revisions
  *    and destroy this migration's own "has this source answered yet?" test.
  *
- *  - **Idempotence has two layers.** Clearing the key is the primary one: the
- *    next activation finds nothing and returns immediately. The second covers
- *    the case where the clear FAILS (a read-only or policy-locked settings
- *    file) — only a source with NO stored answer is written, and the first run
- *    gave every one of them an answer. An explicit `0` on a source counts as an
- *    answer, so a user who has deliberately turned one source off is never
- *    re-enabled by a retried migration.
+ *  - **Idempotence is a durable marker, not an inference.** A completed pass
+ *    records `STATUS_POLL_MIGRATION_DONE_KEY` in `globalState`, and the next
+ *    activation returns on it before reading settings at all. It is deliberately
+ *    NOT inferred from the settings key being gone, because the clear can FAIL
+ *    (a read-only or policy-managed `settings.json`, or a dotfiles-provisioned
+ *    one that simply puts the key back) — and it is not inferred from the
+ *    sources' own answers either, because "answered" means "the key is present
+ *    in the source's config" while the edit form stores NO KEY for a blanked
+ *    number field. A user who turns polling off by clearing the field would
+ *    otherwise read as unanswered on the next activation and have the old
+ *    interval written back: unattended polling at a cadence they switched off.
+ *    The same inference would seed any EVE-NG source ADDED between activations,
+ *    which the "no EVE-NG sources" note above rejects for the same reason.
+ *
+ *    Marked only after the work is DONE (see the ordering note below), so a run
+ *    that throws mid-carry retries on the next activation rather than losing the
+ *    value it was there to preserve. A pass that found no key at all is marked
+ *    too: it is a completed pass, and marking it is what stops a key reappearing
+ *    in the file later from arming polling behind the user.
+ *
+ *    The per-source "already answered" check STAYS, now as what it always
+ *    honestly was — a rule about not overwriting an answer the user has given,
+ *    including an explicit `0` — rather than as the idempotence mechanism.
  *
  *  - **Ordering: apply, then clear.** If the write to a source fails the key
  *    survives and the migration is retried next time; if the clear fails the
@@ -103,8 +136,14 @@ function coerceRetiredValue(raw: unknown): number {
  * Non-fatal by construction: activation must not fail over a settings read, and
  * a poll that does not start is not worth taking a window down for.
  */
-export async function migrateGlobalStatusPollSetting(core: NexusCore): Promise<StatusPollMigrationResult> {
+export async function migrateGlobalStatusPollSetting(
+  core: NexusCore,
+  markers: StatusPollMigrationMarkerStore
+): Promise<StatusPollMigrationResult> {
   try {
+    if (markers.get(STATUS_POLL_MIGRATION_DONE_KEY) === true) {
+      return { applied: [], cleared: [] };
+    }
     const config = vscode.workspace.getConfiguration(RETIRED_STATUS_POLL_SECTION);
     const inspected = config.inspect<unknown>(RETIRED_STATUS_POLL_KEY);
     // Least specific first, so the LAST entry is the effective one.
@@ -115,6 +154,9 @@ export async function migrateGlobalStatusPollSetting(core: NexusCore): Promise<S
     ].filter((entry) => entry.value !== undefined);
 
     if (present.length === 0) {
+      // A completed pass with nothing to carry — marked like any other, so a key
+      // that reappears in the file afterwards is not migrated behind the user.
+      await markMigrated(markers);
       return { applied: [], cleared: [] };
     }
 
@@ -155,13 +197,33 @@ export async function migrateGlobalStatusPollSetting(core: NexusCore): Promise<S
         await config.update(RETIRED_STATUS_POLL_KEY, undefined, entry.target);
         cleared.push(entry.scope);
       } catch {
-        // Read-only / policy-locked settings. The values are already on the
-        // sources; the second idempotence layer covers the retry.
+        // Read-only / policy-managed settings, or a file something else owns.
+        // The values are already on the sources and the marker below is what
+        // makes the next activation a no-op, so a dead key left in the file
+        // costs the user nothing but the key itself.
       }
     }
+
+    // LAST, and only on a pass that got this far: everything above either
+    // succeeded or was deliberately survivable.
+    await markMigrated(markers);
 
     return { value: seconds, applied, cleared };
   } catch {
     return { applied: [], cleared: [] };
+  }
+}
+
+/**
+ * Non-fatal on its own: a `globalState` write that rejects must not turn a
+ * successful carry into a reported failure. The cost is that this installation
+ * runs the migration again next activation, where the cleared key (if the clear
+ * did work) and the sources' own answers still hold the line.
+ */
+async function markMigrated(markers: StatusPollMigrationMarkerStore): Promise<void> {
+  try {
+    await markers.update(STATUS_POLL_MIGRATION_DONE_KEY, true);
+  } catch {
+    // Deliberately swallowed — see above.
   }
 }

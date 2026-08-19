@@ -72,6 +72,25 @@ async function coreWith(...sources: InventorySourceConfig[]): Promise<NexusCore>
 
 const pollOf = (core: NexusCore, id: string): unknown => core.getInventorySource(id)?.config.statusPollSeconds;
 
+/**
+ * The durable "already ran" marker, `globalState` in production. A plain Map
+ * here — the point of the marker is that it does NOT live in the user's
+ * settings file, so nothing about it needs the vscode configuration mock.
+ */
+function makeMarkerStore(initial: Record<string, boolean> = {}) {
+  const store = new Map<string, boolean>(Object.entries(initial));
+  return {
+    get: vi.fn((key: string) => store.get(key)),
+    update: vi.fn(async (key: string, value: boolean) => {
+      store.set(key, value);
+    })
+  };
+}
+
+let markers: ReturnType<typeof makeMarkerStore>;
+const migrate = (core: NexusCore, store: ReturnType<typeof makeMarkerStore> = markers) =>
+  migrateGlobalStatusPollSetting(core, store);
+
 describe("migrateGlobalStatusPollSetting", () => {
   beforeEach(() => {
     inspectMock.mockClear();
@@ -79,10 +98,11 @@ describe("migrateGlobalStatusPollSetting", () => {
     getConfigurationMock.mockClear();
     state.inspected = undefined;
     state.updateImpl = async () => undefined;
+    markers = makeMarkerStore();
   });
 
   it("reads the retired key from its real section", async () => {
-    await migrateGlobalStatusPollSetting(await coreWith());
+    await migrate(await coreWith());
     expect(getConfigurationMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_SECTION);
     expect(inspectMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY);
     expect(RETIRED_STATUS_POLL_SECTION).toBe("nexus.inventory");
@@ -93,7 +113,7 @@ describe("migrateGlobalStatusPollSetting", () => {
     const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
     const revision = core.getInventorySource("eve-1")?.revision;
 
-    const result = await migrateGlobalStatusPollSetting(core);
+    const result = await migrate(core);
 
     expect(result).toEqual({ applied: [], cleared: [] });
     expect(updateMock).not.toHaveBeenCalled();
@@ -109,7 +129,7 @@ describe("migrateGlobalStatusPollSetting", () => {
       makeSource("nb-1", "netbox")
     );
 
-    const result = await migrateGlobalStatusPollSetting(core);
+    const result = await migrate(core);
 
     expect(result.value).toBe(45);
     expect(result.applied.sort()).toEqual(["eve-1", "eve-2"]);
@@ -129,7 +149,7 @@ describe("migrateGlobalStatusPollSetting", () => {
       makeSource("unanswered", EVE_NG_PROVIDER_ID)
     );
 
-    const result = await migrateGlobalStatusPollSetting(core);
+    const result = await migrate(core);
 
     expect(pollOf(core, "explicit-off")).toBe(0);
     expect(pollOf(core, "explicit-on")).toBe(10);
@@ -142,7 +162,7 @@ describe("migrateGlobalStatusPollSetting", () => {
     const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
     const revision = core.getInventorySource("eve-1")?.revision;
 
-    const result = await migrateGlobalStatusPollSetting(core);
+    const result = await migrate(core);
 
     expect(result.applied).toEqual([]);
     expect(pollOf(core, "eve-1")).toBeUndefined();
@@ -154,7 +174,7 @@ describe("migrateGlobalStatusPollSetting", () => {
     state.inspected = { globalValue: 45 };
     const core = await coreWith(makeSource("nb-1", "netbox"));
 
-    const result = await migrateGlobalStatusPollSetting(core);
+    const result = await migrate(core);
 
     expect(result.applied).toEqual([]);
     expect(result.cleared).toEqual(["global"]);
@@ -165,7 +185,7 @@ describe("migrateGlobalStatusPollSetting", () => {
     state.inspected = { workspaceValue: 20 };
     const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
 
-    const result = await migrateGlobalStatusPollSetting(core);
+    const result = await migrate(core);
 
     expect(pollOf(core, "eve-1")).toBe(20);
     expect(result.cleared).toEqual(["workspace"]);
@@ -177,7 +197,7 @@ describe("migrateGlobalStatusPollSetting", () => {
     state.inspected = { globalValue: 45, workspaceValue: 20, workspaceFolderValue: 5 };
     const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
 
-    const result = await migrateGlobalStatusPollSetting(core);
+    const result = await migrate(core);
 
     expect(pollOf(core, "eve-1")).toBe(5);
     expect(result.cleared).toEqual(["global", "workspace", "workspaceFolder"]);
@@ -187,10 +207,12 @@ describe("migrateGlobalStatusPollSetting", () => {
   });
 
   it("reproduces the retired setting's OWN coercion: clamped to 0..3600, floored, and anything non-finite read as 0 (⊘ carrying a hand-edited 99999 or NaN straight onto a source stores a value the field itself would refuse)", async () => {
+    // A fresh core AND a fresh marker store per value: each one stands for a
+    // separate installation whose settings.json held that raw value.
     const migrated = async (raw: unknown): Promise<unknown> => {
       state.inspected = { globalValue: raw };
       const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
-      await migrateGlobalStatusPollSetting(core);
+      await migrate(core, makeMarkerStore());
       return pollOf(core, "eve-1");
     };
 
@@ -205,32 +227,109 @@ describe("migrateGlobalStatusPollSetting", () => {
     state.inspected = { globalValue: 45 };
     const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
 
-    await migrateGlobalStatusPollSetting(core);
+    await migrate(core);
     // The clear happened; a real settings store now reports the key as absent.
     state.inspected = undefined;
     updateMock.mockClear();
 
     await core.addOrUpdateInventorySource(makeSource("eve-2", EVE_NG_PROVIDER_ID));
-    const second = await migrateGlobalStatusPollSetting(core);
+    const second = await migrate(core);
 
     expect(second).toEqual({ applied: [], cleared: [] });
     expect(updateMock).not.toHaveBeenCalled();
     expect(pollOf(core, "eve-2")).toBeUndefined();
   });
 
-  it("is idempotent even if the CLEAR failed, because an already-answered source is skipped (⊘ a migration whose only guard is the cleared key re-writes every source on every activation when settings.json is read-only)", async () => {
+  it("is idempotent even if the CLEAR failed — the durable marker, not the settings key, is what says it already ran (⊘ a migration whose only guard is the cleared key re-writes every source on every activation when settings.json is read-only)", async () => {
     state.inspected = { globalValue: 45 };
     state.updateImpl = async () => { throw new Error("settings.json is read-only"); };
     const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
 
-    const first = await migrateGlobalStatusPollSetting(core);
+    const first = await migrate(core);
     expect(first.applied).toEqual(["eve-1"]);
     expect(first.cleared).toEqual([]);
     const revision = core.getInventorySource("eve-1")?.revision;
 
-    const second = await migrateGlobalStatusPollSetting(core);
+    const second = await migrate(core);
     expect(second.applied).toEqual([]);
     expect(core.getInventorySource("eve-1")?.revision).toBe(revision);
+  });
+
+  /**
+   * REVIEW M1 — the two halves the settings key could not cover, both reachable
+   * from ONE ordinary sequence: the clear fails (a read-only or policy-managed
+   * settings.json — precisely the case the fallback layer exists for, and also a
+   * dotfiles-provisioned file that simply re-adds the key), so the key is still
+   * there on the next activation and the migration used to read every source as
+   * unanswered again.
+   */
+  describe("the durable already-ran marker", () => {
+    it("does NOT re-enable polling on a source whose interval the user has since BLANKED, when the settings clear failed (⊘ inferring 'already ran' from the settings key re-writes the old 45 s onto a source the user deliberately turned off — unattended polling of a system that evicts their EVE-NG browser session)", async () => {
+      state.inspected = { globalValue: 45 };
+      state.updateImpl = async () => { throw new Error("settings.json is read-only"); };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+
+      expect((await migrate(core)).applied).toEqual(["eve-1"]);
+
+      // The user blanks the field in the edit form. `formValuesToProviderConfig`
+      // stores NO KEY for an empty number field, so the source goes back to
+      // looking exactly like one that never answered.
+      const live = core.getInventorySource("eve-1")!;
+      await core.addOrUpdateInventorySource({ ...live, config: {} });
+      const revision = core.getInventorySource("eve-1")?.revision;
+
+      const second = await migrate(core);
+
+      expect(second.applied).toEqual([]);
+      expect(pollOf(core, "eve-1")).toBeUndefined();
+      expect(core.getInventorySource("eve-1")?.revision).toBe(revision);
+    });
+
+    it("does NOT seed a source ADDED after the migration ran, even when the settings clear failed (⊘ the same hole seeds every EVE-NG source added later at a cadence set for a source that may no longer exist — the outcome this module's own design notes reject)", async () => {
+      state.inspected = { globalValue: 45 };
+      state.updateImpl = async () => { throw new Error("settings.json is read-only"); };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+
+      await migrate(core);
+      inspectMock.mockClear();
+
+      await core.addOrUpdateInventorySource(makeSource("eve-2", EVE_NG_PROVIDER_ID));
+      const second = await migrate(core);
+
+      expect(second).toEqual({ applied: [], cleared: [] });
+      expect(pollOf(core, "eve-2")).toBeUndefined();
+      // And the marker short-circuits BEFORE the settings read: it is the gate,
+      // not a tie-breaker consulted after the key is found.
+      expect(inspectMock).not.toHaveBeenCalled();
+    });
+
+    it("marks a pass that found NO key at all, so a settings file that re-adds it later cannot arm polling behind the user (⊘ marking only when something was carried leaves a dotfiles-provisioned key to migrate itself onto every source on some later activation)", async () => {
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+
+      await migrate(core); // nothing set: a clean install's first activation
+
+      state.inspected = { globalValue: 45 }; // the key reappears
+      const second = await migrate(core);
+
+      expect(second.applied).toEqual([]);
+      expect(pollOf(core, "eve-1")).toBeUndefined();
+    });
+
+    it("is NOT marked when the source write FAILED, so the next activation retries the carry (⊘ marking before the work is done abandons the value on the one run that actually needed to preserve it)", async () => {
+      state.inspected = { globalValue: 45 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+      const write = vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("storage full"));
+
+      const first = await migrate(core);
+      expect(first.applied).toEqual([]);
+      expect(pollOf(core, "eve-1")).toBeUndefined();
+
+      write.mockRestore();
+      const second = await migrate(core);
+
+      expect(second.applied).toEqual(["eve-1"]);
+      expect(pollOf(core, "eve-1")).toBe(45);
+    });
   });
 
   it("writes the sources under configMutationLock, so it cannot interleave with an import/reset holding it (⊘ an unlocked write can land between a replace-mode import's own read and write and be thrown away, or throw one away)", async () => {
@@ -241,7 +340,7 @@ describe("migrateGlobalStatusPollSetting", () => {
     const held = new Promise<void>((r) => { release = r; });
     const holder = configMutationLock.runExclusive(async () => { await held; });
 
-    const migration = migrateGlobalStatusPollSetting(core);
+    const migration = migrate(core);
     await Promise.resolve();
     await Promise.resolve();
     // Blocked behind the holder — nothing written yet.
@@ -257,6 +356,6 @@ describe("migrateGlobalStatusPollSetting", () => {
     inspectMock.mockImplementationOnce(() => { throw new Error("configuration unavailable"); });
     const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
 
-    await expect(migrateGlobalStatusPollSetting(core)).resolves.toEqual({ applied: [], cleared: [] });
+    await expect(migrate(core)).resolves.toEqual({ applied: [], cleared: [] });
   });
 });
