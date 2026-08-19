@@ -41,6 +41,8 @@ vi.mock("vscode", () => {
 });
 
 import {
+  InventorySourceItem,
+  InventorySourcesGroupItem,
   SettingsTreeProvider,
   SettingsCategoryItem,
   SettingsValueItem,
@@ -51,6 +53,48 @@ import {
 
 function createProvider(): SettingsTreeProvider {
   return new SettingsTreeProvider();
+}
+
+interface FakeSource {
+  id: string;
+  providerId: string;
+  name: string;
+  lastSyncAt?: number;
+}
+
+/** Minimal NexusCore stand-in: a snapshot plus the onDidChange fan-out. */
+function makeCore(sources: FakeSource[]) {
+  const listeners: Array<() => void> = [];
+  return {
+    core: {
+      getSnapshot: () => ({ inventorySources: sources }),
+      onDidChange: (listener: () => void) => {
+        listeners.push(listener);
+        return () => {
+          const i = listeners.indexOf(listener);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      }
+    },
+    fire: () => {
+      for (const l of [...listeners]) l();
+    },
+    listenerCount: () => listeners.length
+  };
+}
+
+const fakeRegistry = {
+  get: (id: string) => (id === "eve-ng" ? { label: "EVE-NG" } : id === "netbox" ? { label: "NetBox" } : undefined)
+};
+
+function providerWithSources(sources: FakeSource[]): SettingsTreeProvider {
+  const { core } = makeCore(sources);
+  return new SettingsTreeProvider(core as never, fakeRegistry as never);
+}
+
+function groupChildren(provider: SettingsTreeProvider) {
+  const group = provider.getChildren().find((r) => r instanceof InventorySourcesGroupItem)!;
+  return provider.getChildren(group);
 }
 
 function setupDefaultConfig(): void {
@@ -88,17 +132,17 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 15 root items", () => {
+    it("returns 18 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(15);
+      expect(roots).toHaveLength(18);
     });
 
-    it("has 11 category items first with Security & Data after SSH", () => {
+    it("has 14 category items first with Security & Data after SSH, then Inventory (Phase 2) and the local/network server categories", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(11);
+      expect(categories).toHaveLength(14);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
         .toEqual([
           "logging",
@@ -110,17 +154,20 @@ describe("SettingsTreeProvider", () => {
           "sftp",
           "serial",
           "scripts",
+          "inventory",
           "localServers",
-          "networkServers"
+          "networkServers",
+          "tftpServer",
+          "dhcpServer"
         ]);
     });
 
-    it("has 4 root link items for Macros, Auth Profiles, Device Templates, and Inventory Sources", () => {
+    it("has 3 root link items for Macros, Auth Profiles and Device Templates — Inventory Sources is a GROUP now, not a link", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const links = roots.filter((r) => r instanceof SettingsLinkItem);
-      expect(links).toHaveLength(4);
-      expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles", "Device Templates", "Inventory Sources"]);
+      expect(links).toHaveLength(3);
+      expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles", "Device Templates"]);
     });
 
     // §7 UX-M6 — the Auth Profiles row description no longer says "template" so
@@ -147,24 +194,21 @@ describe("SettingsTreeProvider", () => {
       expect(deviceTemplates.tooltip).toBe("Apply shared settings to servers synced from inventory");
     });
 
-    // The owner's complaint this answers: inventory sources had no home in the
-    // extension's own Settings tree, so editing one was palette-only
-    // ("Nexus: Edit Inventory Source"). The link must point at the hub command
-    // nexus.inventory.manage — a link pointing at bare addSource (or at nothing)
-    // would not give edit/remove access.
-    it("points the Inventory Sources link at the nexus.inventory.manage hub", () => {
-      const provider = createProvider();
-      const roots = provider.getChildren();
-      const links = roots.filter((r) => r instanceof SettingsLinkItem) as SettingsLinkItem[];
-      const inventory = links[3];
-      expect(inventory.label).toBe("Inventory Sources");
-      expect(inventory.command).toEqual({
-        command: "nexus.inventory.manage",
-        title: "Inventory Sources"
-      });
-      expect((inventory.iconPath as { id: string }).id).toBe("server-environment");
-      expect(inventory.tooltip).toBe("Add, edit, sync, and remove inventory sources");
-      expect(inventory.id).toBe("settings-link:nexus.inventory.manage");
+    /**
+     * Inventory sources used to be ONE row opening the manage QuickPick — the
+     * sources themselves were invisible in the tree, so "which sources do I
+     * have, and when did each last sync" needed a modal to answer. The group
+     * is provider-agnostic: every row is built from the snapshot, never from a
+     * provider-specific branch.
+     */
+    it("renders Inventory Sources as an expandable group, not a link (\u2298 a link cannot show the sources or carry per-source inline actions)", () => {
+      const roots = createProvider().getChildren();
+      const group = roots.find((r) => r instanceof InventorySourcesGroupItem) as InventorySourcesGroupItem;
+      expect(group).toBeDefined();
+      expect(group.label).toBe("Inventory Sources");
+      expect(group.collapsibleState).toBe(1);
+      expect((group.iconPath as { id: string }).id).toBe("server-environment");
+      expect(roots.filter((r) => r instanceof SettingsLinkItem).map((l) => l.label)).not.toContain("Inventory Sources");
     });
 
     it("does not keep Data Management as a root group", () => {
@@ -343,5 +387,130 @@ describe("SettingsTreeProvider", () => {
     });
 
     expect(listener).toHaveBeenCalledWith(undefined);
+  });
+  describe("inventory sources group", () => {
+    it("lists one row per source, in snapshot order, then a trailing Add row", () => {
+      const children = groupChildren(
+        providerWithSources([
+          { id: "s1", providerId: "netbox", name: "Prod NetBox" },
+          { id: "s2", providerId: "eve-ng", name: "Lab" }
+        ])
+      );
+      expect(children.map((c) => c.label)).toEqual(["Prod NetBox", "Lab", "Add Inventory Source\u2026"]);
+      expect(children.slice(0, 2).every((c) => c instanceof InventorySourceItem)).toBe(true);
+      expect((children[2] as SettingsLinkItem).command).toEqual({
+        command: "nexus.inventory.addSource",
+        title: "Add Inventory Source\u2026"
+      });
+    });
+
+    it("keeps the group — and its Add row — when there are no sources at all (\u2298 hiding an empty group is a dead end: the one thing to do here is add the first source)", () => {
+      const children = groupChildren(providerWithSources([]));
+      expect(children).toHaveLength(1);
+      expect(children[0].label).toBe("Add Inventory Source\u2026");
+    });
+
+    it("describes a row as \"{provider label} \u2014 {absolute last sync}\", resolving the label through the registry", () => {
+      const children = groupChildren(
+        providerWithSources([
+          { id: "s1", providerId: "eve-ng", name: "Lab", lastSyncAt: Date.now() - 3 * 60 * 60_000 },
+          { id: "s2", providerId: "netbox", name: "Prod" }
+        ])
+      );
+      // P2-1 \u2014 the row shows an ABSOLUTE timestamp, not a relative age, so it
+      // never freezes at a stale "synced Nh ago" (MINOR-8 suppresses the
+      // core-event refresh that a relative label would need).
+      expect((children[0] as InventorySourceItem).description).toMatch(/^EVE-NG \u2014 synced \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+      // \u2298 A row that omits the never-synced case reads as a source that
+      // is up to date, which is the opposite of what it is.
+      expect((children[1] as InventorySourceItem).description).toBe("NetBox \u2014 never synced");
+    });
+
+    /**
+     * P2-1 \u2014 the label must NOT drift as wall-clock time advances. MINOR-8's
+     * signature-gated refresh fires only when a source record changes, so a
+     * relative "synced Nh ago" would freeze at whatever it first rendered.
+     */
+    it("keeps the last-sync label stable as the clock advances (\u2298 a relative 'synced Nh ago' reads 'just now' at render and never updates, because no refresh fires until the source next changes)", () => {
+      vi.useFakeTimers();
+      try {
+        const syncedAt = new Date("2026-08-17T04:00:00Z").getTime();
+        const sources: FakeSource[] = [{ id: "s1", providerId: "eve-ng", name: "Lab", lastSyncAt: syncedAt }];
+
+        vi.setSystemTime(syncedAt);
+        const atSync = (groupChildren(providerWithSources(sources))[0] as InventorySourceItem).description;
+
+        vi.setSystemTime(syncedAt + 10 * 60 * 60_000);
+        const tenHoursLater = (groupChildren(providerWithSources(sources))[0] as InventorySourceItem).description;
+
+        expect(atSync).toBe(tenHoursLater);
+        expect(atSync).not.toMatch(/ago|just now/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("falls back to the raw providerId when the registry cannot resolve it \u2014 a source whose provider extension is not installed still has to be visible and removable", () => {
+      const children = groupChildren(providerWithSources([{ id: "s1", providerId: "acme-cmdb", name: "Legacy" }]));
+      expect((children[0] as InventorySourceItem).description).toBe("acme-cmdb \u2014 never synced");
+    });
+
+    it("opens the editor on click and carries the source id as the command argument, so the click edits THIS source rather than re-prompting (\u2298 an argument-less command falls through to the source picker)", () => {
+      const [row] = groupChildren(providerWithSources([{ id: "s1", providerId: "eve-ng", name: "Lab" }])) as InventorySourceItem[];
+      expect(row.sourceId).toBe("s1");
+      expect(row.command).toEqual({
+        command: "nexus.inventory.editSource",
+        title: "Edit Inventory Source",
+        arguments: ["s1"]
+      });
+    });
+
+    it("tags each row with the contextValue the inline Sync/Edit/Rules/Remove menu entries key on", () => {
+      const [row] = groupChildren(providerWithSources([{ id: "s1", providerId: "eve-ng", name: "Lab" }])) as InventorySourceItem[];
+      expect(row.contextValue).toBe("nexus.inventorySource");
+      expect((row.iconPath as { id: string }).id).toBe("server-environment");
+    });
+
+    it("refreshes when the inventory sources change, so a sync or a removal is reflected without reopening the view", () => {
+      const sources: FakeSource[] = [{ id: "s1", providerId: "eve-ng", name: "Lab" }];
+      const { core, fire } = makeCore(sources);
+      const provider = new SettingsTreeProvider(core as never, fakeRegistry as never);
+      const listener = vi.fn();
+      provider.onDidChangeTreeData(listener);
+      // A source's lastSyncAt is stamped by a sync — a real inventory change.
+      sources[0] = { ...sources[0], lastSyncAt: 123 };
+      fire();
+      expect(listener).toHaveBeenCalledWith(undefined);
+    });
+
+    /**
+     * MINOR-8 — the provider must NOT re-render on every unrelated core event.
+     * Subscribing to the whole `onDidChange` firehose meant a terminal or tunnel
+     * blink re-ran `getChildren` (a `getConfiguration` read per settings value
+     * row) many times a second while idle.
+     */
+    it("does NOT refresh when a core event leaves the inventory sources unchanged (⊘ firing on every core event re-renders the whole tree on each terminal/tunnel blink)", () => {
+      const sources: FakeSource[] = [{ id: "s1", providerId: "eve-ng", name: "Lab", lastSyncAt: 5 }];
+      const { core, fire } = makeCore(sources);
+      const provider = new SettingsTreeProvider(core as never, fakeRegistry as never);
+      const listener = vi.fn();
+      provider.onDidChangeTreeData(listener);
+      fire(); // unrelated core change; sources identical
+      fire();
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it("unsubscribes from core on dispose (\u2298 an un-disposed listener fires into a dead emitter for the rest of the session)", () => {
+      const { core, listenerCount } = makeCore([]);
+      const provider = new SettingsTreeProvider(core as never, fakeRegistry as never);
+      expect(listenerCount()).toBe(1);
+      provider.dispose();
+      expect(listenerCount()).toBe(0);
+    });
+
+    it("still renders the group with just the Add row when constructed without a core (the web-extension / test construction path)", () => {
+      const children = groupChildren(createProvider());
+      expect(children.map((c) => c.label)).toEqual(["Add Inventory Source\u2026"]);
+    });
   });
 });

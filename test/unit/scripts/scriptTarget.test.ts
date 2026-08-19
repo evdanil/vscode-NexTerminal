@@ -46,10 +46,10 @@ function makeDescriptor(overrides: Partial<ScriptTargetDescriptor> = {}): Script
 }
 
 interface MockSnapshot {
-  activeSessions: Array<{ id: string; serverId: string; terminalName: string }>;
+  activeSessions: Array<{ id: string; serverId: string; terminalName: string; protocol?: "ssh" | "telnet" }>;
   activeSerialSessions: Array<{ id: string; profileId: string; terminalName: string }>;
   activeLocalShellSessions?: Array<{ id: string; profileId: string; terminalName: string }>;
-  servers: Array<{ id: string; name: string }>;
+  servers: Array<{ id: string; name: string; protocol?: "ssh" | "telnet" }>;
   serialProfiles: Array<{ id: string; name: string }>;
   localShellProfiles?: Array<{ id: string; name: string }>;
 }
@@ -290,5 +290,189 @@ describe("scriptTarget / pickTarget", () => {
     expect(byDuplicateName?.id).toBe("local2");
     expect(quickPickCalls).toHaveLength(1);
     expect(quickPickCalls[0].items).toHaveLength(2);
+  });
+});
+
+describe("pickTarget — telnet sessions", () => {
+  /**
+   * TELNET (Phase 0) — a telnet session is an `ActiveSession` exactly like an
+   * SSH one; the ONLY thing separating them is the protocol on the server the
+   * session names. That is what makes these fixtures discriminating: a filter
+   * that keys off the collection (which is all it could do before) puts both
+   * sessions in both buckets and every assertion below fails.
+   */
+  const snapshot: MockSnapshot = {
+    activeSessions: [
+      { id: "ssh-1", serverId: "srv-ssh", terminalName: "Nexus SSH: prod" },
+      { id: "tel-1", serverId: "srv-tel", terminalName: "Nexus Telnet: eve-r1" }
+    ],
+    activeSerialSessions: [],
+    activeLocalShellSessions: [],
+    servers: [
+      { id: "srv-ssh", name: "prod" },
+      { id: "srv-tel", name: "eve-r1", protocol: "telnet" }
+    ],
+    serialProfiles: [],
+    localShellProfiles: []
+  };
+
+  it("offers only telnet sessions for @target-type telnet", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    const picked = await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot));
+
+    expect(picked?.id).toBe("tel-1");
+    expect(quickPickCalls[0].items.map((i) => i.sessionId)).toEqual(["tel-1"]);
+  });
+
+  it("excludes telnet sessions from @target-type ssh", async () => {
+    resetPicker();
+    pickBySessionId = "ssh-1";
+    await pickTarget(makeDescriptor({ targetType: "ssh" }), makeCore(snapshot));
+
+    expect(quickPickCalls[0].items.map((i) => i.sessionId)).toEqual(["ssh-1"]);
+  });
+
+  it("offers both when no target type is declared", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor(), makeCore(snapshot));
+
+    expect(quickPickCalls[0].items.map((i) => i.sessionId)).toEqual(["ssh-1", "tel-1"]);
+  });
+
+  it("labels a telnet candidate as Telnet", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot));
+
+    expect(quickPickCalls[0].items[0]).toEqual(
+      expect.objectContaining({ description: "Telnet • eve-r1" })
+    );
+  });
+
+  // ⊘ MINOR-6 (review) — the picked item's `targetKind` must come from the
+  // server's protocol, not from parsing the description string. Pinning it here
+  // is what stops a reworded picker label from silently reclassifying every
+  // telnet session as SSH.
+  it("tags each candidate with the protocol it was classified by", async () => {
+    resetPicker();
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor(), makeCore(snapshot));
+
+    const items = quickPickCalls[0].items as Array<{ sessionId: string; targetKind: string }>;
+    expect(items.find((i) => i.sessionId === "ssh-1")?.targetKind).toBe("ssh");
+    expect(items.find((i) => i.sessionId === "tel-1")?.targetKind).toBe("telnet");
+  });
+
+  it("tags a name-disambiguation candidate by protocol too", async () => {
+    resetPicker();
+    // Two sessions sharing a server NAME across protocols force the narrowed
+    // picker, which is the other place the kind was derived from display copy.
+    const shared: MockSnapshot = {
+      ...snapshot,
+      activeSessions: [
+        { id: "ssh-1", serverId: "srv-ssh", terminalName: "Nexus SSH: edge" },
+        { id: "tel-1", serverId: "srv-tel", terminalName: "Nexus Telnet: edge" }
+      ],
+      servers: [
+        { id: "srv-ssh", name: "edge" },
+        { id: "srv-tel", name: "edge", protocol: "telnet" }
+      ]
+    };
+    pickBySessionId = "tel-1";
+    await pickTarget(makeDescriptor({ targetProfile: "edge" }), makeCore(shared));
+
+    const items = quickPickCalls[0].items as Array<{ sessionId: string; targetKind: string }>;
+    expect(items.find((i) => i.sessionId === "ssh-1")?.targetKind).toBe("ssh");
+    expect(items.find((i) => i.sessionId === "tel-1")?.targetKind).toBe("telnet");
+  });
+
+  it("auto-picks a telnet session by server name", async () => {
+    resetPicker();
+    const picked = await pickTarget(
+      makeDescriptor({ targetType: "telnet", targetProfile: "eve-r1" }),
+      makeCore(snapshot)
+    );
+    expect(picked?.id).toBe("tel-1");
+    expect(quickPickCalls).toHaveLength(0);
+  });
+
+  it("reports the absence of telnet sessions in the message the user sees", async () => {
+    resetPicker();
+    await pickTarget(
+      makeDescriptor({ targetType: "telnet" }),
+      makeCore({ ...snapshot, activeSessions: [snapshot.activeSessions[0]] })
+    );
+    expect(errorMessages.join("\n")).toContain("Telnet");
+  });
+});
+
+/**
+ * P1-B (Codex) — a session's transport is fixed the moment it opens. Editing
+ * the server's Protocol afterwards must not reclassify a terminal that is
+ * already connected: the open SSH terminal is still speaking SSH, and offering
+ * it to a `@target-type telnet` script sends automation down the wrong
+ * transport (and vice versa).
+ */
+describe("pickTarget — classification follows the SESSION, not the live config", () => {
+  // ⊘ The config says telnet, the session says ssh. An implementation that
+  // reads `snapshot.servers[…].protocol` classifies this session as telnet and
+  // both assertions below flip.
+  it("keeps an SSH session SSH after its server is flipped to telnet", async () => {
+    resetPicker();
+    const snapshot: MockSnapshot = {
+      activeSessions: [{ id: "ssh-1", serverId: "srv-1", terminalName: "Nexus SSH: edge", protocol: "ssh" }],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      // The user edited the profile while the terminal stayed open.
+      servers: [{ id: "srv-1", name: "edge", protocol: "telnet" }],
+      serialProfiles: [],
+      localShellProfiles: []
+    };
+
+    pickBySessionId = "ssh-1";
+    expect((await pickTarget(makeDescriptor({ targetType: "ssh" }), makeCore(snapshot)))?.id).toBe("ssh-1");
+
+    resetPicker();
+    await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot));
+    expect(quickPickCalls).toHaveLength(0);
+    expect(errorMessages.join("\n")).toContain("Telnet");
+  });
+
+  it("keeps a telnet session telnet after its server is flipped to SSH", async () => {
+    resetPicker();
+    const snapshot: MockSnapshot = {
+      activeSessions: [{ id: "tel-1", serverId: "srv-1", terminalName: "Nexus Telnet: edge", protocol: "telnet" }],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      servers: [{ id: "srv-1", name: "edge" }],
+      serialProfiles: [],
+      localShellProfiles: []
+    };
+
+    pickBySessionId = "tel-1";
+    expect((await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot)))?.id).toBe("tel-1");
+
+    resetPicker();
+    await pickTarget(makeDescriptor({ targetType: "ssh" }), makeCore(snapshot));
+    expect(quickPickCalls).toHaveLength(0);
+  });
+
+  // Back-compat: a session registered without the field falls back to the
+  // server's configured protocol — today's behaviour for anything that has not
+  // been taught to stamp it.
+  it("falls back to the server's protocol when the session carries none", async () => {
+    resetPicker();
+    const snapshot: MockSnapshot = {
+      activeSessions: [{ id: "tel-1", serverId: "srv-1", terminalName: "Nexus Telnet: edge" }],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      servers: [{ id: "srv-1", name: "edge", protocol: "telnet" }],
+      serialProfiles: [],
+      localShellProfiles: []
+    };
+    pickBySessionId = "tel-1";
+    expect((await pickTarget(makeDescriptor({ targetType: "telnet" }), makeCore(snapshot)))?.id).toBe("tel-1");
   });
 });

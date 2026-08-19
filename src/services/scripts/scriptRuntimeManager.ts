@@ -3,14 +3,25 @@ import { Worker } from "node:worker_threads";
 import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
 import type { ActiveLocalShellSession, ActiveSession, ActiveSerialSession, SessionPtyHandle } from "../../models/config";
+import { resolveSessionProtocol } from "../../models/config";
 import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
 import { resolveScriptsDir } from "./resolveScriptsDir";
 import { resolveScriptDefaultTimeoutMs } from "./defaultTimeout";
+import { resolveScriptMaxReadBytes } from "./maxReadSize";
 import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGenerator";
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
+import { scriptFsExists, scriptFsReadText, type ScriptFsContext } from "./scriptFs";
+import {
+  createScriptIncludeState,
+  includeModuleDirOf,
+  includeModuleDisplayNameOf,
+  scriptIncludeLoad,
+  type ScriptIncludeState
+} from "./scriptInclude";
+import { SCRIPT_INCLUDE_ROOT_ID } from "./scriptTypes";
 import type {
   FailureReason,
   FinalState,
@@ -28,6 +39,16 @@ import type {
  * Error `code` values produced by well-behaved user scripts via the documented
  * runtime contract. These are *expected* errors and should not trigger a crash
  * toast in the UI — they're the mechanism by which scripts signal failure.
+ *
+ * `nexus.fs` error codes (`FileNotFound`, `PathOutsideScope`, `NotUtf8`, etc.)
+ * are deliberately NOT added here. `Timeout`/`ConnectionLost`/`Stopped`/
+ * `Cancelled` are cooperative control flow — the documented way well-behaved
+ * scripts end. An uncaught `nexus.fs` error means the script's assumptions
+ * about its environment are wrong (missing fixture, bad path literal, wrong
+ * encoding) — exactly the "bug in the script" class the toast exists for. A
+ * script that wants to branch on absence uses `exists()` or `try/catch`; a
+ * *caught* error never reaches the toast path, so the toast costs
+ * well-behaved scripts nothing.
  */
 const EXPECTED_ERROR_CODES = new Set(["Timeout", "ConnectionLost", "Stopped", "Cancelled"]);
 
@@ -65,6 +86,12 @@ interface RunningScriptRecord {
   id: string;
   scriptName: string;
   scriptPath: string;
+  /** The exact Uri the script was launched from — nexus.fs resolves against this. */
+  scriptUri: vscode.Uri;
+  /** undefined for `untitled:` scripts — every nexus.fs call throws NoScriptDir. */
+  scriptDirUri: vscode.Uri | undefined;
+  /** resolveScriptsDir() snapshotted at run start — decision 6: config changes never touch in-flight runs. */
+  scriptsRootUri: vscode.Uri | undefined;
   sessionId: string;
   sessionName: string;
   sessionType: ScriptTargetType;
@@ -73,6 +100,21 @@ interface RunningScriptRecord {
   currentOperation: ScriptRunOperation | null;
   outputBuffer: ScriptOutputBuffer;
   defaultTimeoutMs: number;
+  /**
+   * `nexus.scripts.maxReadSizeMb` resolved to bytes and snapshotted at run
+   * start — decision 6, same rule as `scriptsRootUri`/`defaultTimeoutMs`: a
+   * setting changed mid-run never moves the goalposts under a script that is
+   * already reading files against the cap it started with.
+   */
+  maxReadBytes: number;
+  /**
+   * This run's `nexus.include()` bookkeeping — module ids, resolved paths and
+   * display names. PER RUN, deliberately: the edit → run loop must pick up a
+   * library edit between runs, and a host-lived cache would serve stale module
+   * source for the rest of the session. Seeded with the entry script as
+   * `#root` at run start.
+   */
+  includeState: ScriptIncludeState;
   worker: WorkerLike;
   pendingRpcs: Map<number, PendingRpc>;
   observerSubscription?: vscode.Disposable;
@@ -121,6 +163,26 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   }
 
   public async runScript(uri: vscode.Uri, sessionId?: string): Promise<string | undefined> {
+    // Workspace Trust gate — the single choke point all five script-start entry
+    // points funnel through. Hard refuse, not a requestWorkspaceTrust() prompt:
+    // a trust prompt raised at the moment of running a script invites
+    // click-through on exactly the artifact (a workspace-supplied .js file)
+    // trust exists to protect against. `=== false` (not `!isTrusted`) keeps
+    // every existing unit/integration mock — none of which define `isTrusted`
+    // — behaving as trusted; real VS Code always supplies a boolean. Gated
+    // before maybeSeedWorkspaceTypes, which also writes to the workspace and
+    // must not run untrusted either.
+    if (vscode.workspace.isTrusted === false) {
+      const pick = await vscode.window.showErrorMessage(
+        "Nexus scripts are disabled in Restricted Mode — a script runs arbitrary JavaScript with your user permissions. Trust this workspace to run scripts.",
+        "Manage Workspace Trust"
+      );
+      if (pick === "Manage Workspace Trust") {
+        void vscode.commands.executeCommand("workbench.trust.manage");
+      }
+      return undefined;
+    }
+
     // US3: ensure IntelliSense scaffolding is in place in the workspace.
     await this.maybeSeedWorkspaceTypes();
 
@@ -167,14 +229,20 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     }
     const pty = target.session.pty;
 
-    const defaultTimeoutMs =
-      header.defaultTimeoutMs ??
-      resolveScriptDefaultTimeoutMs(vscode.workspace.getConfiguration("nexus.scripts"));
+    const scriptsConfig = vscode.workspace.getConfiguration("nexus.scripts");
+    const defaultTimeoutMs = header.defaultTimeoutMs ?? resolveScriptDefaultTimeoutMs(scriptsConfig);
+    // Snapshotted here, exactly once, for the reason `defaultTimeoutMs` and
+    // `scriptsRootUri` are (decision 6): every nexus.fs call this run makes is
+    // measured against the cap that was configured when it started.
+    const maxReadBytes = resolveScriptMaxReadBytes(scriptsConfig);
 
     const record: RunningScriptRecord = {
       id: randomUUID(),
       scriptName: displayName,
       scriptPath: uri.fsPath,
+      scriptUri: uri,
+      scriptDirUri: uri.scheme === "untitled" ? undefined : vscode.Uri.joinPath(uri, ".."),
+      scriptsRootUri: this.safeResolveScriptsRoot(),
       sessionId: target.session.id,
       sessionName: target.session.terminalName,
       sessionType: target.type,
@@ -183,6 +251,10 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       currentOperation: null,
       outputBuffer: new ScriptOutputBuffer(),
       defaultTimeoutMs,
+      maxReadBytes,
+      // Replaced immediately below, once `fsContextFor(record)` can close over
+      // the finished record.
+      includeState: undefined as unknown as ScriptIncludeState,
       worker: this.createWorker(),
       pendingRpcs: new Map(),
       inputLockHeld: false,
@@ -191,6 +263,12 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       cleanedUp: false,
       writeBack: (data: string) => pty.writeProgrammatic(data)
     };
+
+    // Seeded here (not lazily on the first include) so `#root`'s resolved path,
+    // directory and display name are snapshotted from the same launch Uri
+    // everything else about the run is, and so the `load` message below can
+    // name the entry script.
+    record.includeState = createScriptIncludeState(this.fsContextFor(record));
 
     record.observerSubscription = pty.addOutputObserver({
       onOutput: (text) => record.outputBuffer.append(text),
@@ -241,6 +319,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     record.worker.postMessage({
       kind: "load",
       source,
+      // The entry script's own `//# sourceURL`, so its stack frames name the
+      // file and its true lines instead of `<anonymous>` at +2.
+      displayName: includeModuleDisplayNameOf(record.includeState, SCRIPT_INCLUDE_ROOT_ID),
       session: {
         id: target.session.id,
         type: target.type,
@@ -343,6 +424,56 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     }
   }
 
+  /**
+   * `resolveScriptsDir` can touch config/workspace state, and a throwing
+   * config must not kill run start — a run with `scriptsRootUri: undefined`
+   * still has its own-dir nexus.fs scope (decision 4).
+   */
+  private safeResolveScriptsRoot(): vscode.Uri | undefined {
+    try {
+      return resolveScriptsDir(this.deps.globalStoragePath);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private fsContextFor(record: RunningScriptRecord): ScriptFsContext {
+    return {
+      scriptUri: record.scriptUri,
+      scriptDirUri: record.scriptDirUri,
+      scriptsRootUri: record.scriptsRootUri,
+      maxBytes: record.maxReadBytes,
+      log: (text: string) => this.logEvent(record, text),
+      // `cleanedUp` is cleanupRun's own idempotency guard — flipped at the
+      // very top, before anything else about the run's teardown happens — so
+      // reusing it here (rather than a parallel flag) means nexus.fs sees
+      // "this run is over" at exactly the moment the manager itself would say
+      // so, with nothing new to keep in sync. But `cleanedUp` alone misses a
+      // window: `stopScript` sets `record.stopReason` FIRST, then awaits an
+      // up-to-100ms grace race on `worker.terminate()`, and only calls
+      // `cleanupRun` (which flips `cleanedUp`) after that race settles. A read
+      // that gets granted its semaphore permit during that window would see
+      // `cleanedUp === false` and proceed with I/O for a run that's already
+      // been asked to stop. `stopReason` is set synchronously at the top of
+      // `stopScript`, before the race — checking it here closes that window.
+      isAborted: () => record.cleanedUp || record.stopReason !== undefined
+    };
+  }
+
+  /**
+   * The directory a `nexus.fs` call resolves relative paths against: the entry
+   * script's own (`undefined` — the unchanged Phase-1 path) when the call came
+   * from the entry script, or the including module's when `args[1]` names one.
+   *
+   * An id this run never minted throws `IncludeInternal` rather than falling
+   * back to the entry script: the worker is untrusted, so a stale or forged id
+   * is a protocol violation to report, not a default to guess at.
+   */
+  private includeBaseDirFor(record: RunningScriptRecord, moduleId: unknown): string | undefined {
+    if (moduleId === undefined) return undefined;
+    return includeModuleDirOf(record.includeState, moduleId);
+  }
+
   private basenameWithoutExt(fsPath: string): string {
     const name = fsPath.split(/[\\/]/).pop() ?? fsPath;
     return name.replace(/\.[^.]+$/, "");
@@ -353,12 +484,26 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   ): { type: ScriptTargetType; session: (ActiveSession | ActiveSerialSession | ActiveLocalShellSession) } | undefined {
     const snapshot = this.deps.core.getSnapshot();
     const ssh = snapshot.activeSessions.find((s) => s.id === sessionId);
-    if (ssh) return { type: "ssh", session: ssh };
+    // TELNET (Phase 0) — SSH and telnet sessions share `activeSessions`, so the
+    // type comes from the server the session names, never from the collection.
+    if (ssh) return { type: this.sessionProtocolType(ssh), session: ssh };
     const serial = snapshot.activeSerialSessions.find((s) => s.id === sessionId);
     if (serial) return { type: "serial", session: serial };
     const local = snapshot.activeLocalShellSessions.find((s) => s.id === sessionId);
     if (local) return { type: "local", session: local };
     return undefined;
+  }
+
+  /**
+   * The transport a live session is speaking. P1-B (Codex) — sourced from the
+   * SESSION's own stamp, not the server's current `protocol`: editing a profile
+   * while its terminal is open must not reclassify a connection that is already
+   * up, or a `@target-type telnet` script would be handed an SSH terminal (and
+   * the reverse) and would drive automation down the wrong transport.
+   */
+  private sessionProtocolType(session: ActiveSession): ScriptTargetType {
+    const server = this.deps.core.getSnapshot().servers.find((s) => s.id === session.serverId);
+    return resolveSessionProtocol(session, server) === "telnet" ? "telnet" : "ssh";
   }
 
   private validateExplicitTarget(
@@ -386,7 +531,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     target: { type: ScriptTargetType; session: ActiveSession | ActiveSerialSession | ActiveLocalShellSession }
   ): boolean {
     const snapshot = this.deps.core.getSnapshot();
-    if (target.type === "ssh") {
+    if (target.type === "ssh" || target.type === "telnet") {
       const session = target.session as ActiveSession;
       const serverName = snapshot.servers.find((server) => server.id === session.serverId)?.name;
       return session.serverId === targetProfile || serverName === targetProfile;
@@ -414,8 +559,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     if (!session) return undefined;
     // Classify by which active-session collection owns the picked id.
     const snapshot = this.deps.core.getSnapshot();
-    const kind: ScriptTargetType = snapshot.activeSessions.some((s) => s.id === session.id)
-      ? "ssh"
+    const sshSession = snapshot.activeSessions.find((s) => s.id === session.id);
+    const kind: ScriptTargetType = sshSession
+      ? this.sessionProtocolType(sshSession)
       : snapshot.activeSerialSessions.some((s) => s.id === session.id)
         ? "serial"
         : "local";
@@ -545,6 +691,12 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         for (const n of record.macroFilterInitial.denyList) record.macroFilter.deny(n);
         return undefined;
       }
+      case "fs.readText":
+        return scriptFsReadText(args[0], this.fsContextFor(record), this.includeBaseDirFor(record, args[1]));
+      case "fs.exists":
+        return scriptFsExists(args[0], this.fsContextFor(record), this.includeBaseDirFor(record, args[1]));
+      case "include.load":
+        return scriptIncludeLoad(args[0], args[1], this.fsContextFor(record), record.includeState);
       default:
         throw makeError("UnknownMethod", `Unknown script RPC method: ${method}`);
     }
@@ -871,6 +1023,7 @@ function patternToLabel(p: string | RegExp): string {
 
 function friendlyTargetType(type: ScriptTargetType): string {
   if (type === "ssh") return "SSH";
+  if (type === "telnet") return "Telnet";
   if (type === "serial") return "Serial";
   return "Local Shell";
 }

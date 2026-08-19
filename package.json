@@ -1,8 +1,8 @@
 {
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
-  "description": "Full SSH + serial + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.183",
+  "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox and EVE-NG inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
+  "version": "2.8.192",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -45,19 +45,19 @@
     "ssh client",
     "network engineer",
     "cisco",
+    "eve-ng",
+    "netbox",
     "serial console",
     "com port",
     "vscodium",
     "2fa",
     "socks5",
     "expect",
-    "sudo",
     "csv import",
     "bulk import",
     "macro",
     "automation",
-    "scripting",
-    "javascript"
+    "scripting"
   ],
   "main": "./dist/extension.js",
   "browser": "./dist/webExtension.js",
@@ -130,7 +130,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT…)](command:nexus.config.import)\n[Add Inventory Source (NetBox)](command:nexus.inventory.addSource)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Add Local Server Profile](command:nexus.localServer.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT…)](command:nexus.config.import)\n[Add Inventory Source](command:nexus.inventory.addSource)\n[Add SSH Server Profile](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Add Local Server Profile](command:nexus.localServer.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -713,7 +713,7 @@
       },
       {
         "command": "nexus.inventory.addSource",
-        "title": "Add Inventory Source (NetBox)",
+        "title": "Add Inventory Source",
         "category": "Nexus",
         "icon": "$(add)"
       },
@@ -736,9 +736,27 @@
         "icon": "$(sync)"
       },
       {
+        "command": "nexus.inventory.refreshStatus",
+        "title": "Refresh Lab Status",
+        "category": "Nexus",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "nexus.inventory.manage",
         "title": "Manage Inventory Sources",
         "category": "Nexus"
+      },
+      {
+        "command": "nexus.inventory.startNode",
+        "title": "Start Node",
+        "category": "Nexus",
+        "icon": "$(play)"
+      },
+      {
+        "command": "nexus.inventory.stopNode",
+        "title": "Stop Node",
+        "category": "Nexus",
+        "icon": "$(debug-stop)"
       },
       {
         "command": "nexus.settings.fixMacroKeybindings",
@@ -1263,22 +1281,22 @@
       "view/item/context": [
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline"
         },
         {
           "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline@2"
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline@1"
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "inline@2"
         },
         {
@@ -1303,132 +1321,172 @@
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect"
         },
         {
           "command": "nexus.server.runWithScript",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@3"
         },
         {
           "command": "nexus.server.runMacro",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/ && nexus.hasMacros",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/ && nexus.hasMacros",
           "group": "0_connect@5"
         },
         {
           "command": "nexus.server.connectBmcSol",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@6"
         },
         {
           "command": "nexus.server.openBmcWebConsole",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@7"
         },
         {
+          "command": "nexus.inventory.startNode",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.eveStopped$/",
+          "group": "00_power@1"
+        },
+        {
+          "command": "nexus.inventory.stopNode",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.eveRunning$/",
+          "group": "00_power@2"
+        },
+        {
           "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem == nexus.server",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@4"
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.server.edit",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.server.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.server.duplicate",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.files.browse",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serverConnected",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@4"
         },
         {
           "command": "nexus.server.deployKey",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@5"
         },
         {
           "command": "nexus.authProfile.applyToServer",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "1_manage@6"
         },
         {
           "command": "nexus.server.copyInfo",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.server.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
           "group": "3_destructive"
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "inline@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "inline@2"
         },
         {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "group": "inline@3"
+        },
+        {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.folderWithServers",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.group.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.group.add",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.profile.add",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.authProfile.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@4"
         },
         {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.inventory.editSource",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@2"
+        },
+        {
+          "command": "nexus.deviceTemplate.editRules",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@3"
+        },
+        {
+          "command": "nexus.inventory.removeSource",
+          "when": "view == nexusSettings && viewItem == nexus.inventorySource",
+          "group": "inline@4"
+        },
+        {
           "command": "nexus.deviceTemplate.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@5"
         },
         {
+          "command": "nexus.inventory.syncNow",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "group": "1_manage@6"
+        },
+        {
           "command": "nexus.group.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "3_destructive"
         },
         {
@@ -2383,8 +2441,20 @@
           "when": "true"
         },
         {
+          "command": "nexus.inventory.refreshStatus",
+          "when": "true"
+        },
+        {
           "command": "nexus.inventory.manage",
           "when": "true"
+        },
+        {
+          "command": "nexus.inventory.startNode",
+          "when": "false"
+        },
+        {
+          "command": "nexus.inventory.stopNode",
+          "when": "false"
         },
         {
           "command": "nexus.macro.editor",
@@ -3883,7 +3953,7 @@
               "description": "IPv4 addresses, optionally with a /prefix (e.g. 10.0.0.1/24), magenta."
             },
             {
-              "pattern": "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:(?!:)",
+              "pattern": "\\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){6}(?:\\d{1,3}\\.){3}\\d{1,3}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){0,4}:(?:\\d{1,3}\\.){3}\\d{1,3}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,6}(?::[0-9a-fA-F]{1,4}){1,6}\\b|::(?:[0-9a-fA-F]{1,4}:){0,5}(?:\\d{1,3}\\.){3}\\d{1,3}\\b|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:(?!:)",
               "color": "magenta",
               "flags": "g",
               "label": "IPv6 addresses",
@@ -4140,6 +4210,14 @@
           "order": 30,
           "markdownDescription": "Timeout in seconds for commands sent to the serial port sidecar process."
         },
+        "nexus.inventory.statusPollSeconds": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 3600,
+          "order": 10,
+          "markdownDescription": "How often (in seconds) to refresh EVE-NG lab running status while the Command Center is visible. `0` disables polling — use the **Refresh Lab Status** command manually. Only EVE-NG sources report status."
+        },
         "nexus.scripts.path": {
           "type": "string",
           "default": ".nexus/scripts",
@@ -4183,6 +4261,14 @@
           "maximum": 2147483647,
           "order": 24,
           "markdownDescription": "Legacy maximum total runtime for a script in milliseconds. Prefer `nexus.scripts.maxRuntimeSeconds`. 0 disables the cap."
+        },
+        "nexus.scripts.maxReadSizeMb": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 16,
+          "order": 25,
+          "markdownDescription": "Maximum size in MiB of a file a script may read through `nexus.fs.readText` / `nexus.fs.readJson`. Larger files are refused with `FileTooLarge`. Fractional values (e.g. `2.5`) are accepted via `settings.json`. The value is snapshotted when a script run starts — changing it does not affect scripts that are already running."
         },
         "nexus.settingsGuard.enabled": {
           "type": "boolean",
@@ -4393,7 +4479,7 @@
     "untrustedWorkspaces": {
       "supported": "limited",
       "restrictedConfigurations": [],
-      "description": "In Restricted Mode, Local Server Start/Restart commands are disabled and no arbitrary binaries are spawned. The embedded Network Servers (TFTP and DHCP) are disabled too: no privileged UDP ports are bound and no directory is served over the network. Viewing, editing, duplicating, renaming, and inspecting stopped profiles still work."
+      "description": "Nexus Terminal connects to remote systems with saved credentials and runs user-authored automation scripts with full user permissions. Scripts are disabled in Restricted Mode. Local Server Start/Restart commands are disabled and no arbitrary binaries are spawned. The embedded Network Servers (TFTP and DHCP) are disabled too: no privileged UDP ports are bound and no directory is served over the network. Viewing, editing, duplicating, renaming, and inspecting stopped profiles still work."
     }
   },
   "configurationDefaults": {

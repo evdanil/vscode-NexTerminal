@@ -1,4 +1,4 @@
-import type { FormDefinition, FormFieldDescriptor, VisibleWhen } from "./formTypes";
+import { ADVANCED_SECTION_LABEL, type FormDefinition, type FormFieldDescriptor, type VisibleWhen } from "./formTypes";
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
@@ -107,9 +107,12 @@ function renderField(field: FormFieldDescriptor): string {
 
     case "number": {
       const step = field.step !== undefined ? ` step="${field.step}"` : "";
+      const defaultsFrom = field.defaultsFrom
+        ? ` data-defaults-from='${escapeHtml(JSON.stringify(field.defaultsFrom))}'`
+        : "";
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}"${step} placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
+  <input type="number" id="${id}" name="${key}" value="${field.value ?? ""}" min="${field.min ?? ""}" max="${field.max ?? ""}"${step} placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${defaultsFrom} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }
@@ -233,7 +236,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   const basicFieldsHtml = basicFields.map(renderField).join("\n");
   const advancedFieldsHtml = advancedFields.length > 0
     ? `<details class="advanced-fields"${definition.expandAdvanced ? " open" : ""}>
-      <summary>Advanced options</summary>
+      <summary>${ADVANCED_SECTION_LABEL}</summary>
       ${advancedFields.map(renderField).join("\n      ")}
     </details>`
     : "";
@@ -642,6 +645,52 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         }
       }
       updateVisibility();
+
+      /* TELNET (Phase 0, MINOR-3) — a numeric field whose DEFAULT follows
+         another control (the server form's Port following Protocol: 22 for ssh,
+         23 for telnet).
+
+         P2-A (Codex) — the swap tracks whether the value is AUTO-DERIVED, not
+         whether it merely looks like a default. Asking "is this one of the
+         mapped defaults?" cannot tell a hand-set SSH-on-23 apart from the telnet
+         default, so a protocol round-trip silently rewrote it to 22 — breaking
+         the "hand-set values are retained" contract this hook is supposed to
+         keep. A value is auto-derived only if it matched the SOURCE'S OWN
+         default at render time, and it stops being auto the moment the user
+         types into the field. A dirty flag alone is not enough: the seeded value
+         is judged before any typing happens. */
+      var defaultsTargets = document.querySelectorAll("[data-defaults-from]");
+      for (var di = 0; di < defaultsTargets.length; di++) {
+        (function(input) {
+          var spec;
+          try {
+            spec = JSON.parse(input.dataset.defaultsFrom);
+          } catch (_error) {
+            return;
+          }
+          if (!spec || !spec.field || !spec.defaults) return;
+          var source = form.elements[spec.field];
+          if (!source) return;
+          /* Auto-derived iff the rendered value is exactly the default for the
+             protocol the form OPENED on. A telnet server on 23 is auto; an SSH
+             server on 23 is the user's own choice and is never touched again. */
+          var isAuto = String(input.value) === String(spec.defaults[source.value]);
+          input.addEventListener("input", function() { isAuto = false; });
+          input.addEventListener("change", function() { isAuto = false; });
+          var applyDefault = function() {
+            if (!isAuto) return;
+            var wanted = spec.defaults[source.value];
+            if (wanted === undefined) return;
+            if (String(input.value) !== String(wanted)) {
+              input.value = String(wanted);
+              /* Still auto: this write is the hook's own, not the user's. */
+              isAuto = true;
+            }
+          };
+          source.addEventListener("change", applyDefault);
+          source.addEventListener("input", applyDefault);
+        })(defaultsTargets[di]);
+      }
 
       form.addEventListener("submit", function(e) {
         e.preventDefault();

@@ -123,6 +123,73 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(makeProvider({ instanceKey: 42 as never }))).toThrow(/instanceKey/);
   });
 
+  // fetchStatus provider capability (Phase 2) — the twin of the instanceKey
+  // clause. OPTIONAL, so absence is not an error (NetBox never implements it); a
+  // non-function value under that name IS an error, loudly, for the same reason
+  // instanceKey's is: a typo'd `fetchStatus: {...}` would otherwise be
+  // indistinguishable at runtime from a provider that never declared one, and the
+  // symptom (status silently never refreshing) is invisible until a user wonders
+  // why their running labs are not highlighted.
+  it("accepts a provider with NO fetchStatus — it is optional (kills making it required, which would break every provider that only supplies inventory)", () => {
+    const provider = makeProvider();
+    expect(provider.fetchStatus).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("accepts a provider WITH a function fetchStatus", () => {
+    const provider = makeProvider({ fetchStatus: async () => ({ contractVersion: 1, statuses: {} }) });
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function fetchStatus loudly (kills a silent degrade for a typo'd `fetchStatus` that is not callable)", () => {
+    expect(() => validateProviderShape(makeProvider({ fetchStatus: "http://eve" as never }))).toThrow(/fetchStatus/);
+    expect(() => validateProviderShape(makeProvider({ fetchStatus: 42 as never }))).toThrow(/fetchStatus/);
+  });
+
+  // controlNode provider capability (Phase 4) — the twin of the fetchStatus
+  // clause. OPTIONAL (only EVE-NG implements node control); a non-function value
+  // under that name IS an error, loudly, for the same reason fetchStatus's is: a
+  // typo'd `controlNode` would otherwise be indistinguishable at runtime from a
+  // provider that never declared one, and the symptom (Start/Stop silently doing
+  // nothing) is invisible until a user wonders why a node never boots.
+  it("accepts a provider with NO controlNode — it is optional (kills making it required, which would break every provider that offers no node control)", () => {
+    const provider = makeProvider();
+    expect(provider.controlNode).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("accepts a provider WITH a function controlNode", () => {
+    const provider = makeProvider({ controlNode: async () => {} });
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function controlNode loudly (kills a silent degrade for a typo'd `controlNode` that is not callable)", () => {
+    expect(() => validateProviderShape(makeProvider({ controlNode: "start" as never }))).toThrow(/controlNode/);
+    expect(() => validateProviderShape(makeProvider({ controlNode: 42 as never }))).toThrow(/controlNode/);
+  });
+
+  // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
+  // the field contract now, so a malformed one must be caught at the
+  // registration boundary rather than silently coerced when the Add form reads
+  // it as `defaultValue === true`.
+  it("rejects a non-boolean defaultValue (⊘ a string/number defaultValue reaches the form and is coerced, so a documented default of \"yes\" silently becomes unchecked)", () => {
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean", defaultValue: "yes" as never }] }))
+    ).toThrow(/"flag".*non-boolean defaultValue/i);
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean", defaultValue: 1 as never }] }))
+    ).toThrow(/"flag".*non-boolean defaultValue/i);
+  });
+
+  it("accepts a boolean field with a real boolean defaultValue, and one with none", () => {
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean", defaultValue: true }] }))
+    ).not.toThrow();
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean" }] }))
+    ).not.toThrow();
+  });
+
   // SELECT OPTIONS VALIDATION (PR #64 Codex review round 1, P2 — issue #48 PR-E).
   // `type:"select"` reached VALID_FIELD_TYPES without any check on `options`, so a
   // third-party provider could register a select with no/empty/malformed options —

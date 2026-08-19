@@ -28,7 +28,12 @@ const VALID_COLORS = new Set([
   "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightMagenta", "brightCyan", "brightWhite"
 ]);
 
-const VALID_FLAGS_RE = /^[gi]*$/;
+/**
+ * The flags alphabet a rule may use. Exported for highlightRuleUpgrade, whose
+ * flags normalisation must accept exactly what this module tolerates and
+ * `compileRule` runs (an invalid string falls back to "gi" in both places).
+ */
+export const VALID_FLAGS_RE = /^[gi]*$/;
 const MAX_RULES = 100;
 const MAX_PATTERN_LENGTH = 500;
 const MAX_LABEL_LENGTH = 100;

@@ -41,7 +41,7 @@ function tree(devices: InventoryDevice[]): InventoryTree {
 }
 
 function ownedServer(overrides: Partial<ServerConfig> = {}, origin: Partial<ServerOrigin> = {}): ServerConfig {
-  return {
+  const merged: ServerConfig = {
     id: deterministicServerId("source-1", overrides.origin?.externalId ?? "device:1"),
     name: "core-sw-1",
     host: "10.0.0.1",
@@ -53,6 +53,20 @@ function ownedServer(overrides: Partial<ServerConfig> = {}, origin: Partial<Serv
     origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, ...origin },
     ...overrides
   };
+  // PRIMARY HOST/PORT (task #29) — a real synced server OWNS its address, so seed
+  // syncedHost/syncedPort to match its own host/port (when unset and addressed).
+  // Without this these template fixtures would see a spurious matrix-row-5a
+  // stamp-only update (a legacy server gaining its host stamp) and their
+  // "unchanged" assertions would fail for a reason unrelated to templates.
+  if (merged.origin && merged.host !== "") {
+    if (merged.origin.syncedHost === undefined) {
+      merged.origin = { ...merged.origin, syncedHost: merged.host };
+    }
+    if (merged.origin.syncedPort === undefined && merged.port !== 0) {
+      merged.origin = { ...merged.origin, syncedPort: merged.port };
+    }
+  }
+  return merged;
 }
 
 function template(fields: DeviceTemplateProfile["fields"], id = "tmpl-1", name = "T"): DeviceTemplateProfile {
@@ -377,7 +391,10 @@ describe("device template auth cascade — §4.4", () => {
       expect(p.warnings.some((w) => w.includes("device template") && w.includes('"B"'))).toBe(true);
     }
 
-    // Unmapped-pass variant: the device is present but endpoint-less this fetch.
+    // ADDRESSLESS (Fable P1-B) — variant: the device is present but endpoint-less
+    // this fetch, so its owned server DOWNGRADES to an addressless placeholder. The
+    // keyless-key link is rolled back IN the downgrade, exactly as the post-loop
+    // pass would for a skipped device — not deferred.
     const unmapped = plan({
       source: makeSource({ templateRules: [rule("tmpl-1")] }),
       devices: [makeDevice({ endpoints: [] })],
@@ -385,7 +402,10 @@ describe("device template auth cascade — §4.4", () => {
       templates: [template({ authProfileId: { mode: "fill", value: "B" } })],
       authProfiles: [keylessB]
     });
-    expect(afterFor(unmapped, linkedB.id)!.authProfileId).toBeUndefined();
+    const uAfter = afterFor(unmapped, linkedB.id)!;
+    expect(uAfter.addressless).toBe(true);
+    expect(uAfter.authProfileId).toBeUndefined();
+    expect(uAfter.origin?.syncedAuthProfileId).toBeUndefined();
   });
 
   it("Fixture 14c — a RETAINED sync-owned link (its rule gone) to a now-keyless profile is rolled back; a hand link is NOT (kills a scan drawn only from current rules, and one that forgets to stay sync-owned)", () => {
@@ -462,15 +482,22 @@ describe("device template auth cascade — §4.4", () => {
         authProfile: keylessS
       });
 
-    for (const kEndpointless of [false, true]) {
-      const p = runWith(kEndpointless);
-      expect(afterFor(p, kId)!.authProfileId).toBeUndefined(); // K unlinked
-      expect((afterFor(p, xId) ?? X).authProfileId).toBe("S"); // X retains (own key)
-      // No NEW link to S stamped anywhere (AUTH 1b still refuses the keyless stamp).
-      expect(p.adds.every((a) => a.authProfileId !== "S")).toBe(true);
-      // Warning names S with the SOURCE referrer wording ("servers this source creates").
-      expect(p.warnings.some((w) => w.includes('"S"') && w.includes("servers this source creates"))).toBe(true);
-    }
+    // MAPPED: K has an endpoint → the mapped AUTH 2b unlinks its keyless link.
+    const mapped = runWith(false);
+    expect(afterFor(mapped, kId)!.authProfileId).toBeUndefined(); // K unlinked
+    expect((afterFor(mapped, xId) ?? X).authProfileId).toBe("S"); // X retains (own key)
+    expect(mapped.adds.every((a) => a.authProfileId !== "S")).toBe(true);
+    expect(mapped.warnings.some((w) => w.includes('"S"') && w.includes("servers this source creates"))).toBe(true);
+
+    // ADDRESSLESS (Fable P1-B): K has no endpoint → it DOWNGRADES to an addressless
+    // placeholder and its keyless link is rolled back IN the downgrade (parity with
+    // the post-loop pass), not deferred. X (own key, still mapped) is unaffected.
+    const addressless = runWith(true);
+    const kAfter = afterFor(addressless, kId)!;
+    expect(kAfter.addressless).toBe(true);
+    expect(kAfter.authProfileId).toBeUndefined();
+    expect(kAfter.origin?.syncedAuthProfileId).toBeUndefined();
+    expect((afterFor(addressless, xId) ?? X).authProfileId).toBe("S");
   });
 
   it("Fixture 14d — a sync-time OVERRIDE move onto a keyless profile is judged PER TARGET: own-key moves, no-own-key stays + warns; a FILL rule never stamps it (kills the blanket per-profile refusal and its 'generalize onto fill' inverse)", () => {
@@ -2159,5 +2186,77 @@ describe("Round 10 — GATEWAY PART 2 handles a KEPT server's detached formerlyS
     expect(
       p.warnings.some((w) => /IPMI gateway/i.test(w) && /will not survive this sync/.test(w) && /was removed/.test(w))
     ).toBe(true);
+  });
+});
+
+/**
+ * ADDRESSLESS + TEMPLATES (Codex P2-a) — an addressless placeholder (no ssh/telnet
+ * primary, e.g. a redfish/IPMI-only device) must still flow through the per-device
+ * template cascade. The OOB-oriented fields it holds (ipmiAuthProfileId,
+ * ipmiGatewayServerId) don't need a console address, so a template that sets them
+ * must take effect on the placeholder immediately, under the SAME templated-stamp
+ * ownership the addressed path uses. Before the fix the addressless branch
+ * `continue`d before the cascade ever ran, so these never applied.
+ */
+describe("addressless placeholders flow through the template cascade (P2-a)", () => {
+  it("(a) a NEW addressless redfish device gets the template's ipmiAuthProfileId + ipmiGatewayServerId, stamped (⊘ the addressless branch continues before the cascade, so the placeholder is created with neither)", () => {
+    const GW_ID = deterministicServerId("source-1", "device:gw");
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [
+        makeDevice({ externalId: "device:redfish", name: "bmc-only", endpoints: [{ kind: "redfish", host: "10.9.9.9" }] }),
+        makeDevice({ externalId: "device:gw", name: "gw", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] }) // live gateway target
+      ],
+      templates: [
+        template({
+          ipmiAuthProfileId: { mode: "override", value: "ap-bmc" },
+          ipmiGatewayServerId: { mode: "override", value: GW_ID }
+        })
+      ],
+      authProfiles: [authProfile("ap-bmc")]
+    });
+    const added = p.adds.find((s) => s.origin?.externalId === "device:redfish")!;
+    expect(added.addressless).toBe(true);
+    expect(added.host).toBe("");
+    expect(added.ipmiAuthProfileId).toBe("ap-bmc");
+    expect(added.ipmiGatewayServerId).toBe(GW_ID);
+    expect(added.origin?.templated?.ipmiAuthProfileId).toBe("ap-bmc");
+    expect(added.origin?.templated?.ipmiGatewayServerId).toBe(GW_ID);
+  });
+
+  it("(b) an EXISTING addressless server receives a CHANGED template value under the stamp (⊘ the downgrade/stay path skips the matrix, so a later template change never reaches the placeholder)", () => {
+    const before = ownedServer(
+      { host: "", port: 0, addressless: true, ipmiAuthProfileId: "ap-old" },
+      { templated: { ipmiAuthProfileId: "ap-old" }, syncedProtocol: undefined } // sync-owned: value === stamp
+    );
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] })], // device:1 stays addressless
+      servers: [before],
+      templates: [template({ ipmiAuthProfileId: { mode: "override", value: "ap-new" } })],
+      authProfiles: [authProfile("ap-old"), authProfile("ap-new")]
+    });
+    expect(p.updates).toHaveLength(1);
+    const after = p.updates[0].after;
+    expect(after.addressless).toBe(true);
+    expect(after.ipmiAuthProfileId).toBe("ap-new");
+    expect(after.origin?.templated?.ipmiAuthProfileId).toBe("ap-new");
+  });
+
+  it("(c) a HAND-EDITED templated field on an addressless server is NOT stomped by a template override (⊘ applying the value regardless of the stamp overwrites the user's edit)", () => {
+    const before = ownedServer(
+      { host: "", port: 0, addressless: true, ipmiAuthProfileId: "ap-hand" },
+      { templated: undefined, syncedProtocol: undefined } // hand value, NO stamp (row 7)
+    );
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] })],
+      servers: [before],
+      templates: [template({ ipmiAuthProfileId: { mode: "override", value: "ap-tmpl" } })],
+      authProfiles: [authProfile("ap-hand"), authProfile("ap-tmpl")]
+    });
+    const after = p.updates[0]?.after ?? before;
+    expect(after.ipmiAuthProfileId).toBe("ap-hand");
+    expect(after.origin?.templated?.ipmiAuthProfileId).toBeUndefined();
   });
 });

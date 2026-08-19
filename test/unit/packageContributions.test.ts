@@ -32,6 +32,86 @@ describe("package contributions", () => {
     expect(packageJson.activationEvents).toContain("onUri");
   });
 
+  /**
+   * EVE-NG (Phase 1) — a SECOND inventory provider ships, so the entry points
+   * into the add-source flow are provider-agnostic. Naming one provider in
+   * them tells a user looking for the other that the feature is not there.
+   */
+  describe("provider-agnostic inventory entry points", () => {
+    it("titles nexus.inventory.addSource without naming a provider (\u2298 \"Add Inventory Source (NetBox)\" reads as NetBox-only to an EVE-NG user)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title;
+      expect(title).toBe("Add Inventory Source");
+    });
+
+    it("offers the same neutral wording in the Command Center welcome view", () => {
+      const welcome = packageJson.contributes.viewsWelcome?.find((w) => w.view === "nexusCommandCenter")?.contents ?? "";
+      expect(welcome).toContain("[Add Inventory Source](command:nexus.inventory.addSource)");
+      expect(welcome).not.toMatch(/NetBox/i);
+    });
+  });
+
+  /**
+   * EVE-NG (Phase 1) — the Settings tree's per-source rows. Without these
+   * entries the rows render but carry no actions, which is most of the point
+   * of showing them at all.
+   */
+  describe("inventory source row actions", () => {
+    const rowMenus = () =>
+      (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexus.inventorySource") && (m.when ?? "").includes("nexusSettings")
+      );
+
+    it("binds Sync / Edit / Template Rules / Remove inline on an inventory source row (\u2298 rows with no actions leave every operation behind the QuickPick hub they replace)", () => {
+      expect(rowMenus().map((m) => m.command).sort()).toEqual([
+        "nexus.deviceTemplate.editRules",
+        "nexus.inventory.editSource",
+        "nexus.inventory.removeSource",
+        "nexus.inventory.syncNow"
+      ]);
+    });
+
+    it("puts them in the `inline` group so they render as row buttons rather than hiding in the right-click menu", () => {
+      expect(rowMenus().every((m) => (m.group ?? "").startsWith("inline"))).toBe(true);
+    });
+
+    it("matches the row contextValue EXACTLY, so the group row and unrelated tree items never inherit these actions", () => {
+      for (const menu of rowMenus()) {
+        expect(menu.when).toContain("viewItem == nexus.inventorySource");
+      }
+      expect(rowMenus()).not.toHaveLength(0);
+    });
+  });
+
+  /**
+   * EVE-NG (Phase 1) — documentation coverage. The provider's two sharp edges
+   * (telnet-only consoles, Community-certified) are things a user hits during
+   * setup, not afterwards, so they have to be written down.
+   */
+  describe("EVE-NG documentation", () => {
+    it("documents the EVE-NG source in the functional docs, including the telnet-console requirement and the Pro stance", () => {
+      expect(functionalDocs).toContain("EVE-NG");
+      expect(functionalDocs).toMatch(/consoleHost/);
+      expect(functionalDocs).toMatch(/includeStopped/);
+      expect(functionalDocs).toMatch(/Community/);
+      expect(functionalDocs).toMatch(/preliminary/i);
+    });
+
+    it("mentions EVE-NG in the README as a second inventory source", () => {
+      expect(readme).toMatch(/EVE-NG/);
+    });
+
+    it("does not tell the reader to run a command title that no longer exists (\u2298 docs pinned to \"Add Inventory Source (NetBox)\" send an EVE-NG user looking for a NetBox-only command)", () => {
+      const staleTitle = "Add Inventory Source (NetBox)";
+      expect(readme).not.toContain(staleTitle);
+      expect(functionalDocs).not.toContain(staleTitle);
+    });
+
+    it("documents the Settings tree's per-source rows", () => {
+      expect(functionalDocs).toMatch(/Inventory Sources/);
+      expect(functionalDocs).toMatch(/nexus\.inventorySource/);
+    });
+  });
+
   it("includes serialport runtime dependency", () => {
     expect(packageJson.dependencies.serialport).toBeDefined();
   });
@@ -50,7 +130,10 @@ describe("package contributions", () => {
     expect(menuCommands).toContain("nexus.tunnel.edit");
     expect(menuCommands).toContain("nexus.serial.edit");
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.sessionNode"))).toBe(true);
-    expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.serverConnected"))).toBe(true);
+    // BMC gating (Phase 2) broadened the connected-server menus to also match the
+    // .ipmi variant; node control (Phase 4) broadened them again to tolerate the
+    // optional .eveRunning/.eveStopped group, so the assertion follows the new form.
+    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
@@ -88,12 +171,12 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem == nexus.server",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem == nexus.server",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
         group: "0_connect@4"
       }),
       expect.objectContaining({
@@ -140,6 +223,15 @@ describe("package contributions", () => {
     const item = paletteMenu.find((entry) => entry.command === "nexus.profile.actions");
     expect(item).toBeDefined();
     expect(item?.when).toBe("false");
+  });
+
+  it("H1 — hides the state-conditional Start/Stop Node commands from the command palette (⊘ palette-visible, they always error there — Start only makes sense on a stopped EVE node, Stop only on a running one, so a generic picker would let you 'start' a running node)", () => {
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    for (const command of ["nexus.inventory.startNode", "nexus.inventory.stopNode"]) {
+      const item = paletteMenu.find((entry) => entry.command === command);
+      expect(item, command).toBeDefined();
+      expect(item?.when, command).toBe("false");
+    }
   });
 
   it("contributes settings.openPanel command", () => {
@@ -462,6 +554,24 @@ describe("package contributions", () => {
       expect(packageJson.contributes.configuration?.properties?.["nexus.scripts.defaultTimeout"]).toBeUndefined();
     });
 
+    it("contributes the configurable nexus.fs read cap with its documented bounds", () => {
+      // ⊘ registering the setting with no bounds (or the wrong ones): VS Code's
+      // settings UI would then offer values the resolver silently clamps away,
+      // and the two would disagree about what is configurable.
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxReadSizeMb"];
+      expect(prop).toBeDefined();
+      expect(prop?.type).toBe("number");
+      expect(prop?.default).toBe(4);
+      expect(prop?.minimum).toBe(1);
+      expect(prop?.maximum).toBe(16);
+      const description = prop?.markdownDescription || prop?.description || "";
+      expect(description).toMatch(/nexus\.fs\.readText/);
+      expect(description).toMatch(/MiB|MB/);
+      // The snapshot-at-run-start semantics are load-bearing for users: a
+      // change made while a script is running does not apply to it.
+      expect(description).toMatch(/start/i);
+    });
+
     it("keeps legacy maxRuntimeMs compatible and allows 0", () => {
       const prop = packageJson.contributes.configuration?.properties?.["nexus.scripts.maxRuntimeMs"];
       expect(prop).toBeDefined();
@@ -585,18 +695,411 @@ describe("package contributions", () => {
       }
     });
 
-    it("places them on server items UNCONDITIONALLY, matching the existing anchored contextValue regex", () => {
-      // B5 — the server item's `contextValue` is matched by ~15 anchored `when`
-      // regexes, so expressing "this server has a BMC" would mean a new variant
-      // and a rewrite of all of them. The standing rule is "pickers flag, menus
-      // don't hide": an unconfigured server gets an actionable refusal instead.
+    // BMC-menu gating (task #27, Phase 2) — the two BMC entries now require the
+    // `.ipmi` contextValue marker, so they show ONLY on a server that actually
+    // has an ipmiHost. Every OTHER server menu was broadened with an optional
+    // `(\.ipmi)?` so a BMC server keeps all its ordinary actions.
+    function viewItemRegex(when?: string): RegExp | null {
+      const m = /viewItem =~ \/(.+?)\/(?=\s|$)/.exec(when ?? "");
+      return m ? new RegExp(m[1]) : null;
+    }
+
+    it("gates both BMC entries on the .ipmi marker: shown for a server WITH ipmiHost, hidden for one without (⊘ offering BMC on a server with no ipmiHost is an action that can only fail)", () => {
       const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
       for (const id of ids) {
         const entry = menuItems.find((item) => item.command === id);
         expect(entry, id).toBeDefined();
-        expect(entry!.when).toBe("view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?$/");
         expect(entry!.group).toMatch(/^0_connect@/);
+        const re = viewItemRegex(entry!.when);
+        expect(re, id).not.toBeNull();
+        // The .ipmi variants match; the plain (no-BMC) contextValues do not.
+        expect(re!.test("nexus.server.ipmi"), id).toBe(true);
+        expect(re!.test("nexus.serverConnected.ipmi"), id).toBe(true);
+        expect(re!.test("nexus.server"), id).toBe(false);
+        expect(re!.test("nexus.serverConnected"), id).toBe(false);
       }
+    });
+
+    // P2-4 — AFFIRMATIVE per-entry table. For every server-scoped
+    // view/item/context entry, assert EXACTLY which of the four server
+    // contextValues it must and must-not match, driven off the real package.json.
+    // This kills the dangerous over-narrowing the one-directional check let
+    // through: shrinking nexus.server.edit to `.ipmi`-only (hiding Edit on every
+    // normal server) fails here, as does reverting any broadened entry to a
+    // base-only regex or dropping `.ipmi` off a BMC entry.
+    it("matches exactly the intended subset of {server, serverConnected, .ipmi, .eve* variants} for each server menu, and never a non-server contextValue (M10 + the #83/#28 hazard die)", () => {
+      // NODE CONTROL (task #28) — the four base contextValues plus every EVE
+      // node-control variant `nexus.server[Connected][.ipmi][.eveRunning|.eveStopped]`.
+      // Broadening the ~20 anchored server-menu regexes to TOLERATE the optional
+      // eve group is load-bearing: without it an EVE node (whose contextValue now
+      // carries the marker) loses EVERY context action — the exact #83 failure
+      // mode. This affirmative both-directions table is what pins it: a regex that
+      // fails to match a value its command must offer, OR matches one it must not,
+      // fails here.
+      const BASE = ["nexus.server", "nexus.serverConnected", "nexus.server.ipmi", "nexus.serverConnected.ipmi"];
+      const EVE = [
+        "nexus.server.eveRunning", "nexus.server.eveStopped",
+        "nexus.serverConnected.eveRunning", "nexus.serverConnected.eveStopped",
+        "nexus.server.ipmi.eveRunning", "nexus.server.ipmi.eveStopped",
+        "nexus.serverConnected.ipmi.eveRunning", "nexus.serverConnected.ipmi.eveStopped"
+      ];
+      const SERVER_VALUES = [...BASE, ...EVE];
+
+      // Intent-driven category predicates — deliberately NOT the regexes under
+      // test, so a regex mutated to agree with itself still fails the table.
+      const DISCONNECTED = SERVER_VALUES.filter((v) => !v.includes("Connected"));
+      const CONNECTED = SERVER_VALUES.filter((v) => v.includes("Connected"));
+      const IPMI_ONLY = SERVER_VALUES.filter((v) => v.includes(".ipmi"));
+      const ALL = SERVER_VALUES;
+      const EVE_STOPPED = SERVER_VALUES.filter((v) => v.endsWith(".eveStopped"));
+      const EVE_RUNNING = SERVER_VALUES.filter((v) => v.endsWith(".eveRunning"));
+
+      // Sanity on the fixtures themselves: the eve variants must actually widen
+      // each category (a table that silently lost them would be vacuous).
+      expect(DISCONNECTED).toHaveLength(6);
+      expect(CONNECTED).toHaveLength(6);
+      expect(IPMI_ONLY).toHaveLength(6);
+      expect(EVE_STOPPED).toEqual([
+        "nexus.server.eveStopped", "nexus.serverConnected.eveStopped",
+        "nexus.server.ipmi.eveStopped", "nexus.serverConnected.ipmi.eveStopped"
+      ]);
+      expect(EVE_RUNNING).toHaveLength(4);
+
+      const NON_SERVER = [
+        "nexus.folder", "nexus.folderWithServers", "nexus.macro", "nexus.serialProfile",
+        "nexus.serialProfileConnected", "nexus.inventorySource", "nexus.sessionNode",
+        "nexus.localShellProfile", "nexus.localShellProfileConnected",
+        // near-misses that the `$` anchor must reject
+        "nexus.serverFoo", "nexus.server.ipmi.extra", "nexus.serverConnectedX",
+        // eve near-misses — the optional group must be EXACT and stay in order
+        "nexus.server.eve", "nexus.server.eveRunningX", "nexus.server.eveStopped.extra",
+        "nexus.serverConnected.ipmi.eveStopped.extra",
+        // eve BEFORE ipmi is the wrong order — the fixed composition must reject it
+        "nexus.server.eveStopped.ipmi"
+      ];
+
+      // command|group → the contextValues that entry MUST match (and only those).
+      const EXPECTED: Record<string, string[]> = {
+        "nexus.server.connect|inline": DISCONNECTED,
+        "nexus.server.testConnection|inline@2": DISCONNECTED,
+        "nexus.server.connect|inline@1": CONNECTED,
+        "nexus.server.disconnect|inline@2": CONNECTED,
+        "nexus.server.connect|0_connect": DISCONNECTED,
+        "nexus.server.runWithScript|0_connect@3": ALL,
+        "nexus.server.runMacro|0_connect@5": ALL,
+        "nexus.server.connectBmcSol|0_connect@6": IPMI_ONLY,
+        "nexus.server.openBmcWebConsole|0_connect@7": IPMI_ONLY,
+        "nexus.inventory.startNode|00_power@1": EVE_STOPPED,
+        "nexus.inventory.stopNode|00_power@2": EVE_RUNNING,
+        "nexus.server.testConnection|0_connect@4": DISCONNECTED,
+        "nexus.server.connect|0_connect@1": CONNECTED,
+        "nexus.server.disconnect|0_connect@2": CONNECTED,
+        "nexus.server.edit|1_manage@1": ALL,
+        "nexus.server.rename|1_manage@2": ALL,
+        "nexus.server.duplicate|1_manage@3": ALL,
+        "nexus.files.browse|1_manage@4": CONNECTED,
+        "nexus.server.deployKey|1_manage@5": ALL,
+        "nexus.authProfile.applyToServer|1_manage@6": ALL,
+        "nexus.server.copyInfo|2_clipboard": ALL,
+        "nexus.server.remove|3_destructive": ALL
+      };
+
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      // Every Command Center view/item/context entry whose viewItem clause targets
+      // a server contextValue (regex form — after Phase 2 no server menu uses `==`).
+      const serverMenus = menuItems.filter(
+        (m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem =~ /^nexus\\.server")
+      );
+
+      // No server menu may still pin an exact `== nexus.server[...]` (would miss .ipmi).
+      expect(menuItems.filter((m) => (m.when ?? "").includes("viewItem == nexus.server")).map((m) => m.command)).toEqual([]);
+
+      // The set of entries present must be EXACTLY the table's keys — a newly
+      // added server menu on the wrong form, or a missing one, fails here.
+      const presentKeys = serverMenus.map((m) => `${m.command}|${m.group}`).sort();
+      expect(presentKeys).toEqual(Object.keys(EXPECTED).sort());
+
+      for (const m of serverMenus) {
+        const key = `${m.command}|${m.group}`;
+        const expected = EXPECTED[key];
+        const re = viewItemRegex(m.when);
+        expect(re, key).not.toBeNull();
+        for (const value of SERVER_VALUES) {
+          expect(re!.test(value), `${key} vs ${value}`).toBe(expected.includes(value));
+        }
+        for (const value of NON_SERVER) {
+          expect(re!.test(value), `${key} must not match ${value}`).toBe(false);
+        }
+      }
+    });
+  });
+
+
+  /**
+   * PER-SOURCE SYNC ON THE FOLDER ROW (follow-up #43) — the `.syncSource` marker
+   * is an OPTIONAL SUFFIX on a Command Center folder's contextValue, the same
+   * shape `.eveRunning`/`.eveStopped` take on a server's. That only works if
+   * every existing folder `when` clause tolerates it: an entry left on the old
+   * `== nexus.folderWithServers` or the old `/^nexus\.folder(WithServers)?$/`
+   * would silently vanish from exactly the folders this feature marks — a lab's
+   * root folder losing Connect, Rename and Remove.
+   *
+   * The table below is the whole contract, and it is checked in BOTH directions:
+   * every ordinary folder entry must match all four folder values, and the new
+   * inline sync entry must match ONLY the two marked ones.
+   */
+  describe("Folder contextValue markers (follow-up #43)", () => {
+    function viewItemRegexFor(when?: string): RegExp | null {
+      const m = /viewItem =~ \/(.+?)\/(?=\s|$)/.exec(when ?? "");
+      return m ? new RegExp(m[1]) : null;
+    }
+
+    const FOLDER_VALUES = ["nexus.folder", "nexus.folderWithServers", "nexus.folder.syncSource", "nexus.folderWithServers.syncSource"];
+    // Intent-driven, not copied from the regexes under test.
+    const MARKED = FOLDER_VALUES.filter((v) => v.endsWith(".syncSource"));
+    const WITH_SERVERS = FOLDER_VALUES.filter((v) => v.startsWith("nexus.folderWithServers"));
+
+    // Values NO Command Center folder entry may match. `nexus.folder.macros` is
+    // the one that matters most: the Macros view reuses FolderTreeItem with its
+    // own contextValue, and a marker group loose enough to swallow it would put
+    // Connect/Rename/Sync onto macro folders.
+    const NON_FOLDER = [
+      "nexus.folder.macros",
+      "nexus.scriptFolder",
+      "nexus.server",
+      "nexus.inventorySource",
+      // near-misses the anchors must reject
+      "nexus.folderX",
+      "nexus.folder.syncSourceX",
+      "nexus.folderWithServers.syncSource.extra",
+      "nexus.folder.macros.syncSource"
+    ];
+
+    it("every Command Center folder menu entry tolerates the optional .syncSource marker, and none of them matches a Macros/Scripts folder (⊘ leaving one matcher un-widened strips that action from every source-target folder)", () => {
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      const folderMenus = menuItems.filter(
+        (m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem =~ /^nexus\\.folder")
+      );
+      expect(folderMenus.length).toBeGreaterThan(0);
+      // No COMMAND CENTER folder entry may still pin an exact `== nexus.folder…`
+      // — that form cannot carry the marker at all. (The Macros view's entries
+      // legitimately keep theirs; they are pinned to `nexus.folder.macros`,
+      // asserted separately below.)
+      expect(
+        menuItems
+          .filter((m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem == nexus.folder"))
+          .map((m) => m.command)
+      ).toEqual([]);
+
+      // command|group → the folder values that entry MUST match, and only those.
+      const EXPECTED: Record<string, string[]> = {
+        "nexus.group.connect|inline@1": WITH_SERVERS,
+        "nexus.group.disconnect|inline@2": WITH_SERVERS,
+        "nexus.inventory.syncNow|inline@3": MARKED,
+        "nexus.inventory.syncNow|1_manage@6": MARKED,
+        "nexus.group.connect|0_connect@1": WITH_SERVERS,
+        "nexus.group.disconnect|0_connect@2": WITH_SERVERS,
+        "nexus.group.rename|1_manage@1": FOLDER_VALUES,
+        "nexus.group.add|1_manage@2": FOLDER_VALUES,
+        "nexus.profile.add|1_manage@3": FOLDER_VALUES,
+        "nexus.authProfile.applyToFolder|1_manage@4": FOLDER_VALUES,
+        "nexus.deviceTemplate.applyToFolder|1_manage@5": FOLDER_VALUES,
+        "nexus.group.remove|3_destructive": FOLDER_VALUES
+      };
+      expect(folderMenus.map((m) => `${m.command}|${m.group}`).sort()).toEqual(Object.keys(EXPECTED).sort());
+
+      for (const m of folderMenus) {
+        const key = `${m.command}|${m.group}`;
+        const re = viewItemRegexFor(m.when);
+        expect(re, key).not.toBeNull();
+        for (const value of FOLDER_VALUES) {
+          expect(re!.test(value), `${key} vs ${value}`).toBe(EXPECTED[key].includes(value));
+        }
+        for (const value of NON_FOLDER) {
+          expect(re!.test(value), `${key} must not match ${value}`).toBe(false);
+        }
+      }
+    });
+
+    it("the folder sync action reuses nexus.inventory.syncNow with its $(sync) icon and sits AFTER the two connection actions in the inline row (⊘ a second command, or an ordinal before connect/disconnect, reshuffles icons users already know)", () => {
+      const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.syncNow");
+      expect(command?.icon).toBe("$(sync)");
+      const entries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter")
+      );
+      expect(entries.some((m) => m.group === "inline@3")).toBe(true);
+    });
+
+    /**
+     * The inline icon is HOVER-ONLY discoverability. Every other folder action
+     * — Connect and Disconnect included, which are contributed TWICE for exactly
+     * this reason — is also reachable by right-click, so the one action a marked
+     * folder was marked FOR must be too.
+     *
+     * `1_manage`, last: a sync is not a connection action (it opens no session,
+     * and it marks folders with no direct servers at all, where `0_connect` is
+     * empty), and `1_manage` already holds the bulk record-rewriting actions
+     * (Apply Auth Profile, Apply Device Template) that, like a sync, rewrite the
+     * servers UNDER the folder rather than the folder itself. Appending at @6
+     * leaves every-folder ordinals @1..@5 untouched, so a marked folder adds a
+     * row at the end of the management band instead of displacing anything.
+     */
+    it("also contributes Sync Inventory Now to the right-click menu, last in 1_manage, on the same marked-folder matcher as the inline icon (⊘ inline-only leaves the row's whole reason for existing on hover)", () => {
+      const contextEntries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter") && !(m.group ?? "").startsWith("inline")
+      );
+      expect(contextEntries).toHaveLength(1);
+      const entry = contextEntries[0];
+      expect(entry.group).toBe("1_manage@6");
+      // Strictly after every action an UNMARKED folder already shows in the
+      // group, so the marker only ever appends.
+      const manageOrdinals = (packageJson.contributes.menus["view/item/context"] ?? [])
+        .filter(
+          (m) =>
+            (m.when ?? "").includes("nexusCommandCenter") &&
+            (m.when ?? "").includes("viewItem =~ /^nexus\\.folder") &&
+            (m.group ?? "").startsWith("1_manage@") &&
+            m.command !== "nexus.inventory.syncNow"
+        )
+        .map((m) => Number((m.group ?? "").split("@")[1]));
+      expect(manageOrdinals.length).toBeGreaterThan(0);
+      expect(Math.max(...manageOrdinals)).toBeLessThan(6);
+      // The same matcher the inline icon uses: marked folders only, and never a
+      // Macros folder. (The EXPECTED table above checks this exhaustively; this
+      // asserts the two entries cannot drift apart.)
+      const inlineEntry = (packageJson.contributes.menus["view/item/context"] ?? []).find(
+        (m) => m.command === "nexus.inventory.syncNow" && m.group === "inline@3"
+      );
+      expect(entry.when).toBe(inlineEntry?.when);
+    });
+
+    it("keeps the Macros view's own folder entries pinned to nexus.folder.macros, untouched by the widening (⊘ a shared matcher would cross the two views' folder rows)", () => {
+      const macroFolderMenus = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexusMacros") && (m.when ?? "").includes("nexus.folder")
+      );
+      expect(macroFolderMenus.length).toBeGreaterThan(0);
+      expect(macroFolderMenus.every((m) => (m.when ?? "").includes("viewItem == nexus.folder.macros"))).toBe(true);
+    });
+  });
+  describe("Live lab status (Phase 2)", () => {
+    it("contributes nexus.inventory.refreshStatus as a palette-invocable Nexus command", () => {
+      const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.refreshStatus");
+      expect(command).toBeDefined();
+      expect(command?.category).toBe("Nexus");
+      expect(command?.title).toBeTruthy();
+
+      const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+      const paletteEntry = paletteMenu.find((item) => item.command === "nexus.inventory.refreshStatus");
+      expect(paletteEntry).toBeDefined();
+      expect(paletteEntry?.when).not.toBe("false");
+    });
+
+    /**
+     * FOLLOW-UP #42 — Refresh Lab Status is GONE from the Command Center's `...`
+     * menu. A sync now brings lab status current by itself, so a second,
+     * non-standard entry sitting permanently in the hub's menu — visible even to
+     * a user with no EVE-NG source at all — was buying nothing. The command
+     * itself stays, on the Command Palette, for a status-only refresh between
+     * syncs.
+     */
+    it("does NOT put Refresh Lab Status in the Command Center title menu — a sync refreshes lab status, so the standalone entry does not earn a permanent seat there (⊘ leaving it shows a non-standard action to every user, EVE-NG source or not)", () => {
+      const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
+      expect(titleMenuItems.filter((item) => item.command === "nexus.inventory.refreshStatus")).toHaveLength(0);
+      // The COMMAND and its palette entry are deliberately untouched — this
+      // removed a menu seat, not the feature.
+      expect(packageJson.contributes.commands.some((item) => item.command === "nexus.inventory.refreshStatus")).toBe(true);
+      const paletteEntry = (packageJson.contributes.menus.commandPalette ?? []).find(
+        (item) => item.command === "nexus.inventory.refreshStatus"
+      );
+      expect(paletteEntry).toBeDefined();
+      expect(paletteEntry?.when).not.toBe("false");
+    });
+
+    it("does NOT add refreshStatus to the inventory-source row inline group, keeping those rows' four actions intact", () => {
+      const rowMenus = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
+        (m) => (m.when ?? "").includes("nexus.inventorySource") && (m.when ?? "").includes("nexusSettings")
+      );
+      expect(rowMenus.map((m) => m.command)).not.toContain("nexus.inventory.refreshStatus");
+    });
+
+    it("contributes nexus.inventory.statusPollSeconds as an integer setting defaulting to 0 (off), bounded 0..3600", () => {
+      // ⊘ registering it only in SETTINGS_META: VS Code's settings.json UI would
+      // not know the key, and the poll timer in extension.ts reads it via
+      // workspace.getConfiguration — an unregistered key returns undefined and the
+      // poll never arms.
+      const prop = packageJson.contributes.configuration?.properties?.["nexus.inventory.statusPollSeconds"];
+      expect(prop).toBeDefined();
+      expect(prop?.type).toBe("integer");
+      expect(prop?.default).toBe(0);
+      expect(prop?.minimum).toBe(0);
+      expect(prop?.maximum).toBe(3600);
+      const description = prop?.markdownDescription || prop?.description || "";
+      expect(description).toMatch(/0 disables|0 = off|disables/i);
+    });
+
+    it("documents the live-status feature, the poll setting, and the BMC-menu gating in the functional docs and README", () => {
+      expect(functionalDocs).toContain("nexus.inventory.statusPollSeconds");
+      expect(functionalDocs).toMatch(/Refresh Lab Status/);
+      expect(functionalDocs).toMatch(/Live lab status/i);
+      // BMC-menu gating note.
+      expect(functionalDocs).toMatch(/ipmiHost/);
+      expect(functionalDocs).toMatch(/connectBmcSol|BMC menu gating/);
+      expect(readme).toMatch(/Refresh Lab Status/);
+    });
+
+    it("documents that a completed sync now updates lab status, and stops telling the user to click a title-bar button that is gone (\u2298 docs that still describe the removed menu seat send the user hunting for it)", () => {
+      expect(functionalDocs).toMatch(/A completed sync updates every EVE-NG node's running\/stopped state/);
+      // The status report is built from the UNFILTERED node list, so
+      // `Include Stopped Nodes` never makes it partial. The report's OWN
+      // raw-node cap does — a claim of a different kind ("we stopped looking, so
+      // absence proves nothing"), which the docs have to name as such rather
+      // than let it collapse back into the retired filter rule.
+      expect(functionalDocs).toMatch(/counted over the RAW nodes reached, not the devices kept/);
+      expect(functionalDocs).toMatch(/`Include Stopped Nodes` is deliberately NOT one of those stopping points/);
+      // The retired rule — the FILTER as a reason the report is partial — must
+      // not come back in either of the wordings that carried it.
+      expect(functionalDocs).not.toMatch(/marks it `truncated` for \*\*two\*\* reasons/);
+      expect(functionalDocs).not.toMatch(/\*\*Include Stopped Nodes is off\*\*/);
+      // ...and "exactly one reason" is no longer true either.
+      expect(functionalDocs).not.toMatch(/marks it `truncated` for exactly \*\*one\*\* reason/);
+      expect(functionalDocs).not.toMatch(/Available from the palette and as a Command Center title action/);
+      expect(readme).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
+    });
+
+    /**
+     * A sync CAN mint a fresh `revision`: the fingerprint restamp (first sync of
+     * a source with none stored, or one past a confirmed provider change) writes
+     * through `addOrUpdateInventorySource`, the only place a live record's
+     * revision is ever minted. The docs claimed the epoch was the ONLY apply
+     * check a sync moves — true of a routine sync, false in general, and the
+     * kind of absolute a later reader would build on.
+     */
+    it("does not claim a sync NEVER mints a revision — the fingerprint restamp does, and the docs name it (\u2298 the absolute reads as a guarantee the restamp path breaks)", () => {
+      expect(functionalDocs).not.toMatch(/the epoch is the only one of the apply's three checks that a sync moves/);
+      expect(functionalDocs).toMatch(/A sync that RESTAMPS the provider fingerprint is the exception/);
+      // Both sentences say the same thing: the qualification is "routine", and
+      // "routine" is defined rather than assumed.
+      expect(functionalDocs).toMatch(/one that does not restamp the provider fingerprint/);
+      expect(functionalDocs).not.toMatch(/A sync belongs to no sweep, and a routine sync touches only/);
+    });
+
+    /**
+     * The claim the sync's apply invalidates is "this source's status is
+     * PARTIAL", so only a COMPLETE apply makes it false. The docs used to say
+     * the sync's apply deletes the entry, full stop — which describes a sync
+     * whose own report is truncated silencing a warning that is still true of
+     * the screen the user is looking at. And the raw-node status cap, the one
+     * stopping point that deliberately leaves the tree's `truncated` alone, now
+     * has to name itself rather than rely on anything downstream noticing.
+     */
+    it("says the sync's apply invalidates the partial-status claim only when its OWN report is complete, and that the raw-node status cap warns for itself (\u2298 documenting an unconditional deletion teaches the silent-partial behaviour as intended, \u2298 leaving the cap undocumented leaves it looking like the silent stopping point it was)", () => {
+      expect(functionalDocs).toMatch(/but only when the report that sync just applied is itself COMPLETE/);
+      expect(functionalDocs).toMatch(/The deletion is WITHHELD when the sync's own report is truncated/);
+      // The unconditional wording, which said the sync's apply deletes the entry
+      // full stop, must not come back.
+      expect(functionalDocs).not.toMatch(/the \*\*sync's\*\* apply DELETES the source's entry\. A sync belongs to no sweep/);
+      expect(functionalDocs).toMatch(/the cap \*\*pushes its own sync warning\*\*/);
+      expect(functionalDocs).toMatch(/suppressed when the crawl was already truncated/);
     });
   });
 
@@ -1144,8 +1647,12 @@ describe("terminal output performance defaults", () => {
     }
 
     it("ships the IPv6 and UUID rules disabled by default — the two most expensive patterns", () => {
-      const ipv6Rule = defaultRules.find((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"));
-      const uuidRule = defaultRules.find((rule) => rule.pattern.includes("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}"));
+      // Located by label, not by a fragment of the regex: the IPv6 pattern was
+      // rewritten in v2.8.187 to stop truncating compressed addresses, and a
+      // structural finder silently returned undefined (making every assertion
+      // below vacuous) rather than failing loudly.
+      const ipv6Rule = defaultRules.find((rule) => rule.label === "IPv6 addresses");
+      const uuidRule = defaultRules.find((rule) => rule.label === "UUIDs");
       expect(ipv6Rule).toBeDefined();
       expect(uuidRule).toBeDefined();
       expect(ipv6Rule?.enabled).toBe(false);
@@ -1162,7 +1669,7 @@ describe("terminal output performance defaults", () => {
     });
 
     describe("IPv6 pattern coverage (trailing compression, PR #72)", () => {
-      const ipv6Rule = defaultRules.find((rule) => rule.pattern.includes("{1,4}(?::[0-9a-fA-F]{1,4}){7}"))!;
+      const ipv6Rule = defaultRules.find((rule) => rule.label === "IPv6 addresses")!;
 
       it("is defined", () => {
         expect(ipv6Rule).toBeDefined();
@@ -1179,14 +1686,22 @@ describe("terminal output performance defaults", () => {
       });
 
       it("matches a mixed compressed+trailing address (2001:db8::1) in full, not truncated at the ::", () => {
-        // The new trailing-compression alternative is appended LAST in the
-        // alternation, so a complete form like "2001:db8::1" must still be
-        // consumed whole by an earlier alternative rather than stopping short
-        // at "2001:db8::" via the new one.
+        // The trailing-compression alternative is LAST in the alternation, so a
+        // complete form like "2001:db8::1" must still be consumed whole by an
+        // earlier alternative rather than stopping short at "2001:db8::".
         const re = new RegExp(ipv6Rule.pattern, ipv6Rule.flags ?? "g");
         const match = re.exec("2001:db8::1");
         expect(match).not.toBeNull();
         expect(match![0]).toBe("2001:db8::1");
+      });
+
+      it("matches multi-hextet compressed addresses whole (v2.8.187 truncation fix)", () => {
+        // Both historical patterns allowed exactly ONE hextet after "::", so
+        // this address highlighted as "fe80::b3ff". The full matrix lives in
+        // highlightIpv6Default.test.ts; this row keeps the defaults suite
+        // honest about the bug the pattern was rewritten for.
+        const re = new RegExp(ipv6Rule.pattern, ipv6Rule.flags ?? "g");
+        expect(re.exec("fe80::b3ff:fe1e:8329")?.[0]).toBe("fe80::b3ff:fe1e:8329");
       });
 
       it("does NOT match the bare all-zeros :: (a C++/Ruby scope operator in real terminal output) or std::map", () => {

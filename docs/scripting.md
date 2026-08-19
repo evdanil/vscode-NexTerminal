@@ -13,6 +13,8 @@ Nexus Scripts let you automate multi-step terminal procedures in plain JavaScrip
   - [Polling](#polling)
   - [Interacting with the user](#interacting-with-the-user)
   - [Utility](#utility)
+  - [Reading files — nexus.fs](#reading-files--nexusfs)
+  - [Modular scripts — nexus.include](#modular-scripts--nexusinclude)
   - [Macro coordination](#macro-coordination)
   - [Session metadata](#session-metadata)
 - [Error handling](#error-handling)
@@ -133,7 +135,7 @@ Every field except `@nexus-script` is optional.
 | `@nexus-script` | flag — no value | — | Required marker. Files without this are not Nexus scripts. |
 | `@name` | single-line string | filename without `.js` | Display name in tree, CodeLens, picker, and status bar. |
 | `@description` | single-line string | empty | Shown as tooltip in the sidebar. |
-| `@target-type` | `ssh`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. |
+| `@target-type` | `ssh`, `telnet`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. `ssh` and `telnet` are distinct — a telnet session is never offered to an `ssh` script, or the other way round. Classification follows the transport the session was **opened** on, not the profile's current setting, so editing a server's Protocol while its terminal is open does not reclassify a terminal already running. |
 | `@target-profile` | server name, serial profile name, Local Shell profile name, or matching id | none | When a session of this profile is active, it's auto-selected without showing the picker. Duplicate names are disambiguated with a narrowed picker. |
 | `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeoutSeconds` (30s) | Used by `waitFor`/`expect`/`waitAny` when no per-call `timeout` is provided. |
 | `@lock-input` | flag — no value | absent (terminal stays interactive) | Makes the bound terminal read-only for the run. User keystrokes are discarded with a one-shot notice line. |
@@ -142,7 +144,7 @@ Every field except `@nexus-script` is optional.
 ### Header validation
 
 - Unknown `@<tag>` names produce a warning in the Output Channel — the script still loads.
-- Invalid values for `@target-type` (not `ssh` / `serial` / `local`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
+- Invalid values for `@target-type` (not `ssh` / `telnet` / `serial` / `local`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
 - Duplicate fields are tolerated: the first occurrence wins and a warning is logged — **except `@allow-macros`, which concatenates** so you can spread a long allow-list across multiple lines.
 - Only the first JSDoc block in the file is examined.
 
@@ -344,6 +346,166 @@ log.error("auth failed for", session.name);
 
 `log` is not async — it doesn't block the script. Password values entered through `prompt(msg, { password: true })` are excluded from log events; any other values you pass to `log.*` are written verbatim — don't log secrets.
 
+### Reading files — nexus.fs
+
+`nexus.fs` is the supported way for a script to read files: read-only, scoped, size-capped, and every access is logged. It's the alternative to the unsupported `await import("node:fs")` path described in [Security and trust](#security-and-trust).
+
+#### `nexus.fs.readText(path)` → `Promise<string>`
+
+Read a UTF-8 text file. Throws on failure — see the error table below.
+
+```js
+const banner = await nexus.fs.readText("./banner.txt");
+log.info(banner);
+```
+
+#### `nexus.fs.readJson<T>(path)` → `Promise<T>`
+
+`readText` + `JSON.parse`. A malformed file throws a `SyntaxError` with `code: "InvalidJson"` whose message names the requested path. Defaults to `Promise<any>`, so property access on the result type-checks without a cast; pass a type argument for a typed result.
+
+```js
+const config = await nexus.fs.readJson("./devices.json");
+for (const device of config.devices) {
+  // ...
+}
+```
+
+#### `nexus.fs.exists(path)` → `Promise<boolean>`
+
+`true` for any entry at the scoped path — file or directory. An out-of-scope path **throws** rather than returning `false`: there's no existence oracle outside the scope, so `exists` and `readText` fail the same way for a path you shouldn't be probing. A probe the filesystem never answers throws too (see **Deadline** below), and so does one it *refuses* — no permission to look, an erroring or unavailable filesystem provider — which throws `ReadFailed`. Only a genuine "nothing is there" answers `false`, so `false` always means "checked, nothing there", never "couldn't tell".
+
+```js
+if (await nexus.fs.exists("./credentials.json")) {
+  const creds = await nexus.fs.readJson("./credentials.json");
+}
+```
+
+**Path resolution.** A relative path resolves against **this script's own directory** — not the current working directory, not the workspace root. A resolved path is legal if it lands inside either of two roots:
+
+- the script's own directory (and its subtree), or
+- the configured Nexus scripts folder (`nexus.scripts.path`, default `.nexus/scripts`) and its subtree — whether or not the script itself lives there.
+
+Both `..` traversal and absolute paths are accepted, as long as the *result* lands inside one of those two roots — `nexus.fs.readText("../shared/vars.json")` is fine if `../shared` is still under the scripts folder. A script run from outside the scripts folder entirely (e.g. the editor CodeLens on an arbitrary `.js` file) can still read its own folder subtree and the scripts folder — just nothing else. An `untitled:` script (unsaved editor buffer) has no on-disk folder, so every `nexus.fs` call throws `NoScriptDir` until you save it.
+
+**Limits.** Files over the configured read cap — `nexus.scripts.maxReadSizeMb`, default **4 MiB**, settable between 1 and 16 MiB — throw `FileTooLarge`, normally without the file being read at all, since the size is checked first. The cap is snapshotted when a run starts, so changing the setting doesn't move the limit under a script that is already running. A FileSystemProvider that misreports a file's size is still caught, just one step later, by a second check against the actual bytes read. Non-UTF-8 content throws `NotUtf8`.
+
+**Deadline.** A `nexus.fs` call never blocks longer than **30 seconds**. The limit is fixed (not configurable) and covers the **whole call**, measured from the moment your script makes it: both `readText` (its stat + read) and `exists` (its stat), *and* any time spent waiting for a slot when several `nexus.fs` calls are in flight at once. Reads and existence probes are each throttled and bounded the same way, on separate pools — a fan-out of `exists()` calls never waits behind slow reads, and never consumes the reads' capacity either. A call that never gets a slot is bounded exactly like one whose provider never answers. When the limit expires — a hung remote filesystem provider, a `file:` path on a dead network mount; neither offers any way to cancel an in-flight call — the call throws `ReadFailed` with a message ending in `timed out after 30s`. A timeout is never reported as a missing file, an empty read, or a `false` from `exists()`: "I couldn't tell" and "it's definitely not there" justify opposite actions in a script, so they get different outcomes.
+
+**Logging.** Every call — success or refusal — writes a line to the **Nexus Scripts** Output Channel with the resolved path (successes also include the byte count). The one exception is a call whose 30-second deadline fires *after* its run was already stopped — that run's log has ended, so the timeout isn't appended to it.
+
+**Error codes:**
+
+| `err.code` | Thrown by | When |
+|---|---|---|
+| `"NoScriptDir"` | any `nexus.fs.*` call | The script is an unsaved `untitled:` buffer with no folder on disk. |
+| `"InvalidPath"` | any `nexus.fs.*` call | The path is empty, not a string, contains a NUL byte, or (Windows) is drive-relative (`"C:file.txt"`). |
+| `"PathOutsideScope"` | any `nexus.fs.*` call | The resolved path lands outside both allowed roots. |
+| `"FileNotFound"` | `readText` | Nothing exists at the path, or it's a directory. |
+| `"FileTooLarge"` | `readText` | The file is bigger than the run's effective cap (`nexus.scripts.maxReadSizeMb`, default 4 MiB). `err.sizeBytes` / `err.maxBytes` carry the numbers — `sizeBytes` is a lower bound when the true size could not be determined (a file that grew mid-read, or a provider that under-reported it, reports the cap + 1). |
+| `"NotUtf8"` | `readText` | The bytes aren't valid UTF-8. |
+| `"ReadFailed"` | `readText`, `exists` | The path resolved and passed the size check, but the read (or `exists`'s probe) itself failed — permissions, a misbehaving remote filesystem provider — or the operation timed out (30 seconds; see **Deadline** above). A failed `exists` probe throws this rather than answering `false`. |
+| `"InvalidJson"` | `readJson` | The file read fine but isn't valid JSON. A `SyntaxError`, not a plain `Error`. |
+
+`exists()` throws `NoScriptDir` / `InvalidPath` / `PathOutsideScope` under the same conditions as `readText`, plus `ReadFailed` when its probe fails outright (permissions, a provider error) or exceeds the 30-second deadline. It returns a plain boolean only when the filesystem actually answered.
+
+An uncaught `nexus.fs` error is **not** one of the [expected error codes](#error-handling) — it toasts, the same as a syntax error would. If your script wants to branch on "this file might not be there", use `exists()` or wrap the call in `try/catch`.
+
+### Modular scripts — nexus.include
+
+`await nexus.include(path)` loads another `.js` file as a module and resolves to its exports. It is the supported way to split a long script into files, and the alternative to the `import` / `require` statements that a script body cannot use.
+
+```js
+// .nexus/scripts/lib/helpers.js — a plain .js file, NO @nexus-script marker
+exports.login = async (user) => {
+  await sendLine(user);
+  await expect(/Password: $/);
+};
+exports.VERSION = "1.0";
+```
+
+```js
+/**
+ * @nexus-script
+ * @name deploy
+ */
+const helpers = await nexus.include("./lib/helpers.js");
+await helpers.login("admin");
+```
+
+**Three ways to export**, in precedence order:
+
+| The module does | `include()` resolves to |
+|---|---|
+| `module.exports = something` | `something` — a reassigned `module.exports` always wins |
+| `exports.a = 1; exports.b = 2` | the exports object, `{ a: 1, b: 2 }` |
+| `return { retry, backoff }` | the returned value — used **only** when `exports` was never touched and `module.exports` was never reassigned |
+| none of the above | `{}` (never `undefined`) |
+
+The `return` form works because a module body genuinely *is* an async function body here, the same as a script body. A module that both touches `exports` and returns something keeps the CommonJS meaning: the returned value is ignored.
+
+**Relative paths resolve against the file they are written in.** This is the rule for `nexus.include` *and* for `nexus.fs` inside an included file — so `lib/helpers.js` doing `nexus.fs.readText("./banner.txt")` reads `lib/banner.txt`, and a library folder that ships its own data files works no matter which script includes it. Nesting works the same way: an included file may include its own siblings, up to 16 levels deep.
+
+**What may be included:**
+
+- The specifier must be an explicit path ending in `.js` — case-insensitive. There is no implicit extension, no `index.js` directory resolution, no `node_modules` lookup and no bare specifiers, so "why did it load *that* file" is never a question. Data files go through `nexus.fs.readText` / `nexus.fs.readJson`; asking `include` for one throws `InvalidPath` and says so.
+- **A library must not carry `@nexus-script`.** That marker means "entry point" — it is what the Scripts view, the CodeLens and the picker key on — so including a marked file throws `IncludeIsScript`. The flip side is the useful half: an unmarked `.js` file next to your scripts never appears in the Scripts view, the CodeLens or any picker. Nothing else is needed to keep libraries out of the UI.
+- Header directives inside an included file (`@lock-input`, `@allow-macros`, `@target-type`, `@default-timeout`) are **never** honoured. Only the entry script's header is parsed; an included file must not be able to unlock the terminal or re-enable macros behind the entry script's back.
+- Inside an included file, `module`, `exports` and `nexus` are function parameters — don't re-declare them with `const`/`let` (a `var` is fine). Doing so is a compile error (`Identifier 'nexus' has already been declared`) with no line number, like any syntax error. This matters when moving code out of an entry script, where `const nexus = …` is legal shadowing.
+- Containment is unchanged: the resolved path must land inside the scripts folder or the entry script's own folder, exactly like `nexus.fs`. An `untitled:` (unsaved) script has no folder, so every include throws `NoScriptDir`.
+
+**Loaded once per run.** Modules whose source was delivered are loaded at most once per run — later includes of the same file (however they spell the path) get back the *same* exports object, and compile or body failures are sticky: a module that threw keeps throwing the same error rather than half-running again. Refusals are different: a cycle, a missing file, a marked script or a path outside scope is re-evaluated (and re-read) on every call, so fixing the file and calling again works. Two includes of the same not-yet-loaded module — from `Promise.all`, or from two libraries reaching one helper — share a single read and a single execution.
+
+Caching is per **run**, never per session: the edit → run loop always picks up your latest saved library code. Note the word *saved* — unlike the entry script, whose unsaved editor buffer is used when you run from the CodeLens, an included file is always read from disk. Save your libraries before running.
+
+**Cycles are refused, not partially resolved.** If `a.js` includes `b.js` which includes `a.js`, the include throws `CircularInclude` with the loop spelled out — `main.js → lib/a.js → lib/b.js → lib/a.js` — in both the message and `err.cycle`. (CommonJS would hand back a half-built exports object; in an async module system the ancestor has not finished awaiting, so what you would get is arbitrarily incomplete.) A **diamond** is not a cycle: two different modules may both include the same helper, and they share one instance of it.
+
+One shape the runtime cannot detect for you: if a module's body includes a module that is *itself still executing its body* (not a static cycle — the chain does not show it), the second include waits for an evaluation that is waiting for it, and the run hangs until `nexus.scripts.maxRuntimeSeconds` stops it. Keep top-level module bodies to definitions and cheap setup.
+
+**Limits and cost.** Max 16 levels of nesting (`IncludeDepthExceeded`) and 64 distinct modules per run (`IncludeLimitExceeded`) — both far past any real layering, and both refused before the file is read. A run may also load at most **48 MiB of combined module source** in total, refused with `IncludeLimitExceeded` (`err.totalBytes`, `err.maxTotalBytes`) before the worker is ever handed the overage — the module count alone cannot bound memory, since each module may be as large as `nexus.scripts.maxReadSizeMb` allows, and that per-file cap still governs each file on its own. An include is a file read, so it shares everything `nexus.fs` reads have: the same effective size cap (`nexus.scripts.maxReadSizeMb`), the same UTF-8 requirement, the same fixed 30-second deadline, and the same read pool — an include can queue behind a `readText` fan-out, bounded by that same 30 seconds.
+
+**Every load is logged** to the Nexus Scripts Output Channel, naming what you asked for and what it resolved to:
+
+```
+include ./lib/helpers.js → lib/helpers.js (1234 bytes)
+include ./helpers.js → lib/helpers.js (cached)
+include ./lib/a.js → CircularInclude (main.js → lib/a.js → lib/b.js → lib/a.js)
+include ./tools.js → IncludeIsScript
+include ./x.js → IncludeDepthExceeded (17 > 16)
+```
+
+**Error codes** (`nexus.fs`'s codes apply too — an include is a scoped file read):
+
+| `err.code` | When | Extra fields |
+|---|---|---|
+| `"CircularInclude"` | The module is already on the chain including it | `cycle: string[]` |
+| `"IncludeDepthExceeded"` | More than 16 levels of nesting | `depth`, `maxDepth` |
+| `"IncludeLimitExceeded"` | More than 64 distinct modules in one run, or more than 48 MiB of combined module source | `count`, `maxModules` (count budget) / `totalBytes`, `maxTotalBytes` (source budget) |
+| `"IncludeSyntaxError"` | The module's source does not parse | `module` |
+| `"IncludeIsScript"` | The target carries `@nexus-script` | `module` |
+| `"IncludeInternal"` | A protocol violation inside the runtime — please file an issue | — |
+| `"InvalidPath"` | Not a `.js` path, empty, or otherwise unusable | — |
+| `"PathOutsideScope"` / `"FileNotFound"` / `"FileTooLarge"` / `"NotUtf8"` / `"NoScriptDir"` / `"ReadFailed"` | As for `nexus.fs` — see the table above | — |
+
+A module body that **throws** does not get an include code: its own error propagates unwrapped, so `err.code` and the stack are the module's own.
+
+**File names and line numbers in stacks.** An uncaught error — from the entry script or from any included file — reports the real file name and the real line in the Output Channel (which the failure toast's **Show Output** button opens) and in `log.error(err)`. Two honest limits:
+
+- **A syntax error has no line.** V8 reports no location at all when a script or module fails to compile, so the message names the file (`Failed to compile lib/helpers.js: Unexpected token ';'`) and stops there. Your editor's own diagnostics are the line-level answer.
+- **A stack the script reads itself is not corrected.** `err.stack` inside a `catch` names the right file, but its line numbers are 2 higher than the file's (the runtime's own function wrapper). Pass the error to `log.error(err)` — or let it propagate — to get the corrected form.
+
+**Module identity is the spelled path, not the inode.** On Windows, `./Lib.js` and `./lib.js` are the same module; everywhere else they are two — including on a **case-insensitive macOS volume** (APFS's default), where the disk would serve one file for both spellings but the include cache keeps them distinct, so the file's body runs twice and each spelling gets its own exports object. The same happens on a **remote Windows** host (remote path handling is always POSIX, because a URI carries no way to know the far host's OS) and for two **symlinked paths** to one file. Identity is deliberately lexical — no `stat` or `realpath` inside the cache and cycle checks, which also means no way to probe the volume's case behaviour — so the rule to remember is simply: **include each file by one spelling**. Double-loading is bounded like everything else (both spellings count against the module and byte budgets) and cannot affect containment.
+
+**IntelliSense across files.** Every file — script or library — gets full API IntelliSense. What is *not* inferred automatically is the shape of a library's exports: `nexus.include()` is typed `Promise<any>`, and the `moduleDetection: force` setting that makes top-level `await` legal in every script also stops TypeScript from treating your libraries as modules to infer from. Two one-line opt-ins recover it:
+
+```js
+/** @type {typeof import("./lib/helpers.js")} */
+const helpers = await nexus.include("./lib/helpers.js");
+// helpers.login is now fully typed, and a typo in the name is an error
+
+/** @type {import("./lib/helpers.js").DeviceInfo} */
+const info = { hostname: "r1", uptimeSeconds: 5 };   // a @typedef exported by the library
+```
+
 ### Macro coordination
 
 By default, all macros on the script's bound session are **suspended** for the duration of the run. Macros on unrelated sessions keep firing. You can override this four ways:
@@ -395,6 +557,7 @@ Every script runs inside an async function, so normal `try / catch / finally` ap
 | `"Timeout"` | `expect`, `waitAny`, `poll` | The pattern didn't appear within the wait budget. |
 | `"ConnectionLost"` | any in-flight `expect` / `send` / `poll` / `prompt` | The bound session disconnected mid-wait. |
 | `"InvalidKey"` | `sendKey` | An unknown control-key name was passed. |
+| `"NoScriptDir"` / `"InvalidPath"` / `"PathOutsideScope"` / `"FileNotFound"` / `"FileTooLarge"` / `"NotUtf8"` / `"ReadFailed"` / `"InvalidJson"` | `nexus.fs.*` | See [Reading files — nexus.fs](#reading-files--nexusfs) for the full table. These are **not** silent expected codes — uncaught, they toast just like any other bug. |
 
 A typical error-handler:
 
@@ -584,6 +747,7 @@ if (session.type === "serial") {
 | `nexus.scripts.path` | string | `.nexus/scripts` | Workspace-relative directory where scripts live. Created automatically on first script command. |
 | `nexus.scripts.defaultTimeoutSeconds` | number (seconds) | `30` | Default per-wait timeout when neither the script header nor the `opts.timeout` argument specifies one. The legacy `nexus.scripts.defaultTimeout` millisecond key is still read when the seconds setting is absent. |
 | `nexus.scripts.macroPolicy` | `"suspend-all"` \| `"keep-enabled"` | `"suspend-all"` | Default macro policy while a script runs. |
+| `nexus.scripts.maxReadSizeMb` | number (MiB) | `4` | Largest file `nexus.fs.readText` / `nexus.fs.readJson` will read; bigger files throw `FileTooLarge`. Range 1–16 MiB; values outside that range are clamped to the nearest bound, while non-numeric, zero, or negative values fall back to 4 MiB. Snapshotted when a run starts, so a change never applies to a script already running. |
 | `nexus.scripts.maxRuntimeSeconds` | number (seconds) | `1800` (30 min) | Overall runtime cap. When a script exceeds this, it's stopped automatically and tagged with reason `max-runtime-exceeded`. Set `0` to disable. Positive values below 10 s are raised to the minimum effective cap; values above `2147483` are clamped to the largest safe timer delay. |
 | `nexus.scripts.maxRuntimeMs` | number (ms) | `1800000` (30 min) | Legacy compatibility setting read only when `maxRuntimeSeconds` is absent. Values above `2147483647` are rejected/clamped. |
 
@@ -699,6 +863,13 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | Web extension shows "not available in browser" | Expected — desktop-only for v1 | Use VS Code Desktop |
 | Can't find where my scripts are stored without a workspace | No folder is open — Nexus uses the extension's global-storage folder | Run `Nexus: Open Scripts Folder` (or check `nexus.scripts.path` — absolute paths always win). |
 | Error toast says the script "failed" on a normal `Timeout` | Shouldn't happen — expected codes are filtered | File an issue; include the Output Channel contents |
+| A library file I only meant to `include` shows up in the Scripts view (or the ▶ CodeLens, or a picker) | It carries the `@nexus-script` marker, which means "entry point" | Remove the marker from the library. Unmarked `.js` files never appear in the Scripts view, the CodeLens or any picker — and only unmarked files can be included (`IncludeIsScript` otherwise) |
+| `CircularInclude: main.js → lib/a.js → lib/b.js → lib/a.js` | Two modules include each other | Hoist the part they share into a third module that neither of them includes back. Partial exports are deliberately not offered — in an async module system the half-built object you would get back is arbitrarily incomplete |
+| `IncludeSyntaxError` … `Identifier 'nexus' has already been declared` (or `'module'` / `'exports'`) | Inside an included file those three names are function parameters — a `const`/`let` re-declaration is a compile error there, even though it is legal shadowing in an entry script | Rename the local, or drop the declaration and use the parameter directly |
+| `ReferenceError: exports is not defined` in a script I ran directly | `module` / `exports` exist only inside a file loaded by `nexus.include()`. An entry script is *run*, not imported | Move the reusable part into an included file and `nexus.include()` it. (The declarations type-check everywhere, so the editor will not flag this — the failure is at runtime, on purpose: silently discarding the assignment would be worse) |
+| `helpers.something` has no autocomplete after `nexus.include()` | `include()` is typed `Promise<any>`; the shape of a library is not inferred automatically | Add one line above the call: `/** @type {typeof import("./lib/helpers.js")} */`. See [Modular scripts](#modular-scripts--nexusinclude) |
+| An included library reads the wrong data file | A relative path resolves against **the file it is written in**, not the entry script | That is the rule — move the data file next to the library, or pass the path in from the entry script |
+| A script hangs and only `maxRuntimeSeconds` stops it, with an include in the chain | A module's body included a module that was itself still executing its body — each waits for the other | Keep top-level module bodies to definitions and cheap setup; do the work in exported functions |
 | A folder named `types` at the top level of my scripts folder doesn't appear in the sidebar at all | The generated `types/` at the *root* of the scripts directory (`<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json`) is intentionally hidden from the tree — it's Nexus's own scaffolding, not yours | Only the root-level `types/` is hidden. A `types/` folder anywhere else — e.g. `cisco/types/probe.js` — is a normal folder and shows its scripts like any other |
 | Some scripts or folders seem to be missing from a very large or deeply nested scripts directory | The scan stops after 10 levels of nesting or 500 examined directories/files (scripts included), to keep a misconfigured `nexus.scripts.path` from hanging the sidebar | Point `nexus.scripts.path` at a narrower folder — click the "Stopped after 500 entries" row pinned at the top of the Scripts view to jump straight to that setting |
 | The Scripts view shows a single "Scanning scripts…" row | The folder is changing faster than it can be listed (a bulk checkout, a sync client, or repeatedly switching `nexus.scripts.path`). Rather than show you the previous folder's contents as if they were current, the view says so | Nothing — it repaints itself once the folder settles. Clicking the row forces a refresh if you'd rather not wait |
@@ -709,9 +880,11 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 **Scripts run with the same privileges as the Nexus Terminal extension.** Treat a `.js` file you're about to run the same way you'd treat a shell script or a PowerShell script someone sent you — open it and read it first.
 
-- Scripts execute as local Node code inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import `vscode`, read your workspace files, or spawn subprocesses — those capabilities are deliberately omitted from the global surface (see **Limitations**). But that isolation is a *convenience* for correctness and cheap termination, not a security boundary against hostile code.
+- Scripts execute as local Node code inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import the `vscode` API. **Everything else a Node process can do, a script can do**: `await import("node:fs")` and `await import("node:child_process")` work, so a script can read or write any file your user account can and spawn processes. The worker is a cheap-termination mechanism, not a sandbox — only run scripts you have read and trust. `nexus.fs` is the *supported* way to read files: it is read-only, scoped to the scripts folder and the script's own directory, capped at a configurable size (`nexus.scripts.maxReadSizeMb`, default 4 MiB), and every access is logged to the Nexus Scripts Output Channel. Direct Node imports are possible but unsupported — no compatibility promises, and stopping a script (`worker.terminate()`) does **not** kill child processes the script spawned.
+- **`nexus.include()` is a module loader, not a security boundary.** An included file runs in the same isolate, with the same privileges, as the script that included it — it can do anything the entry script can. What include *does* enforce is where files come from: only `.js` files inside the scripts folder or the entry script's own folder, each one logged to the Output Channel as it loads. Read a library before you include it, the same as you would read a script before you run it.
 - Secret prompts (`prompt(msg, { password: true })`) are masked in the input box and the returned value is never written to the Output Channel by the runtime. Anything the script explicitly logs — via `log.info(value)`, for example — is written verbatim, so don't hand-log the result of a password prompt.
-- The runtime never reads your workspace outside the configured `nexus.scripts.path` directory (default `.nexus/scripts`). It does re-write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` on first run and after version bumps. If you customise those files in place, your edits are preserved only until the bundled version string changes — then they're overwritten. Keep local customisations in separate files.
+- On a script's behalf, the runtime reads files only through `nexus.fs`, which refuses paths outside the scripts folder / the script's own folder and logs every read. It does re-write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` on first run and after version bumps. If you customise those files in place, your edits are preserved only until the bundled version string changes — then they're overwritten. Keep local customisations in separate files.
+- **Scripts refuse to start in Restricted Mode.** Nexus Terminal declares `capabilities.untrustedWorkspaces.supported: false` and additionally hard-refuses every script-start command when `vscode.workspace.isTrusted === false`, with a **Manage Workspace Trust** button in the error message. Trust the workspace first.
 
 Bottom line: author your own scripts, or review scripts from others the same way you'd review a Bash script before running it.
 
@@ -722,8 +895,7 @@ Bottom line: author your own scripts, or review scripts from others the same way
 - **Manual-only launch.** Scripts can't be auto-triggered from terminal output today — that's tracked for a future version because the target use cases (firmware changes, config pushes) are deliberately destructive and deserve human intent.
 - **One script per session at a time.** Starting a second script on a busy session prompts you to stop the running one first. Running scripts on different sessions in parallel works fine.
 - **Desktop only.** The web variant of Nexus Terminal shows a friendly "not available in browser" message instead of registering the commands.
-- **No module imports.** Scripts are plain JavaScript executed in a Worker; `import` / `require` don't work. All API primitives are pre-injected as globals.
-- **No process spawning.** The Worker sandbox doesn't expose `child_process` or other Node capabilities. If you need to run something locally before your procedure, do it in a separate terminal or a pre-step script.
-- **No file I/O.** Use `prompt` / `confirm` / `alert` for human input; scripts can't read or write workspace files directly.
+- **No static `import` declarations.** The script body runs as an async function body; a top-level `import`/`require` statement doesn't work. To split a script across files, use [`nexus.include()`](#modular-scripts--nexusinclude) — and note that an included file is always read from disk, so **save your library files before running**; unsaved editor changes are picked up for the entry script only. Dynamic `await import(...)` of Node builtins technically works but is unsupported — see [Security and trust](#security-and-trust).
+- **File access.** `nexus.fs` provides supported, read-only, scoped, logged reads; there is no write API. Anything beyond that runs with your full user permissions and is on you.
 
-These constraints are intentional — they keep the surface small, the mental model simple, and the runtime safely killable. If you have a use case the current API can't express cleanly, open a GitHub issue with the procedure description.
+If you have a use case the current API can't express cleanly, open a GitHub issue with the procedure description.

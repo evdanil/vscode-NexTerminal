@@ -17,7 +17,7 @@ import type * as vscode from "vscode";
  * one-time information notification so they understand why the tabs are
  * unresponsive.
  */
-const NEXUS_TERMINAL_NAME_RE = /Nexus (SSH|Serial):/;
+const NEXUS_TERMINAL_NAME_RE = /Nexus (SSH|Serial|Telnet):/;
 
 export interface OrphanDetectResult {
   count: number;

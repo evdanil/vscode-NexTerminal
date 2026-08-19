@@ -43,6 +43,14 @@ vi.mock("vscode", () => ({
       return this.value;
     }
   },
+  Uri: {
+    from: (components: { scheme: string; authority?: string; path?: string }) => ({
+      scheme: components.scheme,
+      authority: components.authority ?? "",
+      path: components.path ?? "",
+      toString: () => `${components.scheme}://${components.authority ?? ""}${components.path ?? ""}`
+    })
+  },
   workspace: {
     getConfiguration: vi.fn(() => ({ get: () => undefined }))
   }
@@ -112,6 +120,7 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -140,6 +149,7 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -167,6 +177,7 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -200,6 +211,7 @@ describe("NexusTreeProvider folder collapse state", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -279,6 +291,7 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -316,6 +329,7 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -360,6 +374,7 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       remoteTunnels: [],
       explicitGroups: [],
       authProfiles: [],
+      inventorySources: [],
       activitySessionIds: new Set(),
       focusedSessionId: undefined
     });
@@ -441,6 +456,7 @@ function emptySnapshot() {
     remoteTunnels: [] as any[],
     explicitGroups: [] as string[],
     authProfiles: [] as any[],
+    inventorySources: [] as any[],
     activitySessionIds: new Set(),
     focusedSessionId: undefined as string | undefined
   };
@@ -460,6 +476,20 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(disconnected.id).toBe("server:s1");
     expect(connected.id).toBe("server:s1");
     expect(disconnected.id).toBe(connected.id);
+  });
+
+  it("ADDRESSLESS (Codex P1) — renders an addressless server with a ' (no address)' description and does not crash on the empty host (⊘ the default `user@` + empty host reads as a broken addressed server)", () => {
+    const item = new ServerTreeItem(makeServer({ id: "s1", host: "", port: 0, addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } }), false);
+    expect(item.description).toContain("(no address)");
+    // The empty host is not dangled after an "@" as though it were a real host.
+    expect(item.description).not.toMatch(/@\s*\(/);
+    expect(() => item.tooltip).not.toThrow();
+  });
+
+  it("an addressed synced server keeps its normal user@host description with no (no address) suffix", () => {
+    const item = new ServerTreeItem(makeServer({ id: "s2", host: "10.0.0.5", origin: { sourceId: "src", externalId: "e2", syncedAt: 1 } }), false);
+    expect(item.description).toContain("@10.0.0.5");
+    expect(item.description).not.toContain("(no address)");
   });
 
   it("ServerTreeItem shows the IPMI/BMC address on its own tooltip line, only when set (issue #48)", () => {
@@ -1123,5 +1153,376 @@ describe("FolderTreeItem — parameterised contextValue/id (§4.10)", () => {
     // And critically: this contextValue must NOT match the six menu entries
     // gated on the unanchored /^nexus\.macro/ prefix (§4.10's actual bug).
     expect(/^nexus\.macro/.test(item.contextValue!)).toBe(false);
+  });
+});
+
+/**
+ * LIVE STATUS (Phase 2) — the running-lab affordances on the Command Center
+ * tree: a green running dot + " (running)" on a running server, a dim dot on a
+ * stopped EVE node, and the nexus-status: resourceUri that lets the decoration
+ * provider paint the ▶ badge. A server with no status (non-EVE) is unchanged.
+ */
+describe("ServerTreeItem inventory status affordance", () => {
+  function itemWithStatus(status: "running" | "stopped" | undefined): ServerTreeItem {
+    return new ServerTreeItem(makeServer({ id: "s1" }), false, undefined, true, undefined, undefined, undefined, undefined, status);
+  }
+
+  it("a running server gets a green dot and a ' (running)' description suffix (⊘ no affordance leaves the user unable to see which lab is up)", () => {
+    const item = itemWithStatus("running");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("charts.green");
+    expect(item.description).toContain("(running)");
+  });
+
+  it("a stopped EVE node gets a dim dot and NO '(running)' suffix (⊘ a green dot on a stopped node is a lie; a running suffix on a stopped node likewise)", () => {
+    const item = itemWithStatus("stopped");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("descriptionForeground");
+    expect(item.description).not.toContain("(running)");
+  });
+
+  it("a server with NO status keeps the plain connect icon and no status suffix (⊘ applying a status dot to a non-EVE server invents state it does not have)", () => {
+    const item = itemWithStatus(undefined);
+    expect((item.iconPath as { id: string }).id).toBe("debug-disconnect");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconQueued");
+    expect(item.description).not.toContain("(running)");
+  });
+
+  function connectedItemWithStatus(status: "running" | "stopped"): ServerTreeItem {
+    return new ServerTreeItem(makeServer({ id: "c" }), true, undefined, true, undefined, undefined, undefined, undefined, status);
+  }
+
+  it("P3-6: a CONNECTED running EVE node keeps its connected (plug) icon; the running state is carried by the '(running)' description, not by replacing the icon (⊘ swapping the plug for a status dot regresses the connected affordance)", () => {
+    const item = connectedItemWithStatus("running");
+    expect((item.iconPath as { id: string }).id).toBe("plug");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconPassed");
+    expect(item.description).toContain("(running)");
+  });
+
+  it("P3-6: a CONNECTED stopped EVE node keeps its connected icon and shows no dim dot and no '(running)' suffix", () => {
+    const item = connectedItemWithStatus("stopped");
+    expect((item.iconPath as { id: string }).id).toBe("plug");
+    expect((item.iconPath as { color: { id: string } }).color.id).toBe("testing.iconPassed");
+    expect(item.description).not.toContain("(running)");
+  });
+
+  it("threads status from the snapshot and stamps a nexus-status: resourceUri on both the running server and its lab folder (⊘ no resourceUri means the decoration provider can never match the row)", async () => {
+    const provider = new NexusTreeProvider({
+      onTunnelDropped: vi.fn(async () => {}),
+      onItemGroupChanged: vi.fn(async () => {}),
+      onFolderMoved: vi.fn(async () => {})
+    });
+    provider.setSnapshot({
+      servers: [makeServer({ id: "s1", group: "LabA" })],
+      tunnels: [],
+      serialProfiles: [],
+      localShellProfiles: [],
+      activeSessions: [],
+      activeSerialSessions: [],
+      activeLocalShellSessions: [],
+      activeTunnels: [],
+      remoteTunnels: [],
+      explicitGroups: ["LabA"],
+      authProfiles: [],
+      activitySessionIds: new Set(),
+      serverStatus: new Map([["s1", "running"]]),
+      focusedSessionId: undefined,
+      inventorySources: [],
+      deviceTemplates: [],
+      savedFilters: []
+    } as unknown as import("../../src/core/contracts").SessionSnapshot);
+
+    const roots = (await provider.getChildren()) as Array<FolderTreeItem>;
+    const folder = roots.find((i) => i instanceof FolderTreeItem) as FolderTreeItem & { resourceUri?: { scheme: string } };
+    expect(folder).toBeDefined();
+    expect(folder.resourceUri?.scheme).toBe("nexus-status");
+
+    const children = (await provider.getChildren(folder)) as Array<ServerTreeItem & { resourceUri?: { scheme: string } }>;
+    const serverItem = children.find((c) => c instanceof ServerTreeItem);
+    expect(serverItem).toBeDefined();
+    expect(serverItem!.resourceUri?.scheme).toBe("nexus-status");
+    expect((serverItem!.iconPath as { color: { id: string } }).color.id).toBe("charts.green");
+  });
+});
+
+/**
+ * BMC-menu gating (task #27, Phase 2) — a server with an ipmiHost gets an
+ * `.ipmi` marker appended to its contextValue so the two BMC menu entries can
+ * require it; the base string is UNCHANGED so every other server menu (matched
+ * by /^nexus\.server(Connected)?(\.ipmi)?$/) keeps working.
+ */
+describe("ServerTreeItem BMC ipmi contextValue marker", () => {
+  it("appends .ipmi when the server has a non-blank ipmiHost, for both connected states (⊘ no marker means the BMC entries cannot be gated per-server)", () => {
+    expect(new ServerTreeItem(makeServer({ id: "a", ipmiHost: "10.0.0.9" }), false).contextValue).toBe("nexus.server.ipmi");
+    expect(new ServerTreeItem(makeServer({ id: "b", ipmiHost: "10.0.0.9" }), true).contextValue).toBe("nexus.serverConnected.ipmi");
+  });
+
+  it("leaves the base contextValue untouched when ipmiHost is absent or blank (⊘ appending .ipmi to a non-BMC server would show BMC actions that can only fail)", () => {
+    expect(new ServerTreeItem(makeServer({ id: "a" }), false).contextValue).toBe("nexus.server");
+    expect(new ServerTreeItem(makeServer({ id: "b", ipmiHost: "   " }), false).contextValue).toBe("nexus.server");
+    expect(new ServerTreeItem(makeServer({ id: "c" }), true).contextValue).toBe("nexus.serverConnected");
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — an EVE-origin server whose running/stopped
+ * state is KNOWN gets a `.eveRunning` / `.eveStopped` marker APPENDED (after any
+ * `.ipmi`), so the Start/Stop Node menu entries can be gated by state. The
+ * marker is emitted ONLY for an EVE-origin server with a known status: a non-EVE
+ * server (even one that somehow carries a status) and a freshly-synced EVE
+ * server with no status yet get NOTHING — the user runs Refresh Lab Status
+ * first, so we never offer an action blind. The final constructor arg carries
+ * the caller-resolved "this origin is an eve-ng source" signal.
+ */
+describe("ServerTreeItem EVE node-control contextValue marker", () => {
+  // Positional args: (server, connected, lookup, showDesc, authName, authUser,
+  // syncedName, ipmiAuthName, status, isEveOrigin).
+  function item(
+    opts: { connected?: boolean; ipmiHost?: string; status?: "running" | "stopped"; isEveOrigin?: boolean } = {}
+  ): ServerTreeItem {
+    return new ServerTreeItem(
+      makeServer({ id: "s", ...(opts.ipmiHost ? { ipmiHost: opts.ipmiHost } : {}) }),
+      opts.connected ?? false,
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      opts.status,
+      opts.isEveOrigin
+    );
+  }
+
+  it("appends .eveRunning for an EVE-origin RUNNING server and .eveStopped for a stopped one (⊘ no marker means Start/Stop can never be gated by state)", () => {
+    expect(item({ isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.server.eveRunning");
+    expect(item({ isEveOrigin: true, status: "stopped" }).contextValue).toBe("nexus.server.eveStopped");
+  });
+
+  it("emits NO eve marker for an EVE-origin server whose status is UNKNOWN (⊘ offering Start/Stop before a status refresh acts blind)", () => {
+    expect(item({ isEveOrigin: true, status: undefined }).contextValue).toBe("nexus.server");
+  });
+
+  it("emits NO eve marker for a NON-EVE server even when a status is somehow set (⊘ a status dot on a NetBox server must never light up node control it does not support)", () => {
+    expect(item({ isEveOrigin: false, status: "running" }).contextValue).toBe("nexus.server");
+    expect(item({ isEveOrigin: undefined, status: "stopped" }).contextValue).toBe("nexus.server");
+  });
+
+  it("composes with .ipmi in the fixed order nexus.server[.ipmi][.eveRunning|.eveStopped] (⊘ a wrong order or a dropped .ipmi breaks the BMC and node-control gates simultaneously)", () => {
+    expect(item({ isEveOrigin: true, status: "running", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveRunning");
+    expect(item({ isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveStopped");
+  });
+
+  it("composes with the connected base string (⊘ a connected running EVE node must still expose Stop)", () => {
+    expect(item({ connected: true, isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.serverConnected.eveRunning");
+    expect(item({ connected: true, isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe(
+      "nexus.serverConnected.ipmi.eveStopped"
+    );
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — P2 review finding. The direct-constructor
+ * tests above pin the marker COMPOSITION but never exercise the SNAPSHOT WIRING
+ * that decides `isEveOrigin`: the resolution `snapshot.inventorySources` →
+ * `providerId === "eve-ng"` → constructor arg lives in `toServerItem`, and
+ * without a `getChildren`/`toServerItem` end-to-end test it is entirely
+ * unpinned. These tests drive the provider from a real snapshot so the following
+ * feature-killing mutations each DIE here:
+ *   - `isEveOrigin = false` (marker never emitted → Start/Stop dead in the UI),
+ *   - `isEveOrigin = originSource !== undefined` (any synced origin, e.g. NetBox,
+ *     lights up node control it does not support),
+ *   - the `"eve-ng"` literal typo'd (e.g. `"eveng"`) → never matches a real source,
+ *   - the `isEveOrigin` constructor arg at the ServerTreeItem call dropped
+ *     (defaults to false) → marker never reaches the item.
+ */
+describe("NexusTreeProvider EVE node-control marker — end-to-end snapshot wiring", () => {
+  function providerWith(
+    servers: ServerConfig[],
+    inventorySources: Array<{ id: string; providerId: string; name: string }>,
+    serverStatus: Map<string, "running" | "stopped">
+  ): NexusTreeProvider {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers,
+      inventorySources: inventorySources.map((s) => ({
+        ...s,
+        targetFolder: "",
+        prunePolicy: "orphan",
+        defaultUsername: "admin",
+        config: {},
+        secretFieldIds: []
+      })),
+      serverStatus
+    } as any);
+    return provider;
+  }
+
+  function serverItemById(provider: NexusTreeProvider, id: string): ServerTreeItem {
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    return children.find((c) => c instanceof ServerTreeItem && c.server.id === id) as ServerTreeItem;
+  }
+
+  it("resolves an eve-ng inventory source through origin.sourceId → providerId and stamps .eveRunning / .eveStopped from serverStatus (⊘ a broken isEveOrigin resolution, a typo'd 'eve-ng' literal, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
+    const provider = providerWith(
+      [
+        makeServer({ id: "run", name: "R1", origin: { sourceId: "eve-src", externalId: "/Lab.unl#1", syncedAt: 1 } }),
+        makeServer({ id: "stop", name: "R2", origin: { sourceId: "eve-src", externalId: "/Lab.unl#2", syncedAt: 1 } })
+      ],
+      [{ id: "eve-src", providerId: "eve-ng", name: "My EVE" }],
+      new Map<string, "running" | "stopped">([
+        ["run", "running"],
+        ["stop", "stopped"]
+      ])
+    );
+    expect(serverItemById(provider, "run").contextValue).toBe("nexus.server.eveRunning");
+    expect(serverItemById(provider, "stop").contextValue).toBe("nexus.server.eveStopped");
+  });
+
+  it("emits NO eve marker for a NON-eve-ng (e.g. netbox) source even when serverStatus carries a state (⊘ isEveOrigin = (originSource !== undefined) would light up node control on a NetBox-origin server that has no controlNode)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "nb", name: "N1", origin: { sourceId: "nb-src", externalId: "device:1", syncedAt: 1 } })],
+      [{ id: "nb-src", providerId: "netbox", name: "My NetBox" }],
+      new Map<string, "running" | "stopped">([["nb", "running"]])
+    );
+    expect(serverItemById(provider, "nb").contextValue).toBe("nexus.server");
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — M3. An EVE-origin node's tooltip carries a
+ * labeled "Lab status:" line so a freshly-synced node (unknown status) hints
+ * that Refresh Lab Status is what unlocks Start/Stop. Non-EVE nodes get no such
+ * line. isEveOrigin is the final constructor arg.
+ */
+describe("ServerTreeItem EVE lab-status tooltip line", () => {
+  function tip(opts: { status?: "running" | "stopped"; isEveOrigin?: boolean }): string {
+    return new ServerTreeItem(
+      makeServer({ id: "s", origin: { sourceId: "eve", externalId: "/L.unl#1", syncedAt: 1 } }),
+      false, undefined, true, undefined, undefined, undefined, undefined, opts.status, opts.isEveOrigin
+    ).tooltip as string;
+  }
+
+  it("shows 'Lab status: running' for a running EVE node (⊘ no lab-status line leaves running/stopped undiscoverable in the tooltip)", () => {
+    expect(tip({ isEveOrigin: true, status: "running" })).toContain("Lab status: running");
+  });
+
+  it("shows 'Lab status: stopped' for a stopped EVE node", () => {
+    expect(tip({ isEveOrigin: true, status: "stopped" })).toContain("Lab status: stopped");
+  });
+
+  it("shows 'Lab status: unknown — run Refresh Lab Status' for a freshly-synced EVE node with no status yet (⊘ a silent tooltip gives no hint that Refresh Lab Status unlocks Start/Stop)", () => {
+    expect(tip({ isEveOrigin: true, status: undefined })).toContain("Lab status: unknown — run Refresh Lab Status");
+  });
+
+  it("adds NO lab-status line for a non-EVE node even when a status is set (⊘ a Lab status line on a NetBox server invents a lab it does not have)", () => {
+    expect(tip({ isEveOrigin: false, status: "running" })).not.toContain("Lab status:");
+  });
+});
+
+/**
+ * NODE CONTROL (Phase 4, task #28) — M4. Stopped-ness is now load-bearing (it is
+ * the premise for "Start Node"), so a stopped node gets an explicit
+ * " (stopped)" description suffix mirroring the existing " (running)". A node
+ * with no status still gets neither.
+ */
+describe("ServerTreeItem stopped description suffix", () => {
+  function desc(status: "running" | "stopped" | undefined): string | undefined {
+    return new ServerTreeItem(makeServer({ id: "s" }), false, undefined, true, undefined, undefined, undefined, undefined, status)
+      .description;
+  }
+
+  it("appends ' (running)' for a running node and ' (stopped)' for a stopped node (⊘ no stopped suffix leaves a connected+stopped row showing a green plug and a Start menu with no state text)", () => {
+    expect(desc("running")).toContain("(running)");
+    expect(desc("stopped")).toContain("(stopped)");
+    // The two states must be distinct — a stopped node must NOT read as running.
+    expect(desc("stopped")).not.toContain("(running)");
+  });
+
+  it("appends NEITHER suffix for a node with no status (⊘ a state suffix on a non-status server invents state it lacks)", () => {
+    expect(desc(undefined)).not.toContain("(running)");
+    expect(desc(undefined)).not.toContain("(stopped)");
+  });
+});
+
+/**
+ * PER-SOURCE SYNC ON THE FOLDER ROW (follow-up #43) — a Command Center folder
+ * that is EXACTLY ONE inventory source's `targetFolder` carries an inline sync
+ * action for that source, so syncing one source does not mean opening Settings.
+ * The row advertises it with a `.syncSource` marker on its `contextValue` and
+ * carries the source id the command needs.
+ *
+ * "EXACTLY ONE" is the whole rule: two sources sharing a target folder make the
+ * icon ambiguous (which one would it sync?), so the marker is withheld rather
+ * than guessed at.
+ */
+describe("NexusTreeProvider — the inline sync action on a source's target folder", () => {
+  function source(id: string, targetFolder: string, name = id) {
+    return { id, providerId: "eve-ng", name, targetFolder, prunePolicy: "orphan", defaultUsername: "admin", config: {}, secretFieldIds: [] };
+  }
+
+  function foldersOf(servers: ServerConfig[], inventorySources: unknown[]): Map<string, FolderTreeItem> {
+    const provider = new NexusTreeProvider(noopCallbacks);
+    provider.setSnapshot({ ...emptySnapshot(), servers, inventorySources } as any);
+    const found = new Map<string, FolderTreeItem>();
+    const walk = (parent: FolderTreeItem | undefined): void => {
+      for (const child of provider.getChildren(parent) as FolderTreeItem[]) {
+        if (child instanceof FolderTreeItem) {
+          found.set(child.folderPath, child);
+          walk(child);
+        }
+      }
+    };
+    walk(undefined);
+    return found;
+  }
+
+  it("marks the folder a single source targets, and hangs that source's id on the row so the command receives it (⊘ no marker means no inline icon at all, and no sourceId means the icon opens a picker instead of syncing the source the user clicked)", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab" })], [source("src-1", "Lab", "My Lab")]);
+    const lab = folders.get("Lab")!;
+    expect(lab.contextValue).toBe("nexus.folderWithServers.syncSource");
+    expect(lab.sourceId).toBe("src-1");
+  });
+
+  it("marks a source's target folder that holds no servers directly, keeping the folder/folderWithServers distinction intact (⊘ a marker shape that only composes with one of the two silently drops the icon from every lab-tree parent folder)", () => {
+    // "Lab" is an ancestor only — its servers live in "Lab/Site".
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab/Site" })], [source("src-1", "Lab")]);
+    expect(folders.get("Lab")!.contextValue).toBe("nexus.folder.syncSource");
+    expect(folders.get("Lab")!.sourceId).toBe("src-1");
+  });
+
+  it("marks NEITHER when two sources share one targetFolder — ambiguous, so no guess (⊘ a `find`/`some` implementation picks whichever source is listed first and syncs the wrong one, silently, forever)", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Shared" })], [source("src-1", "Shared", "A"), source("src-2", "Shared", "B")]);
+    expect(folders.get("Shared")!.contextValue).toBe("nexus.folderWithServers");
+    expect(folders.get("Shared")!.sourceId).toBeUndefined();
+  });
+
+  it("leaves an UNRELATED folder, and a folder NESTED INSIDE a target, unmarked (⊘ a descendant test instead of an equality test puts a sync icon on every lab folder under the target, each claiming to sync the whole source)", () => {
+    const folders = foldersOf(
+      [makeServer({ id: "s1", group: "Lab/Inner" }), makeServer({ id: "s2", group: "Elsewhere" })],
+      [source("src-1", "Lab")]
+    );
+    expect(folders.get("Lab")!.contextValue).toBe("nexus.folder.syncSource");
+    expect(folders.get("Lab/Inner")!.contextValue).toBe("nexus.folderWithServers");
+    expect(folders.get("Lab/Inner")!.sourceId).toBeUndefined();
+    expect(folders.get("Elsewhere")!.contextValue).toBe("nexus.folderWithServers");
+    expect(folders.get("Elsewhere")!.sourceId).toBeUndefined();
+  });
+
+  it("marks NOTHING for a source targeting the ROOT (`targetFolder: \"\"`) — there is no folder row to host the icon (⊘ a `startsWith` prefix match instead of an equality test makes the empty string match EVERY folder path in the tree, so a root-targeted source stamps a sync icon on all of them)", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab" }), makeServer({ id: "s2" })], [source("src-1", "")]);
+    expect([...folders.values()].every((f) => f.sourceId === undefined)).toBe(true);
+    expect([...folders.values()].every((f) => !String(f.contextValue).includes("syncSource"))).toBe(true);
+  });
+
+  // NOT A REGRESSION GUARD, and labelled honestly as such: no plausible
+  // implementation of the "exactly one source targets this path" rule fails
+  // this, because there is no row to fail on. It documents the tolerance — a
+  // targetFolder naming nothing is a no-op rather than an error — and would
+  // catch a future version that materialises a phantom folder row purely to
+  // host the icon.
+  it("tolerates a targetFolder that names no folder in the tree: nothing marked, no row invented, nothing thrown", () => {
+    const folders = foldersOf([makeServer({ id: "s1", group: "Lab" })], [source("src-1", "Not/Here")]);
+    expect(folders.has("Not/Here")).toBe(false);
+    expect(folders.get("Lab")!.contextValue).toBe("nexus.folderWithServers");
   });
 });

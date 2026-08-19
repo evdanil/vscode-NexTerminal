@@ -1,4 +1,7 @@
 import * as vscode from "vscode";
+import type { NexusCore } from "../core/nexusCore";
+import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
+import { sourceDescriptionAbsolute } from "../services/inventory/sourceDescription";
 import {
   SETTINGS_META,
   CATEGORY_ORDER,
@@ -16,7 +19,9 @@ type SettingsTreeItem =
   | SettingsValueItem
   | SettingsLinkItem
   | DataManagementGroupItem
-  | DataManagementActionItem;
+  | DataManagementActionItem
+  | InventorySourcesGroupItem
+  | InventorySourceItem;
 
 export class SettingsCategoryItem extends vscode.TreeItem {
   public readonly kind = "category" as const;
@@ -110,6 +115,49 @@ export class DataManagementActionItem extends vscode.TreeItem {
   }
 }
 
+/**
+ * Inventory sources used to be ONE row that opened the manage QuickPick, so
+ * "which sources do I have, and when did each last sync" needed a modal to
+ * answer and every per-source action was two clicks behind a picker. This
+ * group renders the sources themselves, with the same four actions inline.
+ *
+ * PROVIDER-AGNOSTIC by construction: every row is built from the snapshot
+ * record plus the registry's label lookup, with no branch on `providerId`.
+ */
+export class InventorySourcesGroupItem extends vscode.TreeItem {
+  public readonly kind = "inventorySourcesGroup" as const;
+  public constructor() {
+    super("Inventory Sources", vscode.TreeItemCollapsibleState.Collapsed);
+    this.id = "settings-inventory-sources";
+    this.iconPath = new vscode.ThemeIcon("server-environment");
+    this.contextValue = "nexus.inventorySourcesGroup";
+    this.tooltip = "Add, edit, sync, and remove inventory sources";
+  }
+}
+
+export class InventorySourceItem extends vscode.TreeItem {
+  public readonly kind = "inventorySource" as const;
+  public constructor(
+    public readonly sourceId: string,
+    name: string,
+    description: string
+  ) {
+    super(name, vscode.TreeItemCollapsibleState.None);
+    this.id = `settings-inventory-source:${sourceId}`;
+    this.description = description;
+    this.iconPath = new vscode.ThemeIcon("server-environment");
+    // Keyed on by the four `view/item/context` inline entries in package.json.
+    this.contextValue = "nexus.inventorySource";
+    this.tooltip = `${name} — ${description}`;
+    // A click carries the source id as the command argument, so the editor
+    // opens on THIS source directly rather than re-prompting. `resolveSourceIdArg`
+    // (commands/inventoryCommands.ts) accepts either form — this string, or the
+    // tree item itself via its `sourceId` — so the inline menu actions, which
+    // receive the item, resolve to the same source.
+    this.command = { command: "nexus.inventory.editSource", title: "Edit Inventory Source", arguments: [sourceId] };
+  }
+}
+
 // ----- Tree provider -----
 
 export class SettingsTreeProvider
@@ -119,8 +167,40 @@ export class SettingsTreeProvider
   public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
 
   private readonly configListener: vscode.Disposable;
+  /** NexusCore's onDidChange returns an unsubscribe function, not a Disposable. */
+  private readonly coreListener?: () => void;
+  /** MINOR-8 — the inventory-relevant slice of the last snapshot, so an unrelated core event does not re-render. */
+  private lastInventorySignature: string;
 
-  public constructor() {
+  /**
+   * `core` and `providerRegistry` are OPTIONAL so the provider stays
+   * constructible without them (tests, and any future host that has no core
+   * yet). Without a core the Inventory Sources group still renders — with just
+   * its "Add Inventory Source…" row — rather than vanishing, because an empty
+   * group whose one action is "add the first source" is a starting point and a
+   * missing group is a dead end.
+   */
+  public constructor(
+    private readonly core?: NexusCore,
+    private readonly providerRegistry?: InventoryProviderRegistry
+  ) {
+    this.lastInventorySignature = this.inventorySignature();
+    // MINOR-8 — `NexusCore.onDidChange` is the whole-state firehose (it fires on
+    // every terminal/tunnel/session blink), but the only rows this provider
+    // renders from core are the inventory sources. Re-render ONLY when that
+    // slice actually changed, so an idle session with active terminals does not
+    // re-run `getChildren` — a `getConfiguration` read per value row — many
+    // times a second. The signature covers exactly the fields the rows show
+    // (id, name, provider, last sync), so a sync's `lastSyncAt` bump refreshes
+    // the "synced N ago" label while an unrelated event does not.
+    this.coreListener = core?.onDidChange(() => {
+      const signature = this.inventorySignature();
+      if (signature === this.lastInventorySignature) {
+        return;
+      }
+      this.lastInventorySignature = signature;
+      this.onDidChangeTreeDataEmitter.fire(undefined);
+    });
     this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
       const affected = SETTINGS_META.some(
         (m) => event.affectsConfiguration(`${m.section}.${m.key}`)
@@ -132,12 +212,19 @@ export class SettingsTreeProvider
   }
 
   public dispose(): void {
+    this.coreListener?.();
     this.configListener.dispose();
     this.onDidChangeTreeDataEmitter.dispose();
   }
 
   public refresh(): void {
     this.onDidChangeTreeDataEmitter.fire(undefined);
+  }
+
+  /** MINOR-8 — exactly the inventory-source fields the rows render, as a comparable string. */
+  private inventorySignature(): string {
+    const sources = this.core?.getSnapshot().inventorySources ?? [];
+    return JSON.stringify(sources.map((s) => [s.id, s.name, s.providerId, s.lastSyncAt ?? 0]));
   }
 
   public getTreeItem(element: SettingsTreeItem): vscode.TreeItem {
@@ -153,6 +240,9 @@ export class SettingsTreeProvider
     }
     if (element instanceof DataManagementGroupItem) {
       return this.getDataManagementActions();
+    }
+    if (element instanceof InventorySourcesGroupItem) {
+      return this.getInventorySourceItems();
     }
     return [];
   }
@@ -177,14 +267,12 @@ export class SettingsTreeProvider
     items.push(
       new SettingsLinkItem("Device Templates", "nexus.deviceTemplate.manage", "layers", "Apply shared settings to servers synced from inventory")
     );
-    // Inventory sources had no home in this tree at all — editing one meant
-    // knowing the palette command "Nexus: Edit Inventory Source". The link
-    // opens the nexus.inventory.manage QuickPick hub, which routes into the
-    // four existing inventory commands (add / sync / edit / remove). It must
-    // NOT point at bare addSource: that would still leave edit unreachable.
-    items.push(
-      new SettingsLinkItem("Inventory Sources", "nexus.inventory.manage", "server-environment", "Add, edit, sync, and remove inventory sources")
-    );
+    // Inventory sources are an expandable GROUP rather than a link: a link can
+    // only open the manage QuickPick, which is where the sources and their
+    // per-source actions used to be hidden. `nexus.inventory.manage` is
+    // deliberately left in place and unchanged — the hub is still the palette
+    // route in.
+    items.push(new InventorySourcesGroupItem());
 
     return items;
   }
@@ -214,6 +302,18 @@ export class SettingsTreeProvider
     if (categoryKey === "securityData") {
       items.push(new DataManagementGroupItem());
     }
+    return items;
+  }
+
+  private getInventorySourceItems(): SettingsTreeItem[] {
+    const sources = this.core?.getSnapshot().inventorySources ?? [];
+    const items: SettingsTreeItem[] = sources.map(
+      (source) => new InventorySourceItem(source.id, source.name, sourceDescriptionAbsolute(source, this.providerRegistry))
+    );
+    // Always last, always present — including when the list above is empty.
+    items.push(
+      new SettingsLinkItem("Add Inventory Source\u2026", "nexus.inventory.addSource", "add", "Add a new inventory source")
+    );
     return items;
   }
 

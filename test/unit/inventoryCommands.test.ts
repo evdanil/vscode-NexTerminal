@@ -13,6 +13,7 @@ import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/n
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import {
   computeProviderFingerprint,
+  InventoryProviderError,
   inventorySecretKey,
   type InventoryProvider,
   type InventorySourceConfig,
@@ -36,6 +37,7 @@ const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
 const mockShowErrorMessage = vi.fn();
 const mockExecuteCommand = vi.fn();
+const mockWithProgress = vi.fn((_opts: unknown, task: (...a: unknown[]) => unknown) => task());
 const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
 const mockWebviewOpen = vi.fn();
@@ -55,7 +57,7 @@ vi.mock("vscode", () => ({
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
-    withProgress: (_opts: unknown, task: (...a: unknown[]) => unknown) => task(),
+    withProgress: (...args: unknown[]) => mockWithProgress(...(args as [unknown, (...a: unknown[]) => unknown])),
     showTextDocument: (...args: unknown[]) => mockShowTextDocument(...args)
   },
   workspace: {
@@ -216,7 +218,7 @@ function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySo
 }
 
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
-  return {
+  const merged: ServerConfig = {
     id: "owned-1",
     name: "old-sw",
     host: "10.0.0.1",
@@ -226,6 +228,20 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     isHidden: false,
     ...overrides
   };
+  // PRIMARY HOST/PORT (task #29) — a real synced server OWNS its address, so seed
+  // its origin's `syncedHost`/`syncedPort` to match its own host/port (when the
+  // fixture supplied an origin but not the stamps, and the record is addressed).
+  // The sync then follows a device address move rather than reading the address
+  // as a hand edit and preserving it.
+  if (merged.origin && merged.host !== "") {
+    if (merged.origin.syncedHost === undefined) {
+      merged.origin = { ...merged.origin, syncedHost: merged.host };
+    }
+    if (merged.origin.syncedPort === undefined && merged.port !== 0) {
+      merged.origin = { ...merged.origin, syncedPort: merged.port };
+    }
+  }
+  return merged;
 }
 
 // A synthetic plan for the pure rendering/drift helpers (describePlanDetail,
@@ -780,6 +796,45 @@ describe("inventoryCommands", () => {
       // missing or silently overwritten with the wrong value.
       expect(source.name).toBe("My Source");
       expect(source.config).toEqual({ name: "netbox-instance-1" });
+    });
+  });
+
+  /**
+   * EVE-NG (Phase 1) — the Settings tree renders one row per source with
+   * inline Sync / Edit / Template Rules / Remove buttons. VS Code hands a
+   * `view/item/context` command the TREE ITEM, not a string, so a handler that
+   * only understands a string id falls through to the source picker — every
+   * inline button on every row would prompt "which source?" instead of acting
+   * on the row it is attached to.
+   */
+  describe("tree-item arguments", () => {
+    async function withTwoSources(): Promise<{ core: NexusCore; registry: InventoryProviderRegistry }> {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider());
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      // TWO sources, so the picker cannot auto-select and a fall-through is
+      // visible as a QuickPick rather than as the right source by luck.
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1", name: "First" }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-2", name: "Second" }));
+      return { core, registry };
+    }
+
+    it("editSource reads the source id off a tree item's `sourceId` (\u2298 a string-only handler opens the picker, so the inline Edit button never edits the row it is on)", async () => {
+      await withTwoSources();
+      await registeredCommands.get("nexus.inventory.editSource")!({ sourceId: "src-2" });
+      expect(mockShowQuickPick).not.toHaveBeenCalled();
+      expect(latestFormCall().definition.fields.find((f) => "key" in f && f.key === "name")).toEqual(
+        expect.objectContaining({ value: "Second" })
+      );
+    });
+
+    it("still falls through to the picker for a menu object that names no source \u2014 a palette invocation must keep prompting", async () => {
+      await withTwoSources();
+      mockShowQuickPick.mockResolvedValueOnce(undefined);
+      await registeredCommands.get("nexus.inventory.editSource")!({ label: "not a source row" });
+      expect(mockShowQuickPick).toHaveBeenCalled();
     });
   });
 
@@ -8141,5 +8196,1915 @@ describe("inventoryCommands", () => {
         expect(mockShowErrorMessage).not.toHaveBeenCalled();
       }
     );
+  });
+
+  /**
+   * NODE CONTROL (Phase 4) — the Start/Stop Node commands. Each takes a
+   * server-bearing tree item, resolves the server's inventory source, and — only
+   * when that source's provider exposes `controlNode` — dispatches through the
+   * PROPAGATING `controlProviderNode` wrapper, then fires a best-effort status
+   * refresh. A server that is not synced, or whose provider has no node control,
+   * is refused with a message rather than offered an action that can only fail.
+   */
+  describe("nexus.inventory.startNode / stopNode", () => {
+    async function setup(
+      opts: {
+        withControl?: boolean;
+        controlNode?: InventoryProvider["controlNode"];
+        noOrigin?: boolean;
+        externalId?: string;
+        secretFieldIds?: string[];
+        secrets?: Record<string, string>;
+      } = {}
+    ) {
+      const withControl = opts.withControl ?? true;
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        ...(opts.noOrigin
+          ? {}
+          : { origin: { sourceId: "src-1", externalId: opts.externalId ?? "/Lab.unl#3", syncedAt: 1 } })
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const controlSpy = vi.fn(async () => {});
+      const provider = makeProvider(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {});
+      registry.register(provider);
+      const vault = makeVault(opts.secrets ?? {});
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [] }));
+      const start = registeredCommands.get("nexus.inventory.startNode")!;
+      const stop = registeredCommands.get("nexus.inventory.stopNode")!;
+      return { core, registry, vault, provider, controlSpy, server, start, stop };
+    }
+
+    it("registers both startNode and stopNode command handlers", async () => {
+      await setup();
+      expect(registeredCommands.get("nexus.inventory.startNode")).toBeTypeOf("function");
+      expect(registeredCommands.get("nexus.inventory.stopNode")).toBeTypeOf("function");
+    });
+
+    it("START dispatches controlNode with the origin's externalId and action 'start', then fires a status refresh for the source (⊘ the wrong externalId controls the wrong node; no refresh leaves the tree stale)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+      const info = mockShowInformationMessage.mock.calls[0]?.[0] as string;
+      expect(info).toContain("R1");
+    });
+
+    it("STOP dispatches controlNode with action 'stop' (⊘ reusing the start action never stops the node)", async () => {
+      const { stop, controlSpy, server } = await setup();
+      await stop({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "stop");
+    });
+
+    it("loads the source's secrets from the vault by secretFieldIds and passes them to controlNode (⊘ dispatching with empty secrets fails auth against the lab server)", async () => {
+      const { start, controlSpy, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+    });
+
+    it("refuses a server whose provider has NO controlNode, with a message, and dispatches nothing (⊘ offering Start/Stop on a NetBox-origin server is an action that can only fail)", async () => {
+      const { start, server } = await setup({ withControl: false });
+      await start({ server });
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    it("refuses a manual (non-synced) server with no origin (⊘ start/stop on a server with no inventory node has nothing to control)", async () => {
+      const { start, controlSpy, server } = await setup({ noOrigin: true });
+      await start({ server });
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(controlSpy).not.toHaveBeenCalled();
+    });
+
+    it("PROPAGATES a controlNode failure into an error message naming the node, and fires NO success info or refresh (⊘ swallowing the failure reports a node that never started as started)", async () => {
+      const { start, server } = await setup({
+        controlNode: vi.fn(async () => {
+          throw new Error("EVE-NG refused the start");
+        })
+      });
+      await start({ server });
+      const msg = mockShowErrorMessage.mock.calls[0]?.[0] as string;
+      expect(msg).toContain("R1");
+      expect(msg).toContain("EVE-NG refused the start");
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    it("P3-4 — wraps the dispatch in withProgress so the '{Starting|Stopping} \"name\"…' title shows DURING the ~60s call, then still dispatches and refreshes (⊘ no withProgress leaves the user staring at a silent UI for the whole login→detect→action sequence)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(mockWithProgress).toHaveBeenCalled();
+      const opts = mockWithProgress.mock.calls[0][0] as { title?: string; location?: unknown };
+      expect(opts.title).toContain("R1");
+      expect(opts.title).toMatch(/starting/i);
+      // The dispatch and refresh still happen through the wrapped task.
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+    });
+
+    it("P3-4 — the success toast is HONEST about the status lag rather than phrased as if the request were about to be sent (⊘ 'Starting \"R1\"…' after the API already returned misreports the timing)", async () => {
+      const { start, server } = await setup();
+      await start({ server });
+      const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(info).toMatch(/sent/i);
+      expect(info).toMatch(/refresh lab status/i);
+    });
+
+    it("M2 — a classified InventoryProviderError surfaces through describeInventoryError, so the failure toast carries the classified prefix (⊘ a bare err.message drops the 'Authentication failed:' classification every other inventory failure shows)", async () => {
+      const { start, server } = await setup({
+        controlNode: vi.fn(async () => {
+          throw new InventoryProviderError("auth", "EVE-NG rejected the credentials");
+        })
+      });
+      await start({ server });
+      const msg = mockShowErrorMessage.mock.calls[0]?.[0] as string;
+      expect(msg).toContain("R1");
+      expect(msg).toContain("Authentication failed:");
+      expect(msg).toContain("EVE-NG rejected the credentials");
+    });
+
+    it("resolves the server from a bare source-less arg via core.getServer when the tree item carries the record id (⊘ a handler that only reads a string id misses the tree-item object VS Code actually passes)", async () => {
+      const { start, controlSpy, server } = await setup();
+      // VS Code passes the ServerTreeItem, whose `.server` is the record — the
+      // handler must read it, not require a string id.
+      await start({ server: { id: server.id } });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+    });
+
+    it("REFUSES to dispatch while the node's source is BUSY (mid-sync/edit/remove) — mirrors refreshStatus's busy-guard so it never races the vault purge or a stale config (⊘ dispatching mid-remove loads partial secrets and names a node whose source was just deleted; mid-edit dispatches a stale baseUrl)", async () => {
+      const { start, controlSpy, server } = await setup();
+      // Open Edit Source on src-1 → it is marked busy ("edit") while the form
+      // stays open (the same technique refreshStatus's busy-guard test uses).
+      await registeredCommands.get("nexus.inventory.editSource")!("src-1");
+      await start({ server });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(true);
+    });
+
+    it("DISPATCHES when the source is idle (⊘ a busy-guard that never releases would block every control forever)", async () => {
+      const { start, controlSpy, server } = await setup();
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+    });
+
+    // The exact wording a sibling command (Sync/Edit/Remove) shows when it finds
+    // the source held by an in-flight control — asserted verbatim so a claim that
+    // records the wrong reason (or none) is unmissable.
+    const BUSY_CONTROL = '"My Source" is currently starting or stopping a node — try again in a moment.';
+
+    it("CLAIMS the source for the whole dispatch — a Sync Now / a second control fired while a control is in flight is refused, and the claim is RELEASED once it settles (⊘ a busy-guard that only READS inFlightSourceIds lets Edit/Remove/Sync race the vault read + control request: stale baseUrl, creds read mid-replacement, or a node whose source was just purged)", async () => {
+      let releaseControl!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseControl = resolve));
+      const controlNode = vi.fn(async () => {
+        await gate;
+      });
+      const { start, provider, server } = await setup({ controlNode });
+      const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
+
+      // Start a control and let it park inside controlNode — the claim is now
+      // held (set synchronously right after the busy check, before the awaited
+      // secrets load + dispatch).
+      const inFlight = start({ server });
+      await vi.waitFor(() => expect(controlNode).toHaveBeenCalledTimes(1));
+
+      // A sibling Sync Now on the same source is refused with the CONTROL-holder
+      // wording (not a running-sync lie) and starts no fetch — the mutation this
+      // guards against is the sync sailing past its own check and racing us.
+      await syncCmd("src-1");
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_CONTROL);
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+
+      // A SECOND control is refused too: controlNode is not entered a second time.
+      await start({ server });
+      expect(controlNode).toHaveBeenCalledTimes(1);
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(true);
+
+      // Release → the claim is freed → a subsequent control dispatches.
+      releaseControl();
+      await inFlight;
+      await start({ server });
+      expect(controlNode).toHaveBeenCalledTimes(2);
+    });
+
+    it("RELEASES the claim even when the control request FAILS — a control after a failed one on the same source is not refused as busy (⊘ deleting the marker only after the !dispatched early-return leaks the claim on every failure, wedging the node forever)", async () => {
+      const controlNode = vi.fn(async () => {
+        throw new Error("EVE-NG refused");
+      });
+      const { start, server } = await setup({ controlNode });
+
+      await start({ server }); // fails inside withProgress → dispatched === false
+      await start({ server }); // must NOT be refused as busy — the finally freed it
+
+      expect(controlNode).toHaveBeenCalledTimes(2);
+      expect(mockShowInformationMessage.mock.calls.some((c) => /busy/i.test(String(c[0])))).toBe(false);
+    });
+
+    it("releases the claim BEFORE the un-awaited refreshStatus fires, so the status refresh is not self-skipped by its own 'control' claim (⊘ firing refreshStatus while the marker is still held makes refreshStatus SKIP the source (~:4413) — the tree never updates after a successful start/stop)", async () => {
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(makeProvider({ controlNode: vi.fn(async () => {}), fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-1" }));
+
+      // Route the real refreshStatus through executeCommand so its skip-if-busy
+      // sweep actually runs against the live marker (the default mock only
+      // records the call, so it can't observe the self-skip). mockImplementationOnce
+      // is consumed by controlNode's single executeCommand and does not leak.
+      mockExecuteCommand.mockImplementationOnce((cmd: string, ...rest: unknown[]) =>
+        cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
+      );
+
+      await registeredCommands.get("nexus.inventory.startNode")!({ server });
+
+      // The un-awaited refresh's fetchStatus must run — proof the source was NOT
+      // still held by the 'control' claim when refreshStatus swept it.
+      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+    });
+
+    it("REFUSES a tree item whose server id is no longer in core — a server removed between render and click — instead of dispatching via its stale record (⊘ a `?? withServer.server` fallback fires a control at a just-deleted node's stale origin)", async () => {
+      const { start, controlSpy } = await setup();
+      // The tree item still carries a full, valid-looking record (origin + all),
+      // but its id was removed from core after the row was rendered. The handler
+      // must resolve strictly against the live core and fall through to the
+      // refusal, not trust the stale item.
+      await start({
+        server: { id: "removed-since-render", origin: { sourceId: "src-1", externalId: "/Lab.unl#9", syncedAt: 1 } }
+      });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    // ── #85 P2 (Codex) — capture under configMutationLock, dispatch OUTSIDE it ──
+    // The per-source "control" claim above guards the SOURCE-SCOPED siblings
+    // (Edit/Remove/Sync each honour inFlightSourceIds). But the GLOBAL config
+    // mutations — an id-preserving replace-import and Delete All Data — DELIBERATELY
+    // bypass inFlightSourceIds and serialize ONLY through configMutationLock. So the
+    // secrets+config CAPTURE is taken INSIDE that lock (re-reading the live source and
+    // bailing if its revision moved), while the ~60s provider dispatch stays OUTSIDE
+    // it (the firm I/O-outside-lock invariant refreshStatus/sync also obey).
+
+    it("BAILS without dispatching when a locked writer (replace-import) supersedes the source between handler entry and the under-lock capture — the live revision no longer matches (⊘ dropping the revision guard dispatches against a source swapped out from under it, with a stale baseUrl)", async () => {
+      const { start, controlSpy, core, server } = await setup();
+      const realSource = core.getInventorySource("src-1")!;
+      // The first getInventorySource (handler entry) sees the real record; the
+      // capture's re-read INSIDE configMutationLock sees a DIFFERENT revision —
+      // exactly what an id-preserving replace-import that swapped the source would
+      // present (addOrUpdateInventorySource re-assigns revision via randomUUID()).
+      let calls = 0;
+      vi.spyOn(core, "getInventorySource").mockImplementation((id: string) => {
+        void id;
+        calls += 1;
+        return calls === 1 ? realSource : { ...realSource, revision: "superseded-revision" };
+      });
+      await start({ server });
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+      expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(true);
+    });
+
+    it("takes the secrets+config CAPTURE inside configMutationLock — while an unrelated writer holds the lock, no vault read and no dispatch happen; once the lock frees, the capture proceeds and dispatches (⊘ capturing without the lock reads credentials mid-purge, racing Delete All Data's vault wipe)", async () => {
+      const { start, controlSpy, vault, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      // Hold configMutationLock with a gated writer — as completeReset (Delete All
+      // Data) or a replace-import would while purging/swapping under the lock.
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+      const held = configMutationLock.runExclusive(async () => {
+        await gate;
+      });
+      await Promise.resolve(); // let the gated writer actually acquire the lock
+
+      const inFlight = start({ server });
+      try {
+        // Give controlNode room to run up to (and queue behind) the held lock.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        // The lock is held → the capture is queued behind it → NO vault read, NO dispatch.
+        expect(vault.get).not.toHaveBeenCalled();
+        expect(controlSpy).not.toHaveBeenCalled();
+      } finally {
+        // Always free the shared configMutationLock singleton, even if an
+        // assertion above threw — otherwise a red run would wedge every later test.
+        releaseGate();
+        await held;
+        await inFlight;
+      }
+      // Release → the capture runs → the vault read happens → the dispatch proceeds.
+      expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "password"));
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+    });
+
+    it("revision STABLE across handler entry and the under-lock re-read → the capture succeeds and dispatch proceeds with the source's secrets, no 'changed' refusal (⊘ a spurious bail would refuse every ordinary control)", async () => {
+      const { start, controlSpy, server } = await setup({
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
+      expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(false);
+    });
+  });
+});
+
+/**
+ * LIVE STATUS (Phase 2) — nexus.inventory.refreshStatus fetches each targeted
+ * source's running/stopped report and applies it. It skips providers with no
+ * fetchStatus, is non-fatal per source, and respects the inFlightSourceIds
+ * busy-guard so it never races a sync/edit/remove on the same source.
+ */
+describe("nexus.inventory.refreshStatus", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
+  });
+
+  const REPORT = { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" as const } } };
+
+  it("applies a report from a source whose provider implements fetchStatus (⊘ never calling applyInventoryStatus leaves the tree without any live status)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledWith("src-1", REPORT);
+  });
+
+  it("skips a source whose provider has NO fetchStatus, without throwing or applying (⊘ calling a missing method throws into the refresh loop; NetBox has no status)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider()); // no fetchStatus
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+    expect(applySpy).not.toHaveBeenCalled();
+  });
+
+  it("is non-fatal per source: a source whose fetchStatus throws does not stop another source from applying (⊘ a single provider failure aborting the whole sweep)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    // One provider, per-source behaviour keyed on config.host.
+    const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+      if (config.host === "boom") throw new Error("provider down");
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "bad", name: "Bad", config: { host: "boom" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "good", name: "Good", config: { host: "ok" } }));
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+
+    // The good source still applied; the throwing one degraded to no update.
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledWith("good", REPORT);
+  });
+
+  it("refreshes only the named source when given a source id argument", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "A", config: { host: "a" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "B", config: { host: "b" } }));
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "a" });
+
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledWith("a", REPORT);
+  });
+
+  it("respects the inFlightSourceIds busy-guard — a source open in Edit Source is skipped, not hit concurrently (⊘ refreshing a busy source races the vault read/provider call the edit/sync is doing)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    // Open the edit form → the source is marked busy ("edit") while it stays open.
+    await registeredCommands.get("nexus.inventory.editSource")!();
+    const { panel } = latestFormCall();
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(fetchStatus).not.toHaveBeenCalled();
+
+    // Once the form closes the guard releases and a later refresh proceeds.
+    panel.fireDispose();
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("P3-4 — re-checks the busy latch immediately before the persisting heal: a source that becomes busy DURING the awaited fetch has its heal SKIPPED, while the pure applyInventoryStatus still runs (⊘ persisting the heal while a concurrent sync/edit writes the same servers races two persisted writes)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    // fetchStatus opens Edit Source WHILE it is in flight — the exact race: the
+    // outer busy-check already passed, then a sync/edit claims the source during
+    // the awaited fetch. editSource marks the source busy synchronously and holds
+    // it (the form stays open).
+    const fetchStatus = vi.fn(async () => {
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+    // applyInventoryStatus is a pure runtime-map update, safe to run alongside a
+    // sync, so it still applies. The heal WRITES servers, so it is skipped while
+    // the source is busy.
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(healSpy).not.toHaveBeenCalled();
+  });
+
+  it("P3-4 control — a refresh on an idle source DOES run the heal (⊘ a latch re-check that always skips would disable the heal entirely)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(healSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // #84 P1 (Codex) — the heal persists via addServersBatch, which submits a FULL
+  // server snapshot to saveServers. If the heal's read-modify-persist is not
+  // serialized against the other server writers, a concurrent (lock-holding)
+  // edit/remove/sync can commit BETWEEN the heal's snapshot and its awaited save,
+  // and the heal's stale full snapshot then overwrites it on disk — reverting an
+  // UNRELATED server after reload. The fix runs the heal under the SAME
+  // configMutationLock every other server writer uses.
+  it("#84 — the heal does not clobber a concurrent edit of an UNRELATED server: serialized under configMutationLock, the edit survives (⊘ removing the lock lets the heal's stale full snapshot revert the concurrent edit)", async () => {
+    // A repository whose saveServers can be gated on a barrier, so the heal's
+    // save can be held in flight while a concurrent edit commits.
+    class GatedRepo extends InMemoryConfigRepository {
+      private armed = false;
+      private releaseFn: () => void = () => {};
+      private startedFn: () => void = () => {};
+      public gate = new Promise<void>((r) => (this.releaseFn = r));
+      public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+      public arm(): void {
+        this.armed = true;
+      }
+      public releaseGate(): void {
+        this.releaseFn();
+      }
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        if (this.armed) {
+          this.armed = false; // gate ONLY the first save after arming — the heal's
+          this.startedFn();
+          await this.gate;
+        }
+        return super.saveServers(servers);
+      }
+    }
+
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+
+    const externalId = "dev#1";
+    // T — the sync-owned telnet node the heal will re-port.
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    // U — an UNRELATED server the concurrent edit renames.
+    const unrelated: ServerConfig = {
+      id: "unrelated-1",
+      name: "U-original",
+      host: "10.9.9.9",
+      port: 22,
+      username: "root",
+      authType: "password",
+      isHidden: false
+    };
+    await core.addServersBatch([telnet, unrelated]);
+
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    // Gate the NEXT saveServers — the heal's.
+    repo.arm();
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    // Wait until the heal's save is in flight (blocked on the barrier).
+    await repo.firstGatedSaveStarted;
+
+    // A concurrent server edit, serialized through configMutationLock exactly as
+    // nexus.server.edit / .remove do — renames the UNRELATED server.
+    const editP = configMutationLock.runExclusive(() => core.addOrUpdateServer({ ...unrelated, name: "U-RENAMED" }));
+    // Give the edit a chance to run. WITHOUT the heal holding the lock, it
+    // acquires the lock, commits its save, and returns here; WITH the lock, it is
+    // queued behind the still-blocked heal and cannot commit yet.
+    await new Promise((r) => setTimeout(r, 0));
+
+    repo.releaseGate();
+    await Promise.all([refreshP, editP]);
+
+    // After both settle, the concurrent rename must have SURVIVED on disk.
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "unrelated-1")?.name).toBe("U-RENAMED");
+    // ...and the heal still landed (its whole point).
+    expect(persisted.find((s) => s.id === telnet.id)?.port).toBe(32800);
+  });
+
+  it("#84 P2-1 — re-validates staleness INSIDE the mutex: a source-revision bump (a replace-import) committed while the heal is QUEUED on the lock makes the heal SKIP its now-stale report (⊘ dropping the in-critical-section revision recheck lands a report fetched under the OLD source config onto the replaced records)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const externalId = "dev#1";
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    await core.addServersBatch([telnet]);
+
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const persistedSource = core.getInventorySource("src-1")!;
+
+    // A concurrent lock-holder standing in for a replace-mode config import: it
+    // HOLDS configMutationLock and, while holding, bumps the source revision
+    // (addOrUpdateInventorySource assigns a fresh revision on a config change) —
+    // exactly the window where the heal's pre-lock revision check is already stale
+    // but the heal is queued behind this holder.
+    let holdStartedResolve: () => void = () => {};
+    let releaseHold: () => void = () => {};
+    const holdStarted = new Promise<void>((r) => (holdStartedResolve = r));
+    const holdBarrier = new Promise<void>((r) => (releaseHold = r));
+    const holderP = configMutationLock.runExclusive(async () => {
+      holdStartedResolve();
+      await holdBarrier;
+      await core.addOrUpdateInventorySource({ ...persistedSource, config: { host: "replaced" } });
+    });
+    await holdStarted; // the lock is now held
+
+    // Trigger the refresh: the fetch resolves, the OUTER revision check passes
+    // (the holder has not bumped yet), applyInventoryStatus runs (pure), and the
+    // heal's runExclusive queues BEHIND the held lock.
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await new Promise((r) => setTimeout(r, 0)); // drain microtasks: heal is now queued
+
+    // Release the holder → it bumps the revision, releases the lock → the queued
+    // heal callback runs against the NEW revision.
+    releaseHold();
+    await Promise.all([holderP, refreshP]);
+
+    // The heal must have SKIPPED — the report was fetched under the pre-replace
+    // config, so its port write must not land on the replaced record.
+    expect(core.getServer(telnet.id)?.port).toBe(32769);
+  });
+
+  it("#84 P2 — a report straddling a COMPLETED sync (which changes the port + bumps the mutation epoch but NOT the source revision) does not heal stale: the in-lock epoch recheck bails, preserving the synced port (⊘ dropping the epoch recheck lands the pre-sync report over the freshly-synced record)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const externalId = "dev#1";
+    const telnet: ServerConfig = {
+      id: deterministicServerId("src-1", externalId),
+      name: "telnet-node",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+    await core.addServersBatch([telnet]);
+
+    const registry = new InventoryProviderRegistry();
+    // The report was fetched under the PRE-sync state and would heal the console
+    // port to 32800.
+    const fetchStatus = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      statuses: { [externalId]: { state: "running" as const, consolePort: 32800 } }
+    }));
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const persistedSource = core.getInventorySource("src-1")!;
+    const startRevision = persistedSource.revision;
+
+    // A concurrent lock-holder standing in for a full syncNow that has ALREADY
+    // cleared its busy latch (inFlightSourceIds) by the time the heal's outer
+    // checks ran, but whose server mutation lands while the heal is QUEUED on the
+    // lock. It applies a sync plan that re-ports the node to 32900 and bumps the
+    // source mutation epoch — WITHOUT bumping the config revision (a routine sync
+    // only touches lastSyncAt/managedFolders). So the heal's pre-lock revision
+    // guard and busy-latch guard BOTH pass; only the in-lock epoch recheck can
+    // catch that the report now straddles a completed sync.
+    let holdStartedResolve: () => void = () => {};
+    let releaseHold: () => void = () => {};
+    const holdStarted = new Promise<void>((r) => (holdStartedResolve = r));
+    const holdBarrier = new Promise<void>((r) => (releaseHold = r));
+    const holderP = configMutationLock.runExclusive(async () => {
+      holdStartedResolve();
+      await holdBarrier;
+      await core.applyInventorySyncPlan({
+        sourceId: "src-1",
+        syncedAt: 2,
+        upsertServers: [
+          { ...telnet, port: 32900, origin: { ...telnet.origin!, syncedPort: 32900, syncedAt: 2 } }
+        ],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: persistedSource
+      });
+    });
+    await holdStarted; // the lock is now held
+
+    // Trigger the refresh: the fetch resolves, the OUTER revision + busy checks
+    // pass (the sync has not applied yet), applyInventoryStatus runs (pure), and
+    // the heal's runExclusive queues BEHIND the held lock.
+    const refreshP = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await new Promise((r) => setTimeout(r, 0)); // drain microtasks: heal is now queued
+
+    // Release the holder → it applies the sync (port -> 32900, epoch bumped, same
+    // revision), releases the lock → the queued heal callback runs.
+    releaseHold();
+    await Promise.all([holderP, refreshP]);
+
+    // The revision never changed, so ONLY the epoch guard can drop the stale
+    // report. The synced port must survive — the report's 32800 must not land.
+    expect(core.getInventorySource("src-1")?.revision).toBe(startRevision);
+    expect(core.getServer(telnet.id)?.port).toBe(32900);
+  });
+
+  it("loads the source's saved secrets and passes them to fetchStatus (⊘ calling the provider without credentials makes every refresh an auth failure)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async (_config: InventorySourceValues, secrets: Record<string, string>) => {
+      expect(secrets.apiToken).toBe("tok");
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+    registerInventoryCommands(core, registry, vault, makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"], config: { host: "h" } }));
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("P3-7: the MANUAL refresh warns once when every targeted source fails, but the POLL path stays silent (⊘ a palette command that silently no-ops on total auth failure looks broken; a warning on every poll tick would nag)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => { throw new Error("auth broken"); });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+
+    // Manual (palette / title) invocation with no arg → warn on total failure.
+    await cmd();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage.mock.calls[0][0]).toMatch(/lab status/i);
+
+    // Poll invocation carries the __poll marker → silent.
+    mockShowWarningMessage.mockClear();
+    await cmd({ __poll: true });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("P3-7: the manual refresh does NOT warn when at least one source produced a report", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+      if (config.host === "boom") throw new Error("down");
+      return REPORT;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "bad", name: "Bad", config: { host: "boom" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "ok", name: "Good", config: { host: "ok" } }));
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("P2-1b: an in-flight refresh started under the OLD config does NOT reapply after the source is edited (⊘ a per-source-revision guard is missing, so a report fetched under the superseded config re-lands once the fetch resolves)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const fetchStatus = vi.fn(async () => { await gate; return REPORT; });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ config: { host: "old" } }));
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!(); // captures the source's current revision, parks on the gate
+    await Promise.resolve();
+
+    // Edit the source while the refresh is parked → a fresh revision.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("src-1")!, config: { host: "new" } });
+
+    release();
+    await sweep;
+    // The apply must be dropped: the report was fetched under the old config.
+    expect(applySpy).not.toHaveBeenCalled();
+  });
+
+  /**
+   * TRUNCATED STATUS (follow-up 2) — `fetchStatus` sets `truncated` when the lab
+   * crawl hits its own time budget, and the report it returns then covers only
+   * the nodes it reached: every other node keeps whatever state it already had,
+   * which may be stale or `unknown`. Nothing used to read the flag, so a partial
+   * refresh looked exactly like a complete one.
+   *
+   * Surfaced on the MANUAL path ONLY, following the P3-7 total-failure precedent
+   * immediately below: the poll stays silent because a warning per tick nags.
+   */
+  describe("a truncated status report", () => {
+    const TRUNCATED = { ...REPORT, truncated: true as const };
+
+    it("warns on a MANUAL refresh, naming the source and what partial means (⊘ nothing reads `truncated`, so a refresh that reached half the lab is indistinguishable from a complete one and the user trusts stale node state)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Big Lab"');
+      expect(message).toMatch(/partial/i);
+      expect(message).toMatch(/stopped before it covered everything/i);
+      expect(message).toMatch(/Root Folder|Lab Filter/);
+    });
+
+    it("stays SILENT on the poll path (⊘ dropping the `manual` gate nags the user with this warning on every poll tick, forever, for a lab that is merely large)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => TRUNCATED);
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      // The `{ __poll: true }` marker is what the background poll passes.
+      await registeredCommands.get("nexus.inventory.refreshStatus")!({ __poll: true });
+
+      expect(fetchStatus).toHaveBeenCalledTimes(1); // the poll DID run
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not warn when the report is COMPLETE (⊘ dropping the `truncated` gate warns after every healthy manual refresh)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => REPORT) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not warn from a SUPERSEDED sweep — the report was never applied, so there is no partial status on screen to explain (⊘ warning from a sweep whose results were dropped blames the user's newer refresh on the older one's budget)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let call = 0;
+      const fetchStatus = vi.fn(async () => {
+        call += 1;
+        if (call === 1) {
+          // Sweep A (older): parks, then comes back TRUNCATED.
+          await firstGate;
+          return TRUNCATED;
+        }
+        // Sweep B (newer): a complete report, applied while A is still parked.
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "Big Lab" }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweepA = cmd() as Promise<void>; // gen 1 — parks inside fetchStatus
+      await Promise.resolve();
+      await cmd(); // gen 2 — supersedes A
+      releaseFirst();
+      await sweepA;
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    /**
+     * R3 (review) — the COMPLEMENT of the test above, and the case its comment
+     * got wrong. Silence-on-supersede is correct only while NOTHING was applied.
+     * A multi-source sweep can be superseded AFTER an earlier source's truncated
+     * report already passed the apply guard: that source's partial status IS on
+     * screen, and the loop-top generation check then `return`s straight past the
+     * post-loop warning, so nothing ever explains it. The superseding sweep is
+     * typically targeted (the node-control path fires one for a single source),
+     * so it does not cover the earlier source either.
+     */
+    it("STILL warns when the supersede lands AFTER an earlier source's truncated report was APPLIED — that partial status is on screen and nothing else will explain it (\u2298 bailing out of the loop skips the post-loop warning, so a user looking at Lab A's half-finished status is told nothing)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      // Lab A truncates; Lab B (which this sweep never reaches) would not.
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => (config.host === "a" ? TRUNCATED : REPORT));
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      // Supersede from INSIDE Lab A's apply, which is exactly the real shape:
+      // the node-control path fires `void executeCommand("...refreshStatus",
+      // source.id)` un-awaited, and refreshStatus bumps the generation
+      // SYNCHRONOUSLY on entry. So gen 1 has already applied Lab A's partial
+      // status when gen 2 starts, and bails at the loop top before Lab B.
+      let superseding: Promise<void> | undefined;
+      const applied = core.applyInventoryStatus.bind(core);
+      vi.spyOn(core, "applyInventoryStatus").mockImplementation((sourceId, report) => {
+        applied(sourceId, report);
+        if (sourceId === "a" && superseding === undefined) {
+          superseding = cmd("b") as Promise<void>;
+        }
+      });
+
+      await cmd();
+      await superseding;
+
+      expect(superseding).toBeDefined(); // the fixture really did supersede mid-sweep
+      expect(fetchStatus).toHaveBeenCalledTimes(2); // Lab A on gen 1, Lab B on gen 2 \u2014 gen 1 never reached B
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Lab A"');
+      expect(message).toMatch(/partial/i);
+      // And ONLY the truncation warning. The total-failure warning must stay
+      // suppressed on a bail: "every source failed" is a claim only a COMPLETE
+      // sweep can make, and here Lab A in fact succeeded.
+      expect(message).not.toMatch(/from any inventory source/i);
+    });
+
+    /**
+     * R4 (Codex P2) — a hazard introduced by the R3 fix directly above. Its
+     * justification is "that partial status is on screen", which holds only
+     * until something NEWER replaces it. A newer sweep that applies a COMPLETE
+     * report for the same source makes the older sweep's claim false: the tree
+     * now shows complete status for it, and warning anyway sends the user off to
+     * narrow a Root Folder that no longer needs narrowing.
+     *
+     * So the collected entries are filtered at the warning exits by WHICH sweep
+     * generation last applied status for each source; only sources whose most
+     * recent apply is still this sweep's survive.
+     */
+    it("does NOT warn about a source whose truncated status a NEWER sweep has already REPLACED with a complete report (⊘ collecting names without recording which sweep last applied each source lets a slow gen 1 claim partial status the tree no longer shows)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      let aCalls = 0;
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          aCalls += 1;
+          return aCalls === 1 ? TRUNCATED : REPORT; // gen 1 partial; gen 2 complete
+        }
+        // Gen 1 parks here, holding its collected "Lab A", while gen 2 runs to
+        // completion over the top of it.
+        bEntered();
+        await bGate;
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweepA = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+      await cmd("a"); // gen 2 — a COMPLETE report for Lab A, applied over gen 1's partial one
+      releaseB();
+      await sweepA; // gen 1 runs out of sources and reaches its post-loop warning exit
+
+      expect(aCalls).toBe(2); // the fixture really did re-fetch and re-apply Lab A
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    /**
+     * R4 hygiene — the per-source generation entry outlives the source itself
+     * unless removal drops it. That is not just a leak: the entry keeps the
+     * sweep's truncation claim alive, so a source the user REMOVED mid-sweep is
+     * still named in the warning and they are told to narrow the Root Folder of
+     * something that no longer exists.
+     */
+    it("does NOT warn about a source the user REMOVED after its truncated report was applied (⊘ warning from the collected list without re-reading the live sources names a source that is no longer in the tree and tells the user to go narrow its Root Folder)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // Lab A owns no servers, so its confirm offers the single "Remove" button.
+      mockShowWarningMessage.mockResolvedValueOnce("Remove");
+      await registeredCommands.get("nexus.inventory.removeSource")!("a");
+      expect(core.getInventorySource("a")).toBeUndefined(); // the fixture really did remove it
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * The SAME staleness, through a remover that cannot maintain the map. The
+     * test above removes the source via `nexus.inventory.removeSource`, which
+     * deletes its own generation entry. But Reset and a replace-mode config
+     * import drop sources by calling `core.removeInventorySource` DIRECTLY
+     * (configCommands.ts) — they never touch this command module's closure-local
+     * map, and neither would any future removal path. So the warning cannot rely
+     * on being told; it re-reads the live source list at the moment it warns.
+     */
+    it("does NOT warn about a source removed by a path that never maintains the generation map — e.g. Reset or a replace-mode import calling core directly (⊘ trusting removers to invalidate the entry covers only the one removal path that was taught to, and names a source that Reset deleted)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // NOT through removeSource: straight to the core, exactly as completeReset
+      // and a replace-mode import do. Nothing informs the generation map.
+      await core.removeInventorySource("a");
+      expect(core.getInventorySource("a")).toBeUndefined();
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * The id survives, the RECORD does not. A replace-mode config import removes
+     * a source and re-adds it under the same id, which mints a fresh revision and
+     * clears the status the old record displayed. An existence test passes that
+     * impostor — same id, still there — so the warning would explain a partial
+     * status on a replacement that is showing none.
+     */
+    it("does NOT warn when the source was removed and RECREATED under the same id mid-sweep, as a replace-mode import does (⊘ testing only that the id still exists accepts a different incarnation, whose status was cleared with the record we actually applied to)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        bEntered();
+        await bGate; // gen 1 parks here, holding its collected "Lab A"
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+      const originalRevision = core.getInventorySource("a")!.revision;
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const sweep = cmd() as Promise<void>; // gen 1 — applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      // Replace-mode import: drop the record, put one back under the SAME id.
+      await core.removeInventorySource("a");
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      const replacement = core.getInventorySource("a");
+      expect(replacement).toBeDefined();                          // the id is back...
+      expect(replacement!.revision).not.toBe(originalRevision);   // ...as a different incarnation
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * R3 (review), the other half of the bail decision: why the bail is a
+     * `return` and not a `break`. `break` would fall through to the TOTAL-FAILURE
+     * warning, whose `succeeded === 0` is meant to say "every source failed" —
+     * true only of a COMPLETE sweep. On a bail it means merely "every source
+     * tried SO FAR failed", and the sources never reached might all be healthy.
+     */
+    it("does NOT fire the total-failure warning from a sweep that bailed on supersede before trying every source (\u2298 a `break` instead of a `return` runs the post-loop total-failure check on a half-finished sweep and reports a total outage from one failed source)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const cmdRef: { fire?: () => Promise<void> } = {};
+      let superseding: Promise<void> | undefined;
+      // Lab A fails outright (no report \u2014 attempted 1, succeeded 0) and the
+      // supersede lands during its fetch, so gen 1 bails at the loop top before
+      // ever trying Lab B.
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          superseding ??= cmdRef.fire!();
+          throw new Error("auth failed");
+        }
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      cmdRef.fire = () => cmd("b") as Promise<void>;
+
+      await cmd();
+      await superseding;
+
+      expect(superseding).toBeDefined();
+      expect(fetchStatus).toHaveBeenCalledTimes(2); // Lab A on gen 1, Lab B on gen 2 only
+      // Nothing at all: no truncation was applied, and the failure count is not a
+      // verdict this incomplete sweep is entitled to deliver.
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    /**
+     * R3 (follow-up #43 review) — the SAME staleness, through the SECOND
+     * applier. A completed sync now applies status too, and it is not a sweep:
+     * it changes neither the generation counter nor `source.revision`, so
+     * nothing the two live checks read moves. If the sync leaves the generation
+     * record alone, a truncated claim collected before it still matches at the
+     * warning exit and the user is told to narrow the Root Folder of a lab tree
+     * the sync has just brought fully current.
+     */
+    it("does NOT warn about a source whose truncated status a completed SYNC has since replaced with a complete one (⊘ leaving the sync's apply out of the generation record lets a slow refresh claim partial status about a tree that is now fully current)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+      let bEntered!: () => void;
+      const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          return TRUNCATED;
+        }
+        // The sweep parks here, holding its collected "Lab A", while the sync
+        // for Lab A runs to completion over the top of it.
+        bEntered();
+        await bGate;
+        return REPORT;
+      });
+      // A nothing-to-change sync that still carries a COMPLETE status report —
+      // the ordinary shape of a re-sync of a settled lab.
+      const fetchInventory = vi.fn(
+        async (): Promise<InventoryTree> => ({ contractVersion: 1, devices: [], status: { contractVersion: 1, statuses: { "dev#1": { state: "running" } } } })
+      );
+      const provider = makeProvider({ fetchStatus, fetchInventory });
+      registry.register(provider);
+      // The provider declares `apiToken` required, so syncNow refuses before it
+      // fetches unless the vault has it.
+      registerInventoryCommands(core, registry, makeVault({ [inventorySecretKey("a", "apiToken")]: "tok" }), makeTeardown());
+      // FINGERPRINT PRE-STAMPED, deliberately. A source with none is stamped
+      // after its first successful sync, and that stamp goes through
+      // addOrUpdateInventorySource — which MINTS A NEW REVISION, so the warning's
+      // revision check would suppress the message for a reason that has nothing
+      // to do with the record this test is about. With it already stamped, a
+      // routine sync touches only lastSyncAt/managedFolders and leaves `revision`
+      // alone (asserted below), which is exactly the case R3 describes.
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" }, providerFingerprint: computeProviderFingerprint(provider) }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" }, providerFingerprint: computeProviderFingerprint(provider) }));
+
+      const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>; // gen 1 applies Lab A truncated, then parks in Lab B's fetch
+      await bParked;
+
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      const revisionBefore = core.getInventorySource("a")!.revision;
+      await registeredCommands.get("nexus.inventory.syncNow")!("a");
+      // The sweep's OTHER live check must not be what suppresses the warning.
+      expect(core.getInventorySource("a")!.revision).toBe(revisionBefore);
+      // The fixture really did apply, and applied a COMPLETE report — the whole
+      // point of this interleaving.
+      expect(applySpy).toHaveBeenCalledTimes(1);
+      expect(applySpy.mock.calls[0][0]).toBe("a");
+      expect(applySpy.mock.calls[0][1].truncated).toBeFalsy();
+
+      releaseB();
+      await sweep; // gen 1 reaches its post-loop warning exit
+
+      expect(mockShowWarningMessage.mock.calls.some((c) => /partial/i.test(String(c[0])))).toBe(false);
+    });
+
+    /**
+     * THE OTHER HALF OF R3, and the one the unconditional deletion got wrong.
+     * The sync's apply invalidates the sweep's collected claim, but that claim
+     * is "this source's status is PARTIAL" — and only a COMPLETE apply makes it
+     * false. A sync that applies a TRUNCATED report of its own has left exactly
+     * the state the warning describes on screen, so dropping the source from the
+     * warning tells the user nothing about a status that really is partial.
+     *
+     * Both shapes of a partial sync report are covered, because they reach the
+     * bookkeeping through the same field: the raw-node STATUS CAP alone (the
+     * device list is complete, so the TREE is not truncated) and a truncated
+     * CRAWL (both flags set).
+     */
+    for (const shape of [
+      { label: "the raw-node status cap alone (the tree itself is complete)", treeTruncated: undefined },
+      { label: "a truncated crawl", treeTruncated: true as const }
+    ]) {
+      it(`STILL warns when the completed SYNC's own status report is ALSO truncated — ${shape.label} (\u2298 invalidating the sweep's claim on every sync, complete or not, drops the source from the warning while its status is still partial and nothing else will say so)`, async () => {
+        const core = new NexusCore(new InMemoryConfigRepository());
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+
+        let releaseB!: () => void;
+        const bGate = new Promise<void>((resolve) => { releaseB = resolve; });
+        let bEntered!: () => void;
+        const bParked = new Promise<void>((resolve) => { bEntered = resolve; });
+        const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+          if (config.host === "a") {
+            return TRUNCATED;
+          }
+          // The sweep parks here holding its collected "Lab A" while the sync of
+          // Lab A runs to completion over the top of it.
+          bEntered();
+          await bGate;
+          return REPORT;
+        });
+        const fetchInventory = vi.fn(
+          async (): Promise<InventoryTree> => ({
+            contractVersion: 1,
+            devices: [],
+            truncated: shape.treeTruncated,
+            status: { contractVersion: 1, truncated: true, statuses: { "dev#1": { state: "running" } } }
+          })
+        );
+        const provider = makeProvider({ fetchStatus, fetchInventory });
+        registry.register(provider);
+        registerInventoryCommands(core, registry, makeVault({ [inventorySecretKey("a", "apiToken")]: "tok" }), makeTeardown());
+        // Fingerprint pre-stamped for the same reason as the test above: a
+        // restamping sync mints a fresh revision, and the warning's revision
+        // check would then suppress the message for an unrelated reason.
+        await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" }, providerFingerprint: computeProviderFingerprint(provider) }));
+        await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" }, providerFingerprint: computeProviderFingerprint(provider) }));
+
+        const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>; // gen 1 applies Lab A truncated, then parks in Lab B's fetch
+        await bParked;
+
+        const applySpy = vi.spyOn(core, "applyInventoryStatus");
+        const revisionBefore = core.getInventorySource("a")!.revision;
+        // A truncated TREE carries plan warnings, and syncNow chains .then() onto
+        // that toast — the default `vi.fn()` returns undefined. Only the calls
+        // matching /partial/ are inspected below, so this affects nothing else.
+        mockShowWarningMessage.mockResolvedValue(undefined);
+        await registeredCommands.get("nexus.inventory.syncNow")!("a");
+        // The sweep's other live checks must not be what decides this test.
+        expect(core.getInventorySource("a")!.revision).toBe(revisionBefore);
+        // The sync really did apply, and applied a TRUNCATED report — the whole
+        // premise of the interleaving.
+        expect(applySpy).toHaveBeenCalledTimes(1);
+        expect(applySpy.mock.calls[0][0]).toBe("a");
+        expect(applySpy.mock.calls[0][1].truncated).toBe(true);
+
+        releaseB();
+        await sweep; // gen 1 reaches its post-loop warning exit
+
+        const partial = mockShowWarningMessage.mock.calls.filter((c) => /partial/i.test(String(c[0])));
+        expect(partial).toHaveLength(1);
+        expect(String(partial[0][0])).toContain('"Lab A"');
+      });
+    }
+
+    it("emits ONE message for the whole sweep, naming every affected source (⊘ one showWarningMessage per source stacks a modal-ish pile of notifications on a multi-lab refresh)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Lab A"');
+      expect(message).toContain('"Lab B"');
+      expect(message).toContain("2 sources");
+    });
+    it("names only the first three of FOUR truncated sources and counts the rest, with a plural possessive (\u2298 the 3-name cap and the \u2018and N more\u2019 count are only ever exercised at 1 and 2 sources, so an off-by-one in either \u2014 or a slice that drops a name \u2014 ships unnoticed)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ fetchStatus: vi.fn(async () => TRUNCATED) }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      for (const key of ["a", "b", "c", "d"]) {
+        await core.addOrUpdateInventorySource(makeSource({ id: key, name: `Lab ${key.toUpperCase()}`, config: { host: key } }));
+      }
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      // Asserted WHOLE, not by substring: the cap, the remainder count and the
+      // possessive are each one edit away from being wrong, and only the exact
+      // sentence pins all three at once. "Lab D" is named nowhere.
+      expect(String(mockShowWarningMessage.mock.calls[0][0])).toBe(
+        'Lab status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the sources\' Root Folder or Lab Filter to bring the lab tree inside the crawl\'s limits.'
+      );
+    });
+  });
+
+  /**
+   * R4 (follow-up #43 review) — a refresh whose fetch STRADDLED a completed
+   * sync. `startEpoch` is captured before the fetch and was already re-checked
+   * before `healSyncedConsolePorts`; the apply needs it too now that a sync
+   * writes status of its own. Neither of the other two guards catches a sync: it
+   * starts no sweep and bumps no `revision`.
+   */
+  it("does NOT apply a report whose fetch straddled a COMPLETED sync for the same source — the sync's status is newer (⊘ guarding only the sweep generation and the source revision lets a report fetched before the sync repaint the state the sync just established)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const parked = new Promise<void>((resolve) => { entered = resolve; });
+    const fetchStatus = vi.fn(async () => {
+      entered();
+      await gate;
+      // Fetched BEFORE the sync below and resolved after it: stale by the time
+      // it lands, and it disagrees with the sync about the node.
+      return { contractVersion: 1 as const, statuses: { "dev#1": { state: "stopped" as const } } };
+    });
+    const fetchInventory = vi.fn(
+      async (): Promise<InventoryTree> => ({
+        contractVersion: 1,
+        devices: [{ externalId: "dev#1", name: "R1", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }],
+        status: { contractVersion: 1, statuses: { "dev#1": { state: "running" } } }
+      })
+    );
+    const provider = makeProvider({ fetchStatus, fetchInventory });
+    registry.register(provider);
+    registerInventoryCommands(core, registry, makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" }), makeTeardown());
+    // Fingerprint pre-stamped so the sync does not restamp it: a restamp mints a
+    // fresh revision, and the apply's revision guard would then drop the stale
+    // report for a reason that has nothing to do with the epoch this test is
+    // about. Asserted below.
+    await core.addOrUpdateInventorySource(makeSource({ providerFingerprint: computeProviderFingerprint(provider) }));
+
+    const sweep = registeredCommands.get("nexus.inventory.refreshStatus")!() as Promise<void>;
+    await parked;
+
+    // The sync commits: it persists a server (bumping the source's mutation
+    // epoch) and applies its own, newer status.
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    const revisionBefore = core.getInventorySource("src-1")!.revision;
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getInventorySource("src-1")!.revision).toBe(revisionBefore); // the OTHER guard is not what drops the report
+    const serverId = deterministicServerId("src-1", "dev#1");
+    expect(core.getSnapshot().serverStatus.get(serverId)).toBe("running"); // the fixture really did land a sync
+
+    release();
+    await sweep;
+
+    expect(core.getSnapshot().serverStatus.get(serverId)).toBe("running"); // not repainted "stopped" by the stale report
+  });
+
+  it("P2-1 generation guard: a slow older sweep resolving AFTER a newer one does NOT overwrite the newer apply (⊘ last-completed-wins lets a stale report clobber fresh state)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let call = 0;
+    const RUNNING = { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" as const } } };
+    const STOPPED = { contractVersion: 1 as const, statuses: { "dev#1": { state: "stopped" as const } } };
+    const fetchStatus = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        // Sweep A (older): blocks until released, then returns the STALE report.
+        await firstGate;
+        return STOPPED;
+      }
+      // Sweep B (newer): resolves immediately with the FRESH report.
+      return RUNNING;
+    });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+
+    const sweepA = cmd(); // gen 1 — parks on firstGate inside fetchStatus
+    await Promise.resolve();
+    const sweepB = cmd(); // gen 2 — completes and applies the fresh (running) report
+    await sweepB;
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy.mock.calls[0][1].statuses["dev#1"].state).toBe("running");
+
+    releaseFirst(); // sweep A resumes; its apply must be dropped as stale
+    await sweepA;
+    expect(applySpy).toHaveBeenCalledTimes(1); // A did NOT apply over B
+    expect(applySpy.mock.calls.every((c) => c[1].statuses["dev#1"].state === "running")).toBe(true);
+  });
+});
+
+/**
+ * LIVE STATUS ON A SYNC (follow-up #42) — a completed sync now applies the
+ * status picture the provider handed back on `InventoryTree.status`, so an
+ * EVE-NG sync leaves lab state current without a separate Refresh Lab Status.
+ * The provider decides whether that picture is COMPLETE (`status.truncated`);
+ * `NexusCore.applyInventoryStatus` merges a truncated one and clears-then-
+ * applies a complete one, and this command is only responsible for handing it
+ * over on the paths where a sync actually applied.
+ */
+describe("nexus.inventory.syncNow — the sync applies the fetched lab status", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
+    // A truncated fetch carries plan warnings, and syncNow chains .then() onto
+    // the warning toast — a bare vi.fn() returning undefined would throw there.
+    mockShowWarningMessage.mockResolvedValue(undefined);
+  });
+
+  /**
+   * The provider's required `apiToken` must be in the vault or syncNow refuses
+   * before it ever fetches. Covers both source ids the NetBox test uses.
+   */
+  const VAULT = () => makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok", [inventorySecretKey("src-2", "apiToken")]: "tok" });
+
+  /** The two devices every test here syncs, and the ids they land on. */
+  const RUNNING_ID = deterministicServerId("src-1", "/L.unl#1");
+  const STOPPED_ID = deterministicServerId("src-1", "/L.unl#2");
+
+  function eveTree(overrides: Partial<InventoryTree> = {}): InventoryTree {
+    return {
+      contractVersion: 1,
+      devices: [
+        { externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] },
+        { externalId: "/L.unl#2", name: "R2", endpoints: [{ kind: "telnet", host: "10.0.0.2", port: 32770 }] }
+      ],
+      status: {
+        contractVersion: 1,
+        statuses: { "/L.unl#1": { state: "running" }, "/L.unl#2": { state: "stopped" } }
+      },
+      ...overrides
+    };
+  }
+
+  async function makeWorld(tree: InventoryTree | (() => Promise<InventoryTree>), source = makeSource()) {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: typeof tree === "function" ? vi.fn(tree) : vi.fn(async () => tree) }));
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(source);
+    return { core, sync: registeredCommands.get("nexus.inventory.syncNow")! };
+  }
+
+  /** Re-point the registered commands at a provider returning a DIFFERENT tree. */
+  function reregister(core: NexusCore, tree: InventoryTree): (id: string) => unknown {
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: vi.fn(async () => tree) }));
+    registeredCommands.clear();
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    return registeredCommands.get("nexus.inventory.syncNow")! as (id: string) => unknown;
+  }
+
+  it("leaves every synced server's status matching the node state the fetch reported (⊘ dropping the applyInventoryStatus call leaves a freshly-synced lab with NO status at all, so the tree shows nothing and Start/Stop stays hidden until a separate refresh)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+    await sync("src-1");
+
+    expect(core.getSnapshot().servers.map((s) => s.id).sort()).toEqual([RUNNING_ID, STOPPED_ID].sort());
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("applies the status on a NOTHING-TO-CHANGE sync too — that path applies an (empty) plan and completes, and its status is just as fresh (⊘ wiring the apply only into the confirm path leaves the common re-sync of an unchanged lab unable to refresh a single node)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1"); // first sync creates the servers
+
+    // Second sync: same devices, nothing to change — but node 1 has since
+    // STOPPED and node 2 has STARTED. No "Apply" is queued, because a
+    // nothing-to-change plan takes the fast path and shows no confirm modal.
+    const sync2 = reregister(core, {
+      ...eveTree(),
+      status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
+    });
+    await sync2("src-1");
+
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("stopped");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("running");
+  });
+
+  it("a provider that supplies NO tree.status (NetBox) does not reach applyInventoryStatus at all (⊘ handing an empty report over on its behalf is a COMPLETE report saying 'nothing is known any more', which clears every entry THAT source owns)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ id: "eve", fetchInventory: vi.fn(async () => eveTree()) }));
+    registry.register(
+      makeProvider({
+        id: "netbox",
+        // A NetBox-shaped tree: devices, no `status` member at all.
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:9", name: "nb-1", endpoints: [{ kind: "ssh" as const, host: "10.9.0.9", port: 22 }] }]
+        }))
+      })
+    );
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", providerId: "eve", name: "Lab" }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-2", providerId: "netbox", name: "NetBox", targetFolder: "NB" }));
+
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+    // The NetBox sync landed (its server exists) and said NOTHING about status.
+    // NOT CALLED AT ALL, rather than called with an empty report: an absent
+    // report is "no news", and an empty COMPLETE one asserts "nothing is known",
+    // which would clear src-2's own entries. (It could not touch src-1's either
+    // way — see the source-scoping test below for that, which is a property of
+    // `applyInventoryStatus`, not of this guard.)
+    expect(core.getSnapshot().servers.some((s) => s.origin?.sourceId === "src-2")).toBe(true);
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  /**
+   * R5 (follow-up #43 review) — what ACTUALLY stops one source's sync from
+   * blanking another's decorations is `applyInventoryStatus`'s SCOPING, not the
+   * fact that NetBox supplies no status: the clear loop drops only entries whose
+   * recorded owner is this `sourceId`, and the report is resolved only against
+   * servers with `origin.sourceId === sourceId`. So the case worth testing is
+   * the one the absent-report test cannot reach — a second source that DOES hand
+   * over a full, complete report.
+   */
+  it("a second source's COMPLETE report clears only ITS OWN entries — the first source's decorations survive intact (⊘ a clear loop that drops every entry regardless of owner lets any source's sync blank every other source's lab highlight)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ id: "eve", fetchInventory: vi.fn(async () => eveTree()) }));
+    registry.register(
+      makeProvider({
+        id: "eve2",
+        fetchInventory: vi.fn(
+          async (): Promise<InventoryTree> => ({
+            contractVersion: 1,
+            devices: [{ externalId: "/O.unl#1", name: "O1", endpoints: [{ kind: "telnet" as const, host: "10.9.0.9", port: 32769 }] }],
+            // COMPLETE (no `truncated`), so the apply CLEARS before it applies —
+            // the only shape that can wipe anything at all.
+            status: { contractVersion: 1, statuses: { "/O.unl#1": { state: "running" } } }
+          })
+        )
+      })
+    );
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", providerId: "eve", name: "Lab" }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-2", providerId: "eve2", name: "Other Lab", targetFolder: "Other" }));
+
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-2");
+
+    // src-2's own entry landed — so the clear-then-apply really did run...
+    expect(core.getSnapshot().serverStatus.get(deterministicServerId("src-2", "/O.unl#1"))).toBe("running");
+    // ...and it left src-1's two entries exactly where they were.
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("a TRUNCATED report MERGES: a node absent from the partial fetch keeps the state it already had (⊘ handing the same report over as COMPLETE clears every unreached node back to unknown, which reads on the tree as 'never refreshed')", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1"); // both nodes known: #1 running, #2 stopped
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+
+    // A second, TRUNCATED crawl that only reached node 1. `truncated` on the
+    // TREE too, so the plan skips pruning and node 2's server survives.
+    const sync2 = reregister(core, {
+      contractVersion: 1,
+      truncated: true,
+      devices: [{ externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] }],
+      status: { contractVersion: 1, truncated: true, statuses: { "/L.unl#1": { state: "running" } } }
+    });
+    await sync2("src-1");
+
+    expect(core.getSnapshot().servers.some((s) => s.id === STOPPED_ID)).toBe(true);
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped"); // retained, not cleared
+  });
+
+  it("a COMPLETE report CLEARS first: a node the source stopped reporting drops out of the status map instead of lingering (⊘ merging unconditionally leaves a vanished node's state painted on a server the sync deliberately kept)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: vi.fn(async () => eveTree()) }));
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    // "keep" so node 2's server survives its device vanishing and the only thing
+    // that can change is the status entry.
+    await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "keep" }));
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+
+    // Node 2 is gone from the source, and the crawl was COMPLETE.
+    const sync2 = reregister(core, {
+      contractVersion: 1,
+      devices: [{ externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] }],
+      status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "running" } } }
+    });
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync2("src-1");
+
+    expect(core.getSnapshot().servers.some((s) => s.id === STOPPED_ID)).toBe(true);
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.has(STOPPED_ID)).toBe(false);
+  });
+
+  /**
+   * THE FIXTURE THESE TWO SHARE, and the reason it is not simply "sync once
+   * and cancel". Before a sync has applied, a status entry resolves to no server
+   * at all (the devices have no records yet), so a premature apply writes
+   * NOTHING and an empty status map reads identically whether the apply was
+   * correctly withheld or merely futile. So: sync once for real, so both nodes
+   * exist with a known state; then run a SECOND sync that would flip both states
+   * and fail. Only a status apply on a path that did not commit can move them.
+   */
+  async function settledLab(): Promise<{ core: NexusCore; flipped: InventoryTree }> {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ fetchInventory: vi.fn(async () => eveTree()) }));
+    registerInventoryCommands(core, registry, VAULT(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+    // A renamed node makes the second plan non-empty, so it reaches the preview
+    // modal rather than the nothing-to-do fast path.
+    return {
+      core,
+      flipped: {
+        contractVersion: 1,
+        devices: [
+          { externalId: "/L.unl#1", name: "R1-renamed", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] },
+          { externalId: "/L.unl#2", name: "R2", endpoints: [{ kind: "telnet", host: "10.0.0.2", port: 32770 }] }
+        ],
+        status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
+      }
+    };
+  }
+
+  it("a sync the user CANCELS at the preview applies no status (⊘ applying the report as soon as the fetch returns makes the tree assert a lab state the user just declined to import)", async () => {
+    const { core, flipped } = await settledLab();
+    const sync2 = reregister(core, flipped);
+    mockShowInformationMessage.mockResolvedValueOnce(undefined); // Esc on the preview
+
+    await sync2("src-1");
+
+    expect(core.getServer(RUNNING_ID)?.name).toBe("R1"); // the rename was declined...
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running"); // ...and so was its status
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("a sync whose APPLY is rejected (the source record changed under it) applies no status (⊘ applying status for a plan that never committed decorates servers the sync did not write)", async () => {
+    const { core, flipped } = await settledLab();
+    const sync2 = reregister(core, flipped);
+    vi.spyOn(core, "applyInventorySyncPlan").mockRejectedValue(new Error("Inventory source configuration changed since the sync was computed"));
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+    await sync2("src-1");
+
+    expect(mockShowErrorMessage).toHaveBeenCalled();
+    expect(core.getServer(RUNNING_ID)?.name).toBe("R1"); // nothing committed...
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running"); // ...including the status
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+  it("a malformed provider status degrades to NO status update rather than failing the sync — the devices were fine (⊘ validating it as part of the tree aborts an otherwise-good sync over one bad status entry, and skipping validation entirely lets a garbage report reach the core)", async () => {
+    const { core, sync } = await makeWorld(eveTree({ status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "on fire" } } } as never }));
+    const applySpy = vi.spyOn(core, "applyInventoryStatus");
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+
+    await sync("src-1");
+
+    expect(core.getSnapshot().servers).toHaveLength(2); // the sync itself succeeded
+    // NOT CALLED AT ALL, rather than called with an empty report: a rejected
+    // report is "no news", and handing an empty one over would CLEAR every entry
+    // this source owns — the exact wipe the NetBox case must also avoid.
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(core.getSnapshot().serverStatus.size).toBe(0);
+  });
+
+  it("a status-less fetch leaves that SAME source's existing status untouched — an absent report is 'no news', not 'nothing is running' (⊘ applying an empty report unconditionally wipes on the source's OWN next sync the state a Refresh Lab Status had just established)", async () => {
+    const statusless: InventoryTree = { contractVersion: 1, devices: eveTree().devices };
+    const { core, sync } = await makeWorld(statusless);
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1"); // creates both servers; the tree carries no status
+
+    // A Refresh Lab Status has since established their real state.
+    core.applyInventoryStatus("src-1", {
+      contractVersion: 1,
+      statuses: { "/L.unl#1": { state: "running" }, "/L.unl#2": { state: "stopped" } }
+    });
+
+    // Re-sync the same status-less tree — nothing to change, and nothing to say
+    // about status either.
+    await reregister(core, statusless)("src-1");
+
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  /**
+   * THE APPLY BELONGS TO ONE INCARNATION OF ONE SOURCE. `inFlightSourceIds`
+   * keeps other syncs/edits/removes off this source for the whole command, but a
+   * replace-mode config import (and a complete reset) consults no such latch —
+   * it only queues on `configMutationLock`. So it can be waiting the moment the
+   * sync's own locked attempt releases, replace the source and its servers under
+   * the same id, and leave the sync holding a report keyed by `source.id` alone.
+   *
+   * The three tests below cover the two halves of the fix (the apply runs before
+   * the restamp's own lock acquisition; it revalidates anyway) and the ordering
+   * rule neither half may break.
+   */
+  const FLIPPED = {
+    ...eveTree(),
+    status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" as const }, "/L.unl#2": { state: "running" as const } } }
+  };
+
+  /**
+   * The replace phase of `importMergeReplaceLocked`, driven directly: drop every
+   * server, drop the source record, then re-add a source under the SAME id and
+   * one id-preserving server owned by it. Nothing here takes
+   * `configMutationLock` (no NexusCore method does), so it can be run from
+   * inside the lock spy without recursing.
+   */
+  async function replaceSourceIncarnation(core: NexusCore): Promise<void> {
+    for (const server of core.getSnapshot().servers) {
+      await core.removeServer(server.id);
+    }
+    await core.removeInventorySource("src-1");
+    await core.addOrUpdateInventorySource(makeSource({ name: "Imported Lab", targetFolder: "Imported" }));
+    await core.addOrUpdateServer(
+      makeServer({
+        id: RUNNING_ID,
+        name: "imported-r1",
+        host: "10.0.0.1",
+        origin: { sourceId: "src-1", externalId: "/L.unl#1", syncedAt: 1 }
+      })
+    );
+  }
+
+  /**
+   * Runs `inject` in the gap between the sync's own locked attempt resolving and
+   * the caller resuming — i.e. exactly where a queued lock waiter runs. The
+   * empty-plan fast path takes two acquisitions (the apply, then the restamp),
+   * and `n` picks which one to land behind.
+   */
+  async function syncWithInjectionAfterAcquisition(n: number, sync: (id: string) => unknown, inject: () => Promise<void>): Promise<void> {
+    let acquisitions = 0;
+    const originalRunExclusive = configMutationLock.runExclusive.bind(configMutationLock);
+    const spy = vi.spyOn(configMutationLock, "runExclusive").mockImplementation(async (fn: () => Promise<unknown>) => {
+      acquisitions++;
+      const mine = acquisitions;
+      const result = await originalRunExclusive(fn as () => Promise<unknown>);
+      if (mine === n) {
+        await inject();
+      }
+      return result;
+    });
+    try {
+      await sync("src-1");
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("skips the apply when a replace-mode import replaced the source in the gap between the commit and the apply (⊘ applying a report keyed by source.id alone paints THIS sync's picture onto the replacement's servers and clears the replacement's own status bookkeeping)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1");
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+
+    // A nothing-to-change re-sync carrying a FLIPPED picture, with the import
+    // landing the instant the sync's own lock acquisition resolves.
+    await syncWithInjectionAfterAcquisition(1, reregister(core, FLIPPED), () => replaceSourceIncarnation(core));
+
+    // The replacement really is in place...
+    expect(core.getInventorySource("src-1")?.name).toBe("Imported Lab");
+    expect(core.getServer(RUNNING_ID)?.name).toBe("imported-r1");
+    // ...and nothing repainted its runtime status. (Removing the old servers
+    // dropped every entry, so a stale apply is the only thing that could put one
+    // back — it would resolve `/L.unl#1` onto the re-added server and stamp the
+    // pre-replacement crawl's `stopped` on it.)
+    expect(core.getSnapshot().serverStatus.size).toBe(0);
+  });
+
+  /**
+   * The epoch half, driven directly. No shipping writer can currently bump this
+   * source's epoch inside the window — `inFlightSourceIds` keeps a second sync
+   * out and makes `refreshStatus` skip the source (and its heal re-checks the
+   * same latch), and the replace-mode import above mutates servers without ever
+   * bumping it. So this is defence in depth, and it is deliberate: the refresh
+   * path already re-checks the epoch before its apply, and the sync path having
+   * a WEAKER rule than the refresh path is precisely the asymmetry that produced
+   * this bug in the first place.
+   */
+  it("skips the apply when a server-mutating write for the SAME source landed in that gap, even though the source record is untouched (⊘ checking only the record's incarnation lets a completed write for this source be repainted with the pre-write picture)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1");
+
+    await syncWithInjectionAfterAcquisition(1, reregister(core, FLIPPED), async () => {
+      // A sync apply for src-1 that changes no server: it bumps the source's
+      // mutation epoch and its lastSyncAt, and — a spread onto the same record —
+      // leaves the revision, and so the incarnation check, alone.
+      await core.applyInventorySyncPlan({
+        sourceId: "src-1",
+        syncedAt: Date.now(),
+        upsertServers: [],
+        removeServerIds: [],
+        folders: [],
+        expectedSource: core.getInventorySource("src-1")!
+      });
+    });
+
+    // The record is still the same incarnation, so only the epoch can have
+    // caught this — and the flipped picture was NOT applied.
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
+  });
+
+  it("applies the status BEFORE the fingerprint restamp, so no await separates the commit from the apply (⊘ restamping first opens a full lock acquisition — the window a queued replace-mode import runs in — between the two)", async () => {
+    const { core, sync } = await makeWorld(eveTree());
+    mockShowInformationMessage.mockResolvedValueOnce("Apply");
+    await sync("src-1");
+    // The first sync stamped the fingerprint; clear it so the next sync restamps.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("src-1")!, providerFingerprint: undefined });
+
+    const order: string[] = [];
+    const applied = core.applyInventoryStatus.bind(core);
+    vi.spyOn(core, "applyInventoryStatus").mockImplementation((sourceId, report) => {
+      order.push("status");
+      applied(sourceId, report);
+    });
+    const saved = core.addOrUpdateInventorySource.bind(core);
+    vi.spyOn(core, "addOrUpdateInventorySource").mockImplementation(async (updated) => {
+      // Only the restamp writes a fingerprint — the apply's own lastSyncAt bump
+      // does not go through this method at all.
+      if (updated.providerFingerprint !== undefined) {
+        order.push("restamp");
+      }
+      return saved(updated);
+    });
+
+    await reregister(core, FLIPPED)("src-1");
+
+    expect(order).toEqual(["status", "restamp"]);
+    expect(core.getInventorySource("src-1")?.providerFingerprint).toBeDefined(); // the restamp still ran
+    expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("stopped"); // ...and the status still landed
   });
 });

@@ -136,7 +136,27 @@ export function isValidServerOrigin(value: unknown): value is ServerOrigin {
     // with an empty host is never selected), and the server form stores a cleared
     // alternate host as `undefined`, so an empty string could not have come from
     // either — only a hand-edited backup or a version-skewed row.
-    isOptionalNonEmptyString(obj.syncedAltHost)
+    isOptionalNonEmptyString(obj.syncedAltHost) &&
+    // TELNET (Phase 0) — the two `ServerConfig.protocol` literals, or absent.
+    // `"ssh"` is accepted even though the sync only ever writes `undefined` for
+    // it: the two are the same statement, and rejecting a record over a
+    // synonym would cost it its sync ownership for nothing.
+    (obj.syncedProtocol === undefined || obj.syncedProtocol === "ssh" || obj.syncedProtocol === "telnet") &&
+    // PRIMARY HOST (task #29) — the same tolerant optional-string check as
+    // `syncedAltHost`/`syncedIpmiHost` above, for the same reason: the sync writes
+    // this stamp only in the same breath as a non-empty `host` (an endpoint with an
+    // empty host is never selected), so an empty string could not have come from a
+    // sync — only a hand-edited backup or a version-skewed row.
+    isOptionalNonEmptyString(obj.syncedHost) &&
+    // PRIMARY PORT (task #29) — the FIRST numeric stamp, so a NUMERIC clause
+    // rather than the string check its siblings get: absent, or a non-negative
+    // integer (the sync only ever writes a real endpoint port `>= 1`; `0` is the
+    // `ADDRESSLESS_PORT` sentinel, which the sync stores as an absent stamp, so
+    // `>= 0` is the tolerant bound and a fractional/negative/NaN/string value can
+    // only be a hand-edited backup). A bad value strips the WHOLE origin, exactly
+    // as every clause above does.
+    (obj.syncedPort === undefined ||
+      (typeof obj.syncedPort === "number" && Number.isInteger(obj.syncedPort) && obj.syncedPort >= 0))
   );
 }
 
@@ -232,6 +252,12 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
   if (obj.syncedAltHost !== undefined && !isNonEmptyString(obj.syncedAltHost)) {
     return false;
   }
+  // TELNET (Phase 0) — the same closed-enum check `isValidServerOrigin` makes of
+  // the origin stamp this receipt mirrors; restored into a real origin at
+  // adoption, where the write rule compares it against the record's own field.
+  if (obj.syncedProtocol !== undefined && obj.syncedProtocol !== "ssh" && obj.syncedProtocol !== "telnet") {
+    return false;
+  }
   if (obj.templated !== undefined && !isValidTemplatedStamps(obj.templated)) {
     return false;
   }
@@ -249,13 +275,65 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   const obj = item as Record<string, unknown>;
+  // TELNET (Phase 0) — a CLOSED ENUM, the `SerialProfile.mode` disposition
+  // rather than `bmcWebProtocol`'s tolerant type check, and the difference is
+  // deliberate. `bmcWebProtocol` only ever picks a URL scheme, and its read site
+  // neutralizes an unknown value to the safe default; `protocol` selects the
+  // whole TRANSPORT and, with it, whether the auth machinery runs at all. A
+  // record naming a transport this build does not implement is one whose author
+  // meant something we cannot honour, so it is rejected here rather than
+  // silently demoted to SSH — which for a device that only speaks telnet would
+  // mean handing its credentials to a service that is not listening.
+  //
+  // Absent is valid and means `"ssh"` (see `resolveServerProtocol`), so no
+  // record written before this field existed is affected.
+  if (obj.protocol !== undefined && obj.protocol !== "ssh" && obj.protocol !== "telnet") {
+    return false;
+  }
+  // ADDRESSLESS (Codex P1 on #82) — a synced placeholder for a device with no
+  // usable primary endpoint carries `host: ""` (and a sentinel port). Only an
+  // EXACT `true` relaxes the host/port requirement; any other value — a
+  // non-boolean smuggled in from a hand-edited backup included — is treated as
+  // false (fail-closed), so a broken hand-created empty-host record still fails
+  // exactly as before. `enabled`-style coercion, not a rejecting type guard, so
+  // a well-formed addressed record carrying a junk flag is not itself dropped.
+  const addressless = obj.addressless === true;
   if (
     !(
       isNonEmptyString(obj.id) &&
       isNonEmptyString(obj.name) &&
-      isNonEmptyString(obj.host) &&
-      isValidPort(obj.port) &&
-      isNonEmptyString(obj.username) &&
+      // P2-b (Codex) / P3-5 (Fable) — addressless relaxes host NON-EMPTINESS and
+      // port VALIDITY, never the underlying shape. An addressless record has an
+      // EMPTY host (a non-empty one is contradictory — it claims an address the
+      // flag says it lacks) and a FINITE sentinel port (`Number.isFinite` rejects a
+      // missing port and NaN, both of which a looser `typeof` check admits). A
+      // downstream `host.toLowerCase()` (inventory sync, tree filtering) would throw
+      // on a malformed backup a blanket short-circuit had let through.
+      (addressless ? obj.host === "" : isNonEmptyString(obj.host)) &&
+      (addressless ? Number.isFinite(obj.port) : isValidPort(obj.port)) &&
+      // TELNET (Phase 0) — the ONE field this feature relaxes. Telnet has no
+      // protocol-level login: the user logs in at the device's own prompt, in
+      // the terminal, so the server form never collects a username for a telnet
+      // record and the submission carries none. Requiring a non-empty one here
+      // would drop every telnet server at the storage/import boundary.
+      //
+      // MAJOR-2 (review) — ABSENT is accepted as well as blank, and that is the
+      // whole point rather than tidiness. An inventory sync writes
+      // `endpoint.username ?? source.defaultUsername`, which is `undefined` for
+      // a telnet console whose device names no username and whose source has no
+      // default. Demanding `typeof === "string"` made the SYNC'S OWN OUTPUT fail
+      // the guard that decides whether a record survives a reload
+      // (`VscodeConfigRepository.getServers` drops it with only a console
+      // warning), so the server appeared, worked for the session, and silently
+      // vanished — on every re-sync, forever. The writer normalizes to `""` now
+      // too; this end is the one that must never disagree with it again.
+      //
+      // SSH SEMANTICS ARE UNCHANGED: a non-empty username is still required
+      // there, so this is scoped to the transport that has no login rather than
+      // a general loosening.
+      (obj.protocol === "telnet"
+        ? obj.username === undefined || typeof obj.username === "string"
+        : isNonEmptyString(obj.username)) &&
       (obj.authType === "password" || obj.authType === "key" || obj.authType === "agent")
     )
   ) {

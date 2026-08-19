@@ -20,6 +20,7 @@ import { TunnelTreeItem, formatTunnelRoute } from "../ui/tunnelTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { naturalCompare } from "../utils/naturalCompare";
 import { isTunnelRouteChanged, resolveBrowserUrl } from "../utils/tunnelProfile";
+import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 import { browseForKey, collectGroups, formValuesToServer } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -132,6 +133,21 @@ export async function startTunnel(
   connectionMode: ResolvedTunnelConnectionMode,
   registrySync?: TunnelRegistrySync
 ): Promise<void> {
+  // TELNET (Phase 0) — port forwarding is an SSH channel feature and telnet has
+  // no equivalent. THE one guard for every route into starting a tunnel: the
+  // command, the tree's drag-and-drop of a tunnel profile onto a server, the
+  // auto-start-on-connect sweep and the edit-then-restart path all funnel here.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showWarningMessage(addresslessMessage);
+    return;
+  }
+  const unsupported = telnetUnsupportedMessage(server, "Port forwarding");
+  if (unsupported) {
+    void vscode.window.showWarningMessage(unsupported);
+    return;
+  }
+
   if (core.getSnapshot().activeTunnels.some((tunnel) => tunnel.profileId === profile.id)) {
     void vscode.window.showInformationMessage(`Tunnel "${profile.name}" is already running.`);
     return;
@@ -399,7 +415,8 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
                 if (!server) {
                   return;
                 }
-                await ctx.core.addOrUpdateServer(server);
+                // #84 P1 (serialization audit) — serialize the inline jump-host add under configMutationLock (full-snapshot write).
+                await configMutationLock.runExclusive(() => ctx.core.addOrUpdateServer(server));
                 panel.addSelectOption("defaultServerId", server.id, server.name);
               },
               onBrowse: browseForKey
@@ -470,7 +487,8 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
                 if (!server) {
                   return;
                 }
-                await ctx.core.addOrUpdateServer(server);
+                // #84 P1 (serialization audit) — serialize the inline jump-host add under configMutationLock (full-snapshot write).
+                await configMutationLock.runExclusive(() => ctx.core.addOrUpdateServer(server));
                 panel.addSelectOption("defaultServerId", server.id, server.name);
               },
               onBrowse: browseForKey

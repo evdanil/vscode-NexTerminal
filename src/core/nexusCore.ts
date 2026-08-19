@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   cloneServerConfig,
   mergeServerConfigFields,
+  resolveServerProtocol,
   serverConfigsEqual,
   templatedHasAnyStamp,
   type ActiveLocalShellSession,
@@ -15,7 +16,19 @@ import {
   type TunnelProfile,
   type TunnelRegistryEntry
 } from "../models/config";
-import { sourceConfigUnchanged, type InventorySourceConfig } from "../models/inventory";
+import { inventorySourceValuesEqual, sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
+// PRIMARY HOST/PORT (task #29) — the telnet port-heal reuses the sync engine's
+// OWN ownership predicates rather than a local copy, so the "only heal what the
+// sync owns" rule can never drift from the sync's own write rule. This is a
+// runtime import into syncEngine; the reverse edge (syncEngine → nexusCore) is
+// type-only, so there is no runtime cycle.
+import { syncOwnsHost, syncOwnsPort } from "../services/inventory/syncEngine";
+// P2-1 (review) — the heal validates its own resulting record before persisting,
+// so it can NEVER write a host/port that `validateServerConfig` would reject on
+// the next reload (the #82 record-drop class). Belt-and-suspenders behind the
+// tightened status-report validator, for an untrusted provider that hands a
+// report straight in-process without going through validateInventoryStatusReport.
+import { validateServerConfig } from "../utils/validation";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import {
@@ -136,6 +149,23 @@ export class NexusCore {
   private readonly dhcpProfiles = new Map<string, DhcpConfigProfile>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
+  // LIVE STATUS (Phase 2) — runtime-only running/stopped state per server,
+  // driven by applyInventoryStatus from a provider's fetchStatus report. NOT
+  // persisted (it dies with the window and is re-fetched on demand / poll).
+  // `serverStatusSource` records which source each entry came from, so a later
+  // apply for that source can drop the entries it no longer reports (including
+  // servers pruned or removed) without touching another source's entries.
+  private readonly serverStatus = new Map<string, "running" | "stopped">();
+  private readonly serverStatusSource = new Map<string, string>();
+  // #84 P2 (Codex) — per-source MUTATION EPOCH: a monotonic counter bumped
+  // whenever THIS source's servers are mutated+persisted (a sync apply, or the
+  // heal's own writes). The refresh path captures it at fetch start and re-checks
+  // it inside the heal's lock, so a status report that straddled a completed sync
+  // (which bumps the epoch but NOT the config revision — a routine sync only
+  // touches lastSyncAt/managedFolders) is dropped instead of persisting a stale
+  // console port over the freshly-synced one. A dedicated counter, not
+  // `lastSyncAt` (a timestamp can collide and is not bumped by non-sync writes).
+  private readonly sourceMutationEpoch = new Map<string, number>();
   private focusedSessionId: string | undefined = undefined;
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
@@ -250,6 +280,7 @@ export class NexusCore {
       explicitGroups: [...this.explicitGroups],
       authProfiles: [...this.authProfiles.values()],
       activitySessionIds: new Set(this.activitySessionIds),
+      serverStatus: new Map(this.serverStatus),
       focusedSessionId: this.focusedSessionId,
       inventorySources: [...this.inventorySources.values()],
       deviceTemplates: [...this.deviceTemplates.values()],
@@ -642,6 +673,13 @@ export class NexusCore {
   public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
     const hadPrevious = this.inventorySources.has(source.id);
     const previous = this.inventorySources.get(source.id);
+    // LIVE STATUS (Phase 2) — a change to the PROVIDER CONFIG (baseUrl,
+    // rootFolder, filter, …) invalidates any runtime status: the report was
+    // fetched under the old config, so nodes the new config excludes — or the
+    // old deployment's nodes entirely — must not keep a stale highlight. Detected
+    // by a real config-value change so a no-op edit (or a non-config edit like a
+    // rename) does not needlessly clear. Cleared AFTER the persist succeeds.
+    const configChanged = hadPrevious && previous !== undefined && !inventorySourceValuesEqual(previous.config, source.config);
     const withRevision: InventorySourceConfig = { ...source, revision: randomUUID() };
     this.inventorySources.set(source.id, withRevision);
     try {
@@ -653,6 +691,10 @@ export class NexusCore {
         this.inventorySources.delete(source.id);
       }
       throw error;
+    }
+    if (configChanged) {
+      // No separate emit — the emitChanged() below covers the status drop too.
+      this.dropInventoryStatusForSource(source.id);
     }
     this.emitChanged();
   }
@@ -704,6 +746,11 @@ export class NexusCore {
       }
       throw error;
     }
+    // LIVE STATUS (Phase 2) — the source is gone; drop any runtime status it
+    // owned so a removed source leaves no lingering running/stopped highlight.
+    // Shares clearInventoryStatus's loop; no extra emit since emitChanged()
+    // fires below regardless.
+    this.dropInventoryStatusForSource(id);
     this.emitChanged();
   }
 
@@ -1264,9 +1311,20 @@ export class NexusCore {
         }
       }
     }
+    // LIVE STATUS (Phase 2) — capture the runtime status entries this prune is
+    // about to drop, so a rejected persist below can restore them alongside the
+    // servers they belong to (the rollback envelope otherwise loses the
+    // running/stopped highlight even though the server itself comes back).
+    const droppedServerStatus = new Map<string, { state: "running" | "stopped"; source: string | undefined }>();
     for (const id of removeServerIds) {
+      const priorStatus = this.serverStatus.get(id);
+      if (priorStatus !== undefined) {
+        droppedServerStatus.set(id, { state: priorStatus, source: this.serverStatusSource.get(id) });
+      }
       this.servers.delete(id);
       this.removeServerSessions(id);
+      // A pruned server must not leave a ghost status entry (P3-4).
+      this.dropServerStatusEntry(id);
       batchWrittenServers.set(id, undefined);
     }
     for (const server of upsertServers) {
@@ -1913,6 +1971,19 @@ export class NexusCore {
           return depthA !== depthB ? depthA - depthB : idA.localeCompare(idB);
         }
       );
+      // LIVE STATUS (Phase 2) — restore a pruned server's runtime status
+      // entry when (and only when) the server itself is restored below, so the
+      // rollback leaves status and server consistent. A server left deleted (a
+      // concurrent recreation) keeps its status dropped.
+      const restoreDroppedStatus = (id: string): void => {
+        const dropped = droppedServerStatus.get(id);
+        if (dropped) {
+          this.serverStatus.set(id, dropped.state);
+          if (dropped.source !== undefined) {
+            this.serverStatusSource.set(id, dropped.source);
+          }
+        }
+      };
       for (const [id, priorServer] of orderedRemovedServerRestores) {
         if (this.servers.get(id) !== undefined) {
           continue; // something concurrent recreated this record — leave theirs.
@@ -1923,6 +1994,7 @@ export class NexusCore {
           // Sound chain (or nothing to judge): restore the captured pre-batch
           // record itself, byte-for-byte, exactly as before this fix.
           this.servers.set(id, priorServer);
+          restoreDroppedStatus(id);
           addSurvivingFolderChain(group);
           continue;
         }
@@ -1945,6 +2017,7 @@ export class NexusCore {
         const restored = cloneServerConfig(priorServer);
         restored.group = remappedGroup;
         this.servers.set(id, restored);
+        restoreDroppedStatus(id);
         addSurvivingFolderChain(remappedGroup);
       }
       // TOMBSTONE — a captured session that was genuinely torn down by
@@ -2019,6 +2092,12 @@ export class NexusCore {
     // so any recorded ids are moot).
     this.inventorySyncApplyInFlight = false;
     this.inventorySyncTombstonedSessionIds.clear();
+    // #84 P2 (Codex) — a sync apply mutated+persisted this source's servers.
+    // Advance its mutation epoch so a status report captured before this apply,
+    // resolving after it, is dropped by the heal's in-lock epoch re-check — even
+    // when the config revision is unchanged (a routine sync bumps lastSyncAt /
+    // managedFolders, not the revision).
+    this.bumpSourceMutationEpoch(apply.sourceId);
     this.emitChanged();
     return { skippedCount, removedServerIds: [...removeServerIds], removedEmptyFolderCount: removedEmptyGroups.size };
   }
@@ -2206,6 +2285,8 @@ export class NexusCore {
 
   public async removeServer(serverId: string): Promise<void> {
     this.servers.delete(serverId);
+    // LIVE STATUS (Phase 2) — drop any runtime status keyed to the deleted server.
+    this.dropServerStatusEntry(serverId);
     // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 9, extracted to
     // the shared `clearGatewayReferencesTo` helper in round 10) — clear every
     // OTHER server's `ipmiGatewayServerId` that named the server just deleted,
@@ -2301,6 +2382,223 @@ export class NexusCore {
   public registerSession(session: ActiveSession): void {
     this.activeSessions.set(session.id, session);
     this.emitChanged();
+  }
+
+  /**
+   * #84 P2 (Codex) — the current MUTATION EPOCH for a source (0 if never
+   * mutated). The refresh path captures this before its status fetch and the
+   * heal re-checks it inside its lock; if it advanced during the fetch, a
+   * server-mutating operation for this source (a sync apply, or a prior heal)
+   * completed while the fetch was outstanding, so the report may be stale and the
+   * heal bails. See `sourceMutationEpoch`.
+   */
+  public getSourceMutationEpoch(sourceId: string): number {
+    return this.sourceMutationEpoch.get(sourceId) ?? 0;
+  }
+
+  /** #84 P2 (Codex) — advance a source's mutation epoch after a persisted server write. */
+  private bumpSourceMutationEpoch(sourceId: string): void {
+    this.sourceMutationEpoch.set(sourceId, this.getSourceMutationEpoch(sourceId) + 1);
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — apply one source's fetchStatus report onto the
+   * runtime serverStatus map. Each report entry is resolved to a server by its
+   * REAL origin identity — a server owned by this source (origin.sourceId ===
+   * sourceId) whose origin.externalId matches — which covers both a normal
+   * deterministic-id server and an ADOPTED one whose id was preserved (#82).
+   * Entries this source previously wrote but no longer reports —
+   * pruned nodes, removed servers — are dropped; entries owned by OTHER sources
+   * are untouched. One emitChanged() on the way out, like registerSession.
+   */
+  public applyInventoryStatus(sourceId: string, report: InventoryStatusReport): void {
+    // TRUNCATION — a COMPLETE report is authoritative: clear this source's prior
+    // entries first, then rebuild, so a node the source stops reporting (a
+    // stopped node is still present as "stopped", so absent == removed) drops
+    // out. A TRUNCATED report is PARTIAL — nodes beyond the provider's cap are
+    // merely absent, not gone — so we MERGE instead: skip the clear and retain
+    // the prior status of any entry not in this report, applying only what is
+    // present (present entries overwrite below, keeping serverStatusSource ===
+    // sourceId consistently for both retained and freshly-applied entries).
+    if (!report.truncated) {
+      for (const [serverId, owner] of [...this.serverStatusSource]) {
+        if (owner === sourceId) {
+          this.serverStatus.delete(serverId);
+          this.serverStatusSource.delete(serverId);
+        }
+      }
+    }
+    // Resolve report entries by the server's REAL origin identity, not by
+    // assuming `id === deterministicServerId(sourceId, externalId)`. Adoption
+    // (Keep Servers → re-add → Adopt Existing, #82) PRESERVES an adoptee's
+    // original id while stamping the NEW source into `origin`, so a deterministic
+    // lookup would miss every adopted node. Building the map from servers owned
+    // by this source (origin.sourceId === sourceId), keyed by origin.externalId,
+    // covers BOTH the deterministic (non-adopted) and the preserved-id (adopted)
+    // cases, and inherently keeps the source-ownership scoping.
+    const serverIdByExternalId = new Map<string, string>();
+    for (const server of this.servers.values()) {
+      if (server.origin?.sourceId === sourceId) {
+        serverIdByExternalId.set(server.origin.externalId, server.id);
+      }
+    }
+    for (const [externalId, deviceStatus] of Object.entries(report.statuses)) {
+      const serverId = serverIdByExternalId.get(externalId);
+      if (serverId !== undefined) {
+        this.serverStatus.set(serverId, deviceStatus.state);
+        this.serverStatusSource.set(serverId, sourceId);
+      }
+    }
+    this.emitChanged();
+  }
+
+  /**
+   * PRIMARY HOST/PORT (task #29, the deferred D8) — heal a source's TELNET
+   * console addresses from its `fetchStatus` report. A provider (EVE-NG
+   * Community) that reassigns console ports on node restart surfaces the current
+   * `consoleHost`/`consolePort` on each RUNNING node; this persists them onto the
+   * owned server so the NEXT connect targets the live port instead of the stale
+   * one. `applyInventoryStatus` stays PURE (runtime maps only) — this is the
+   * SEPARATE, persisting step the refresh path runs right after it.
+   *
+   * Heals ONLY where every one of these holds, and the gate is deliberately
+   * strict because it WRITES persisted config:
+   *  - the node is `state: "running"` and the report carries a fresh
+   *    `consoleHost`/`consolePort` (a stopped node reports none);
+   *  - the owned server resolves via the SAME origin identity
+   *    `applyInventoryStatus` uses (`origin.sourceId === sourceId`, keyed by
+   *    `origin.externalId`) — covers adopted, preserved-id servers too;
+   *  - the server is TELNET and NOT addressless (an ssh node or a placeholder is
+   *    never a console-port node to heal);
+   *  - the reported host/port DIFFER from the persisted ones (nothing to do
+   *    otherwise); AND
+   *  - the sync OWNS them — `syncOwnsHost`/`syncOwnsPort` against
+   *    `origin.syncedHost`/`syncedPort`, the sync engine's OWN predicates, so a
+   *    HAND-EDITED port is NEVER healed (the whole reason this is gated and not a
+   *    blanket overwrite). When a value is healed its stamp is advanced with it,
+   *    exactly as the sync's own write would.
+   *
+   * Respects the truncated-merge: only entries PRESENT in the report are
+   * considered, so a partial report never touches the nodes it did not reach.
+   * Batches every heal into one persisted write and one `emitChanged`, via
+   * `addServersBatch`, to avoid an emit storm across a lab's worth of nodes. An
+   * already-open telnet terminal keeps its port — the heal affects the NEXT
+   * connect, which is the only place a reassigned port matters.
+   */
+  public async healSyncedConsolePorts(sourceId: string, report: InventoryStatusReport): Promise<void> {
+    // The SAME origin lookup applyInventoryStatus builds (owned-by-this-source,
+    // keyed by externalId) — reused rather than duplicated so the two can never
+    // resolve a report entry to different servers.
+    const serverIdByExternalId = new Map<string, string>();
+    for (const server of this.servers.values()) {
+      if (server.origin?.sourceId === sourceId) {
+        serverIdByExternalId.set(server.origin.externalId, server.id);
+      }
+    }
+    const healed: ServerConfig[] = [];
+    for (const [externalId, deviceStatus] of Object.entries(report.statuses)) {
+      if (deviceStatus.state !== "running") {
+        continue;
+      }
+      const reportedHost = deviceStatus.consoleHost;
+      const reportedPort = deviceStatus.consolePort;
+      if (reportedHost === undefined && reportedPort === undefined) {
+        continue;
+      }
+      const serverId = serverIdByExternalId.get(externalId);
+      if (serverId === undefined) {
+        continue;
+      }
+      const server = this.servers.get(serverId);
+      if (server === undefined || server.origin === undefined) {
+        continue;
+      }
+      if (resolveServerProtocol(server) !== "telnet" || server.addressless === true) {
+        continue;
+      }
+      // Each half heals only when the reported value DIFFERS from the persisted
+      // one AND the sync owns it — a hand-edited host/port fails `syncOwns*` and
+      // is left exactly as the user set it.
+      const healHost =
+        reportedHost !== undefined &&
+        reportedHost !== server.host &&
+        syncOwnsHost(server.host, server.origin.syncedHost, reportedHost);
+      const healPort =
+        reportedPort !== undefined &&
+        reportedPort !== server.port &&
+        syncOwnsPort(server.port, server.origin.syncedPort, reportedPort);
+      if (!healHost && !healPort) {
+        continue;
+      }
+      const next = cloneServerConfig(server);
+      if (healHost && reportedHost !== undefined && next.origin !== undefined) {
+        next.host = reportedHost;
+        next.origin.syncedHost = reportedHost;
+      }
+      if (healPort && reportedPort !== undefined && next.origin !== undefined) {
+        next.port = reportedPort;
+        next.origin.syncedPort = reportedPort;
+      }
+      // P2-1 (review) — WRITE-SITE DEFENSE. Never persist a record the next reload
+      // would reject: a bad host/port that slipped past the report validator (a
+      // provider calling this in-process without validateInventoryStatusReport)
+      // would otherwise be dropped whole on reload, taking its credentials/tunnels
+      // with it. Validating the RESULT — not just the reported field — means the
+      // heal structurally cannot write what the sync path never would.
+      if (!validateServerConfig(next)) {
+        continue;
+      }
+      healed.push(next);
+    }
+    if (healed.length === 0) {
+      return;
+    }
+    // addServersBatch is the existing one-save/one-emit batch primitive.
+    await this.addServersBatch(healed);
+    // #84 P2 (Codex) — a heal mutated+persisted this source's servers; advance
+    // the epoch so a concurrent refresh whose fetch straddled this heal re-checks
+    // and bails rather than persisting its own (now potentially stale) report.
+    this.bumpSourceMutationEpoch(sourceId);
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — drop every status entry a source owns, WITHOUT
+   * emitting. Returns whether anything changed. Shared by clearInventoryStatus
+   * (which emits) and removeInventorySource (which emits once on its own way
+   * out), so the two never drift on the clearing rule.
+   */
+  /**
+   * LIVE STATUS (Phase 2) — drop a single server's runtime status entry, WITHOUT
+   * emitting. Called from every path that removes a server (manual delete, sync
+   * prune) so a gone server never strands a running/stopped highlight; the
+   * calling path's own emit covers the change.
+   */
+  private dropServerStatusEntry(serverId: string): void {
+    this.serverStatus.delete(serverId);
+    this.serverStatusSource.delete(serverId);
+  }
+
+  private dropInventoryStatusForSource(sourceId: string): boolean {
+    let changed = false;
+    for (const [serverId, owner] of [...this.serverStatusSource]) {
+      if (owner === sourceId) {
+        this.serverStatus.delete(serverId);
+        this.serverStatusSource.delete(serverId);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * LIVE STATUS (Phase 2) — drop every status entry a source owns (used on
+   * source removal). Silent when there was nothing to clear, so an unrelated
+   * source removal does not churn every tree.
+   */
+  public clearInventoryStatus(sourceId: string): void {
+    if (this.dropInventoryStatusForSource(sourceId)) {
+      this.emitChanged();
+    }
   }
 
   public registerSerialSession(session: ActiveSerialSession): void {

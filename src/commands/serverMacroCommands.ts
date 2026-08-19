@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
+import { resolveServerProtocol } from "../models/config";
 import type { TerminalMacro } from "../models/terminalMacro";
 import {
   IPMI_GATEWAY_INERT_CREDENTIALS_HINT,
@@ -300,25 +301,99 @@ export function sessionIpmiHintNote(macro: TerminalMacro): string | undefined {
 }
 
 /**
- * The server a target server routes its IPMI to, or `undefined` when it names no
- * gateway or names one that no longer exists in the snapshot. A dangling id
- * resolves to "no gateway" — the same disposition `remapProxy` gives an
- * out-of-export jump host — so the fall-back rule (run locally, plus a note)
- * catches it exactly as it catches a server with no gateway at all.
+ * The outcome of asking "where does this server route its IPMI?", kept as three
+ * DISTINCT dispositions rather than collapsing two of them to `undefined` (Codex
+ * P1, safety):
  *
- * The ONE read site for `ipmiGatewayServerId` on the run path, so "does this
- * server route to a gateway, and to which one" is decided once.
+ *  - `none` — no gateway is configured (id unset, empty, or a self-reference).
+ *    Local delivery IS the configured route here, not a degradation.
+ *  - `unavailable` — a gateway IS configured but cannot serve as an SSH IPMI
+ *    gateway: its server is MISSING (deleted, so the id dangles), ADDRESSLESS
+ *    (downgraded to `host: ""` during inventory sync), or a TELNET profile (has a
+ *    host, but no SSH console — routing ipmitool through it would send the command
+ *    into that device's own telnet console). The run path MUST abort here — routing
+ *    into the wrong endpoint, or falling back to a LOCAL shell, injects the target's
+ *    IPMI credentials somewhere they do not belong, and for a chassis/power command
+ *    a wrong endpoint can hit a DIFFERENT device instead of merely failing.
+ *  - `server` — a reachable, addressed SSH gateway to route through.
  */
-export function resolveIpmiGatewayServer(ctx: CommandContext, server: ServerConfig): ServerConfig | undefined {
+export type IpmiGatewayResolution =
+  | { kind: "none" }
+  | { kind: "unavailable"; reason: "missing" | "addressless" | "telnet" }
+  | { kind: "server"; server: ServerConfig };
+
+/**
+ * Where a target server routes its IPMI. The ONE read site for
+ * `ipmiGatewayServerId` on the run path, so "does this server route to a gateway,
+ * and to which one" is decided once — and, critically, so "no gateway configured"
+ * (→ local) is kept DISTINCT from "gateway configured but unavailable" (→ abort).
+ */
+export function resolveIpmiGatewayServer(ctx: CommandContext, server: ServerConfig): IpmiGatewayResolution {
   const id = server.ipmiGatewayServerId;
   // P4/NIT-4 — a server naming ITSELF as its IPMI gateway is treated as no
   // gateway (local delivery). A hand-edited or exported self-reference would
   // otherwise deliver the routed command into the target's OWN session terminal,
   // which is not what "route to the gateway" means and defeats the fall-back rule.
   if (typeof id !== "string" || !id || id === server.id) {
-    return undefined;
+    return { kind: "none" };
   }
-  return ctx.core.getSnapshot().servers.find((candidate) => candidate.id === id);
+  const found = ctx.core.getSnapshot().servers.find((candidate) => candidate.id === id);
+  // MISSING — the target still NAMES a gateway, but no server carries that id
+  // (deleted after the assignment was made; import drops a dangling id, but a
+  // live-session delete does not). "Unavailable", not "none": the intent to route
+  // stands, so the run must abort rather than silently run locally.
+  if (!found) {
+    return { kind: "unavailable", reason: "missing" };
+  }
+  // ADDRESSLESS (Codex P1 review) — an addressless gateway has no console to route
+  // ipmitool through (its `host` was cleared to "" during inventory sync). Also
+  // "unavailable": abort rather than fall back to local, and resolve it FAST
+  // (never by attempting a connection the addressless guard would block, which
+  // would hang out the ~90s connect-session timeout).
+  if (found.addressless === true) {
+    return { kind: "unavailable", reason: "addressless" };
+  }
+  // TELNET (Codex P1, twin of the addressless case) — a gateway server switched to
+  // Telnet has a host but no SSH console. The picker already excludes telnet
+  // servers (formDefinitions.ts), but an assignment made while the server was SSH
+  // and later switched to Telnet is unprotected: `resolveServerSessionTarget` would
+  // reuse/open its TELNET session and send the gateway-routed macro or SOL command
+  // into THAT device's console. "Unavailable", so the run aborts rather than
+  // executing into the wrong endpoint. Read through `resolveServerProtocol` (never
+  // a raw `protocol` read), matching the picker's own eligibility test.
+  if (resolveServerProtocol(found) === "telnet") {
+    return { kind: "unavailable", reason: "telnet" };
+  }
+  return { kind: "server", server: found };
+}
+
+/** The gateway server a resolution names, or `undefined` for `none`/`unavailable`. */
+function gatewayServerOf(resolution: IpmiGatewayResolution): ServerConfig | undefined {
+  return resolution.kind === "server" ? resolution.server : undefined;
+}
+
+/**
+ * The abort message for a configured-but-unavailable IPMI gateway — the same
+ * sentence for the macro run path and the direct BMC command, so the two cannot
+ * drift. `action` names what will NOT happen locally ("running the command",
+ * "connecting to the BMC").
+ */
+export function ipmiGatewayUnavailableMessage(
+  server: ServerConfig,
+  reason: "missing" | "addressless" | "telnet",
+  action: string
+): string {
+  // The telnet case is a WRONG-ENDPOINT abort, not a fall-back-to-local one, so it
+  // gets its own tail rather than the "…locally" one the other two share: routing
+  // into the telnet console is the danger, and there is nothing local to warn off.
+  if (reason === "telnet") {
+    return `IPMI gateway for "${server.name}" is unavailable — its server is a Telnet profile, which cannot act as an SSH IPMI gateway. Aborting to avoid ${action} through that device's telnet console.`;
+  }
+  const because =
+    reason === "addressless"
+      ? "its server has no address (it was downgraded to a placeholder during inventory sync)"
+      : "its configured server no longer exists";
+  return `IPMI gateway for "${server.name}" is unavailable — ${because}. Aborting to avoid ${action} locally.`;
 }
 
 /**
@@ -766,9 +841,23 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // meaningful only for a `localTerminal` macro; every other target stays local
   // to its own semantics.
   const route = runTarget === "localTerminal" ? resolveMacroRoute(macro) : "local";
-  const gatewayServer = route === "ipmiGateway" ? resolveIpmiGatewayServer(ctx, server) : undefined;
+  const gatewayResolution: IpmiGatewayResolution =
+    route === "ipmiGateway" ? resolveIpmiGatewayServer(ctx, server) : { kind: "none" };
+  // SAFETY (Codex P1) — a gateway that is CONFIGURED but UNAVAILABLE (missing or
+  // addressless) aborts the run outright. It must NEVER fall back to a local
+  // terminal: that would inject the target's IPMI credentials into a local shell,
+  // and a chassis/power command could reach a different overlapping-private-address
+  // device. This is distinct from `kind: "none"` (no gateway configured), where
+  // local IS the configured route and the fall-back note below is correct.
+  if (gatewayResolution.kind === "unavailable") {
+    await vscode.window.showErrorMessage(
+      ipmiGatewayUnavailableMessage(server, gatewayResolution.reason, "running the command")
+    );
+    return;
+  }
+  const gatewayServer = gatewayServerOf(gatewayResolution);
   // A gateway routing actually takes effect only when the target names a gateway
-  // that resolves; `route: "ipmiGateway"` with no reachable gateway FALLS BACK to
+  // that resolves; `route: "ipmiGateway"` with no gateway configured FALLS BACK to
   // a local terminal (plus the note below), so the credentials flag applies
   // normally there because the terminal really is local.
   const routedToGateway = route === "ipmiGateway" && gatewayServer !== undefined;
@@ -795,7 +884,10 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
         : gatewayInertCredentialsNote(macro)
       : ipmiCredentialsOffNote(macro),
     sessionIpmiHintNote(macro),
-    routeReconsentNote(macro, route, resolveIpmiGatewayServer(ctx, server))
+    // Only a resolved, addressed gateway earns the reconsent note (it names the
+    // gateway); a `none`/`unavailable` disposition has no name to point at, and on
+    // the local route the reconsent note never fires anyway.
+    routeReconsentNote(macro, route, gatewayServerOf(resolveIpmiGatewayServer(ctx, server)))
   );
 
   // THE CREDENTIAL GATE (issue #48 §3.3). Three conditions, all required, and

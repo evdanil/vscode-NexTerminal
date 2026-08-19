@@ -42,10 +42,48 @@ function keyPathVisibleWhen(definition: ReturnType<typeof serverFormDefinition>)
   return keyPathField!.visibleWhen;
 }
 
+describe("serverFormDefinition — addressless (P2-a)", () => {
+  // A synced placeholder has no console address, so the Edit form must not mark
+  // Host (or the sentinel-port field) required — otherwise the user cannot open it
+  // to set OOB fields without inventing a host. ⊘ Leaving `required: true` blocks
+  // the save at the webview boundary before formValuesToServer is ever reached.
+  it("does NOT require Host or Port when the seed is addressless", () => {
+    const def = serverFormDefinition({ id: "s1", name: "stopped", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
+    expect(keyedField(def, "host").required).toBe(false);
+    expect(keyedField(def, "port").required).toBe(false);
+  });
+
+  it("STILL requires Host and Port for an ordinary (non-addressless) server", () => {
+    const def = serverFormDefinition({ id: "s1", name: "prod", host: "h", port: 22, username: "admin", authType: "agent" });
+    expect(keyedField(def, "host").required).toBe(true);
+    expect(keyedField(def, "port").required).toBe(true);
+  });
+
+  // P2-b (Codex) — the addressless Port field must seed the PROTOCOL-appropriate
+  // default (its stored value is a sentinel, so it can't seed from that). Hardcoding
+  // 22 left a telnet placeholder showing the SSH port; because `defaultsFrom` treats
+  // a value as automatic only when it equals the CURRENT protocol's default (23 for
+  // telnet), 22 was deemed user-owned and NOT corrected — so typing a host without
+  // toggling Protocol saved a telnet server on port 22. ⊘ Seeding 22 regardless of
+  // protocol reproduces that.
+  it("seeds the addressless Port from the protocol-appropriate default — 23 for a telnet placeholder, 22 for an ssh one", () => {
+    const telnet = serverFormDefinition({ id: "s1", name: "t", host: "", port: 0, username: "", authType: "agent", addressless: true, protocol: "telnet" });
+    expect(keyedField(telnet, "port").value).toBe(23);
+    const ssh = serverFormDefinition({ id: "s1", name: "s", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
+    expect(keyedField(ssh, "port").value).toBe(22);
+  });
+});
+
 describe("formDefinitions keyPath visibility", () => {
-  it("shows server keyPath field only for authType=key", () => {
+  it("shows server keyPath field only for authType=key on an SSH server", () => {
+    // TELNET (Phase 0) — the key-file control now carries the SSH-only gate as
+    // well: telnet has no key material, so the field must stay hidden there
+    // whatever `authType` reads.
     const visibleWhen = keyPathVisibleWhen(serverFormDefinition());
-    expect(visibleWhen).toEqual({ field: "authType", value: "key" });
+    expect(visibleWhen).toEqual([
+      { field: "protocol", value: "ssh" },
+      { field: "authType", value: "key" }
+    ]);
   });
 
   it("compounds unified form keyPath visibility with profileType=ssh", () => {
@@ -58,6 +96,7 @@ describe("formDefinitions keyPath visibility", () => {
     expect(Array.isArray(keyPathField!.visibleWhen)).toBe(true);
     expect(keyPathField!.visibleWhen).toEqual([
       { field: "profileType", value: "ssh" },
+      { field: "protocol", value: "ssh" },
       { field: "authType", value: "key" }
     ]);
   });
@@ -220,14 +259,19 @@ describe("formDefinitions keyPath visibility", () => {
       label: "Open File Explorer on first connection",
       value: true,
       advanced: true,
-      hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script."
+      hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script.",
+      // TELNET (Phase 0) — the SFTP file explorer is SSH-only machinery.
+      visibleWhen: { field: "protocol", value: "ssh" }
     }));
 
     const unifiedField = keyedField(unifiedProfileFormDefinition(), "openFileExplorerOnFirstConnect");
     expect(unifiedField).toEqual(expect.objectContaining({
       type: "checkbox",
       value: false,
-      visibleWhen: { field: "profileType", value: "ssh" }
+      visibleWhen: [
+        { field: "profileType", value: "ssh" },
+        { field: "protocol", value: "ssh" }
+      ]
     }));
     expect(maybeKeyedField(serialFormDefinition(), "openFileExplorerOnFirstConnect")).toBeUndefined();
     expect(maybeKeyedField(localShellFormDefinition(), "openFileExplorerOnFirstConnect")).toBeUndefined();
@@ -383,6 +427,137 @@ describe("inventorySourceFormDefinition", () => {
     testConnection: async () => undefined,
     fetchInventory: async () => ({ nodes: [] }) as never
   };
+
+  /**
+   * EVE-NG (Phase 1) — `InventoryConfigField.defaultValue` for boolean fields.
+   * A provider's documented default used to be unreachable: the checkbox was
+   * always seeded `existingConfig[field.id] === true`, so a NEW source stored
+   * `false` however the provider described the field.
+   */
+  describe("boolean field defaults", () => {
+    const boolProvider = (defaultValue?: boolean): InventoryProvider => ({
+      ...fakeProvider,
+      configFields: [{ id: "includeStopped", label: "Include Stopped", type: "boolean", defaultValue }]
+    });
+    const seedWith = (config: Record<string, string | number | boolean>) => ({
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "",
+      config,
+      secretFieldIds: []
+    });
+
+    it("starts a defaultValue:true boolean CHECKED on Add (⊘ seeding purely from the stored config leaves it unchecked, and the source silently imports none of the population the provider says it defaults to importing)", () => {
+      const field = keyedField(inventorySourceFormDefinition(boolProvider(true)), "cfg_includeStopped");
+      expect(field.type).toBe("checkbox");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(true);
+    });
+
+    it("leaves a boolean with no declared default unchecked on Add — NetBox's includeVms is byte-identical to before (⊘ defaulting every boolean to true silently turns VM import on for every new NetBox source)", () => {
+      const field = keyedField(inventorySourceFormDefinition(boolProvider(undefined)), "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(false);
+    });
+
+    it("honours a STORED false over a defaultValue:true when editing — the user unchecked it, and a default that re-checks it every visit is a setting that cannot be turned off (⊘ `existingConfig[id] || defaultValue` reads a stored `false` as absent and re-checks the box)", () => {
+      const definition = inventorySourceFormDefinition(boolProvider(true), seedWith({ includeStopped: false }));
+      const field = keyedField(definition, "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(false);
+    });
+
+    it("still shows a stored true as checked when the default is false", () => {
+      const definition = inventorySourceFormDefinition(boolProvider(false), seedWith({ includeStopped: true }));
+      const field = keyedField(definition, "cfg_includeStopped");
+      expect((field as Extract<FormFieldDescriptor, { type: "checkbox" }>).value).toBe(true);
+    });
+  });
+
+  /**
+   * INSECURE TLS (EVE-NG) — `InventoryConfigField.advanced`. A provider field
+   * that relaxes a safety default belongs behind the form's Advanced
+   * disclosure, and until this existed a provider had no way to say so: every
+   * config field rendered at the top level regardless of how rarely it should
+   * be touched.
+   */
+  describe("advanced provider config fields", () => {
+    const withAdvanced = (advanced?: boolean): InventoryProvider => ({
+      ...fakeProvider,
+      configFields: [
+        { id: "allowInsecureTls", label: "Allow Insecure TLS", type: "boolean", advanced },
+        { id: "baseUrl", label: "Base URL", type: "string", advanced: advanced === undefined ? undefined : false }
+      ]
+    });
+
+    it("puts a provider field declared advanced BEHIND the Advanced disclosure (\u2298 dropping the flag renders a certificate-verification switch beside the base URL, at the top of the form)", () => {
+      const definition = withAdvanced(true);
+      expect(keyedField(inventorySourceFormDefinition(definition), "cfg_allowInsecureTls").advanced).toBe(true);
+      expect(keyedField(inventorySourceFormDefinition(definition), "cfg_baseUrl").advanced).toBe(false);
+    });
+
+    /**
+     * A5 — reopening a source that has an advanced field TURNED ON showed that
+     * setting collapsed: for `allowInsecureTls` that means a source running
+     * without certificate verification looks, on open, exactly like one that is
+     * not. The disclosure exists to keep a rarely-touched switch out of the way,
+     * not to hide one that is currently in effect.
+     */
+    const seedConfig = (config: Record<string, string | number | boolean>) => ({
+      id: "src1",
+      providerId: "fake",
+      name: "Fake",
+      targetFolder: "",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "",
+      config,
+      secretFieldIds: []
+    });
+
+    it("OPENS the Advanced disclosure when a source already has an advanced field turned on (⊘ a source running with certificate verification off opens looking identical to one that is not)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ allowInsecureTls: true })).expandAdvanced).toBe(true);
+    });
+
+    it("leaves it CLOSED when the advanced field is off, absent, or the source is new (⊘ expanding unconditionally defeats the disclosure for every source that never touched it)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ allowInsecureTls: false })).expandAdvanced).not.toBe(true);
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({})).expandAdvanced).not.toBe(true);
+      expect(inventorySourceFormDefinition(withAdvanced(true)).expandAdvanced).not.toBe(true);
+    });
+
+    it("ignores a NON-advanced field's value — only what the disclosure actually hides can open it (⊘ any stored true anywhere pops the section open)", () => {
+      expect(inventorySourceFormDefinition(withAdvanced(true), seedConfig({ baseUrl: "https://10.0.0.5" })).expandAdvanced).not.toBe(true);
+    });
+
+    it("leaves a field that declares nothing exactly where it was — every existing provider field is byte-identical", () => {
+      expect(keyedField(inventorySourceFormDefinition(withAdvanced(undefined)), "cfg_allowInsecureTls").advanced).toBeUndefined();
+    });
+
+    it("carries the flag through every field TYPE, not just the boolean branch it was added for", () => {
+      const provider: InventoryProvider = {
+        ...fakeProvider,
+        configFields: [
+          { id: "t", label: "T", type: "string", advanced: true },
+          { id: "p", label: "P", type: "password", advanced: true },
+          { id: "n", label: "N", type: "number", advanced: true },
+          { id: "s", label: "S", type: "select", advanced: true, options: [{ label: "A", value: "a" }] }
+        ]
+      };
+      const definition = inventorySourceFormDefinition(provider);
+      for (const id of ["t", "p", "n", "s"]) {
+        expect(keyedField(definition, `cfg_${id}`).advanced).toBe(true);
+      }
+    });
+  });
+
+  // EVE-NG (Phase 1) — the Target Folder placeholder is an EXAMPLE shown on
+  // every provider's source form, so it must not read as an instruction to
+  // name a folder after one specific provider.
+  it("gives Target Folder a provider-neutral example placeholder (\u2298 \"e.g. Datacenter/NetBox\" is a NetBox instruction on an EVE-NG form)", () => {
+    const field = keyedField(inventorySourceFormDefinition(fakeProvider), "targetFolder");
+    const placeholder = String((field as { placeholder?: string }).placeholder ?? "");
+    expect(placeholder).not.toMatch(/NetBox/i);
+    expect(placeholder).toContain("e.g.");
+  });
 
   it("marks a provider-declared number field with step \"any\" so fractional values pass native validation (kills the missing-step regression)", () => {
     const definition = inventorySourceFormDefinition(fakeProvider);

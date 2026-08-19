@@ -6,6 +6,7 @@ import { validateInventorySource, validateServerConfig } from "../../src/utils/v
 import { mergeServerConfigFields, resolveBmcWebProtocol, serverConfigsEqual, serverOriginStampsEqual } from "../../src/models/config";
 import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
 import { computeProviderFingerprint, sourceConfigUnchanged, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
+import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 
 function makeSourceConfig(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -4577,5 +4578,615 @@ describe("serverOriginStampsEqual / mergeServerConfigFields — origin.syncedIpm
 
     expect(merged.ipmiHost).toBeUndefined();
     expect(merged.origin?.syncedIpmiHost).toBeUndefined();
+  });
+});
+
+/**
+ * PRIMARY HOST/PORT (task #29, the deferred #82 P2-3) — `ServerOrigin.syncedHost`
+ * / `syncedPort`, the stamps that record the console address the SYNC wrote into
+ * `ServerConfig.host`/`port`. These make `host`/`port` sync-owned-with-hand-off
+ * (the DELIBERATE BEHAVIOR CHANGE): the sync writes them only where the record
+ * still carries exactly what the stamp says, so a comparator that cannot SEE the
+ * stamp silently loses the write that created it — after which the address reads
+ * as hand-edited (never updated) or never-configured. Mirrors the syncedIpmiHost
+ * fixtures above; every fixture makes the broken implementation visibly diverge.
+ */
+describe("serverOriginStampsEqual — origin.syncedHost / syncedPort (task #29)", () => {
+  function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: "s1",
+      name: "core-sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      ...overrides
+    };
+  }
+
+  it("counts syncedHost in both directions while still ignoring syncedAt (kills leaving the host stamp out of the `changed` check, which discards the write that gives the sync ownership of `host`)", () => {
+    const legacy = {
+      sourceId: "src-1",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedInstanceKey: "https://eve.example.com",
+      syncedUsername: "admin"
+    };
+    const stamped = { ...legacy, syncedHost: "10.0.0.1" };
+
+    // Gaining the stamp is a change (matrix row 5a — a record whose host already
+    // equals the device's gains a syncedHost). A comparator blind to it lets
+    // computeSyncPlan discard that `after`, and the server never gains ownership
+    // of its own address — read as a hand entry forever after.
+    expect(serverOriginStampsEqual(legacy, stamped)).toBe(false);
+    expect(serverOriginStampsEqual(stamped, legacy)).toBe(false);
+    // Moving to another address is a change — the console address following the device.
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedHost: "10.0.0.2" })).toBe(false);
+    // ...and an unchanged stamp is not, or every owned server reports as an update every sync.
+    expect(serverOriginStampsEqual(stamped, { ...stamped })).toBe(true);
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedAt: 9999 })).toBe(true);
+    // serverConfigsEqual inherits the term through serverOriginsEqual.
+    expect(serverConfigsEqual(server({ origin: legacy }), server({ origin: stamped }))).toBe(false);
+  });
+
+  it("counts syncedPort in both directions (kills leaving the FIRST numeric stamp out of the `changed` check)", () => {
+    const base = {
+      sourceId: "src-1",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedHost: "10.0.0.1"
+    };
+    const legacy = { ...base }; // syncedPort absent — a placeholder / legacy row
+    const stamped = { ...base, syncedPort: 32769 };
+
+    expect(serverOriginStampsEqual(legacy, stamped)).toBe(false);
+    expect(serverOriginStampsEqual(stamped, legacy)).toBe(false);
+    // A reassigned console port following at the source (the exact case the D5 heal serves).
+    expect(serverOriginStampsEqual(stamped, { ...stamped, syncedPort: 32800 })).toBe(false);
+    expect(serverOriginStampsEqual(stamped, { ...stamped })).toBe(true);
+    expect(serverConfigsEqual(server({ origin: legacy }), server({ origin: stamped }))).toBe(false);
+    expect(serverConfigsEqual(server({ origin: stamped }), server({ origin: { ...stamped } }))).toBe(true);
+  });
+});
+
+/**
+ * LIVE STATUS (Phase 2) — NexusCore's runtime-only serverStatus map, keyed by
+ * serverId, exposed on the snapshot and never persisted. applyInventoryStatus
+ * maps a provider's externalId-keyed report onto owned servers via
+ * deterministicServerId, scopes strictly by source, drops entries the source no
+ * longer reports, and fires exactly one change.
+ */
+describe("NexusCore inventory status", () => {
+  function makeSyncedServer(id: string, sourceId: string, externalId: string): ServerConfig {
+    return {
+      id: deterministicServerId(sourceId, externalId),
+      name: id,
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId, externalId, syncedAt: 1 }
+    };
+  }
+
+  it("maps externalId→serverId, sets running/stopped on the snapshot, and fires onDidChange exactly once (⊘ keying the map by externalId would never resolve against the tree's serverIds)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s1 = makeSyncedServer("a", "source-1", "lab.unl#1");
+    const s2 = makeSyncedServer("b", "source-1", "lab.unl#2");
+    await core.addServersBatch([s1, s2]);
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running" }, "lab.unl#2": { state: "stopped" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(s1.id)).toBe("running");
+    expect(snap.serverStatus.get(s2.id)).toBe("stopped");
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("scopes by source: a status keyed to another source's device is dropped, and applying one source leaves another source's entries untouched (⊘ ignoring origin.sourceId lets one lab's refresh overwrite another's highlight via an externalId collision)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const owned = makeSyncedServer("a", "source-1", "dev#1");
+    const other = makeSyncedServer("b", "source-2", "dev#1");
+    await core.addServersBatch([owned, other]);
+
+    // Seed source-2's status first.
+    core.applyInventoryStatus("source-2", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(other.id)).toBe("running");
+
+    // source-1 reports the SAME externalId string. deterministicServerId(source-1,"dev#1")
+    // differs from source-2's serverId, and the server it resolves to IS owned by
+    // source-1 — so it sets source-1's server and does NOT touch source-2's.
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "stopped" } } });
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(owned.id)).toBe("stopped");
+    expect(snap.serverStatus.get(other.id)).toBe("running");
+  });
+
+  it("P2 (adoption): decorates an ADOPTED server whose ServerConfig.id was PRESERVED (id !== deterministicServerId(newSource, X)) by resolving via origin.externalId — while still covering a normal deterministic-id server and not touching another source's server (⊘ a deterministicServerId lookup misses every adopted node, so Refresh/poll never highlight them)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // Adopted (#82): Remove Source → Keep Servers, then re-add → Adopt Existing
+    // preserves the ORIGINAL id and stamps the NEW source in origin. So the id is
+    // NOT deterministicServerId("new-source", "adopted#1").
+    const adopted: ServerConfig = {
+      id: "preserved-original-id-abc123",
+      name: "adopted",
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "new-source", externalId: "adopted#1", syncedAt: 1 }
+    };
+    // Normal server owned by the same source: id === deterministicServerId(...).
+    const normal = makeSyncedServer("n", "new-source", "normal#1");
+    // Owned by a DIFFERENT source — must stay untouched.
+    const foreign = makeSyncedServer("f", "other-source", "x#1");
+    expect(adopted.id).not.toBe(deterministicServerId("new-source", "adopted#1"));
+    await core.addServersBatch([adopted, normal, foreign]);
+
+    core.applyInventoryStatus("new-source", {
+      contractVersion: 1,
+      statuses: {
+        "adopted#1": { state: "running" },
+        "normal#1": { state: "stopped" },
+        "x#1": { state: "running" }
+      }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get("preserved-original-id-abc123")).toBe("running"); // adopted decorated
+    expect(snap.serverStatus.get(normal.id)).toBe("stopped"); // deterministic still works
+    expect(snap.serverStatus.get(foreign.id)).toBeUndefined(); // other source untouched
+  });
+
+  it("P2 (truncation): a TRUNCATED report MERGES — a previously-running node absent from the partial report KEEPS its running status, while present entries still apply (⊘ clearing all prior entries under a capped report loses the decoration of every node beyond the cap)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-1", "dev#2");
+    await core.addServersBatch([a, b]);
+
+    // Complete report first: both running.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+    expect(core.getSnapshot().serverStatus.get(a.id)).toBe("running");
+    expect(core.getSnapshot().serverStatus.get(b.id)).toBe("running");
+
+    // A TRUNCATED report that only reached dev#2 (dev#1 is beyond the cap).
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#2": { state: "stopped" } },
+      truncated: true
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(a.id)).toBe("running"); // retained — merge, not clear
+    expect(snap.serverStatus.get(b.id)).toBe("stopped"); // present entry applied
+  });
+
+  it("P2 (truncation) DISCRIMINATOR: a NON-truncated report still CLEARS an absent node's status (an absent node in a complete report is genuinely removed — do not turn every apply into a merge) (⊘ merging a complete report leaves a pruned node highlighted forever)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-1", "dev#2");
+    await core.addServersBatch([a, b]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+
+    // Complete (non-truncated) report omitting dev#1 → dev#1 is gone.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#2": { state: "stopped" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false); // cleared — absent == removed
+    expect(snap.serverStatus.get(b.id)).toBe("stopped");
+  });
+
+  it("does not set a status for a serverId that resolves to no owned server (⊘ populating the map for a device the sync has not materialized leaves a stale highlight with nothing to hang it on)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "ghost#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.size).toBe(0);
+  });
+
+  it("P2-2: does NOT stamp status onto a server sitting at deterministicServerId(source-1, x) whose origin was STRIPPED (kept via Remove Source → Keep Servers) or belongs to another source (⊘ dropping the origin.sourceId ownership check lets a stale in-flight refresh re-light a detached server)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // The deterministic id still resolves — but ownership no longer does.
+    const detachedId = deterministicServerId("source-1", "dev#1");
+    const detached: ServerConfig = {
+      id: detachedId,
+      name: "kept",
+      host: "10.0.0.9",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false
+      // origin ABSENT — the Keep-Servers strip removed it.
+    };
+    // A second server that resolves under source-1's namespace but is OWNED by source-2.
+    const foreign: ServerConfig = {
+      id: deterministicServerId("source-1", "dev#2"),
+      name: "foreign",
+      host: "10.0.0.10",
+      port: 23,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "source-2", externalId: "dev#2", syncedAt: 1 }
+    };
+    await core.addServersBatch([detached, foreign]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(detachedId)).toBe(false);
+    expect(snap.serverStatus.has(foreign.id)).toBe(false);
+    expect(snap.serverStatus.size).toBe(0);
+  });
+
+  it("drops an entry the source no longer reports on the next apply (⊘ retaining it shows a pruned/gone node as still running)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: {} });
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("clearInventoryStatus removes only that source's entries and fires a change", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-2", "dev#2");
+    await core.addServersBatch([a, b]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    core.applyInventoryStatus("source-2", { contractVersion: 1, statuses: { "dev#2": { state: "running" } } });
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    core.clearInventoryStatus("source-1");
+    expect(listener).toHaveBeenCalledTimes(1);
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false);
+    expect(snap.serverStatus.get(b.id)).toBe("running");
+  });
+
+  it("P2-3/P3-3: removeInventorySource ALONE clears the removed source's status and leaves other sources' entries (⊘ removing the clear from removeInventorySource strands a running highlight on a deleted source's servers)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1" }));
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    const b = makeSyncedServer("b", "source-2", "dev#2");
+    await core.addServersBatch([a, b]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    core.applyInventoryStatus("source-2", { contractVersion: 1, statuses: { "dev#2": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(a.id)).toBe("running");
+
+    // NO pre-clear — removeInventorySource must do the clearing itself.
+    await core.removeInventorySource("source-1");
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(a.id)).toBe(false);
+    expect(snap.serverStatus.get(b.id)).toBe("running");
+  });
+
+  it("P3-4: removeServer drops that server's runtime status entry (⊘ a manual delete strands a running highlight keyed to a server that no longer exists)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    await core.removeServer(s1.id);
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("P3-4: applyInventorySyncPlan drops a pruned server's runtime status entry (⊘ a sync prune leaves a ghost running highlight behind)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const source = makeSourceConfig({ id: "source-1" });
+    await core.addOrUpdateInventorySource(source);
+    const persisted = core.getInventorySource("source-1")!;
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    await core.applyInventorySyncPlan({
+      sourceId: "source-1",
+      syncedAt: 2000,
+      upsertServers: [],
+      removeServerIds: [s1.id],
+      folders: [],
+      expectedSource: persisted
+    });
+
+    expect(core.getServer(s1.id)).toBeUndefined();
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("P2-1a: editing a source's config clears its stale runtime status, but a no-op edit does NOT (⊘ keying status only by the stable sourceId keeps a report fetched under the OLD baseUrl/rootFolder/filter active after Edit Source changes it)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", config: { baseUrl: "http://a" } }));
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    // No-op edit — config unchanged — must NOT clear the status.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, config: { baseUrl: "http://a" } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    // Real config change (baseUrl) — the report fetched under the old config is
+    // no longer trustworthy, so the status is cleared.
+    await core.addOrUpdateInventorySource({ ...core.getInventorySource("source-1")!, config: { baseUrl: "http://b" } });
+    expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
+  });
+
+  it("P2-2: a sync apply that prunes a status-bearing server then FAILS its repo write restores BOTH the server and its runtime status on rollback (⊘ the rollback envelope restores server/sessions/folders/source but not status, so a failed save strands the highlight lost until another refresh — which may never come with polling off)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1" }));
+    const persisted = core.getInventorySource("source-1")!;
+    const s1 = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([s1]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+
+    vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("disk full"));
+    await expect(
+      core.applyInventorySyncPlan({
+        sourceId: "source-1",
+        syncedAt: 2000,
+        upsertServers: [],
+        removeServerIds: [s1.id],
+        folders: [],
+        expectedSource: persisted
+      })
+    ).rejects.toThrow("disk full");
+
+    // Rolled back: the server is back AND its running status is back with it.
+    expect(core.getServer(s1.id)).toBeDefined();
+    expect(core.getSnapshot().serverStatus.get(s1.id)).toBe("running");
+  });
+
+  it("does not fire a change when clearInventoryStatus has nothing to clear (⊘ an unconditional emit churns every tree on an unrelated source removal)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    core.clearInventoryStatus("source-1");
+    expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * PRIMARY HOST/PORT (task #29, the deferred D8) — `NexusCore.healSyncedConsolePorts`,
+ * the SEPARATE persisting step the status-refresh path runs right after the pure
+ * `applyInventoryStatus`. A provider that reassigns telnet console ports on node
+ * restart (EVE-NG Community) surfaces the live `consolePort` on each running
+ * node; the heal persists it onto a sync-owned telnet server so the next connect
+ * targets the live port. The gate is deliberately strict — telnet + running +
+ * not-addressless + reported-differs + SYNC-OWNS — because it writes persisted
+ * config, and a HAND-EDITED port must never be healed.
+ */
+describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
+  function telnetServer(
+    sourceId: string,
+    externalId: string,
+    over: { host?: string; port?: number; syncedHost?: string; syncedPort?: number; protocol?: "telnet" | undefined; addressless?: boolean } = {}
+  ): ServerConfig {
+    const host = over.host ?? "10.0.0.9";
+    const port = over.port ?? 32769;
+    return {
+      id: deterministicServerId(sourceId, externalId),
+      name: externalId,
+      host,
+      port,
+      protocol: "protocol" in over ? over.protocol : "telnet",
+      addressless: over.addressless,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: {
+        sourceId,
+        externalId,
+        syncedAt: 1,
+        // A genuinely sync-owned address unless the test overrides the stamps.
+        // P2-4 (review) — `'x' in over` NOT `over.x ??`, so a test passing an
+        // EXPLICIT `undefined` (a real addressless placeholder, whose add writes
+        // `syncedHost: undefined`) gets an ABSENT stamp rather than the default
+        // host/port. The old `??` coerced explicit-undefined into "" / the port,
+        // making `syncOwnsHost`/`syncOwnsPort` fail for the WRONG reason and
+        // shielding the addressless-gate mutant.
+        syncedHost: "syncedHost" in over ? over.syncedHost : host,
+        syncedPort: "syncedPort" in over ? over.syncedPort : port,
+        syncedProtocol: "telnet"
+      }
+    };
+  }
+
+  it("heals a running SYNC-OWNED telnet node whose console port was reassigned — persists the new port AND re-stamps syncedPort, with one change fired (⊘ leaving applyInventoryStatus to consume consolePort would never persist it — nothing consumes it today)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { host: "10.0.0.9", port: 32769 });
+    await core.addServersBatch([s]);
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consoleHost: "10.0.0.9", consolePort: 32800 } }
+    });
+
+    const after = core.getServer(s.id);
+    expect(after?.port).toBe(32800);
+    expect(after?.origin?.syncedPort).toBe(32800);
+    // Host unchanged (reported host equals persisted), and the stamp stays sync-owned.
+    expect(after?.host).toBe("10.0.0.9");
+    expect(after?.origin?.syncedHost).toBe("10.0.0.9");
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("NEVER heals a HAND-EDITED port — the sync-ownership gate (⊘ dropping the syncOwnsPort gate overwrites a port the user set by hand)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // The sync last wrote 32769; the user hand-edited the port to 5000.
+    const s = telnetServer("source-1", "lab.unl#1", { port: 5000, syncedPort: 32769 });
+    await core.addServersBatch([s]);
+
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32800 } }
+    });
+
+    const after = core.getServer(s.id);
+    expect(after?.port).toBe(5000); // untouched
+    expect(after?.origin?.syncedPort).toBe(32769); // stamp untouched
+    // Nothing healed ⇒ no persisted write, no emit.
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("does NOT heal a STOPPED node even if it carries a console port (⊘ dropping the state === running gate heals a node whose reported port is meaningless)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    await core.addServersBatch([s]);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "stopped", consolePort: 32800 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(32769);
+  });
+
+  it("does NOT heal an SSH node (⊘ dropping the telnet gate heals a node whose port is an ssh port, not a reassignable console port)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // protocol undefined ⇒ ssh; a sync-owned address so ONLY the telnet gate stops the heal.
+    const s = telnetServer("source-1", "lab.unl#1", { host: "10.0.0.9", port: 22, protocol: undefined, syncedPort: 22 });
+    await core.addServersBatch([s]);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 830 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(22);
+  });
+
+  it("does NOT heal an ADDRESSLESS node (⊘ dropping the `|| server.addressless === true` gate writes a console port onto a placeholder that has no console — M15b)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // A REAL placeholder: host "", port 0, and — per the addressless add — its
+    // address stamps ABSENT (the fixed helper honors explicit undefined). With
+    // absent stamps, syncOwnsPort(0, undefined, port) reads the sentinel 0 as the
+    // fill-in row, so ONLY the addressless gate stops the heal.
+    const s = telnetServer("source-1", "lab.unl#1", { host: "", port: 0, addressless: true, syncedHost: undefined, syncedPort: undefined });
+    await core.addServersBatch([s]);
+    // A PORT-ONLY report (no consoleHost): healing it onto the placeholder would
+    // leave host "" (still a VALID addressless record), so the write-site
+    // validateServerConfig defense does NOT catch it — the addressless gate is the
+    // SOLE guard, and dropping it persists port 32800 onto a still-addressless node.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32800 } }
+    });
+    const after = core.getServer(s.id);
+    expect(after?.port).toBe(0);
+    expect(after?.addressless).toBe(true);
+    expect(after?.origin?.syncedPort).toBeUndefined();
+  });
+
+  it("respects the truncated-merge — only entries PRESENT in the report are considered (⊘ healing beyond the report would touch a node the partial scan never reached)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    const b = telnetServer("source-1", "lab.unl#2", { port: 32770 });
+    await core.addServersBatch([a, b]);
+    // A truncated report that only reached lab.unl#1.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32800 } },
+      truncated: true
+    });
+    expect(core.getServer(a.id)?.port).toBe(32800); // present ⇒ healed
+    expect(core.getServer(b.id)?.port).toBe(32770); // absent ⇒ untouched
+  });
+
+  it("NEVER persists a heal whose result would fail validateServerConfig — the write-site defense (⊘ a bad port/host reaching the heal directly, bypassing the report validator, would persist a record dropped at reload — the #82 record-drop class)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    await core.addServersBatch([s]);
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    // Reports constructed DIRECTLY (not through validateInventoryStatusReport), as
+    // an untrusted second provider could hand in-process. Port 0 is the ADDRESSLESS
+    // sentinel and would make a NON-addressless record invalid; the heal recognises
+    // it as sync-owned (cur === stamp) but MUST refuse to persist the invalid result.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 0 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(32769);
+    // An out-of-range port is the same class.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 70000 } }
+    });
+    expect(core.getServer(s.id)?.port).toBe(32769);
+    // An empty console host would blank host — the whole entry is refused (the
+    // resulting record fails validateServerConfig), so its port is not healed either.
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consoleHost: "", consolePort: 40000 } }
+    });
+    const after = core.getServer(s.id);
+    expect(after?.host).toBe("10.0.0.9");
+    expect(after?.port).toBe(32769);
+    // Nothing was ever persisted, so no change fired across all three refusals.
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("does not heal when the reported port EQUALS the persisted one (⊘ an unconditional write churns a persist + emit every refresh on every unchanged node)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    await core.addServersBatch([s]);
+    const listener = vi.fn();
+    core.onDidChange(listener);
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consolePort: 32769 } }
+    });
+    expect(listener).not.toHaveBeenCalled();
   });
 });

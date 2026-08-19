@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let mockConfig: Record<string, unknown> = {};
@@ -1065,20 +1067,50 @@ describe("TerminalHighlighter — output latency", () => {
 });
 
 /**
- * F6 — the IPv6 and UUID rules are no longer shipped as defaults because the
- * two of them cost more than every other rule combined. A user who adds them
- * back by hand must get exactly the highlighting they had before, so the
- * patterns published in the CHANGELOG and the settings description are pinned
- * here verbatim.
+ * The UUID rule ships DISABLED by default (it and IPv6 cost more than every
+ * other rule combined), and its pattern has never changed — so nothing
+ * upgrades it and this is a straight behavioural pin of the pattern published
+ * in the CHANGELOG and the settings description.
  */
-describe("TerminalHighlighter — restoring the opt-in IPv6 / UUID rules", () => {
-  const IPV6_PATTERN =
-    "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b";
+describe("TerminalHighlighter — the opt-in UUID rule", () => {
   const UUID_PATTERN =
     "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 
-  it("highlights IPv6 addresses once the documented rule is added back", () => {
-    setConfig(true, [{ pattern: IPV6_PATTERN, color: "magenta", flags: "g" }]);
+  it("highlights UUIDs once the rule is enabled", () => {
+    setConfig(true, [{ pattern: UUID_PATTERN, color: "brightBlue", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("id: 3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toContain(
+      "\x1b[94m3f2504e0-4f89-11d3-9a0c-0305e82c3301\x1b[39m"
+    );
+  });
+});
+
+/**
+ * Read-time upgrade (v2.8.187). A user who saved highlighting rules from the
+ * editor before v2.8.182 has a frozen, label-less snapshot in their global
+ * settings that fully shadows the shipped defaults — VS Code does not merge
+ * array settings. `reload()` therefore upgrades known-default patterns before
+ * compiling, so the fixed IPv6 pattern actually RUNS even if the snapshot on
+ * disk is never rewritten.
+ *
+ * NOTE ON EVERY IPv6 ASSERTION IN THIS FILE: a config carrying a historical
+ * IPv6 default pattern no longer compiles that pattern — reload() rewrites it
+ * to the canonical one first. There is deliberately no test left that claims
+ * to pin a historical pattern's behaviour through the highlighter, because
+ * such a test cannot: it would silently be testing the upgrade instead. The
+ * historical patterns are pinned as string literals (here and in
+ * highlightRuleUpgrade.test.ts), and the shipped pattern's behaviour is pinned
+ * against package.json in highlightIpv6Default.test.ts.
+ */
+describe("TerminalHighlighter — known-default upgrade at reload()", () => {
+  const IPV6_V1 =
+    "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b";
+  const IPV6_V2 = `${IPV6_V1}|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:(?!:)`;
+
+  // The forms a v1 rule always handled correctly must keep working after the
+  // rewrite — the upgrade is a strict widening, not a swap.
+  it("keeps highlighting the forms the stale pattern already got right", () => {
+    setConfig(true, [{ pattern: IPV6_V1, color: "magenta", flags: "g" }]);
     const h = new TerminalHighlighter();
     expect(h.apply("addr fe80::1")).toContain("\x1b[35mfe80::1\x1b[39m");
     expect(h.apply("addr 2001:db8::1")).toContain("\x1b[35m2001:db8::1\x1b[39m");
@@ -1087,11 +1119,69 @@ describe("TerminalHighlighter — restoring the opt-in IPv6 / UUID rules", () =>
     );
   });
 
-  it("highlights UUIDs once the documented rule is added back", () => {
-    setConfig(true, [{ pattern: UUID_PATTERN, color: "brightBlue", flags: "g" }]);
+  // ⊘ Fails if reload() skips the upgrade: the stale pattern truncates the
+  // address at the first hextet after "::", so only "fe80::b3ff" gets wrapped.
+  it("compiles the FIXED IPv6 pattern from a stale v1 snapshot", () => {
+    setConfig(true, [{ pattern: IPV6_V1, color: "magenta", flags: "g" }]);
     const h = new TerminalHighlighter();
-    expect(h.apply("id: 3f2504e0-4f89-11d3-9a0c-0305e82c3301")).toContain(
-      "\x1b[94m3f2504e0-4f89-11d3-9a0c-0305e82c3301\x1b[39m"
+    expect(h.apply("link-local fe80::b3ff:fe1e:8329 up")).toBe(
+      "link-local \x1b[35mfe80::b3ff:fe1e:8329\x1b[39m up"
     );
+  });
+
+  it("compiles the FIXED IPv6 pattern from a stale v2 snapshot", () => {
+    setConfig(true, [{ pattern: IPV6_V2, color: "magenta", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    expect(h.apply("peer 2001:db8::8a2e:370:7334 ok")).toBe(
+      "peer \x1b[35m2001:db8::8a2e:370:7334\x1b[39m ok"
+    );
+  });
+
+  it("still honours enabled:false on an upgraded stale rule", () => {
+    setConfig(true, [{ pattern: IPV6_V1, color: "magenta", flags: "g", enabled: false }]);
+    const h = new TerminalHighlighter();
+    expect(h.isEnabled()).toBe(false);
+    expect(h.apply("fe80::b3ff:fe1e:8329")).toBe("fe80::b3ff:fe1e:8329");
+  });
+});
+
+/**
+ * End-to-end check of the SHIPPED default set — the whole array out of
+ * package.json, with only the IPv6 rule flipped on, exactly as a user who
+ * enables it from the Highlighting Rules editor gets it.
+ *
+ * The unit matrix in highlightIpv6Default.test.ts tests the pattern in
+ * isolation; this tests it in company. An IPv4-mapped address is the case
+ * where that distinction bites: the IPv4 rule sits in the same array and
+ * matches the dotted-quad tail, so a pattern that stops at `::ffff:` does not
+ * merely under-highlight — it hands the tail to a different rule, and the
+ * address renders as two differently-coloured halves.
+ */
+describe("TerminalHighlighter — shipped defaults with IPv6 enabled", () => {
+  const shippedDefaults = (
+    JSON.parse(readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf8")).contributes
+      .configuration.properties["nexus.terminal.highlighting.rules"].default ?? []
+  ) as Array<Record<string, unknown>>;
+
+  function withIpv6Enabled(): Array<Record<string, unknown>> {
+    return shippedDefaults.map((rule) =>
+      rule.label === "IPv6 addresses" ? { ...rule, enabled: true } : { ...rule }
+    );
+  }
+
+  // ⊘ Fails against any pattern without a dotted-quad alternative: the match
+  // stops at "::ffff:" and the IPv4 rule then colours "192.168.1.1" separately.
+  it("wraps a whole IPv4-mapped address in the IPv6 rule's magenta", () => {
+    setConfig(true, withIpv6Enabled());
+    const h = new TerminalHighlighter();
+    expect(h.apply("peer ::ffff:192.168.1.1 ESTABLISHED")).toContain(
+      "\x1b[35m::ffff:192.168.1.1\x1b[39m"
+    );
+  });
+
+  it("still leaves a plain IPv4 address to the IPv4 rule", () => {
+    setConfig(true, withIpv6Enabled());
+    const h = new TerminalHighlighter();
+    expect(h.apply("gw 192.168.1.1 up")).toContain("\x1b[35m192.168.1.1\x1b[39m");
   });
 });

@@ -6,11 +6,14 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
+  controlProviderNode,
+  fetchProviderStatus,
   InventoryProviderError,
   inventorySecretKey,
   inventorySourceValuesEqual,
   resolveProviderInstanceKey,
   sourceConfigUnchanged,
+  validateInventoryStatusReport,
   type InventoryConfigField,
   type InventoryPrunePolicy,
   type InventoryProvider,
@@ -20,6 +23,8 @@ import {
   type InventoryTree
 } from "../models/inventory";
 import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
+// Shared with ui/settingsTreeProvider.ts so both surfaces describe a source identically.
+import { sourceDescription } from "../services/inventory/sourceDescription";
 import {
   computeSyncPlan,
   planToApplication,
@@ -109,7 +114,7 @@ function providerMissingMessage(providerId: string): string {
  * `sourceBusyMessage`'s Record forces any future member to bring its own
  * wording instead of silently inheriting one of these.
  */
-type SourceBusyReason = "sync" | "edit" | "remove";
+type SourceBusyReason = "sync" | "edit" | "remove" | "control";
 
 /**
  * The warning a command shows when the source it was asked to act on is
@@ -130,7 +135,8 @@ function sourceBusyMessage(name: string, holder: SourceBusyReason, asking: Sourc
   const wording: Record<SourceBusyReason, string> = {
     sync: asking === "sync" ? `"${name}" is already syncing.` : `"${name}" is currently syncing — try again once the sync finishes.`,
     edit: `"${name}" is open in Edit Source — close that tab, then try again.`,
-    remove: `"${name}" is currently being removed — try again once the removal finishes.`
+    remove: `"${name}" is currently being removed — try again once the removal finishes.`,
+    control: `"${name}" is currently starting or stopping a node — try again in a moment.`
   };
   return wording[holder];
 }
@@ -218,13 +224,29 @@ async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<
  * sync's own apply never changes revision, so this still matches on the
  * ordinary, non-racy path.
  */
+/**
+ * F5, shared — is the record currently holding `snapshot.id` still the SAME
+ * INCARNATION `snapshot` names? `sourceConfigUnchanged` is revision-based once
+ * both sides carry a revision (see its doc) and `addOrUpdateInventorySource`
+ * mints a fresh revision on every write, so an edit — or a replace-mode import /
+ * complete reset that removed the source and re-added one under the same id —
+ * fails it, while the sync's own lastSyncAt-only bump does not. The name is
+ * compared separately because the comparator does not cover it. Used by the
+ * best-effort restamp and by the sync's status apply, which must not land on a
+ * different incarnation for exactly the same reason.
+ */
+function isSameSourceIncarnation(core: NexusCore, snapshot: InventorySourceConfig): boolean {
+  const current = core.getInventorySource(snapshot.id);
+  return current !== undefined && sourceConfigUnchanged(current, snapshot) && current.name === snapshot.name;
+}
+
 async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapshot: InventorySourceConfig, fingerprint: string): Promise<void> {
   await configMutationLock.runExclusive(async (): Promise<void> => {
     const current = core.getInventorySource(syncSnapshot.id);
     if (!current || current.providerFingerprint === fingerprint) {
       return;
     }
-    if (!sourceConfigUnchanged(current, syncSnapshot) || current.name !== syncSnapshot.name) {
+    if (!isSameSourceIncarnation(core, syncSnapshot)) {
       return;
     }
     try {
@@ -291,23 +313,30 @@ function describeInventoryError(error: unknown): string {
  * text. Core's own message is NEVER changed by this — it's also asserted
  * verbatim by nexusCoreInventory.test.ts.
  */
+/**
+ * The source id a command invocation names, from any of the three shapes a
+ * `nexus.inventory.*` (or `nexus.deviceTemplate.editRules`) handler is called
+ * with: a bare id string (the manage hub), a tree item carrying `sourceId`
+ * (the Settings tree's per-source rows — VS Code hands `view/item/context`
+ * commands the ITEM, never a string), or nothing at all (the palette).
+ * `undefined` means "ask", which is the right answer for the last case and for
+ * any menu object that names no source.
+ */
+export function resolveSourceIdArg(arg: unknown): string | undefined {
+  if (typeof arg === "string") {
+    return arg;
+  }
+  if (arg !== null && typeof arg === "object") {
+    const sourceId = (arg as { sourceId?: unknown }).sourceId;
+    if (typeof sourceId === "string" && sourceId.length > 0) {
+      return sourceId;
+    }
+  }
+  return undefined;
+}
+
 function isSourceConfigMismatchError(error: unknown): boolean {
   return error instanceof Error && error.message.includes("configuration changed since the sync was computed");
-}
-
-function formatLastSync(source: InventorySourceConfig): string {
-  if (!source.lastSyncAt) return "never synced";
-  const minutes = Math.floor((Date.now() - source.lastSyncAt) / 60_000);
-  if (minutes < 1) return "synced just now";
-  if (minutes < 60) return `synced ${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `synced ${hours}h ago`;
-  return `synced ${Math.floor(hours / 24)}d ago`;
-}
-
-function sourceDescription(source: InventorySourceConfig, registry: InventoryProviderRegistry): string {
-  const providerLabel = registry.get(source.providerId)?.label ?? source.providerId;
-  return `${providerLabel} — ${formatLastSync(source)}`;
 }
 
 /** Auto-picks when exactly one source exists; warns and returns undefined when there are none. */
@@ -2190,6 +2219,24 @@ export function registerInventoryCommands(
   // one-size-fits-all "is currently syncing" this used to be.
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
+  // LIVE STATUS (Phase 2) — monotonic status-refresh generation. Each
+  // refreshStatus sweep captures the value it bumps to; before applying any
+  // report it checks it still holds the latest generation, so a slow older
+  // sweep that resolves AFTER a newer one started drops its (now stale) apply
+  // rather than clobbering the fresher state. The poll's in-flight latch stops
+  // poll ticks from stacking; this covers poll-vs-manual and any residual race.
+  let statusRefreshGeneration = 0;
+
+  // TRUNCATED STATUS (follow-up 2; R4 review) — which sweep generation last
+  // APPLIED status for each source id. The generation counter above orders
+  // sweeps; this records the outcome per source, which is what the truncation
+  // warning needs: a sweep may only claim a source's status is partial while
+  // its own truncated apply is still the newest one for that source. Written on
+  // EVERY apply, not just truncated ones — a later COMPLETE apply is precisely
+  // what has to invalidate an earlier truncated claim. Entries are dropped when
+  // the source is removed (see removeSource).
+  const statusAppliedGeneration = new Map<string, number>();
+
   /**
    * Shared Test-button handler for both the Add and Edit forms. Never throws
    * out to WebviewFormPanel — a bad/incomplete field value is reported as a
@@ -2804,6 +2851,7 @@ export function registerInventoryCommands(
           return { ok: false };
         }
 
+
         // FINDING 1 — the source record is gone for good now, so record
         // removal can no longer race server disposition. `expectedSource:
         // "absent"` still guards a narrower race: a replace-mode import
@@ -3043,6 +3091,12 @@ export function registerInventoryCommands(
                     // update it. Omitted rather than written as `undefined` for the
                     // reason `instanceKey` is.
                     ...(origin.syncedAltHost !== undefined ? { syncedAltHost: origin.syncedAltHost } : {}),
+                    // TELNET (Phase 0) — the transport receipt, on exactly the terms of
+                    // the alternate-host one above: it says whether the `protocol` this
+                    // server keeps was the SYNC'S doing or the USER'S, which is the whole
+                    // of the `syncOwnsProtocol` write rule. Omitted rather than written as
+                    // `undefined` for the reason `instanceKey` is.
+                    ...(origin.syncedProtocol !== undefined ? { syncedProtocol: origin.syncedProtocol } : {}),
                     // DEVICE TEMPLATES (issue #48 PR-T1) — the third part of the
                     // origin that has to SURVIVE the strip, on exactly the terms
                     // of the auth/OOB provenance above. It says whether the
@@ -3218,6 +3272,101 @@ export function registerInventoryCommands(
         return;
       }
 
+      /**
+       * LIVE STATUS ON A SYNC (follow-up #42) — the running/stopped picture this
+       * fetch came back with, if the provider supplies one (`InventoryTree
+       * .status`; EVE-NG does, NetBox does not). `undefined` — an absent report,
+       * or a malformed one — means this sync changes NO status, which is what
+       * keeps a NetBox sync from blanking an EVE source's decorations.
+       *
+       * VALIDATED HERE, not in `validateInventoryTree`, and DEGRADED rather than
+       * thrown: the devices of this fetch are already proven good, so a
+       * third-party provider's quirky status entry must not abort a sync that
+       * would otherwise apply cleanly. Same discipline (and the same validator)
+       * as `fetchProviderStatus` on the refresh path — one definition of "a
+       * usable status report", so the two paths cannot disagree about one.
+       *
+       * Computed ONCE here, off the same `tree` object every plan below is
+       * computed from, so the status applied on the success paths can only ever
+       * be the one belonging to the fetch that was actually applied.
+       */
+      const fetchedStatus = validateInventoryStatusReport(tree.status);
+      /**
+       * Handed to the core ONLY from a path where the plan was actually applied,
+       * and only AFTER that apply: the report is keyed by `externalId`, which
+       * `applyInventoryStatus` resolves through the servers this source owns —
+       * before the apply, a device this sync has just created matches nothing and
+       * its status would be silently dropped.
+       *
+       * `inFlightSourceIds` claims this source for the whole of `syncNow`, so no
+       * other sync/edit/remove races it and `refreshStatus` skips it — but the
+       * latch does not cover a config IMPORT or a complete reset, which replace
+       * every record (this source included, id reused) without consulting it.
+       * Both queue on `configMutationLock`, so one can be waiting the moment this
+       * sync's own locked attempt releases; the apply is keyed by `source.id`
+       * alone, and applied to a replacement incarnation it would overwrite the new
+       * source's runtime status and clear its `statusAppliedGeneration` entry.
+       *
+       * Two things keep it on its own incarnation:
+       *  1. CALLED FIRST, immediately after the locked attempt that committed and
+       *     BEFORE the best-effort restamp beside it. The restamp takes its own
+       *     `configMutationLock` acquisition — a real `await` on a lock a queued
+       *     import may already hold — so anything after it can resume into a
+       *     replaced source. Nothing awaits between the commit and this call now.
+       *  2. REVALIDATED ANYWAY, mirroring what `refreshStatus` does before its own
+       *     apply. `runExclusive` resolving is itself a scheduling boundary, so
+       *     "no await in between" is not a proof; the caller passes the incarnation
+       *     it applied against and the MUTATION EPOCH as of the end of its locked
+       *     section — captured INSIDE the lock, after the plan apply that bumps it,
+       *     which is what distinguishes this sync's own commit (epoch matches) from
+       *     somebody else's server write landing afterwards (it does not). Capturing
+       *     before the commit would never match; capturing after the lock released
+       *     would fold a racing writer's bump into the baseline and always match.
+       *     The epoch alone does not see a source record REPLACED (removal and
+       *     re-add mutate no servers), so the incarnation is compared too — the
+       *     same `sourceConfigUnchanged` + name check the restamp uses.
+       *
+       * Still called OUTSIDE `configMutationLock`: it is a pure runtime-map update
+       * (no persistence) and the lock's rule is that nothing joins it that does not
+       * need it.
+       */
+      const applyFetchedStatus = (committed: { source: InventorySourceConfig; mutationEpoch: number }): void => {
+        if (fetchedStatus) {
+          if (core.getSourceMutationEpoch(source.id) !== committed.mutationEpoch || !isSameSourceIncarnation(core, committed.source)) {
+            return;
+          }
+          core.applyInventoryStatus(source.id, fetchedStatus);
+          // R3 (follow-up #43 review) — THE SECOND APPLIER. `refreshStatus`
+          // records the sweep generation that last applied status for a source
+          // and only warns "this source's lab status is partial" while its own
+          // apply is still the newest one. That record exists precisely so a
+          // later COMPLETE apply invalidates an earlier partial claim — but a
+          // sync belongs to no sweep and does not bump `source.revision`, so
+          // without this line a truncated claim collected before the sync would
+          // still match at warning time and the user would be told to narrow a
+          // Root Folder for a tree this sync has just brought fully current.
+          // DELETING the entry (rather than writing some generation of our own)
+          // is the minimal shape: the filter is `get(id) !== myGeneration`, and
+          // a missing entry fails it for every sweep, which is exactly the claim
+          // this apply supersedes.
+          //
+          // ONLY WHEN THIS SYNC'S OWN REPORT IS COMPLETE (review). The
+          // claim being invalidated is "this source's status is partial", and
+          // only a COMPLETE apply makes that claim false. A sync whose own
+          // `fetchedStatus` is truncated — the crawl stopped short, or the
+          // raw-node status cap tripped — has just applied a partial status of
+          // its own, so an earlier sweep's warning is STILL TRUE about the
+          // screen the user is looking at. Deleting there would drop that source
+          // from the sweep's warning and leave a partial status with nothing to
+          // explain it, which is the silent-partial failure this whole record
+          // exists to prevent. The APPLY above happens either way; only the
+          // invalidation is conditional.
+          if (!fetchedStatus.truncated) {
+            statusAppliedGeneration.delete(source.id);
+          }
+        }
+      };
+
       // PAIRING RULE (see resolveSourceAuthProfile) — resolved immediately
       // before the call it feeds, against `source`, and reassigned in lockstep
       // with `plan` at every point below where `plan` itself is reassigned
@@ -3273,7 +3422,15 @@ export function registerInventoryCommands(
         // source config race (or any persist failure) here must produce a
         // friendly error instead of an unhandled command rejection.
         type FastPathResult =
-          | { kind: "done"; plan: InventorySyncPlan; removedEmptyFolderCount: number; source: InventorySourceConfig }
+          | {
+              kind: "done";
+              plan: InventorySyncPlan;
+              removedEmptyFolderCount: number;
+              source: InventorySourceConfig;
+              // The source's mutation epoch as of the END of this locked section
+              // — the anchor `applyFetchedStatus` re-checks against. See its doc.
+              mutationEpoch: number;
+            }
           | {
               kind: "not-empty";
               plan: InventorySyncPlan;
@@ -3340,7 +3497,16 @@ export function registerInventoryCommands(
             // against), not the outer `source` captured before this sync
             // started, is what the post-lock restamp below must compare
             // against.
-            return { kind: "done", plan: recomputed, removedEmptyFolderCount: applyResult.removedEmptyFolderCount, source: freshSource };
+            return {
+              kind: "done",
+              plan: recomputed,
+              removedEmptyFolderCount: applyResult.removedEmptyFolderCount,
+              source: freshSource,
+              // Read INSIDE the lock, after the apply that bumped it: everything
+              // this sync itself did is already folded in, and no other locked
+              // writer can have run yet.
+              mutationEpoch: core.getSourceMutationEpoch(freshSource.id)
+            };
           } catch (error) {
             // The apply did NOT commit (or a stale-secret delete failed) — the old
             // proxy config is still live and needs its password; put back what we
@@ -3360,6 +3526,18 @@ export function registerInventoryCommands(
         if (fastPathResult.kind === "abort") return;
         if (fastPathResult.kind === "done") {
           const donePlan = fastPathResult.plan;
+          // LIVE STATUS ON A SYNC (follow-up #42) — a nothing-to-change sync is
+          // still a COMPLETED sync: it applied a (empty) plan, it bumped
+          // lastSyncAt, and the status it fetched is exactly as current as the
+          // confirm path's. This is also the ORDINARY shape of a re-sync of a
+          // settled lab, so leaving it out would mean the status only ever
+          // updates on the syncs that happen to change something.
+          //
+          // BEFORE the restamp, not after: the restamp awaits its own
+          // `configMutationLock` acquisition, and a replace-mode import queued on
+          // that lock runs to completion inside the await (see
+          // `applyFetchedStatus`).
+          applyFetchedStatus(fastPathResult);
           // ITEM A — the sync (a no-op apply, but still a successful one)
           // has now committed; restamp outside the lock just released above.
           if (fingerprintToStamp) {
@@ -3760,6 +3938,9 @@ export function registerInventoryCommands(
             // against (`freshSource`, read inside this same locked attempt),
             // for the post-lock restamp below to compare against.
             source: InventorySourceConfig;
+            // The source's mutation epoch as of the END of this locked section
+            // — the anchor `applyFetchedStatus` re-checks against. See its doc.
+            mutationEpoch: number;
           };
 
       for (;;) {
@@ -4223,7 +4404,12 @@ export function registerInventoryCommands(
             recreatedCount: recreatedIds.size,
             teardownFailureCount: teardownFailedIds.size,
             removedEmptyFolderCount: applyResult.removedEmptyFolderCount,
-            source: freshSource
+            source: freshSource,
+            // Read INSIDE the lock, at the very end of the section that
+            // committed: this sync's own apply has already bumped it and no
+            // other locked writer can have run yet, so a later mismatch names
+            // somebody else's write.
+            mutationEpoch: core.getSourceMutationEpoch(freshSource.id)
           };
         });
 
@@ -4236,6 +4422,19 @@ export function registerInventoryCommands(
           continue;
         }
 
+        // LIVE STATUS ON A SYNC (follow-up #42) — AFTER the apply committed
+        // (`attempt.kind === "success"` is the only way here), so every server
+        // this plan just created is already in the core and can resolve its own
+        // status entry. Every earlier exit — abort, retry, a declined preview, a
+        // failed fetch — returns or loops without reaching this line, which is
+        // what makes "a sync that did not apply changes no status" true by
+        // construction rather than by a condition that could drift.
+        //
+        // BEFORE the restamp, not after: the restamp awaits its own
+        // `configMutationLock` acquisition, and a replace-mode import queued on
+        // that lock runs to completion inside the await (see
+        // `applyFetchedStatus`).
+        applyFetchedStatus(attempt);
         // ITEM A — the sync has now committed successfully; restamp as a
         // separate, non-nested locked write outside the attempt's own
         // (already-resolved) lock acquisition. F5 — compared against
@@ -4350,18 +4549,507 @@ export function registerInventoryCommands(
     };
   }
 
+  /**
+   * LIVE STATUS (Phase 2) — refresh the running/stopped state of one source (by
+   * id) or ALL sources (no arg, the poll path). Read-only: it never mutates
+   * servers or secrets, only NexusCore's runtime status map. Per-source errors
+   * are non-fatal (the whole point of the visible poll is that a flaky lab box
+   * never nags), so the sweep continues past any single failure:
+   *  - a source whose provider has no `fetchStatus` is skipped (NetBox);
+   *  - a source currently claimed in `inFlightSourceIds` (an in-flight
+   *    sync/edit/remove) is skipped so this never races the vault read or
+   *    provider call that operation is making — refresh never CLAIMS the guard
+   *    itself, so it can never block a real operation and overlapping refreshes
+   *    stay harmless (fetchProviderStatus is idempotent);
+   *  - `fetchProviderStatus` swallows a throwing/ malformed provider answer into
+   *    `undefined`, and a vault read that rejects is caught here.
+   */
+  async function refreshStatus(sourceIdArg?: string, options?: { manual?: boolean }): Promise<void> {
+    const myGeneration = ++statusRefreshGeneration;
+    const targets = sourceIdArg
+      ? (() => {
+          const source = core.getInventorySource(sourceIdArg);
+          return source ? [source] : [];
+        })()
+      : core.getSnapshot().inventorySources;
+    // P3-7 — on the MANUAL path only, warn once if every source we actually
+    // tried failed to produce a report (all auth broken / unreachable). The
+    // poll path stays silent (a warning per tick would nag).
+    let attempted = 0;
+    let succeeded = 0;
+    // TRUNCATED STATUS (follow-up 2) — the sources whose report came back
+    // `truncated` AND was applied, by name, for one manual-only warning after the
+    // loop. `fetchStatus` sets the flag when the lab crawl hits its own time
+    // budget; the report then covers only the nodes it reached, so every other
+    // node keeps whatever state it already had — stale, or still `unknown`.
+    // Nothing read the flag before, so a partial refresh was indistinguishable
+    // from a complete one.
+    // Entries carry the source ID as well as the name: the name is what the
+    // message renders, the id is what `warnIfTruncated` filters by.
+    const truncatedSources: { id: string; name: string; revision: string | undefined }[] = [];
+    // TRUNCATED STATUS (follow-up 2; R3 review) — ONE renderer, because this
+    // warning has TWO exits: the normal end of the sweep, and the supersede bail
+    // inside the loop below. Written twice they would drift; written once they
+    // cannot. It is self-gating (manual-only, and silent with nothing collected),
+    // so both call sites are an unconditional call.
+    //
+    // MANUAL ONLY, exactly like the total-failure warning and for the same
+    // reason: the poll fires on a timer, and a warning per tick would nag about a
+    // lab that is merely large. ONE message for the sweep, never one per source —
+    // a multi-lab refresh would otherwise stack a pile of notifications. Names up
+    // to three sources, in the spirit of the sync's own `namedExamples`.
+    //
+    // CAUSE-NEUTRAL (Codex P2) — `truncated` is set by the wall-clock deadline
+    // AND by every size cap (nodes, labs, folder listings, depth), so naming the
+    // time budget is wrong for a lab tree that simply exceeds a cap — and
+    // "run it again" is actively bad advice there, because a cap is deterministic
+    // and truncates identically next time. The remedy that works for BOTH causes
+    // is a narrower crawl, so that is the only one offered. Propagating the real
+    // reason out of the provider would let this be specific again; the report
+    // contract carries no reason field today.
+    const warnIfTruncated = (): void => {
+      if (options?.manual !== true || truncatedSources.length === 0) {
+        return;
+      }
+      // R4 (Codex P2) — a STALE CLAIM guard, and the reason the collected entries
+      // carry ids. Applying a truncated report earns the right to say so only
+      // while that apply is still what the tree shows. A NEWER sweep that applied
+      // a COMPLETE report for the same source (very much the expected shape: this
+      // sweep is slow because the lab is big, and the user refreshed again) has
+      // replaced the partial status with a full one, so naming that source here
+      // describes a screen the user is no longer looking at and sends them to
+      // narrow a Root Folder that no longer needs narrowing. Drop those and warn
+      // about what is left, staying silent if that is nothing.
+      //
+      // Correct too when the newer sweep is ALSO truncated: it collected the
+      // source itself and warns with its own accurate message, so suppressing the
+      // older claim removes a duplicate rather than losing information.
+      // STILL THIS SWEEP'S, AND STILL THERE (Codex P2 ×2). Two independent ways a
+      // collected claim goes stale between the apply and the warning:
+      //
+      //  1. A NEWER sweep re-applied this source — its status is on screen now,
+      //     not ours. The generation record settles that.
+      //  2. The source is no longer the RECORD we applied to. Removed mid-sweep,
+      //     so there is nothing left to be partial about — naming it would tell
+      //     the user to narrow the Root Folder of something they just deleted —
+      //     or removed and RECREATED under the same id, which a replace-mode
+      //     import does: the replacement is a different incarnation with a fresh
+      //     revision, its status was cleared with the record we applied to, and
+      //     it displays nothing partial to explain. An id-existence test passes
+      //     that impostor, so the revision captured at apply time is what the
+      //     live record must still match. This is the same incarnation rule the
+      //     apply guard above already enforces before it writes anything.
+      //
+      // (2) is checked by READING THE LIVE STATE rather than by trusting removals
+      // to notify us. `removeSource` here does delete its entry, but it is not the
+      // only remover: `completeReset` and a replace-mode config import drop
+      // sources by calling core directly (configCommands.ts), and they cannot
+      // reach this closure-local map. A future fourth path could not either. The
+      // live read is immune to all of them by construction, which a growing list
+      // of notification call sites would not be.
+      const live = truncatedSources.filter((s) => {
+        if (statusAppliedGeneration.get(s.id) !== myGeneration) {
+          return false;
+        }
+        // BOTH halves, deliberately. `revision` is optional (older records are
+        // backfilled at load), so `getInventorySource(id)?.revision === captured`
+        // alone would read a REMOVED legacy source — `undefined?.revision` is
+        // `undefined`, and so was its captured revision — as a match, and warn
+        // about a source that is gone.
+        const liveSource = core.getInventorySource(s.id);
+        return liveSource !== undefined && liveSource.revision === s.revision;
+      });
+      if (live.length === 0) {
+        return;
+      }
+      const count = live.length;
+      const names = live.slice(0, 3).map((s) => `"${s.name}"`).join(", ");
+      const andMore = count > 3 ? ` and ${count - 3} more` : "";
+      const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
+      void vscode.window.showWarningMessage(
+        `${subject} — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the ${
+          count === 1 ? "source's" : "sources'"
+        } Root Folder or Lab Filter to bring the lab tree inside the crawl's limits.`
+      );
+    };
+    for (const source of targets) {
+      // A newer sweep has started while this one was awaiting — stop applying
+      // stale results (last-STARTED-wins, so an older completion never
+      // overwrites a newer apply).
+      if (myGeneration !== statusRefreshGeneration) {
+        // R3 (review) — but NOT silently, if this sweep already APPLIED a
+        // truncated report. Silence-on-supersede is right only while nothing
+        // reached the tree; here an earlier source's partial status is on screen
+        // and returning past the post-loop warning would leave it unexplained
+        // (the superseding sweep is often targeted at ONE source, so it covers
+        // neither that source nor its truncation).
+        //
+        // Deliberately a warn-then-`return` rather than a `break`: a `break`
+        // would also drop the sweep into the TOTAL-FAILURE warning below, whose
+        // `succeeded === 0` means "every source failed" — false on a bail, where
+        // it only means every source TRIED SO FAR failed. That warning needs a
+        // complete sweep to mean anything, so it stays suppressed here.
+        warnIfTruncated();
+        return;
+      }
+      if (inFlightSourceIds.get(source.id) !== undefined) {
+        continue; // busy with a sync/edit/remove — skip, don't race it
+      }
+      const provider = registry.get(source.providerId);
+      if (!provider || typeof provider.fetchStatus !== "function") {
+        continue; // provider gone or offers no status (e.g. NetBox)
+      }
+      // P2-1(b) — capture the source's incarnation as of THIS fetch. If Edit
+      // Source (or any write) changes the record while the fetch is in flight,
+      // the report was produced under a config the source no longer has, so its
+      // apply is dropped. Complements the global generation guard, which only
+      // orders sweeps against each other.
+      const startRevision = source.revision;
+      // #84 P2 (Codex) — capture this source's MUTATION EPOCH as of the fetch
+      // start. A routine syncNow that lands while this fetch is in flight changes
+      // servers (e.g. a device console port) WITHOUT bumping the source revision
+      // (revision tracks config edits, not sync applies), so the revision guard
+      // alone lets a report fetched under the pre-sync state heal onto the freshly
+      // synced records — a stale write. The epoch is bumped by every server
+      // mutation for the source (sync-apply and the heal itself), so a change here
+      // means the report straddled a completed mutation and must be dropped.
+      const startEpoch = core.getSourceMutationEpoch(source.id);
+      attempted++;
+      try {
+        const secrets: InventorySourceSecrets = {};
+        for (const fieldId of source.secretFieldIds) {
+          const value = await vault.get(inventorySecretKey(source.id, fieldId));
+          if (value !== undefined) {
+            secrets[fieldId] = value;
+          }
+        }
+        // fetchProviderStatus clones source.config internally (so the stored
+        // record is never mutated) and degrades every provider failure to
+        // undefined; secrets is a fresh local object, safe to pass as-is.
+        const report = await fetchProviderStatus(provider, source.config, secrets);
+        if (report) {
+          // A report (even an empty one) means the source was reachable — count
+          // it as a success for the total-failure warning regardless of whether
+          // the guards below actually apply it.
+          succeeded++;
+          // Re-check AFTER the (awaited) fetch, three guards:
+          //  - the global generation: a NEWER sweep may have started and applied
+          //    while this fetch was in flight (applying now would clobber it);
+          //  - this source's revision: an Edit Source may have superseded the
+          //    config this report was fetched under (P2-1b);
+          //  - this source's MUTATION EPOCH: a syncNow that completed while this
+          //    fetch was outstanding applied its OWN status for the source, and
+          //    that picture is newer than this report. R4 (follow-up #43 review)
+          //    — the epoch was already re-checked before the heal below; the
+          //    apply needs it too now that a sync writes status at all, and it
+          //    is the only one of the three that catches a ROUTINE sync (which
+          //    changes neither the sweep generation nor `source.revision` — a
+          //    sync that RESTAMPS the provider fingerprint does mint a fresh
+          //    revision and is caught one check earlier). Dropping the
+          //    apply usually loses nothing: the sync that bumped the epoch
+          //    applied its own status, leaving the source's picture newer than
+          //    this one — EXCEPT where that sync's own report was ABSENT or
+          //    MALFORMED, since the plan apply bumps the epoch either way while
+          //    `applyFetchedStatus` writes nothing. There this report is dropped
+          //    for a newer picture that never landed and status stays stale for
+          //    one poll tick. Self-healing on the next refresh or sync, and
+          //    dropping is still the conservative direction, so the guard stays
+          //    as it is.
+          const currentSource = core.getInventorySource(source.id);
+          if (
+            myGeneration === statusRefreshGeneration &&
+            currentSource?.revision === startRevision &&
+            core.getSourceMutationEpoch(source.id) === startEpoch
+          ) {
+            core.applyInventoryStatus(source.id, report);
+            // R4 (review) — record WHOSE apply the tree is now showing for this
+            // source, for every report and not only truncated ones (see the map's
+            // note above). Set immediately after the apply, inside the same
+            // guard, so it can never claim an apply that was dropped.
+            statusAppliedGeneration.set(source.id, myGeneration);
+            // TRUNCATED STATUS (follow-up 2) — collected INSIDE the apply guard,
+            // not on receipt of the report. The warning explains the status the
+            // user is now LOOKING AT, so a report the guards dropped (a superseded
+            // sweep, or a config edit mid-fetch) must not produce one: nothing
+            // partial reached the tree. This also makes the single-source
+            // supersede case silent, which the loop-top generation check alone
+            // cannot do — it only catches a supersede before the NEXT source.
+            if (report.truncated === true) {
+              truncatedSources.push({ id: source.id, name: source.name, revision: startRevision });
+            }
+            // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
+            // console-port reassignment onto sync-owned nodes, so the next
+            // connect targets the live port. Separate from the pure status apply
+            // above and non-fatal per source: a rejecting write must not abort the
+            // sweep, and the heal only ever affects the NEXT connect.
+            //
+            // P3-4 (review) — RE-CHECK the busy latch immediately before the heal
+            // PERSISTS. The latch was checked before the awaited fetch, but a
+            // sync/edit/remove can claim the source during it; applyInventoryStatus
+            // above is a pure runtime-map update (safe to run alongside), but the
+            // heal WRITES servers and must not race a concurrent persisted write.
+            //
+            // #84 P1 (Codex) — and SERIALIZE the persist itself under
+            // `configMutationLock`, the SAME singleton every other server writer
+            // holds (server edit/remove, inventory sync, template/saved-filter ops,
+            // config import/reset). `healSyncedConsolePorts` persists via
+            // `addServersBatch`, which submits a FULL server snapshot to
+            // `saveServers`; without this lock a concurrent locked write could
+            // commit between the heal's snapshot and its awaited save, and the
+            // heal's stale full snapshot would then overwrite it on disk —
+            // reverting an UNRELATED server after reload. The heal re-reads the
+            // live server list INSIDE this lock (it takes no snapshot before an
+            // await), so it never persists stale state. Acquired at the command
+            // layer, not inside core, per the AsyncMutex non-reentrancy convention
+            // (see NexusCore's configMutationLock note); refreshStatus never itself
+            // holds the lock, so there is no deadlock.
+            if (inFlightSourceIds.get(source.id) === undefined) {
+              await configMutationLock.runExclusive(async () => {
+                // #84 P2-1 (Codex) — RE-VALIDATE inside the critical section. The
+                // generation / revision / busy-latch checks above ran BEFORE this
+                // callback waited in the mutex queue. A lock-holding writer — a
+                // replace-mode config import that swaps the source AND its servers
+                // (new records reusing the old deterministic ids) — can commit
+                // while the heal waits, after which applying a report fetched under
+                // the OLD source config onto the NEW records is a stale write.
+                // Bail if the generation, this source's revision, or the busy latch
+                // changed since the pre-lock checks.
+                //
+                // #84 P2 (Codex) — ALSO bail if the source's mutation epoch
+                // advanced since fetch start. A full syncNow that completed while
+                // this fetch was outstanding changes servers (e.g. a device port)
+                // and bumps the epoch WITHOUT bumping the revision, so only the
+                // epoch check catches a report that straddled a completed sync; the
+                // revision guard would let it heal stale over the synced records.
+                if (
+                  myGeneration !== statusRefreshGeneration ||
+                  core.getInventorySource(source.id)?.revision !== startRevision ||
+                  core.getSourceMutationEpoch(source.id) !== startEpoch ||
+                  inFlightSourceIds.get(source.id) !== undefined
+                ) {
+                  return;
+                }
+                await core.healSyncedConsolePorts(source.id, report);
+              });
+            }
+          }
+        }
+      } catch {
+        // Non-fatal per source (e.g. a rejecting vault read) — continue the sweep.
+        continue;
+      }
+    }
+    // P3-7 — every attempted source failed to report: surface it, manual only.
+    if (options?.manual && attempted > 0 && succeeded === 0) {
+      void vscode.window.showWarningMessage(
+        "Could not refresh lab status from any inventory source — check the source's credentials and connectivity."
+      );
+    }
+    // TRUNCATED STATUS (follow-up 2) — a partial refresh leaves some nodes' state
+    // stale or `unknown`, which is indistinguishable from a confirmed state in the
+    // tree, so say so. The wording, the manual-only gate and the one-message rule
+    // live in `warnIfTruncated` above, shared with the supersede bail.
+    //
+    // No guard is needed against this and the total-failure warning both firing:
+    // they are mutually exclusive by construction. A truncated report IS a report,
+    // so it increments `succeeded`, and the warning above requires
+    // `succeeded === 0`.
+    warnIfTruncated();
+  }
+
   function manageSources(): void {
     ManagementListPanel.open(core, inventorySourcesDescriptor());
   }
 
+  /**
+   * NODE CONTROL (Phase 4) — resolve the ServerConfig a Start/Stop command was
+   * invoked on. VS Code hands a `view/item/context` command its TREE ITEM (a
+   * `ServerTreeItem`, whose `.server` is the record); the palette hands nothing.
+   * Duck-typed on `.server`/string rather than importing `toServerFromArg` from
+   * serverCommands, which would drag `ServerTreeItem extends vscode.TreeItem`
+   * into this module's (VS-Code-mocked) unit tests.
+   */
+  function resolveServerArg(arg: unknown): ServerConfig | undefined {
+    if (typeof arg === "object" && arg !== null) {
+      const withServer = arg as { server?: { id?: unknown } };
+      if (withServer.server && typeof withServer.server === "object" && typeof withServer.server.id === "string") {
+        // Resolve strictly against the LIVE core — NO `?? withServer.server`
+        // fallback. A server removed between tree render and click carries a
+        // full, valid-looking (but stale) record on the item; trusting it would
+        // dispatch a control at a just-deleted node's old origin. A missing id
+        // falls through to the "Select a synced EVE-NG node" refusal instead.
+        return core.getServer(withServer.server.id);
+      }
+    }
+    if (typeof arg === "string") {
+      return core.getServer(arg);
+    }
+    return undefined;
+  }
+
+  /**
+   * NODE CONTROL (Phase 4) — Start/Stop one EVE-NG lab node from its tree item.
+   * Resolves the server → its inventory source → the source's provider, and only
+   * dispatches when that provider exposes `controlNode` (so a manual server or a
+   * NetBox-origin one is refused rather than offered an action that can only
+   * fail). Dispatch goes through `controlProviderNode`, which PROPAGATES a
+   * failure — surfaced here as an error naming the node — unlike the swallowing
+   * status refresh. On success it fires a best-effort `refreshStatus` for the
+   * source WITHOUT awaiting: the node boots over seconds, so the status will lag
+   * a beat, which is expected and fine.
+   */
+  async function controlNode(arg: unknown, action: "start" | "stop"): Promise<void> {
+    const server = resolveServerArg(arg);
+    if (!server) {
+      void vscode.window.showErrorMessage(`Select a synced EVE-NG node to ${action} it.`);
+      return;
+    }
+    const origin = server.origin;
+    const source = origin ? core.getInventorySource(origin.sourceId) : undefined;
+    const provider = source ? registry.get(source.providerId) : undefined;
+    if (!origin || !source || !provider || typeof provider.controlNode !== "function") {
+      void vscode.window.showErrorMessage(
+        `"${server.name}" is not synced from an inventory source that supports node control.`
+      );
+      return;
+    }
+    // BUSY-GUARD (P3-2) — refuse BEFORE loading secrets when the source is
+    // mid-sync/edit/remove, mirroring refreshStatus's `inFlightSourceIds` check
+    // (~:4413). Without it a Start fired while the same source is being removed
+    // races the vault purge and dispatches with partial secrets naming a node
+    // whose source was just deleted; mid-edit it dispatches a stale
+    // `source.config` (old baseUrl). This guards the SOURCE-SCOPED siblings; the
+    // GLOBAL config mutations that bypass inFlightSourceIds are handled by the
+    // under-lock capture below (see the #85 P2 note before the claim).
+    if (inFlightSourceIds.get(source.id) !== undefined) {
+      void vscode.window.showInformationMessage(`"${source.name}" is busy — try again in a moment.`);
+      return;
+    }
+    // CLAIM the source atomically right after the check passes (no await in
+    // between, so a second control arriving on the next microtask sees it). The
+    // bare read above was a TOCTOU: after it passed, this handler still awaits
+    // `vault.get` + the network control request, during which Edit Source /
+    // Remove Source / Sync Now each pass THEIR own busy check and mutate or
+    // purge the source — so a control that only READ the marker could dispatch
+    // with a stale baseUrl, read credentials mid-replacement/purge, or act on a
+    // node whose source was just removed. Claiming closes that window; the
+    // siblings now find it held (they show the "control" wording).
+    //
+    // The claim is released in the `finally` below — deliberately BEFORE the
+    // post-action `refreshStatus` fires, because refreshStatus SKIPS a source
+    // that is inFlightSourceIds-held (~:4413 `continue`); firing it while still
+    // holding "control" would self-skip the very status refresh we want. So:
+    // claim → try{ capture; dispatch } finally{ release } → toast → refresh.
+    //
+    // #85 P2 (Codex) — the "control" claim above guards only the SOURCE-SCOPED
+    // siblings (Edit/Remove/Sync all honour inFlightSourceIds). But the two GLOBAL
+    // config mutations — an id-preserving replace-import (`importMergeReplace`) and
+    // Delete All Data (`completeReset`) — DELIBERATELY bypass inFlightSourceIds and
+    // serialize ONLY through `configMutationLock`. So the config mutation lock IS
+    // taken here — for the CAPTURE only: re-read the live source + read its vault
+    // secrets under the lock, serialized against a replace-import swapping the
+    // source and against completeReset purging its credentials. The ~60s provider
+    // DISPATCH stays OUTSIDE the lock, mirroring refreshStatus/sync (~:4470-4515):
+    // holding `configMutationLock` across long provider I/O would freeze every
+    // config mutation app-wide (including the Delete All Data a user needs to
+    // recover a hung source). The sole residual is a benign stale dispatch against
+    // a source removed DURING the network call — it persists nothing and sends the
+    // captured credentials only to the box they were captured for.
+    //
+    // `source` was resolved synchronously at handler entry, so this revision is
+    // fresh; the capture bails if a locked writer moved it before we re-read (an
+    // id-preserving import bumps `revision` via randomUUID(); a reset removes the
+    // record). `controlProviderNode` and the EVE provider are pure network — they
+    // never take `configMutationLock` — so the dispatch-outside-lock split has no
+    // reentrancy or deadlock.
+    const startRevision = source.revision;
+    inFlightSourceIds.set(source.id, "control");
+    let dispatched = false;
+    try {
+      const captured = await configMutationLock.runExclusive(async () => {
+        // Re-read the LIVE source inside the lock. A replace-import that swapped it
+        // (or a reset that removed it) commits under this same lock, so either it
+        // ran before us — caught here — or it queues behind us, and we captured a
+        // coherent snapshot first. Keep this callback SHORT: only the re-read and
+        // the vault reads, no network, no dispatch (that stays outside the lock).
+        const live = core.getInventorySource(source.id);
+        if (!live || live.revision !== startRevision) {
+          return undefined;
+        }
+        const secrets: InventorySourceSecrets = {};
+        for (const fieldId of live.secretFieldIds) {
+          const value = await vault.get(inventorySecretKey(source.id, fieldId));
+          if (value !== undefined) {
+            secrets[fieldId] = value;
+          }
+        }
+        return { config: structuredClone(live.config), secrets };
+      });
+      if (!captured) {
+        void vscode.window.showInformationMessage(`"${source.name}" changed — try again in a moment.`);
+        return;
+      }
+      // P3-4 — controlNode runs login → detectEdition → action sequentially (up to
+      // ~60s with a re-login), so without a progress UI the user sees nothing until
+      // it all resolves. Wrap the dispatch so the title shows DURING the call
+      // (mirrors serverCommands' "Connecting to …" and the "Testing connection to
+      // …" above). M2 — a FAILURE surfaces through describeInventoryError (the
+      // provider throws classified InventoryProviderErrors), matching every other
+      // inventory failure toast, rather than a bare err.message.
+      const verb = action === "start" ? "Starting" : "Stopping";
+      dispatched = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
+        async () => {
+          try {
+            await controlProviderNode(provider, captured.config, captured.secrets, origin.externalId, action);
+            return true;
+          } catch (err) {
+            void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);
+            return false;
+          }
+        }
+      );
+    } finally {
+      inFlightSourceIds.delete(source.id);
+    }
+    if (!dispatched) {
+      return;
+    }
+    // HONEST completion toast — the API has already returned by now, but the node
+    // boots over seconds so the lab status lags. Say that, rather than phrasing it
+    // as if the request were about to be sent.
+    const sent = action === "start" ? "Start" : "Stop";
+    void vscode.window.showInformationMessage(
+      `${sent} sent to "${server.name}" — lab status will catch up on the next Refresh Lab Status.`
+    );
+    // Best-effort, NOT awaited — the node takes seconds to boot, so the status
+    // will lag this refresh by a poll or two, which is expected.
+    void vscode.commands.executeCommand("nexus.inventory.refreshStatus", source.id);
+  }
+
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
-    // Same arg widening as syncNow's below: a menu/tree invocation hands the
-    // handler its context object, which must fall through to the picker
-    // rather than being read as a source id.
-    vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(typeof arg === "string" ? arg : undefined)),
-    vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(typeof arg === "string" ? arg : undefined)),
-    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(typeof arg === "string" ? arg : undefined)),
-    vscode.commands.registerCommand("nexus.inventory.manage", manageSources)
+    // Arg widening: these four run from the palette (no argument at all), from
+    // the manage hub (a source id string), and from the Settings tree's
+    // per-source rows — where VS Code hands a `view/item/context` command the
+    // TREE ITEM. Reading `sourceId` off it is what makes the inline buttons act
+    // on the row they are attached to; anything else still falls through to the
+    // picker, which is the correct behaviour for a palette invocation and for a
+    // menu object that names no source.
+    vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(resolveSourceIdArg(arg))),
+    vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(resolveSourceIdArg(arg))),
+    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(resolveSourceIdArg(arg))),
+    // The poll fires with a `{ __poll: true }` marker so it stays silent on
+    // total failure; every other invocation (palette, title action, a tree row)
+    // is the MANUAL path and warns if every source failed.
+    vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => {
+      const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
+      return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
+    }),
+    vscode.commands.registerCommand("nexus.inventory.manage", manageSources),
+    // NODE CONTROL (Phase 4) — gated in package.json to EVE-origin servers by
+    // running/stopped state; the handler re-guards on the provider capability.
+    vscode.commands.registerCommand("nexus.inventory.startNode", (arg?: unknown) => controlNode(arg, "start")),
+    vscode.commands.registerCommand("nexus.inventory.stopNode", (arg?: unknown) => controlNode(arg, "stop"))
   ];
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderFormHtml, sortFilterableOptions } from "../../src/ui/formHtml";
+import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 import type { FormDefinition } from "../../src/ui/formTypes";
 import { inventorySourceFormDefinition, serverFormDefinition, tunnelFormDefinition } from "../../src/ui/formDefinitions";
 import type { AuthProfile } from "../../src/models/config";
@@ -215,7 +216,11 @@ describe("renderFormHtml", () => {
     const html = renderFormHtml(definition);
     const hostIndex = html.indexOf('id="field-host"');
     const detailsIndex = html.indexOf('<details class="advanced-fields">');
-    const summaryIndex = html.indexOf("<summary>Advanced options</summary>");
+    // Built from the SAME constant the messages that point at this disclosure
+    // use (`ADVANCED_SECTION_LABEL`), so a rename cannot leave them naming a
+    // section the form no longer draws.
+    const summaryIndex = html.indexOf(`<summary>${ADVANCED_SECTION_LABEL}</summary>`);
+    expect(ADVANCED_SECTION_LABEL).toBe("Advanced options");
     const multiplexingIndex = html.indexOf('id="field-multiplexing"');
     const groupIndex = html.indexOf('id="field-group"');
 

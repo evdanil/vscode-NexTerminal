@@ -13,13 +13,17 @@ import { registerServerCommands, teardownServerRuntime } from "./commands/server
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
+import { configMutationLock } from "./services/configMutationLock";
 import { ScriptRuntimeManager } from "./services/scripts/scriptRuntimeManager";
 import { TerminalRegistry } from "./services/terminal/terminalRegistry";
 import { CwdTracker } from "./services/terminal/cwdTracker";
 import { CwdSyncCoordinator } from "./services/sftp/cwdSyncCoordinator";
 import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
+import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
+import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
+import { InventoryStatusDecorationProvider } from "./ui/inventoryStatusDecorationProvider";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, LocalServerTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
 import { LocalServerManager, wireLocalServerTerminalCloseListener } from "./services/local/localServerManager";
@@ -78,6 +82,7 @@ import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
 import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
+import { createEveNgProvider } from "./services/inventory/providers/eveNgProvider";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
@@ -326,6 +331,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     void vscode.window.showInformationMessage(message);
   }
 
+  // Heal a stale user snapshot of nexus.terminal.highlighting.rules in global
+  // settings (label-less rules from before v2.8.182, the truncating IPv6
+  // pattern from before v2.8.187). Fire-and-forget and non-fatal: the read-time
+  // upgrade in TerminalHighlighter/HighlightRuleEditorPanel already makes
+  // behaviour correct, so this only tidies settings.json and future exports and
+  // must never delay or break activation.
+  void migrateHighlightRulesGlobalSetting();
+
   const repository = new VscodeConfigRepository(context);
   const core = new NexusCore(repository);
   await core.initialize();
@@ -338,11 +351,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   );
   const secretVault = new VscodeSecretVault(context);
 
-  // B4 — built-in NetBox provider registered up front so it's available to
-  // registerInventoryCommands (below) and to any third party registering
-  // through the public API returned from this function.
+  // B4 — the built-in providers are registered up front so they're available
+  // to registerInventoryCommands (below) and to any third party registering
+  // through the public API returned from this function. Registration ORDER is
+  // the order the add-source provider picker lists them in.
   const inventoryProviderRegistry = new InventoryProviderRegistry();
   inventoryProviderRegistry.register(createNetboxProvider());
+  inventoryProviderRegistry.register(createEveNgProvider());
 
   const macroStore = new VscodeMacroStore(context);
   await macroStore.initialize();
@@ -801,10 +816,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     async onItemGroupChanged(itemType, itemId, newGroup) {
       if (itemType === "server") {
-        const server = core.getServer(itemId);
-        if (server) {
-          await core.addOrUpdateServer({ ...server, group: newGroup });
-        }
+        // #84 P1 (Codex, serialization audit) — a drag-drop group change persists
+        // a FULL server snapshot; serialize it under configMutationLock and
+        // RE-READ the live record inside the lock, applying ONLY the group so a
+        // concurrent background port-heal is never reverted (the same discipline
+        // as the rename fix).
+        await configMutationLock.runExclusive(async () => {
+          const live = core.getServer(itemId);
+          if (live) {
+            await core.addOrUpdateServer({ ...live, group: newGroup });
+          }
+        });
       } else if (itemType === "serial") {
         const profile = core.getSerialProfile(itemId);
         if (profile) {
@@ -823,12 +845,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       }
     },
     async onFolderMoved(oldPath, newParentPath) {
-      await core.moveFolder(oldPath, newParentPath);
+      // #84 P1 (serialization audit) — moveFolder rewrites `group` on every server
+      // in the subtree and persists a FULL server snapshot; serialize it under
+      // configMutationLock (it reads/mutates the live map inside the lock).
+      await configMutationLock.runExclusive(() => core.moveFolder(oldPath, newParentPath));
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
   const networkServerTreeProvider = new NetworkServerTreeProvider();
-  const settingsTreeProvider = new SettingsTreeProvider();
+  // Core + registry so the Settings tree can render one row per inventory
+  // source (name, provider label, last sync) with inline actions, and refresh
+  // them on any core change.
+  const settingsTreeProvider = new SettingsTreeProvider(core, inventoryProviderRegistry);
   const savedCollapsed = context.globalState.get<string[]>(COLLAPSED_FOLDERS_KEY, []);
   nexusTreeProvider.loadCollapsedFolders(savedCollapsed);
   const collapsedFolderStatePersistence = createCollapsedFolderStatePersistence(
@@ -860,6 +888,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     dragAndDropController: nexusTreeProvider,
     showCollapseAll: true
   });
+  // LIVE STATUS (Phase 2) — the running-lab highlight. Registered globally; it
+  // decorates only the nexus-status: resourceUris the Command Center tree stamps
+  // on running servers and their lab folders. Fed the latest snapshot in
+  // syncViewsImmediate below.
+  const inventoryStatusDecoration = new InventoryStatusDecorationProvider();
+  context.subscriptions.push(vscode.window.registerFileDecorationProvider(inventoryStatusDecoration), inventoryStatusDecoration);
   void vscode.commands.executeCommand("setContext", "nexus.filterActive", false);
 
   const filterCommand = vscode.commands.registerCommand("nexus.filter", async () => {
@@ -1076,6 +1110,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
     networkServerTreeProvider.setSnapshot(snapshot);
+    inventoryStatusDecoration.update(snapshot);
     const totalTunnels = snapshot.activeTunnels.length + snapshot.remoteTunnels.length;
     statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length + snapshot.activeLocalShellSessions.length} sessions, ${totalTunnels} tunnels`;
     if (snapshot.remoteTunnels.length > 0) {
@@ -1357,6 +1392,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
   const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
+  // LIVE STATUS (Phase 2) — opt-in poll of EVE-NG lab running status, gated on
+  // the Command Center being visible and nexus.inventory.statusPollSeconds > 0.
+  // Seeds from commandCenterView.visible up front (createTreeView never fires the
+  // visibility event at registration), re-arms/stops on the config change, and
+  // is disposed with the extension.
+  const inventoryStatusPoll = startInventoryStatusPoll({
+    view: commandCenterView,
+    getIntervalSeconds: () => Math.floor(readBoundedNumber("nexus.inventory", "statusPollSeconds", 0, 0, 3600)),
+    onDidChangeInterval: (listener) =>
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration("nexus.inventory.statusPollSeconds")) {
+          listener();
+        }
+      }),
+    // Return the thenable so the poll's in-flight latch can await the sweep.
+    // The `__poll` marker tells refreshStatus this is the background path, so it
+    // stays silent on total failure (the manual command warns instead).
+    fire: () => Promise.resolve(vscode.commands.executeCommand("nexus.inventory.refreshStatus", { __poll: true })).then(() => undefined)
+  });
+  context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());

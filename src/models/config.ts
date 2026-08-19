@@ -2,6 +2,8 @@ import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import type * as vscode from "vscode";
 
 export type AuthType = "password" | "key" | "agent";
+/** How a `ServerConfig` opens its terminal. See `ServerConfig.protocol`. */
+export type ServerProtocol = "ssh" | "telnet";
 export type TunnelConnectionMode = "isolated" | "shared" | "ask";
 export type ResolvedTunnelConnectionMode = Exclude<TunnelConnectionMode, "ask">;
 export type TunnelType = "local" | "reverse" | "dynamic";
@@ -220,6 +222,71 @@ export interface ServerOrigin {
    */
   syncedAltHost?: string;
   /**
+   * TELNET (Phase 0) — the transport the sync itself last WROTE into
+   * `ServerConfig.protocol`: `"telnet"` when this device's primary endpoint was
+   * a telnet one as of that write, and `undefined` when it was SSH (which is
+   * also what `protocol` itself stores for SSH — the stamp mirrors the value,
+   * exactly as `syncedAltHost` mirrors `altHost`).
+   *
+   * A FAITHFUL TWIN of `syncedAltHost` above, with ONE difference that follows
+   * from the field being a two-valued enum rather than a free address: absent
+   * here is NOT "hands off". Both the stamp and the field are compared through
+   * their RESOLVED value (absent ≡ `"ssh"`), so a record synced by a build from
+   * before this stamp existed reads as "the sync wrote ssh" — which is exactly
+   * what happened, since no earlier build could map anything but an ssh
+   * endpoint. That is the one asymmetry against `syncedIpmiHost`, and it exists
+   * because there IS a meaningful default to fall back to here and there is no
+   * such thing as a legacy hand-typed protocol.
+   *
+   * The write rule and its matrix are `syncOwnsProtocol` in the sync engine.
+   * What it buys: a user who switches a synced dual-stack device to telnet by
+   * hand keeps that choice forever, and a device that genuinely loses its SSH
+   * endpoint still follows.
+   *
+   * Written ONLY where the sync writes `protocol` — the add path always
+   * (`undefined` included), the update path only when the write rule fires —
+   * and never inferred from the record's current value, which would launder a
+   * hand-flip into "as stamped" one sync later.
+   */
+  syncedProtocol?: ServerProtocol;
+  /**
+   * PRIMARY HOST (task #29, the deferred #82 P2-3) — the primary console address
+   * the sync itself last WROTE into `ServerConfig.host`, and `undefined` when the
+   * sync wrote none (an addressless placeholder, or a server synced before this
+   * stamp existed).
+   *
+   * A FAITHFUL TWIN of `syncedAltHost`/`syncedIpmiHost`, and it exists to make
+   * `host` SYNC-OWNED WITH HAND-OFF rather than "device always wins". Before this
+   * stamp the sync wrote the device's `host`/`port` UNCONDITIONALLY, so a
+   * hand-edited console address on a synced server was stomped on the next sync.
+   * The stamp records what the SYNC put there, so the sync only ever overwrites a
+   * `host` still carrying exactly its own last value (or the device's current
+   * address — matrix row 5a); a hand-typed value (a stamp the value no longer
+   * equals) is left alone. This is what makes both the addressless-downgrade
+   * preserve (D3) and the telnet port-heal (D5) safe.
+   *
+   * Written ONLY where the sync writes `host` — the addressed add always, the
+   * update path only when the write rule (`syncOwnsHost`) fires, and the
+   * addressless downgrade only when it OWNS the value it is about to blank. Never
+   * inferred from the record's current value, which would launder a hand edit
+   * into "as stamped" one sync later.
+   */
+  syncedHost?: string;
+  /**
+   * PRIMARY PORT (task #29) — the numeric twin of `syncedHost` above: the console
+   * port the sync itself last WROTE into `ServerConfig.port`, and `undefined`
+   * when the sync wrote none. The SAME ownership discipline, governed by
+   * `syncOwnsPort` in the sync engine (`current === stamp || current === dev`,
+   * with the `ADDRESSLESS_PORT` sentinel normalized to absent).
+   *
+   * THE FIRST NUMERIC STAMP on this record — every other stamp is a string or an
+   * enum. Validated as an integer `>= 0` (not the non-empty-string check its
+   * siblings get) at `isValidServerOrigin`; the sync only ever writes it in the
+   * same breath as a real endpoint port, so the sentinel/undefined split carries
+   * the "no address" state exactly as an absent `syncedHost` does.
+   */
+  syncedPort?: number;
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — per-field record of what the sync's
    * TEMPLATE APPLICATION last wrote onto this server, one member per
    * non-auth templatable field. Same `syncedUsername`/`syncedAuthProfileId`
@@ -437,6 +504,30 @@ export interface DetachedServerOrigin {
    */
   syncedAltHost?: string;
   /**
+   * TELNET (Phase 0) — the transport the REMOVED SOURCE'S SYNC had last written
+   * into `protocol` on this server, copied verbatim from the server's own
+   * `ServerOrigin.syncedProtocol` at detach time, and `undefined` when that sync
+   * had written SSH (which is what the field stores for SSH).
+   *
+   * NOT a matching input, exactly like the two receipts above it: it decides
+   * nothing about adoption. It is preserved so an adopted server's protocol
+   * arrives with its provenance intact — dropped, a sync-written `"telnet"`
+   * would look hand-flipped after a Remove Source → Keep Servers → re-add →
+   * Adopt round trip, and no later sync could move it again.
+   */
+  syncedProtocol?: ServerProtocol;
+  // PRIMARY HOST/PORT (task #29) — DELIBERATELY ABSENT. Unlike the receipts
+  // above, `syncedHost`/`syncedPort` (see ServerOrigin) are NOT mirrored onto the
+  // adoption marker, and the omission is correct rather than a forgotten mirror.
+  // Adoption corroborates by ADDRESS — a kept server is only adoptable when its
+  // `host` still equals the device's — so a freshly-adopted origin with
+  // `syncedHost === undefined` reads exactly right under the next update's
+  // `syncOwnsHost(current, undefined, dev)`: it returns false for a hand-typed
+  // value (current !== dev, so preserve) and true only when `current === dev`
+  // (the sync then owns and re-stamps it, matrix row 5a). A receipt here would
+  // buy nothing the address corroboration does not already guarantee. Documented
+  // so a future reader does not "complete" the mirror unnecessarily.
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T1) — the per-field record of what the
    * REMOVED SOURCE'S TEMPLATE APPLICATION last wrote onto this server's
    * template-managed fields (proxy / booleans / the two IPMI id references,
@@ -491,12 +582,100 @@ export function resolveBmcWebProtocol(server: Pick<ServerConfig, "bmcWebProtocol
   return (server.bmcWebProtocol as unknown) === "http" ? "http" : "https";
 }
 
+/**
+ * The protocol a server's terminal ACTUALLY opens with, applied at every read
+ * site (the untrusted-field discipline `resolveBmcWebProtocol` sets): absent, a
+ * non-string, or anything outside the two literals resolves to `"ssh"` — the
+ * compatibility default, and the one every record written before the field
+ * existed implies. `"telnet"` is the only value that changes the transport, and
+ * only when it is spelled exactly.
+ *
+ * `validateServerConfig` is STRICTER than this (it rejects a record carrying a
+ * third value outright, the closed-enum disposition `SerialProfile.mode` gets),
+ * and the two are not in tension: the guard is what should stop such a value
+ * existing, this is what stops one that slipped past it from choosing a
+ * transport.
+ */
+export function resolveServerProtocol(server: Pick<ServerConfig, "protocol">): ServerProtocol {
+  return (server.protocol as unknown) === "telnet" ? "telnet" : "ssh";
+}
+
+/**
+ * TELNET (P1-B) — the transport a LIVE SESSION is speaking.
+ *
+ * The session's own stamp wins (see `ActiveSession.protocol`): it records what
+ * the connection actually opened with, and a profile edited while the terminal
+ * is open must not reclassify it. Falls back to the server's configured protocol
+ * only when the session carries no stamp — a session described by something that
+ * did not go through a connect path — which is the behaviour every reader had
+ * before the stamp existed.
+ *
+ * THE ONE RESOLVER both the script target picker and the script runtime call, so
+ * "which transport is this session?" cannot be answered two different ways.
+ */
+export function resolveSessionProtocol(
+  session: Pick<ActiveSession, "protocol">,
+  server: Pick<ServerConfig, "protocol"> | undefined
+): ServerProtocol {
+  if (session.protocol !== undefined) {
+    return resolveServerProtocol(session);
+  }
+  return resolveServerProtocol(server ?? {});
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
   group?: string;
   host: string;
   port: number;
+  /**
+   * ADDRESSLESS (Codex P1 on #82) — a SYNCED PLACEHOLDER with no usable primary
+   * endpoint yet: a stopped EVE-NG node, a VNC/HTML5-console node, or a NetBox
+   * row with no IP. `true` here means `host` is `""` and there is nothing to
+   * connect to; the connect path refuses it with a friendly, provider-neutral
+   * "no console address yet — re-sync the source once it has an address" message
+   * instead of a raw handshake failure, and the tree renders a `" (no address)"`
+   * suffix.
+   *
+   * Written ONLY by inventory sync — a hand-created server is never addressless,
+   * and `validateServerConfig` only relaxes the empty-host requirement when this
+   * is exactly `true` (any other value, including a non-boolean, is treated as
+   * false and the host stays required). A later sync where the device gains a
+   * console UPGRADES the same record in place (fills `host`/`port`/`protocol`,
+   * clears this flag); losing the console again DOWNGRADES it back (no
+   * create/prune churn), under the same host/protocol ownership discipline the
+   * addressed update uses.
+   *
+   * Optional and additive, like every field added after 1.0 — absent ≡ false, so
+   * every record written before this existed round-trips untouched with no
+   * migration.
+   */
+  addressless?: boolean;
+  /**
+   * TELNET (Phase 0) — which transport this server's terminal opens. ABSENT
+   * MEANS `"ssh"`, so every record written before this field existed keeps
+   * working untouched and there is no migration.
+   *
+   * A `"telnet"` server takes an ENTIRELY different connect path
+   * (`TelnetPty`, services/telnet/telnetPty.ts): no `SilentAuthSshFactory`, no
+   * password prompt, no vault read, and none of the SSH-only machinery —
+   * tunnels, SFTP, jump hosts, cwd sync, multiplexing — applies to it. Telnet
+   * has no protocol-level login at all, so `username`/`authType`/`keyPath`/
+   * `authProfileId` are inapplicable rather than optional: the server form hides
+   * them, and a telnet record's `username` is legitimately blank (the one place
+   * `validateServerConfig` relaxes for this field).
+   *
+   * UNTRUSTED at every read site, like `bmcWebProtocol`: go through
+   * `resolveServerProtocol()`, never a direct read, so a hand-edited backup
+   * cannot name a third transport.
+   *
+   * Written by inventory sync, unlike `bmcWebProtocol` — a device that reports
+   * only a telnet endpoint maps to a telnet server. That write carries the
+   * `ServerOrigin.syncedProtocol` stamp and the ownership matrix that goes with
+   * it, so a user who switches a synced server's protocol by hand keeps it.
+   */
+  protocol?: ServerProtocol;
   /**
    * ALTERNATE HOST (issue #48) — an OPTIONAL, ADDITIVE second SSH address tried
    * as a fallback when the primary `host` is unreachable at the TCP/DNS level
@@ -782,6 +961,21 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // permanently stampless, read as a hand entry by every later sync and never
     // updated when the second address changes.
     a.syncedAltHost === b.syncedAltHost &&
+    // TELNET (Phase 0) — the protocol stamp joins for the same reason the two
+    // above it do, and AUTH 3a's shape reaches it identically: a legacy owned
+    // server whose protocol already equals the device's computes this stamp for
+    // the first time and changes nothing else, and an `after` discarded as
+    // "unchanged" there would throw the new stamp away.
+    a.syncedProtocol === b.syncedProtocol &&
+    // PRIMARY HOST/PORT (task #29) — the `host` and `port` stamps join for the
+    // same reason every stamp above them does, and this term is LOAD-BEARING:
+    // a legacy owned server whose `host` already equals the device's computes
+    // this stamp for the FIRST time (matrix row 5a) and changes nothing else,
+    // and an `after` discarded as "unchanged" here would throw the new stamp
+    // away — leaving that server permanently stampless, read as a hand entry by
+    // every later sync (its address then never followed and never healed).
+    a.syncedHost === b.syncedHost &&
+    a.syncedPort === b.syncedPort &&
     // DEVICE TEMPLATES (PR-T1) — the per-field template stamps join for the
     // same reason: a template application whose value already equals the
     // record must still land in `updates` to persist the stamp (AUTH 3a's
@@ -861,6 +1055,12 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // adopted server's second address would be back to looking hand-typed, which
     // no later sync can repair.
     a.syncedAltHost === b.syncedAltHost &&
+    // TELNET (Phase 0) — compared one field down for the identical reason: a
+    // rollback that called two markers equal while one remembers the transport
+    // the removed source wrote and the other does not would restore the
+    // forgetful one, and the adopted server's protocol would be back to looking
+    // hand-flipped, which no later sync can repair.
+    a.syncedProtocol === b.syncedProtocol &&
     // DEVICE TEMPLATES (issue #48 PR-T1) — the template receipt joins for the
     // identical reason `syncedAuthProfileId` and `syncedIpmiHost` above it did:
     // a rollback that called two markers equal while one remembers the non-auth
@@ -892,6 +1092,14 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.group === b.group &&
     a.host === b.host &&
     a.port === b.port &&
+    // ADDRESSLESS (Codex P1) — absent ≡ false, so a legacy record and an
+    // explicit `false` compare equal; but a flip between addressless and
+    // addressed IS a difference the sync must apply (never dropped as a no-op).
+    (a.addressless ?? false) === (b.addressless ?? false) &&
+    // TELNET (Phase 0) — present-vs-absent is a DIFFERENCE: absent means ssh, so
+    // a comparator that skipped this field would call a server the user just
+    // switched to telnet "unchanged" and a rollback would put it back on SSH.
+    a.protocol === b.protocol &&
     a.altHost === b.altHost &&
     a.username === b.username &&
     a.authType === b.authType &&
@@ -941,6 +1149,10 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   if (current.group !== batchSnapshot.group) merged.group = current.group;
   if (current.host !== batchSnapshot.host) merged.host = current.host;
   if (current.port !== batchSnapshot.port) merged.port = current.port;
+  // ADDRESSLESS (Codex P1) — a concurrent upgrade/downgrade the batch wrote is
+  // kept, not reverted to `prior`.
+  if (current.addressless !== batchSnapshot.addressless) merged.addressless = current.addressless;
+  if (current.protocol !== batchSnapshot.protocol) merged.protocol = current.protocol;
   if (current.altHost !== batchSnapshot.altHost) merged.altHost = current.altHost;
   if (current.username !== batchSnapshot.username) merged.username = current.username;
   if (current.authType !== batchSnapshot.authType) merged.authType = current.authType;
@@ -1073,6 +1285,24 @@ export interface ActiveSession {
   serverId: string;
   terminalName: string;
   startedAt: number;
+  /**
+   * TELNET (P1-B) — the transport this session ACTUALLY OPENED WITH, stamped by
+   * the connect path and never changed afterwards.
+   *
+   * WHY IT IS ON THE SESSION AND NOT READ FROM THE SERVER. `ServerConfig.protocol`
+   * is mutable: the user can edit a profile while its terminal is still open, and
+   * the open terminal keeps speaking whatever it connected with. Classifying a
+   * live session from the CURRENT config therefore offered an SSH terminal to a
+   * `@target-type telnet` script (and the reverse), which sends automation —
+   * `sendLine`, `expect` — down the wrong transport. A session's transport is a
+   * fact about the connection, so it is recorded on the connection.
+   *
+   * RUNTIME-ONLY, exactly like `pty`: never persisted, absent on anything that
+   * did not go through a connect path. Readers fall back to the server's
+   * configured protocol when it is absent, which is the pre-existing behaviour
+   * and correct for a session that has only just been described to us.
+   */
+  protocol?: ServerProtocol;
   pty?: SessionPtyHandle;
 }
 
@@ -1348,7 +1578,18 @@ export function formOfferedServerCredentials(
 ): FormOfferedServerCredentials {
   const owned = authProfileOwnedCredentials(profile);
   return {
-    // Always rendered; only ownership can take it away.
+    // Rendered whenever the form is showing SSH controls at all; from there,
+    // only profile ownership can take it away.
+    //
+    // TELNET (Phase 0, MAJOR-4) — the "always" that used to head this line is no
+    // longer true: `protocol: "telnet"` hides every SSH credential control, so
+    // the form offers none of them. That case is NOT expressed here, and
+    // deliberately — this function answers "which credentials did the SSH form
+    // offer?", and on a telnet save there is no SSH form to answer for. The
+    // whole submission is handled one layer up instead, by
+    // `preserveDormantSshConfig` (commands/serverCommands.ts), which restores
+    // the stored SSH config wholesale rather than field by field. Teaching this
+    // function about the protocol would split one decision across two places.
     username: owned.username === undefined,
     // A closed enum is always owned, so this is `true` only where nothing
     // resolved — no link, or an id that names no profile, which is the same

@@ -7,8 +7,22 @@ import { templateAppliedFields, TEMPLATE_FIELD_SHORT_LABELS } from "../services/
 import { toParityCode } from "../utils/helpers";
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { TUNNEL_DRAG_MIME, ITEM_DRAG_MIME } from "./dndMimeTypes";
+import { serverStatusUri, folderStatusUri } from "./inventoryStatusDecorationProvider";
 
 export class FolderTreeItem extends vscode.TreeItem {
+  /**
+   * PER-SOURCE SYNC (follow-up #43) — the inventory source this folder is the
+   * `targetFolder` of, set by `NexusTreeProvider.makeFolderItem` only when
+   * EXACTLY ONE source targets it. It is what makes the row's inline sync icon
+   * act on that source: `resolveSourceIdArg` (commands/inventoryCommands.ts)
+   * already reads `arg.sourceId` off the tree item VS Code hands a
+   * `view/item/context` command, so this needs no command-layer change at all.
+   *
+   * Left `undefined` everywhere else — a folder no source targets, a folder two
+   * sources share (ambiguous, so no icon), and every Macros-view folder.
+   */
+  public sourceId?: string;
+
   public constructor(
     public readonly folderPath: string,
     displayName: string,
@@ -57,7 +71,20 @@ export class ServerTreeItem extends vscode.TreeItem {
     // D3 — the linked IPMI Auth Profile's name, so the tooltip's IPMI line
     // predicts whether Connect BMC Serial Console will find a username/password
     // or prompt. Resolved by the caller against `server.ipmiAuthProfileId`.
-    ipmiAuthProfileName?: string
+    ipmiAuthProfileName?: string,
+    // LIVE STATUS (Phase 2) — the server's inventory running/stopped state,
+    // resolved by the caller from snapshot.serverStatus. Only EVE-origin servers
+    // ever carry one (only EVE reports status), so `undefined` means "not a
+    // status-bearing server" and the row renders exactly as before.
+    status?: "running" | "stopped",
+    // NODE CONTROL (Phase 4, task #28) — whether this server's origin resolves to
+    // an `eve-ng` inventory source, decided by the caller (a live ServerOrigin
+    // carries no providerId — see toServerItem). Gates the `.eveRunning` /
+    // `.eveStopped` contextValue marker below: emitted ONLY for an EVE-origin
+    // server with a KNOWN status, so a non-EVE server that somehow carries a
+    // status, and a freshly-synced EVE server with none yet, get no node-control
+    // menu (the user runs Refresh Lab Status first — we never act blind).
+    isEveOrigin = false
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -82,16 +109,60 @@ export class ServerTreeItem extends vscode.TreeItem {
     const templateSuffix = applied.length > 0
       ? `\nTemplate-applied: ${applied.map((f) => TEMPLATE_FIELD_SHORT_LABELS[f]).join(", ")} (your edits override)`
       : "";
-    this.tooltip = `${displayUsername}@${server.host}:${server.port}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}`;
+    // ADDRESSLESS (Codex P1) — a synced placeholder with no console address yet.
+    // Its empty host must not be dangled after an "@" as though it were a real
+    // host, in the tooltip or the description.
+    const addressless = server.addressless === true;
+    const hostSummary = addressless ? "no console address yet" : `${displayUsername}@${server.host}:${server.port}`;
+    // NODE CONTROL (Phase 4, task #28) — a lab-status line for EVE-origin nodes
+    // only, so a freshly-synced node (no status yet) hints that Refresh Lab
+    // Status is what unlocks Start/Stop. Matches the labeled-line tooltip idiom.
+    const labStatusSuffix = isEveOrigin
+      ? `\nLab status: ${status === "running" ? "running" : status === "stopped" ? "stopped" : "unknown — run Refresh Lab Status"}`
+      : "";
+    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}${labStatusSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";
-    this.description = showDescription ? `${displayUsername}@${server.host}${authDesc}${syncedDesc}` : undefined;
-    this.contextValue = connected ? "nexus.serverConnected" : "nexus.server";
-    this.iconPath = new vscode.ThemeIcon(
-      connected ? "plug" : "debug-disconnect",
-      new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
-    );
+    const addresslessDesc = addressless ? " (no address)" : "";
+    // LIVE STATUS (Phase 2) / NODE CONTROL (Phase 4, task #28 — M4) — a state
+    // suffix on a status-bearing lab node. Phase 4 makes stopped-ness
+    // load-bearing (it is the premise for "Start Node"), and the worst case —
+    // connected + stopped — otherwise shows a green plug, no state text, and a
+    // "Start Node" menu, a row that contradicts its own menu. So a stopped node
+    // now gets an explicit " (stopped)" mirroring " (running)"; a non-status
+    // server still gets nothing at all.
+    const statusDesc = status === "running" ? " (running)" : status === "stopped" ? " (stopped)" : "";
+    const descHead = addressless ? displayUsername : `${displayUsername}@${server.host}`;
+    this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${statusDesc}` : undefined;
+    // BMC-menu gating (task #27) — a server with an ipmiHost (same truthiness as
+    // the tooltip's ipmiSuffix above) gets an `.ipmi` marker APPENDED so the two
+    // BMC menu entries can require it. The base string is left UNCHANGED and the
+    // other server menus were broadened to /^nexus\.server(Connected)?(\.ipmi)?$/,
+    // so no existing menu is dropped for a BMC server.
+    const hasIpmi = typeof server.ipmiHost === "string" && server.ipmiHost.trim() !== "";
+    // NODE CONTROL (task #28) — the eve-state marker, APPENDED after `.ipmi` in
+    // the fixed order `nexus.server[Connected][.ipmi][.eveRunning|.eveStopped]`.
+    // Only an EVE-origin server with a KNOWN status carries it; every package.json
+    // server-menu `when` regex was broadened to tolerate the optional group first,
+    // so no existing action is dropped for an EVE node (the #83 hazard).
+    const eveMarker = isEveOrigin && status ? (status === "running" ? ".eveRunning" : ".eveStopped") : "";
+    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${eveMarker}`;
+    // LIVE STATUS (Phase 2) — the icon. A CONNECTED server always keeps its
+    // connected (plug) icon: the connected affordance must not be lost (P3-6),
+    // and the running state is still conveyed by the " (running)" description
+    // and the green ▶ FileDecoration. The running/stopped dot is only for a
+    // NON-connected status-bearing (EVE-origin) server; every other server keeps
+    // the plain disconnect icon.
+    if (connected) {
+      this.iconPath = new vscode.ThemeIcon("plug", new vscode.ThemeColor("testing.iconPassed"));
+    } else if (status === "running") {
+      this.iconPath = new vscode.ThemeIcon("circle-filled", new vscode.ThemeColor("charts.green"));
+    } else if (status === "stopped") {
+      this.iconPath = new vscode.ThemeIcon("circle-outline", new vscode.ThemeColor("descriptionForeground"));
+    } else {
+      this.iconPath = new vscode.ThemeIcon("debug-disconnect", new vscode.ThemeColor("testing.iconQueued"));
+    }
     this.command = {
       command: "nexus.profile.actions",
       title: "Profile Actions",
@@ -301,6 +372,7 @@ export class NexusTreeProvider
     explicitGroups: [],
     authProfiles: [],
     activitySessionIds: new Set(),
+    serverStatus: new Map(),
     focusedSessionId: undefined,
     inventorySources: [],
     deviceTemplates: [],
@@ -323,7 +395,10 @@ export class NexusTreeProvider
       localShellProfiles: snapshot.localShellProfiles ?? [],
       activeLocalShellSessions: snapshot.activeLocalShellSessions ?? [],
       localServers: (snapshot as unknown as { localServers?: LocalServerConfig[] }).localServers ?? [],
-      activeLocalServerSessions: (snapshot as unknown as { activeLocalServerSessions?: ActiveLocalServerSession[] }).activeLocalServerSessions ?? []
+      activeLocalServerSessions: (snapshot as unknown as { activeLocalServerSessions?: ActiveLocalServerSession[] }).activeLocalServerSessions ?? [],
+      // LIVE STATUS (Phase 2) — tolerate a partial snapshot (older callers /
+      // test fixtures predating serverStatus) so reads below never hit undefined.
+      serverStatus: snapshot.serverStatus ?? new Map()
     };
     this.authProfileById = new Map(snapshot.authProfiles.map((profile) => [profile.id, profile]));
     this.computeFolderCache();
@@ -606,7 +681,7 @@ export class NexusTreeProvider
 
   private makeFolderItem(path: string): FolderTreeItem {
     const hasDirectServers = this.snapshot.servers.some((s) => !s.isHidden && s.group === path);
-    return new FolderTreeItem(
+    const item = new FolderTreeItem(
       path,
       folderDisplayName(path),
       this.collapsedFolders.has(path)
@@ -614,6 +689,57 @@ export class NexusTreeProvider
         : vscode.TreeItemCollapsibleState.Expanded,
       hasDirectServers
     );
+    // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
+    // to paint the ▶ badge for a lab folder that directly contains a running
+    // server. Set only on Command Center folders (this method) — the Macros
+    // view builds its own FolderTreeItems and must not inherit lab highlights.
+    item.resourceUri = folderStatusUri(path);
+    // PER-SOURCE SYNC (follow-up #43) — set HERE, alongside the resourceUri and
+    // for the same reason: this is the one construction site for Command Center
+    // folder rows, so the Macros view (which builds its own FolderTreeItems with
+    // an explicit contextValue) cannot inherit either.
+    //
+    // THE MARKER IS AN OPTIONAL SUFFIX on whichever base value the row already
+    // has, exactly as `.eveRunning`/`.eveStopped` suffix a server's — so the
+    // `nexus.folder` / `nexus.folderWithServers` distinction survives it and
+    // every existing folder menu entry keeps matching (their `when` regexes were
+    // widened with the same optional group). Appending, rather than replacing,
+    // is what keeps a marked folder's connect/rename/remove actions.
+    const syncSourceId = this.soleSourceTargeting(path);
+    if (syncSourceId !== undefined) {
+      item.sourceId = syncSourceId;
+      item.contextValue = `${item.contextValue}.syncSource`;
+    }
+    return item;
+  }
+
+  /**
+   * PER-SOURCE SYNC (follow-up #43) — the id of the inventory source this folder
+   * is the `targetFolder` of, or `undefined` when that is not exactly one source.
+   *
+   * COUNTED, never `find`/`some`. Two sources can legitimately share a target
+   * folder, and there is no defensible answer to "which one does this icon
+   * sync?" — a first-match implementation would silently pick whichever the
+   * snapshot happens to list first and sync the wrong source on every click. So
+   * an ambiguous folder gets no icon and the user goes through Settings, which
+   * names both.
+   *
+   * An EQUALITY test, not a descendant test: the icon belongs on the folder the
+   * source syncs INTO, not on every lab folder underneath it, each of which
+   * would otherwise claim to sync the whole source. `targetFolder: ""` (root)
+   * matches nothing, because no folder row has an empty path — root is the
+   * absence of a row, so there is simply nowhere to put the icon.
+   */
+  private soleSourceTargeting(path: string): string | undefined {
+    let found: string | undefined;
+    let count = 0;
+    for (const source of this.snapshot.inventorySources) {
+      if (source.targetFolder === path) {
+        count++;
+        found = source.id;
+      }
+    }
+    return count === 1 ? found : undefined;
   }
 
   private getFolderChildren(parentPath: string | undefined): NexusTreeItem[] {
@@ -709,9 +835,16 @@ export class NexusTreeProvider
     // stored on the server itself, so a source rename is reflected immediately
     // and a removed source (origin left dangling — see B5's tree tooltip doc)
     // falls back to the generic "Synced from inventory" line in ServerTreeItem.
-    const syncedSourceName = server.origin
-      ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)?.name
+    // NODE CONTROL (task #28) — resolve the origin's source ONCE for both the
+    // display name and the providerId (a live ServerOrigin carries no providerId
+    // — Phase 4 gotcha #1). `isEveOrigin` gates the `.eveRunning`/`.eveStopped`
+    // contextValue marker; "eve-ng" is EVE_NG_PROVIDER_ID (string-literal here to
+    // avoid dragging the provider module into the UI bundle).
+    const originSource = server.origin
+      ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)
       : undefined;
+    const syncedSourceName = originSource?.name;
+    const isEveOrigin = originSource?.providerId === "eve-ng";
     // REVIEW FINDING (P2) — the username shown is the one a connection will
     // actually use, resolved through the shared ownership rule
     // (`authProfileOwnedCredentials`, models/config.ts). Reading
@@ -719,7 +852,8 @@ export class NexusTreeProvider
     // whitespace-only username as the server's, rendering "@host:22" in the
     // label and tooltip while the connection uses the server's own username.
     const ipmiAuthProfile = server.ipmiAuthProfileId ? this.authProfileById.get(server.ipmiAuthProfileId) : undefined;
-    return new ServerTreeItem(
+    const status = this.snapshot.serverStatus.get(server.id);
+    const item = new ServerTreeItem(
       server,
       connected,
       lookup,
@@ -727,8 +861,14 @@ export class NexusTreeProvider
       authProfile?.name,
       authProfileOwnedCredentials(authProfile).username,
       syncedSourceName,
-      ipmiAuthProfile?.name
+      ipmiAuthProfile?.name,
+      status,
+      isEveOrigin
     );
+    // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
+    // to paint the ▶ badge for a running server.
+    item.resourceUri = serverStatusUri(server.id);
+    return item;
   }
 
   private toSerialProfileItem(profile: SerialProfile): SerialProfileTreeItem {

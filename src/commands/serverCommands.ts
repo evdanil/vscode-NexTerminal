@@ -11,15 +11,18 @@ import {
   effectiveServerUsername,
   formOfferedServerCredentials,
   mergeServerConfigFields,
+  proxyConfigsEqual,
+  resolveServerProtocol,
   serverConfigsEqual
 } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
+import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
-import { serverFormDefinition } from "../ui/formDefinitions";
+import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -40,6 +43,7 @@ import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { configMutationLock } from "../services/configMutationLock";
+import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 
 export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -53,7 +57,9 @@ export async function pickServer(core: import("../core/nexusCore").NexusCore): P
       .sort((a, b) => naturalCompare(a.name, b.name))
       .map((server) => ({
         label: server.name,
-        description: `${server.username}@${server.host}:${server.port}`,
+        // P3-2 (Fable) — an addressless placeholder has no endpoint, so show
+        // "(no address)" rather than the nonsense "user@:0".
+        description: server.addressless === true ? "(no address)" : `${server.username}@${server.host}:${server.port}`,
         server
       })),
     { title: "Select Nexus Server" }
@@ -360,6 +366,53 @@ function resolveEffectiveUsername(core: import("../core/nexusCore").NexusCore, s
   return effectiveServerUsername(server, core.getAuthProfile(server.authProfileId));
 }
 
+/**
+ * #84 P2 (Codex) — do two records name the SAME connection target — the box a
+ * key deploy physically lands on? The SSH key is deployed to the CAPTURED
+ * server's endpoint, so the conversion to key auth is only valid if the live
+ * record still points at that endpoint. If the target moved while the deploy or
+ * the conversion prompt was open (a concurrent host/port/proxy edit, or a
+ * replace-import reusing the id), converting would switch a DIFFERENT box — one
+ * that never received the key — to key auth, so the caller aborts instead.
+ *
+ * Connection IDENTITY = the fields that decide which host `sshFactory.connect`
+ * reaches and authenticates against: `host`, `port`, the `proxy`/jump config,
+ * and `username` (the account the key was authorized for). NOT `authType`
+ * (that is what the conversion changes), name, group, or other display fields.
+ */
+function sameConnectionIdentity(a: ServerConfig, b: ServerConfig): boolean {
+  return (
+    a.host === b.host &&
+    a.port === b.port &&
+    a.username === b.username &&
+    proxyConfigsEqual(a.proxy, b.proxy)
+  );
+}
+
+/**
+ * #84 P2 (Codex) — is the LIVE record still the same connection target the key
+ * was deployed to? Combines the structural identity (`sameConnectionIdentity`)
+ * with the RESOLVED effective username (P2-2): a profile-linked server's stored
+ * `username` is blank/unchanged even when its profile's username — the account
+ * the key was authorized for — changed under the open prompt, so the stored
+ * comparison alone accepts a moved account. `deployedEffectiveUsername` is the
+ * account resolved BEFORE the deploy (what `sshFactory.connect` authenticated
+ * as); it must still equal the live record's re-resolved effective username, or
+ * the key went to a different account and the conversion must abort. A removed
+ * record (undefined) is never the same target.
+ */
+function isSameKeyDeployTarget(
+  core: import("../core/nexusCore").NexusCore,
+  live: ServerConfig,
+  captured: ServerConfig,
+  deployedEffectiveUsername: string
+): boolean {
+  return (
+    sameConnectionIdentity(live, captured) &&
+    resolveEffectiveUsername(core, live) === deployedEffectiveUsername
+  );
+}
+
 function buildStandaloneKeyServer(server: ServerConfig, username: string, privateKeyPath: string): ServerConfig {
   return {
     ...server,
@@ -611,12 +664,43 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
   await ctx.secretVault.delete(secretKey);
 }
 
-export function formValuesToServer(values: FormValues, existingId?: string, preserveIsHidden = false): ServerConfig | undefined {
+// ADDRESSLESS (Codex P2-a) — the sentinel port an addressless placeholder carries
+// (mirrors `ADDRESSLESS_PORT` in the sync engine, which mints these records). A
+// placeholder has no console endpoint, so the port is a placeholder too; kept in
+// sync-engine and form-save so an edited placeholder round-trips to the same shape.
+const ADDRESSLESS_PORT = 0;
+
+export function formValuesToServer(
+  values: FormValues,
+  existingId?: string,
+  preserveIsHidden = false,
+  existingAddressless = false
+): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
   const username = typeof values.username === "string" ? values.username.trim() : "";
   const normalizedGroup = normalizeOptionalFolderPath(values.group);
-  if (!name || !host || !username) {
+  // TELNET (Phase 0) — only `"telnet"` is stored. `"ssh"` is the default the
+  // absent field already means, and writing it explicitly would put a member on
+  // every server record no build before this one understands (the same rule
+  // `bmcWebProtocol` follows below). Anything else the submission carries is not
+  // a transport we implement, so it reads as the default.
+  const isTelnet = values.protocol === "telnet";
+  // ADDRESSLESS (Codex P2-a) — editing a synced placeholder that has no console
+  // address. The Edit form leaves Host empty for it, and a normal record needs a
+  // host, so without this the save would abort (`return undefined`) and the user
+  // could never reach the OOB fields (IPMI auth profile, BMC protocol) the
+  // placeholder exists to hold. Preserve the addressless shape (empty host,
+  // sentinel port) instead — but ONLY when the user left Host empty. Typing a
+  // real host means "give this device an address": fall through to the normal
+  // addressed record and let the flag clear (the next sync's ownership decides).
+  const keepAddressless = existingAddressless && !host;
+  // A telnet server has no protocol-level login, so the form DISABLES the
+  // username control for one — a disabled control submits nothing, and the
+  // save must not reject the record over a field it never asked for. An
+  // addressless placeholder likewise never offered a Host (and may carry an
+  // empty username), so its emptiness is not a rejection either.
+  if (!name || (!keepAddressless && (!host || (!username && !isTelnet)))) {
     return undefined;
   }
   if (normalizedGroup === null) {
@@ -626,7 +710,11 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
     id: existingId ?? randomUUID(),
     name,
     host,
-    port: typeof values.port === "number" ? values.port : 22,
+    port: keepAddressless ? ADDRESSLESS_PORT : typeof values.port === "number" ? values.port : 22,
+    // Preserved only while the record stays addressless; typing a host clears it
+    // (absent ≡ addressed), so a placeholder upgraded in the form saves as normal.
+    ...(keepAddressless ? { addressless: true } : {}),
+    protocol: isTelnet ? "telnet" : undefined,
     username,
     authType: isAuthType(values.authType) ? values.authType : "password",
     keyPath: typeof values.keyPath === "string" && values.keyPath ? values.keyPath : undefined,
@@ -704,6 +792,60 @@ export function formValuesToServer(values: FormValues, existingId?: string, pres
  * prefilled from the record. The edit path rejects such a submission outright
  * (`serverAuthProfileRejection`) rather than relying on that agreement.
  */
+/**
+ * TELNET (Phase 0, MAJOR-4) — carry a server's SSH configuration through a save
+ * that switched it to Telnet.
+ *
+ * WHY IT IS NEEDED. A field hidden by `visibleWhen` is DISABLED by the webview,
+ * a disabled control submits nothing, and `formValuesToServer` maps a missing
+ * key to `undefined`. So the very act of choosing Telnet erased `username`,
+ * `keyPath`, `altHost`, `authProfileId`, `proxy`, `multiplexing`,
+ * `legacyAlgorithms` and `openFileExplorerOnFirstConnect`, and reset `authType`
+ * to `password` — the profile was destroyed by the flip, and a user who
+ * flipped back rebuilt it from memory.
+ *
+ * `preserveLinkedServerCredentials` cannot cover this: it returns `next`
+ * untouched when `!next.authProfileId`, and the auth-profile select is itself
+ * one of the hidden controls, so the flip disarms it in the same submission.
+ *
+ * THE MODEL: a telnet server keeps its SSH config DORMANT, exactly like the
+ * vault entry that survives beside it (which is also why the edit path skips the
+ * proxy-password sync on a telnet save — see its call site). Nothing reads these
+ * fields while `protocol` is `"telnet"`; they exist so flipping back is
+ * lossless.
+ *
+ * SOURCED FROM THE LIVE RECORD (P2-B), never from the form-open snapshot — see
+ * the call site. These fields were never offered by this submission, so the
+ * record should keep what it holds NOW; restoring a form-open copy resurrected
+ * an auth-profile link that had been deleted while the form sat open.
+ *
+ * SCOPED TO THE FLIP, deliberately. It fires ONLY when the submission is telnet,
+ * i.e. only when the form could not have offered the fields. An SSH save is
+ * untouched, so clearing a key file, an alternate host or a proxy still works —
+ * a blanket "always merge from existing" would make those fields unclearable
+ * forever, which is the opposite failure.
+ */
+export function preserveDormantSshConfig(existing: ServerConfig | undefined, next: ServerConfig): ServerConfig {
+  if (!existing || resolveServerProtocol(next) !== "telnet") {
+    return next;
+  }
+  return {
+    ...next,
+    // `username` is the one that must be carried even when blank-vs-absent
+    // looks identical: the submission has no username at all for a telnet save,
+    // and `formValuesToServer` produced `""`.
+    username: existing.username,
+    authType: existing.authType,
+    keyPath: existing.keyPath,
+    altHost: existing.altHost,
+    authProfileId: existing.authProfileId,
+    proxy: existing.proxy ? { ...existing.proxy } : undefined,
+    multiplexing: existing.multiplexing,
+    legacyAlgorithms: existing.legacyAlgorithms,
+    openFileExplorerOnFirstConnect: existing.openFileExplorerOnFirstConnect
+  };
+}
+
 export function preserveLinkedServerCredentials(
   existing: ServerConfig | undefined,
   next: ServerConfig,
@@ -890,9 +1032,150 @@ export interface ConnectServerOptions {
   onConnectFailed?: (message: string) => void;
 }
 
+/**
+ * TELNET (Phase 0) — the telnet half of `connectServer`, split out rather than
+ * threaded through the SSH one because almost nothing is shared: no auth factory
+ * (so no password prompt and no vault read), no OSC 7 / cwd tracking, no SFTP
+ * auto-open and no auto-start tunnels — every one of those is SSH machinery.
+ *
+ * What IS shared is everything the terminal layer sees: the same
+ * `TerminalRegistry.register` call, the same `NexusCore.registerSession`
+ * bookkeeping under an `ActiveSession`, the same macro observer binding and the
+ * same activity-indicator wiring. That is what makes a telnet tab behave
+ * identically to an SSH one for highlighting, tab commands, macros and scripts.
+ */
+async function connectTelnetServer(
+  ctx: CommandContext,
+  server: ServerConfig,
+  options: ConnectServerOptions
+): Promise<void> {
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Connecting to ${server.name}...`,
+      cancellable: false
+    },
+    async () => {
+      const terminalName = `Nexus Telnet: ${server.name}`;
+      let terminalRef: vscode.Terminal | undefined;
+      let ptyRef: TelnetPty | undefined;
+      const triggerObserver = ctx.macroAutoTrigger.createObserver(
+        (text) => ptyRef?.handleInput(text),
+        () => ctx.focusedTerminal === terminalRef,
+        undefined,
+        server.id
+      );
+      const terminalType = vscode.workspace
+        .getConfiguration("nexus.ssh")
+        .get<string>("terminalType", "xterm-256color");
+      const pty = new TelnetPty(
+        server,
+        {
+          onSessionOpened: (sessionId) => {
+            ctx.core.registerSession({
+              id: sessionId,
+              serverId: server.id,
+              terminalName,
+              startedAt: Date.now(),
+              // P1-B — the transport this session opened with, fixed for its
+              // lifetime even if the profile is edited underneath it.
+              protocol: "telnet",
+              pty: ptyRef
+            });
+            ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
+            if (terminalRef) {
+              ctx.sessionTerminals.set(sessionId, terminalRef);
+            }
+            if (ptyRef) {
+              ctx.activityIndicators.set(sessionId, ptyRef);
+            }
+            if (vscode.window.activeTerminal === terminalRef) {
+              ctx.core.setFocusedSession(sessionId);
+            }
+          },
+          onSessionClosed: (sessionId) => {
+            ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
+            if (terminalRef) {
+              removeTerminal(server.id, terminalRef, ctx.terminalsByServer);
+            }
+          },
+          onDisconnected: (sessionId) => {
+            ctx.core.unregisterSession(sessionId);
+            ctx.sessionTerminals.delete(sessionId);
+            ctx.activityIndicators.delete(sessionId);
+            // The terminal stays alive holding the press-any-key notice, so its
+            // `terminalsByServer` entry is deliberately kept — `onSessionClosed`
+            // clears it when the tab actually goes away.
+          },
+          onConnectFailed: (_sessionId, message) => {
+            options.onConnectFailed?.(message);
+          },
+          onDataReceived: (sessionId) => {
+            if (terminalRef && ctx.focusedTerminal !== terminalRef) {
+              ctx.core.markSessionActivity(sessionId);
+              ptyRef?.setActivityIndicator(true);
+            }
+          }
+        },
+        ctx.loggerFactory.create("terminal", server.id),
+        {
+          transcript: createSessionTranscript(
+            ctx.sessionLogDir,
+            server.name,
+            server.logSession ?? getDefaultSessionTranscriptsEnabled(),
+            getTranscriptRotationOptions(ctx)
+          ),
+          highlighter: ctx.highlighter,
+          outputObserver: triggerObserver,
+          terminalType
+        }
+      );
+      ptyRef = pty;
+      const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+      const terminal = vscode.window.createTerminal({
+        name: terminalName,
+        pty,
+        iconPath: new vscode.ThemeIcon("server"),
+        color: new vscode.ThemeColor("terminal.ansiCyan"),
+        location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+      });
+      terminalRef = terminal;
+      ctx.terminalRegistry?.register(terminal, pty);
+      addTerminal(server.id, terminal, ctx.terminalsByServer);
+      ctx.focusedTerminal = terminal;
+      terminal.show();
+    }
+  );
+}
+
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
+    return;
+  }
+  // ADDRESSLESS (Codex P1) — refuse BEFORE any transport branch: a placeholder
+  // with no console address has nothing to connect to, so it must not reach the
+  // SSH factory (prompt + vault + handshake to an empty host) or the telnet
+  // path. This is the first thing checked, ahead of the protocol branch.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showInformationMessage(addresslessMessage);
+    // REVIEW FINDING (P2) — signal the refusal, do not just return. A watchdog
+    // wrapper (Run Macro on Server / Connect and Run Script) arms a 90s timer
+    // and then awaits `onConnectFailed` (or a new session) to know the connect
+    // is over. A silent early-return here leaves that wrapper with nothing to
+    // settle on, so it sits out the whole watchdog and then shows a MISLEADING
+    // timeout. Firing `onConnectFailed` is the same signal a real initial-connect
+    // failure raises (services/ssh/sshPty.ts), so the wrappers settle at once.
+    options.onConnectFailed?.(addresslessMessage);
+    return;
+  }
+  // TELNET (Phase 0) — branch BEFORE anything auth-shaped runs. A telnet server
+  // must never reach `SilentAuthSshFactory`: no password prompt, no vault read.
+  if (resolveServerProtocol(server) === "telnet") {
+    await connectTelnetServer(ctx, server, options);
     return;
   }
   const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
@@ -926,6 +1209,9 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               serverId: server.id,
               terminalName,
               startedAt: Date.now(),
+              // P1-B — see the telnet path: stamped so a later Protocol edit
+              // cannot reclassify a terminal that is already connected.
+              protocol: "ssh",
               pty: ptyRef
             });
             ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, sessionId);
@@ -1074,6 +1360,21 @@ async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise
   if (!server) {
     return;
   }
+  // ADDRESSLESS (Codex P1) — an SSH-only feature against a placeholder with no
+  // console address must refuse up front rather than handshake against nothing.
+  const addresslessMessage = addresslessUnavailableMessage(server);
+  if (addresslessMessage) {
+    void vscode.window.showWarningMessage(addresslessMessage);
+    return;
+  }
+  // TELNET (Phase 0) — this opens an SSH connection and reports its handshake.
+  // Against a telnet server it would report a raw ssh2 error naming a port that
+  // is answering perfectly well; say the real reason instead.
+  const unsupported = telnetUnsupportedMessage(server, "Test Connection");
+  if (unsupported) {
+    void vscode.window.showWarningMessage(unsupported);
+    return;
+  }
 
   try {
     const connection = await vscode.window.withProgress(
@@ -1115,7 +1416,10 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
     void vscode.window.showErrorMessage("Nexus script runtime is not available in this context.");
     return;
   }
-  const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, "ssh");
+  // TELNET (Phase 0) — filter by the protocol this server actually connects
+  // with, so a telnet profile offers telnet-targeted scripts (and `any`) rather
+  // than SSH-targeted ones it would then refuse to run.
+  const scriptUri = await pickScriptFromWorkspace(ctx.globalStoragePath, resolveServerProtocol(server));
   if (!scriptUri) return;
 
   const preExisting = new Set(
@@ -1155,7 +1459,22 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
   }, timeoutMs);
 
   try {
-    await connectServer(ctx, server.id, { allowAutoFileExplorer: false });
+    await connectServer(ctx, server.id, {
+      allowAutoFileExplorer: false,
+      // REVIEW FINDING (P2) — an initial-connect failure (or an addressless
+      // refusal) never produces a session, so the change-event subscription
+      // above stays silent and, without this, the timer would sit out the full
+      // 90s before showing a MISLEADING "the script did not start" warning. Tear
+      // the watchdog down the moment the connect reports it failed — the cause
+      // has already been surfaced (SSH diagnostic, or the addressless notice),
+      // so there is nothing to add here.
+      onConnectFailed: () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        unsubscribe();
+      }
+    });
   } catch (err) {
     // connectServer can reject (auth failure, proxy error). Without this
     // the subscription + timer would leak until the 90-second watchdog.
@@ -1275,7 +1594,9 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       }
       const existingGroups = collectGroups(ctx);
       const snapshot = ctx.core.getSnapshot();
-      const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
+      // TELNET (Phase 0, MAJOR-3) — the protocol rides along so the Jump Host
+      // and IPMI Gateway pickers can leave telnet servers out of their options.
+      const serverList = toSshInfrastructureServerList(snapshot.servers);
       const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
       // Issue #48 — a caller that is sending the user here to fill in an
       // advanced field (a `${profile.ipmiHost}` refusal) says so, and the
@@ -1305,7 +1626,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const candidate = formValuesToServer(values, existing.id, existing.isHidden);
+          const candidate = formValuesToServer(values, existing.id, existing.isHidden, existing.addressless === true);
           if (!candidate) {
             return;
           }
@@ -1488,8 +1809,30 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // conditional spread is what keeps "absent stays absent" true for
             // both, rather than writing an explicit `undefined` key onto a
             // record that never had one.
+            // P2-B (Codex) — the dormant SSH fields are restored from the LIVE
+            // record, captured immediately above, NOT from the form-open
+            // `existing` snapshot.
+            //
+            // WHY THESE AND NOT `preserveLinkedServerCredentials` one step up.
+            // That helper deliberately sources from `existing` (see its doc): it
+            // restores credentials the form RENDERED, so the form-open snapshot
+            // is what the user's submission was composed against, and
+            // last-writer-wins is the intended rule. These fields are the
+            // opposite case — a telnet save never OFFERED them at all (hidden ⇒
+            // disabled ⇒ absent from the submission), so the user expressed
+            // nothing about them and the record should simply keep whatever it
+            // currently holds.
+            //
+            // The failure that forced it: delete the linked auth profile while a
+            // telnet edit form sits open. `removeAuthProfile`'s sweep clears the
+            // link on the live record, but the stale snapshot still remembers it,
+            // so saving RESURRECTED a dangling id — and nothing downstream
+            // catches that, because the auth-profile rejection is keyed on
+            // `candidate.authProfileId` and the hidden select produced no
+            // candidate. Synchronous, so the "nothing may await between the
+            // liveRecord capture and the write" rule above still holds.
             const updated: ServerConfig = {
-              ...linked,
+              ...preserveDormantSshConfig(liveRecord ?? existing, linked),
               ...(liveRecord?.origin !== undefined ? { origin: liveRecord.origin } : {}),
               ...(liveRecord?.formerlySynced !== undefined ? { formerlySynced: liveRecord.formerlySynced } : {})
             };
@@ -1530,7 +1873,18 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             const writtenSnapshot = cloneServerConfig(updated);
             await ctx.core.addOrUpdateServer(updated);
             try {
-              await syncProxyPasswordSecret(ctx, updated.id, values);
+              // TELNET (Phase 0, MAJOR-4) — the vault half of the dormant SSH
+              // config. The proxy controls are hidden on a telnet save, so the
+              // submission carries no `proxyType` and this sync would read that
+              // as "no proxy" and DELETE the stored proxy password. The record
+              // keeps its proxy (see `preserveDormantSshConfig`), so deleting
+              // the credential beside it would mean the SSH config came back on
+              // a flip-back with a password silently missing. Skipped entirely
+              // rather than passed different values: this submission expressed
+              // nothing about the proxy, so there is nothing to sync.
+              if (resolveServerProtocol(updated) !== "telnet") {
+                await syncProxyPasswordSecret(ctx, updated.id, values);
+              }
             } catch {
               // The record above just committed to the NEW generation, but
               // its proxy secret never did — left alone, the new record
@@ -1718,6 +2072,16 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
             );
           }
+          // P2-3 fallback (Fable) — the user gave an addressless placeholder a host
+          // in the form (`existing` was addressless, the saved record is not). There
+          // is no host-ownership stamp yet, so the NEXT sync of a still-consoleless
+          // device will blank this hand-typed host. Warn so the revert is disclosed
+          // rather than a silent surprise.
+          if (existing.addressless === true && candidate.addressless !== true) {
+            void vscode.window.showWarningMessage(
+              `You gave "${existing.name}" a console address by hand. Its inventory source did not assign one, so the next sync will revert it to a placeholder unless the device has an address by then.`
+            );
+          }
         },
         onBrowse: browseForKey,
         onCreateInline: inlineAuthProfile.handleCreateInline,
@@ -1862,7 +2226,20 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // copying connection details to paste into a ticket or a shell wants it
       // too, and it is otherwise only visible behind the form's Advanced section.
       const ipmiHost = typeof server.ipmiHost === "string" ? server.ipmiHost.trim() : "";
-      const info = `${server.username}@${server.host}:${server.port}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
+      // TELNET (Phase 0, MINOR-4) — a telnet server has no username, so the
+      // `user@` prefix is dropped rather than emitted empty: `@10.0.0.1:23` is
+      // not an address anyone can paste into a ticket or a shell. Keyed on the
+      // VALUE, not the protocol, so a blank username reads the same whatever put
+      // it there.
+      const account = typeof server.username === "string" && server.username.trim() !== ""
+        ? `${server.username}@`
+        : "";
+      // P3-2 (Fable) — an addressless placeholder has no console address, so the
+      // `host:port` half renders the nonsense ":0". Head with "(no console address)"
+      // (and drop the `user@` prefix, which reads as an address it is not) while
+      // still carrying the BMC line below — often the only usable address.
+      const endpointLine = server.addressless === true ? "(no console address)" : `${account}${server.host}:${server.port}`;
+      const info = `${endpointLine}${ipmiHost ? `\nIPMI/BMC: ${ipmiHost}` : ""}`;
       await vscode.env.clipboard.writeText(info);
       void vscode.window.showInformationMessage(`Copied: ${info.replace(/\n/g, "  ")}`);
     }),
@@ -1870,6 +2247,19 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     vscode.commands.registerCommand("nexus.server.duplicate", async (arg?: unknown) => {
       const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
       if (!server) {
+        return;
+      }
+      // P2-1 (Fable) — refuse duplicating an addressless placeholder. A duplicate
+      // strips `origin` (see below), so the copy would be a MANUAL addressless
+      // record — an invariant violation: `addressless` exists only for synced
+      // placeholders. No sync would ever upgrade it (no origin), and its connect
+      // refusal tells the user to re-sync a source it has no link to. Stripping the
+      // flag instead would leave an empty host that fails validation, so refusing is
+      // the only coherent answer.
+      if (server.addressless === true) {
+        void vscode.window.showInformationMessage(
+          `"${server.name}" has no console address yet, so it can't be duplicated — it will get one when its inventory source next syncs.`
+        );
         return;
       }
       // F6 — a duplicate of a synced server is a manual server: keeping `origin`
@@ -1893,7 +2283,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         origin: undefined,
         formerlySynced: undefined
       };
-      await ctx.core.addOrUpdateServer(copy);
+      // #84 P1 (serialization audit) — addOrUpdateServer persists a FULL server
+      // snapshot, so even adding a fresh copy must serialize under
+      // configMutationLock: a lock-free add captured its snapshot could commit
+      // after a concurrent port-heal and revert the heal on an UNRELATED server.
+      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateServer(copy));
     }),
 
     vscode.commands.registerCommand("nexus.server.rename", async (arg?: unknown) => {
@@ -1910,7 +2304,33 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === server.name) {
         return;
       }
-      await ctx.core.addOrUpdateServer({ ...server, name: newName.trim() });
+      const trimmedName = newName.trim();
+      // #84 P1 (Codex) — serialize under configMutationLock like every other
+      // server writer, and RE-READ the live record inside the lock, applying ONLY
+      // the name. `server` was captured before the input box opened; a background
+      // status-refresh port-heal (or any concurrent write) may have replaced the
+      // live host/port/stamps since. Committing the form-captured full snapshot
+      // would revert the heal and point the next connect at the stale console
+      // port — a data-loss race the heal's own lock cannot close from its side.
+      // rename holds no lock of its own and runs after the input box resolves, so
+      // there is no re-entrancy / interactive-UI-under-lock hazard.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getServer(server.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 (Codex) — BAIL if a CONCURRENT rename changed the name to some
+        // OTHER value while this input box was open: the live name no longer
+        // matches what this prompt started from (`server.name`), so writing
+        // `trimmedName` would overwrite the newer rename with a decision made
+        // against a stale name. (The port-heal re-read above is safe to keep —
+        // host/port are not the field this prompt owns — but a name that moved out
+        // from under the prompt means the prompt is stale.)
+        if (live.name !== server.name) {
+          return;
+        }
+        await ctx.core.addOrUpdateServer({ ...live, name: trimmedName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.group.rename", async (arg?: unknown) => {
@@ -1937,7 +2357,14 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === currentName) {
         return;
       }
-      await ctx.core.renameFolder(oldPath, newName.trim());
+      // #84 P1 (Codex, serialization audit) — a folder rename rewrites `group` on
+      // every server in the subtree and persists a FULL server snapshot; serialize
+      // it under configMutationLock like every other writer so a concurrent
+      // background port-heal (or edit/remove/sync) cannot interleave and clobber
+      // the folder move or have its own port write reverted. `renameFolder` reads
+      // and mutates the live server map inside the lock, so no stale snapshot is
+      // captured. The input box has already resolved — no UI is held under the lock.
+      await configMutationLock.runExclusive(() => ctx.core.renameFolder(oldPath, newName.trim()));
     }),
 
     vscode.commands.registerCommand("nexus.group.connect", async (arg?: unknown) => {
@@ -1948,8 +2375,22 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       const servers = ctx.core
         .getSnapshot()
         .servers.filter((s) => s.group === folderPath && !s.isHidden);
+      // P3-3 (Fable) — skip addressless placeholders in the sweep rather than let
+      // connectServer pop its "no console address" info message once PER node. An
+      // EVE lab folder is mostly stopped nodes (the documented common case), so the
+      // per-node path is a popup storm. Disclose them once, in aggregate, instead.
+      const addresslessInGroup = servers.filter((s) => s.addressless === true);
       for (const server of servers) {
+        if (server.addressless === true) {
+          continue;
+        }
         void connectServer(ctx, server.id, { allowAutoFileExplorer: false });
+      }
+      if (addresslessInGroup.length > 0) {
+        const count = addresslessInGroup.length;
+        void vscode.window.showInformationMessage(
+          `${count} ${count === 1 ? "server has" : "servers have"} no console address yet and ${count === 1 ? "was" : "were"} skipped — ${count === 1 ? "it" : "they"} will connect once the inventory source assigns an address.`
+        );
       }
     }),
 
@@ -1969,6 +2410,18 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
     vscode.commands.registerCommand("nexus.server.deployKey", async (arg?: unknown) => {
       const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
       if (!server) {
+        return;
+      }
+      // TELNET (Phase 0) — there is no authorized_keys on the far side of a
+      // telnet session, and the deploy itself runs over SSH.
+      const addresslessDeploy = addresslessUnavailableMessage(server);
+      if (addresslessDeploy) {
+        void vscode.window.showWarningMessage(addresslessDeploy);
+        return;
+      }
+      const unsupported = telnetUnsupportedMessage(server, "Deploy SSH Key");
+      if (unsupported) {
+        void vscode.window.showWarningMessage(unsupported);
         return;
       }
 
@@ -1995,6 +2448,15 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
 
+      // #84 P2-2 (Codex) — the EFFECTIVE username the key was authorized for, as
+      // of THIS connection: for a profile-linked server it comes from the linked
+      // profile, which can change while the deploy/prompt is open. Captured BEFORE
+      // the deploy — this is the account `sshFactory.connect(server)` below
+      // installs the key for — so the conversion can later abort if the live
+      // record's effective username no longer matches it (the stored field would
+      // be identical — blank/profile-linked — and miss the change).
+      const deployedEffectiveUsername = resolveEffectiveUsername(ctx.core, server);
+
       let connection: import("../services/ssh/contracts").SshConnection | undefined;
       try {
         const deployResult = await vscode.window.withProgress(
@@ -2014,21 +2476,62 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           return;
         }
 
-        const effectiveUsername = resolveEffectiveUsername(ctx.core, server);
+        // #84 P1/P2 (Codex, serialization audit) — `server` was captured BEFORE
+        // the key deployment (a withProgress connect) and the conversion prompt,
+        // both long awaits during which a concurrent writer can replace the live
+        // record. Serialize the conversion write under configMutationLock, and
+        // inside the lock REVALIDATE the connection IDENTITY: the key physically
+        // landed on the captured endpoint, so converting is only correct if the
+        // live record still points at that endpoint. If it moved (host/port/proxy/
+        // username edit, or a replace-import reusing the id) — or the record was
+        // removed — ABORT rather than switch a box that never received the key to
+        // key auth. When it still matches, build from the LIVE record so any
+        // NON-identity concurrent edit (name, group, …) is preserved. Acquired
+        // AFTER the interactive prompts.
         if (conversionMode === "standalone") {
-          await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(server, effectiveUsername, privateKeyPath));
-          await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+          // #84 P2-1 (Codex) — the password cleanup + "switched to key auth"
+          // announcement must run ONLY when the conversion actually SUCCEEDED. On
+          // abort, the `return` exits just the mutex callback, so `converted` is
+          // propagated out to gate the cleanup — otherwise a still-password-auth
+          // (or replacement) record would have its stored password offered for
+          // deletion under a false announcement.
+          let converted = false;
+          await configMutationLock.runExclusive(async () => {
+            const live = ctx.core.getServer(server.id);
+            if (!live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
+              void vscode.window.showWarningMessage(
+                `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
+              );
+              return;
+            }
+            await ctx.core.addOrUpdateServer(buildStandaloneKeyServer(live, deployedEffectiveUsername, privateKeyPath));
+            converted = true;
+          });
+          if (converted) {
+            await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+          }
           return;
         }
 
-        const profile = await pickOrCreateKeyAuthProfile(ctx, effectiveUsername, privateKeyPath);
+        const profile = await pickOrCreateKeyAuthProfile(ctx, deployedEffectiveUsername, privateKeyPath);
         if (!profile) {
           return;
         }
-        await ctx.core.addOrUpdateServer(
-          buildProfileLinkedKeyServer(server, effectiveUsername, privateKeyPath, profile.id)
-        );
-        await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+        let converted = false;
+        await configMutationLock.runExclusive(async () => {
+          const live = ctx.core.getServer(server.id);
+          if (!live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
+            void vscode.window.showWarningMessage(
+              `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
+            );
+            return;
+          }
+          await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, deployedEffectiveUsername, privateKeyPath, profile.id));
+          converted = true;
+        });
+        if (converted) {
+          await maybeRemoveStoredPasswordAfterKeyConversion(ctx, server);
+        }
       } catch (err: any) {
         void vscode.window.showErrorMessage(`Deploy failed: ${err?.message ?? err}`);
       } finally {

@@ -10,6 +10,7 @@ import {
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import { isValidServerOrigin, validateServerConfig } from "../../src/utils/validation";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { buildConnectConfig } from "../../src/services/ssh/ssh2Connector";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../src/models/inventory";
@@ -42,7 +43,7 @@ function makeTree(devices: InventoryDevice[], warnings?: string[]): InventoryTre
 }
 
 function makeOwnedServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
-  return {
+  const merged: ServerConfig = {
     id: deterministicServerId("source-1", "device:1"),
     name: "core-sw-1",
     host: "10.0.0.1",
@@ -54,6 +55,22 @@ function makeOwnedServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 },
     ...overrides
   };
+  // PRIMARY HOST/PORT (task #29) — a real synced server OWNS its address, so its
+  // origin carries `syncedHost`/`syncedPort` matching its own `host`/`port`. Seed
+  // them here (when the fixture did not set them and the record is addressed) so
+  // every default fixture represents a post-#29 sync-owned server: the update
+  // path then follows a device move (sync-owned) rather than preserving it as a
+  // hand edit. A test that wants a HAND-EDITED address sets `origin.syncedHost`
+  // to a different value (or omits it on an addressless `host: ""` record).
+  if (merged.origin) {
+    if (merged.origin.syncedHost === undefined && merged.host !== "") {
+      merged.origin = { ...merged.origin, syncedHost: merged.host };
+    }
+    if (merged.origin.syncedPort === undefined && merged.port !== 0) {
+      merged.origin = { ...merged.origin, syncedPort: merged.port };
+    }
+  }
+  return merged;
 }
 
 /**
@@ -119,7 +136,16 @@ describe("computeSyncPlan — adds", () => {
     // can compare against it instead of the source's current defaultUsername.
     // Whole-object equality on the origin: it is the retro-apply rule's only
     // input besides the auth fields, so a missing or extra member has to fail.
-    expect(add.origin).toEqual({ sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" });
+    expect(add.origin).toEqual({
+      sourceId: "source-1",
+      externalId: "device:1",
+      syncedAt: 1000,
+      syncedUsername: "admin",
+      // PRIMARY HOST/PORT (task #29) — a fresh add owns its address, stamped
+      // unconditionally alongside the host/port it wrote.
+      syncedHost: "10.0.0.1",
+      syncedPort: 22
+    });
   });
 
   it("maps the ssh endpoint even when a redfish endpoint appears first (kills first-endpoint-regardless-of-kind)", () => {
@@ -137,7 +163,7 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.adds[0].host).toBe("10.0.0.1");
   });
 
-  it("skips devices with empty externalId, no usable ssh endpoint, or an out-of-range port — each with a warning, no adds", () => {
+  it("ADDRESSLESS (Codex P1) — still skips an empty externalId and an out-of-range port, but the no-primary (redfish-only) device becomes an addressless placeholder rather than being dropped", () => {
     const source = makeSource();
     const tree = makeTree([
       makeDevice({ externalId: "", name: "no-external-id" }),
@@ -145,8 +171,35 @@ describe("computeSyncPlan — adds", () => {
       makeDevice({ externalId: "device:bad-port", name: "bad-port", endpoints: [{ kind: "ssh", host: "10.0.0.3", port: 70000 }] })
     ]);
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
-    expect(plan.adds).toHaveLength(0);
-    expect(plan.warnings.length).toBeGreaterThanOrEqual(3);
+    // Only the no-primary device is created — as an addressless placeholder.
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].addressless).toBe(true);
+    expect(plan.adds[0].origin?.externalId).toBe("device:redfish-only");
+    // The malformed rows are still skipped, each with its own warning.
+    expect(plan.warnings.some((w) => w.includes("no device ID"))).toBe(true);
+    expect(plan.warnings.some((w) => w.includes("invalid port"))).toBe(true);
+  });
+
+  // P3-4 (Fable) — the OOB extraction was hoisted before the addressless branch,
+  // which also put it before the invalid-port skip. A device skipped for a bad port
+  // then still pushed an "out-of-band address cannot be used" warning it never did
+  // pre-PR. ⊘ Extracting OOB before the skip warns for a device that produces nothing.
+  it("P3-4 — a device skipped for an invalid port does NOT also push an out-of-band-address warning", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({
+          endpoints: [
+            { kind: "ssh", host: "10.0.0.1", port: 0 }, // invalid port → skipped
+            { kind: "redfish", host: "bad host with spaces" } // malformed OOB
+          ]
+        })
+      ]),
+      currentServers: [],
+      now: 5000
+    });
+    expect(plan.warnings.some((w) => /invalid port/i.test(w))).toBe(true);
+    expect(plan.warnings.every((w) => !/out-of-band address that cannot be used/i.test(w))).toBe(true);
   });
 
   it("root targetFolder (''): a device with no folder gets group undefined, not '' (kills '' + '/' + rel concatenation)", () => {
@@ -181,7 +234,7 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.warnings.some((w) => w.includes("Duplicate device ID"))).toBe(true);
   });
 
-  it("(N1) many endpoint-less devices with no owned server produce ONE aggregate warning, not one per device (kills per-device spam)", () => {
+  it("(N1 / ADDRESSLESS) many endpoint-less NEW devices become addressless adds with ONE aggregate note, not one warning per device (kills per-device spam)", () => {
     const source = makeSource();
     const devices = Array.from({ length: 5 }, (_, i) =>
       makeDevice({
@@ -192,31 +245,669 @@ describe("computeSyncPlan — adds", () => {
     );
     const tree = makeTree(devices);
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
-    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("no usable ssh endpoint"));
-    expect(endpointWarnings).toHaveLength(1);
-    expect(endpointWarnings[0]).toContain("5");
+    expect(plan.adds).toHaveLength(5);
+    expect(plan.adds.every((a) => a.addressless === true)).toBe(true);
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    expect(note).toHaveLength(1);
+    expect(note[0]).toContain("5");
   });
 
-  it("(N1) an endpoint-less device whose externalId IS owned still gets a per-device warning naming it (kills over-aggregation losing the protective signal)", () => {
+  it("(N1 / ADDRESSLESS) an endpoint-less OWNED device downgrades in place while an unowned one is added — both addressless, no per-device spam (kills losing the placeholder for the owned one)", () => {
     const source = makeSource();
     const before = makeOwnedServer(); // origin.externalId === "device:1", matches the first device below
     const tree = makeTree([
-      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] }), // externalId "device:1" — owned, no usable ssh endpoint
+      makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] }), // externalId "device:1" — owned, downgrades
       makeDevice({ externalId: "device:2", name: "unowned-noendpoint", endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })
     ]);
     const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
-    // Owned device: dedicated per-device warning, naming it explicitly.
-    expect(plan.warnings.some((w) => w.includes(`Device "core-sw-1" (device:1) has no usable SSH endpoint and was skipped.`))).toBe(true);
-    // Unowned device: no dedicated per-device warning of that form — it's folded
-    // into the aggregate instead (its name may still appear as an aggregate example).
-    expect(
-      plan.warnings.some((w) => w.includes(`Device "unowned-noendpoint" (device:2) has no usable SSH endpoint and was skipped.`))
-    ).toBe(false);
-    // Aggregate warning covers exactly the one unowned skip, and names it.
-    const endpointWarnings = plan.warnings.filter((w) => w.toLowerCase().includes("had no usable ssh endpoint"));
-    expect(endpointWarnings).toHaveLength(1);
-    expect(endpointWarnings[0]).toContain("1");
-    expect(endpointWarnings[0]).toContain("unowned-noendpoint");
+    // Owned device: downgraded to addressless (an update), NOT pruned.
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.origin?.externalId).toBe("device:1");
+    // Unowned device: created addressless.
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].addressless).toBe(true);
+    // Only the NEW addressless device is named in the aggregate note (the owned
+    // one is an in-place update, not a fresh placeholder).
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    expect(note).toHaveLength(1);
+    expect(note[0]).toContain("unowned-noendpoint");
+  });
+
+  /**
+   * ADDRESSLESS (Codex P1 on #82) — a device with no usable primary endpoint (a
+   * stopped EVE node, a VNC-console node, a NetBox row with no IP) now produces
+   * a VISIBLE addressless placeholder server instead of being skipped, and
+   * upgrades/downgrades in place as the device gains/loses a console — no
+   * create/prune churn.
+   */
+  describe("addressless placeholders", () => {
+    // A device with NO usable endpoint of ANY kind — no ssh/telnet primary AND no
+    // redfish/ipmi-sol OOB. Deliberately endpoint-less rather than redfish-only:
+    // a redfish endpoint is now an OOB address the placeholder CARRIES (see the
+    // OOB (P2) tests below), so a redfish fixture here would conflate "no console"
+    // with "has a BMC address" and churn a spurious ipmiHost update.
+    const noEndpointDevice = (overrides: Partial<InventoryDevice> = {}) =>
+      makeDevice({ endpoints: [], ...overrides });
+
+    it("CREATES an addressless server for a new endpoint-less device instead of skipping it (⊘ the old skip leaves the device invisible in the tree)", () => {
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      const [added] = plan.adds;
+      expect(added.addressless).toBe(true);
+      expect(added.host).toBe("");
+      expect(added.id).toBe(deterministicServerId("source-1", "device:1"));
+      expect(added.group).toBe("NetBox");
+      expect(added.origin?.sourceId).toBe("source-1");
+      expect(added.origin?.externalId).toBe("device:1");
+      expect(added.origin?.syncedAt).toBe(5000);
+      // No console ⇒ ssh-default protocol, unset stamp.
+      expect(added.protocol).toBeUndefined();
+      expect(added.origin?.syncedProtocol).toBeUndefined();
+      // The record the sync writes must survive its own reload.
+      expect(validateServerConfig(added)).toBe(true);
+    });
+
+    it("UPGRADES an owned addressless server in place when the device gains a console — same id, host filled, flag cleared, no duplicate add (⊘ a create-only path would add a second server for the same device)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.adds).toHaveLength(0);
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.id).toBe(before.id);
+      expect(after.host).toBe("10.0.0.1");
+      expect(after.port).toBe(22);
+      expect(after.addressless ?? false).toBe(false);
+      expect(plan.prunes).toHaveLength(0);
+    });
+
+    it("DOWNGRADES an owned addressed server to addressless when the device loses its console — keeps the server (does NOT prune), flips the flag, clears the host (⊘ pruning a merely-stopped node destroys the server and its credentials)", () => {
+      const before = makeOwnedServer(); // addressed, host 10.0.0.1
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.prunes).toHaveLength(0);
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.addressless).toBe(true);
+      expect(after.host).toBe("");
+      expect(after.id).toBe(before.id);
+    });
+
+    it("PRIMARY HOST (task #29, the deferred #82 P2-3) — a synced node the user gave a HAND host to keeps that address when the device loses its console: PRESERVED, not blanked to \"\", and the record stays ADDRESSED (⊘ forcing blanksAddress true reverts the hand host to the placeholder shape and strands the user's address)", () => {
+      // The sync last wrote host 10.0.0.5 / port 22 (a telnet console node); the
+      // user hand-edited the console to 10.0.0.50:2222. The device now loses its
+      // console, and the node is renamed so an update is produced regardless.
+      const before = makeOwnedServer({
+        protocol: "telnet",
+        host: "10.0.0.50",
+        port: 2222,
+        origin: {
+          sourceId: "source-1",
+          externalId: "device:1",
+          syncedAt: 1000,
+          syncedHost: "10.0.0.5",
+          syncedPort: 22,
+          syncedProtocol: "telnet"
+        }
+      });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice({ name: "renamed" })]), currentServers: [before], now: 5000 });
+      expect(plan.prunes).toHaveLength(0);
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.name).toBe("renamed");
+      // The hand-typed address survives — this is the #82 P2-3 fix.
+      expect(after.host).toBe("10.0.0.50");
+      expect(after.port).toBe(2222);
+      // ...and because a hand address is preserved, the record is NOT addressless.
+      expect(after.addressless ?? false).toBe(false);
+      // The stamp is carried forward verbatim, never laundered to the current value.
+      expect(after.origin?.syncedHost).toBe("10.0.0.5");
+      expect(after.origin?.syncedPort).toBe(22);
+      // #84 P2 (Codex) — the PROTOCOL rides with the retained endpoint. host/port
+      // and protocol are one coherent console: because the hand-typed telnet
+      // endpoint is preserved (not blanked to a placeholder), the protocol must
+      // STAY telnet — a working addressed telnet server. Clearing it to the ssh
+      // default here (as the sync-owned-protocol rule would in isolation) would
+      // leave a telnet endpoint that the next connect speaks SSH to. The stamp
+      // rides forward with the value.
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+      // The record the sync writes must survive its own reload (a preserved-address
+      // non-addressless record is a normal addressed server).
+      expect(validateServerConfig(after)).toBe(true);
+      // P3-3 (review, M19) — the "downgraded to a placeholder" DISCLOSURE must be
+      // EMPTY: this server did NOT become addressless, so announcing it as
+      // downgraded is a false preview. Dropping `blanksAddress &&` from the
+      // disclosure gate would push this warning for a hand-preserved address.
+      expect((plan.warnings ?? []).some((w) => w.toLowerCase().includes("downgraded to"))).toBe(false);
+    });
+
+    it("PRIMARY HOST (task #29) — a genuinely SYNC-OWNED addressed node that loses its console downgrades to the addressless placeholder as before, and its host/port stamps are cleared (⊘ forcing blanksAddress false leaves a sync-owned node addressed with a dead console)", () => {
+      // Sync-owned address (host === syncedHost, port === syncedPort — seeded by
+      // the helper). Device loses its console.
+      const before = makeOwnedServer({ host: "10.0.0.5", port: 2200 });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.addressless).toBe(true);
+      expect(after.host).toBe("");
+      expect(after.port).toBe(0);
+      // The placeholder owns no address, so the stamps are dropped to undefined.
+      expect(after.origin?.syncedHost).toBeUndefined();
+      expect(after.origin?.syncedPort).toBeUndefined();
+    });
+
+    it("re-syncing an already-addressless owned device with no change produces NO update (⊘ churning a no-op update every sync on every stopped node)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [before], now: 5000 });
+      expect(plan.updates).toHaveLength(0);
+      expect(plan.prunes).toHaveLength(0);
+    });
+
+    it("PRUNES an owned addressless server whose device disappears, exactly like an addressed one (⊘ special-casing addressless out of the prune phase strands deleted placeholders forever)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true });
+      const plan = computeSyncPlan({ source: makeSource({ prunePolicy: "delete" }), tree: makeTree([]), currentServers: [before], now: 5000 });
+      expect(plan.prunes.map((p) => p.server.id)).toContain(before.id);
+    });
+
+    it("P1-b — an addressless ADD does NOT clobber an existing server holding its deterministic id (a kept/restored profile), just like the addressed add path's collision guard (⊘ the addressless add unconditionally upserts the id, so applying the plan replaces the kept profile and discards its config)", () => {
+      const source = makeSource();
+      const collidingId = deterministicServerId("source-1", "device:1");
+      // A restored kept profile (no `origin`, so it is not owned by this source)
+      // that happens to hold the id this device's addressless placeholder would.
+      const kept = makeManualServer({ id: collidingId, name: "restored-kept", host: "10.0.0.7" });
+      const plan = computeSyncPlan({ source, tree: makeTree([noEndpointDevice()]), currentServers: [kept], now: 5000 });
+      // No add under the colliding id, and the kept server is left untouched.
+      expect(plan.adds.map((a) => a.id)).not.toContain(collidingId);
+      expect(plan.updates.map((u) => u.after.id)).not.toContain(collidingId);
+    });
+
+    it("clears a SYNC-OWNED telnet protocol to ssh-default on downgrade, but LEAVES a hand-flipped telnet alone (⊘ forking the protocol stamp logic would either stomp the user's hand-flip or freeze a synced telnet)", () => {
+      // Sync-owned telnet (record telnet, stamp telnet) → cleared to ssh-default.
+      const syncedTelnet = makeOwnedServer({ protocol: "telnet", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet" } });
+      const p1 = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [syncedTelnet], now: 5000 });
+      expect(p1.updates[0].after.protocol).toBeUndefined();
+      // Hand-flipped telnet (record telnet, stamp ssh/undefined) → kept.
+      const handTelnet = makeOwnedServer({ protocol: "telnet", origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const p2 = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice()]), currentServers: [handTelnet], now: 5000 });
+      expect(p2.updates[0].after.protocol).toBe("telnet");
+    });
+
+    it("STILL skips an endpoint-less device with an empty NAME — addressless is only for a device with no endpoint, never a swallow for the name skip (⊘ addressless creating a nameless placeholder)", () => {
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([noEndpointDevice({ name: "" })]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(0);
+    });
+
+    it("STILL skips a device whose endpoint has an INVALID PORT — malformed endpoint data is NOT an addressless placeholder (⊘ addressless swallowing the invalid-port skip)", () => {
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 0 }] })]),
+        currentServers: [],
+        now: 5000
+      });
+      expect(plan.adds).toHaveLength(0);
+    });
+
+    // OOB on ADDRESSLESS (Codex P2) — an addressless-for-CONSOLE device (no
+    // ssh/telnet primary) can still expose a BMC web-console or locally-executed
+    // IPMI, neither of which needs a primary console address. The addressless
+    // branch used to run BEFORE management-endpoint extraction, so it dropped the
+    // OOB address entirely; extraction now happens first and both the add and the
+    // downgrade/stay paths populate ipmiHost under the SAME syncOwnsIpmiHost
+    // discipline the addressed path uses.
+    it("(a) a redfish-only device becomes addressless but CARRIES its ipmiHost + syncedIpmiHost (⊘ the addressless branch runs before management extraction, so the placeholder drops the OOB address)", () => {
+      const device = makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.9" }] });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([device]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      const [added] = plan.adds;
+      expect(added.addressless).toBe(true);
+      expect(added.host).toBe("");
+      expect(added.ipmiHost).toBe("10.9.9.9");
+      expect(added.origin?.syncedIpmiHost).toBe("10.9.9.9");
+      // An addressless (empty-host) record carrying an ipmiHost must still validate.
+      expect(validateServerConfig(added)).toBe(true);
+    });
+
+    it("(b) re-syncing an addressless server whose OOB address moved follows it per syncOwnsIpmiHost, but a HAND-EDITED ipmiHost is NEVER stomped (⊘ the addressless path forks the ipmiHost ownership rules or ignores the stamp)", () => {
+      const movedOob = makeDevice({ endpoints: [{ kind: "redfish", host: "10.9.9.10" }] });
+
+      // Sync-owned (value === stamp) → follows the device's new OOB address.
+      const owned = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        ipmiHost: "10.9.9.9",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.9.9.9", syncedProtocol: undefined }
+      });
+      const p1 = computeSyncPlan({ source: makeSource(), tree: makeTree([movedOob]), currentServers: [owned], now: 5000 });
+      expect(p1.updates).toHaveLength(1);
+      expect(p1.updates[0].after.ipmiHost).toBe("10.9.9.10");
+      expect(p1.updates[0].after.origin?.syncedIpmiHost).toBe("10.9.9.10");
+
+      // Hand-edited (value present, stamp absent) → left alone; the discriminator.
+      const handEdited = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        ipmiHost: "192.168.99.99",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+      });
+      const p2 = computeSyncPlan({ source: makeSource(), tree: makeTree([movedOob]), currentServers: [handEdited], now: 5000 });
+      const after2 = p2.updates[0]?.after ?? handEdited;
+      expect(after2.ipmiHost).toBe("192.168.99.99");
+      expect(after2.origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    it("(c) a device with NO endpoints at all is addressless with NO ipmiHost (⊘ an over-broad fix that stamps an ipmiHost even without an OOB endpoint)", () => {
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [] })]), currentServers: [], now: 5000 });
+      expect(plan.adds).toHaveLength(1);
+      expect(plan.adds[0].addressless).toBe(true);
+      expect(plan.adds[0].ipmiHost).toBeUndefined();
+      expect(plan.adds[0].origin?.syncedIpmiHost).toBeUndefined();
+    });
+
+    // P1-A (Fable) — the addressed-update path deletes `addressless` UNCONDITIONALLY,
+    // but `selectEndpointForProtocol` returns undefined when the record's protocol is
+    // USER-OWNED (a hand-flip) and the device offers only the OTHER transport — so the
+    // host/port stay ""/0 while the flag is cleared, producing an invalid record that
+    // storage silently drops on the next reload. ⊘ Clearing the flag when no address
+    // was gained writes `{host:"",port:0}` with no addressless flag.
+    it("P1-A — a hand-flipped-telnet placeholder whose device offers only SSH stays a VALID addressless record, never {host:'',port:0} sans flag (probe: computeSyncPlan on the hand-flip × single-transport fixture)", () => {
+      // Hand-flipped: record protocol telnet, stamp ssh (syncedProtocol undefined).
+      const before = makeOwnedServer({
+        host: "",
+        port: 0,
+        addressless: true,
+        protocol: "telnet",
+        origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+      });
+      // Device gained an SSH-ONLY console — the other transport from the hand-flip.
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]),
+        currentServers: [before],
+        now: 5000
+      });
+      const after = plan.updates[0]?.after ?? before;
+      // The record the sync writes must survive its own reload.
+      expect(validateServerConfig(after)).toBe(true);
+      // It gained no address of its (hand-owned telnet) transport, so it stays addressless.
+      expect(after.addressless).toBe(true);
+      expect(after.host).toBe("");
+      // P2-3 (review, M9) — the address is left ENTIRELY alone: no endpoint of the
+      // record's hand-owned transport was found, so NEITHER value NOR stamp moves.
+      // The placeholder carried no address stamp and none is minted. Dropping the
+      // `ownedEndpoint !== undefined` gate on takesHost/takesPort would launder the
+      // ""/0 placeholder address into `syncedHost: ""` / `syncedPort: 0` — an empty
+      // stamp `isValidServerOrigin` then rejects, stripping the whole origin on the
+      // next reload (the #82 origin-strip class). validateServerConfig alone does
+      // NOT catch it (it never re-checks the origin stamps), which is why M9 hid.
+      expect(after.origin?.syncedHost).toBeUndefined();
+      expect(after.origin?.syncedPort).toBeUndefined();
+      expect(isValidServerOrigin(after.origin)).toBe(true);
+    });
+
+    it("P2-3 (review, M9) — a hand-flipped telnet server whose device offers only SSH keeps its address AND its stamp verbatim, never laundering a hand-edited host into the stamp (⊘ dropping the `ownedEndpoint !== undefined` gate re-stamps syncedHost to the record's own value, exposing the hand edit to a stomp the next time the device offers telnet)", () => {
+      // A hand-flipped telnet server (syncedProtocol undefined) whose console HOST
+      // was ALSO hand-edited: the sync last wrote 10.0.0.5, the user retyped it to
+      // 10.9.9.9. The device offers only SSH — the OTHER transport — so
+      // selectEndpointForProtocol("telnet") returns undefined and the address must
+      // be left completely alone. The device is renamed to force an update.
+      const before = makeOwnedServer({
+        protocol: "telnet",
+        host: "10.9.9.9",
+        port: 2222,
+        origin: {
+          sourceId: "source-1",
+          externalId: "device:1",
+          syncedAt: 1000,
+          syncedHost: "10.0.0.5",
+          syncedPort: 22,
+          syncedProtocol: undefined
+        }
+      });
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]),
+        currentServers: [before],
+        now: 5000
+      });
+      const after = plan.updates[0].after;
+      expect(after.name).toBe("renamed");
+      // Value untouched (no endpoint of the record's transport was found)...
+      expect(after.host).toBe("10.9.9.9");
+      expect(after.port).toBe(2222);
+      expect(after.protocol).toBe("telnet");
+      // ...and the stamp carried VERBATIM — never laundered to the current hand value.
+      expect(after.origin?.syncedHost).toBe("10.0.0.5");
+      expect(after.origin?.syncedPort).toBe(22);
+    });
+
+    // The other direction: a genuine upgrade (device offers the record's OWN transport)
+    // still clears the flag and fills the address — the fix must not freeze real upgrades.
+    it("P1-A control — an upgrade whose device offers the record's transport still clears addressless and fills the host (⊘ gating the clear on the wrong condition would freeze every upgrade addressless)", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]), currentServers: [before], now: 5000 });
+      const after = plan.updates[0].after;
+      expect(after.addressless ?? false).toBe(false);
+      expect(after.host).toBe("10.0.0.1");
+      expect(validateServerConfig(after)).toBe(true);
+    });
+
+    // P1-C (Fable) — a NEW addressless placeholder from a source with a USABLE auth
+    // profile must carry the source-level auth link, exactly as the addressed ADD
+    // does. It is inert while addressless but correct on upgrade, and BMC/IPMI
+    // features may use it. ⊘ The addressless add omitting the winner leaves the
+    // placeholder link-less, so upgrading it later reads as a hand-cleared link.
+    it("P1-C — a new addressless device from an auth-profile'd source carries the source-level authProfileId + stamp", () => {
+      const usable: AuthProfile = { id: "p1", name: "Prod", username: "svc", authType: "agent" };
+      const plan = computeSyncPlan({
+        source: makeSource({ authProfileId: "p1", defaultUsername: "admin" }),
+        tree: makeTree([makeDevice({ endpoints: [] })]),
+        currentServers: [],
+        now: 5000,
+        authProfile: usable
+      });
+      expect(plan.adds).toHaveLength(1);
+      expect(plan.adds[0].addressless).toBe(true);
+      expect(plan.adds[0].authProfileId).toBe("p1");
+      expect(plan.adds[0].origin?.syncedAuthProfileId).toBe("p1");
+    });
+
+    // The other direction: a KEYLESS source profile writes no link on the placeholder
+    // (blanket per-profile refusal), exactly as the addressed add drops a keyless
+    // winner — the placeholder falls back to agent auth.
+    // P2-3 facet 1 (Fable) — a downgrade blanks a previously-addressed server's
+    // host with NO warning (the addresslessAdded aggregate covers only NEW
+    // placeholders). Disclose it, parallel to addresslessAdded.
+    it("P2-3 — downgrading a previously-addressed server emits an aggregate disclosure warning", () => {
+      const before = makeOwnedServer({ host: "10.0.0.1", port: 22 }); // addressed
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [] })]), // device lost its console
+        currentServers: [before],
+        now: 5000
+      });
+      expect(plan.updates[0].after.addressless).toBe(true);
+      expect(plan.warnings.some((w) => /lost their console address|lost its console address|downgraded/i.test(w))).toBe(true);
+    });
+
+    it("P2-3 control — a server that was ALREADY addressless does NOT emit the downgrade warning even when the sync updates it (⊘ warning every stay-addressless sync spams the log)", () => {
+      const before = makeOwnedServer({ name: "old-name", host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({
+        source: makeSource(),
+        // Renamed at the source so the stay-addressless server IS an update this
+        // sync — exercising the "was it previously addressed?" guard.
+        tree: makeTree([makeDevice({ name: "renamed", endpoints: [] })]),
+        currentServers: [before],
+        now: 5000
+      });
+      expect(plan.updates).toHaveLength(1);
+      expect(plan.warnings.every((w) => !/lost .*console address|downgraded/i.test(w))).toBe(true);
+    });
+
+    // P3-1 (Fable) — a stay-addressless server with no change must be counted in
+    // unchangedCount (and unchangedServerIds), like the addressed no-change branch,
+    // or preview totals don't sum to the owned count and the promotion decrement
+    // gate miscounts.
+    it("P3-1 — a stay-addressless server with no change is counted in unchangedCount", () => {
+      const before = makeOwnedServer({ host: "", port: 0, addressless: true, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined } });
+      const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice({ endpoints: [] })]), currentServers: [before], now: 5000 });
+      expect(plan.updates).toHaveLength(0);
+      expect(plan.unchangedCount).toBe(1);
+    });
+
+    /**
+     * ONE ADDRESSLESS LINE (follow-up 1) — the sync owns the whole addressless
+     * disclosure now. Both providers used to push their OWN aggregate covering
+     * every addressless row in the fetch, while the engine pushed a second line
+     * covering only the placeholders it ADDED, so a sync showed two lines about
+     * overlapping sets of devices. The engine is the only layer that knows the
+     * OUTCOME (added now vs already a placeholder), so it emits the single line
+     * and the providers emit none.
+     *
+     * `addressless` here is about the DEVICE's console address, never about a
+     * downgrade: a previously-ADDRESSED server that lost its address keeps its
+     * own separate warning (the P2-3 line above) — losing an address is a
+     * different event from never having had one.
+     */
+    describe("the single addressless line", () => {
+      /** A device that is already an addressless placeholder owned by this source. */
+      function ownedPlaceholder(externalId: string, name: string): ServerConfig {
+        return makeOwnedServer({
+          id: deterministicServerId("source-1", externalId),
+          name,
+          host: "",
+          port: 0,
+          addressless: true,
+          origin: { sourceId: "source-1", externalId, syncedAt: 1000, syncedProtocol: undefined }
+        });
+      }
+
+      /** Every warning that speaks about devices having no console address. */
+      function addresslessLines(plan: InventorySyncPlan): string[] {
+        return plan.warnings.filter((w) => w.includes("no console address yet"));
+      }
+
+      it("ADDS ONLY — keeps today's sentence verbatim, so the common case does not regress (⊘ rewording the added-only branch churns the line every user already reads)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "fresh-a", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "fresh-b", endpoints: [] })
+          ]),
+          currentServers: [],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(2);
+        expect(addresslessLines(plan)).toEqual([
+          '2 devices have no console address yet and were added without one (e.g. "fresh-a", "fresh-b").'
+        ]);
+      });
+
+      it("ADDS ONLY, singular — one device reads in the singular throughout (⊘ a hardcoded plural says '1 devices ... were added')", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice({ name: "lonely", endpoints: [] })]),
+          currentServers: [],
+          now: 5000
+        });
+        expect(addresslessLines(plan)).toEqual([
+          '1 device has no console address yet and was added without one (e.g. "lonely").'
+        ]);
+      });
+
+      it("BOTH GROUPS — ONE line giving the total AND the split, covering the placeholder that was already one (⊘ counting only `addresslessAdded` under-reports the total and hides the standing placeholders — the very gap the deleted provider aggregates used to cover)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          // device:1 matches an existing placeholder and stays one (unchanged);
+          // device:2 is new and is added as a placeholder this run.
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "fresh-node", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1")],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(1);
+        expect(addresslessLines(plan)).toEqual([
+          '2 devices have no console address yet — 1 was added without one and 1 was already a placeholder (e.g. "fresh-node", "core-sw-1").'
+        ]);
+      });
+
+      it("BOTH GROUPS, plural halves — each half of the split carries its own singular/plural (⊘ one shared plural flag mangles '2 were added ... 1 were already placeholders')", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "edge-sw-2", endpoints: [] }),
+            makeDevice({ externalId: "device:3", name: "fresh-node", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1"), ownedPlaceholder("device:2", "edge-sw-2")],
+          now: 5000
+        });
+        expect(addresslessLines(plan)).toEqual([
+          '3 devices have no console address yet — 1 was added without one and 2 were already placeholders (e.g. "fresh-node", "core-sw-1", "edge-sw-2").'
+        ]);
+      });
+
+      it("BOTH GROUPS, plural ADDED half — the added half pluralises on its own count, not on the already-half's (\u2298 every other BOTH case has exactly 1 added, so a hardcoded singular arm there says '2 was added without one' and no test notices)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "fresh-a", endpoints: [] }),
+            makeDevice({ externalId: "device:3", name: "fresh-b", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1")],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(2);
+        // The mirror of the case above: 2 added / 1 already, where that one is
+        // 1 added / 2 already. Between them every arm of the BOTH branch is read.
+        expect(addresslessLines(plan)).toEqual([
+          '3 devices have no console address yet — 2 were added without one and 1 was already a placeholder (e.g. "fresh-a", "fresh-b", "core-sw-1").'
+        ]);
+      });
+
+      it("ALREADY-PLACEHOLDER ONLY — the line must NOT claim anything was added this run (⊘ reusing the added-only sentence tells the user N placeholders were created by a sync that created none)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] })]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1")],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(0);
+        expect(plan.unchangedCount).toBe(1);
+        expect(addresslessLines(plan)).toEqual([
+          '1 device has no console address yet and remains a placeholder (e.g. "core-sw-1").'
+        ]);
+        expect(addresslessLines(plan)[0]).not.toContain("added");
+      });
+
+      it("ALREADY-PLACEHOLDER ONLY, plural (⊘ a singular-only branch says '2 devices ... remains a placeholder')", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([
+            makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] }),
+            makeDevice({ externalId: "device:2", name: "edge-sw-2", endpoints: [] })
+          ]),
+          currentServers: [ownedPlaceholder("device:1", "core-sw-1"), ownedPlaceholder("device:2", "edge-sw-2")],
+          now: 5000
+        });
+        expect(addresslessLines(plan)).toEqual([
+          '2 devices have no console address yet and remain placeholders (e.g. "core-sw-1", "edge-sw-2").'
+        ]);
+      });
+
+      it("counts a stay-addressless server the sync UPDATED, not just the untouched ones — the count must span both the changed and the no-change branch (⊘ counting only in the `else` branch drops every renamed placeholder from the line)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          // Renamed at the source, so this stay-addressless server IS an update.
+          tree: makeTree([makeDevice({ externalId: "device:1", name: "renamed", endpoints: [] })]),
+          currentServers: [ownedPlaceholder("device:1", "old-name")],
+          now: 5000
+        });
+        expect(plan.updates).toHaveLength(1);
+        expect(addresslessLines(plan)).toEqual([
+          '1 device has no console address yet and remains a placeholder (e.g. "renamed").'
+        ]);
+      });
+
+      it("NEITHER — an ordinary addressed device produces NO addressless line at all (⊘ an unconditional push adds a '0 devices' line to every healthy sync)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice()]),
+          currentServers: [],
+          now: 5000
+        });
+        expect(plan.adds).toHaveLength(1);
+        expect(addresslessLines(plan)).toEqual([]);
+      });
+
+      /**
+       * R4 (review) — the `blanksAddress &&` half of the stay-addressless guard.
+       * Without it the guard is just `addressless === true` and this record is
+       * reported as "remains a placeholder", when the sync in fact decided it is
+       * NOT one: a hand edit to either half of the address makes the sync stop
+       * owning the address, so it preserves what the user typed instead of
+       * blanking it, and `blanksAddress` is false.
+       *
+       * DEFENSIVE, not a supported flow — but not unreachable either. The edit
+       * form clears the flag the moment a host is typed and export drops
+       * addressless records, so no UI produces this. A hand-edited `globalState`
+       * does: note the fixture is `host: ""` with a hand-typed PORT, which is the
+       * only shape of this state that survives the store. `validateServerConfig`
+       * demands `host === ""` whenever `addressless === true` (validation.ts:310),
+       * so `addressless: true` beside a hand-typed HOST is rejected on load and
+       * never reaches the engine at all. Asserted below, so the premise fails
+       * loudly if that rule ever changes.
+       *
+       * (This fixture also lands on the pre-existing #82-class storage hazard in
+       * the else-branch — deliberately not asserted here; it is not this line's
+       * business and needs its own change.)
+       */
+      it("a placeholder carrying a HAND-EDITED PORT is not reported as a standing placeholder — the sync preserved the hand edit, so it no longer calls the record one (\u2298 keying the guard on the `addressless` flag alone reports a record the very same sync just decided to treat as addressed)", () => {
+        const handEdited: ServerConfig = {
+          id: deterministicServerId("source-1", "device:1"),
+          name: "core-sw-1",
+          host: "",
+          port: 2222, // typed straight into the stored record, over the ADDRESSLESS_PORT sentinel
+          username: "admin",
+          authType: "agent",
+          isHidden: false,
+          group: "NetBox",
+          addressless: true,
+          // No syncedPort stamp: the sync never owned a port here, so the
+          // hand-typed one is a user value it must preserve.
+          origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+        };
+        // The premise: this record really does survive the store and reach the engine.
+        expect(validateServerConfig(handEdited)).toBe(true);
+        // ...whereas the same flag beside a hand-typed HOST does not.
+        expect(validateServerConfig({ ...handEdited, host: "10.9.9.9" })).toBe(false);
+
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          tree: makeTree([makeDevice({ externalId: "device:1", name: "core-sw-1", endpoints: [] })]),
+          currentServers: [handEdited],
+          now: 5000
+        });
+
+        expect(addresslessLines(plan)).toEqual([]);
+        // Nor the downgrade line — it shares the same `blanksAddress` gate.
+        expect(plan.warnings.filter((w) => /downgraded to a placeholder/.test(w))).toEqual([]);
+      });
+
+      it("a DOWNGRADE is NOT folded into this line — it keeps its own separate warning (⊘ lumping downgrades in with the standing placeholders reports 'was already a placeholder' about a server that had a working address until this sync)", () => {
+        const plan = computeSyncPlan({
+          source: makeSource(),
+          // Previously ADDRESSED (the default fixture owns 10.0.0.1) and the
+          // device lost its console this fetch — a downgrade, not a stay.
+          tree: makeTree([makeDevice({ endpoints: [] })]),
+          currentServers: [makeOwnedServer()],
+          now: 5000
+        });
+        expect(plan.updates).toHaveLength(1);
+        expect(plan.updates[0].after.addressless).toBe(true);
+        // The downgrade line, and ONLY the downgrade line.
+        expect(addresslessLines(plan)).toEqual([]);
+        expect(plan.warnings.filter((w) => /downgraded to a placeholder/.test(w))).toHaveLength(1);
+      });
+    });
+
+    it("P1-C — a new addressless device from a KEYLESS source profile carries NO link (⊘ writing a keyless winner stamps a link no server can satisfy)", () => {
+      const keyless: AuthProfile = { id: "p1", name: "Shared Key", username: "svc", authType: "key" };
+      const plan = computeSyncPlan({
+        source: makeSource({ authProfileId: "p1", defaultUsername: "admin" }),
+        tree: makeTree([makeDevice({ endpoints: [] })]),
+        currentServers: [],
+        now: 5000,
+        authProfile: keyless
+      });
+      expect(plan.adds[0].authProfileId).toBeUndefined();
+      expect(plan.adds[0].origin?.syncedAuthProfileId).toBeUndefined();
+    });
   });
 
   it("skips (never adopts/overwrites) a device whose deterministic id collides with an unrelated server", () => {
@@ -257,6 +948,129 @@ describe("computeSyncPlan — updates", () => {
     expect(after.logSession).toBe(true);
   });
 
+  // PRIMARY HOST/PORT (task #29, the deferred #82 P2-3) — the DELIBERATE BEHAVIOR
+  // CHANGE: host/port are now sync-owned-with-hand-off, exactly like altHost /
+  // ipmiHost / protocol. The sync follows a device address move while the record
+  // still carries what the sync last wrote, and HANDS OFF a hand-edited address.
+  it("PRIMARY HOST/PORT (task #29) — a SYNC-OWNED host/port (record === stamp) follows the device when the console address moves, and re-stamps (⊘ forcing takesHost/takesPort false ignores a real device move and freezes a synced address)", () => {
+    const source = makeSource();
+    // The helper seeds syncedHost === host and syncedPort === port, so this is a
+    // genuinely sync-owned record.
+    const before = makeOwnedServer({ host: "10.0.0.5", port: 2200 });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 2300 }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 });
+
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    // Value follows the device...
+    expect(after.host).toBe("10.0.0.9");
+    expect(after.port).toBe(2300);
+    // ...and the stamp is re-recorded to what the sync just wrote, so the record
+    // and its ownership can never disagree.
+    expect(after.origin?.syncedHost).toBe("10.0.0.9");
+    expect(after.origin?.syncedPort).toBe(2300);
+  });
+
+  it("PRIMARY HOST (task #29) — a HAND-EDITED host (record ≠ stamp) is left alone and its stamp carried forward VERBATIM as the device address moves (⊘ forcing takesHost true stomps the hand edit; laundering the stamp to the current value would let the NEXT sync overwrite it)", () => {
+    const source = makeSource();
+    // The sync last wrote 10.0.0.5; the user hand-edited the console host to
+    // 10.0.0.50. The device now reports a THIRD address, and the record is renamed
+    // so an update is produced for a reason unrelated to the address.
+    const before = makeOwnedServer({
+      host: "10.0.0.50",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedHost: "10.0.0.5", syncedPort: 22 }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.9" }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 });
+
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.name).toBe("renamed");
+    // The hand edit stands — this is the whole point of the sync-owned-with-hand-off change.
+    expect(after.host).toBe("10.0.0.50");
+    // The stamp is carried forward verbatim (10.0.0.5), NEVER laundered to the
+    // record's current 10.0.0.50 — which would read as "as stamped" one sync later.
+    expect(after.origin?.syncedHost).toBe("10.0.0.5");
+  });
+
+  it("PRIMARY PORT (task #29) — a HAND-EDITED port (record ≠ stamp) is left alone and its stamp carried forward as the device port moves (⊘ forcing takesPort true stomps a hand-edited port — the exact hazard the D5 heal must also respect)", () => {
+    const source = makeSource();
+    // The sync last wrote port 22; the user hand-edited it to 2222. The device now
+    // offers a THIRD port, and the record is renamed to force an unrelated update.
+    const before = makeOwnedServer({
+      port: 2222,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 830 }] })]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 2000 });
+
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.name).toBe("renamed");
+    // The hand-edited port stands, and its stamp is carried forward verbatim.
+    expect(after.port).toBe(2222);
+    expect(after.origin?.syncedPort).toBe(22);
+    // The sync-owned host is untouched by the port hand-off (host === stamp === device).
+    expect(after.host).toBe("10.0.0.1");
+  });
+
+  // P2-2 (review, M4/M4b) — a STAMPLESS fixture, built WITHOUT makeOwnedServer,
+  // because that helper now seeds syncedHost/syncedPort and so can never present
+  // the legacy pre-#29 shape row 5a exists to migrate: a synced server whose
+  // host/port equals the device's but carries NO address stamp (no sync before
+  // task #29 ever wrote one). This is the exact state the `|| cur === dev` clause
+  // of syncOwnsHost/syncOwnsPort rescues.
+  function stamplessOwnedServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: deterministicServerId("source-1", "device:1"),
+      name: "core-sw-1",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" },
+      ...overrides
+    };
+  }
+
+  it("MATRIX ROW 5a (task #29, M4/M4b) — a STAMPLESS synced server whose host/port already equals the device's gains BOTH address stamps while the values stay put: a genuine stamp-only update (kills dropping `|| cur === dev` from syncOwnsHost/syncOwnsPort, under which a legacy pre-#29 record can never be stamped — read as a hand entry forever, never followed and never healed)", () => {
+    const owned = stamplessOwnedServer();
+    // Nothing about the device moved — same host, same port. The STAMPS are the
+    // entire difference between before and after, which is what makes this the
+    // row-5a stamp-only shape rather than row 1 (row 1 also changes the value, so
+    // it passes even against an implementation that dropped `|| cur === dev`).
+    const plan = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice()]), currentServers: [owned], now: 2000 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.unchangedCount).toBe(0);
+    const { before, after } = plan.updates[0];
+    // The values do not move — row 5a refines "leave the value alone".
+    expect(after.host).toBe("10.0.0.1");
+    expect(after.port).toBe(22);
+    // ...and BOTH ownership stamps are now recorded, which is the whole change.
+    expect(before.origin?.syncedHost).toBeUndefined();
+    expect(before.origin?.syncedPort).toBeUndefined();
+    expect(after.origin?.syncedHost).toBe("10.0.0.1");
+    expect(after.origin?.syncedPort).toBe(22);
+  });
+
+  it("MATRIX ROW 5a, WHAT THE STAMP BUYS (task #29) — once a stampless record is stamped, the same record follows the device's host/port on the next sync (row 3); without the stamp it is stuck forever", () => {
+    const owned = stamplessOwnedServer();
+    // Sync one: values match, so the stamps are recorded.
+    const stamped = computeSyncPlan({ source: makeSource(), tree: makeTree([makeDevice()]), currentServers: [owned], now: 2000 }).updates[0].after;
+    expect(stamped.origin?.syncedHost).toBe("10.0.0.1");
+    expect(stamped.origin?.syncedPort).toBe(22);
+    // Sync two, feeding sync one's OUTPUT back in, with the device re-addressed.
+    const moved = makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 2200 }] });
+    const followed = computeSyncPlan({ source: makeSource(), tree: makeTree([moved]), currentServers: [stamped], now: 3000 }).updates[0].after;
+    expect(followed.host).toBe("10.0.0.9");
+    expect(followed.port).toBe(2200);
+    expect(followed.origin?.syncedHost).toBe("10.0.0.9");
+    expect(followed.origin?.syncedPort).toBe(2200);
+  });
+
   it("username ownership: an endpoint username overrides; its absence keeps the existing username (never falls back to defaultUsername)", () => {
     const source = makeSource({ defaultUsername: "admin" });
 
@@ -269,6 +1083,99 @@ describe("computeSyncPlan — updates", () => {
     const treeWithoutUsername = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9" }] })]); // host differs so the device is still an "update"
     const planWithoutUsername = computeSyncPlan({ source, tree: treeWithoutUsername, currentServers: [withoutEndpointUsername], now: 1000 });
     expect(planWithoutUsername.updates[0].after.username).toBe("evgeny");
+  });
+
+  // #84 P2 (Codex) — ENDPOINT-TUPLE COHERENCE. host + port + protocol + username
+  // describe ONE endpoint. When the user hand-edits the ADDRESS (so the sync hands
+  // off host/port and retains the manual endpoint), the OTHER endpoint-derived
+  // fields must NOT be applied from the inventory endpoint the user effectively
+  // rejected — otherwise the record points at the user's endpoint but authenticates
+  // as the device's account (username) or speaks the device's transport (protocol).
+  // `takesEndpoint = takesHost && takesPort` is the "the record is following the
+  // device's endpoint" gate; the endpoint-derived fields ride on it.
+  it("#84 P2 — a hand-edited HOST (address retained) keeps the CURRENT username and its syncedUsername stamp, NOT the inventory endpoint's (⊘ applying the endpoint username regardless of takesEndpoint authenticates the retained endpoint as the device's account)", () => {
+    // The sync last wrote host 10.0.0.1; the user hand-retyped it to 10.0.0.99. The
+    // device still advertises 10.0.0.1 WITH an endpoint username; renamed so an
+    // update is produced regardless of the username decision.
+    const before = makeOwnedServer({
+      username: "evgeny",
+      host: "10.0.0.99",
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedHost: "10.0.0.1",
+        syncedPort: 22,
+        syncedUsername: "prevsync"
+      }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "netops" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.host).toBe("10.0.0.99"); // the hand address is retained (#82 P2-3)
+    expect(after.username).toBe("evgeny"); // the rejected endpoint's username must NOT land
+    expect(after.origin?.syncedUsername).toBe("prevsync"); // ...nor its stamp
+  });
+
+  it("#84 P2 — a hand-edited PORT (address retained) likewise keeps the CURRENT username and its syncedUsername stamp (⊘ same bug reached via the port half of the tuple)", () => {
+    const before = makeOwnedServer({
+      username: "evgeny",
+      port: 9999,
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedHost: "10.0.0.1",
+        syncedPort: 22,
+        syncedUsername: "prevsync"
+      }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "netops" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.port).toBe(9999); // the hand port is retained
+    expect(after.username).toBe("evgeny");
+    expect(after.origin?.syncedUsername).toBe("prevsync");
+  });
+
+  it("#84 P2 — DISCRIMINATOR: when the address IS accepted (sync-owned, not hand-edited), the endpoint username IS applied and stamped, exactly as before (⊘ gating the username on 'address NOT taken' would strand a genuinely-followed endpoint on the old account)", () => {
+    const before = makeOwnedServer({ username: "evgeny" }); // sync-owned address (host === syncedHost)
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1", username: "netops" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.username).toBe("netops"); // the endpoint is followed → its username applies
+    expect(after.origin?.syncedUsername).toBe("netops");
+  });
+
+  it("#84 P2 — a sync-owned PROTOCOL rides with a RETAINED hand-edited address: a device that flips to SSH does NOT reset the telnet protocol while the telnet endpoint is kept (⊘ writing the protocol on takesProtocol alone leaves SSH pointed at the retained telnet endpoint)", () => {
+    // Sync-owned telnet (record telnet, stamp telnet) whose console was ALSO
+    // hand-edited (host 10.9.9.9:2222, sync last wrote 10.0.0.5:22). The device now
+    // advertises an SSH primary — a transport change the sync owns — so on
+    // takesProtocol alone the protocol would flip to ssh while the hand telnet
+    // endpoint is retained: SSH aimed at a telnet box.
+    const before = makeOwnedServer({
+      protocol: "telnet",
+      host: "10.9.9.9",
+      port: 2222,
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedHost: "10.0.0.5",
+        syncedPort: 22,
+        syncedProtocol: "telnet"
+      }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 5000 });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.host).toBe("10.9.9.9"); // the hand address is retained
+    expect(after.protocol).toBe("telnet"); // ...so the protocol rides with it
+    expect(after.origin?.syncedProtocol).toBe("telnet"); // stamp carried verbatim
   });
 
   it("an identical device produces no add/update, only unchangedCount (kills always-update + syncedAt-refresh-on-unchanged)", () => {
@@ -450,7 +1357,15 @@ describe("computeSyncPlan — auth profile link", () => {
       authType: "agent",
       isHidden: false,
       group: "NetBox",
-      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedUsername: "admin",
+        // PRIMARY HOST/PORT (task #29) — the address stamps the add owns.
+        syncedHost: "10.0.0.1",
+        syncedPort: 22
+      }
     });
     expect(plan.warnings.some((w) => w.includes("auth profile"))).toBe(false);
   });
@@ -625,7 +1540,12 @@ describe("computeSyncPlan — auth profile link", () => {
       sourceId: "source-1",
       externalId: "device:1",
       syncedAt: 2000,
-      syncedUsername: "admin"
+      syncedUsername: "admin",
+      // PRIMARY HOST/PORT (task #29) — the sync-owned address (seeded by the
+      // helper to match the record's own host/port) is re-stamped as this run's
+      // write, since the device still supplies it.
+      syncedHost: "10.0.0.1",
+      syncedPort: 22
     });
   });
 
@@ -733,7 +1653,10 @@ describe("computeSyncPlan — auth profile link", () => {
       externalId: "device:1",
       syncedAt: 1000,
       syncedUsername: "admin",
-      syncedAuthProfileId: "p1"
+      syncedAuthProfileId: "p1",
+      // PRIMARY HOST/PORT (task #29) — the fresh add's address stamps.
+      syncedHost: "10.0.0.1",
+      syncedPort: 22
     });
   });
 
@@ -833,7 +1756,10 @@ describe("computeSyncPlan — auth profile link", () => {
       externalId: "device:1",
       syncedAt: 2000,
       syncedUsername: "admin",
-      syncedAuthProfileId: "p1"
+      syncedAuthProfileId: "p1",
+      // PRIMARY HOST/PORT (task #29) — the sync-owned address, re-stamped.
+      syncedHost: "10.0.0.1",
+      syncedPort: 22
     });
 
     // ...and the opt-out is still standing on the sync after that one.
@@ -1373,58 +2299,62 @@ describe("computeSyncPlan — auth profile link", () => {
    * builds what is sent to the SSH server can tell a repaired record from a
    * plausible-looking one.
    */
-  it("AUTH 2b decides the rollback for an owned server whose device this run cannot map — the no-primary-IP case — so that server can open a connection again (kills running the rollback after mapping validation's skips)", async () => {
-    // "delete" rather than the fixture default, so a pass that mistook a skipped
-    // device for an absent one would DELETE this server rather than merely move it.
+  it("ADDRESSLESS (Fable P1-B) — an owned server whose device goes no-primary DOWNGRADES to addressless (not pruned), applies the source rename, AND unlinks a keyless-key profile in the same pass — parity with the post-loop rollback that covers a skipped device", async () => {
+    // "delete" rather than the fixture default, so a pass that mistook a
+    // downgraded device for an absent one would DELETE this server.
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin", prunePolicy: "delete" });
     const before = previouslyLinkedServer();
 
-    // The premise, proven rather than assumed.
-    const brokenResolved = await resolveThroughConnect(before, KEYLESS_KEY_PROFILE);
-    expect(brokenResolved.authType).toBe("key");
-    await expect(buildConnectConfig(brokenResolved)).rejects.toThrow("Missing keyPath for key auth on core-sw-1");
-
     const plan = computeSyncPlan({
       source,
-      // Exactly what the provider emits for a device with no primary IP: present,
-      // named, zero endpoints. Renamed at the source as well, so a "fix" that
-      // simply moved the validation exits below the update-building would be
-      // visible as a rename this sync has no business writing.
+      // Exactly what the provider emits for a device with no primary endpoint,
+      // renamed at the source too so the downgrade's name refresh is visible.
       tree: makeTree([makeDevice({ name: "renamed-at-source", endpoints: [] })]),
       currentServers: [before],
       now: 2000,
       authProfile: KEYLESS_KEY_PROFILE
     });
 
-    // Under the wrong implementation this plan is empty and the server stays
-    // linked, unusable, forever.
     expect(plan.updates).toHaveLength(1);
     const after = plan.updates[0].after;
+    // Downgraded, not pruned.
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.adds).toHaveLength(0);
+    expect(after.addressless).toBe(true);
+    expect(after.host).toBe("");
+    // P1-B — the keyless-key link is rolled back HERE, in the downgrade, exactly as
+    // the post-loop pass would have for a skipped device (it is not deferred).
     expect(after.authProfileId).toBeUndefined();
     expect(after.origin?.syncedAuthProfileId).toBeUndefined();
-
-    // The skip semantics are untouched. No add; no prune (FIX 1 — a device the
-    // provider could not map is not a deleted device); the per-device warning
-    // still names it; no rename, no folder move, and no claim that this sync
-    // mapped the device.
-    expect(plan.adds).toHaveLength(0);
-    expect(plan.prunes).toHaveLength(0);
-    expect(plan.warnings).toContain('Device "renamed-at-source" (device:1) has no usable SSH endpoint and was skipped.');
-    expect(after.name).toBe("core-sw-1");
-    expect(after.host).toBe("10.0.0.1");
-    expect(after.port).toBe(22);
+    // A full update: the source-side rename and folder are applied, syncedAt
+    // advances (this sync DID decide the record).
+    expect(after.name).toBe("renamed-at-source");
     expect(after.group).toBe("NetBox");
-    expect(after.username).toBe("admin");
-    expect(after.origin?.syncedAt).toBe(1000);
-    expect(after.origin?.syncedUsername).toBe("admin");
-    expect(plan.folders).toEqual(["NetBox"]);
+    expect(after.origin?.syncedAt).toBe(2000);
+  });
 
-    // THE ASSERTION THAT MATTERS — the record this plan writes connects.
+  it("ADDRESSLESS — the keyless-key unlink ALSO fires on the addressless→addressed UPGRADE, so a placeholder that still carries a keyless link (e.g. one linked by hand) is repaired when it regains an address", async () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    // The server as it sits AFTER a downgrade: addressless, still carrying the
+    // keyless-key link.
+    const addressless = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice()]), // device gained an ssh endpoint again
+      currentServers: [addressless],
+      now: 3000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.addressless ?? false).toBe(false);
+    expect(after.host).toBe("10.0.0.1");
+    // The mapped AUTH 2b unlink runs on the addressed upgrade path.
+    expect(after.authProfileId).toBeUndefined();
     const resolved = await resolveThroughConnect(after, KEYLESS_KEY_PROFILE);
     expect(resolved.authType).toBe("agent");
     const config = await buildConnectConfig(resolved);
     expect(config).toMatchObject({ host: "10.0.0.1", port: 22, username: "admin" });
-    expect(config.privateKey).toBeUndefined();
   });
 
   it("AUTH 2b covers the other mapping-validation skips too — an empty device name and an invalid port — without letting either device write anything else (kills a fix that special-cases only the no-endpoint skip)", () => {
@@ -1469,29 +2399,88 @@ describe("computeSyncPlan — auth profile link", () => {
     );
   });
 
-  it("AUTH 2b decides an owned server exactly once when the source reports its device twice and the first copy is itself skipped (kills deciding per device rather than per owned server)", () => {
+  it("ADDRESSLESS (Codex P1) — an owned server is decided exactly ONCE when its no-primary device is reported twice: the first copy downgrades it, the second is a duplicate (kills a double update / double placeholder)", () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    // A USABLE profile (has a key file), so the link legitimately rides forward on
+    // the downgrade — this test is about the decided-once/duplicate handling, not
+    // the keyless rollback (P1-B covers that with a keyless profile).
+    const usableKeyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
 
     const plan = computeSyncPlan({
       source,
-      // First copy: skipped for having no endpoint — and it is the copy that
-      // claims the externalId, so the second is skipped as a duplicate. Neither
-      // reaches the update path, and the owned server behind them is one server.
+      // First copy: no endpoint — claims the externalId, downgrading the owned
+      // server to addressless. The second copy is then a duplicate.
       tree: makeTree([makeDevice({ endpoints: [] }), makeDevice({ name: "core-sw-1-again" })]),
       currentServers: [previouslyLinkedServer()],
       now: 2000,
-      authProfile: KEYLESS_KEY_PROFILE
+      authProfile: usableKeyProfile
     });
 
-    // A rollback moved ABOVE the validation exits instead of into its own pass
-    // decides this server once per device: two updates for one record, and a
-    // warning claiming two servers were unlinked when there is only one.
+    // Exactly one update for the one owned record — the addressless downgrade —
+    // and the usable link rides forward.
     expect(plan.updates).toHaveLength(1);
-    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.authProfileId).toBe("p1");
     expect(plan.warnings).toContain('Duplicate device ID "device:1" — kept first ("core-sw-1").');
+  });
+
+  // P1-B (Fable) — the downgrade/stay addressless path marks the device "decided"
+  // (so the post-loop rollback pass skips it) but never ran the rollback itself, so
+  // an owned placeholder linked to a KEYLESS key profile stayed linked and unusable
+  // forever — a regression, since pre-PR a no-endpoint device fell through to the
+  // post-loop pass that unlinks exactly these. ⊘ Skipping decideSourceAuthRollback
+  // in the downgrade leaves the broken link in place with no unlink and no warning.
+  it("P1-B — a stay-addressless server linked to a KEYLESS key profile is UNLINKED in the downgrade path, exactly as the post-loop pass unlinks a skipped one", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]), // device:1 stays addressless
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.authProfileId).toBeUndefined();
+    expect(plan.updates[0].after.origin?.syncedAuthProfileId).toBeUndefined();
     expect(plan.warnings).toContain(
       `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it is unlinked here so it can connect again; a later sync re-links it once the profile has a key file.`
     );
+  });
+
+  it("P1-B — a stay-addressless server that brings its OWN key file is RETAINED, not unlinked, exactly as the addressed/skip paths retain it (⊘ an over-broad downgrade rollback unlinks a working keyless-profile+own-key pairing)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true, authType: "key", keyPath: "/keys/own_ed25519" });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: KEYLESS_KEY_PROFILE
+    });
+    // The link is kept (own key), and the retained clause is reported.
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.authProfileId).toBe("p1");
+    expect(plan.warnings).toContain(
+      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile.`
+    );
+  });
+
+  it("P1-B control — a USABLE profile link rides forward on downgrade (⊘ running the rollback with the wrong unusable set would unlink a working link)", () => {
+    const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
+    const usableKeyProfile: AuthProfile = { ...KEYLESS_KEY_PROFILE, keyPath: "/keys/id_ed25519" };
+    const before = previouslyLinkedServer({ host: "", port: 0, addressless: true });
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([makeDevice({ endpoints: [] })]),
+      currentServers: [before],
+      now: 2000,
+      authProfile: usableKeyProfile
+    });
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.authProfileId).toBe("p1");
+    expect(after.origin?.syncedAuthProfileId).toBe("p1");
   });
 
   it("AUTH 2b still leaves a server whose device is GONE from the fetch to the prune policy (kills a pass over every owned server, which would rewrite the credentials of a server the same plan reports as kept in place)", () => {
@@ -1510,15 +2499,14 @@ describe("computeSyncPlan — auth profile link", () => {
     expect(plan.warnings).toContain(KEYLESS_KEY_WARNING);
   });
 
-  it("the pass over unmapped devices applies the same clauses as the mapped one — a hand-set link is left alone, and a server with its own key is retained AND reported as retained (kills an unmapped pass that unlinks whatever it finds)", () => {
+  it("ADDRESSLESS (Codex P1) — two owned servers whose devices go no-primary both DOWNGRADE to addressless, each carrying its own auth (a hand-set link and a synced-with-own-key link) forward unchanged (kills clearing a link on the downgrade)", () => {
     const source = makeSource({ authProfileId: "p1", defaultUsername: "admin" });
-    // Linked by hand: carries the profile but no stamp naming it. Not the sync's to clear.
+    // Linked by hand: carries the profile but no stamp naming it.
     const handLinked = makeOwnedServer({
       authProfileId: "p1",
       origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "admin" }
     });
-    // The sync's own link, on a server that has since been given its own key file:
-    // the pairing still connects, so the link stays.
+    // The sync's own link, on a server since given its own key file.
     const withOwnKey = previouslyLinkedServer({
       id: deterministicServerId("source-1", "device:2"),
       name: "core-sw-2",
@@ -1530,17 +2518,23 @@ describe("computeSyncPlan — auth profile link", () => {
 
     const plan = computeSyncPlan({
       source,
-      // Both devices unmappable — the pass is the only thing that sees them.
       tree: makeTree([makeDevice({ endpoints: [] }), makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [] })]),
       currentServers: [handLinked, withOwnKey],
       now: 2000,
       authProfile: KEYLESS_KEY_PROFILE
     });
 
-    expect(plan.updates).toHaveLength(0);
-    expect(plan.warnings).toContain(
-      `${KEYLESS_KEY_WARNING} 1 server this sync had already linked to it keeps the link, because it carries a key file of its own and still connects through the profile.`
-    );
+    // Both downgrade to addressless; neither is pruned; each keeps its own link.
+    expect(plan.prunes).toHaveLength(0);
+    expect(plan.updates).toHaveLength(2);
+    const byId = new Map(plan.updates.map((u) => [u.after.id, u.after] as const));
+    const a = byId.get(handLinked.id)!;
+    const b = byId.get(withOwnKey.id)!;
+    expect(a.addressless).toBe(true);
+    expect(a.authProfileId).toBe("p1");
+    expect(b.addressless).toBe(true);
+    expect(b.authProfileId).toBe("p1");
+    expect(b.keyPath).toBe("/keys/own_ed25519");
   });
 
   // Pinned verbatim in both grammatical numbers: this sentence is the finding.
@@ -1771,18 +2765,18 @@ describe("computeSyncPlan — prunes", () => {
     expect(plan.hiddenPruneCount).toBe(1);
   });
 
-  it("(FIX 1) an owned server whose device is present in the tree but skipped (no usable ssh endpoint) is NOT pruned (kills pruning skipped-but-present devices)", () => {
+  it("(FIX 1 / ADDRESSLESS) an owned server whose device is present but has no usable endpoint is NOT pruned — it downgrades to an addressless placeholder instead (kills pruning a merely-stopped device)", () => {
     const source = makeSource({ prunePolicy: "delete" });
     const before = makeOwnedServer();
-    // Same externalId as `before`'s origin, still present in the fetched tree,
-    // but unmappable (no ssh endpoint) — this must NOT read as "deleted at
-    // the source".
+    // Same externalId as `before`'s origin, still present, but unmappable — this
+    // must NOT read as "deleted at the source".
     const tree = makeTree([makeDevice({ endpoints: [{ kind: "redfish", host: "10.0.0.9" }] })]);
     const plan = computeSyncPlan({ source, tree, currentServers: [before], now: 1000 });
     expect(plan.prunes).toHaveLength(0);
     expect(plan.adds).toHaveLength(0);
-    expect(plan.updates).toHaveLength(0);
-    expect(plan.warnings.some((w) => w.includes("no usable SSH endpoint"))).toBe(true);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.addressless).toBe(true);
+    expect(plan.updates[0].after.host).toBe("");
   });
 
   it("(FIX 1) an owned server whose device is present but skipped for an empty name is NOT pruned", () => {
@@ -1956,6 +2950,147 @@ describe("computeSyncPlan — adopt-on-add", () => {
 
   const profile: AuthProfile = { id: "p1", name: "Lab credentials", username: "labuser", authType: "password" };
 
+  // P2-2 (Fable) — a kept ADDRESSLESS placeholder ("":0) cannot corroborate by
+  // address, and the addressless ADD consults only the id-collision map, never the
+  // kept markers. So (a) a still-addressless re-added device mints a SECOND
+  // placeholder while the kept copy is stranded with no warning, and (b) the
+  // moved-address refusal renders the kept record as ":0" (nonsense).
+  describe("P2-2 — kept addressless placeholders", () => {
+    it("(a) a still-addressless device with a matching kept marker WARNS instead of silently stranding the kept placeholder", () => {
+      // kept-1 holds a marker for device:1 but a NON-deterministic id, so no id
+      // collision — a fresh placeholder is minted for the deterministic id.
+      const keptAddressless = makeKeptServer({ host: "", port: 0, addressless: true });
+      const plan = planFor({
+        source: makeSource(),
+        tree: makeTree([makeDevice({ endpoints: [] })]), // device:1 still addressless
+        currentServers: [keptAddressless],
+        now: 5000
+      });
+      // A placeholder is added (still no adoption-by-address possible), but the user
+      // is told a kept copy exists rather than being left to find the duplicate.
+      expect(plan.adds.some((a) => a.addressless === true)).toBe(true);
+      expect(plan.warnings.some((w) => w.includes("device:1") && /kept/i.test(w))).toBe(true);
+    });
+
+    it("(b) the moved-address refusal renders '(no address)' for an addressless kept record, never ':0'", () => {
+      const keptAddressless = makeKeptServer({ host: "", port: 0, addressless: true });
+      const plan = planFor({
+        source: makeSource(),
+        tree: makeTree([keptDevice()]), // device gained the address lab-sw-01
+        currentServers: [keptAddressless],
+        now: 5000
+      });
+      expect(plan.warnings.some((w) => w.includes("(no address)"))).toBe(true);
+      expect(plan.warnings.every((w) => !/:0\b/.test(w))).toBe(true);
+    });
+  });
+
+  /**
+   * M27/M29 (review) — THE ADOPTEE TWIN of the update path's protocol matrix.
+   * The update path had four discriminating tests and the adoption path none,
+   * so both `takesProtocol` forced true and the dropped `syncedProtocol`
+   * receipt restore survived the full suite.
+   *
+   * The substitution that makes it the same decision on a record this sync did
+   * not create: `DetachedServerOrigin.syncedProtocol` stands in for the origin
+   * stamp. Fixtures are built so the WRONG behaviour visibly changes the
+   * outcome, per CLAUDE.md's convention.
+   */
+  describe("adoption — the protocol write rule and its receipt", () => {
+    const telnetDevice = () => keptDevice({ endpoints: [{ kind: "telnet", host: "lab-sw-01" }] });
+
+    // ⊘ M27 — `takesProtocol` forced TRUE. The removed source's sync had
+    // written telnet; the user then switched the kept server back to SSH by
+    // hand. The device STILL reports telnet only, so an adoption that always
+    // takes the device's protocol flips it back — visibly, and against a choice
+    // the marker itself proves was the user's.
+    it("does NOT stomp a protocol the user changed by hand before the adoption", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: undefined,
+        formerlySynced: keptMarker({ syncedProtocol: "telnet" })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBeUndefined();
+      // ⊘ M29 — the receipt is RESTORED into the new origin, not dropped.
+      // Dropped, the next ordinary sync reads the record as "sync wrote ssh"
+      // (an absent stamp resolves to ssh), sees the device saying telnet, and
+      // row 3 flips it — the hand edit survives adoption and dies one sync later.
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    // The mirror of the test above, and the reason that one is not vacuous: on
+    // the SAME device, an adoptee whose protocol still equals what the removed
+    // source wrote DOES follow the device. Adoption eligibility corroborates
+    // host AND port, so the fixture keeps port 23 fixed and moves only the
+    // protocol — which is exactly what isolates the write rule.
+    it("DOES take the device's protocol when the kept record still carries what the removed source wrote", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: undefined,
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      expect(plan.updates).toHaveLength(1);
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    it("stamps an adoptee whose protocol already agrees with the device", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        host: "lab-sw-01",
+        port: 23,
+        protocol: "telnet",
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([telnetDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      expect(after.origin?.syncedProtocol).toBe("telnet");
+    });
+
+    it("leaves a hand-set telnet protocol alone when the device offers SSH", () => {
+      const source = makeSource();
+      const kept = makeKeptServer({
+        protocol: "telnet",
+        formerlySynced: keptMarker({ syncedProtocol: undefined })
+      });
+      const plan = planFor({ source, tree: makeTree([keptDevice()]), currentServers: [kept], now: 5000, adoptionChoice: "adopt" });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBe("telnet");
+      // Not laundered into the stamp: the very next sync must still read this
+      // as the user's value, not as "what the sync wrote".
+      expect(after.origin?.syncedProtocol).toBeUndefined();
+    });
+
+    it("adopts an ordinary SSH kept server without inventing a protocol (control)", () => {
+      const source = makeSource();
+      const plan = planFor({
+        source,
+        tree: makeTree([keptDevice()]),
+        currentServers: [makeKeptServer()],
+        now: 5000,
+        adoptionChoice: "adopt"
+      });
+
+      const after = plan.updates[0].after;
+      expect(after.protocol).toBeUndefined();
+      expect(after.origin?.syncedProtocol).toBeUndefined();
+    });
+  });
+
   it("(E-7) HEADLINE — a hand-made server at the device's exact address is NEVER adopted: no marker, no adoption (kills matching on address, the rejected design)", () => {
     const source = makeSource();
     // Identical to the canonical fixture in every respect EXCEPT the marker.
@@ -2005,7 +3140,12 @@ describe("computeSyncPlan — adopt-on-add", () => {
       syncedAt: 5000,
       syncedInstanceKey: INSTANCE_A,
       syncedUsername: undefined,
-      syncedAuthProfileId: undefined
+      syncedAuthProfileId: undefined,
+      // PRIMARY HOST/PORT (task #29) — adoption owns the address it writes (the
+      // record already corroborates the device's, up to case), so it stamps them
+      // directly, exactly as the add path does. No receipt is needed or restored.
+      syncedHost: "lab-sw-01",
+      syncedPort: 22
     });
     expect(after.origin?.syncedUsername).toBeUndefined();
     expect(after.origin?.syncedAuthProfileId).toBeUndefined();
@@ -4529,5 +5669,395 @@ describe("computeSyncPlan — altHost (alternate host, Phase 2)", () => {
     expect(after.host).toBe("2001:db8::1");
     // Hand value untouched even though it now equals `host`; the sync never owned it.
     expect(after.altHost).toBe("2001:db8::1");
+  });
+});
+
+/**
+ * TELNET (Phase 0) — inventory contract. A device that offers a telnet console
+ * and no SSH maps to a telnet server; one that offers both stays SSH. The
+ * `syncedProtocol` stamp follows the `syncedAltHost` / `syncedIpmiHost`
+ * discipline verbatim: the sync owns the field only while the record still
+ * carries exactly what the sync put there (or exactly what the device says
+ * today), and a hand-flipped protocol is never stomped.
+ */
+describe("computeSyncPlan — telnet endpoints", () => {
+  const telnetDevice = (overrides: Partial<InventoryDevice> = {}) =>
+    makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }], ...overrides });
+
+  it("maps a telnet-only device to a telnet server on the telnet default port", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].protocol).toBe("telnet");
+    expect(plan.adds[0].host).toBe("10.0.0.5");
+    // ⊘ An implementation that reuses the SSH default lands every telnet
+    // console on port 22, where nothing is listening.
+    expect(plan.adds[0].port).toBe(23);
+    expect(plan.adds[0].origin?.syncedProtocol).toBe("telnet");
+  });
+
+  it("honours an explicit port on a telnet endpoint", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5", port: 2001 }] })]),
+      currentServers: [],
+      now: 1000
+    });
+    expect(plan.adds[0].port).toBe(2001);
+  });
+
+  // ⊘ THE PRIMARY RULE. A selector that simply took the first endpoint of
+  // either kind would make this device telnet, because the telnet endpoint is
+  // listed first.
+  it("gives SSH the primary slot when a device offers both", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([
+        makeDevice({
+          endpoints: [
+            { kind: "telnet", host: "10.0.0.5" },
+            { kind: "ssh", host: "10.0.0.1" }
+          ]
+        })
+      ]),
+      currentServers: [],
+      now: 1000
+    });
+
+    expect(plan.adds[0].protocol).toBeUndefined();
+    expect(plan.adds[0].host).toBe("10.0.0.1");
+    expect(plan.adds[0].port).toBe(22);
+    expect(plan.adds[0].origin?.syncedProtocol).toBeUndefined();
+  });
+
+  it("creates an addressless placeholder for a device that offers neither ssh nor telnet (a url-only console)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "url", host: "https://example" }] })]),
+      currentServers: [],
+      now: 1000
+    });
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].addressless).toBe(true);
+  });
+
+  it("switches an owned server to telnet when the device stops offering SSH", () => {
+    const before = makeOwnedServer();
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [before],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.protocol).toBe("telnet");
+    expect(plan.updates[0].after.origin?.syncedProtocol).toBe("telnet");
+  });
+
+  // ⊘ THE STAMP DISCRIMINATOR. The sync wrote telnet; the user switched the
+  // record back to SSH by hand. The device STILL reports telnet only, so a
+  // "device always wins" implementation flips it back on the very next sync —
+  // and the fixture is built so that stomping visibly changes the outcome
+  // (protocol telnet vs ssh), not so that both paths agree.
+  it("does NOT stomp a protocol the user changed by hand", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.5",
+      port: 23,
+      protocol: undefined, // the user switched it back to SSH
+      origin: {
+        sourceId: "source-1",
+        externalId: "device:1",
+        syncedAt: 1000,
+        syncedProtocol: "telnet"
+      }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [before],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.protocol).toBeUndefined();
+    // The stamp is carried forward VERBATIM, not re-derived from the record —
+    // laundering it into "ssh" would let the sync after this one overwrite the
+    // user's choice.
+    expect(after.origin?.syncedProtocol).toBe("telnet");
+  });
+
+  it("does NOT stomp a hand-set telnet protocol back to SSH", () => {
+    const before = makeOwnedServer({
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: undefined }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice()]), // device offers SSH
+      currentServers: [before],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.protocol).toBe("telnet");
+  });
+
+  it("re-takes ownership when the record still carries exactly what the sync wrote", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.5",
+      port: 23,
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet" }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice()]), // the device gained an SSH endpoint
+      currentServers: [before],
+      now: 2000
+    });
+
+    expect(plan.updates[0].after.protocol).toBeUndefined();
+    expect(plan.updates[0].after.origin?.syncedProtocol).toBeUndefined();
+  });
+
+  it("stamps a legacy owned server whose protocol already agrees with the device", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.5",
+      port: 23,
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 }
+    });
+
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([telnetDevice()]),
+      currentServers: [before],
+      now: 2000
+    });
+
+    // Stamp-only change: the value does not move, but ownership is recorded so
+    // the field can follow the device the next time it changes.
+    expect(plan.updates[0].after.protocol).toBe("telnet");
+    expect(plan.updates[0].after.origin?.syncedProtocol).toBe("telnet");
+  });
+});
+
+/**
+ * MAJOR-2 (review) — THE WRITER AND THE VALIDATOR MUST AGREE. A record the sync
+ * writes that `validateServerConfig` rejects is dropped by
+ * `VscodeConfigRepository.getServers()` with only a console warning: the user
+ * watches the server sync in, work for the rest of the session, and silently
+ * vanish on the next reload — forever, on every re-sync.
+ */
+describe("computeSyncPlan — every telnet record it writes must validate", () => {
+  const telnetTree = () =>
+    makeTree([makeDevice({ externalId: "d1", name: "console-1", endpoints: [{ kind: "telnet", host: "10.0.0.5" }] })]);
+
+  // ⊘ The discriminator is the SOURCE with no `defaultUsername`: telnet
+  // endpoints legitimately carry no username (console servers, lab gear), so
+  // `endpoint.username ?? source.defaultUsername` is `undefined` and the record
+  // the sync just wrote fails the guard that decides whether it survives a
+  // reload. A fixture with a default username passes either way and proves
+  // nothing.
+  it("writes a valid record for a telnet device when the source has no default username", () => {
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const plan = computeSyncPlan({ source, tree: telnetTree(), currentServers: [], now: 1000 });
+
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0].protocol).toBe("telnet");
+    expect(validateServerConfig(plan.adds[0])).toBe(true);
+  });
+
+  it("writes a valid record for a telnet device when the source's default username is blank", () => {
+    const source = makeSource({ defaultUsername: "" });
+    const plan = computeSyncPlan({ source, tree: telnetTree(), currentServers: [], now: 1000 });
+    expect(validateServerConfig(plan.adds[0])).toBe(true);
+  });
+
+  it("keeps SSH records subject to the unchanged username rule", () => {
+    // An SSH device with no username anywhere is still an invalid record — the
+    // relaxation must be scoped to telnet, not a general loosening.
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const plan = computeSyncPlan({ source, tree: makeTree([makeDevice()]), currentServers: [], now: 1000 });
+    expect(plan.adds[0].protocol).toBeUndefined();
+    expect(validateServerConfig(plan.adds[0])).toBe(false);
+  });
+
+  // MINOR-8 — the "no silent drops" guarantee, stated as a property over every
+  // record a telnet sync produces rather than over one hand-picked fixture.
+  it("produces only valid records across adds, updates and adoptions", () => {
+    const source = makeSource({ defaultUsername: undefined as unknown as string });
+    const owned = makeOwnedServer({ host: "10.0.0.5", port: 23, username: "" });
+    const tree = makeTree([
+      makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }] }),
+      makeDevice({ externalId: "d2", name: "console-2", endpoints: [{ kind: "telnet", host: "10.0.0.6", port: 2002 }] })
+    ]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [owned], now: 2000 });
+
+    const written = [...plan.adds, ...plan.updates.map((u) => u.after)];
+    expect(written.length).toBeGreaterThan(0);
+    for (const record of written) {
+      expect(validateServerConfig(record), `sync wrote an invalid record: ${JSON.stringify(record)}`).toBe(true);
+    }
+  });
+});
+
+/**
+ * P1-C (Codex) — the protocol and the endpoint tuple must be decided TOGETHER.
+ *
+ * `takesProtocol` could answer "the user owns this protocol, leave it telnet"
+ * while `host`/`port` were taken unconditionally from the inventory-selected
+ * endpoint — which for a dual-stack device is the SSH one. The next sync then
+ * produced a telnet profile pointed at port 22: a record that cannot connect,
+ * assembled out of two individually-correct decisions.
+ */
+describe("computeSyncPlan — protocol and endpoint are decided coherently", () => {
+  const dualStack = () =>
+    makeDevice({
+      endpoints: [
+        { kind: "ssh", host: "10.0.0.1" },
+        { kind: "telnet", host: "10.0.0.5", port: 2001 }
+      ]
+    });
+
+  /** An owned server the user hand-switched to telnet (no stamp ⇒ hand-owned). */
+  const handTelnet = (overrides: Partial<ServerConfig> = {}) =>
+    makeOwnedServer({
+      protocol: "telnet",
+      host: "10.0.0.5",
+      port: 2001,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 },
+      ...overrides
+    });
+
+  // ⊘ THE FINDING. Pre-fix this produced `{ protocol: "telnet", host: "10.0.0.1",
+  // port: 22 }` — the SSH endpoint's tuple under a telnet protocol. The fixture
+  // gives the device BOTH endpoints at DIFFERENT addresses and ports, so a
+  // mismatched pick is visible in every field.
+  it("follows the telnet endpoint for a hand-telnet server on a dual-endpoint device", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([dualStack()]),
+      currentServers: [handTelnet({ host: "10.0.0.9", port: 23 })],
+      now: 2000
+    });
+
+    expect(plan.updates).toHaveLength(1);
+    const after = plan.updates[0].after;
+    expect(after.protocol).toBe("telnet");
+    expect(after.host).toBe("10.0.0.5");
+    expect(after.port).toBe(2001);
+  });
+
+  // ⊘ The conservative half: the device offers no telnet endpoint at all, so
+  // there is no address to follow. Overwriting host/port from the SSH endpoint
+  // would leave a telnet profile aimed at the SSH port — the exact broken record
+  // this finding is about — so the tuple is left ALONE.
+  it("leaves a hand-telnet server's address alone when the device offers no telnet endpoint", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]),
+      currentServers: [handTelnet({ host: "10.0.0.9", port: 23 })],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after;
+    if (after) {
+      expect(after.protocol).toBe("telnet");
+      expect(after.host).toBe("10.0.0.9");
+      expect(after.port).toBe(23);
+    }
+    // Whether or not an update is emitted, the record must never end up telnet
+    // on the SSH endpoint's tuple.
+    expect(after?.host).not.toBe("10.0.0.1");
+    expect(after?.port).not.toBe(22);
+  });
+
+  it("mirrors the rule for a hand-SSH server on a telnet-only device", () => {
+    const owned = makeOwnedServer({
+      protocol: undefined,
+      host: "10.0.0.9",
+      port: 22,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet" }
+    });
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = plan.updates[0]?.after;
+    // The user owns "ssh"; the device offers only telnet, so nothing to follow.
+    expect(after?.protocol ?? owned.protocol).toBeUndefined();
+    expect(after?.host ?? owned.host).toBe("10.0.0.9");
+    expect(after?.port ?? owned.port).toBe(22);
+  });
+
+  // CONTROL — a sync-owned server still follows the device exactly as before,
+  // so the fix is scoped to the hand-owned case and has not frozen addresses.
+  it("still moves a sync-owned server's address and protocol with the device", () => {
+    const owned = makeOwnedServer({
+      host: "10.0.0.99",
+      port: 22,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 }
+    });
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5" }] })]),
+      currentServers: [owned],
+      now: 2000
+    });
+
+    const after = plan.updates[0].after;
+    expect(after.protocol).toBe("telnet");
+    expect(after.host).toBe("10.0.0.5");
+    expect(after.port).toBe(23);
+  });
+
+  it("still follows the SSH endpoint for an ordinary sync-owned SSH server", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([dualStack()]),
+      currentServers: [makeOwnedServer({ host: "10.0.0.99" })],
+      now: 2000
+    });
+
+    const after = plan.updates[0].after;
+    expect(after.protocol).toBeUndefined();
+    expect(after.host).toBe("10.0.0.1");
+    expect(after.port).toBe(22);
+  });
+});
+
+describe("validateInventoryTree — telnet endpoint kind", () => {
+  it("accepts a device whose only endpoint is telnet", () => {
+    expect(() =>
+      validateInventoryTree({
+        contractVersion: 1,
+        devices: [{ externalId: "d1", name: "r1", endpoints: [{ kind: "telnet", host: "10.0.0.5", port: 2001 }] }]
+      })
+    ).not.toThrow();
+  });
+
+  // ⊘ A tree that validates but whose telnet endpoint is dropped on the way
+  // through would pass the assertion above and still be useless.
+  it("carries the accepted telnet endpoint all the way to a mapped server", () => {
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.5", port: 2001 }] })]),
+      currentServers: [],
+      now: 1000
+    });
+    expect(plan.adds[0]).toEqual(expect.objectContaining({ host: "10.0.0.5", port: 2001, protocol: "telnet" }));
   });
 });

@@ -1,0 +1,148 @@
+# Releases automatically when a version bump lands on main.
+#
+# On every push to main this workflow compares package.json's version against
+# the previous commit. If the version changed, it creates the v{version} tag
+# and runs the full release pipeline (VSIX build + GitHub Release + VS Code
+# Marketplace, and Open VSX) by CALLING release.yml and publish-openvsx.yml
+# directly. Calling them is deliberate, not a convenience: tags pushed with the
+# workflow's own GITHUB_TOKEN do not trigger other workflows (a GitHub
+# safeguard against recursive Actions), so the tag alone would release nothing.
+#
+# ESCAPE HATCHES — three ways a merge to main does NOT release:
+#   1. Don't bump the version. Docs/CI-only merges release nothing.
+#   2. Put "[skip release]" anywhere in the merge (squash) commit message —
+#      the version bump lands, the tag is NOT created, nothing publishes.
+#      Releasing later = push the tag manually (tag push still triggers the
+#      release workflows exactly as before this workflow existed).
+#   3. The tag already exists (e.g. pushed manually first) — no-op.
+#
+# Manual tag pushes keep working unchanged; this workflow only automates the
+# "merge a version-bumped PR" path.
+
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+
+# DELIBERATELY NO concurrency group. GitHub keeps at most ONE pending run per
+# group, so a version-bump run queued behind an active release could be
+# replaced (canceled) by a later docs-only push — and because the decision
+# below compares each push against its own base, the replaced push's version
+# would then never release. Correctness here relies on every push run being
+# allowed to complete. Races between simultaneous runs are serialized by the
+# tag push itself instead: a git ref creation is atomic server-side, so the
+# loser sees the tag exist and skips the release jobs (see the tag job).
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the base of a multi-commit push may not be HEAD^.
+          fetch-depth: 0
+
+      - name: Decide whether this push releases
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          tag="v$version"
+          release=true
+          reason="version bumped to $version"
+
+          # Escape hatch 2: explicit opt-out in the merge commit message.
+          if grep -qiF '[skip release]' <<<"$HEAD_MSG"; then
+            release=false
+            reason="head commit message contains [skip release]"
+          fi
+
+          # Escape hatch 1: no version change since the pushed range's base.
+          if [ "$release" = true ]; then
+            base="$BASE_SHA"
+            if [ -z "$base" ] \
+              || [ "$base" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              base=$(git rev-parse -q --verify HEAD^ || true)
+            fi
+            if [ -n "$base" ]; then
+              prev=$(git show "$base:package.json" \
+                | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+              if [ "$prev" = "$version" ]; then
+                release=false
+                reason="version unchanged ($version)"
+              fi
+            fi
+          fi
+
+          # Escape hatch 3: the tag already exists (manual release beat us).
+          if [ "$release" = true ] \
+            && git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            release=false
+            reason="tag $tag already exists"
+          fi
+
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Decision: release=$release ($reason)"
+
+  tag:
+    needs: decide
+    if: needs.decide.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.tag.outputs.created }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create and push the release tag
+        id: tag
+        env:
+          TAG: ${{ needs.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG" "$GITHUB_SHA"
+          # The serialization point: ref creation is atomic, so exactly one
+          # concurrent run can win. A loser is not an error — someone else
+          # released this version — it just must not run the release jobs.
+          if git push origin "refs/tags/$TAG"; then
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — another run won the race; skipping release."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag push failed and $TAG does not exist — real failure." >&2
+            exit 1
+          fi
+
+  release:
+    needs: [decide, tag]
+    if: needs.tag.outputs.created == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.decide.outputs.tag }}
+    secrets: inherit
+
+  openvsx:
+    needs: [decide, tag]
+    if: needs.tag.outputs.created == 'true'
+    uses: ./.github/workflows/publish-openvsx.yml
+    with:
+      tag: ${{ needs.decide.outputs.tag }}
+    secrets: inherit

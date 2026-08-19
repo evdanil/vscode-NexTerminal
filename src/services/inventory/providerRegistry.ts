@@ -42,6 +42,13 @@ export function validateProviderShape(provider: unknown): asserts provider is In
     if (typeof f.type !== "string" || !VALID_FIELD_TYPES.has(f.type as InventoryConfigFieldType)) {
       throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid type "${String(f.type)}".`);
     }
+    // MINOR-14 (EVE-NG review) — `defaultValue` is part of the field contract
+    // (the Add form seeds a boolean field from it). A non-boolean value would be
+    // silently coerced by the form's `=== true` read, so a documented default of
+    // "yes" becomes an unchecked box — reject it at the boundary.
+    if (f.defaultValue !== undefined && typeof f.defaultValue !== "boolean") {
+      throw new Error(`Inventory provider configFields entry "${f.id}" has a non-boolean defaultValue.`);
+    }
     if (f.type === "select") {
       if (!Array.isArray(f.options) || f.options.length === 0) {
         throw new Error(`Inventory provider configFields entry "${f.id}" of type "select" must declare a non-empty options array.`);
@@ -88,6 +95,25 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   // already removed a source with Keep Servers.
   if (obj.instanceKey !== undefined && typeof obj.instanceKey !== "function") {
     throw new Error("Inventory provider instanceKey must be a function when present.");
+  }
+  // LIVE STATUS (Phase 2) — the twin of the instanceKey clause. `fetchStatus` is
+  // OPTIONAL (a provider that only supplies inventory has none), but a
+  // non-function value under that name is an error, loudly rather than silently:
+  // a typo'd `fetchStatus` would otherwise be indistinguishable at runtime from a
+  // provider that never declared one, and the symptom — status refresh quietly
+  // never firing — is invisible until a user wonders why running labs are not
+  // highlighted.
+  if (obj.fetchStatus !== undefined && typeof obj.fetchStatus !== "function") {
+    throw new Error("Inventory provider fetchStatus must be a function when present.");
+  }
+  // NODE CONTROL (Phase 4) — the twin of the fetchStatus clause. `controlNode`
+  // is OPTIONAL (only EVE-NG implements node start/stop), but a non-function
+  // value under that name is an error, loudly rather than silently: a typo'd
+  // `controlNode` would otherwise be indistinguishable at runtime from a
+  // provider that never declared one, and the symptom — Start/Stop quietly doing
+  // nothing — is invisible until a user wonders why a node never boots.
+  if (obj.controlNode !== undefined && typeof obj.controlNode !== "function") {
+    throw new Error("Inventory provider controlNode must be a function when present.");
   }
 }
 

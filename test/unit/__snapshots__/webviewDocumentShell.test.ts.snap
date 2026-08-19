@@ -2146,6 +2146,52 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       }
       updateVisibility();
 
+      /* TELNET (Phase 0, MINOR-3) — a numeric field whose DEFAULT follows
+         another control (the server form's Port following Protocol: 22 for ssh,
+         23 for telnet).
+
+         P2-A (Codex) — the swap tracks whether the value is AUTO-DERIVED, not
+         whether it merely looks like a default. Asking "is this one of the
+         mapped defaults?" cannot tell a hand-set SSH-on-23 apart from the telnet
+         default, so a protocol round-trip silently rewrote it to 22 — breaking
+         the "hand-set values are retained" contract this hook is supposed to
+         keep. A value is auto-derived only if it matched the SOURCE'S OWN
+         default at render time, and it stops being auto the moment the user
+         types into the field. A dirty flag alone is not enough: the seeded value
+         is judged before any typing happens. */
+      var defaultsTargets = document.querySelectorAll("[data-defaults-from]");
+      for (var di = 0; di < defaultsTargets.length; di++) {
+        (function(input) {
+          var spec;
+          try {
+            spec = JSON.parse(input.dataset.defaultsFrom);
+          } catch (_error) {
+            return;
+          }
+          if (!spec || !spec.field || !spec.defaults) return;
+          var source = form.elements[spec.field];
+          if (!source) return;
+          /* Auto-derived iff the rendered value is exactly the default for the
+             protocol the form OPENED on. A telnet server on 23 is auto; an SSH
+             server on 23 is the user's own choice and is never touched again. */
+          var isAuto = String(input.value) === String(spec.defaults[source.value]);
+          input.addEventListener("input", function() { isAuto = false; });
+          input.addEventListener("change", function() { isAuto = false; });
+          var applyDefault = function() {
+            if (!isAuto) return;
+            var wanted = spec.defaults[source.value];
+            if (wanted === undefined) return;
+            if (String(input.value) !== String(wanted)) {
+              input.value = String(wanted);
+              /* Still auto: this write is the hook's own, not the user's. */
+              isAuto = true;
+            }
+          };
+          source.addEventListener("change", applyDefault);
+          source.addEventListener("input", applyDefault);
+        })(defaultsTargets[di]);
+      }
+
       form.addEventListener("submit", function(e) {
         e.preventDefault();
         var values = {};
@@ -3594,6 +3640,52 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         }
       }
       updateVisibility();
+
+      /* TELNET (Phase 0, MINOR-3) — a numeric field whose DEFAULT follows
+         another control (the server form's Port following Protocol: 22 for ssh,
+         23 for telnet).
+
+         P2-A (Codex) — the swap tracks whether the value is AUTO-DERIVED, not
+         whether it merely looks like a default. Asking "is this one of the
+         mapped defaults?" cannot tell a hand-set SSH-on-23 apart from the telnet
+         default, so a protocol round-trip silently rewrote it to 22 — breaking
+         the "hand-set values are retained" contract this hook is supposed to
+         keep. A value is auto-derived only if it matched the SOURCE'S OWN
+         default at render time, and it stops being auto the moment the user
+         types into the field. A dirty flag alone is not enough: the seeded value
+         is judged before any typing happens. */
+      var defaultsTargets = document.querySelectorAll("[data-defaults-from]");
+      for (var di = 0; di < defaultsTargets.length; di++) {
+        (function(input) {
+          var spec;
+          try {
+            spec = JSON.parse(input.dataset.defaultsFrom);
+          } catch (_error) {
+            return;
+          }
+          if (!spec || !spec.field || !spec.defaults) return;
+          var source = form.elements[spec.field];
+          if (!source) return;
+          /* Auto-derived iff the rendered value is exactly the default for the
+             protocol the form OPENED on. A telnet server on 23 is auto; an SSH
+             server on 23 is the user's own choice and is never touched again. */
+          var isAuto = String(input.value) === String(spec.defaults[source.value]);
+          input.addEventListener("input", function() { isAuto = false; });
+          input.addEventListener("change", function() { isAuto = false; });
+          var applyDefault = function() {
+            if (!isAuto) return;
+            var wanted = spec.defaults[source.value];
+            if (wanted === undefined) return;
+            if (String(input.value) !== String(wanted)) {
+              input.value = String(wanted);
+              /* Still auto: this write is the hook's own, not the user's. */
+              isAuto = true;
+            }
+          };
+          source.addEventListener("change", applyDefault);
+          source.addEventListener("input", applyDefault);
+        })(defaultsTargets[di]);
+      }
 
       form.addEventListener("submit", function(e) {
         e.preventDefault();
@@ -9703,6 +9795,17 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.maxRuntimeSeconds"></span>
 </div>
   <div class="form-group">
+  <label for="setting-nexus-scripts-maxReadSizeMb">Max File Read Size</label>
+  <div class="setting-desc">Largest file nexus.fs.readText / readJson will read for a script. Bigger files are refused with FileTooLarge. Snapshotted when a run starts — a change does not affect scripts already running.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-scripts-maxReadSizeMb" data-section="nexus.scripts" data-key="maxReadSizeMb" value="1" min="1" max="16" />
+    <span class="unit-suffix">MB</span>
+    <span class="range-hint">(1–16, default: 4)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.scripts.maxReadSizeMb"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.maxReadSizeMb"></span>
+</div>
+  <div class="form-group">
   <label id="setting-nexus-scripts-macroPolicy-label">Macro Behaviour During Runs</label>
   <div class="setting-desc">How macro auto-triggers on the bound session behave while a script is running. Applies to new runs only — in-flight scripts keep the policy they started with.</div>
   <div class="custom-select" data-section="nexus.scripts" data-key="macroPolicy">
@@ -9716,6 +9819,19 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
     </div>
   </div>
   <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.macroPolicy"></span>
+</div>
+
+  <h3 id="section-inventory">Inventory</h3>
+  <div class="form-group">
+  <label for="setting-nexus-inventory-statusPollSeconds">Lab status poll interval</label>
+  <div class="setting-desc">How often to refresh EVE-NG lab running status while the Command Center is visible. 0 disables polling (use Refresh Lab Status manually).</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-inventory-statusPollSeconds" data-section="nexus.inventory" data-key="statusPollSeconds" value="0" min="0" max="3600" />
+    <span class="unit-suffix">seconds</span>
+    <span class="range-hint">(0–3600, default: 0)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.inventory.statusPollSeconds"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.inventory.statusPollSeconds"></span>
 </div>
 
   <h3 id="section-importexport">Import / Export</h3>

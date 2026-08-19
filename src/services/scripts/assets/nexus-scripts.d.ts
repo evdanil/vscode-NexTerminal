@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v3
+// Nexus Scripts API types — v7
 /**
  * Nexus Terminal — Scripts API
  *
@@ -261,4 +261,220 @@ declare global {
   interface CancelledError extends Error {
     code: "Cancelled";
   }
+
+  /**
+   * Thrown by `nexus.fs` calls. Catch with `if (e.code === "FileNotFound") ...`.
+   *
+   * `ReadFailed` covers both "the path resolved but the read/probe itself
+   * failed" (permissions, a misbehaving filesystem provider) and "the call hit
+   * the fixed 30-second deadline every `nexus.fs` call is bounded by" — the
+   * latter's message ends in `timed out after 30s`. Neither a timeout nor a
+   * failed probe is ever reported as a missing file, an empty read, or (for
+   * `exists`) a `false`.
+   *
+   * `FileTooLarge` additionally carries `sizeBytes` / `maxBytes` (see
+   * `ScriptFsFileTooLargeError` below) — declared here too, optionally, so
+   * `e.sizeBytes` type-checks straight off a plain `ScriptFsError`-typed
+   * catch without narrowing to the subtype first.
+   */
+  interface ScriptFsError extends Error {
+    code: "FileNotFound" | "PathOutsideScope" | "FileTooLarge" | "NotUtf8"
+        | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
+    /**
+     * Present when `code === "FileTooLarge"`. The file's size in bytes as
+     * observed at read time — a LOWER BOUND when the true size could not be
+     * determined (a file that grew past the cap mid-read, or a provider that
+     * under-reported its size, reports the cap + 1).
+     */
+    sizeBytes?: number;
+    /**
+     * Present when `code === "FileTooLarge"`. The effective cap for this run —
+     * `nexus.scripts.maxReadSizeMb` (default 4 MiB, range 1–16 MiB),
+     * snapshotted when the script started.
+     */
+    maxBytes?: number;
+  }
+
+  /**
+   * `ScriptFsError` narrowed to the `"FileTooLarge"` case, with `sizeBytes` /
+   * `maxBytes` required instead of optional. Narrow a `ScriptFsError` (or
+   * `ScriptFsError | ScriptFsFileTooLargeError`) down to this shape the usual
+   * discriminated-union way:
+   * ```js
+   * try {
+   *   await nexus.fs.readText(path);
+   * } catch (e) {
+   *   if (e.code === "FileTooLarge") {
+   *     log.warn(`${path}: ${e.sizeBytes} bytes exceeds the ${e.maxBytes}-byte limit`);
+   *   }
+   * }
+   * ```
+   */
+  interface ScriptFsFileTooLargeError extends ScriptFsError {
+    code: "FileTooLarge";
+    sizeBytes: number;
+    maxBytes: number;
+  }
+
+  /**
+   * Thrown by `nexus.include()` when a module cannot be loaded. Catch with
+   * `if (e.code === "CircularInclude") ...`.
+   *
+   * A module body that throws does NOT produce one of these: its own error
+   * propagates unwrapped, so the stack keeps pointing at the line that threw.
+   * Path failures (`InvalidPath`, `PathOutsideScope`, `FileNotFound`,
+   * `FileTooLarge`, `NotUtf8`, `NoScriptDir`, `ReadFailed`) come through as
+   * `ScriptFsError` — an include IS a scoped file read.
+   */
+  interface ScriptIncludeError extends Error {
+    code:
+      /** The module is already on the chain that is including it. `cycle` spells the loop out. */
+      | "CircularInclude"
+      /** More than 16 levels of nesting. */
+      | "IncludeDepthExceeded"
+      /** This run hit an include budget: 64 distinct modules per run, or 48 MiB of combined module source, whichever comes first. */
+      | "IncludeLimitExceeded"
+      /** The module's source did not compile. Names the file; V8 gives no line for this. */
+      | "IncludeSyntaxError"
+      /** The target carries an `@nexus-script` marker — it is a script, not a library. */
+      | "IncludeIsScript"
+      /** Protocol violation inside the runtime — please file an issue. */
+      | "IncludeInternal";
+    /** `CircularInclude`: the loop, entry script first, e.g. `["main.js", "lib/a.js", "lib/a.js"]`. */
+    cycle?: string[];
+    /** `IncludeDepthExceeded`: the depth that was refused, and the limit. */
+    depth?: number;
+    maxDepth?: number;
+    /** `IncludeLimitExceeded`, module-count budget: modules already loaded, and the limit. */
+    count?: number;
+    maxModules?: number;
+    /** `IncludeLimitExceeded`, source-size budget: bytes of module source already loaded, and the limit. */
+    totalBytes?: number;
+    maxTotalBytes?: number;
+    /** `IncludeIsScript` / `IncludeSyntaxError`: the module's display name. */
+    module?: string;
+  }
+
+  // ---------------------------------------------------------------------------
+  // nexus.fs — read-only, scoped, logged file access
+  // ---------------------------------------------------------------------------
+
+  interface NexusFileSystem {
+    /**
+     * Read a UTF-8 text file. Relative paths resolve against THIS SCRIPT'S own
+     * directory; the target must stay inside the Nexus scripts folder or the
+     * script's own folder subtree. Max `nexus.scripts.maxReadSizeMb` (default
+     * 4 MiB). Every read is logged to the "Nexus Scripts" Output Channel.
+     *
+     * Never blocks longer than 30 seconds, measured over the WHOLE call —
+     * including any wait for a read slot when several reads are in flight at
+     * once. A filesystem that hasn't answered by then (or a slot that never
+     * came free) throws `ReadFailed` ("timed out after 30s") instead of
+     * hanging the run.
+     */
+    readText(path: string): Promise<string>;
+    /**
+     * readText + JSON.parse. Parse failures throw SyntaxError with code
+     * "InvalidJson". Defaults to `Promise<any>` so `.property` access on the
+     * result type-checks without a cast; pass `T` for a typed result, e.g.
+     * `await nexus.fs.readJson<{ devices: string[] }>("./config.json")`.
+     */
+    readJson<T = any>(path: string): Promise<T>;
+    /**
+     * True if an entry (file or directory) exists at the scoped path.
+     * Out-of-scope paths throw rather than answering `false`.
+     *
+     * Bounded by the same 30-second deadline as `readText`, whole call
+     * included: probes are throttled on their own pool — separate from
+     * `readText`'s, so a slow read never delays a probe or vice versa — and a
+     * wait for a probe slot counts against the deadline exactly like a wait
+     * for the filesystem. A probe the filesystem hasn't answered by then
+     * throws `ReadFailed` ("timed out after 30s"). A probe that FAILED — no
+     * permission to look, an erroring or unavailable filesystem provider —
+     * throws `ReadFailed` too; only a genuine "nothing is there" answers
+     * `false`. "I couldn't tell" is deliberately never collapsed into
+     * `false`.
+     */
+    exists(path: string): Promise<boolean>;
+  }
+
+  interface NexusApi {
+    /** Read-only, scoped, logged file access. */
+    fs: NexusFileSystem;
+    /**
+     * Load another `.js` file as a module and resolve to its exports —
+     * CommonJS-flavoured, and the supported way to split a long script into
+     * files.
+     *
+     * ```js
+     * // lib/helpers.js  (a plain .js file, NO @nexus-script marker)
+     * exports.login = async (user) => { await sendLine(user); };
+     *
+     * // main.js
+     * const helpers = await nexus.include("./lib/helpers.js");
+     * await helpers.login("admin");
+     * ```
+     *
+     * - **Relative paths resolve against the file they are written in**, at any
+     *   depth — `nexus.fs` inside an included file does too. Containment is
+     *   unchanged: the target must still land inside the scripts folder or the
+     *   entry script's own folder.
+     * - The specifier must be an explicit path ending in `.js`. No implicit
+     *   extension, no `index.js`, no `node_modules`, no bare specifiers. Data
+     *   files go through `nexus.fs.readText` / `nexus.fs.readJson`.
+     * - **An included file must not carry `@nexus-script`** — that marker means
+     *   "entry point" (`IncludeIsScript`), and header directives in an included
+     *   file are never honoured.
+     * - Exports precedence: a reassigned `module.exports` wins; otherwise
+     *   anything put on `exports` wins; otherwise the body's own `return` value
+     *   is used.
+     * - Each module whose source was delivered is loaded **at most once per
+     *   run** — later includes get the same exports object, and a module whose
+     *   compile or body threw keeps throwing the same error. Refusals are
+     *   re-evaluated on every call.
+     * - Cycles throw `CircularInclude` with the loop spelled out. Max 16 levels
+     *   deep, and 64 distinct modules per run, or 48 MiB of combined module
+     *   source, whichever comes first (`IncludeLimitExceeded`).
+     * - Reads share `nexus.fs`'s cap, UTF-8 requirement, 30-second deadline and
+     *   read pool, and every load is logged to the "Nexus Scripts" Output
+     *   Channel.
+     *
+     * Defaults to `Promise<any>` so property access on the result type-checks
+     * without a cast; pass `T` (e.g. `typeof import("./lib/helpers.js")`) for a
+     * typed result.
+     */
+    include<T = any>(path: string): Promise<T>;
+  }
+
+  /** Nexus host API namespace. */
+  const nexus: NexusApi;
+
+  // ---------------------------------------------------------------------------
+  // Available INSIDE AN INCLUDED FILE only
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The module record of an included file. Whatever `module.exports` holds when
+   * the file finishes is what `nexus.include()` resolves to.
+   */
+  interface NexusScriptModule {
+    exports: any;
+  }
+
+  /**
+   * Present inside a file loaded with `nexus.include()`. Assigning
+   * `module.exports = ...` replaces the whole exports object.
+   *
+   * NOT available in an entry script (a file with `@nexus-script`) — referencing
+   * it there throws `ReferenceError` at runtime. Entry scripts are run, not
+   * imported; move the reusable part into an included file.
+   */
+  const module: NexusScriptModule;
+
+  /**
+   * Present inside a file loaded with `nexus.include()`, and initially the same
+   * object as `module.exports`. Same caveat as `module`: referencing it in an
+   * entry script throws `ReferenceError`.
+   */
+  var exports: any;
 }

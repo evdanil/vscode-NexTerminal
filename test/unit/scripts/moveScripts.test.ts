@@ -50,7 +50,6 @@ vi.mock("vscode", () => ({
 import * as vscode from "vscode";
 import {
   moveScriptIntoFolder,
-  isPathInside,
   type ScriptMoveResult
 } from "../../../src/services/scripts/moveScripts";
 
@@ -69,21 +68,12 @@ async function move(
   return moveScriptIntoFolder(uri(source), uri(targetDir), new Set(running), uri(root));
 }
 
-describe("isPathInside", () => {
-  it("accepts a descendant and the directory itself", () => {
-    expect(isPathInside("/ws/scripts/a.js", "/ws/scripts")).toBe(true);
-    expect(isPathInside("/ws/scripts/cisco/a.js", "/ws/scripts")).toBe(true);
-    expect(isPathInside("/ws/scripts", "/ws/scripts")).toBe(true);
-  });
-
-  it("rejects an escape, and a sibling whose name merely shares the prefix", () => {
-    expect(isPathInside("/ws/elsewhere/a.js", "/ws/scripts")).toBe(false);
-    expect(isPathInside("/ws/scripts/../secrets/a.js", "/ws/scripts")).toBe(false);
-    // The trap a bare `startsWith` falls into: "/ws/scripts-backup" starts with
-    // "/ws/scripts" as a STRING but is a different directory.
-    expect(isPathInside("/ws/scripts-backup/a.js", "/ws/scripts")).toBe(false);
-  });
-});
+// Containment (isLexicallyWithin) has its own full matrix in
+// test/unit/scripts/scriptFsScope.test.ts — moveScripts.ts now delegates to
+// it (Amendment A / DRY) rather than carrying its own copy. The refusal case
+// below ("refuses a source outside the scripts root") is the integration
+// point: it pins that moveScriptIntoFolder actually wires the shared
+// function up, not just that the function itself works.
 
 describe("moveScriptIntoFolder", () => {
   beforeEach(() => {

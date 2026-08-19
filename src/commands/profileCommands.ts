@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { UnifiedProfileSeed } from "../ui/formDefinitions";
-import { unifiedProfileFormDefinition, unifiedProfileFormId } from "../ui/formDefinitions";
+import { unifiedProfileFormDefinition, unifiedProfileFormId , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, LocalServerConfigTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -65,7 +65,9 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const existingGroups = collectGroups(ctx);
   const defaultLogSession = vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
   const snapshot = ctx.core.getSnapshot();
-  const serverList = snapshot.servers.map((s) => ({ id: s.id, name: s.name }));
+  // TELNET (Phase 0, MAJOR-3) — see serverCommands.ts: the protocol is what
+  // keeps telnet servers out of the SSH-infrastructure pickers.
+  const serverList = toSshInfrastructureServerList(snapshot.servers);
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles, {
     vscodeTerminalProfileNames: getConfiguredVscodeTerminalProfileNames()
   });
@@ -328,9 +330,23 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
 export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[] {
   const showProfileActions = async (arg?: unknown): Promise<void> => {
     if (arg instanceof ServerTreeItem) {
+      // NODE CONTROL (Phase 4, task #28 — M5) — node power is the headline EVE-row
+      // capability, but the click-path quick-pick only offered Connect/Test
+      // (futile on a stopped node) and left Start/Stop right-click-only. Reuse the
+      // same origin+status resolution the row already ran: the eve marker is
+      // composed into contextValue, so read it back rather than re-resolving. Only
+      // ONE ever shows (the whens are mutually exclusive). The command arg is the
+      // tree item, so the handler's resolveServerArg receives arg.server.
+      const eveState = arg.contextValue?.endsWith(".eveStopped")
+        ? "stopped"
+        : arg.contextValue?.endsWith(".eveRunning")
+          ? "running"
+          : undefined;
       const picks: ProfileActionPick[] = [
         { label: "Connect", command: "nexus.server.connect" },
         { label: "Test Connection", command: "nexus.server.testConnection" },
+        ...(eveState === "stopped" ? [{ label: "Start Node", command: "nexus.inventory.startNode" }] : []),
+        ...(eveState === "running" ? [{ label: "Stop Node", command: "nexus.inventory.stopNode" }] : []),
         ...(ctx.core.isServerConnected(arg.server.id)
           ? [{ label: "Browse Files", command: "nexus.files.browse" }]
           : []),
@@ -444,7 +460,11 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
         return;
       }
       const fullPath = parentPath ? parentPath + "/" + name.trim() : name.trim();
-      await ctx.core.addGroup(fullPath);
+      // #84 P1 (serialization audit) — addGroup persists the FULL folder list;
+      // serialize it under configMutationLock so two concurrent group writes (or a
+      // group write racing a folder rename/remove) cannot clobber each other's
+      // snapshot. Acquired after the input box resolves — no UI held under the lock.
+      await configMutationLock.runExclusive(() => ctx.core.addGroup(fullPath));
     }),
 
     vscode.commands.registerCommand("nexus.group.remove", async (arg?: unknown) => {
@@ -456,9 +476,17 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
       const itemCount = items.servers.length + items.serialProfiles.length + items.localShellProfiles.length + (items.localServers?.length ?? 0);
       const hasContents = itemCount > 0;
 
+      // #84 P1 (Codex, serialization audit) — removeFolderCascade reassigns or
+      // DELETES every server in the subtree and persists a FULL server snapshot.
+      // Serialize it under configMutationLock like every other writer: a
+      // lock-free cascade racing a background port-heal (or edit/remove/sync)
+      // could restore deleted servers or revert folder reassignments on reload,
+      // or have the heal's port write reverted. The cascade reads and mutates the
+      // live server map inside the lock, so no stale snapshot is captured. The
+      // confirmation modal has already resolved — no UI held under the lock.
       if (!hasContents) {
         // Empty folder — remove silently
-        await ctx.core.removeFolderCascade(folderPath, false);
+        await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, false));
         return;
       }
 
@@ -469,9 +497,9 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
         "Delete contents"
       );
       if (choice === "Move to parent") {
-        await ctx.core.removeFolderCascade(folderPath, false);
+        await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, false));
       } else if (choice === "Delete contents") {
-        await ctx.core.removeFolderCascade(folderPath, true);
+        await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, true));
       }
     })
   ];

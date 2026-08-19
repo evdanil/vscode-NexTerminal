@@ -130,6 +130,7 @@ import { IMPORTED_CAPABILITY_RESET_NOTICE } from "../../src/models/terminalMacro
 import { SETTINGS_META } from "../../src/ui/settingsMetadata";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
@@ -765,6 +766,44 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  // ⊘ Discriminator against a validate-only import path. Import is the third
+  // way a rule array reaches global settings (after the editor's Save and the
+  // activation migration), and it is the one that carries a snapshot from
+  // ANOTHER machine — typically an older install, which is exactly where the
+  // truncating IPv6 pattern and the label-less rules live. Writing that
+  // payload through unchanged re-pollutes settings with the stale form the
+  // rest of this release exists to heal, and does it AFTER the one-shot
+  // migration has already run.
+  it("upgrades known-default rules on import instead of re-polluting settings with a stale snapshot", async () => {
+    mockShowWarningMessage.mockClear();
+    const shippedIpv6 = (
+      JSON.parse(readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf8")).contributes
+        .configuration.properties["nexus.terminal.highlighting.rules"].default as Array<Record<string, unknown>>
+    ).find((rule) => rule.label === "IPv6 addresses")!;
+    const IPV6_V1 =
+      "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b";
+
+    const exportData = makeExportData({
+      settings: {
+        "nexus.terminal.highlighting.rules": [
+          { pattern: IPV6_V1, color: "magenta", flags: "g", enabled: false },
+          { pattern: "\\bERR(?:OR)?\\b", color: "red", flags: "gi", bold: true }
+        ]
+      }
+    });
+    await runImport(exportData);
+
+    const written = configStore.get("nexus.terminal.highlighting.rules") as Array<Record<string, unknown>>;
+    expect(written[0].pattern).toBe(shippedIpv6.pattern);
+    expect(written[0].label).toBe("IPv6 addresses");
+    expect(written[0].enabled).toBe(false);
+    expect(written[1].label).toBe("Errors");
+    expect(written[1].description).toBe("ERR / ERROR — general error keyword, bold red.");
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      "1 imported Nexus setting had an invalid value and was skipped."
+    );
+  });
+
   it("generates IDs for items with missing IDs", async () => {
     const exportData = makeExportData({
       servers: [{ ...makeServer(), id: "" }],
@@ -1107,7 +1146,7 @@ describe("import chooser (nexus.config.import)", () => {
       "add servers in bulk",
       "$(clippy) Paste Host List from Clipboard",
       "$(list-flat) Host List File…",
-      "$(sync) Inventory Source (NetBox)…",
+      "$(sync) Inventory Source…",
       "migrate from another client",
       "$(file-code) MobaXterm INI File…",
       "$(file-code) SecureCRT XML Export…",
@@ -1126,7 +1165,7 @@ describe("import chooser (nexus.config.import)", () => {
     expect(byLabel("Nexus Export File")?.description).toBe("An encrypted backup or a shared config (.json)");
   });
 
-  it("Inventory Source (NetBox)… routes straight to nexus.inventory.addSource (no host-list dialog)", async () => {
+  it("Inventory Source… routes straight to nexus.inventory.addSource (no host-list dialog)", async () => {
     mockShowQuickPick.mockResolvedValueOnce({ value: "inventorySource" });
 
     const importCmd = registeredCommands.get("nexus.config.import")!;
@@ -1871,6 +1910,30 @@ describe("backup import", () => {
     mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     await registeredCommands.get("nexus.config.import")!();
   }
+
+  // TELNET (Phase 0) — the round trip a telnet server has to survive. The
+  // fixture is discriminating on BOTH halves of the model change: a rebuild that
+  // enumerated fields and forgot `protocol` restores an SSH server (which would
+  // then prompt for credentials and connect to the wrong service), and a
+  // `validateServerConfig` that still demanded a non-empty username drops the
+  // record entirely at the import boundary — telnet collects none.
+  it("round-trips a telnet server, blank username and all", async () => {
+    const exportData = {
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers: [makeServer({ id: "tel-1", name: "Console 1", protocol: "telnet", username: "", port: 2001 })],
+      settings: {}
+    };
+
+    await runBackupImport(exportData, "replace");
+
+    const imported = core.getSnapshot().servers.find((s) => s.name === "Console 1");
+    expect(imported).toBeDefined();
+    expect(imported?.protocol).toBe("telnet");
+    expect(imported?.username).toBe("");
+    expect(imported?.port).toBe(2001);
+  });
 
   it("decrypts and restores passwords, passphrases, and secret macros", async () => {
     const { encrypt } = await import("../../src/utils/configCrypto");
@@ -5340,6 +5403,14 @@ describe("sanitizeForSharing", () => {
     expect(result.servers[0].bmcWebProtocol).toBe("http");
   });
 
+  it("ADDRESSLESS (Codex P1 review MINOR-1) — DROPS addressless placeholder servers from a shared export entirely (⊘ the `...s` spread ships an origin-less `addressless:true, host:\"\"` record the recipient can never connect to, re-address, or upgrade)", () => {
+    const normal = makeServer({ id: "srv-normal", name: "Prod", host: "10.0.0.1" });
+    const placeholder = makeServer({ id: "srv-addr", name: "Stopped Node", host: "", addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } });
+    const result = sanitizeForSharing([normal, placeholder], [], [], [], {}, [], []);
+    expect(result.servers.map((s) => s.name)).toEqual(["Prod"]);
+    expect(result.servers.some((s) => s.addressless)).toBe(false);
+  });
+
   it("clears defaultServerId when server not in export", () => {
     const servers: ServerConfig[] = [];
     const tunnels = [makeTunnel({ defaultServerId: "missing" })];
@@ -7878,5 +7949,123 @@ describe("backup export round-trip", () => {
       typeof msg === "string" && msg.includes("missing credential")
     );
     expect(missingCredentialWarnings).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P1 (Codex, serialization audit) — the config-import writers (share import,
+// MobaXterm/SecureCRT import, host-list/inventory import) persist FULL server
+// snapshots and were lock-free. A concurrent background telnet port-heal could
+// clobber them, or be reverted by their snapshot. Each is now serialized under
+// configMutationLock. Real NexusCore + a gated repository proves it.
+// ---------------------------------------------------------------------------
+describe("config-import serialization (#84 P1)", () => {
+  class GatedRepo extends InMemoryConfigRepository {
+    private armed = false;
+    private releaseFn: () => void = () => {};
+    private startedFn: () => void = () => {};
+    public gate = new Promise<void>((r) => (this.releaseFn = r));
+    public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+    public arm(): void {
+      this.armed = true;
+    }
+    public releaseGate(): void {
+      this.releaseFn();
+    }
+    public override async saveServers(servers: ServerConfig[]): Promise<void> {
+      if (this.armed) {
+        this.armed = false; // gate ONLY the first server save after arming
+        this.startedFn();
+        await this.gate;
+      }
+      return super.saveServers(servers);
+    }
+  }
+
+  let repo: GatedRepo;
+  let importCore: NexusCore;
+
+  function existingTelnet(): ServerConfig {
+    return {
+      id: "x1",
+      name: "x1",
+      host: "10.0.0.9",
+      port: 32769,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: { sourceId: "src-1", externalId: "x1", syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 32769, syncedProtocol: "telnet" }
+    };
+  }
+  const healReport = { contractVersion: 1 as const, statuses: { x1: { state: "running" as const, consolePort: 32800 } } };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const vault = new MockVault();
+    repo = new GatedRepo();
+    importCore = new NexusCore(repo);
+    await importCore.initialize();
+    await importCore.addOrUpdateServer(existingTelnet());
+    registerConfigCommands(importCore, vault);
+  });
+
+  // Runs an import that adds exactly one server, gated on its saveServers, while a
+  // concurrent (lock-wrapped) heal re-ports the pre-existing x1. Returns after both settle.
+  async function importWithConcurrentHeal(trigger: () => Promise<void>): Promise<void> {
+    repo.arm();
+    const importP = trigger();
+    await repo.firstGatedSaveStarted; // the import's server save is blocked
+    const healP = configMutationLock.runExclusive(() => importCore.healSyncedConsolePorts("src-1", healReport));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([importP, healP]);
+  }
+
+  it("host-list/inventory import (applyInventoryText) does not clobber a concurrent heal (⊘ dropping the runExclusive lets the batch's snapshot revert the heal)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "clipboard" });
+    mockClipboardReadText.mockResolvedValue("10.1.1.1,imported-sw,admin\n");
+    mockShowInputBox.mockResolvedValue("");
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await importWithConcurrentHeal(() => registeredCommands.get("nexus.config.import")!() as Promise<void>);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "x1")?.port).toBe(32800); // heal survives on disk
+    expect(persisted.some((s) => s.name === "imported-sw")).toBe(true); // import lands
+  });
+
+  it("MobaXterm import (applyImportedSessions) does not clobber a concurrent heal (⊘ dropping the runExclusive lets the import's snapshot revert the heal)", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "mobaxterm" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/moba.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from("[Bookmarks]\nSubRep=\nServer=#109#0%host.test%22%user%%-1%\n", "utf8"));
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await importWithConcurrentHeal(() => registeredCommands.get("nexus.config.import")!() as Promise<void>);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "x1")?.port).toBe(32800); // heal survives
+    expect(persisted.length).toBeGreaterThan(1); // the imported session landed
+  });
+
+  it("share import (importShareData) does not clobber a concurrent heal (⊘ dropping the runExclusive lets the share import's snapshot revert the heal)", async () => {
+    const exportData = makeExportData({
+      exportType: "share",
+      servers: [makeServer({ id: "imp-1", name: "shared-sw" })],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: []
+    });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/share.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+
+    await importWithConcurrentHeal(() => registeredCommands.get("nexus.config.import")!() as Promise<void>);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "x1")?.port).toBe(32800); // heal survives
+    expect(persisted.some((s) => s.name === "shared-sw")).toBe(true); // share import lands
   });
 });

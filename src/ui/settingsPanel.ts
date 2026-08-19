@@ -4,7 +4,7 @@ import { renderSettingsHtml } from "./settingsHtml";
 import { SETTINGS_META, CATEGORY_LABELS } from "./settingsMetadata";
 import { validateSettingUpdate } from "./settingsValidation";
 import { createWebviewNonce } from "./shared/webviewNonce";
-import { resetSettings } from "./settingsReset";
+import { resetAllExtraKeys, resetExtraKeysForCategory, resetSettings } from "./settingsReset";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 
 /**
@@ -251,7 +251,7 @@ export class SettingsPanel {
           "Reset"
         );
         if (confirm === "Reset") {
-          await resetSettings(SETTINGS_META);
+          await resetSettings(SETTINGS_META, resetAllExtraKeys());
           this.render();
         }
         break;
@@ -266,7 +266,7 @@ export class SettingsPanel {
         );
         if (confirm === "Reset") {
           const categoryMetas = SETTINGS_META.filter((m) => m.category === category);
-          await resetSettings(categoryMetas);
+          await resetSettings(categoryMetas, resetExtraKeysForCategory(category));
           this.render();
         }
         break;

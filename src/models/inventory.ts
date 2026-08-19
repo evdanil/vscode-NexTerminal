@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-export type InventoryEndpointKind = "ssh" | "redfish" | "url" | "ipmi-sol";
+export type InventoryEndpointKind = "ssh" | "telnet" | "redfish" | "url" | "ipmi-sol";
 
 /**
  * One way to reach a device. The sync engine maps the FIRST endpoint with
@@ -15,6 +15,31 @@ export type InventoryEndpointKind = "ssh" | "redfish" | "url" | "ipmi-sol";
  * `syncedIpmiHost`'s). THE CONVENTION: first ssh = primary host, second ssh =
  * alternate host. All other kinds — and any THIRD-or-later ssh endpoint — are
  * accepted, preserved on the tree, and otherwise unused.
+ *
+ * TELNET (Phase 0) — the FIRST endpoint with kind === "telnet" maps onto
+ * `host`/`port` PLUS `protocol: "telnet"` (see `selectPrimaryEndpoint` in
+ * services/inventory/syncEngine.ts, and the `ServerOrigin.syncedProtocol` stamp
+ * rule, which twins `syncedAltHost`'s). Its default port is 23, not 22.
+ *
+ * PROTOCOL AND ADDRESS ARE ONE DECISION (P1-C). The endpoint a server takes is
+ * the one matching the protocol that server will ACTUALLY have — not simply the
+ * device's preferred endpoint. It matters only for a record whose protocol the
+ * USER owns (a hand-flip the `syncedProtocol` stamp protects): such a server
+ * follows an endpoint of ITS OWN transport, and when the device offers none of
+ * that kind its address is LEFT UNCHANGED rather than rewritten to the other
+ * transport's host and port. Deciding the two separately produced a telnet
+ * profile pointed at port 22 — a record that cannot connect, assembled out of
+ * two individually-correct answers.
+ *
+ * SSH WINS THE PRIMARY SLOT. A device that reports BOTH an ssh and a telnet
+ * endpoint maps to an SSH server, whatever order they are listed in, and its
+ * telnet endpoint is then simply unused. This is a deliberate simplification
+ * rather than a preference setting: SSH is the protocol with authentication,
+ * file transfer and tunnelling, so where a device offers both there is no case
+ * for choosing the one that offers none of them — and a device reachable only
+ * over telnet (a virtual console server, lab gear) is exactly the population
+ * this kind exists for. A user who wants telnet on a dual-stack device switches
+ * the server by hand, and the `syncedProtocol` stamp keeps that choice.
  */
 export interface InventoryEndpoint {
   kind: InventoryEndpointKind;
@@ -48,6 +73,7 @@ export interface InventoryDevice {
   attributes?: Record<string, string | string[]>;
 }
 
+
 export interface InventoryTree {
   contractVersion: 1;
   devices: InventoryDevice[];
@@ -56,6 +82,86 @@ export interface InventoryTree {
   // its own hard cap (not because the source ran out of devices). When true,
   // computeSyncPlan skips the prune phase entirely: a capped fetch must never
   // be mistaken for "these devices no longer exist at the source".
+  truncated?: boolean;
+  /**
+   * LIVE STATUS ON A SYNC (follow-up #42) — the source's live device state as of
+   * THIS fetch, when the provider can supply it for free; consumed by the sync so
+   * a completed sync leaves lab state current without a separate refresh. Absent
+   * ⇒ the sync changes no status.
+   *
+   * WHY THE PROVIDER DECLARES IT. Only the provider knows whether the picture it
+   * just collected is COMPLETE — the crawl may have been capped, or a config
+   * switch may have excluded a whole class of node from the fetch. That
+   * completeness is exactly what `truncated` on the report encodes, and it
+   * decides whether `NexusCore.applyInventoryStatus` MERGES the report or
+   * CLEARS-then-applies it. A caller reconstructing the flag from the device
+   * list alone could not tell "absent because gone" from "absent because never
+   * asked for".
+   *
+   * KEYED BY THE SAME `externalId` the devices carry, so the same origin lookup
+   * resolves both — but the report is NOT required to describe the same node set
+   * as `devices`, and EVE-NG's deliberately does not: it reports every node the
+   * crawl reached, including the stopped ones `Include Stopped Nodes` keeps out
+   * of `devices`, so a node that stops is reported as `stopped` instead of
+   * quietly keeping its last known state. An entry that resolves to no server is
+   * ignored by the apply. Entries carry `state` only: the fetched console
+   * endpoints already flow through the sync plan under the normal ownership
+   * rules, so setting `consoleHost`/`consolePort` here would write the same
+   * address twice under two different rules — and `healSyncedConsolePorts`, the
+   * consumer of those fields, is not on this path at all.
+   *
+   * NOT VALIDATED BY `validateInventoryTree` — deliberately. A malformed status
+   * from a third-party provider must not abort a sync whose DEVICES are fine, so
+   * the sync runs it through `validateInventoryStatusReport` instead and degrades
+   * a bad one to "no status update", exactly as `fetchProviderStatus` does.
+   */
+  status?: InventoryStatusReport;
+}
+
+/**
+ * LIVE STATUS (Phase 2) — one device's running/stopped state, as reported by a
+ * provider's optional `fetchStatus`. Deliberately smaller than a full
+ * `InventoryDevice`: status polling runs while the Command Center is visible and
+ * must stay cheap, so it carries only what the tree highlight and the optional
+ * port-heal need.
+ */
+export interface InventoryDeviceStatus {
+  state: "running" | "stopped";
+  // OPTIONAL fresh console endpoint. A provider (EVE-NG Community) that reassigns
+  // console ports on node restart surfaces the current one here; only ever
+  // present for a running node. CONSUMED by `NexusCore.healSyncedConsolePorts`
+  // (task #29 / D8), the separate persisting step the status-refresh path runs
+  // right after the pure `applyInventoryStatus`: for a running, telnet,
+  // non-addressless, SYNC-OWNED server whose console address differs from these,
+  // it persists the reported value onto `host`/`port` (and advances the
+  // `syncedHost`/`syncedPort` stamp) so the next connect targets the live port.
+  // A hand-edited port is never healed. `applyInventoryStatus` itself still
+  // stores only `state`.
+  consoleHost?: string;
+  consolePort?: number;
+}
+
+/**
+ * LIVE STATUS (Phase 2) — the result of `InventoryProvider.fetchStatus`, keyed
+ * by `InventoryDevice.externalId` exactly as `fetchInventory` keys its devices,
+ * so the same `deterministicServerId(sourceId, externalId)` maps a status onto
+ * the server it belongs to. Reports ALL known devices' status (the tree decides
+ * what to render); it is never persisted.
+ */
+export interface InventoryStatusReport {
+  contractVersion: 1;
+  statuses: Record<string, InventoryDeviceStatus>;
+  // TRUNCATION — set when the provider stopped collecting early because it hit
+  // its own hard cap (mirrors InventoryTree.truncated). A truncated report is
+  // PARTIAL: nodes beyond the cap are simply absent, NOT gone — so
+  // applyInventoryStatus MERGES a truncated report (retaining prior status for
+  // absent entries) rather than clearing-then-applying (which treats an absent
+  // node as removed). Absent/false ⇒ a complete report.
+  //
+  // CONSUMED BY `refreshStatus` (commands/inventoryCommands.ts): a truncated
+  // report that is APPLIED names its source in one manual-only warning, because
+  // the merge above leaves the unreached nodes showing stale (or `unknown`) state
+  // and nothing else on screen would say so. The poll path stays silent.
   truncated?: boolean;
 }
 
@@ -79,6 +185,43 @@ export interface InventoryConfigField {
    * it stores a string.
    */
   options?: { label: string; value: string }[];
+  /**
+   * EVE-NG (Phase 1) — the value a `type: "boolean"` field starts at on the ADD
+   * form, when the source has no stored value for it yet. Ignored for every
+   * other field type, and ignored on EDIT (a stored `false` is a real answer the
+   * user gave and must not be re-flipped to `true` on every visit).
+   *
+   * Exists because a provider's declared default was previously unreachable
+   * through the only UI that creates sources: the checkbox descriptor seeded
+   * from `existingConfig[field.id] === true`, so a NEW source always stored
+   * `false` no matter what the provider documented. EVE-NG's
+   * `includeStopped` defaults to TRUE — a lab's nodes are stopped most of the
+   * time, and a source that silently imported none of them would read as an
+   * empty inventory and, under a `delete` prune policy, remove the servers a
+   * previous sync created.
+   *
+   * Absent behaves exactly as before (`false`), so NetBox's `includeVms` — the
+   * only other boolean field that ships — is byte-identical. Deliberately NOT
+   * part of `computeProviderFingerprint`: changing a default changes what a
+   * FUTURE source starts at, never what an existing source is configured with,
+   * so it is not a change a user needs to re-confirm credentials over.
+   */
+  defaultValue?: boolean;
+  /**
+   * INSECURE TLS (EVE-NG) — render this field behind the source form's
+   * ADVANCED disclosure rather than at the top level. Presentation only, and
+   * deliberately NOT part of `computeProviderFingerprint`: where a field is
+   * drawn changes nothing about what a source is configured with, so it is not
+   * a change a user should be asked to re-confirm credentials over.
+   *
+   * Exists for `allowInsecureTls`, a switch that turns a safety default OFF for
+   * one source. It has to be reachable, and it should not sit beside the base
+   * URL as though it were an ordinary part of naming the server.
+   *
+   * Absent behaves exactly as before (top level), so every field that ships
+   * today is byte-identical.
+   */
+  advanced?: boolean;
 }
 
 export type InventorySourceValues = Record<string, string | number | boolean>; // secrets NEVER here
@@ -144,6 +287,33 @@ export interface InventoryProvider {
    * this method.
    */
   instanceKey?(config: InventorySourceValues): string | undefined;
+  /**
+   * LIVE STATUS (Phase 2) — OPTIONAL. Report the current running/stopped state
+   * of this source's devices, keyed by the same `externalId` `fetchInventory`
+   * uses. Called on an explicit "Refresh Lab Status" and on the visible-gated
+   * poll, NOT on a sync. A provider that does not implement it simply shows no
+   * status (NetBox). The ONLY sanctioned caller is `fetchProviderStatus` below,
+   * which clones the config, validates the return, and degrades every failure to
+   * "no update" — so an implementation may throw / return garbage without
+   * breaking the refresh path, exactly like `instanceKey`.
+   */
+  fetchStatus?(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport>;
+  /**
+   * NODE CONTROL (Phase 4) — OPTIONAL. Start or stop ONE device, keyed by the
+   * same `externalId` `fetchInventory`/`fetchStatus` use. Unlike `fetchStatus`
+   * this MUTATES the source, so its ONLY sanctioned caller is
+   * `controlProviderNode` below — which, DELIBERATELY UNLIKE
+   * `fetchProviderStatus`, PROPAGATES a failure rather than degrading it to a
+   * no-op: a start/stop the user issued that did not happen must surface as an
+   * error, not vanish. A provider that does not implement it offers no node
+   * control (NetBox); the Start/Stop commands guard on it and stay hidden.
+   */
+  controlNode?(
+    config: InventorySourceValues,
+    secrets: InventorySourceSecrets,
+    externalId: string,
+    action: "start" | "stop"
+  ): Promise<void>;
 }
 
 /**
@@ -224,6 +394,142 @@ export function resolveProviderInstanceKey(
     return undefined;
   }
   return trimmed;
+}
+
+/**
+ * LIVE STATUS (Phase 2) — validates a raw `fetchStatus` return into an
+ * `InventoryStatusReport`, or `undefined` for anything malformed. A provider is
+ * third-party code, so this is the boundary that keeps a garbage report from
+ * reaching the tree; it never throws.
+ *
+ * Prototype-pollution-safe like the highlight-rule upgrade: `Object.entries`
+ * reads only own enumerable keys and never walks the prototype, each value is
+ * validated field-by-field, AND the result is built on a null-prototype object
+ * (`Object.create(null)`) so writing a device key named `__proto__` (as
+ * JSON.parse can produce) stores it as ordinary own data rather than hitting the
+ * inherited `__proto__` setter — which on a plain `{}` would silently drop the
+ * entry and leak its `state` onto `Object.prototype`.
+ *
+ * The whole report is rejected on the FIRST bad entry rather than dropping it:
+ * a partial report applied against a differently-keyed intent is worse than no
+ * update, since the tree would then show some nodes stale and some fresh with no
+ * way to tell which.
+ */
+export function validateInventoryStatusReport(raw: unknown): InventoryStatusReport | undefined {
+  if (typeof raw !== "object" || raw === null) {
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.contractVersion !== 1) {
+    return undefined;
+  }
+  // TRUNCATION — optional; when present it MUST be a real boolean (a string /
+  // number would be read truthily and silently flip the clear-vs-merge decision).
+  if (Object.prototype.hasOwnProperty.call(obj, "truncated") && typeof obj.truncated !== "boolean") {
+    return undefined;
+  }
+  const statuses = obj.statuses;
+  // A plain object, not an array (Array is typeof "object") and not null.
+  if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
+    return undefined;
+  }
+  const validated: Record<string, InventoryDeviceStatus> = Object.create(null);
+  for (const [key, value] of Object.entries(statuses as Record<string, unknown>)) {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    const v = value as Record<string, unknown>;
+    if (v.state !== "running" && v.state !== "stopped") {
+      return undefined;
+    }
+    const status: InventoryDeviceStatus = { state: v.state };
+    // P2-1 (review) — the console fields are HEAL INPUTS: `healSyncedConsolePorts`
+    // persists them into `ServerConfig.host`/`port`, which `validateServerConfig`
+    // then re-checks on reload (non-empty host, integer port 1..65535). An
+    // invalid one must therefore never be surfaced to the heal, or the heal would
+    // persist a record that is dropped on the next load — the #82 record-drop
+    // class. But `state` keying is unchanged and still drives the tree highlight,
+    // so a bad console field is DROPPED (not surfaced) rather than failing the
+    // whole entry or report, which would blank an entire source's decorations
+    // over one node's quirky console value. A non-empty string host and an
+    // `isValidPort` port are the exact bounds `validateServerConfig` enforces.
+    if (Object.prototype.hasOwnProperty.call(v, "consoleHost") && typeof v.consoleHost === "string" && v.consoleHost.length > 0) {
+      status.consoleHost = v.consoleHost;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(v, "consolePort") &&
+      typeof v.consolePort === "number" &&
+      Number.isInteger(v.consolePort) &&
+      v.consolePort >= 1 &&
+      v.consolePort <= 65535
+    ) {
+      status.consolePort = v.consolePort;
+    }
+    validated[key] = status;
+  }
+  const result: InventoryStatusReport = { contractVersion: 1, statuses: validated };
+  // Preserve an explicit boolean (true OR false); never invent the key when absent.
+  if (typeof obj.truncated === "boolean") {
+    result.truncated = obj.truncated;
+  }
+  return result;
+}
+
+/**
+ * LIVE STATUS (Phase 2) — the ONE sanctioned way to invoke
+ * `InventoryProvider.fetchStatus`, mirroring `resolveProviderInstanceKey`'s
+ * discipline: undefined when the provider has no `fetchStatus`; the provider is
+ * handed a `structuredClone` of the config inside the try (so an in-place
+ * normalization cannot mutate the caller's stored source config, and a
+ * non-cloneable config degrades to undefined rather than throwing); the return
+ * is validated. A throw or a malformed report both degrade to `undefined` — "no
+ * status update" — never an exception escaping into the refresh loop.
+ */
+export async function fetchProviderStatus(
+  provider: Pick<InventoryProvider, "fetchStatus">,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets
+): Promise<InventoryStatusReport | undefined> {
+  if (typeof provider.fetchStatus !== "function") {
+    return undefined;
+  }
+  let raw: unknown;
+  try {
+    raw = await provider.fetchStatus(structuredClone(config), secrets);
+  } catch {
+    return undefined;
+  }
+  return validateInventoryStatusReport(raw);
+}
+
+/**
+ * NODE CONTROL (Phase 4) — the ONE sanctioned way to invoke
+ * `InventoryProvider.controlNode`, the MUTATING twin of `fetchProviderStatus`.
+ * TWO deliberate divergences from that read-only wrapper:
+ *  - it PROPAGATES failures. A start/stop is a user-initiated action, not a
+ *    background poll: if it fails the user must be told, so — unlike the status
+ *    refresh, which degrades every flaky-lab error to "no update" so it can
+ *    never nag — the provider's throw is rethrown as-is.
+ *  - a provider with NO `controlNode` is a THROW, not a silent no-op, so a
+ *    caller that reached here without first guarding on the capability gets a
+ *    clear "not supported" error rather than a command that appears to succeed
+ *    while doing nothing.
+ * Like the status wrapper, the provider is handed a `structuredClone` of the
+ * config so an in-place normalization cannot mutate the caller's stored source
+ * config — but the clone is OUTSIDE any try, matching the propagate-everything
+ * stance: a non-cloneable config surfaces rather than masquerading as success.
+ */
+export async function controlProviderNode(
+  provider: Pick<InventoryProvider, "controlNode">,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets,
+  externalId: string,
+  action: "start" | "stop"
+): Promise<void> {
+  if (typeof provider.controlNode !== "function") {
+    throw new Error("This inventory source does not support node control.");
+  }
+  await provider.controlNode(structuredClone(config), secrets, externalId, action);
 }
 
 export type InventoryErrorKind = "auth" | "network" | "protocol";

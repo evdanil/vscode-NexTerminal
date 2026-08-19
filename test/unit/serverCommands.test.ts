@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import {
   registerServerCommands,
+  connectServer,
   authProfileCredentialMirror,
   formValuesToServer,
   formValuesToProxy,
@@ -18,7 +19,13 @@ import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { SshPty } from "../../src/services/ssh/sshPty";
+import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
+import { validateServerConfig } from "../../src/utils/validation";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { CommandContext as CmdCtx } from "../../src/commands/types";
+import { registerProfileCommands } from "../../src/commands/profileCommands";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -42,6 +49,10 @@ const mockAddOutputObserver = vi.fn((_observer: unknown) => ({ dispose: vi.fn() 
 
 vi.mock("../../src/services/ssh/sshPty", () => ({
   SshPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
+}));
+
+vi.mock("../../src/services/telnet/telnetPty", () => ({
+  TelnetPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
 }));
 
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
@@ -528,6 +539,55 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(removeServer).toHaveBeenCalledWith("srv-1");
   });
 
+  it("(#84 P1) rename re-reads the LIVE record under the lock and applies only the name — a console-port heal that lands while the input box is open is NOT reverted (⊘ committing the form-captured snapshot clobbers the healed port with the stale one)", async () => {
+    // The record the user's context-menu click captured — a telnet node at its
+    // pre-heal console port.
+    const captured = makeServer({ name: "old-name", host: "10.0.0.9", port: 32769, protocol: "telnet" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [captured] });
+    registerServerCommands(ctx);
+
+    // While the rename input box is open, a background status-refresh heals the
+    // console port on the LIVE record (a fresh object replaces the map entry).
+    (vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      await ctx.core.addOrUpdateServer({ ...captured, port: 32800, origin: { sourceId: "s", externalId: "e", syncedAt: 2, syncedHost: "10.0.0.9", syncedPort: 32800 } });
+      return "new-name";
+    });
+
+    // The rename is submitted with the STALE captured snapshot (ServerTreeItem
+    // returns arg.server verbatim), exactly as the context-menu path does.
+    await registeredCommands.get("nexus.server.rename")!(new ServerTreeItem(captured, false));
+
+    // The heal survives, and only the name changed.
+    const live = ctx.core.getServer("srv-1");
+    expect(live?.name).toBe("new-name");
+    expect(live?.port).toBe(32800);
+    expect(live?.origin?.syncedPort).toBe(32800);
+    // The last write must have been the merge of the LIVE record + name, never the
+    // form-captured 32769 snapshot.
+    const lastWrite = addOrUpdateServer.mock.calls.at(-1)?.[0] as ServerConfig;
+    expect(lastWrite.port).toBe(32800);
+    expect(lastWrite.name).toBe("new-name");
+  });
+
+  it("(#84 P2-1) rename bails when a CONCURRENT rename changed the name to a DIFFERENT value while the input box was open — it does not overwrite the newer rename with this stale prompt (⊘ checking only `live.name === trimmedName` lets a stale 'C' clobber a concurrent 'B')", async () => {
+    const captured = makeServer({ name: "A", host: "10.0.0.9", port: 32769 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [captured] });
+    registerServerCommands(ctx);
+
+    // While THIS rename's input box is open (renaming A -> C), another rename
+    // lands first and changes the live record to "B".
+    (vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      await ctx.core.addOrUpdateServer({ ...captured, name: "B" });
+      return "C";
+    });
+
+    await registeredCommands.get("nexus.server.rename")!(new ServerTreeItem(captured, false));
+
+    // The concurrent "B" survives — the stale "A -> C" prompt is discarded because
+    // the live name no longer matches the captured "A".
+    expect(ctx.core.getServer("srv-1")?.name).toBe("B");
+  });
+
   it("(P1, remove-lock-picker-fallback fix) remove command re-checks server presence inside the lock and bails out with an info message — never falls through to an interactive picker or performs any teardown/vault/removal work — when the record was deleted while the confirmation modal or the lock wait was pending", async () => {
     const { ctx, stopTunnel, disconnectPool, removeServer, secretDelete, terminalDispose } = setupHarness({
       profiles: [],
@@ -785,6 +845,34 @@ describe("server disconnect with tunnel autoStop", () => {
     // the marker (e.g. writing it back onto `server` too) would make the
     // original unadoptable, which is the opposite failure.
     expect(ctx.core.getServer("srv-1")?.formerlySynced).toEqual(marker);
+  });
+
+  // P2-1 (Fable) — duplicating spreads the record and strips `origin`, so an
+  // addressless placeholder would become a MANUAL addressless record: an invariant
+  // violation (addressless exists only for synced placeholders), which no sync will
+  // ever upgrade (no origin) and whose connect refusal tells the user to "re-sync the
+  // source" it has no link to. ⊘ Minting the copy leaves that record in the store.
+  it("P2-1 — refuses to duplicate an addressless placeholder with a message, writing nothing", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ addressless: true, host: "", port: 0, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.duplicate")!("srv-1");
+
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("can't be duplicated"));
+  });
+
+  it("P2-1 control — still duplicates an ORDINARY addressed server (⊘ an over-broad guard would block normal duplication)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.duplicate")!("srv-1");
+
+    expect(addOrUpdateServer).toHaveBeenCalledWith(expect.objectContaining({ name: "Server 1 (copy)" }));
   });
 
   it("group disconnect applies only to direct-folder servers and skips hidden ones", async () => {
@@ -2125,6 +2213,36 @@ describe("SSH File Explorer auto-open on manual connect", () => {
 
     expect(ctx.sftpService.connect).not.toHaveBeenCalled();
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
+  });
+
+  // P3-3 (Fable) — group connect swept every node through connectServer, which pops
+  // the addressless info message per node — a popup storm on an EVE lab folder
+  // (mostly stopped, the documented common case). Skip addressless nodes and show
+  // ONE aggregate message. ⊘ Sweeping them builds no pty but fires one toast each.
+  it("P3-3 — group connect skips addressless nodes and shows one aggregate message, not one toast per stopped node", async () => {
+    const origin = { sourceId: "s", externalId: "e", syncedAt: 1 };
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({ id: "a1", name: "stopped-1", group: "Lab", addressless: true, host: "", port: 0, origin }),
+        makeServer({ id: "a2", name: "stopped-2", group: "Lab", addressless: true, host: "", port: 0, origin }),
+        makeServer({ id: "s1", name: "live", group: "Lab", host: "10.0.0.1" })
+      ]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.group.connect")!(new FolderTreeItem("Lab", "Lab"));
+    await flushPromises();
+
+    // Exactly one addressless message — the aggregate — never one per stopped node.
+    const infoMsgs = vi.mocked(vscode.window.showInformationMessage as any).mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .filter((m: string) => /no console address/i.test(m));
+    expect(infoMsgs).toHaveLength(1);
+    expect(infoMsgs[0]).toContain("2");
+    // Only the live server built a pty.
+    expect(SshPty).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the SSH session registered when automatic File Explorer browse fails", async () => {
@@ -4138,5 +4256,1024 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
     const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
     expect(finalSecret).toBeUndefined();
+  });
+});
+
+/**
+ * ADDRESSLESS (Codex P1 on #82) — a synced placeholder with no console address
+ * (a stopped EVE node). Connecting must show a friendly "start it and re-sync"
+ * message and do NOTHING else — no vault read, no prompt, no transport.
+ */
+/**
+ * ADDRESSLESS (Codex review P2) — the picker-exclusion filter in
+ * `sshInfrastructureCandidates` only works if the adapters that build
+ * `ServerListEntry` carry the `addressless` flag. This exercises the REAL edit
+ * adapter (serverCommands → serverFormDefinition), not a hand-built entry, so a
+ * future adapter that forgets the flag is caught end to end.
+ */
+describe("addressless servers are not offered as SSH infrastructure (end-to-end via the real edit adapter)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  it("omits an addressless server from the Jump Host and IPMI Gateway pickers, while an ordinary SSH server still appears (⊘ the adapter drops `addressless`, so the filter never sees it and the placeholder is offered as infrastructure)", async () => {
+    const edited = makeServer({ id: "srv-1", name: "prod" });
+    const bastion = makeServer({ id: "srv-ssh", name: "bastion" });
+    const placeholder = makeServer({ id: "srv-addr", name: "stopped-node", host: "", port: 0, addressless: true, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [edited, bastion, placeholder] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    const definition = mockWebviewFormPanelOpen.mock.calls.at(-1)![1] as { fields: Array<{ key?: string; options?: { value: string }[] }> };
+    const optionValues = (key: string): string[] => {
+      const field = definition.fields.find((f) => f.key === key);
+      return field?.options?.map((o) => o.value) ?? [];
+    };
+
+    for (const key of ["proxyJumpHostId", "ipmiGatewayServerId"]) {
+      expect(optionValues(key), key).toContain("srv-ssh");
+      expect(optionValues(key), key).not.toContain("srv-addr");
+    }
+  });
+});
+
+/**
+ * ADDRESSLESS (Codex P2-a) — an addressless placeholder (host "", addressless:true)
+ * must be EDITABLE so the user can configure its OOB fields (IPMI auth profile, BMC
+ * protocol) without inventing a console host. The edit path must recognize and
+ * preserve `addressless` on save; typing a real host gives it an address and
+ * clears the flag. Measured on the PERSISTED record — the whole failure mode is
+ * the form and the save path disagreeing.
+ */
+describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  async function openEdit(ctx: CommandContext): Promise<{ onSubmit: (v: Record<string, unknown>) => Promise<void> }> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    expect(mockWebviewFormPanelOpen).toHaveBeenCalled();
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+  }
+
+  // The submission the webview composes for an addressless server: Host is left
+  // empty (the placeholder has no console address), only OOB fields differ.
+  function addresslessSubmit(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      name: "stopped-node",
+      host: "",
+      port: 0,
+      protocol: "ssh",
+      username: "admin",
+      authType: "agent",
+      ...overrides
+    };
+  }
+
+  const placeholder = () =>
+    makeServer({ id: "srv-1", name: "stopped-node", host: "", port: 0, username: "admin", authType: "agent", addressless: true, origin: { sourceId: "s", externalId: "e", syncedAt: 1 } });
+
+  it("saves an edit to an addressless server, KEEPING addressless + empty host while applying the new IPMI auth profile (⊘ Host-required / formValuesToServer returning undefined aborts the save so the OOB fields can never be set)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: [makeAuthProfile({ id: "ap-bmc", username: "bmc" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ ipmiAuthProfileId: "ap-bmc" }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.addressless).toBe(true);
+    expect(saved.host).toBe("");
+    expect(saved.ipmiAuthProfileId).toBe("ap-bmc");
+    // The persisted record must survive its own reload.
+    expect(validateServerConfig(saved)).toBe(true);
+  });
+
+  it("CLEARS addressless when the user types a real host into an addressless profile — it becomes a normal addressed server (⊘ preserving addressless regardless of host freezes the placeholder even after the user gives it an address)", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: []
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.addressless ?? false).toBe(false);
+    expect(saved.host).toBe("10.0.0.5");
+    expect(saved.port).toBe(22);
+  });
+
+  // P2-3 fallback (Fable) — there is no syncedHost ownership stamp, so the next
+  // sync of a still-consoleless device will blank a hand-typed host. Warn the user
+  // at save so the impending revert is not a silent surprise. ⊘ Saving silently
+  // lets the address vanish on the next sync with no disclosure.
+  it("P2-3 — warns that the next sync may revert a host typed into an addressless placeholder", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: []
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("next sync"));
+  });
+
+  it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host does not warn about a revert (⊘ warning on every placeholder edit is noise)", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [placeholder()],
+      authProfiles: [makeAuthProfile({ id: "ap-bmc", username: "bmc" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ ipmiAuthProfileId: "ap-bmc" }));
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("next sync"));
+  });
+});
+
+describe("addressless connect guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("refuses to connect an addressless server with a friendly message and builds NEITHER an SshPty NOR a TelnetPty (⊘ no guard reaches SshPty with host \"\", prompting and handshaking against nothing)", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx.sshFactory as any).connect = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(SshPty).not.toHaveBeenCalled();
+    expect(TelnetPty).not.toHaveBeenCalled();
+    expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
+      expect.stringContaining("no console address yet")
+    );
+  });
+
+  it("refuses Test Connection against an addressless server without touching the SSH factory (⊘ an SSH-only feature slips through to a raw empty-host failure)", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx.sshFactory as any).connect = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+
+    expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+  });
+
+  // REVIEW FINDING (P2) — a watchdog wrapper (Run Macro on Server / Connect and
+  // Run Script) arms a 90s timer, then calls connectServer and waits for its
+  // onConnectFailed signal (or a session). The addressless early-return showed the
+  // friendly message but never fired that signal, so the wrapper had nothing to
+  // settle on and sat out the full watchdog before showing a MISLEADING timeout.
+  // ⊘ Drop the onConnectFailed call from the early-return and the caller is left
+  // awaiting a signal that never comes.
+  it("fires onConnectFailed when refusing an addressless server, so a watchdog wrapper settles at once instead of hanging 90s", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const onConnectFailed = vi.fn();
+
+    await connectServer(ctx, "srv-1", { onConnectFailed });
+
+    expect(onConnectFailed).toHaveBeenCalledTimes(1);
+    expect(onConnectFailed).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+  });
+
+  // The script wrapper (nexus.server.runWithScript → connectAndRunScript) does not
+  // await connectServer's result the way the macro wrapper does; it arms its own
+  // 90s timer and fires the script when a session appears. On an addressless
+  // target no session ever appears, so without an onConnectFailed hook the timer
+  // waits out the full 90s and shows "the script did not start within 90s".
+  // ⊘ Leave the wrapper's onConnectFailed unwired (or connectServer not firing it)
+  // and the misleading timeout warning fires after the watchdog elapses.
+  it("cancels the connect-and-run-script watchdog immediately on an addressless target, never the misleading 90s timeout", async () => {
+    const server = makeServer({ addressless: true, host: "", port: 0 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    ctx.scriptRuntimeManager = { runScript: vi.fn(async () => {}) } as any;
+    registerServerCommands(ctx);
+
+    vi.useFakeTimers();
+    try {
+      await registeredCommands.get("nexus.server.runWithScript")!("srv-1");
+      // Run out the entire watchdog: a live timer would fire its warning here.
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("did not start within"));
+      expect(ctx.scriptRuntimeManager.runScript).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("telnet connect path", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  function connectTelnet(overrides: Partial<ServerConfig> = {}) {
+    const server = makeServer({ protocol: "telnet", username: "", port: 2001, ...overrides });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+    return { ctx, server, run: () => registeredCommands.get("nexus.server.connect")!("srv-1") };
+  }
+
+  // ⊘ THE POINT OF THE BRANCH. A connect path that still built an SshPty for a
+  // telnet server would prompt for a password, touch the vault, and then hand
+  // an SSH handshake to a port that speaks telnet.
+  it("builds a TelnetPty and never an SshPty", async () => {
+    const { run } = connectTelnet();
+    await run();
+
+    expect(TelnetPty).toHaveBeenCalledTimes(1);
+    expect(SshPty).not.toHaveBeenCalled();
+  });
+
+  it("still builds an SshPty for an ordinary server", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(SshPty).toHaveBeenCalledTimes(1);
+    expect(TelnetPty).not.toHaveBeenCalled();
+  });
+
+  it("names the terminal 'Nexus Telnet: {name}' and registers it with the terminal registry", async () => {
+    const registry = { register: vi.fn() };
+    const server = makeServer({ protocol: "telnet", username: "" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    (ctx as any).terminalRegistry = registry;
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+
+    expect(vscode.window.createTerminal).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "Nexus Telnet: Server 1" })
+    );
+    expect(registry.register).toHaveBeenCalledTimes(1);
+  });
+
+  // ⊘ P1-B (Codex) — the session records the transport it actually opened with,
+  // so a later edit to the server's Protocol cannot reclassify a terminal that
+  // is already connected. Without the stamp the classifier falls back to live
+  // config, which is precisely the bug.
+  it("stamps the session with the transport it opened on", async () => {
+    const { ctx, run } = connectTelnet();
+    await run();
+
+    const callbacks = vi.mocked(TelnetPty).mock.calls[0][1] as unknown as {
+      onSessionOpened(sessionId: string): void;
+    };
+    callbacks.onSessionOpened("telnet-session-1");
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(
+      expect.objectContaining({ protocol: "telnet" })
+    );
+  });
+
+  it("registers an ActiveSession under the telnet terminal name so scripts can target it", async () => {
+    const { ctx, run } = connectTelnet();
+    await run();
+
+    const callbacks = vi.mocked(TelnetPty).mock.calls[0][1] as unknown as {
+      onSessionOpened(sessionId: string): void;
+    };
+    callbacks.onSessionOpened("telnet-session-1");
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "telnet-session-1",
+        serverId: "srv-1",
+        terminalName: "Nexus Telnet: Server 1"
+      })
+    );
+  });
+
+  it("passes the server's host and port through to the pty", async () => {
+    const { run } = connectTelnet({ host: "192.0.2.9", port: 5001 });
+    await run();
+
+    expect(vi.mocked(TelnetPty).mock.calls[0][0]).toEqual(
+      expect.objectContaining({ host: "192.0.2.9", port: 5001, protocol: "telnet" })
+    );
+  });
+});
+
+describe("SSH connect path — session protocol stamp (P1-B)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    (vscode.window as any).activeTerminal = undefined;
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("stamps an SSH session with ssh, so flipping the profile later cannot reclassify it", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    ctx.core.registerSession = vi.fn();
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.connect")!("srv-1");
+    latestSshCallbacks().onSessionOpened("session-1");
+
+    expect(ctx.core.registerSession).toHaveBeenCalledWith(expect.objectContaining({ protocol: "ssh" }));
+  });
+});
+
+describe("SSH-only commands against a telnet server", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  // ⊘ Unguarded, this reached `sftpService.connect`, which opens an SSH
+  // connection to a telnet port and surfaces a raw handshake error several
+  // seconds later — naming a port that is answering perfectly well.
+  it("refuses Test Connection with a clear message instead of an SSH handshake error", async () => {
+    const server = makeServer({ protocol: "telnet", username: "" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("not available for telnet servers")
+    );
+  });
+});
+
+/**
+ * MAJOR-4 (review) — switching an existing server to Telnet must not DESTROY
+ * its SSH configuration.
+ *
+ * The mechanism: a field hidden by `visibleWhen` is DISABLED by the webview,
+ * a disabled control submits nothing, and `formValuesToServer` maps a missing
+ * key to `undefined`. So a Protocol=Telnet save of an SSH server silently wiped
+ * username, key file, alternate host, auth-profile link, proxy, multiplexing,
+ * legacy algorithms and the File Explorer flag, and reset authType to
+ * `password`. `preserveLinkedServerCredentials` cannot help — it returns `next`
+ * untouched when `!next.authProfileId`, and the auth-profile select is one of
+ * the hidden controls.
+ *
+ * The record must keep its SSH config DORMANT, exactly like the vault entry
+ * that survives beside it.
+ */
+describe("nexus.server.edit — flipping protocol must not destroy the other protocol's config", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+  });
+
+  interface EditPanel {
+    onSubmit: (v: Record<string, unknown>) => Promise<void>;
+  }
+
+  async function openEdit(ctx: CommandContext): Promise<EditPanel> {
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    return mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as EditPanel;
+  }
+
+  /** A fully-configured SSH server — every field the flip used to erase. */
+  const CONFIGURED = makeServer({
+    username: "netadmin",
+    authType: "key",
+    keyPath: "/keys/id_ed25519",
+    altHost: "2001:db8::1",
+    authProfileId: "ap1",
+    proxy: { type: "socks5", host: "proxy.example.com", port: 1080, username: "puser" },
+    multiplexing: false,
+    legacyAlgorithms: true,
+    openFileExplorerOnFirstConnect: true
+  });
+
+  /**
+   * Exactly what the webview posts for a Protocol=Telnet save: the protocol,
+   * the three fields that stay visible, and NOTHING for any disabled control.
+   */
+  const TELNET_SUBMISSION = {
+    name: "Server 1",
+    host: "example.com",
+    port: 2001,
+    protocol: "telnet"
+  };
+
+  // ⊘ The whole finding in one assertion set. Every field listed here was
+  // measured lost on the pre-fix code; a fixture that left any of them at its
+  // default would not have shown the loss.
+  it("keeps every SSH-only field when the server is switched to Telnet", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    // The edit itself landed…
+    expect(saved.protocol).toBe("telnet");
+    expect(saved.port).toBe(2001);
+    // …and nothing else was collateral.
+    expect(saved.username).toBe("netadmin");
+    expect(saved.authType).toBe("key");
+    expect(saved.keyPath).toBe("/keys/id_ed25519");
+    expect(saved.altHost).toBe("2001:db8::1");
+    expect(saved.authProfileId).toBe("ap1");
+    expect(saved.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "puser" });
+    expect(saved.multiplexing).toBe(false);
+    expect(saved.legacyAlgorithms).toBe(true);
+    expect(saved.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  // ⊘ THE ROUND TRIP the finding names: a user who flips to Telnet and back
+  // must not have to rebuild the profile from memory. Discriminating because
+  // the second save re-submits the SSH fields the form re-rendered FROM THE
+  // PRESERVED RECORD — if the first save dropped them, the form has nothing to
+  // render and the second submission carries the losses forward.
+  it("survives a flip to Telnet and back to SSH with nothing lost", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    await (await openEdit(ctx)).onSubmit(TELNET_SUBMISSION);
+    const afterFlip = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+
+    // Re-open: the form is seeded from the stored record, so the SSH controls
+    // render the preserved values and submit them back.
+    registeredCommands.clear();
+    const panel = await openEdit(ctx);
+    await panel.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      protocol: "ssh",
+      username: afterFlip.username,
+      authType: afterFlip.authType,
+      keyPath: afterFlip.keyPath,
+      altHost: afterFlip.altHost,
+      authProfileId: afterFlip.authProfileId,
+      proxyType: "socks5",
+      proxySocks5Host: afterFlip.proxy?.type === "socks5" ? afterFlip.proxy.host : "",
+      proxySocks5Port: afterFlip.proxy?.type === "socks5" ? afterFlip.proxy.port : 0,
+      proxySocks5Username: afterFlip.proxy?.type === "socks5" ? afterFlip.proxy.username : "",
+      multiplexing: afterFlip.multiplexing,
+      legacyAlgorithms: afterFlip.legacyAlgorithms,
+      openFileExplorerOnFirstConnect: afterFlip.openFileExplorerOnFirstConnect
+    });
+
+    const restored = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(restored.protocol).toBeUndefined();
+    expect(restored.username).toBe("netadmin");
+    expect(restored.authType).toBe("key");
+    expect(restored.keyPath).toBe("/keys/id_ed25519");
+    expect(restored.altHost).toBe("2001:db8::1");
+    expect(restored.authProfileId).toBe("ap1");
+    expect(restored.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "puser" });
+    expect(restored.multiplexing).toBe(false);
+    expect(restored.legacyAlgorithms).toBe(true);
+    expect(restored.openFileExplorerOnFirstConnect).toBe(true);
+  });
+
+  // ⊘ Scoped to the flip: an SSH save must still be able to CLEAR these fields.
+  // A blanket "always merge from existing" would make the key file, the
+  // alternate host and the proxy unclearable forever.
+  it("still lets an SSH save clear the fields the user actually cleared", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit({
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "netadmin",
+      authType: "password",
+      authProfileId: ""
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.keyPath).toBeUndefined();
+    expect(saved.altHost).toBeUndefined();
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.authProfileId).toBeUndefined();
+    expect(saved.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
+  /**
+   * ⊘ P2-B (Codex) — the dormant fields must come from the LIVE record, not
+   * from the form-open snapshot.
+   *
+   * The sequence: open a telnet edit form; elsewhere, delete the linked auth
+   * profile — `removeAuthProfile` sweeps every server and clears the link on the
+   * live record; save the form. The form-open snapshot still remembers `ap1`, so
+   * restoring from it RESURRECTS a dangling link to a profile that no longer
+   * exists. Nothing catches it downstream: the auth-profile rejection is keyed on
+   * `candidate.authProfileId`, and the hidden select produced no candidate at all.
+   *
+   * Discriminating because the profile is deleted AFTER the form opened — the two
+   * snapshots disagree, which is the entire finding.
+   */
+  it("takes dormant fields from the LIVE record, so a profile deleted while the form was open stays deleted", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+
+    // `removeAuthProfile`'s own reference sweep, as it reaches this server.
+    await ctx.core.addOrUpdateServer({ ...CONFIGURED, authProfileId: undefined });
+
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.authProfileId).toBeUndefined();
+    // …and the fields nothing touched still come through.
+    expect(saved.username).toBe("netadmin");
+    expect(saved.keyPath).toBe("/keys/id_ed25519");
+  });
+
+  it("picks up a concurrent change to any dormant field, not just the auth link", async () => {
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })]
+    });
+
+    const panel = await openEdit(ctx);
+    await ctx.core.addOrUpdateServer({
+      ...CONFIGURED,
+      proxy: { type: "ssh", jumpHostId: "bastion-2" },
+      keyPath: "/keys/rotated"
+    });
+
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.proxy).toEqual({ type: "ssh", jumpHostId: "bastion-2" });
+    expect(saved.keyPath).toBe("/keys/rotated");
+  });
+
+  // ⊘ The proxy PASSWORD is the vault half of the same loss: the proxy fields
+  // are hidden on a telnet save, so the secret-sync saw "no proxy" and deleted
+  // the stored password — the SSH config would come back on a flip-back with a
+  // credential silently missing.
+  it("keeps the stored proxy password across a flip to Telnet", async () => {
+    const secretKey = proxyPasswordSecretKey("srv-1");
+    const { ctx, secretDelete } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [CONFIGURED],
+      authProfiles: [makeAuthProfile({ id: "ap1", name: "Lab", authType: "password" })],
+      initialSecrets: { [secretKey]: "proxy-secret" }
+    });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(TELNET_SUBMISSION);
+
+    expect(secretDelete).not.toHaveBeenCalledWith(secretKey);
+    expect(await ctx.secretVault!.get(secretKey)).toBe("proxy-secret");
+  });
+});
+
+describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  // ⊘ A telnet server has no username, so the old template produced a leading
+  // "@" — `@10.0.0.1:23` — which is not a paste-able address in a ticket or a
+  // shell. Discriminating because the SSH control below proves the `user@`
+  // form is still emitted where there IS a user.
+  it("omits the empty username and its @ separator", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ protocol: "telnet", username: "", host: "10.0.0.1", port: 2001 })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:2001");
+  });
+
+  it("still emits user@host:port for an SSH server (control)", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ username: "dev", host: "example.com", port: 22 })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("dev@example.com:22");
+  });
+
+  it("still carries the BMC address alongside", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ protocol: "telnet", username: "", host: "10.0.0.1", port: 23, ipmiHost: "10.9.9.9" })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("10.0.0.1:23\nIPMI/BMC: 10.9.9.9");
+  });
+
+  // P3-2 (Fable) — an addressless placeholder has no console address, so Copy Info
+  // must not paste the nonsense ":0"; it heads with "(no console address)" and
+  // still carries the BMC line, which is often the only usable address. ⊘ Emitting
+  // `${host}:${port}` renders ":0".
+  it("P3-2 — renders '(no console address)' for an addressless placeholder and keeps the BMC line", async () => {
+    const { ctx } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ addressless: true, host: "", port: 0, username: "admin", ipmiHost: "10.9.9.9", origin: { sourceId: "s", externalId: "e", syncedAt: 1 } })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+
+    const copied = vi.mocked(vscode.env.clipboard.writeText).mock.calls[0][0];
+    expect(copied).toContain("(no console address)");
+    expect(copied).not.toContain(":0");
+    expect(copied).toContain("IPMI/BMC: 10.9.9.9");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P1 (Codex, serialization audit) — folder ops that persist a FULL server
+// snapshot must serialize under configMutationLock, or a concurrent background
+// port-heal (or any other writer) can clobber the folder result or have its own
+// port write reverted on reload. Uses a REAL NexusCore + a gated repository so
+// the heal's write can be held in flight while the folder op commits.
+// ---------------------------------------------------------------------------
+describe("folder-op serialization (#84 P1)", () => {
+  class GatedRepo extends InMemoryConfigRepository {
+    private armed = false;
+    private releaseFn: () => void = () => {};
+    private startedFn: () => void = () => {};
+    public gate = new Promise<void>((r) => (this.releaseFn = r));
+    public firstGatedSaveStarted = new Promise<void>((r) => (this.startedFn = r));
+    public arm(): void {
+      this.armed = true;
+    }
+    public releaseGate(): void {
+      this.releaseFn();
+    }
+    public override async saveServers(servers: ServerConfig[]): Promise<void> {
+      if (this.armed) {
+        this.armed = false; // gate ONLY the first save after arming
+        this.startedFn();
+        await this.gate;
+      }
+      return super.saveServers(servers);
+    }
+  }
+
+  function realCtx(core: NexusCore, extra: Partial<CmdCtx> = {}): CmdCtx {
+    return { core, ...extra } as unknown as CmdCtx;
+  }
+
+  function telnetServer(id: string, group: string, port: number): ServerConfig {
+    return {
+      id,
+      name: id,
+      host: "10.0.0.9",
+      port,
+      protocol: "telnet",
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group,
+      origin: { sourceId: "src-1", externalId: id, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: port, syncedProtocol: "telnet" }
+    };
+  }
+
+  const healReport = (externalId: string, port: number) => ({
+    contractVersion: 1 as const,
+    statuses: { [externalId]: { state: "running" as const, consolePort: port } }
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("nexus.group.rename does not clobber a concurrent port-heal: the folder move stands AND the healed port survives (⊘ dropping the runExclusive lets the rename's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addServersBatch([telnetServer("t1", "Old", 32769)], ["Old"]);
+    registerServerCommands(realCtx(core));
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValue("New");
+
+    repo.arm();
+    const renameP = registeredCommands.get("nexus.group.rename")!(new FolderTreeItem("Old", "Old")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the rename's saveServers is blocked
+
+    // A background heal (serialized like refreshStatus does) re-ports t1.
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("t1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+
+    repo.releaseGate();
+    await Promise.all([renameP, healP]);
+
+    const t1 = (await repo.getServers()).find((s) => s.id === "t1");
+    expect(t1?.group).toBe("New"); // folder rename stands
+    expect(t1?.port).toBe(32800); // heal survives (not reverted on disk)
+  });
+
+  it("a folder rename does not clobber a concurrent server EDIT of an UNRELATED server (a latent race even before the heal) (⊘ dropping the runExclusive lets the rename's stale snapshot revert the edit)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // t1 lives in "Old" (to be renamed); x1 lives in an untouched folder.
+    const x1 = telnetServer("x1", "Keep", 22);
+    await core.addServersBatch([telnetServer("t1", "Old", 32769), x1], ["Old", "Keep"]);
+    registerServerCommands(realCtx(core));
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValue("New");
+
+    repo.arm();
+    const renameP = registeredCommands.get("nexus.group.rename")!(new FolderTreeItem("Old", "Old")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the rename's saveServers is blocked
+
+    // A concurrent server edit (serialized like nexus.server.edit) changes x1's
+    // host — replacing its object in the map, which the rename's stale snapshot
+    // (holding x1's original object) would revert.
+    const editP = configMutationLock.runExclusive(() => core.addOrUpdateServer({ ...x1, host: "10.9.9.9" }));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([renameP, editP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "t1")?.group).toBe("New"); // rename stands
+    expect(persisted.find((s) => s.id === "x1")?.host).toBe("10.9.9.9"); // edit survives
+  });
+
+  it("nexus.group.remove (delete contents) does not clobber a concurrent port-heal on a SURVIVOR: the deleted server stays deleted AND the survivor's healed port survives (⊘ dropping the runExclusive lets the cascade's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // t1 is in the folder being deleted; s1 (a survivor, telnet, sync-owned) is elsewhere.
+    await core.addServersBatch(
+      [telnetServer("t1", "Trash", 22), telnetServer("s1", "Keep", 32769)],
+      ["Trash", "Keep"]
+    );
+    registerProfileCommands(realCtx(core));
+
+    mockShowWarningMessage.mockResolvedValue("Delete contents");
+
+    repo.arm();
+    const removeP = registeredCommands.get("nexus.group.remove")!(new FolderTreeItem("Trash", "Trash")) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the cascade's saveServers is blocked
+
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("s1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([removeP, healP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "t1")).toBeUndefined(); // deleted stays deleted
+    expect(persisted.find((s) => s.id === "s1")?.port).toBe(32800); // survivor's heal survives
+  });
+
+  it("nexus.server.deployKey (key conversion) does not clobber a concurrent heal of an UNRELATED telnet server, and builds from the LIVE deploy target (⊘ dropping the runExclusive+re-read lets the conversion's stale snapshot revert the heal)", async () => {
+    const repo = new GatedRepo();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    // d1 is the ssh server being converted to key auth; t1 is an unrelated telnet
+    // node a background refresh heals while the deploy/prompt awaits.
+    const d1: ServerConfig = {
+      id: "d1",
+      name: "deploy-target",
+      host: "10.0.0.1",
+      port: 22,
+      username: "dev",
+      authType: "agent",
+      isHidden: false
+    };
+    await core.addServersBatch([d1, telnetServer("t1", "Keep", 32769)]);
+
+    const sshFactory = { connect: vi.fn(async () => ({ dispose: vi.fn() })) };
+    registerServerCommands(realCtx(core, { sshFactory: sshFactory as unknown as CmdCtx["sshFactory"] }));
+
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
+    // pickKeyForDeployment's quick pick → choose the existing key.
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // withProgress runs its callback (connect + deploy) directly.
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_opts: unknown, task: (...a: unknown[]) => unknown) => task());
+    // pickDeployConversionMode → "Use standalone key".
+    vi.mocked(vscode.window.showInformationMessage).mockResolvedValue("Use standalone key" as unknown as vscode.MessageItem);
+
+    repo.arm();
+    const deployP = registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false)) as Promise<void>;
+    await repo.firstGatedSaveStarted; // the conversion write's saveServers is blocked
+
+    const healP = configMutationLock.runExclusive(() => core.healSyncedConsolePorts("src-1", healReport("t1", 32800)));
+    await new Promise((r) => setTimeout(r, 0));
+    repo.releaseGate();
+    await Promise.all([deployP, healP]);
+
+    const persisted = await repo.getServers();
+    expect(persisted.find((s) => s.id === "d1")?.authType).toBe("key"); // conversion stands
+    expect(persisted.find((s) => s.id === "d1")?.keyPath).toBe("/home/user/.ssh/id_ed25519");
+    expect(persisted.find((s) => s.id === "t1")?.port).toBe(32800); // unrelated heal survives
+  });
+
+  // #84 P2 (Codex) — the key is deployed to the CAPTURED endpoint; if the live
+  // connection identity (host/port/proxy/username) changed while the deploy or
+  // conversion prompt was open, converting would switch a box that never got the
+  // key to key auth. The conversion must ABORT instead. Uses a plain repo — the
+  // edit lands during the conversion prompt, BEFORE the conversion write.
+  function deployKit(core: NexusCore, sshFactory: { connect: ReturnType<typeof vi.fn> }): void {
+    registerServerCommands(realCtx(core, { sshFactory: sshFactory as unknown as CmdCtx["sshFactory"] }));
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([
+      { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    ]);
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_o: unknown, task: (...a: unknown[]) => unknown) => task());
+  }
+  const sshDeploy = () => ({ connect: vi.fn(async () => ({ dispose: vi.fn() })) });
+
+  it("nexus.server.deployKey ABORTS the conversion when the connection identity changed during deploy (standalone) — the box is NOT switched to key auth and the concurrent edit survives (⊘ skipping the identity revalidation switches a box that never received the key to key auth)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "agent", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // The conversion-mode prompt is the last await before the write: a concurrent
+    // edit changes d1's HOST (an identity field) while it is open.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateServer({ ...d1, host: "10.9.9.9" });
+      return "Use standalone key";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.host).toBe("10.9.9.9"); // the concurrent edit survives
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
+  });
+
+  it("nexus.server.deployKey ABORTS the conversion when the identity changed during deploy (profile-linked branch) — same revalidation (⊘ skipping it links a moved box to a key auth profile it can't use)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "agent", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    // A matching key auth profile so pickOrCreateKeyAuthProfile resolves without creating one.
+    await core.addOrUpdateAuthProfile({ id: "kp1", name: "K", username: "dev", authType: "key", keyPath: "/home/user/.ssh/id_ed25519" });
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick)
+      .mockResolvedValueOnce({
+        keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+      } as unknown as vscode.QuickPickItem)
+      .mockResolvedValueOnce({ profile: { id: "kp1", name: "K", username: "dev", authType: "key", keyPath: "/home/user/.ssh/id_ed25519" } } as unknown as vscode.QuickPickItem);
+    // Edit d1's PORT (identity) during the conversion-mode prompt → then choose profile.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateServer({ ...d1, port: 2222 });
+      return "Use key auth profile";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.authProfileId).toBeUndefined(); // not linked to the profile
+    expect(live?.port).toBe(2222); // the concurrent edit survives
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
+  });
+
+  it("(#84 P2-1) deployKey runs the password cleanup ONLY on a SUCCESSFUL conversion — an aborted conversion neither announces 'switched to key auth' nor deletes the stored password (⊘ running cleanup regardless of success announces a false switch and offers a still-password-auth record's password for deletion)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "dev", authType: "password", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    const vaultGet = vi.fn(async () => "stored-pw");
+    const vaultDelete = vi.fn(async () => {});
+    deployKit(core, sshDeploy());
+    // Attach a vault so the (buggy) cleanup could act.
+    registerServerCommands(realCtx(core, {
+      sshFactory: sshDeploy() as unknown as CmdCtx["sshFactory"],
+      secretVault: { get: vaultGet, store: vi.fn(async () => {}), delete: vaultDelete } as unknown as CmdCtx["secretVault"]
+    }));
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // Mode prompt: edit d1's host (identity change → abort). The removal
+    // announcement, if the buggy cleanup ran, would return the delete action.
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async (msg: string) => {
+      if (typeof msg === "string" && msg.includes("Choose how to use it")) {
+        await core.addOrUpdateServer({ ...d1, host: "10.9.9.9" });
+        return "Use standalone key";
+      }
+      return "Remove stored password";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    // Conversion aborted, so the cleanup must not have run at all.
+    expect(vi.mocked(vscode.window.showInformationMessage)).not.toHaveBeenCalledWith(
+      expect.stringContaining("switched to key authentication"),
+      expect.anything()
+    );
+    expect(vaultDelete).not.toHaveBeenCalled();
+    expect(core.getServer("d1")?.authType).toBe("password"); // never converted
+  });
+
+  it("(#84 P2-2) deployKey ABORTS when the linked profile's USERNAME changed during deploy — the stored username field is unchanged (profile-linked) but the effective account the key was authorized for moved (⊘ comparing the stored username instead of the resolved effective one converts a moved account to key auth)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // Profile-linked server: stored username blank, effective username comes from p1.
+    await core.addOrUpdateAuthProfile({ id: "p1", name: "P", username: "old-acct", authType: "password" });
+    const d1: ServerConfig = { id: "d1", name: "deploy-target", host: "10.0.0.1", port: 22, username: "", authType: "agent", authProfileId: "p1", isHidden: false };
+    await core.addOrUpdateServer(d1);
+    deployKit(core, sshDeploy());
+
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
+      keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
+    } as unknown as vscode.QuickPickItem);
+    // During the mode prompt, the linked profile's username changes — the key was
+    // installed for "old-acct", the profile now resolves to "new-acct".
+    vi.mocked(vscode.window.showInformationMessage).mockImplementation((async () => {
+      await core.addOrUpdateAuthProfile({ id: "p1", name: "P", username: "new-acct", authType: "password" });
+      return "Use standalone key";
+    }) as unknown as typeof vscode.window.showInformationMessage);
+
+    await registeredCommands.get("nexus.server.deployKey")!(new ServerTreeItem(d1, false));
+
+    const live = core.getServer("d1");
+    expect(live?.authType).toBe("agent"); // NOT switched to key auth
+    expect(live?.authProfileId).toBe("p1"); // still profile-linked, unchanged
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
   });
 });

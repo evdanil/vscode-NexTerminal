@@ -280,6 +280,72 @@ describe("ProxySshFactory", () => {
     );
   }
 
+  /**
+   * MAJOR-3 (review) — DEFENSE IN DEPTH behind the picker filter. A server can
+   * be switched to Telnet long AFTER another server named it as a jump host, so
+   * the stored id outlives the picker's refusal to offer it. Without a guard
+   * here the chain dereferenced the telnet server and handed it to
+   * `SilentAuthSshFactory`: a vault read and a password prompt for a host that
+   * has no SSH login, ending in a raw ssh2 handshake error against port 23.
+   */
+  describe("addressless jump host", () => {
+    // ADDRESSLESS (Codex P1 review MAJOR-1) — the stale-id defense: a picker can
+    // never retract a jump-host choice already saved, and a server can go
+    // addressless (its device stopped) long after another named it. Selecting an
+    // addressless jump host must refuse BEFORE any vault read or auth attempt.
+    it("refuses an addressless jump host before any authentication is attempted (⊘ no guard reaches SilentAuthSshFactory with host \"\", prompting and handshaking against nothing)", async () => {
+      servers.set("srv-addr-jump", makeServer({ id: "srv-addr-jump", name: "stopped-node", addressless: true, host: "" }));
+      const target = makeServer({ id: "srv-target", proxy: { type: "ssh", jumpHostId: "srv-addr-jump" } });
+      servers.set(target.id, target);
+      const factory = await createFactory();
+
+      await expect(factory.connect(target)).rejects.toThrow(/stopped-node/);
+      expect(authFactory.connect).not.toHaveBeenCalled();
+      expect(vault.get).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("telnet jump host", () => {
+    // ⊘ The assertion that matters is `authFactory.connect` NOT being called:
+    // an implementation that merely lets the connection fail later still
+    // prompts for a credential first, which is the harm.
+    it("refuses a telnet jump host before any authentication is attempted", async () => {
+      servers.set("srv-telnet-jump", makeServer({ id: "srv-telnet-jump", name: "eve-console", protocol: "telnet", username: "" }));
+      const target = makeServer({ id: "srv-target", proxy: { type: "ssh", jumpHostId: "srv-telnet-jump" } });
+      servers.set(target.id, target);
+      const factory = await createFactory();
+
+      await expect(factory.connect(target)).rejects.toThrow(/telnet/i);
+      expect(authFactory.connect).not.toHaveBeenCalled();
+      expect(vault.get).not.toHaveBeenCalled();
+    });
+
+    it("names the offending jump host so the message is actionable", async () => {
+      servers.set("srv-telnet-jump", makeServer({ id: "srv-telnet-jump", name: "eve-console", protocol: "telnet", username: "" }));
+      const target = makeServer({ id: "srv-target", proxy: { type: "ssh", jumpHostId: "srv-telnet-jump" } });
+      servers.set(target.id, target);
+      const factory = await createFactory();
+
+      await expect(factory.connect(target)).rejects.toThrow(/eve-console/);
+    });
+
+    // CONTROL — the guard must be scoped to telnet, not a blanket refusal of
+    // jump hosts. Reaching the target connect at all proves the chain ran.
+    it("still authenticates against an ordinary SSH jump host (control)", async () => {
+      const jump = makeServer({ id: "srv-jump", name: "bastion" });
+      servers.set(jump.id, jump);
+      const target = makeServer({ id: "srv-target", proxy: { type: "ssh", jumpHostId: "srv-jump" } });
+      servers.set(target.id, target);
+      const factory = await createFactory();
+
+      await factory.connect(target).catch(() => {
+        /* the fake connection's tunnel stream is not a real Duplex; the chain
+           having got that far is the assertion, not the outcome. */
+      });
+      expect(authFactory.connect).toHaveBeenCalledWith(jump);
+    });
+  });
+
   async function createPooledFactory() {
     const factory = await createFactory();
     const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 5000 });

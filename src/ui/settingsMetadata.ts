@@ -13,6 +13,7 @@ export interface SettingMeta {
     | "sftp"
     | "serial"
     | "scripts"
+    | "inventory"
     | "localServers"
     | "networkServers"
     | "tftpServer"
@@ -498,6 +499,19 @@ export const SETTINGS_META: SettingMeta[] = [
     default: 1800
   },
   {
+    key: "maxReadSizeMb",
+    section: "nexus.scripts",
+    label: "Max File Read Size",
+    type: "number",
+    category: "scripts",
+    description:
+      "Largest file nexus.fs.readText / readJson will read for a script. Bigger files are refused with FileTooLarge. Snapshotted when a run starts — a change does not affect scripts already running.",
+    min: 1,
+    max: 16,
+    unit: "MB",
+    default: 4
+  },
+  {
     key: "macroPolicy",
     section: "nexus.scripts",
     label: "Macro Behaviour During Runs",
@@ -529,6 +543,20 @@ export const SETTINGS_META: SettingMeta[] = [
     description:
       "Automatically restore terminal.integrated.commandsToSkipShell when an external program strips it. Forensic logging stays active even when disabled.",
     default: true
+  },
+  // --- Inventory (Phase 2) ---
+  {
+    key: "statusPollSeconds",
+    section: "nexus.inventory",
+    label: "Lab status poll interval",
+    type: "number",
+    category: "inventory",
+    min: 0,
+    max: 3600,
+    unit: "seconds",
+    default: 0,
+    description:
+      "How often to refresh EVE-NG lab running status while the Command Center is visible. 0 disables polling (use Refresh Lab Status manually)."
   },
   // --- Local Servers ---
   {
@@ -791,6 +819,7 @@ export const CATEGORY_ORDER = [
   "sftp",
   "serial",
   "scripts",
+  "inventory",
   "localServers",
   "networkServers",
   "tftpServer",
@@ -807,6 +836,7 @@ export const CATEGORY_LABELS: Record<string, string> = {
   sftp: "SFTP / File Explorer",
   serial: "Serial",
   scripts: "Scripts",
+  inventory: "Inventory",
   localServers: "Local Servers",
   networkServers: "Network Servers",
   tftpServer: "TFTP Server",
@@ -823,6 +853,7 @@ export const CATEGORY_ICONS: Record<string, string> = {
   sftp: "folder-opened",
   serial: "circuit-board",
   scripts: "play",
+  inventory: "server-environment",
   localServers: "server-process",
   networkServers: "bell",
   tftpServer: "radio-tower",
@@ -839,6 +870,7 @@ export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   sftp: "Configure remote file browsing, caching, watching, transfer timeouts, and delete safety limits.",
   serial: "Set serial command timeout behavior.",
   scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs.",
+  inventory: "Control how synced inventory sources refresh live device status in the Command Center.",
   localServers: "Tune auto-restart limits, backoff timing, and working-directory safety for local server processes.",
   networkServers:
     "Behaviour shared by both embedded network services — how much of what TFTP and DHCP are doing is surfaced as notifications.",

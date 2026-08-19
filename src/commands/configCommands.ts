@@ -69,6 +69,7 @@ import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidation";
+import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
 import { MAX_SCRIPT_WAIT_TIMEOUT_MS, MAX_SCRIPT_WAIT_TIMEOUT_SECONDS } from "../services/scripts/defaultTimeout";
@@ -216,8 +217,15 @@ function validStaticReservations(value: unknown): boolean {
 // Keeping them in a lookup map keeps the apply loop flat (no special-case if/else ladder).
 const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingValidation> = {
   "nexus.terminal.highlighting.rules": (value) => {
+    // Upgrade as well as validate. Import is the one path that carries a rule
+    // array in from ANOTHER machine — usually an older install, which is
+    // exactly where the pre-2.8.187 truncating IPv6 pattern and the
+    // pre-2.8.182 nameless rules live. The one-shot activation migration has
+    // already run by now, so importing the raw payload would re-pollute global
+    // settings with the stale snapshot this release exists to heal, with no
+    // second chance to fix it until the next restart.
     const rules = validateAndSanitizeHighlightRules(value);
-    return rules ? { ok: true, value: rules } : { ok: false };
+    return rules ? { ok: true, value: upgradeHighlightRules(rules).rules } : { ok: false };
   },
   "nexus.scripts.maxRuntimeMs": (value) =>
     validBoundedNumber(value, 0, MAX_SCRIPT_RUNTIME_MS) ? { ok: true, value } : { ok: false },
@@ -821,6 +829,14 @@ export function sanitizeForSharing(
   for (const p of authProfiles) {
     idMap.set(p.id, randomUUID());
   }
+
+  // ADDRESSLESS (Codex P1 review MINOR-1) — DROP addressless placeholders from a
+  // shared export entirely. A share strips `origin` (a synced marker is local
+  // only), which would leave an `addressless:true, host:""` record the recipient
+  // can never connect to, re-address, or upgrade — and one that violates the
+  // "addressless is written ONLY by inventory sync" invariant on their machine.
+  // They are meaningless without their source, so they do not travel.
+  servers = servers.filter((s) => s.addressless !== true);
 
   // Second pass: assign new IDs for servers
   for (const s of servers) {
@@ -1622,7 +1638,13 @@ export function registerConfigCommands(
 
     // For share exports, always merge with fresh IDs
     if (exportType === "share") {
-      await importShareData(data);
+      // #84 P1 (Codex, serialization audit) — a share import adds servers/groups/
+      // etc. through per-entity full-snapshot writes; serialize it under
+      // configMutationLock so a concurrent background port-heal (or any writer)
+      // cannot clobber it or be reverted by it. importShareData runs no blocking
+      // prompt (only fire-and-forget notifications), so holding the lock across
+      // it is safe.
+      await configMutationLock.runExclusive(() => importShareData(data));
       return;
     }
 
@@ -2757,6 +2779,12 @@ export function registerConfigCommands(
                       ...(rolledBackOrigin.syncedAltHost !== undefined
                         ? { syncedAltHost: rolledBackOrigin.syncedAltHost }
                         : {}),
+                      // TELNET (Phase 0) — the transport receipt, on exactly the terms of
+                      // the alternate-host one above: it says whether the `protocol` this
+                      // server keeps was the SYNC'S doing or the USER'S, which is the whole
+                      // of the `syncOwnsProtocol` write rule. Omitted rather than written as
+                      // `undefined` for the reason `instanceKey` is.
+                      ...(rolledBackOrigin.syncedProtocol !== undefined ? { syncedProtocol: rolledBackOrigin.syncedProtocol } : {}),
                       // DEVICE TEMPLATES (issue #48 PR-T1, Codex review round 3) —
                       // the template stamps, the fourth part of the origin that
                       // must OUTLIVE the strip, on exactly the terms of the auth/
@@ -3007,21 +3035,27 @@ export function registerConfigCommands(
     );
     if (confirm !== "Import") return;
 
-    for (const folder of result.folders) {
-      await core.addGroup(folder);
-    }
-    for (const session of result.sessions) {
-      await core.addOrUpdateServer({
-        id: randomUUID(),
-        name: session.name,
-        host: session.host,
-        port: session.port,
-        username: session.username,
-        authType: "password",
-        isHidden: false,
-        group: session.folder || undefined
-      });
-    }
+    // #84 P1 (Codex, serialization audit) — the write phase adds folders and
+    // servers through per-entity full-snapshot writes; serialize it under
+    // configMutationLock (AFTER the confirm modal, no UI held) so a concurrent
+    // background port-heal cannot clobber it or be reverted by it.
+    await configMutationLock.runExclusive(async () => {
+      for (const folder of result.folders) {
+        await core.addGroup(folder);
+      }
+      for (const session of result.sessions) {
+        await core.addOrUpdateServer({
+          id: randomUUID(),
+          name: session.name,
+          host: session.host,
+          port: session.port,
+          username: session.username,
+          authType: "password",
+          isHidden: false,
+          group: session.folder || undefined
+        });
+      }
+    });
 
     void vscode.window.showInformationMessage(
       `Imported ${result.sessions.length} ${pluralizeNoun(noun, result.sessions.length)} from ${sourceName}.`
@@ -3273,7 +3307,11 @@ export function registerConfigCommands(
         cancellable: false
       },
       async () => {
-        await core.addServersBatch(serverConfigs, folders);
+        // #84 P1 (Codex, serialization audit) — serialize the bulk import write
+        // under configMutationLock (after the confirm modal) so a concurrent
+        // background port-heal cannot clobber it or be reverted by its
+        // full-snapshot write.
+        await configMutationLock.runExclusive(() => core.addServersBatch(serverConfigs, folders));
       }
     );
 
@@ -3535,7 +3573,7 @@ export function registerConfigCommands(
       value: "hostListFile"
     },
     {
-      label: "$(sync) Inventory Source (NetBox)…",
+      label: "$(sync) Inventory Source…",
       description: "Live sync — devices stay linked to the source",
       value: "inventorySource"
     },
