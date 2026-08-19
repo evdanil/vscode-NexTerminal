@@ -1363,7 +1363,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       core
         .getSnapshot()
         .inventorySources.filter((source) => source.providerId === EVE_NG_PROVIDER_ID)
-        .map((source) => ({ id: source.id, intervalSeconds: readEveNgStatusPollSeconds(source.config) })),
+        .map((source) => ({
+          id: source.id,
+          intervalSeconds: readEveNgStatusPollSeconds(source.config),
+          // WHICH INCARNATION of the record this is (review G1). `revision` is
+          // minted afresh by `addOrUpdateInventorySource` on every write and is
+          // assigned nowhere else, so it changes exactly when the record is
+          // replaced — a remove-and-recreate under the same id, or an Edit
+          // Source save — and not when a routine sync merely stamps it. That
+          // is what lets the scheduler tell a source that came back from one
+          // that was only hidden, and it is the same value `refreshStatus`
+          // compares before applying a report.
+          incarnation: source.revision
+        })),
     // NexusCore's own change event covers every way the set or its intervals can
     // move — add/edit/remove a source, a backup import, the one-time migration
     // of the retired global setting — so no separate configuration listener is
@@ -1400,7 +1412,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // This drain routinely lands while that arm fire is still awaiting its vault
   // read, so the notification arrives before the source can possibly say whether
   // it ran. The poll records it against the fire in flight and re-tests when it
-  // reports (`SourceSchedule.settleDuringFire`) — which is why this is safe to
+  // reports (`SourceSchedule.pendingRecheck`) — which is why this is safe to
   // fire exactly once, with nothing here retrying.
   context.subscriptions.push(configMutationLock.onIdle(() => inventoryStatusPoll.sourceSettled()));
   context.subscriptions.push(inventoryStatusPoll);

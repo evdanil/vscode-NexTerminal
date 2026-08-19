@@ -47,6 +47,30 @@ export interface InventoryStatusPollSource {
   id: string;
   /** This source's poll interval in seconds; 0 (or less, or non-finite) disables it. */
   intervalSeconds: number;
+  /**
+   * WHICH INCARNATION OF THE RECORD this is (review G1) — `revision` in
+   * production. A source id is NOT an identity: a replace-mode restore removes
+   * and recreates the same id, and an Edit Source save replaces the record
+   * under it. `NexusCore.addOrUpdateInventorySource` mints a fresh `revision`
+   * on EVERY write and is the only place a live record's revision is ever
+   * assigned, so it is exactly the codebase's own notion of "a new incarnation
+   * of this record" — and exactly what `refreshStatus` compares before it
+   * applies a report.
+   *
+   * The scheduler needs it for one question it cannot otherwise answer: a
+   * hide/show cycle and a remove-and-recreate look identical from here (both
+   * disarm, retain the schedule for its latch, and re-arm the same id), yet an
+   * outstanding sweep SERVES the first and is discarded by the second. The
+   * incarnation is the only thing that separates them.
+   *
+   * REQUIRED, though the value may be `undefined`: a supplier must name it
+   * rather than be able to forget it. Absent on both sides reads as "the same
+   * record", which is sound for the real supplier — a recreate necessarily goes
+   * through `addOrUpdateInventorySource`, which cannot leave a record without
+   * one — but a supplier that silently omitted it would reintroduce the ABA,
+   * so the type does not let it.
+   */
+  incarnation: string | undefined;
 }
 
 /**
@@ -125,8 +149,38 @@ interface SourceSchedule {
    */
   firedSinceArm: boolean;
   /**
-   * THE LOST-WAKEUP GUARD (review F1). A settle that arrived while a fire for
-   * this source was IN FLIGHT, to be re-examined the moment that fire settles.
+   * WHICH INCARNATION THIS ARMING WAS MADE FOR (review G1) — the source's
+   * `incarnation` as of the not-running → running transition, and the identity
+   * `firedSinceArm` is implicitly a statement about.
+   *
+   * Without it `firedSinceArm` records THAT a fire ran, not WHICH arming it ran
+   * under, and the retained-schedule trick below turns that into an ABA. A
+   * replace-mode restore removes and recreates a source under the SAME id while
+   * its sweep is outstanding: the schedule object is deliberately kept alive to
+   * hold the latch, so it is re-armed in place — same object, same map entry —
+   * and the old fire then resolves `ran: true` and discharges an arming it
+   * never served. `schedules.get(id) !== schedule` cannot catch that; it is
+   * the same object. The recreated source is left with no status at all (its
+   * removal cleared it, and `refreshStatus` dropped the old report on its own
+   * revision guard) until a whole period elapses.
+   *
+   * A COUNTER BUMPED ON EVERY ARMING would fix that case and break the one
+   * beside it. A hide/show cycle re-arms the same record, and there the
+   * outstanding sweep DOES serve the new arming — its report is applied — so
+   * invalidating it buys a redundant crawl of the lab box. Only the incarnation
+   * tells the two apart, and it does so by the same test `refreshStatus` uses
+   * to decide whether the report was worth applying: a fire discharges the
+   * arming exactly when its report could still have reached the tree.
+   */
+  armedIncarnation: string | undefined;
+  /**
+   * THE RE-TEST GUARD (review F1/G1). A reason to ask "does this source still
+   * want a fire?" the moment the outstanding one completes — because while a
+   * fire is in flight the question has no answer yet.
+   *
+   * Set by the two places that discover the question cannot be answered now: a
+   * settle that arrives while a fire is in flight, and an ARM tick the latch
+   * swallowed (a source re-armed while its previous sweep is still running).
    *
    * Without it the protocol has a check-then-act window straddling an await,
    * and the config-restore path walks straight into it: the restore persists a
@@ -140,10 +194,16 @@ interface SourceSchedule {
    * Recorded WITHOUT looking at `firedSinceArm`, because at that moment the
    * answer is not yet known; `release` asks the question again when it is. That
    * is the whole discipline — record the wakeup, re-test the condition after
-   * the wait — and it is what makes a settle impossible to lose rather than
+   * the wait — and it is what makes a wakeup impossible to lose rather than
    * merely unlikely to be.
+   *
+   * It needs NO incarnation keying of its own, unlike `firedSinceArm`. It is
+   * not an answer, only a prompt to look again, and the looking (`redeem`)
+   * re-validates arming, incarnation and liveness against current state — so a
+   * prompt recorded under a dead arming can only ever cause a fire the LIVE
+   * arming was waiting for anyway.
    */
-  settleDuringFire: boolean;
+  pendingRecheck: boolean;
 }
 
 export interface InventoryStatusPoll {
@@ -176,6 +236,11 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
     if (schedule.inFlight) {
       return false; // a prior sweep of THIS source is still running — do not stack another
     }
+    // CAPTURED BEFORE THE FIRE (review G1). Everything this tick is later
+    // allowed to conclude is a statement about the arming it was dispatched
+    // under, and by the time it reports, the schedule may have been re-armed
+    // in place for a DIFFERENT incarnation of the record.
+    const dispatchedFor = schedule.armedIncarnation;
     const result = options.fire(id);
     // Latch only while a real (pending) sweep is outstanding: a fire that
     // returns a thenable (the executeCommand path / a gated test) holds the
@@ -184,29 +249,33 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
       schedule.inFlight = true;
       const release = (outcome?: InventoryStatusPollFireResult | void): void => {
         schedule.inFlight = false;
-        // ANYTHING BUT AN EXPLICIT DECLINE DISCHARGES THE ARMING. A `void`
+        if (schedules.get(id) !== schedule) {
+          return; // replaced by a fresh entry — that one owns its own state
+        }
+        // ANYTHING BUT AN EXPLICIT DECLINE DISCHARGES THE ARMING — but only
+        // THE ARMING THIS FIRE WAS DISPATCHED UNDER (review G1). A `void`
         // result (a caller with nothing to say) and a REJECTED sweep (a lab box
         // that is down) both read as "ran": the tick reached the provider, and
-        // there is nothing a later settle would do differently.
-        if (!(outcome && outcome.ran === false)) {
+        // there is nothing a later settle would do differently. A fire that
+        // outlived its incarnation says nothing about the record standing here
+        // now — its report was dropped by `refreshStatus`'s own revision guard
+        // — so it discharges nothing and the new arming keeps waiting.
+        if (schedule.armedIncarnation === dispatchedFor && !(outcome && outcome.ran === false)) {
           schedule.firedSinceArm = true;
         }
-        // Take and clear the lost-wakeup guard BEFORE anything can return: a
-        // settle recorded against this fire is answered exactly once, here.
-        const settledWhileWeRan = schedule.settleDuringFire;
-        schedule.settleDuringFire = false;
-        if (schedules.get(id) !== schedule) {
-          return; // re-armed or replaced meanwhile — that entry owns its own state
-        }
+        // Take and clear the re-test guard BEFORE anything can return: a
+        // recorded prompt is answered exactly once, here.
+        const recheck = schedule.pendingRecheck;
+        schedule.pendingRecheck = false;
         // The schedule may have been retired while its sweep was outstanding —
         // it was kept alive only to hold this latch (see `reevaluate`). Now that
-        // the latch is released, drop it. A disarmed source is owed nothing, so
+        // the latch is released, drop it. A disarmed source wants nothing, so
         // the guard goes with it.
         if (schedule.timer === undefined) {
           schedules.delete(id);
           return;
         }
-        if (settledWhileWeRan) {
+        if (recheck) {
           redeem(id, schedule);
         }
       };
@@ -214,7 +283,8 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
       // latch shut forever.
       (result as Promise<InventoryStatusPollFireResult | void>).then(release, () => release());
     } else {
-      // Nothing to await, so nothing can decline it afterwards: it ran.
+      // Nothing to await, so nothing can decline it afterwards and nothing can
+      // have re-armed underneath it: it ran, for this arming.
       schedule.firedSinceArm = true;
     }
     return true;
@@ -224,7 +294,7 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
    * Give an armed source the fire it is still waiting for, if it is still
    * waiting for one. The condition is re-tested HERE rather than trusted from
    * the caller, which is what lets every settle path — immediate, or deferred
-   * through `settleDuringFire` — go through one door.
+   * through `pendingRecheck` — go through one door.
    *
    * A source that has already had a fire run since it armed, or that is no
    * longer armed at all (the user hid the panel, set the interval to 0, or
@@ -235,22 +305,24 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
       return;
     }
     if (!tick(id, schedule)) {
-      // The latch swallowed it. Record the wakeup against the fire that is
+      // The latch swallowed it. Record the question against the fire that is
       // holding the latch, so `release` re-tests instead of dropping it.
-      schedule.settleDuringFire = true;
+      schedule.pendingRecheck = true;
     }
   };
 
   const reevaluate = (): void => {
     // What SHOULD be running right now. Nothing runs while the view is hidden.
-    const desired = new Map<string, number>();
+    // The whole SOURCE is kept, not just its period: arming is a statement
+    // about a particular incarnation of the record (see `armedIncarnation`).
+    const desired = new Map<string, InventoryStatusPollSource>();
     if (visible) {
       for (const source of options.getSources()) {
         const seconds = source.intervalSeconds;
         // Non-finite is rejected as well as non-positive: `NaN * 1000` arms a
         // timer that reports itself as running and never fires on its period.
         if (Number.isFinite(seconds) && seconds > 0) {
-          desired.set(source.id, seconds);
+          desired.set(source.id, source);
         }
       }
     }
@@ -265,26 +337,36 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
         // armed; once it is not — interval 0, removed, no longer offered, or
         // the view hidden — a fire would crawl a lab box for a source nothing
         // is polling, against the very gating this scheduler exists to enforce.
-        // `redeem` re-tests `timer` for exactly that, so the only thing to drop
-        // here is a settle recorded against the arming that just ended — and it
-        // is dropped explicitly because the entry can SURVIVE this loop (below)
-        // to hold its latch. `firedSinceArm` needs no clearing: a fresh arming
-        // resets it, and until then nobody reads it.
-        schedule.settleDuringFire = false;
+        // `redeem` re-tests `timer` for exactly that, so clearing the re-test
+        // guard here is hygiene rather than correctness — but the entry can
+        // SURVIVE this loop (below) to hold its latch, and leaving a prompt on
+        // a schedule whose arming is over reads as though it meant something.
+        // `firedSinceArm` needs no clearing: a fresh arming resets it, and
+        // until then nobody reads it.
+        schedule.pendingRecheck = false;
         // Keep a schedule whose sweep is still outstanding, purely so its latch
         // survives: dropping it here and re-adding the source a moment later
         // would let a second crawl start against a lab box already being
-        // crawled. `release` prunes it once the sweep settles.
+        // crawled. `release` prunes it once the sweep settles. This retention
+        // is also why arming needs an identity of its own — the re-armed entry
+        // is the SAME OBJECT, so object identity cannot tell the two apart.
         if (!schedule.inFlight) {
           schedules.delete(id);
         }
       }
     }
 
-    for (const [id, seconds] of desired) {
+    for (const [id, source] of desired) {
+      const seconds = source.intervalSeconds;
       let schedule = schedules.get(id);
       if (!schedule) {
-        schedule = { seconds, inFlight: false, firedSinceArm: false, settleDuringFire: false };
+        schedule = {
+          seconds,
+          inFlight: false,
+          armedIncarnation: source.incarnation,
+          firedSinceArm: false,
+          pendingRecheck: false
+        };
         schedules.set(id, schedule);
       }
       if (schedule.timer === undefined) {
@@ -294,28 +376,65 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
         // honours the latch, so a source re-armed while its previous sweep is
         // outstanding does not double-fire.
         schedule.seconds = seconds;
+        // THE ARMING, stamped with the incarnation it is for. Set BEFORE the
+        // tick so the fire it dispatches is captured against this arming.
+        schedule.armedIncarnation = source.incarnation;
         // A FRESH ARMING WANTS A FIRE, whatever the last one got. Set BEFORE the
         // tick, so a fire that declines (or that the latch swallows) leaves the
         // source still waiting rather than reading as satisfied by history.
         schedule.firedSinceArm = false;
-        // The ARM tick. If it is declined, or the latch swallows it,
-        // `firedSinceArm` stays false and the next settle brings the source its
-        // fire (see `redeem`).
-        tick(id, schedule);
+        if (!tick(id, schedule)) {
+          // The latch swallowed the ARM tick — a source re-armed while its
+          // previous sweep is still running. Record the question rather than
+          // dropping it: `release` re-tests the moment the latch opens, which
+          // is what gets a recreated source its fire without waiting for a
+          // settle or a whole period.
+          schedule.pendingRecheck = true;
+        }
         schedule.timer = setInterval(() => tick(id, schedule!), seconds * 1000);
-      } else if (schedule.seconds !== seconds) {
-        // A period change REPLACES this source's timer with one at the current
-        // period — never layers a second one on top — and does NOT re-fire. It
-        // is not a re-arming either: `firedSinceArm` is left exactly as it was,
-        // so a source still waiting for its first fire keeps waiting for it and
-        // one that has had it is not sent round again.
-        clearInterval(schedule.timer);
-        schedule.seconds = seconds;
-        schedule.timer = setInterval(() => tick(id, schedule!), seconds * 1000);
+      } else {
+        // ALREADY RUNNING. Two things can still have moved.
+        if (schedule.armedIncarnation !== source.incarnation) {
+          // A NEW INCARNATION UNDER A LIVE ARMING (review G1) — an Edit Source
+          // save, which replaces the record in place: the id never leaves the
+          // list, so nothing above disarms and re-arms it. It is a fresh arming
+          // in every sense that matters here. `addOrUpdateInventorySource`
+          // DROPS the source's runtime status whenever a config value changed,
+          // so the tree is now blank for it; and any fire still in flight was
+          // dispatched for the old record, so it discharges nothing. Without
+          // this the source shows nothing until its next routine tick — up to
+          // an hour after an edit the user just made.
+          //
+          // The TIMER IS LEFT ALONE, deliberately: re-arming it would restart
+          // the phase on every edit. This changes only what the schedule is
+          // waiting for, then asks for it — through `redeem`, which honours the
+          // latch and re-validates like every other path.
+          // Stamped BEFORE the ask, so a fire that re-enters `reevaluate`
+          // synchronously sees an arming that already matches and cannot ask
+          // again.
+          schedule.armedIncarnation = source.incarnation;
+          schedule.firedSinceArm = false;
+          redeem(id, schedule);
+        }
+        if (schedule.seconds !== seconds) {
+          // A period change REPLACES this source's timer with one at the current
+          // period — never layers a second one on top — and does NOT re-fire of
+          // itself. It is not a re-arming either: `firedSinceArm` is left
+          // exactly as it was, so a source still waiting for its first fire
+          // keeps waiting for it and one that has had it is not sent round
+          // again. (In production a period change arrives WITH a new
+          // incarnation — the interval lives in the source's config — so the
+          // branch above has usually just asked for a fire; this one is only
+          // about the timer.)
+          clearInterval(schedule.timer);
+          schedule.seconds = seconds;
+          schedule.timer = setInterval(() => tick(id, schedule!), seconds * 1000);
+        }
       }
-      // Unchanged period, already running: deliberately left alone. Re-arming it
-      // would restart its phase every time an UNRELATED source was edited, so a
-      // long-period source in a set that changes often would never reach a tick.
+      // Unchanged period and incarnation, already running: deliberately left
+      // alone. Re-arming it would restart its phase every time an UNRELATED
+      // source was edited, so a long-period source in a set that changes often
+      // would never reach a tick.
     }
   };
 
@@ -349,7 +468,7 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
      *    exists to prevent.
      *  - A FIRE IS IN FLIGHT: the condition cannot be evaluated yet — that fire
      *    has not said whether it ran — so the wakeup is RECORDED against it
-     *    (`settleDuringFire`) and `release` re-tests the moment it can. This is
+     *    (`pendingRecheck`) and `release` re-tests the moment it can. This is
      *    the case a check-then-act across the await silently dropped, and the
      *    config-restore path hits it every time: the restore persists a source,
      *    the arm fire goes off to read the vault, the mutation queue drains,
@@ -367,7 +486,7 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
           continue;
         }
         if (schedule.inFlight) {
-          schedule.settleDuringFire = true;
+          schedule.pendingRecheck = true;
           continue;
         }
         redeem(id, schedule);

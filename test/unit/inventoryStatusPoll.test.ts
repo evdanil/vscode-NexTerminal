@@ -30,17 +30,29 @@ function makeView(initialVisible: boolean): VisibilityAwareView & { emit(visible
   };
 }
 
-function makeSourceFeed(initial: InventoryStatusPollSource[]): {
+/**
+ * A source as these tests write one. `incarnation` is REQUIRED on the module's
+ * own contract — a supplier must not be able to forget it (see
+ * `InventoryStatusPollSource`) — but most tests here are about scheduling, not
+ * identity, and for them one unchanging record is the honest fixture. Omitting
+ * it means "the same record throughout", which is what a hide/show cycle or a
+ * period change actually is; the identity tests name it explicitly.
+ */
+type PollSourceSeed = { id: string; intervalSeconds: number; incarnation?: string };
+
+function makeSourceFeed(initial: PollSourceSeed[]): {
   onDidChangeSources: (cb: () => void) => { dispose(): void };
   getSources: () => InventoryStatusPollSource[];
-  set(next: InventoryStatusPollSource[]): void;
+  set(next: PollSourceSeed[]): void;
   disposed: () => boolean;
 } {
   let cb: (() => void) | undefined;
   let disposed = false;
   let sources = initial;
+  const seen = (seeds: PollSourceSeed[]): InventoryStatusPollSource[] =>
+    seeds.map((seed) => ({ id: seed.id, intervalSeconds: seed.intervalSeconds, incarnation: seed.incarnation }));
   return {
-    getSources: () => sources,
+    getSources: () => seen(sources),
     onDidChangeSources(listener) {
       cb = listener;
       return { dispose: () => { disposed = true; cb = undefined; } };
@@ -413,6 +425,109 @@ describe("startInventoryStatusPoll", () => {
       poll.sourceSettled();
       await vi.advanceTimersByTimeAsync(0);
       expect(fire).toHaveBeenCalledTimes(2);
+    });
+
+    /**
+     * THE ABA (review G1). `firedSinceArm` records THAT a fire ran; on its own
+     * it does not record WHICH arming it ran under, and the retained-schedule
+     * trick turns that into an identity bug.
+     *
+     * A replace-mode restore removes and recreates a source under the SAME id
+     * while its sweep is outstanding. The schedule object is deliberately kept
+     * alive to hold the latch, so it is re-armed IN PLACE — same object, same
+     * map entry, which is why the `schedules.get(id) !== schedule` guard cannot
+     * see it. The old fire then resolves `ran: true` and discharges an arming
+     * it never served. The recreated source is left showing nothing at all:
+     * removal cleared its status, and `refreshStatus` dropped the old report on
+     * its own revision guard.
+     */
+    it("does not let a sweep from the PREVIOUS incarnation discharge a recreated source's arming, and gives that source its fire as soon as the latch opens (⊘ an id is not an identity: the retained schedule is re-armed in place, so a fire that outlived the record it was dispatched for silently satisfies the new arming and the recreated source shows nothing for a whole period)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600, incarnation: "rev-1" }]);
+      const gate = deferred();
+      let call = 0;
+      const fire = vi.fn(() => {
+        call++;
+        // The old incarnation's sweep runs to completion and reports that it RAN.
+        return call === 1 ? gate.promise.then(() => ({ ran: true })) : Promise.resolve({ ran: true });
+      });
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      expect(fire).toHaveBeenCalledTimes(1); // armed; its sweep is outstanding
+
+      // A replace-mode restore: the source is removed…
+      feed.set([]);
+      // …and recreated under the SAME id, as a new record.
+      feed.set([{ id: "a", intervalSeconds: 3600, incarnation: "rev-2" }]);
+      expect(fire).toHaveBeenCalledTimes(1); // the arm tick is swallowed by the old sweep's latch
+
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      // No settle, and not one second of the 3600 s period has elapsed.
+      expect(fire).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(1);
+    });
+
+    /**
+     * The twin, and the reason arming identity is the SOURCE'S INCARNATION
+     * rather than a counter bumped on every arming. A hide/show cycle re-arms
+     * the same record, and there the outstanding sweep genuinely serves the new
+     * arming — its report is applied — so treating every re-arm as a fresh
+     * question buys a redundant crawl of the lab box. Only the incarnation
+     * separates this from the case above, and it separates them by the same
+     * test `refreshStatus` uses to decide whether the report was worth applying.
+     */
+    it("lets a sweep outstanding across a HIDE/SHOW cycle discharge the new arming, because it is the same record and its report still lands (⊘ a counter bumped on every arming cannot tell a source that came back from one that was only hidden, and crawls the lab again for status already on screen)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600, incarnation: "rev-1" }]);
+      const gate = deferred();
+      const fire = vi.fn(() => gate.promise.then(() => ({ ran: true })));
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      expect(fire).toHaveBeenCalledTimes(1);
+
+      view.emit(false); // disarmed; the entry survives only to hold its latch
+      view.emit(true); // re-armed — SAME record, so the outstanding sweep is still ours
+      expect(fire).toHaveBeenCalledTimes(1);
+
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(1);
+
+      // …and it stays discharged, so no settle crawls the lab for it either.
+      poll.sourceSettled("a");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * The same identity assumption, reached without any disarm at all (review
+     * G1 sweep). An **Edit Source** save REPLACES the record under a live
+     * arming: the id never leaves the source list, so nothing disarms and
+     * re-arms it, and `firedSinceArm` stays set from an arming made for a
+     * record that no longer exists. `addOrUpdateInventorySource` drops the
+     * source's runtime status whenever a config value changed, so the row is
+     * blank — and stays blank until the next routine tick, up to an hour after
+     * an edit the user just made.
+     */
+    it("asks for a fire when the record is REPLACED under a live arming, and leaves the timer's phase alone (⊘ an edit drops the source's runtime status while `firedSinceArm` still reads as satisfied, so the row goes blank and no settle will refill it; re-arming the timer instead would restart the phase on every edit)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30, incarnation: "rev-1" }]);
+      const fire = vi.fn(async () => ({ ran: true }));
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(1);
+
+      // Half a period in, the record is replaced — same id, same interval.
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(fire).toHaveBeenCalledTimes(1);
+      feed.set([{ id: "a", intervalSeconds: 30, incarnation: "rev-2" }]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      // The phase is UNTOUCHED: the routine tick still lands at the original
+      // 30 s mark, not 30 s after the edit.
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(fire).toHaveBeenCalledTimes(3);
+      expect(vi.getTimerCount()).toBe(1);
     });
 
     /**
