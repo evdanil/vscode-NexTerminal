@@ -2358,8 +2358,16 @@ export function registerInventoryCommands(
   // EVERY apply, not just truncated ones — a later COMPLETE apply is precisely
   // what has to invalidate an earlier truncated claim. Both sides are drawn from
   // the SAME per-source counter, so the comparison stays exact now that the
-  // counters are per source. Entries are dropped when the source is removed (see
-  // removeSource).
+  // counters are per source.
+  //
+  // NEVER PRUNED, including when the source is removed — an earlier revision of
+  // this note claimed otherwise, and `removeSource` has never done it. It is
+  // safe for the reason `statusRefreshGenerations` is never pruned either, and
+  // the two facts are the same fact: that counter is monotonic per id and is not
+  // reset by removal, so an entry left behind by a REMOVED-AND-RECREATED id
+  // holds a strictly lower number than any claim the new incarnation can be
+  // issued, and can never match one. A stale entry is unreachable, not
+  // misleading — the failure mode a per-incarnation reset would have created.
   const statusAppliedGeneration = new Map<string, number>();
 
   /**
