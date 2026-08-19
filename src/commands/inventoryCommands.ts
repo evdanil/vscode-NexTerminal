@@ -487,6 +487,17 @@ function formValuesToProviderConfig(
         numeric = Number(raw);
       }
       if (numeric !== undefined) {
+        // PER-SOURCE LAB STATUS POLL — the declared bounds re-checked on the
+        // COLLECTION side. The rendered input carries the same min/max
+        // natively, but that is the browser layer: this is what a value posted
+        // programmatically (or by a form opened before a provider schema change)
+        // has to pass. Rejects rather than clamps — silently storing a
+        // different number than the user typed is how a source ends up polling
+        // at a cadence nobody chose.
+        const { min, max } = field;
+        if ((min !== undefined && numeric < min) || (max !== undefined && numeric > max)) {
+          throw new Error(`${field.label} must be between ${min ?? "-\u221e"} and ${max ?? "\u221e"}`);
+        }
         config[field.id] = numeric;
       } else if (field.required) {
         throw new Error(`${field.label} is required`);

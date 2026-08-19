@@ -1416,6 +1416,12 @@ function inventoryConfigFieldDescriptor(
       // (including on reopening a source that already has a fractional value
       // saved) with no visible error.
       step: "any",
+      // PER-SOURCE LAB STATUS POLL — the provider's declared bounds, rendered
+      // as the input's native min/max so a typo is caught where it is typed.
+      // Both are optional on the contract, so a provider that declares neither
+      // renders exactly the unbounded input it always did.
+      min: field.min,
+      max: field.max,
       placeholder: field.placeholder,
       value: typeof existing === "number" ? existing : undefined,
       hint: field.description,

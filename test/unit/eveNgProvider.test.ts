@@ -4,9 +4,11 @@ import { describe, expect, it, vi } from "vitest";
 import {
   EVE_NG_INSECURE_TLS_WARNING,
   EVE_NG_PROVIDER_ID,
+  EVE_NG_STATUS_POLL_FIELD_ID,
   createEveNgProvider,
   eveNgInstanceKey,
-  labFolderPath
+  labFolderPath,
+  readEveNgStatusPollSeconds
 } from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
@@ -115,7 +117,12 @@ describe("createEveNgProvider — shape", () => {
       // INSECURE TLS — appended LAST on purpose: the order is part of the
       // provider fingerprint, and adding the field at the end keeps every
       // existing field where the user last saw it.
-      "allowInsecureTls"
+      "allowInsecureTls",
+      // PER-SOURCE POLL — appended after `allowInsecureTls` for the same
+      // reason it was appended after `consoleHost`: the order is part of the
+      // provider fingerprint, and adding at the end keeps every existing field
+      // where the user last saw it.
+      "statusPollSeconds"
     ]);
   });
 
@@ -2844,6 +2851,66 @@ describe("createEveNgProvider — allowInsecureTls field", () => {
     expect(computeProviderFingerprint({ label: "EVE-NG", configFields: fields(true) })).not.toBe(
       computeProviderFingerprint({ label: "EVE-NG", configFields: [...fields(true), { id: "extra", label: "Extra", type: "string" }] })
     );
+  });
+});
+
+/**
+ * PER-SOURCE LAB STATUS POLL — the interval moved out of the global
+ * `nexus.inventory.statusPollSeconds` setting and onto the source, so a user
+ * running two lab servers can poll a busy one often and a quiet one not at all.
+ * The provider owns the field AND its interpretation: `readEveNgStatusPollSeconds`
+ * is the one place that turns a stored value into seconds, so the poll
+ * scheduler, the migration and a hand-edited backup all agree.
+ */
+describe("createEveNgProvider — statusPollSeconds field", () => {
+  const field = (): InventoryConfigField => {
+    const found = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === EVE_NG_STATUS_POLL_FIELD_ID);
+    expect(found).toBeDefined();
+    return found!;
+  };
+
+  it("is an OPTIONAL, ADVANCED number bounded 0..3600 with no defaultValue, so an unanswered field reads as OFF (\u2298 a required field would block every existing source's next edit, and a non-zero default would silently start polling every lab box)", () => {
+    const f = field();
+    expect(f.type).toBe("number");
+    expect(f.required).not.toBe(true);
+    expect(f.advanced).toBe(true);
+    expect(f.defaultValue).toBeUndefined();
+    expect(f.min).toBe(0);
+    expect(f.max).toBe(3600);
+    expect(EVE_NG_STATUS_POLL_FIELD_ID).toBe("statusPollSeconds");
+  });
+
+  it("says in its hint that 0 is off and that a poll can evict the browser's EVE-NG session, pointing at a dedicated account (\u2298 a bare 'seconds between refreshes' hint sends the user to turn polling on with no idea it will log them out of the web UI)", () => {
+    const hint = String(field().description ?? "").toLowerCase();
+    expect(hint).toMatch(/\b0\b/);
+    expect(hint).toMatch(/off|disable/);
+    expect(hint).toMatch(/log(s|ged)? (you )?out|evict|session/);
+    expect(hint).toMatch(/separate account|its own eve-ng account|dedicated account/);
+  });
+
+  it("still passes the provider-shape validation the registry runs, with the new field in place", () => {
+    expect(() => validateProviderShape(createEveNgProvider(vi.fn() as unknown as typeof fetch))).not.toThrow();
+  });
+
+  describe("readEveNgStatusPollSeconds", () => {
+    it("reads a stored positive value", () => {
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 30 })).toBe(30);
+    });
+
+    it("treats an ABSENT value as 0 — off (\u2298 defaulting a legacy source to a non-zero interval starts polling every lab box the user already had)", () => {
+      expect(readEveNgStatusPollSeconds({})).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: undefined as unknown as number })).toBe(0);
+    });
+
+    it("clamps to the declared bounds and floors to whole seconds, and reads anything non-numeric as OFF (\u2298 an unclamped hand-edited backup arms a 10 ms timer against a lab box, or NaN * 1000 arms a timer that never fires but reports itself as running)", () => {
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: -5 })).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 99_999 })).toBe(3600);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 30.9 })).toBe(30);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 0.4 })).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: Number.NaN })).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: Number.POSITIVE_INFINITY })).toBe(3600);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: "30" as unknown as number })).toBe(0);
+    });
   });
 });
 

@@ -186,6 +186,22 @@ export interface InventoryConfigField {
    */
   options?: { label: string; value: string }[];
   /**
+   * PER-SOURCE LAB STATUS POLL — the inclusive bounds of a `type: "number"`
+   * field. Rendered as the input's native `min`/`max` (so the browser blocks a
+   * Save that is out of range) and re-checked server-side in
+   * `formValuesToProviderConfig`, which is the layer a programmatically posted
+   * value has to pass. Ignored for every other field type.
+   *
+   * NOT part of `computeProviderFingerprint` — like `advanced` and
+   * `defaultValue`, a bound says how a field is entered, not what the source is
+   * configured with, so widening or narrowing one must never make every
+   * existing source re-confirm its saved credentials. Providers still clamp at
+   * READ time (see `readEveNgStatusPollSeconds`): a config restored from a
+   * hand-edited backup never passed through this form at all.
+   */
+  min?: number;
+  max?: number;
+  /**
    * EVE-NG (Phase 1) — the value a `type: "boolean"` field starts at on the ADD
    * form, when the source has no stored value for it yet. Ignored for every
    * other field type, and ignored on EDIT (a stored `false` is a real answer the

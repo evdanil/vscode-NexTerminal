@@ -465,6 +465,62 @@ describe("inventoryCommands", () => {
       expect(byKey("cfg_verifyTls")).toEqual(expect.objectContaining({ type: "checkbox" }));
     });
 
+    /**
+     * PER-SOURCE LAB STATUS POLL — a bounded number field (EVE-NG's poll
+     * interval is the first one). The bound has to survive BOTH layers: the
+     * rendered input's native min/max, which is what stops a typo at the
+     * browser, and the parse, which is the only layer a programmatically
+     * posted value meets.
+     */
+    it("carries a number field's declared bounds onto the rendered input (\u2298 dropping min/max lets the browser accept 99999 with no complaint)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "pollSeconds", label: "Poll Seconds", type: "number", required: false, min: 0, max: 3600 }
+        ]
+      });
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const field = latestFormCall().definition.fields.find((f) => "key" in f && f.key === "cfg_pollSeconds");
+      expect(field).toEqual(expect.objectContaining({ type: "number", min: 0, max: 3600 }));
+    });
+
+    it("rejects a number field posted outside its declared bounds and persists nothing (\u2298 trusting the browser's min/max lets a posted 99999 arm an hour-plus poll, or a negative one a timer that never fires)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "pollSeconds", label: "Poll Seconds", type: "number", required: false, min: 0, max: 3600 }
+        ]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: 99_999 })
+      ).rejects.toThrow(/Poll Seconds must be between 0 and 3600/);
+      await expect(
+        onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: -1 })
+      ).rejects.toThrow(/Poll Seconds must be between 0 and 3600/);
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+      // …and a value INSIDE the bounds still saves, so the check is a bound and
+      // not a blanket rejection of the field.
+      await onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: 3600 });
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ host: "eve.local", pollSeconds: 3600 });
+    });
+
     it("titles the form with the provider label and prefills Default SSH Username with mostCommonUsername", async () => {
       const owned = [
         makeServer({ id: "s1", username: "opsuser" }),
