@@ -19,6 +19,7 @@ import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
+import { migrateGlobalStatusPollSetting } from "./services/inventory/statusPollSettingMigration";
 import { InventoryStatusDecorationProvider } from "./ui/inventoryStatusDecorationProvider";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
@@ -335,6 +336,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const repository = new VscodeConfigRepository(context);
   const core = new NexusCore(repository);
   await core.initialize();
+
+  // ONE-TIME MOVE of the retired global `nexus.inventory.statusPollSeconds`
+  // onto each EVE-NG source's own Lab Status Poll Interval field. Needs the
+  // sources, so it runs after initialize(); fire-and-forget and non-fatal,
+  // because a value-preserving tidy-up must never delay or break activation.
+  // The status poll below does not have to wait for it either: a source it
+  // writes fires NexusCore's change event, which is exactly what re-evaluates
+  // the schedule.
+  void migrateGlobalStatusPollSetting(core);
 
   terminalOutputTraceEnabled = readTerminalOutputTrace();
   const loggerFactory = new TerminalLoggerFactory(
