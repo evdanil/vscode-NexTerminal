@@ -1479,6 +1479,19 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     .advanced-fields .form-group {
       margin-bottom: 14px;
     }
+    .form-section {
+      margin: 22px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+    .form-section:first-child {
+      margin-top: 4px;
+    }
     .actions button[data-visible-when] {
       display: none;
     }
@@ -2960,6 +2973,19 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     }
     .advanced-fields .form-group {
       margin-bottom: 14px;
+    }
+    .form-section {
+      margin: 22px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+    .form-section:first-child {
+      margin-top: 4px;
     }
     .actions button[data-visible-when] {
       display: none;

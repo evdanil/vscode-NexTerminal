@@ -5,6 +5,10 @@ import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/c
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
+import { registerLocalServerCommands } from "./commands/localServerCommands";
+import { registerNetworkServerCommands } from "./commands/networkServerCommands";
+import { registerNetworkServerProfileCommands } from "./commands/networkServerProfileCommands";
+import { registerNetworkServerTransferCommands } from "./commands/networkServerTransferCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
@@ -21,7 +25,9 @@ import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
 import { InventoryStatusDecorationProvider } from "./ui/inventoryStatusDecorationProvider";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
-import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
+import type { CommandContext, LocalShellTerminalMap, LocalServerTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
+import { LocalServerManager, wireLocalServerTerminalCloseListener } from "./services/local/localServerManager";
+import { NetworkServerManager } from "./services/networkServers/networkServerManager";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
 import { flushSessionTranscripts } from "./logging/sessionTranscriptLogger";
@@ -52,6 +58,7 @@ import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { ScriptCodeLensProvider } from "./ui/scriptCodeLensProvider";
 import { ScriptTreeProvider } from "./ui/scriptTreeProvider";
 import { SettingsTreeProvider } from "./ui/settingsTreeProvider";
+import { NetworkServerTreeProvider } from "./ui/networkServerTreeProvider";
 import { TunnelTreeProvider, formatTunnelRoute } from "./ui/tunnelTreeProvider";
 import { clamp } from "./utils/helpers";
 import { readBoundedNumber } from "./utils/boundedConfig";
@@ -477,6 +484,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const sessionTerminals: SessionTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
   const localShellTerminals: LocalShellTerminalMap = new Map();
+  const localServerTerminals: LocalServerTerminalMap = new Map();
 
   const highlighter = new TerminalHighlighter();
   const macroAutoTrigger = new MacroAutoTrigger();
@@ -493,9 +501,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
   // Reverse-lookup: given a VS Code Terminal, find the Nexus session id that owns it.
   const resolveTrackedSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
-    resolveSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
+    resolveSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals, localServerTerminals);
   const resolveScriptCapableSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
-    resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
+    resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals, localServerTerminals);
   const globalStoragePath = context.globalStorageUri.fsPath;
   SettingsPanel.setGlobalStoragePath(globalStoragePath);
   const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager, globalStoragePath);
@@ -702,6 +710,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     sessionTerminals,
     serialTerminals,
     localShellTerminals,
+    localServerTerminals,
     highlighter,
     macroAutoTrigger,
     sftpService,
@@ -723,6 +732,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const terminalRegistry = new TerminalRegistry(core);
   context.subscriptions.push(terminalRegistry);
   ctx.terminalRegistry = terminalRegistry;
+
+  const localServerManager = new LocalServerManager({
+    core,
+    extensionPath: context.extensionPath,
+    terminals: localServerTerminals,
+    terminalRegistry,
+    outputChannel: localShellOutputChannel,
+    highlighter,
+    diagnostics: (line) => localShellOutputChannel.appendLine(`${new Date().toISOString()} [Local Server] ${line}`)
+  });
+  context.subscriptions.push(localServerManager);
+
+  // The channel is created here rather than inside the manager so the
+  // inspectLogs command can reveal the same instance the daemon writes to.
+  const networkServerOutputChannel = vscode.window.createOutputChannel("Nexus Network Servers");
+  context.subscriptions.push(networkServerOutputChannel);
+  const networkServerManager = new NetworkServerManager({
+    core,
+    extensionPath: context.extensionPath,
+    globalStoragePath,
+    outputChannel: networkServerOutputChannel
+  });
+  context.subscriptions.push(networkServerManager);
+  ctx.networkServerManager = networkServerManager;
+  ctx.networkServerOutputChannel = networkServerOutputChannel;
 
   // --- Directory sync (issue #35) — CwdTracker + CwdSyncCoordinator wiring ---
   // No existing generic "Nexus" output channel exists to reuse (only the
@@ -798,10 +832,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         if (profile) {
           await core.addOrUpdateSerialProfile({ ...profile, group: newGroup });
         }
-      } else {
+      } else if (itemType === "localShell") {
         const profile = core.getLocalShellProfile(itemId);
         if (profile) {
           await core.addOrUpdateLocalShellProfile({ ...profile, group: newGroup });
+        }
+      } else if (itemType === "localServer") {
+        const config = core.getLocalServer(itemId);
+        if (config) {
+          await core.addOrUpdateLocalServerConfig({ ...config, group: newGroup });
         }
       }
     },
@@ -813,6 +852,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     }
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
+  const networkServerTreeProvider = new NetworkServerTreeProvider();
   // Core + registry so the Settings tree can render one row per inventory
   // source (name, provider label, last sync) with inline actions, and refresh
   // them on any core change.
@@ -887,6 +927,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const tunnelView = vscode.window.createTreeView("nexusTunnels", {
     treeDataProvider: tunnelTreeProvider,
     dragAndDropController: tunnelTreeProvider,
+    showCollapseAll: true
+  });
+
+  const networkServerView = vscode.window.createTreeView("nexusNetworkServers", {
+    treeDataProvider: networkServerTreeProvider,
     showCollapseAll: true
   });
 
@@ -1064,6 +1109,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     const snapshot = core.getSnapshot();
     nexusTreeProvider.setSnapshot(snapshot);
     tunnelTreeProvider.setSnapshot(snapshot);
+    networkServerTreeProvider.setSnapshot(snapshot);
     inventoryStatusDecoration.update(snapshot);
     const totalTunnels = snapshot.activeTunnels.length + snapshot.remoteTunnels.length;
     statusBarItem.text = `$(terminal) Nexus: ${snapshot.activeSessions.length + snapshot.activeLocalShellSessions.length} sessions, ${totalTunnels} tunnels`;
@@ -1301,6 +1347,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     if (event.affectsConfiguration("nexus.sftp.maxOpenFileSizeMB")) {
       fileExplorerProvider.refresh();
     }
+    if (event.affectsConfiguration("nexus.networkServers")) {
+      // Pushes the new values to the daemon so a stopped service picks them up
+      // on its next start without an extra round trip. Running services keep
+      // what they launched with until explicitly restarted.
+      void networkServerManager.syncConfiguration();
+      // Configuration rows (TFTP root, DHCP pool, static reservations) render
+      // straight from settings, so they go stale without an explicit repaint —
+      // no NexusCore state changed here to drive one.
+      networkServerTreeProvider.refresh();
+    }
   });
 
   const serverDisposables = registerServerCommands(ctx);
@@ -1309,11 +1365,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
   const localShellDisposables = registerLocalShellCommands(ctx);
+  const localServerCloseListener = wireLocalServerTerminalCloseListener({
+    core,
+    localServerTerminals,
+    manager: localServerManager
+  });
+  const localServerCtx = { ...ctx, localServerManager } as const;
+  const localServerDisposables = registerLocalServerCommands(localServerCtx);
+  const networkServerDisposables = registerNetworkServerCommands({ ...ctx, networkServerManager });
+  const networkServerProfileDisposables = registerNetworkServerProfileCommands({ ...ctx, networkServerManager });
+  const networkServerTransferDisposables = registerNetworkServerTransferCommands({ ...ctx, networkServerManager });
   registerTerminalTabCommands(context, {
     registry: terminalRegistry,
     sessionTerminals: ctx.sessionTerminals,
     serialTerminals: ctx.serialTerminals,
-    localShellTerminals: ctx.localShellTerminals
+    localShellTerminals: ctx.localShellTerminals,
+    localServerTerminals: ctx.localServerTerminals
   });
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
@@ -1377,6 +1444,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     collapseListener,
     expandListener,
     tunnelView,
+    networkServerView,
     settingsView,
     settingsTreeProvider,
     macroAutoTrigger,
@@ -1428,6 +1496,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     ...tunnelDisposables,
     ...serialDisposables,
     ...localShellDisposables,
+    localServerCloseListener,
+    ...localServerDisposables,
+    ...networkServerDisposables,
+    ...networkServerProfileDisposables,
+    ...networkServerTransferDisposables,
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,
@@ -1480,12 +1553,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
             console.error("[Nexus] markShuttingDown failed for local shell session", session.id, err);
           }
         }
+        for (const session of snapshot.activeLocalServerSessions) {
+          try {
+            session.pty?.markShuttingDown(shutdownReason);
+          } catch (err) {
+            console.error("[Nexus] markShuttingDown failed for local server session", session.id, err);
+          }
+        }
         serialTerminals.clear();
         localShellTerminals.clear();
+        localServerTerminals.clear();
         serialSidecar.dispose();
         fileExplorerProvider.dispose();
         sftpService.dispose();
         void tunnelManager.stopAll();
+        void localServerManager.stopAll();
+        // Kills the daemon child explicitly rather than relying on subscription
+        // order, so UDP 69/67 are released before the host process goes away.
+        networkServerManager.dispose();
         registrySync.dispose();
         void registrySync.cleanupOwnEntries();
         viewSync.dispose();

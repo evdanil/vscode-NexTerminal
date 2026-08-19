@@ -132,19 +132,34 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 14 root items", () => {
+    it("returns 18 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(14);
+      expect(roots).toHaveLength(18);
     });
 
-    it("has 10 category items first with Security & Data after SSH and Inventory last (Phase 2)", () => {
+    it("has 14 category items first with Security & Data after SSH, then Inventory (Phase 2) and the local/network server categories", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(10);
+      expect(categories).toHaveLength(14);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
-        .toEqual(["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts", "inventory"]);
+        .toEqual([
+          "logging",
+          "ssh",
+          "securityData",
+          "tunnels",
+          "terminal",
+          "ui",
+          "sftp",
+          "serial",
+          "scripts",
+          "inventory",
+          "localServers",
+          "networkServers",
+          "tftpServer",
+          "dhcpServer"
+        ]);
     });
 
     it("has 3 root link items for Macros, Auth Profiles and Device Templates — Inventory Sources is a GROUP now, not a link", () => {

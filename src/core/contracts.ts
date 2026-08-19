@@ -13,6 +13,9 @@ import type {
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
+import type { ActiveLocalServerSession, LocalServerConfig } from "../models/localServer";
+import type { ActiveNetworkServerSession } from "../models/networkServer";
+import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 
 export interface ConfigRepository {
   getServers(): Promise<ServerConfig[]>;
@@ -23,6 +26,12 @@ export interface ConfigRepository {
   saveSerialProfiles(profiles: SerialProfile[]): Promise<void>;
   getLocalShellProfiles(): Promise<LocalShellProfile[]>;
   saveLocalShellProfiles(profiles: LocalShellProfile[]): Promise<void>;
+  getLocalServers(): Promise<LocalServerConfig[]>;
+  saveLocalServers(servers: LocalServerConfig[]): Promise<void>;
+  getTftpProfiles(): Promise<TftpConfigProfile[]>;
+  saveTftpProfiles(profiles: TftpConfigProfile[]): Promise<void>;
+  getDhcpProfiles(): Promise<DhcpConfigProfile[]>;
+  saveDhcpProfiles(profiles: DhcpConfigProfile[]): Promise<void>;
   getGroups(): Promise<string[]>;
   saveGroups(groups: string[]): Promise<void>;
   getAuthProfiles(): Promise<AuthProfile[]>;
@@ -40,9 +49,28 @@ export interface SessionSnapshot {
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
   localShellProfiles: LocalShellProfile[];
+  localServers: LocalServerConfig[];
   activeSessions: ActiveSession[];
   activeSerialSessions: ActiveSerialSession[];
   activeLocalShellSessions: ActiveLocalShellSession[];
+  activeLocalServerSessions: ActiveLocalServerSession[];
+  /**
+   * Runtime state of the two fixed embedded network services (TFTP / DHCP).
+   *
+   * Runtime-only by design: there is no matching `networkServers` config array
+   * because these services are configured entirely through native VS Code
+   * settings (`nexus.networkServers.*`), which VS Code persists itself. Empty
+   * until a service is first started.
+   */
+  activeNetworkServerSessions: ActiveNetworkServerSession[];
+  /**
+   * Saved presets for the two network services. Unlike the sessions above these
+   * *are* persisted config: a profile is a named snapshot that gets written
+   * back into `nexus.networkServers.*` on demand, never a second runtime model.
+   * The two lists are independent — a TFTP preset never carries DHCP fields.
+   */
+  tftpProfiles: TftpConfigProfile[];
+  dhcpProfiles: DhcpConfigProfile[];
   activeTunnels: ActiveTunnel[];
   remoteTunnels: TunnelRegistryEntry[];
   explicitGroups: string[];

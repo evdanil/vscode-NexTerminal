@@ -3,6 +3,8 @@ import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, Tunne
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
+import type { LocalServerConfig } from "../models/localServer";
+import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
@@ -12,9 +14,12 @@ export class InMemoryConfigRepository implements ConfigRepository {
     private groups: string[] = [],
     private authProfiles: AuthProfile[] = [],
     private localShellProfiles: LocalShellProfile[] = [],
+    private localServers: LocalServerConfig[] = [],
     private inventorySources: InventorySourceConfig[] = [],
     private deviceTemplates: DeviceTemplateProfile[] = [],
-    private savedFilters: SavedFilterDefinition[] = []
+    private savedFilters: SavedFilterDefinition[] = [],
+    private tftpProfiles: TftpConfigProfile[] = [],
+    private dhcpProfiles: DhcpConfigProfile[] = []
   ) {}
 
   public async getServers(): Promise<ServerConfig[]> {
@@ -47,6 +52,30 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveLocalShellProfiles(profiles: LocalShellProfile[]): Promise<void> {
     this.localShellProfiles = [...profiles];
+  }
+
+  public async getLocalServers(): Promise<LocalServerConfig[]> {
+    return [...this.localServers];
+  }
+
+  public async saveLocalServers(servers: LocalServerConfig[]): Promise<void> {
+    this.localServers = [...servers];
+  }
+
+  public async getTftpProfiles(): Promise<TftpConfigProfile[]> {
+    return [...this.tftpProfiles];
+  }
+
+  public async saveTftpProfiles(profiles: TftpConfigProfile[]): Promise<void> {
+    this.tftpProfiles = [...profiles];
+  }
+
+  public async getDhcpProfiles(): Promise<DhcpConfigProfile[]> {
+    return [...this.dhcpProfiles];
+  }
+
+  public async saveDhcpProfiles(profiles: DhcpConfigProfile[]): Promise<void> {
+    this.dhcpProfiles = [...profiles];
   }
 
   public async getGroups(): Promise<string[]> {
