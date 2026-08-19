@@ -774,7 +774,13 @@ describe("config import command (legacy)", () => {
       expect(pollOf("eve-new")).toBe(45);
     });
 
-    it("never overwrites an imported source that already answered the field — an explicit 0 included (⊘ writing over the payload's own value replaces a per-source interval the user chose in a later release with a global one they retired)", async () => {
+    it("carries nothing at all when ANY source in the payload answers the field — the ones that did keep their own values, and the one that did not is a deliberate blank (⊘ treating a per-source absence as \"predates the field\" re-arms polling on the one source whose owner switched it off, in a payload that provably knew the field)", async () => {
+      // A source carrying `statusPollSeconds` can only have come from a build
+      // that HAS the per-source field. In such a payload an ABSENT value is not
+      // "this export predates the field" — it is the shape the edit form stores
+      // for a number field the user BLANKED. That is evidence a deliberate
+      // blank cannot forge: blanking one source cannot remove the field from
+      // the others.
       await runImport(
         makeExportData({
           exportType: "backup",
@@ -789,7 +795,50 @@ describe("config import command (legacy)", () => {
 
       expect(pollOf("explicit-off")).toBe(0);
       expect(pollOf("explicit-on")).toBe(10);
-      expect(pollOf("unanswered")).toBe(45);
+      expect(pollOf("unanswered")).toBeUndefined();
+    });
+
+    it("carries nothing when the export STAMPS itself as coming from a build that has the per-source field, even with no source answering it (⊘ with every source blanked there is nothing else left to tell a deliberately-silenced machine from a pre-field one, and the carry turns polling back on behind the user)", async () => {
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventoryStatusPollPerSource: true,
+          inventorySources: [eveSource("eve-1"), eveSource("eve-2")],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        })
+      );
+
+      expect(pollOf("eve-1")).toBeUndefined();
+      expect(pollOf("eve-2")).toBeUndefined();
+      // Still never written back into settings, stamped or not.
+      expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+    });
+
+    it("does NOT re-arm a blanked source when restoring a backup THIS build wrote on a machine whose settings clear had failed (⊘ the stale global key rides the backup onto a source its owner silenced, which is the durable marker's guarantee broken by way of the file)", async () => {
+      // The failed-clear machine: the activation migration could not remove the
+      // key (policy-managed settings.json), so it is still in Global scope and
+      // export captures it. The user has since turned this source's polling OFF
+      // by blanking the field, which stores NO key — the same shape as a source
+      // that predates the field entirely.
+      configStore.set("nexus.inventory.statusPollSeconds", 45);
+      await core.addOrUpdateInventorySource(eveSource("eve-blanked"));
+
+      mockShowInputBox.mockResolvedValue("testpass123");
+      mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+      mockWriteFile.mockResolvedValue(undefined);
+      await registeredCommands.get("nexus.config.export.backup")!();
+      const written = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+
+      // The premise really holds: the backup carries the stale key, and the
+      // source in it carries no interval of its own.
+      expect(written.settings["nexus.inventory.statusPollSeconds"]).toBe(45);
+      expect(written.inventorySources[0].config).toEqual({});
+
+      // Replace mode deletes and re-creates every source, so this one IS in the
+      // list the carry applies to — nothing else stands between it and 45.
+      await runImport(written, "replace");
+
+      expect(pollOf("eve-blanked")).toBeUndefined();
     });
 
     it("carries a 0 onto nothing — it was the shipped default and it polled nothing (⊘ writing the 0 answers the field on every imported source, so the user's own blank-means-off default is replaced by a stored 0 and every later carry is blocked)", async () => {
@@ -1671,6 +1720,11 @@ describe("share export command", () => {
 
     expect(writtenData.exportType).toBe("share");
     expect(writtenData.version).toBe(2);
+    // REVIEW D3 — the same stamp a backup carries. A share export carries no
+    // inventorySources, so nothing here can receive the retired interval; it is
+    // stamped anyway so there is ONE rule about what this build's exports say
+    // about themselves, rather than a per-path exemption to remember.
+    expect(writtenData.inventoryStatusPollPerSource).toBe(true);
     expect(writtenData.servers).toHaveLength(1);
     expect(writtenData.servers[0].id).not.toBe("s1");
     expect(writtenData.servers[0].username).toBe("user");
@@ -1821,6 +1875,18 @@ describe("backup export command", () => {
       const written = await exportBackupPayload();
 
       expect(written.settings).not.toHaveProperty("nexus.inventory.statusPollSeconds");
+    });
+
+    /**
+     * REVIEW D3 — the stamp import gates the carry on. It is written
+     * UNCONDITIONALLY, by every export this build makes, because its whole job
+     * is to be un-forgeable by anything a user does in the UI: blanking a
+     * source's interval removes that source's key, and can remove nothing else.
+     */
+    it("stamps every backup as written by a build that has the per-source interval field (\u2298 an unstamped export from this build is indistinguishable from a pre-field one, and a restore re-arms every source whose interval its owner had blanked)", async () => {
+      const written = await exportBackupPayload();
+
+      expect(written.inventoryStatusPollPerSource).toBe(true);
     });
 
     it("still captures an ORDINARY setting's effective value, workspace included (\u2298 narrowing every key to Global drops the workspace settings a backup has always carried)", async () => {

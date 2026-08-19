@@ -119,6 +119,25 @@ interface NexusConfigExport {
   /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
   macroFolders?: string[];
   settings?: Record<string, unknown>;
+  /**
+   * RETIRED LAB-STATUS POLL INTERVAL (review D3) — `true` on every export
+   * written by a build that HAS the per-source **Lab Status Poll Interval**
+   * field, and absent on every export written before it. It exists for exactly
+   * one decision: whether an imported source's MISSING interval means "this
+   * export predates the field" (carry the retired global value onto it) or "its
+   * owner blanked the field to stop polling" (leave it alone) — two states with
+   * the identical shape, since the edit form stores no key at all for a blanked
+   * number field.
+   *
+   * Absence is what the import treats as evidence of a pre-field export, and
+   * that is sound because the field and this stamp ship in the SAME build: no
+   * release writes exports that know the field but omit the stamp. What makes
+   * it better than the per-source absence it replaces is that no action in the
+   * UI can produce it — blanking a source's interval removes that source's key
+   * and can touch nothing else, while removing this would take a text editor.
+   * See `importPredatesPerSourceStatusPoll`.
+   */
+  inventoryStatusPollPerSource?: boolean;
   encryptedSecrets?: EncryptedPayload;
 }
 
@@ -181,6 +200,54 @@ const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${sect
 const SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY = "nexus.scripts.defaultTimeoutSeconds";
 const LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY = "nexus.scripts.defaultTimeout";
 const RETIRED_STATUS_POLL_FULL_KEY = `${RETIRED_STATUS_POLL_SECTION}.${RETIRED_STATUS_POLL_KEY}`;
+
+/**
+ * Does this payload predate the per-source Lab Status Poll Interval field —
+ * i.e. may the retired GLOBAL interval it carries be applied to the sources it
+ * creates? (Review D3.)
+ *
+ * The question exists because the two payload shapes that matter are the same
+ * shape. A source exported before the field HAS no interval; a source whose
+ * owner BLANKED the field to stop polling also has none, because the edit form
+ * stores no key for an empty number field. Carrying onto the first is the point
+ * of the whole mechanism; carrying onto the second re-enables unattended
+ * polling somebody deliberately switched off — the exact harm the migration's
+ * durable marker prevents locally, arriving through a backup instead.
+ *
+ * So the gate is payload-wide, and rests on two pieces of evidence that a
+ * deliberate blank cannot produce:
+ *
+ *  1. **The export's own stamp.** `inventoryStatusPollPerSource` is written by
+ *     every export from a build that has the field. Blanking a field in the UI
+ *     cannot remove it; only hand-editing the JSON can.
+ *  2. **Any source in the payload answering the field.** One source carrying
+ *     `statusPollSeconds` proves the exporting build knew the field, so every
+ *     ABSENT value in that same payload is an answer ("off"), not a gap.
+ *     Blanking one source cannot remove the key from the others.
+ *
+ * Be straight about the limit: a genuinely old export contains no positive "I
+ * predate the field" marker — there was nothing to write one with — so the
+ * decision to carry ultimately rests on the ABSENCE of both signals above.
+ * That absence is sound rather than circular because the field and the stamp
+ * ship in the same build: no released version produces an export that knows the
+ * field yet lacks the stamp. The residual case is a payload from an
+ * intermediate development build (field present, stamp absent) in which EVERY
+ * source's interval was blanked, so signal 2 has nothing to find either. That
+ * one is chosen against knowingly, and it is the direction the choice should
+ * fall: not carrying is recoverable — the user types the number into the
+ * field — while re-enabling polling behind somebody's back is not.
+ */
+function importPredatesPerSourceStatusPoll(data: NexusConfigExport): boolean {
+  if (data.inventoryStatusPollPerSource === true) {
+    return false;
+  }
+  const sources = Array.isArray(data.inventorySources) ? data.inventorySources : [];
+  // Every source, not only the EVE-NG ones: the field can only be there because
+  // a build that had it wrote the file, whatever provider the source names.
+  return !sources.some(
+    (source) => source && typeof source === "object" && source.config?.[EVE_NG_STATUS_POLL_FIELD_ID] !== undefined
+  );
+}
 
 function legacyDefaultTimeoutMsToSeconds(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 100) {
@@ -1548,6 +1615,10 @@ export function registerConfigCommands(
           version: 2,
           exportType: "backup",
           exportedAt: new Date().toISOString(),
+          // Review D3 — unconditional, on both export paths, so an import can
+          // tell a source with no interval apart from a source whose interval
+          // its owner blanked. See the field's contract on NexusConfigExport.
+          inventoryStatusPollPerSource: true,
           servers: captured.servers,
           tunnels: snapshot.tunnels,
           serialProfiles: snapshot.serialProfiles,
@@ -1609,6 +1680,11 @@ export function registerConfigCommands(
       version: 2,
       exportType: "share",
       exportedAt: new Date().toISOString(),
+      // Stamped like a backup (review D3). A share export carries no
+      // `inventorySources`, so nothing in it can receive the retired interval —
+      // it is stamped anyway so this build has ONE rule about what its exports
+      // say about themselves, not a per-path exemption to remember.
+      inventoryStatusPollPerSource: true,
       servers: sanitized.servers,
       tunnels: sanitized.tunnels,
       serialProfiles: sanitized.serialProfiles,
@@ -2598,20 +2674,33 @@ export function registerConfigCommands(
      * guarantee intact — a user who turned polling off by BLANKING the field
      * keeps it off, because their source is not one this import created.
      *
-     * A source that is in the list came out of the very payload that carried
-     * the retired key: a config from the era when the interval was global, so
-     * that number is literally the cadence this source was polled at, and it
-     * has no answer of its own to overwrite. A newer export whose source
-     * already carries `statusPollSeconds` HAS answered and is skipped, `0`
-     * included. A carried value of 0 applies to nothing, exactly as in the
-     * migration — it was the shipped default and it polled nothing.
+     * WHICH PAYLOADS (review D3): only one that shows no sign of coming from a
+     * build that HAS the per-source field — no export stamp, and no source in
+     * it answering the field. Being in `importedIds` is not enough on its own:
+     * a source exported before the field and a source whose owner BLANKED the
+     * field to stop polling are the same shape, and replace mode re-creates
+     * every source, so restoring your own backup puts the blanked one squarely
+     * in that list. `importPredatesPerSourceStatusPoll` carries the full
+     * argument, including what it knowingly gives up.
+     *
+     * A source that reaches the write below came out of a payload from the era
+     * when the interval was global, so that number is literally the cadence it
+     * was polled at, and it has no answer of its own to overwrite — the
+     * per-source re-read still refuses to overwrite one, `0` included, as a
+     * rule about answers rather than about vintage. A carried value of 0
+     * applies to nothing, exactly as in the migration — it was the shipped
+     * default and it polled nothing.
      *
      * Already inside `configMutationLock` (importMergeReplace holds it across
      * this whole function), so no second acquisition: the lock is not
      * reentrant.
      */
     const carriedPollSeconds = settingsCarry.retiredStatusPollSeconds;
-    if (carriedPollSeconds !== undefined && carriedPollSeconds > EVE_NG_STATUS_POLL_MIN_SECONDS) {
+    if (
+      carriedPollSeconds !== undefined
+      && carriedPollSeconds > EVE_NG_STATUS_POLL_MIN_SECONDS
+      && importPredatesPerSourceStatusPoll(data)
+    ) {
       for (const sourceId of inventorySourceTally.importedIds) {
         // Re-read: the dangling-reference sweeps above rewrite sources, so the
         // record to extend is the live one, not the payload's copy.
