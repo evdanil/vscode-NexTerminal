@@ -111,7 +111,8 @@ export interface InventoryStatusRefreshOutcome {
  * Optional collaborators the inventory commands report runtime facts to.
  * Everything here is a FACT this layer owns, never a request: what the observer
  * does with it is the observer's business (see `extension.ts`, where the status
- * poll uses `onSourceFree` to redeem a declined arm fire).
+ * poll uses `onSourceFree` to bring a source the arm fire it is still
+ * waiting for).
  */
 export interface InventoryCommandObservers {
   /** A source's busy claim has just been released, whatever had held it. */
@@ -2282,8 +2283,9 @@ export function registerInventoryCommands(
    * This layer keeps NO memory of that. It reports two facts it owns — which
    * sources a refresh did not run for (`refreshStatus`'s return value), and
    * that a claim has been released (`onSourceFree`) — and the poll, which owns
-   * arming and visibility, owns the debt they feed and decides whether paying
-   * it is still justified. A `delete` that bypassed this funnel would silently
+   * arming and visibility, owns the one piece of state they feed — has a fire
+   * RUN for this source since it armed? — and decides whether firing again is
+   * still justified. A `delete` that bypassed this funnel would silently
    * drop the notification for whichever command forgot it.
    */
   const releaseSourceClaim = (sourceId: string): void => {
@@ -4840,7 +4842,7 @@ export function registerInventoryCommands(
       if (inFlightSourceIds.get(source.id) !== undefined) {
         // Declined, and SAID so (review D6). Racing the operation holding the
         // claim is exactly what this skip exists to prevent; reporting it is
-        // what lets the poll redeem a declined arm fire when the claim clears.
+        // what lets the poll bring the source its arm fire when the claim clears.
         unrefreshedSourceIds.push(source.id);
         continue; // busy with a sync/edit/remove — skip, don't race it
       }

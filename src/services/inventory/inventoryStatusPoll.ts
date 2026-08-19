@@ -51,8 +51,8 @@ export interface InventoryStatusPollSource {
 
 /**
  * What a fire reports back. A caller with nothing to say returns `void`, which
- * reads as "it ran" — the conservative direction, since a debt is only ever
- * created by an explicit decline.
+ * reads as "it ran" — the conservative direction, since a source is only ever
+ * left waiting for another fire by an explicit decline.
  */
 export interface InventoryStatusPollFireResult {
   /**
@@ -102,22 +102,48 @@ interface SourceSchedule {
    */
   inFlight: boolean;
   /**
-   * THE ARM DEBT (review D6/E1/E2). TRUE when this source's arm fire — its
-   * not-running → running tick — was DECLINED and has not yet been made good.
+   * THE ONE THING THE ARM PROTOCOL REMEMBERS (review D6/E1/E2/F1): has any fire
+   * for this source RUN since it was armed?
    *
-   * It lives on the schedule, and that placement is the design: the debt is a
-   * property of the arming that justified it, so it is created only by a
-   * declined arm fire, it dies with the schedule (interval to 0, source removed
-   * or no longer offered, view hidden — every disarm deletes the entry), and it
-   * is redeemed only against live arm state in `sourceSettled`. A debt cannot
-   * outlive its arming, and a dead one cannot resurrect: a source that arms
-   * again starts at `false` and fires its own arm tick.
+   * Deliberately a STATE, not a debt. Five review rounds were spent on an
+   * `armOwed` obligation — created only by a declined ARM fire, cancelled by
+   * disarm, redeemed by a settle — and every one of them found a new way for
+   * the obligation and the notification meant to discharge it to get out of
+   * step. This says the same thing without an obligation to keep in step with
+   * anything: the source wants a fire, and stops wanting one the moment it gets
+   * one. Nothing can create it twice, nothing can resurrect it (arming resets
+   * it), and it cannot outlive its arming (disarm deletes the schedule).
    *
-   * A ROUTINE tick never creates one. Another follows in a period, and
-   * deferring it would mean an extra lab crawl after every sync (which already
-   * applies fresh status) and every node control (which fires its own refresh).
+   * It also subsumes two rules the debt needed separately. A ROUTINE tick that
+   * RAN now discharges the arming as honestly as the arm tick would have —
+   * status is on screen either way — so a settle after it fires nothing, where
+   * the debt would have bought a redundant lab crawl. And an arm tick the LATCH
+   * swallowed (a source re-armed while its previous sweep is still outstanding)
+   * leaves this false, so the outstanding sweep discharges it if it ran and
+   * leaves the source wanting a fire if it did not — where the debt recorded
+   * nothing at all and the source waited a full period.
    */
-  armOwed: boolean;
+  firedSinceArm: boolean;
+  /**
+   * THE LOST-WAKEUP GUARD (review F1). A settle that arrived while a fire for
+   * this source was IN FLIGHT, to be re-examined the moment that fire settles.
+   *
+   * Without it the protocol has a check-then-act window straddling an await,
+   * and the config-restore path walks straight into it: the restore persists a
+   * source, the arm fire starts and goes off to read the vault, the mutation
+   * queue drains and `sourceSettled` runs — finding a source that has neither
+   * run a fire nor yet reported that it could not — and only afterwards does
+   * the fire resolve `ran: false`. The only notification that could have helped
+   * has already been and gone, and the source waits its whole configured
+   * period, up to an hour.
+   *
+   * Recorded WITHOUT looking at `firedSinceArm`, because at that moment the
+   * answer is not yet known; `release` asks the question again when it is. That
+   * is the whole discipline — record the wakeup, re-test the condition after
+   * the wait — and it is what makes a settle impossible to lose rather than
+   * merely unlikely to be.
+   */
+  settleDuringFire: boolean;
 }
 
 export interface InventoryStatusPoll {
@@ -142,10 +168,11 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
   };
 
   /**
-   * Fires one tick. Returns FALSE when the latch swallowed it, so an arm
-   * redemption can keep owing rather than count a tick that never happened.
+   * Fires one tick for this source. Returns FALSE when the latch swallowed it,
+   * so a redemption can record that it still has not happened rather than count
+   * a tick that was never dispatched.
    */
-  const tick = (id: string, schedule: SourceSchedule, arm: boolean): boolean => {
+  const tick = (id: string, schedule: SourceSchedule): boolean => {
     if (schedule.inFlight) {
       return false; // a prior sweep of THIS source is still running — do not stack another
     }
@@ -157,33 +184,61 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
       schedule.inFlight = true;
       const release = (outcome?: InventoryStatusPollFireResult | void): void => {
         schedule.inFlight = false;
-        // A DECLINED ARM fire is owed — but only if this very schedule is still
-        // the armed one. A source disarmed while the fire was outstanding has
-        // had its debt cancelled by that disarm, and re-recording it here would
-        // be the resurrection the lifecycle exists to prevent. (A second line of
-        // defence, strictly: a disarmed schedule is deleted either by the
-        // disarm itself or by the retirement check below. It is written out
-        // because "a debt is only recorded against live arming" is the rule,
-        // and a rule that is only true by another site's construction is one
-        // edit away from being false.)
-        if (arm && outcome && outcome.ran === false && schedules.get(id) === schedule && schedule.timer !== undefined) {
-          schedule.armOwed = true;
+        // ANYTHING BUT AN EXPLICIT DECLINE DISCHARGES THE ARMING. A `void`
+        // result (a caller with nothing to say) and a REJECTED sweep (a lab box
+        // that is down) both read as "ran": the tick reached the provider, and
+        // there is nothing a later settle would do differently.
+        if (!(outcome && outcome.ran === false)) {
+          schedule.firedSinceArm = true;
+        }
+        // Take and clear the lost-wakeup guard BEFORE anything can return: a
+        // settle recorded against this fire is answered exactly once, here.
+        const settledWhileWeRan = schedule.settleDuringFire;
+        schedule.settleDuringFire = false;
+        if (schedules.get(id) !== schedule) {
+          return; // re-armed or replaced meanwhile — that entry owns its own state
         }
         // The schedule may have been retired while its sweep was outstanding —
         // it was kept alive only to hold this latch (see `reevaluate`). Now that
-        // the latch is released, drop it, but only if nothing has re-armed or
-        // replaced it in the meantime.
-        if (schedule.timer === undefined && schedules.get(id) === schedule) {
+        // the latch is released, drop it. A disarmed source is owed nothing, so
+        // the guard goes with it.
+        if (schedule.timer === undefined) {
           schedules.delete(id);
+          return;
+        }
+        if (settledWhileWeRan) {
+          redeem(id, schedule);
         }
       };
-      // Both settlements release: a REJECTED sweep (a lab box that is down)
-      // must not wedge its source's latch shut forever. A rejection reports no
-      // outcome, so it reads as "ran" — the tick reached the provider, and
-      // there is nothing a later settle would do differently.
+      // Both settlements release: a rejected sweep must not wedge its source's
+      // latch shut forever.
       (result as Promise<InventoryStatusPollFireResult | void>).then(release, () => release());
+    } else {
+      // Nothing to await, so nothing can decline it afterwards: it ran.
+      schedule.firedSinceArm = true;
     }
     return true;
+  };
+
+  /**
+   * Give an armed source the fire it is still waiting for, if it is still
+   * waiting for one. The condition is re-tested HERE rather than trusted from
+   * the caller, which is what lets every settle path — immediate, or deferred
+   * through `settleDuringFire` — go through one door.
+   *
+   * A source that has already had a fire run since it armed, or that is no
+   * longer armed at all (the user hid the panel, set the interval to 0, or
+   * removed the source), gets nothing: there is no lab crawl to justify.
+   */
+  const redeem = (id: string, schedule: SourceSchedule): void => {
+    if (schedule.firedSinceArm || schedule.timer === undefined) {
+      return;
+    }
+    if (!tick(id, schedule)) {
+      // The latch swallowed it. Record the wakeup against the fire that is
+      // holding the latch, so `release` re-tests instead of dropping it.
+      schedule.settleDuringFire = true;
+    }
   };
 
   const reevaluate = (): void => {
@@ -205,13 +260,17 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
     for (const [id, schedule] of schedules) {
       if (!desired.has(id)) {
         disarm(schedule);
-        // DISARM CANCELS THE DEBT (review E2). The justification for owing an
-        // arm fire is that the source is armed; once it is not — interval 0,
-        // removed, no longer offered, or the view hidden — paying it would
-        // crawl a lab box for a source nothing is polling, against the very
-        // gating this scheduler exists to enforce. Cleared explicitly because
-        // the entry can SURVIVE this loop (below) to hold its latch.
-        schedule.armOwed = false;
+        // DISARM ENDS THE WAIT (review E2). The justification for firing at a
+        // source that has not been refreshed since it armed is that it IS
+        // armed; once it is not — interval 0, removed, no longer offered, or
+        // the view hidden — a fire would crawl a lab box for a source nothing
+        // is polling, against the very gating this scheduler exists to enforce.
+        // `redeem` re-tests `timer` for exactly that, so the only thing to drop
+        // here is a settle recorded against the arming that just ended — and it
+        // is dropped explicitly because the entry can SURVIVE this loop (below)
+        // to hold its latch. `firedSinceArm` needs no clearing: a fresh arming
+        // resets it, and until then nobody reads it.
+        schedule.settleDuringFire = false;
         // Keep a schedule whose sweep is still outstanding, purely so its latch
         // survives: dropping it here and re-adding the source a moment later
         // would let a second crawl start against a lab box already being
@@ -225,7 +284,7 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
     for (const [id, seconds] of desired) {
       let schedule = schedules.get(id);
       if (!schedule) {
-        schedule = { seconds, inFlight: false, armOwed: false };
+        schedule = { seconds, inFlight: false, firedSinceArm: false, settleDuringFire: false };
         schedules.set(id, schedule);
       }
       if (schedule.timer === undefined) {
@@ -235,19 +294,24 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
         // honours the latch, so a source re-armed while its previous sweep is
         // outstanding does not double-fire.
         schedule.seconds = seconds;
-        // A fresh arming starts with no debt — including a source that was
-        // disarmed and armed again, whose old debt died with its schedule.
-        schedule.armOwed = false;
-        // The ARM tick. If the fire declines it, `release` records the debt (see
-        // `SourceSchedule.armOwed`) and `sourceSettled` makes good on it.
-        tick(id, schedule, true);
-        schedule.timer = setInterval(() => tick(id, schedule!, false), seconds * 1000);
+        // A FRESH ARMING WANTS A FIRE, whatever the last one got. Set BEFORE the
+        // tick, so a fire that declines (or that the latch swallows) leaves the
+        // source still waiting rather than reading as satisfied by history.
+        schedule.firedSinceArm = false;
+        // The ARM tick. If it is declined, or the latch swallows it,
+        // `firedSinceArm` stays false and the next settle brings the source its
+        // fire (see `redeem`).
+        tick(id, schedule);
+        schedule.timer = setInterval(() => tick(id, schedule!), seconds * 1000);
       } else if (schedule.seconds !== seconds) {
         // A period change REPLACES this source's timer with one at the current
-        // period — never layers a second one on top — and does NOT re-fire.
+        // period — never layers a second one on top — and does NOT re-fire. It
+        // is not a re-arming either: `firedSinceArm` is left exactly as it was,
+        // so a source still waiting for its first fire keeps waiting for it and
+        // one that has had it is not sent round again.
         clearInterval(schedule.timer);
         schedule.seconds = seconds;
-        schedule.timer = setInterval(() => tick(id, schedule!, false), seconds * 1000);
+        schedule.timer = setInterval(() => tick(id, schedule!), seconds * 1000);
       }
       // Unchanged period, already running: deliberately left alone. Re-arming it
       // would restart its phase every time an UNRELATED source was edited, so a
@@ -266,9 +330,9 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
   return {
     /**
      * "Something that could have been stopping this source's refresh has
-     * finished." Redeems an outstanding ARM DEBT — and only that: with no debt
-     * it does nothing at all, so a source whose arm fire ran is never crawled
-     * again by a settle, however many arrive.
+     * finished." Brings a source the fire it has been waiting for since it
+     * armed — and only that: a source that has already had one is left alone,
+     * so a settle is never a lab crawl in its own right, however many arrive.
      *
      * Two callers, each reporting a fact it owns (see `extension.ts`): the
      * inventory commands, when a per-source busy claim is released — naming
@@ -276,27 +340,37 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
      * mutation queue drains (a finished backup restore, complete reset or
      * migration) — naming none, which means "every armed source".
      *
-     * RE-VALIDATED HERE, not at creation: the debt is paid only if the source
-     * is still armed right now (`timer !== undefined`), so one created before
-     * the user hid the panel, turned the interval off, or removed the source is
-     * simply not paid. A redemption the latch swallows, or which the fire
-     * declines again, stays owed and waits for the next settle — no timer, no
-     * retry loop, and nothing that fires on its own.
+     * THREE CASES, and the middle one is the whole point:
+     *
+     *  - NOT ARMED (`timer === undefined`): nothing. The source may be
+     *    mid-teardown, holding a schedule entry open only for its latch; the
+     *    user may have hidden the panel, zeroed the interval, or removed it.
+     *    Firing at a source nothing is polling is exactly what the visible-gate
+     *    exists to prevent.
+     *  - A FIRE IS IN FLIGHT: the condition cannot be evaluated yet — that fire
+     *    has not said whether it ran — so the wakeup is RECORDED against it
+     *    (`settleDuringFire`) and `release` re-tests the moment it can. This is
+     *    the case a check-then-act across the await silently dropped, and the
+     *    config-restore path hits it every time: the restore persists a source,
+     *    the arm fire goes off to read the vault, the mutation queue drains,
+     *    and only afterwards does the fire report that it could not run.
+     *  - OTHERWISE: `redeem` re-tests "still armed, still unfired" against LIVE
+     *    state and fires if it holds. Nothing is scheduled, nothing retries on
+     *    its own; the next settle asks again.
      */
     sourceSettled(sourceId?: string): void {
       for (const [id, schedule] of schedules) {
         if (sourceId !== undefined && id !== sourceId) {
           continue;
         }
-        if (!schedule.armOwed || schedule.timer === undefined) {
+        if (schedule.timer === undefined) {
           continue;
         }
-        // Cleared BEFORE the fire so a decline can set it again through
-        // `release`; a tick the latch swallowed leaves it owed.
-        schedule.armOwed = false;
-        if (!tick(id, schedule, true)) {
-          schedule.armOwed = true;
+        if (schedule.inFlight) {
+          schedule.settleDuringFire = true;
+          continue;
         }
+        redeem(id, schedule);
       }
     },
     dispose(): void {

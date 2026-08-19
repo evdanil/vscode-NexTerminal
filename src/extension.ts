@@ -1393,9 +1393,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // restore, a complete reset, the one-time poll-setting migration — persists a
   // source's record before its credentials, so the arm fire it triggers can be
   // declined for want of a password that arrives moments later, inside the same
-  // locked run. When that queue drains, every armed source that is still owed an
-  // arm fire gets it. No source id: the flow that just finished may have touched
-  // any of them.
+  // locked run. When that queue drains, every armed source that has still not
+  // had a fire RUN since it armed gets one. No source id: the flow that just
+  // finished may have touched any of them.
+  //
+  // This drain routinely lands while that arm fire is still awaiting its vault
+  // read, so the notification arrives before the source can possibly say whether
+  // it ran. The poll records it against the fire in flight and re-tests when it
+  // reports (`SourceSchedule.settleDuringFire`) — which is why this is safe to
+  // fire exactly once, with nothing here retrying.
   context.subscriptions.push(configMutationLock.onIdle(() => inventoryStatusPoll.sourceSettled()));
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);

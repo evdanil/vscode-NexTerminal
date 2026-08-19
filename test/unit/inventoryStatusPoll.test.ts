@@ -179,11 +179,21 @@ describe("startInventoryStatusPoll", () => {
    * view hidden), and it is redeemed only against live arm state. A debt cannot
    * outlive the arming that justified it, and cannot resurrect after it dies.
    */
-  describe("the arm debt", () => {
-    /** A fire that declines everything, as a busy/credential-less refresh does. */
+  /**
+   * ARMING, AND THE FIRE A SOURCE IS STILL WAITING FOR.
+   *
+   * The scheduler remembers ONE thing about a source's arming: whether any fire
+   * has RUN since it armed (`SourceSchedule.firedSinceArm`). A settle brings the
+   * source that fire if it is still waiting for one, and does nothing at all if
+   * it is not. That replaced an `armOwed` DEBT — created only by a declined ARM
+   * fire, cancelled on disarm, redeemed on settle — whose obligation and
+   * notification kept getting out of step across an await.
+   */
+  describe("arming, and the fire a source is still waiting for", () => {
+    /** A fire that declines everything, as a busy / credential-less refresh does. */
     const declining = () => vi.fn(async () => ({ ran: false }));
 
-    it("redeems a DECLINED arm fire when the source settles, and does not touch the schedule's phase (⊘ treating a decline as a fire loses the arm tick entirely: polling appears to do nothing for a whole period)", async () => {
+    it("brings a source its fire when it settles after a DECLINED arm fire, and does not touch the schedule's phase (⊘ treating a decline as a fire loses the arm tick entirely: polling appears to do nothing for a whole period)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = declining();
@@ -199,7 +209,7 @@ describe("startInventoryStatusPoll", () => {
       expect(vi.getTimerCount()).toBe(1);
     });
 
-    it("keeps owing while the redemption is declined too, and stops the moment one runs (⊘ clearing the debt on a declined retry drops it again, and re-owing on a successful one crawls the lab on every later settle)", async () => {
+    it("keeps waiting while each retry is declined too, and stops the moment one runs (⊘ counting a declined retry as the fire drops the source again, and re-arming the wait after a successful one crawls the lab on every later settle)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       let ran = false;
@@ -226,7 +236,7 @@ describe("startInventoryStatusPoll", () => {
       expect(fire).toHaveBeenCalledTimes(2);
     });
 
-    it("never owes anything for a fire that RAN, however many settles arrive (⊘ redeeming on settle without a debt turns every sync, edit and node control into an extra lab crawl)", async () => {
+    it("asks for nothing more once a fire has RUN, however many settles arrive (⊘ firing on settle without checking turns every sync, edit and node control into an extra lab crawl)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = vi.fn(async () => ({ ran: true }));
@@ -240,7 +250,7 @@ describe("startInventoryStatusPoll", () => {
       expect(fire).toHaveBeenCalledTimes(1);
     });
 
-    it("treats a fire that reports NOTHING as one that ran — the shape a caller with no outcome to give returns (⊘ reading a void result as a decline owes a debt for every tick and crawls on every settle)", async () => {
+    it("treats a fire that reports NOTHING as one that ran — the shape a caller with no outcome to give returns (⊘ reading a void result as a decline leaves every source waiting after every tick and crawls on every settle)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = vi.fn();
@@ -253,7 +263,7 @@ describe("startInventoryStatusPoll", () => {
       expect(fire).not.toHaveBeenCalled();
     });
 
-    it("owes nothing for a declined ROUTINE tick — only the arm one (⊘ deferring every declined tick buys an extra lab crawl after every sync, which has already applied fresh status, and after every node control, which fires its own refresh)", async () => {
+    it("leaves a source that has ALREADY had a fire run alone when a later routine tick is declined (⊘ deferring every declined tick buys an extra lab crawl after every sync, which has already applied fresh status, and after every node control, which fires its own refresh)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
       let ran = true;
@@ -269,7 +279,7 @@ describe("startInventoryStatusPoll", () => {
       expect(fire).toHaveBeenCalledTimes(2);
     });
 
-    it("CANCELS the debt when the view is hidden, and does not resurrect it when the view comes back (⊘ a debt with no cancellation crawls the lab after the user closed the panel — against the poll's own visible-gating — and then a second time on the next settle)", async () => {
+    it("stops waiting when the view is hidden, and does not resurrect the wait when the view comes back (⊘ a wait that survives the disarm crawls the lab after the user closed the panel — against the poll's own visible-gating — and then a second time on the next settle)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = declining();
@@ -283,13 +293,13 @@ describe("startInventoryStatusPoll", () => {
       expect(fire).not.toHaveBeenCalled();
 
       // Coming back is a fresh not-running → running transition: it fires its OWN
-      // arm tick (one), and the dead debt adds nothing on top.
+      // arm tick (one), and the ended wait adds nothing on top.
       view.emit(true);
       await vi.advanceTimersByTimeAsync(0);
       expect(fire).toHaveBeenCalledTimes(1);
     });
 
-    it("CANCELS the debt when the source stops being polled at all — interval 0, removed, or no longer offered (⊘ a stale debt pays out after the user turned polling off, or for a source that is gone)", async () => {
+    it("stops waiting when the source stops being polled at all — interval 0, removed, or no longer offered (⊘ a stale wait fires after the user turned polling off, or for a source that is gone)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }, { id: "b", intervalSeconds: 3600 }]);
       const fire = declining();
@@ -307,15 +317,52 @@ describe("startInventoryStatusPoll", () => {
       expect(fire).not.toHaveBeenCalled();
     });
 
-    it("stays owed when the LATCH swallows the redemption, and pays on the next settle (⊘ counting a tick the latch never dispatched as payment loses the arm fire to a sweep that was already running)", async () => {
+    /**
+     * THE LOST WAKEUP (review F1) — the bug a debt made possible and a state
+     * plus a recorded wakeup makes impossible.
+     *
+     * The arm refresh is ASYNCHRONOUS: `refreshStatus` awaits a vault read
+     * before it can say whether it ran. The config-mutation queue can drain in
+     * that window, so `sourceSettled` arrives while the source has neither run
+     * a fire nor yet reported that it could not. A protocol that reads a DEBT
+     * at that instant finds none, discards the settle, and only then does the
+     * fire resolve `ran: false` and create the debt — after the one
+     * notification that could ever have discharged it. This is the live
+     * ordering of a backup restore: sources are persisted, credentials are
+     * written later in the same locked run, and the drain fires in between.
+     */
+    it("answers a settle that arrives BEFORE the arm fire has reported, the moment it reports a decline (⊘ reading the debt at settle time finds none, discards the notification, and the source then waits its whole configured period — an hour — for a status a restore had already made available)", async () => {
       const view = makeView(true);
-      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
-      const pending = deferred();
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
+      const gate = deferred();
       let call = 0;
       const fire = vi.fn(() => {
         call++;
-        if (call === 1) return Promise.resolve({ ran: false }); // arm fire declined → owed
-        if (call === 2) return pending.promise.then(() => ({ ran: true })); // a routine sweep, still running
+        // The arm fire reads the vault first, so it reports LATE — and declines.
+        return call === 1 ? gate.promise.then(() => ({ ran: false })) : Promise.resolve({ ran: true });
+      });
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      expect(fire).toHaveBeenCalledTimes(1); // armed; the fire is still in flight
+
+      // The mutation queue drains while the arm fire is still deciding.
+      poll.sourceSettled();
+      expect(fire).toHaveBeenCalledTimes(1); // nothing to dispatch yet — the latch is held
+
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      // No further settle arrives, and none is needed.
+      expect(fire).toHaveBeenCalledTimes(2);
+    });
+
+    it("answers a settle the LATCH swallowed the moment the outstanding fire declines, without waiting for another one (⊘ leaving it owed for a NEXT settle strands the source when no next settle comes — the restore that drained the queue was the last event of the flow)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+      const gate = deferred();
+      let call = 0;
+      const fire = vi.fn(() => {
+        call++;
+        if (call === 1) return Promise.resolve({ ran: false }); // arm fire declined
+        if (call === 2) return gate.promise.then(() => ({ ran: false })); // routine tick, slow, declined too
         return Promise.resolve({ ran: true });
       });
       const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
@@ -327,14 +374,83 @@ describe("startInventoryStatusPoll", () => {
       poll.sourceSettled("a");
       expect(fire).toHaveBeenCalledTimes(2);
 
-      // The sweep finishes, and the NEXT settle finds the debt still owed.
-      pending.resolve();
+      gate.resolve();
       await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(3);
+    });
+
+    /**
+     * The other half of the same rule, and a DELIBERATE change from the debt:
+     * an outstanding fire that RAN discharges the arming. It put this source's
+     * status on screen, which is the entire point of the arm fire, so a settle
+     * recorded behind it has nothing left to buy. The debt could not see that —
+     * it was created by the ARM tick and only a redemption could clear it — so
+     * it spent a redundant lab crawl here.
+     */
+    it("treats an outstanding fire that RAN as the fire the source was waiting for, so a settle recorded behind it buys nothing (⊘ a debt only a redemption can clear crawls the lab again for status the sweep it was queued behind has already applied)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+      const gate = deferred();
+      let call = 0;
+      const fire = vi.fn(() => {
+        call++;
+        if (call === 1) return Promise.resolve({ ran: false }); // arm fire declined
+        if (call === 2) return gate.promise.then(() => ({ ran: true })); // routine tick — this one RUNS
+        return Promise.resolve({ ran: true });
+      });
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      poll.sourceSettled("a");
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      // …and it stays discharged for every later settle.
+      poll.sourceSettled("a");
+      poll.sourceSettled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2);
+    });
+
+    /**
+     * A RE-ARMING the latch swallowed. The debt was created only by a declined
+     * ARM tick, so a source re-armed while a ROUTINE sweep was outstanding
+     * recorded nothing: the arm tick was dropped by the latch, and the routine
+     * sweep's own decline was (correctly, for a routine tick) not deferred.
+     * Nothing was owed, nothing settled, and the source sat on an empty status
+     * map for a full period. Asking "has a fire RUN since this arming?" answers
+     * it without needing to know which kind of tick was in flight.
+     */
+    it("leaves a source re-armed behind an outstanding sweep still waiting when that sweep declines (⊘ recording the wait only for a DECLINED ARM tick misses the re-arming entirely, because the arm tick was never dispatched and the routine sweep in flight defers nothing)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+      const gate = deferred();
+      let call = 0;
+      const fire = vi.fn(() => {
+        call++;
+        if (call === 1) return Promise.resolve({ ran: true }); // arm fire ran
+        if (call === 2) return gate.promise.then(() => ({ ran: false })); // routine tick, slow, declined
+        return Promise.resolve({ ran: true });
+      });
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(30_000); // routine tick — in flight
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      view.emit(false); // disarmed; the entry survives only to hold its latch
+      view.emit(true); // re-armed — its arm tick is swallowed by that latch
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0); // the outstanding sweep DECLINED
       poll.sourceSettled("a");
       expect(fire).toHaveBeenCalledTimes(3);
     });
 
-    it("redeems EVERY armed source's debt when settled with no source id — the shape a finished config-level flow reports (⊘ a restore that persists sources before their credentials leaves every one of them waiting a full period)", async () => {
+    it("brings EVERY armed source still waiting its fire when settled with no source id — the shape a finished config-level flow reports (⊘ a restore that persists sources before their credentials leaves every one of them waiting a full period)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }, { id: "b", intervalSeconds: 3600 }]);
       const fire = declining();
@@ -346,7 +462,7 @@ describe("startInventoryStatusPoll", () => {
       expect(firedIds(fire).sort()).toEqual(["a", "b"]);
     });
 
-    it("keeps a debt across a mere period change, which re-arms nothing (⊘ dropping it there loses the arm fire for a source the user just re-tuned)", async () => {
+    it("keeps a source waiting across a mere period change, which is not a re-arming (⊘ treating the replaced timer as a fresh arming, or clearing the wait there, loses the arm fire for a source the user just re-tuned)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = declining();
