@@ -220,10 +220,12 @@ const RETIRED_STATUS_POLL_FULL_KEY = `${RETIRED_STATUS_POLL_SECTION}.${RETIRED_S
  *  1. **The export's own stamp.** `inventoryStatusPollPerSource` is written by
  *     every export from a build that has the field. Blanking a field in the UI
  *     cannot remove it; only hand-editing the JSON can.
- *  2. **Any source in the payload answering the field.** One source carrying
- *     `statusPollSeconds` proves the exporting build knew the field, so every
- *     ABSENT value in that same payload is an answer ("off"), not a gap.
- *     Blanking one source cannot remove the key from the others.
+ *  2. **Any EVE-NG source in the payload answering the field.** One EVE-NG
+ *     source carrying `statusPollSeconds` proves the exporting build knew the
+ *     field, so every ABSENT value in that same payload is an answer ("off"),
+ *     not a gap. Blanking one source cannot remove the key from the others.
+ *     Scoped to EVE-NG because the id is a provider's field name and not a
+ *     reserved word — see the note at the check itself.
  *
  * Be straight about the limit: a genuinely old export contains no positive "I
  * predate the field" marker — there was nothing to write one with — so the
@@ -242,10 +244,22 @@ function importPredatesPerSourceStatusPoll(data: NexusConfigExport): boolean {
     return false;
   }
   const sources = Array.isArray(data.inventorySources) ? data.inventorySources : [];
-  // Every source, not only the EVE-NG ones: the field can only be there because
-  // a build that had it wrote the file, whatever provider the source names.
+  // EVE-NG SOURCES ONLY. `statusPollSeconds` is EVE-NG's field id, not a
+  // reserved word: provider registration is a public API and puts no constraint
+  // on field ids, so a third-party provider may define one of its own under the
+  // same name. Reading the id across every provider would let such a source
+  // classify a genuinely OLD backup as post-migration, and the legacy EVE-NG
+  // sources in that same backup would silently lose the interval this carry
+  // exists to preserve. Only an EVE-NG source answering the field is evidence
+  // that the exporting build knew EVE-NG's new field — the same reason the
+  // carry itself, and the activation migration, re-check `providerId` before
+  // writing an EVE-NG-only field into a source's config.
   return !sources.some(
-    (source) => source && typeof source === "object" && source.config?.[EVE_NG_STATUS_POLL_FIELD_ID] !== undefined
+    (source) =>
+      source
+      && typeof source === "object"
+      && source.providerId === EVE_NG_PROVIDER_ID
+      && source.config?.[EVE_NG_STATUS_POLL_FIELD_ID] !== undefined
   );
 }
 

@@ -798,6 +798,27 @@ describe("config import command (legacy)", () => {
       expect(pollOf("unanswered")).toBeUndefined();
     });
 
+    it("still carries onto legacy EVE-NG sources when the only source answering `statusPollSeconds` belongs to ANOTHER provider (⊘ reading the field id across every provider lets a third-party source that happens to use the same id classify a genuinely old backup as post-migration, and the EVE-NG sources it was written to rescue silently lose the interval)", async () => {
+      // Provider registration is a PUBLIC API with no reserved field ids, so a
+      // third-party inventory provider may define its own `statusPollSeconds`.
+      // Such a source proves nothing about whether the exporting build knew
+      // EVE-NG's field, so it must not speak for the payload.
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [
+            makeInventorySource({ id: "other-1", providerId: "third-party", secretFieldIds: [], config: { [EVE_NG_STATUS_POLL_FIELD_ID]: 10 } }),
+            eveSource("eve-legacy")
+          ],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        })
+      );
+
+      expect(pollOf("eve-legacy")).toBe(45);
+      // …and the other provider's own value is left exactly as it came in.
+      expect(core.getInventorySource("other-1")?.config[EVE_NG_STATUS_POLL_FIELD_ID]).toBe(10);
+    });
+
     it("carries nothing when the export STAMPS itself as coming from a build that has the per-source field, even with no source answering it (⊘ with every source blanked there is nothing else left to tell a deliberately-silenced machine from a pre-field one, and the carry turns polling back on behind the user)", async () => {
       await runImport(
         makeExportData({
