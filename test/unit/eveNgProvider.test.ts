@@ -2895,6 +2895,38 @@ describe("createEveNgProvider — statusPollSeconds field", () => {
     expect(() => validateProviderShape(createEveNgProvider(vi.fn() as unknown as typeof fetch))).not.toThrow();
   });
 
+  /**
+   * The `advanced` exclusion's twin, and the same latent bug. `min`/`max` are
+   * BOUNDS ON A VALUE, not part of the shape a user configured a source
+   * against, and `computeProviderFingerprint` excludes them — but only by
+   * projection: adding them to it failed no test.
+   *
+   * They must stay out. The fingerprint gates a MODAL asking the user to
+   * re-confirm handing a re-registered provider their saved credentials, and
+   * this field's ceiling is exactly the kind of thing a later release widens
+   * (3600 → 86400, say). Projecting the bounds would make that one-word change
+   * re-prompt EVERY existing EVE-NG source for its credentials, which is how a
+   * security modal stops being read.
+   */
+  it("keeps `min`/`max` OUT of the provider fingerprint — widening a bound must not re-prompt every source for its credentials (⊘ projecting the bounds turns a raised ceiling into a credential re-confirmation modal for every existing user)", () => {
+    const fields = (max: number | undefined, min?: number): InventoryConfigField[] => [
+      { id: "baseUrl", label: "EVE-NG Base URL", type: "string", required: true },
+      { id: EVE_NG_STATUS_POLL_FIELD_ID, label: "Lab Status Poll Interval (seconds)", type: "number", required: false, min, max }
+    ];
+    const fingerprint = (max: number | undefined, min?: number): string =>
+      computeProviderFingerprint({ label: "EVE-NG", configFields: fields(max, min) });
+
+    // A widened ceiling, a raised floor, and dropping the bounds entirely: all
+    // the same shape as far as the user's configuration is concerned.
+    expect(fingerprint(3600, 0)).toBe(fingerprint(86_400, 0));
+    expect(fingerprint(3600, 0)).toBe(fingerprint(3600, 5));
+    expect(fingerprint(3600, 0)).toBe(fingerprint(undefined, undefined));
+    // …and the projection is not simply inert: a change that IS material still moves the hash.
+    expect(fingerprint(3600, 0)).not.toBe(
+      computeProviderFingerprint({ label: "EVE-NG", configFields: [...fields(3600, 0), { id: "extra", label: "Extra", type: "string" }] })
+    );
+  });
+
   describe("readEveNgStatusPollSeconds", () => {
     it("reads a stored positive value", () => {
       expect(readEveNgStatusPollSeconds({ statusPollSeconds: 30 })).toBe(30);
