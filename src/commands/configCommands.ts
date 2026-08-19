@@ -330,12 +330,31 @@ function readSettings(): Record<string, unknown> {
 }
 
 
+/** The result of reading a payload's settings, before anything is written. */
+interface PartitionedImportSettings {
+  /** Keys destined for `settings.json`, still to be validated at write time. */
+  writable: Record<string, unknown>;
+  /** Keys consumed here and never written — see `AppliedSettingsCarry`. */
+  carry: AppliedSettingsCarry;
+  /** Values rejected during the partition; the write phase adds its own. */
+  invalidCount: number;
+}
+
 /**
- * Writes the payload's contributed settings, and returns the retired keys it
- * consumed WITHOUT writing (see `AppliedSettingsCarry`) so the caller can put
- * them where they now live.
+ * Reads the payload and decides what each key is, WITHOUT writing anything
+ * (review D4). Split out from the write phase because the two have different
+ * failure modes and only one of them is fallible: `config.update` rejects on
+ * policy-managed or otherwise unwritable configuration, and when the carry was
+ * extracted behind those writes, one such rejection threw before it could be
+ * returned. The inventory sources are persisted EARLIER in the same import, so
+ * a retry in merge mode skips their ids, `importedIds` comes back empty, and
+ * the cadence could never be applied by any later run — a partial settings
+ * failure stranding freshly imported sources with polling off, for good.
+ *
+ * Pure: no `vscode` writes, nothing to throw, so a caller can take the carry
+ * first and let the writes fail on their own terms.
  */
-async function applySettings(settings: Record<string, unknown>): Promise<AppliedSettingsCarry> {
+function partitionImportedSettings(settings: Record<string, unknown>): PartitionedImportSettings {
   const allowedSettings: Record<string, unknown> = {};
   let invalidCount = 0;
   let legacyDefaultTimeoutSeconds: number | undefined;
@@ -381,7 +400,19 @@ async function applySettings(settings: Record<string, unknown>): Promise<Applied
   // — macros now live in MacroStore, not settings. The allowedSettings filter above
   // will already exclude it, but delete explicitly in case any stale reference slips through.
 
-  for (const [fullKey, value] of Object.entries(allowedSettings)) {
+  return { writable: allowedSettings, carry: { retiredStatusPollSeconds }, invalidCount };
+}
+
+/**
+ * The fallible half: validates and WRITES what the partition kept, then warns
+ * once about everything either half rejected. Rejects exactly as
+ * `config.update` does, so an import still reports a settings write it could
+ * not make — the caller decides what it has already committed by then.
+ */
+async function writeImportedSettings(partitioned: PartitionedImportSettings): Promise<void> {
+  let invalidCount = partitioned.invalidCount;
+
+  for (const [fullKey, value] of Object.entries(partitioned.writable)) {
     const lastDot = fullKey.lastIndexOf(".");
     if (lastDot < 0) {
       continue;
@@ -409,7 +440,18 @@ async function applySettings(settings: Record<string, unknown>): Promise<Applied
         : `${invalidCount} imported Nexus settings had invalid values and were skipped.`
     );
   }
-  return { retiredStatusPollSeconds };
+}
+
+/**
+ * Partition + write, for the callers that have nothing to do with the carry (a
+ * share import, which discards it). The import that DOES use the carry calls
+ * the two halves itself, so a failed write cannot strand it — see review D4 in
+ * `partitionImportedSettings`.
+ */
+async function applySettings(settings: Record<string, unknown>): Promise<AppliedSettingsCarry> {
+  const partitioned = partitionImportedSettings(settings);
+  await writeImportedSettings(partitioned);
+  return partitioned.carry;
 }
 
 function isFile(type: vscode.FileType): boolean {
@@ -2650,10 +2692,24 @@ export function registerConfigCommands(
       }
     }
 
-    // Apply settings
+    // Apply settings. The READ is separated from the WRITES (review D4): the
+    // retired interval below is extracted by the partition, which cannot throw,
+    // so a `config.update` that rejects — policy-managed configuration, a
+    // settings file something else owns — can no longer take the carry down
+    // with it. The sources were persisted earlier in this same import, so a
+    // retry in merge mode would skip their ids and leave the cadence
+    // unappliable by any later run. The rejection is kept and re-thrown after
+    // the carry, so the import still fails exactly where and how it did.
     let settingsCarry: AppliedSettingsCarry = {};
+    let settingsWriteError: unknown;
     if (data.settings && typeof data.settings === "object") {
-      settingsCarry = await applySettings(data.settings);
+      const partitioned = partitionImportedSettings(data.settings);
+      settingsCarry = partitioned.carry;
+      try {
+        await writeImportedSettings(partitioned);
+      } catch (error) {
+        settingsWriteError = error;
+      }
     }
 
     /**
@@ -2717,6 +2773,14 @@ export function registerConfigCommands(
           config: { ...live.config, [EVE_NG_STATUS_POLL_FIELD_ID]: carriedPollSeconds }
         });
       }
+    }
+
+    // Re-thrown HERE and not earlier (review D4): everything above this line is
+    // what the failed settings write must not be allowed to strand. Everything
+    // below it aborted on a settings write before this change too, so the
+    // import fails in exactly the same place it always did.
+    if (settingsWriteError !== undefined) {
+      throw settingsWriteError;
     }
 
     // Restore passwords/passphrases from decrypted secrets

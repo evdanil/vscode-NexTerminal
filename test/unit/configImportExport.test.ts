@@ -857,6 +857,48 @@ describe("config import command (legacy)", () => {
       );
     });
 
+    /**
+     * REVIEW D4 — the carry used to be RETURNED by `applySettings`, after its
+     * writes. So one ordinary setting whose global `config.update` rejects
+     * (policy-managed configuration, or a settings file something else owns)
+     * threw before the retired interval could be handed back, and the sources
+     * had already been persisted earlier in the same import — retrying in merge
+     * mode skips those ids, `importedIds` comes back empty, and the cadence can
+     * never be applied by the retry. A partial settings failure stranded
+     * freshly imported sources with polling off, permanently.
+     */
+    it("applies the carry even when an ordinary setting's write rejects (⊘ extracting it behind the fallible writes strands it: the sources are already persisted, so the retry skips them and no later run can ever apply the cadence)", async () => {
+      // Reset in `finally`: `vi.clearAllMocks()` clears calls but KEEPS
+      // implementations, so a rejecting `update` would otherwise leak into
+      // every test after this one.
+      mockConfigUpdate.mockImplementation((_section: string, key: string) => {
+        if (key === "openLocation") {
+          throw new Error("Unable to write to User Settings because nexus.terminal.openLocation is not a registered configuration.");
+        }
+      });
+
+      try {
+        await expect(
+          runImport(
+            makeExportData({
+              exportType: "backup",
+              inventorySources: [eveSource("eve-1")],
+              settings: {
+                "nexus.terminal.openLocation": "editor",
+                "nexus.inventory.statusPollSeconds": 45
+              }
+            })
+          )
+        ).rejects.toThrow(/openLocation/);
+
+        // The source was persisted before the settings phase, so it is the
+        // record the retry can no longer reach — and it carries the cadence.
+        expect(pollOf("eve-1")).toBe(45);
+      } finally {
+        mockConfigUpdate.mockReset();
+      }
+    });
+
     it("skips an out-of-range or non-numeric interval, counting it, and carries nothing (⊘ a key with no validator at all lets a hand-edited 99999 or \"45\" through to be coerced into a number the user never chose, silently and uncounted)", async () => {
       for (const bad of [99_999, -1, "45", Number.NaN]) {
         configStore.clear();
