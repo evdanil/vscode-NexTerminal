@@ -1,13 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { startInventoryStatusPoll } from "../../src/services/inventory/inventoryStatusPoll";
+import { startInventoryStatusPoll, type InventoryStatusPollSource } from "../../src/services/inventory/inventoryStatusPoll";
 import type { VisibilityAwareView } from "../../src/services/terminal/viewVisibilityWiring";
 
 /**
- * LIVE STATUS (Phase 2) — the visible-gated poll. It fires refreshStatus once
- * immediately on arm (so a window reload / becoming-visible does not sit on an
- * empty status map for a whole period), then every N seconds while the Command
- * Center is visible AND the interval is > 0. An in-flight latch keeps a slow
- * sweep from stacking concurrent EVE crawls. Driven with fake timers.
+ * PER-SOURCE LAB STATUS POLL — the visible-gated poll, now scheduled per
+ * inventory source rather than as one global sweep. Each source with a positive
+ * interval gets its own timer: it fires once immediately on arm (so a window
+ * reload / becoming-visible does not sit on an empty status map for a whole
+ * period), then every N seconds while the Command Center is visible. A
+ * PER-SOURCE in-flight latch keeps one slow lab box from stacking concurrent
+ * crawls against itself — without slowing down every other source, which a
+ * single global latch did.
+ *
+ * This file deliberately does NOT mock `vscode`: the module under test must
+ * stay `vscode`-free (type-only imports), and an accidental runtime import
+ * would fail to resolve here rather than pass unnoticed.
  */
 function makeView(initialVisible: boolean): VisibilityAwareView & { emit(visible: boolean): void } {
   let listener: ((e: { visible: boolean }) => void) | undefined;
@@ -23,15 +30,24 @@ function makeView(initialVisible: boolean): VisibilityAwareView & { emit(visible
   };
 }
 
-function makeConfigSource(): { onDidChangeInterval: (cb: () => void) => { dispose(): void }; emit(): void; disposed: () => boolean } {
+function makeSourceFeed(initial: InventoryStatusPollSource[]): {
+  onDidChangeSources: (cb: () => void) => { dispose(): void };
+  getSources: () => InventoryStatusPollSource[];
+  set(next: InventoryStatusPollSource[]): void;
+  disposed: () => boolean;
+} {
   let cb: (() => void) | undefined;
   let disposed = false;
+  let sources = initial;
   return {
-    onDidChangeInterval(listener) {
+    getSources: () => sources,
+    onDidChangeSources(listener) {
       cb = listener;
       return { dispose: () => { disposed = true; cb = undefined; } };
     },
-    emit() {
+    /** Replace the source list AND announce it, the way a config write does. */
+    set(next) {
+      sources = next;
       cb?.();
     },
     disposed: () => disposed
@@ -44,138 +60,229 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+/** Calls of `fire`, in order, as the source ids they named. */
+function firedIds(fire: { mock: { calls: unknown[][] } }): string[] {
+  return fire.mock.calls.map((call) => String(call[0]));
+}
+
 describe("startInventoryStatusPoll", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("fires once immediately on arm (visible + interval > 0), then every N seconds (⊘ P3-8: waiting a full period before the first refresh leaves a freshly-reloaded window on an empty status map)", () => {
+  it("gives every source with a positive interval its own cadence, naming the source on each fire (⊘ one global timer at one interval cannot poll a busy lab often and a quiet one rarely — the whole point of moving the setting onto the source)", () => {
     const view = makeView(true);
-    const config = makeConfigSource();
+    const feed = makeSourceFeed([
+      { id: "busy", intervalSeconds: 10 },
+      { id: "quiet", intervalSeconds: 60 }
+    ]);
     const fire = vi.fn();
-    startInventoryStatusPoll({ view, getIntervalSeconds: () => 30, onDidChangeInterval: config.onDidChangeInterval, fire });
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
-    expect(fire).toHaveBeenCalledTimes(1); // immediate fire on arm
-    vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(2);
-    vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(3);
+    // Both arm immediately, each named.
+    expect(firedIds(fire).sort()).toEqual(["busy", "quiet"]);
+
+    fire.mockClear();
+    vi.advanceTimersByTime(60_000);
+    // 60 s: six busy ticks, one quiet tick.
+    expect(firedIds(fire).filter((id) => id === "busy")).toHaveLength(6);
+    expect(firedIds(fire).filter((id) => id === "quiet")).toHaveLength(1);
   });
 
-  it("does NOT arm or fire when interval is 0, even while visible (⊘ polling a 0 interval busy-loops the provider)", () => {
+  it("does NOT arm a source whose interval is 0, and arms NO timer at all when no source has a positive one (⊘ a 0 interval that still arms busy-loops the provider; a timer with nothing to poll wakes the extension host for nothing)", () => {
     const view = makeView(true);
-    const config = makeConfigSource();
+    const feed = makeSourceFeed([
+      { id: "off", intervalSeconds: 0 },
+      { id: "also-off", intervalSeconds: 0 }
+    ]);
     const fire = vi.fn();
-    startInventoryStatusPoll({ view, getIntervalSeconds: () => 0, onDidChangeInterval: config.onDidChangeInterval, fire });
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
     expect(fire).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(600_000);
+    expect(fire).not.toHaveBeenCalled();
+
+    // One source turning on arms exactly one timer — the other stays off.
+    feed.set([{ id: "off", intervalSeconds: 0 }, { id: "also-off", intervalSeconds: 30 }]);
+    expect(firedIds(fire)).toEqual(["also-off"]);
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("does NOT fire while hidden, and fires every armed source immediately when the view becomes visible (⊘ hammering a lab box while the panel is closed)", () => {
+    const view = makeView(false);
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }, { id: "b", intervalSeconds: 30 }]);
+    const fire = vi.fn();
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+
+    vi.advanceTimersByTime(90_000);
+    expect(fire).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+
+    view.emit(true);
+    expect(firedIds(fire).sort()).toEqual(["a", "b"]);
+    fire.mockClear();
+    vi.advanceTimersByTime(30_000);
+    expect(firedIds(fire).sort()).toEqual(["a", "b"]);
+  });
+
+  it("disarms every source when the view is hidden again (⊘ timers that keep firing after the panel closes)", () => {
+    const view = makeView(true);
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }, { id: "b", intervalSeconds: 45 }]);
+    const fire = vi.fn();
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+
+    fire.mockClear();
+    view.emit(false);
+    expect(vi.getTimerCount()).toBe(0);
     vi.advanceTimersByTime(600_000);
     expect(fire).not.toHaveBeenCalled();
   });
 
-  it("does NOT fire while hidden, and fires immediately when the view becomes visible (⊘ hammering a lab box while the panel is closed)", () => {
-    const view = makeView(false);
-    const config = makeConfigSource();
+  it("fires ONCE on a source's not-running → running transition and leaves every already-running source's cadence untouched (⊘ re-arming the whole set on any source's change resets a 60 s source's phase every time an unrelated source is edited, so it never actually reaches its period)", () => {
+    const view = makeView(true);
+    const feed = makeSourceFeed([{ id: "old", intervalSeconds: 60 }]);
     const fire = vi.fn();
-    startInventoryStatusPoll({ view, getIntervalSeconds: () => 30, onDidChangeInterval: config.onDidChangeInterval, fire });
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
-    vi.advanceTimersByTime(90_000);
+    expect(firedIds(fire)).toEqual(["old"]);
+    fire.mockClear();
+
+    // 45 s into `old`'s period, an unrelated source is added.
+    vi.advanceTimersByTime(45_000);
     expect(fire).not.toHaveBeenCalled();
+    feed.set([{ id: "old", intervalSeconds: 60 }, { id: "new", intervalSeconds: 60 }]);
 
-    view.emit(true);
-    expect(fire).toHaveBeenCalledTimes(1); // immediate fire on becoming visible
-    vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(2);
+    // Only the NEW source fires on the transition…
+    expect(firedIds(fire)).toEqual(["new"]);
+    fire.mockClear();
+
+    // …and `old` is still 15 s from its own tick, not restarted at 60.
+    vi.advanceTimersByTime(15_000);
+    expect(firedIds(fire)).toEqual(["old"]);
   });
 
-  it("disarms when the view is hidden again (⊘ a timer that keeps firing after the panel closes)", () => {
+  it("replaces a source's timer on an interval change WITHOUT a fresh immediate fire (⊘ firing on every config event turns a settings edit into a refresh storm)", () => {
     const view = makeView(true);
-    const config = makeConfigSource();
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
     const fire = vi.fn();
-    startInventoryStatusPoll({ view, getIntervalSeconds: () => 30, onDidChangeInterval: config.onDidChangeInterval, fire });
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
-    expect(fire).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(2);
+    expect(firedIds(fire)).toEqual(["a"]);
+    fire.mockClear();
 
-    view.emit(false);
-    vi.advanceTimersByTime(120_000);
-    expect(fire).toHaveBeenCalledTimes(2);
-  });
-
-  it("re-arms on an interval config change: 0→30 starts polling with an immediate fire, and a period change replaces the running timer WITHOUT a fresh immediate fire (⊘ ignoring the config event leaves a stale cadence, or 0→N never starts)", () => {
-    const view = makeView(true);
-    const config = makeConfigSource();
-    const fire = vi.fn();
-    let interval = 0;
-    startInventoryStatusPoll({ view, getIntervalSeconds: () => interval, onDidChangeInterval: config.onDidChangeInterval, fire });
-
+    feed.set([{ id: "a", intervalSeconds: 60 }]);
     expect(fire).not.toHaveBeenCalled();
-
-    interval = 30;
-    config.emit();
-    expect(fire).toHaveBeenCalledTimes(1); // arm transition 0→running fires immediately
+    // Exactly one timer for the source — the old one was replaced, not layered.
+    expect(vi.getTimerCount()).toBe(1);
     vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(2);
-
-    // Period change while already running: re-arm the timer, no fresh immediate fire.
-    interval = 60;
-    config.emit();
-    expect(fire).toHaveBeenCalledTimes(2);
+    expect(fire).not.toHaveBeenCalled(); // 30 s into a 60 s period
     vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(2); // 30s into a 60s period
-    vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(3);
+    expect(firedIds(fire)).toEqual(["a"]);
   });
 
-  it("interval → 0 disarms a running poll", () => {
+  it("stops a source that goes to 0 or disappears, and leaves its neighbour running (⊘ tearing down every timer on a removal, or leaving a removed source's timer firing against a source that no longer exists)", () => {
     const view = makeView(true);
-    const config = makeConfigSource();
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }, { id: "b", intervalSeconds: 30 }]);
     const fire = vi.fn();
-    let interval = 30;
-    startInventoryStatusPoll({ view, getIntervalSeconds: () => interval, onDidChangeInterval: config.onDidChangeInterval, fire });
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+    fire.mockClear();
 
-    expect(fire).toHaveBeenCalledTimes(1);
+    feed.set([{ id: "a", intervalSeconds: 0 }, { id: "b", intervalSeconds: 30 }]);
+    expect(vi.getTimerCount()).toBe(1);
     vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(2);
+    expect(firedIds(fire)).toEqual(["b"]);
 
-    interval = 0;
-    config.emit();
+    fire.mockClear();
+    feed.set([]); // both sources removed
+    expect(vi.getTimerCount()).toBe(0);
     vi.advanceTimersByTime(300_000);
-    expect(fire).toHaveBeenCalledTimes(2);
+    expect(fire).not.toHaveBeenCalled();
   });
 
-  it("P2-1: an in-flight latch skips ticks while a sweep is still running, so slow sweeps never stack (⊘ removing the latch lets a 1s interval stack unbounded concurrent EVE crawls)", async () => {
+  it("latches PER SOURCE: a slow sweep skips only its OWN ticks, while every other source keeps polling on time (⊘ one shared latch lets one slow lab box silently stop every other source from refreshing; no latch at all lets a 1 s interval stack unbounded concurrent crawls)", async () => {
     const view = makeView(true);
-    const config = makeConfigSource();
+    const feed = makeSourceFeed([{ id: "slow", intervalSeconds: 1 }, { id: "fast", intervalSeconds: 1 }]);
     const gate = deferred();
-    const fire = vi.fn(() => gate.promise); // stays pending — one long sweep
-    startInventoryStatusPoll({ view, getIntervalSeconds: () => 1, onDidChangeInterval: config.onDidChangeInterval, fire });
+    const fire = vi.fn((id: string) => (id === "slow" ? gate.promise : Promise.resolve()));
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
-    // The immediate arm-fire is in flight; every tick during it is skipped.
-    expect(fire).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(fire).toHaveBeenCalledTimes(1);
+    expect(firedIds(fire).sort()).toEqual(["fast", "slow"]);
+    fire.mockClear();
 
-    // Sweep completes → the latch releases → the next tick fires again.
+    await vi.advanceTimersByTimeAsync(5_000);
+    // `slow` is still in flight — none of its ticks stacked…
+    expect(firedIds(fire).filter((id) => id === "slow")).toHaveLength(0);
+    // …and `fast` was not held hostage by it.
+    expect(firedIds(fire).filter((id) => id === "fast")).toHaveLength(5);
+
+    // The slow sweep completes → its latch releases → its next tick fires.
+    fire.mockClear();
     gate.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(firedIds(fire).sort()).toEqual(["fast", "slow"]);
+  });
+
+  it("releases a source's latch when its sweep REJECTS, so one failed refresh does not stop that source forever (⊘ latching only on fulfilment wedges a source whose lab box is down)", async () => {
+    const view = makeView(true);
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 1 }]);
+    let reject!: (e: unknown) => void;
+    const first = new Promise<void>((_r, rj) => { reject = rj; });
+    first.catch(() => undefined); // the poll attaches its own handler; keep the runner quiet
+    let call = 0;
+    const fire = vi.fn(() => (call++ === 0 ? first : Promise.resolve()));
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+
+    expect(fire).toHaveBeenCalledTimes(1);
+    reject(new Error("lab box down"));
     await Promise.resolve();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(fire).toHaveBeenCalledTimes(2);
   });
 
-  it("dispose clears the timer and unsubscribes (⊘ a leaked interval keeps firing after teardown)", () => {
+  it("does not double-fire a source that is re-armed while its previous sweep is still in flight (⊘ dropping the latch with the timer lets a hide/show cycle stack a second crawl on the same lab box)", async () => {
     const view = makeView(true);
-    const config = makeConfigSource();
-    const fire = vi.fn();
-    const handle = startInventoryStatusPoll({ view, getIntervalSeconds: () => 30, onDidChangeInterval: config.onDidChangeInterval, fire });
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+    const gate = deferred();
+    const fire = vi.fn(() => gate.promise);
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
     expect(fire).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(30_000);
-    expect(fire).toHaveBeenCalledTimes(2);
+    view.emit(false);
+    view.emit(true); // re-arm transition while the first sweep is STILL pending
+    expect(fire).toHaveBeenCalledTimes(1);
 
-    handle.dispose();
-    vi.advanceTimersByTime(300_000);
+    gate.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(30_000);
     expect(fire).toHaveBeenCalledTimes(2);
-    expect(config.disposed()).toBe(true);
+  });
+
+  it("dispose clears every timer and unsubscribes (⊘ leaked intervals keep firing after teardown)", () => {
+    const view = makeView(true);
+    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }, { id: "b", intervalSeconds: 45 }]);
+    const fire = vi.fn();
+    const handle = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+
+    fire.mockClear();
+    handle.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(300_000);
+    expect(fire).not.toHaveBeenCalled();
+    expect(feed.disposed()).toBe(true);
+  });
+
+  it("ignores a non-finite or negative interval rather than arming a timer that never fires (⊘ NaN * 1000 arms an interval the runtime treats as 1 ms, or as never)", () => {
+    const view = makeView(true);
+    const feed = makeSourceFeed([
+      { id: "nan", intervalSeconds: Number.NaN },
+      { id: "neg", intervalSeconds: -30 },
+      { id: "inf", intervalSeconds: Number.POSITIVE_INFINITY }
+    ]);
+    const fire = vi.fn();
+    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+
+    expect(fire).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

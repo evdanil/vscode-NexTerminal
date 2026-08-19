@@ -75,7 +75,7 @@ import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
 import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
-import { createEveNgProvider } from "./services/inventory/providers/eveNgProvider";
+import { EVE_NG_PROVIDER_ID, createEveNgProvider, readEveNgStatusPollSeconds } from "./services/inventory/providers/eveNgProvider";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
@@ -1325,24 +1325,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
   const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
-  // LIVE STATUS (Phase 2) — opt-in poll of EVE-NG lab running status, gated on
-  // the Command Center being visible and nexus.inventory.statusPollSeconds > 0.
-  // Seeds from commandCenterView.visible up front (createTreeView never fires the
-  // visibility event at registration), re-arms/stops on the config change, and
-  // is disposed with the extension.
+  // LIVE STATUS — opt-in poll of EVE-NG lab running status, gated on the Command
+  // Center being visible and on the SOURCE's own Lab Status Poll Interval field
+  // being > 0. Seeds from commandCenterView.visible up front (createTreeView
+  // never fires the visibility event at registration), re-arms/stops whenever a
+  // source is added, edited or removed, and is disposed with the extension.
+  //
+  // Only EVE-NG sources are offered: it is the only built-in provider that
+  // implements `fetchStatus`, and the interval field is declared on it. A source
+  // of any other provider simply never appears in this list.
   const inventoryStatusPoll = startInventoryStatusPoll({
     view: commandCenterView,
-    getIntervalSeconds: () => Math.floor(readBoundedNumber("nexus.inventory", "statusPollSeconds", 0, 0, 3600)),
-    onDidChangeInterval: (listener) =>
-      vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration("nexus.inventory.statusPollSeconds")) {
-          listener();
-        }
-      }),
-    // Return the thenable so the poll's in-flight latch can await the sweep.
-    // The `__poll` marker tells refreshStatus this is the background path, so it
-    // stays silent on total failure (the manual command warns instead).
-    fire: () => Promise.resolve(vscode.commands.executeCommand("nexus.inventory.refreshStatus", { __poll: true })).then(() => undefined)
+    getSources: () =>
+      core
+        .getSnapshot()
+        .inventorySources.filter((source) => source.providerId === EVE_NG_PROVIDER_ID)
+        .map((source) => ({ id: source.id, intervalSeconds: readEveNgStatusPollSeconds(source.config) })),
+    // NexusCore's own change event covers every way the set or its intervals can
+    // move — add/edit/remove a source, a backup import, the one-time migration
+    // of the retired global setting — so no separate configuration listener is
+    // needed now that the interval no longer lives in settings.
+    onDidChangeSources: (listener) => ({ dispose: core.onDidChange(listener) }),
+    // Return the thenable so the source's in-flight latch can await its sweep.
+    // `sourceId` narrows the refresh to this one source (refreshStatus already
+    // takes a source id, and `resolveSourceIdArg` reads it off the argument
+    // object), and the `__poll` marker tells it this is the background path, so
+    // it stays silent on total failure (the manual command warns instead).
+    fire: (sourceId) =>
+      Promise.resolve(vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })).then(() => undefined)
   });
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);

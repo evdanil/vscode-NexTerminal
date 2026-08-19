@@ -8996,6 +8996,31 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
+  /**
+   * PER-SOURCE LAB STATUS POLL — the poll now fires one source at a time, and
+   * it does so through the argument shapes this command already understood:
+   * `resolveSourceIdArg` reads `sourceId` off the argument object, and the
+   * `__poll` marker keeps the background path silent. No command-layer change
+   * was needed for per-source firing; this is what pins that.
+   */
+  it("takes a { sourceId, __poll } argument as a SILENT refresh of that ONE source (⊘ ignoring sourceId on the poll path makes every tick of one 10 s source sweep every lab server the user has)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => { throw new Error("auth broken"); });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", config: { host: "one" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-2", config: { host: "two" } }));
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-2", __poll: true });
+
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    expect(fetchStatus.mock.calls[0][0]).toEqual({ host: "two" });
+    // …and it is still the background path, so a total failure stays silent.
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
   it("P3-7: the manual refresh does NOT warn when at least one source produced a report", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
