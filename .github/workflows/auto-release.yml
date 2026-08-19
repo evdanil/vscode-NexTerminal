@@ -72,11 +72,16 @@ jobs:
           release=false
           reason="no [release] marker in the head commit message"
 
-          # THE OPT-IN. Nothing releases without this marker. Note it cannot be
-          # matched by the retired "[skip release]" opt-out: that string does
-          # not contain "[release]" as a substring, so an old merge message
-          # phrased the previous way still releases nothing.
-          if grep -qiF '[release]' <<<"$HEAD_MSG"; then
+          # THE OPT-IN. Nothing releases without this marker, and the marker
+          # must be a LINE OF ITS OWN — not a substring anywhere in the message.
+          # A substring test reads "Do not [release] this PR yet" as consent and
+          # publishes, which is the exact failure this opt-in model exists to
+          # make impossible; prose about releasing must never be able to
+          # release. A whole-line match makes the marker a deliberate act that
+          # cannot be produced by discussing one. Surrounding whitespace (and a
+          # CR from a CRLF message) is tolerated; nothing else on the line is.
+          # This also cannot be matched by the retired "[skip release]" opt-out.
+          if grep -qiE '^[[:space:]]*\[release\][[:space:]]*$' <<<"$HEAD_MSG"; then
             release=true
             reason="head commit message contains [release]"
           fi
