@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { configMutationLock } from "../configMutationLock";
 import type { NexusCore } from "../../core/nexusCore";
+import type { InspectableConfiguration } from "../../utils/configurationInspection";
 import {
   EVE_NG_PROVIDER_ID,
   EVE_NG_STATUS_POLL_FIELD_ID,
@@ -61,6 +62,30 @@ export function coerceRetiredStatusPollSeconds(raw: unknown): number {
     return EVE_NG_STATUS_POLL_MIN_SECONDS;
   }
   return Math.floor(Math.min(Math.max(raw, EVE_NG_STATUS_POLL_MIN_SECONDS), EVE_NG_STATUS_POLL_MAX_SECONDS));
+}
+
+/**
+ * THE ONE READ of the retired key, for every consumer: its GLOBAL value, and
+ * nothing else. Exported so config EXPORT reads exactly the scope this
+ * migration reads (review D1) instead of re-deriving the rule beside it.
+ *
+ * The generic reader (`getConfiguredSettingValue`) deliberately prefers a
+ * WORKSPACE or FOLDER value, which is right for a setting that means "how this
+ * window behaves" and wrong for this one: it is being moved onto INVENTORY
+ * SOURCES, which are machine-wide. Reading the effective scope anywhere would
+ * promote one workspace's number onto every window — through the migration if
+ * it read that way (it no longer does), or, one machine later, through a backup
+ * that captured it and a restore that applied it to every source the import
+ * created. The scope note in the doc comment below is the full argument; this
+ * function is what keeps both callers on the same side of it.
+ *
+ * Returns the RAW value. Every caller coerces through
+ * `coerceRetiredStatusPollSeconds` (or, on the import path, validates first),
+ * so a non-numeric value is handled where it can be reported rather than
+ * silently normalised here.
+ */
+export function readGlobalRetiredStatusPollValue(config: InspectableConfiguration): unknown {
+  return config.inspect?.<unknown>(RETIRED_STATUS_POLL_KEY)?.globalValue;
 }
 
 /**
@@ -176,7 +201,7 @@ export async function migrateGlobalStatusPollSetting(
     // what makes two concurrent first activations produce one outcome instead
     // of a race. A workspace override is deliberately neither read nor cleared;
     // see the scope note in the doc comment above.
-    const globalValue = config.inspect<unknown>(RETIRED_STATUS_POLL_KEY)?.globalValue;
+    const globalValue = readGlobalRetiredStatusPollValue(config);
 
     if (globalValue === undefined) {
       // A completed pass with nothing to carry — marked like any other, so a key

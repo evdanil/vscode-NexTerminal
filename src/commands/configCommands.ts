@@ -77,6 +77,7 @@ import { getConfiguredSettingValue } from "../utils/configurationInspection";
 import { configMutationLock } from "../services/configMutationLock";
 import {
   coerceRetiredStatusPollSeconds,
+  readGlobalRetiredStatusPollValue,
   RETIRED_STATUS_POLL_KEY,
   RETIRED_STATUS_POLL_SECTION
 } from "../services/inventory/statusPollSettingMigration";
@@ -232,9 +233,20 @@ function readSettings(): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const { section, key } of SETTINGS_KEYS) {
     const config = vscode.workspace.getConfiguration(section);
-    const value = getConfiguredSettingValue(config, key);
+    const fullKey = `${section}.${key}`;
+    // RETIRED LAB-STATUS POLL INTERVAL (review D1) — GLOBAL ONLY, through the
+    // migration's own reader. Every other key is captured at its EFFECTIVE
+    // scope, which is what a backup of "how this install behaves" should hold.
+    // This one is different because of where its value ENDS UP: the import
+    // carries it onto inventory sources, and a source is machine-wide. Reading
+    // the effective scope here would capture the very workspace-scoped number
+    // the activation migration refuses to promote, and the restore would then
+    // promote it on the next machine — the outcome the Global-only rule was
+    // adopted to remove, re-entering through the export instead of activation.
+    const value = fullKey === RETIRED_STATUS_POLL_FULL_KEY
+      ? readGlobalRetiredStatusPollValue(config)
+      : getConfiguredSettingValue(config, key);
     if (value !== undefined) {
-      const fullKey = `${section}.${key}`;
       if (fullKey === LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY) {
         if (result[SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY] === undefined) {
           const seconds = legacyDefaultTimeoutMsToSeconds(value);

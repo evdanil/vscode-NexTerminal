@@ -31,6 +31,10 @@ const mockShowTextDocument = vi.fn();
 const mockExecuteCommand = vi.fn();
 const configStore = new Map<string, unknown>();
 const configDefaults = new Map<string, unknown>();
+// WORKSPACE-scoped values, separate from `configStore` (which models GLOBAL scope).
+// `getConfiguredSettingValue` prefers a workspace value over a global one, so the two
+// have to be distinguishable for any test about WHICH scope a read picks up.
+const configWorkspaceStore = new Map<string, unknown>();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -74,6 +78,9 @@ vi.mock("vscode", () => ({
     getConfiguration: vi.fn((section: string) => ({
       get: (key: string, fallback?: unknown) => {
         const fullKey = `${section}.${key}`;
+        // Workspace wins over global, as it does in VS Code, so a test that sets one
+        // cannot make a `get`-based read disagree with an `inspect`-based one.
+        if (configWorkspaceStore.has(fullKey)) return configWorkspaceStore.get(fullKey);
         if (configStore.has(fullKey)) return configStore.get(fullKey);
         if (configDefaults.has(fullKey)) return configDefaults.get(fullKey);
         return fallback;
@@ -82,7 +89,8 @@ vi.mock("vscode", () => ({
         const fullKey = `${section}.${key}`;
         return {
           defaultValue: configDefaults.get(fullKey),
-          globalValue: configStore.has(fullKey) ? configStore.get(fullKey) : undefined
+          globalValue: configStore.has(fullKey) ? configStore.get(fullKey) : undefined,
+          workspaceValue: configWorkspaceStore.has(fullKey) ? configWorkspaceStore.get(fullKey) : undefined
         };
       },
       update: (key: string, value: unknown) => {
@@ -254,6 +262,7 @@ function makeExportData(overrides: Record<string, unknown> = {}) {
 // both of which call getMacros()/saveMacros().
 beforeEach(async () => {
   configDefaults.clear();
+  configWorkspaceStore.clear();
   const store = new InMemoryMacroStore();
   await store.initialize();
   setActiveMacroStore(store);
@@ -1776,6 +1785,51 @@ describe("backup export command", () => {
     core = new NexusCore(repo);
     await core.initialize();
     registerConfigCommands(core, vault);
+  });
+
+  /**
+   * REVIEW D1 — the retired `nexus.inventory.statusPollSeconds` is in
+   * `SETTINGS_KEYS` so an old export keeps carrying it, which means EXPORT reads
+   * it too, through `getConfiguredSettingValue` — and that reader prefers a
+   * WORKSPACE (or folder) value over the global one. The activation migration
+   * deliberately refuses to promote a workspace-scoped number onto machine-wide
+   * sources; capturing one here and carrying it through a restore promotes it
+   * anyway, one machine later. Export therefore reads exactly the scope the
+   * migration reads, through the migration's own reader.
+   */
+  describe("the retired lab-status poll interval, on export", () => {
+    async function exportBackupPayload(): Promise<Record<string, unknown>> {
+      mockShowInputBox.mockResolvedValueOnce("testpass123").mockResolvedValueOnce("testpass123");
+      mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+      mockWriteFile.mockResolvedValue(undefined);
+      await registeredCommands.get("nexus.config.export.backup")!();
+      return JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    }
+
+    it("captures the GLOBAL value even when a workspace override is in effect (\u2298 reading the effective scope captures the workspace number the migration refuses to promote, and a restore then applies it to every imported machine-wide source)", async () => {
+      configStore.set("nexus.inventory.statusPollSeconds", 30);
+      configWorkspaceStore.set("nexus.inventory.statusPollSeconds", 45);
+
+      const written = await exportBackupPayload();
+
+      expect(written.settings).toMatchObject({ "nexus.inventory.statusPollSeconds": 30 });
+    });
+
+    it("captures nothing when the interval is set ONLY in a workspace (\u2298 as above, with no global value to hide behind: the workspace number becomes the backup's own)", async () => {
+      configWorkspaceStore.set("nexus.inventory.statusPollSeconds", 45);
+
+      const written = await exportBackupPayload();
+
+      expect(written.settings).not.toHaveProperty("nexus.inventory.statusPollSeconds");
+    });
+
+    it("still captures an ORDINARY setting's effective value, workspace included (\u2298 narrowing every key to Global drops the workspace settings a backup has always carried)", async () => {
+      configWorkspaceStore.set("nexus.logging.sessionLogDirectory", "/workspace/logs");
+
+      const written = await exportBackupPayload();
+
+      expect(written.settings).toMatchObject({ "nexus.logging.sessionLogDirectory": "/workspace/logs" });
+    });
   });
 
   it("exports with encrypted secrets and strips secret macro text from top-level macros", async () => {
