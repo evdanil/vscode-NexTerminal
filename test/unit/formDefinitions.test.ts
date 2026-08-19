@@ -582,6 +582,24 @@ describe("inventorySourceFormDefinition", () => {
     expect((field as Extract<FormFieldDescriptor, { type: "number" }>).step).toBe("any");
   });
 
+  /**
+   * REVIEW D2 — `step: "any"` is right for a field that HAS a meaning for
+   * fractions, and wrong for one that does not. EVE-NG's poll interval is
+   * floored at read time, so `0.4` silently means OFF and `1.9` silently means
+   * one second, while the form shows the number the user typed as saved. A
+   * field that declares `integer` renders the native `step="1"` that catches it
+   * where it is typed.
+   */
+  it("steps a provider-declared INTEGER number field by 1, so the browser catches a fraction where it is typed (\u2298 step \"any\" accepts 0.4 on a field whose runtime floors it to OFF, and the form reports it as saved)", () => {
+    const definition = inventorySourceFormDefinition({
+      ...fakeProvider,
+      configFields: [{ id: "pollInterval", label: "Poll Interval", type: "number", integer: true }]
+    });
+    const field = keyedField(definition, "cfg_pollInterval") as Extract<FormFieldDescriptor, { type: "number" }>;
+    expect(field.type).toBe("number");
+    expect(field.step).toBe(1);
+  });
+
   it("carries the fractional value through unchanged when reopening a source that already stores one", () => {
     const definition = inventorySourceFormDefinition(fakeProvider, {
       id: "src1",

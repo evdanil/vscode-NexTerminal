@@ -2883,6 +2883,17 @@ describe("createEveNgProvider — statusPollSeconds field", () => {
     expect(EVE_NG_STATUS_POLL_FIELD_ID).toBe("statusPollSeconds");
   });
 
+  /**
+   * REVIEW D2 — the runtime FLOORS this value, so a fraction is never the
+   * cadence that runs: `0.4` disables polling although the hint says only `0`
+   * does, and `1.9` polls every second while the form shows 1.9 as saved. The
+   * field declares `integer`, which both layers enforce — the rendered input's
+   * native `step="1"` and the collection-side parse a posted value has to pass.
+   */
+  it("declares itself an INTEGER field, since a fractional poll period has no runtime meaning (\u2298 without it the form accepts 0.4 and the runtime floors it to OFF, telling the user one thing and doing another)", () => {
+    expect(field().integer).toBe(true);
+  });
+
   it("says in its hint that 0 is off and that a poll can evict the browser's EVE-NG session, pointing at a dedicated account (\u2298 a bare 'seconds between refreshes' hint sends the user to turn polling on with no idea it will log them out of the web UI)", () => {
     const hint = String(field().description ?? "").toLowerCase();
     expect(hint).toMatch(/\b0\b/);
@@ -2925,6 +2936,28 @@ describe("createEveNgProvider — statusPollSeconds field", () => {
     expect(fingerprint(3600, 0)).not.toBe(
       computeProviderFingerprint({ label: "EVE-NG", configFields: [...fields(3600, 0), { id: "extra", label: "Extra", type: "string" }] })
     );
+  });
+
+  /**
+   * REVIEW D2 — `integer` joins `advanced`, `defaultValue` and `min`/`max` in
+   * the excluded set, for their reason: it says how a value is ENTERED, not
+   * what the source is configured with. Declaring it on a field that already
+   * shipped without it must not re-prompt every existing source to re-confirm
+   * handing the provider its saved credentials — which is exactly what this
+   * release does to EVE-NG's poll interval.
+   */
+  it("keeps `integer` OUT of the provider fingerprint — constraining an existing field to whole numbers must not re-prompt every source for its credentials (\u2298 projecting it turns a tightened constraint into a credential re-confirmation modal for every existing user)", () => {
+    const withIntegerFlag = (integer?: boolean): string =>
+      computeProviderFingerprint({
+        label: "EVE-NG",
+        configFields: [
+          { id: "baseUrl", label: "EVE-NG Base URL", type: "string", required: true },
+          { id: EVE_NG_STATUS_POLL_FIELD_ID, label: "Lab Status Poll Interval (seconds)", type: "number", required: false, min: 0, max: 3600, integer }
+        ]
+      });
+
+    expect(withIntegerFlag(true)).toBe(withIntegerFlag(undefined));
+    expect(withIntegerFlag(true)).toBe(withIntegerFlag(false));
   });
 
   describe("readEveNgStatusPollSeconds", () => {

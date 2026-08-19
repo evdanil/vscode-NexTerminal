@@ -191,6 +191,28 @@ describe("validateProviderShape", () => {
   });
 
   /**
+   * REVIEW D2 — `integer` is the third member of the same family as
+   * `defaultValue` and `min`/`max`, on the same public boundary, and it fails
+   * the same silent way: the collection-side check reads it as a truthy/falsy
+   * flag, so `integer: "yes"` constrains a field the provider never meant to
+   * constrain and `integer: 0` leaves one it did mean to constrain wide open —
+   * with nothing anywhere saying the schema is at fault.
+   */
+  it("rejects a non-boolean `integer` (\u2298 a truthy string silently constrains a field the provider never meant to, and a falsy non-boolean silently leaves one unconstrained)", () => {
+    for (const bad of ["yes" as never, 1 as never, 0 as never, null as never]) {
+      expect(() =>
+        validateProviderShape(makeProvider({ configFields: [{ id: "poll", label: "Poll", type: "number", integer: bad }] }))
+      ).toThrow(/"poll".*integer/i);
+    }
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "poll", label: "Poll", type: "number", integer: true }] }))
+    ).not.toThrow();
+    expect(() =>
+      validateProviderShape(makeProvider({ configFields: [{ id: "poll", label: "Poll", type: "number" }] }))
+    ).not.toThrow();
+  });
+
+  /**
    * REVIEW L3 — the same boundary that already rejects a non-boolean
    * `defaultValue` for exactly this class of typo said nothing about `min`/`max`,
    * and this is a PUBLIC API third-party providers register through.

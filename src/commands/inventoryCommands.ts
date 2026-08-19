@@ -498,6 +498,16 @@ function formValuesToProviderConfig(
         if ((min !== undefined && numeric < min) || (max !== undefined && numeric > max)) {
           throw new Error(`${field.label} must be between ${min ?? "-\u221e"} and ${max ?? "\u221e"}`);
         }
+        // WHOLE NUMBERS (review D2) — the twin of the bounds check above, and
+        // the same reason for living here: the rendered input carries the
+        // native `step="1"`, but that is the browser's word, and a value can be
+        // posted without one. Rejects rather than rounds, exactly as the bounds
+        // do — storing a different number than the user typed is how a source
+        // ends up polling at a cadence nobody chose, and here the runtime's own
+        // floor is what would change it (0.4 becomes OFF, 1.9 becomes 1).
+        if (field.integer && !Number.isInteger(numeric)) {
+          throw new Error(`${field.label} must be a whole number`);
+        }
         config[field.id] = numeric;
       } else if (field.required) {
         throw new Error(`${field.label} is required`);

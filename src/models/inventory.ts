@@ -202,6 +202,35 @@ export interface InventoryConfigField {
   min?: number;
   max?: number;
   /**
+   * PER-SOURCE LAB STATUS POLL (review D2) — a `type: "number"` field whose
+   * values are WHOLE numbers. Rendered as the input's native `step="1"` (so the
+   * browser refuses a fraction where it is typed, instead of the `step="any"`
+   * every other number field gets) and re-checked in
+   * `formValuesToProviderConfig`, which is the layer a programmatically posted
+   * value has to pass. Ignored for every other field type.
+   *
+   * It belongs on the CONTRACT rather than in one provider's own submit
+   * handling because both enforcement layers are generic: the descriptor and
+   * the collection parse know about fields, not about EVE-NG, and a
+   * provider-specific rule would have to hard-code a field id in one of them.
+   * `min`/`max` set that precedent, and this is the same kind of statement —
+   * which values are acceptable — expressed the same way.
+   *
+   * Declare it only where a fraction has NO runtime meaning. EVE-NG's poll
+   * interval is the first such field: `readEveNgStatusPollSeconds` floors it, so
+   * an accepted `0.4` silently means OFF and `1.9` silently means one second,
+   * while the form reports back the number the user typed. Refusing the
+   * fraction at collection time is the honest direction; a field that genuinely
+   * measures in halves simply omits this and keeps `step: "any"`.
+   *
+   * NOT part of `computeProviderFingerprint`, for the reason `min`/`max` are
+   * not: a constraint says how a value is entered, not what the source is
+   * configured with, so tightening one must never make every existing source
+   * re-confirm its saved credentials. Providers still coerce at READ time — a
+   * config restored from a hand-edited backup never passed through this form.
+   */
+  integer?: boolean;
+  /**
    * EVE-NG (Phase 1) — the value a `type: "boolean"` field starts at on the ADD
    * form, when the source has no stored value for it yet. Ignored for every
    * other field type, and ignored on EDIT (a stored `false` is a real answer the

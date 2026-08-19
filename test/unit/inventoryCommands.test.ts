@@ -521,6 +521,66 @@ describe("inventoryCommands", () => {
       expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ host: "eve.local", pollSeconds: 3600 });
     });
 
+    /**
+     * REVIEW D2 — the bound is only half the story. The runtime FLOORS this
+     * value (`readEveNgStatusPollSeconds`), so a fraction the form accepts is
+     * not the cadence that runs: `0.4` disables polling although the field's
+     * own description says only `0` does, and `1.9` is shown as saved while the
+     * poll ticks every second. The honest direction is to refuse the fraction at
+     * collection time — there is no runtime meaning for one — and this is the
+     * layer that has to do it, because the native `step` is the browser's word
+     * and a value can be posted without one.
+     */
+    it("rejects a fractional value on an INTEGER number field and persists nothing (\u2298 accepting it stores a number the runtime floors: 0.4 silently turns polling off, 1.9 silently polls every second, and the form reports both as saved)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "pollSeconds", label: "Poll Seconds", type: "number", required: false, min: 0, max: 3600, integer: true }
+        ]
+      });
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      const post = (pollSeconds: unknown) =>
+        onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: pollSeconds });
+
+      await expect(post(0.4)).rejects.toThrow(/Poll Seconds must be a whole number/);
+      await expect(post(1.9)).rejects.toThrow(/Poll Seconds must be a whole number/);
+      // A numeric STRING posts the same way an input does, and must be judged the same.
+      await expect(post("2.5")).rejects.toThrow(/Poll Seconds must be a whole number/);
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+      // …and a whole number still saves, so this is a constraint and not a
+      // blanket rejection of the field.
+      await post(30);
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ host: "eve.local", pollSeconds: 30 });
+    });
+
+    it("leaves a number field that does NOT declare `integer` accepting fractions (\u2298 refusing every fraction everywhere breaks a provider whose field legitimately measures in halves)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "timeout", label: "Timeout", type: "number", required: false, min: 0, max: 60 }
+        ]
+      });
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_timeout: 2.5 });
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ host: "eve.local", timeout: 2.5 });
+    });
+
     it("titles the form with the provider label and prefills Default SSH Username with mostCommonUsername", async () => {
       const owned = [
         makeServer({ id: "s1", username: "opsuser" }),

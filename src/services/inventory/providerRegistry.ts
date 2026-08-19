@@ -67,6 +67,15 @@ export function validateProviderShape(provider: unknown): asserts provider is In
         throw new Error(`Inventory provider configFields entry "${f.id}" has a non-finite ${bound} (a bound must be a finite number when present).`);
       }
     }
+    // REVIEW D2 — the third member of the `defaultValue` / `min`-`max` family,
+    // on the same public boundary and failing the same silent way: the
+    // collection-side check reads this as a truthy flag, so `integer: "yes"`
+    // constrains a field the provider never meant to constrain, and `integer: 0`
+    // leaves one it did mean to constrain wide open — with nothing naming the
+    // schema either way.
+    if (f.integer !== undefined && typeof f.integer !== "boolean") {
+      throw new Error(`Inventory provider configFields entry "${f.id}" has a non-boolean integer flag.`);
+    }
     if (typeof f.min === "number" && typeof f.max === "number" && f.min > f.max) {
       throw new Error(`Inventory provider configFields entry "${f.id}" declares min ${f.min} greater than max ${f.max}, which no value can satisfy.`);
     }

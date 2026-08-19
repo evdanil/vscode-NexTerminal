@@ -227,6 +227,14 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
     advanced: true,
     min: EVE_NG_STATUS_POLL_MIN_SECONDS,
     max: EVE_NG_STATUS_POLL_MAX_SECONDS,
+    // WHOLE SECONDS ONLY (review D2). `readEveNgStatusPollSeconds` floors what
+    // it reads, so a fraction is never the cadence that runs: 0.4 would be OFF
+    // and 1.9 would be one second, both reported back by the form as the number
+    // the user typed. There is no runtime meaning to give a fractional poll
+    // period, so the field refuses one at both layers instead of accepting a
+    // value it will quietly change. Not part of the fingerprint (pinned by a
+    // test), so adding it re-prompts nobody.
+    integer: true,
     placeholder: "0",
     description: EVE_NG_STATUS_POLL_DESCRIPTION
   }
