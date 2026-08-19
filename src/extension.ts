@@ -1337,7 +1337,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const inventoryTeardown: InventoryRuntimeTeardown = {
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
-  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
+  // The poll is created just below (it needs the Command Center view), so its
+  // redemption entry point is reached through this holder rather than by
+  // reordering: creating the poll FIRST would let its arm fire run
+  // `nexus.inventory.refreshStatus` before that command is registered.
+  let notifyPollSourceSettled: ((sourceId: string) => void) | undefined;
+  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown, {
+    // A FACT the command layer owns — "this source's busy claim is gone" — not
+    // a request to refresh. The poll decides whether it owes that source an arm
+    // fire and whether paying it is still justified (review D6/E2).
+    onSourceFree: (sourceId) => notifyPollSourceSettled?.(sourceId)
+  });
   // LIVE STATUS — opt-in poll of EVE-NG lab running status, gated on the Command
   // Center being visible and on the SOURCE's own Lab Status Poll Interval field
   // being > 0. Seeds from commandCenterView.visible up front (createTreeView
@@ -1364,16 +1374,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // takes a source id, and `resolveSourceIdArg` reads it off the argument
     // object), and the `__poll` marker tells it this is the background path, so
     // it stays silent on total failure (the manual command warns instead).
-    // `__armTick` tells refreshStatus which fire this is (review D6): the
-    // not-running → running one has nothing behind it, so if the source is busy
-    // when it lands, the refresh is owed and re-run when the claim clears
-    // instead of waiting a whole period. Routine ticks carry `false` and are
-    // simply skipped, as they always were.
-    fire: (sourceId, { arm }) =>
+    // The command answers with the sources it did NOT refresh — busy with a
+    // sibling command, or missing a declared credential (review D6/E1). This
+    // fire names exactly one source, so that answer is the whole verdict on it,
+    // and the poll uses it to tell a fire that ran from one that was declined.
+    fire: (sourceId) =>
       Promise.resolve(
-        vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true, __armTick: arm })
-      ).then(() => undefined)
+        vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })
+      ).then((outcome) => {
+        const unrefreshed = (outcome as { unrefreshedSourceIds?: unknown })?.unrefreshedSourceIds;
+        // Anything that is not an explicit "did not run for this source" reads
+        // as RAN — the conservative direction, since only a decline defers.
+        return { ran: !(Array.isArray(unrefreshed) && unrefreshed.includes(sourceId)) };
+      })
   });
+  notifyPollSourceSettled = (sourceId) => inventoryStatusPoll.sourceSettled(sourceId);
+  // The other half of the same rule (review E1): a config-level flow — a backup
+  // restore, a complete reset, the one-time poll-setting migration — persists a
+  // source's record before its credentials, so the arm fire it triggers can be
+  // declined for want of a password that arrives moments later, inside the same
+  // locked run. When that queue drains, every armed source that is still owed an
+  // arm fire gets it. No source id: the flow that just finished may have touched
+  // any of them.
+  context.subscriptions.push(configMutationLock.onIdle(() => inventoryStatusPoll.sourceSettled()));
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {

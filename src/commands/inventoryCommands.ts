@@ -92,6 +92,32 @@ export interface InventoryRuntimeTeardown {
   teardownServerRuntime(serverId: string, shouldAbort?: () => boolean): Promise<void>;
 }
 
+/**
+ * What `refreshStatus` reports back about the sources it was asked to refresh
+ * (review D6/E1).
+ */
+export interface InventoryStatusRefreshOutcome {
+  /**
+   * Targeted sources this invocation did NOT refresh and could not have — busy
+   * with a sibling command, or missing a credential the record declares — both
+   * of which somebody else will clear. Everything else is absent: a provider
+   * with no status to give can never be refreshed, and a lab box that answered
+   * with an error was genuinely tried.
+   */
+  unrefreshedSourceIds: string[];
+}
+
+/**
+ * Optional collaborators the inventory commands report runtime facts to.
+ * Everything here is a FACT this layer owns, never a request: what the observer
+ * does with it is the observer's business (see `extension.ts`, where the status
+ * poll uses `onSourceFree` to redeem a declined arm fire).
+ */
+export interface InventoryCommandObservers {
+  /** A source's busy claim has just been released, whatever had held it. */
+  onSourceFree?: (sourceId: string) => void;
+}
+
 function providerMissingMessage(providerId: string): string {
   return `Inventory provider "${providerId}" is not available (the extension providing it may be disabled).`;
 }
@@ -2227,7 +2253,8 @@ export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
   vault: SecretVault,
-  teardown: InventoryRuntimeTeardown
+  teardown: InventoryRuntimeTeardown,
+  observers?: InventoryCommandObservers
 ): vscode.Disposable[] {
   // F4 — shared by all four commands: syncNow holds a source's id for its whole
   // run; editSource/removeSource hold it for their whole run too (they mutate
@@ -2241,53 +2268,27 @@ export function registerInventoryCommands(
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
   /**
-   * REVIEW D6 — sources whose POLL ARM TICK was refused because they were busy,
-   * and which therefore still owe that refresh.
+   * REVIEW D6/E1/E2 — the ONE way a busy claim is dropped, and the one place
+   * that says so.
    *
-   * The arm tick is the poll's not-running → running fire (polling enabled, a
-   * source added, the view shown). It exists because the alternative is sitting
-   * on no status at all for a whole period — up to an hour. `refreshStatus`
-   * skips a source that is mid-sync/edit/remove/control, silently, and the
-   * commonest way to ARM a source is an Edit Source save: that save fires
-   * `core.onDidChange` synchronously while the edit still holds this source's
-   * claim (it is released when the form is disposed), so the arm tick lands
-   * squarely inside the busy window and was simply lost. The scheduler had
-   * armed the timer and believed it had fired; nothing re-evaluated when the
-   * claim cleared. Turning polling on appeared to do nothing.
+   * The poll's arm fire — a source's not-running → running tick — is the fire
+   * with nothing behind it: the source has no status on screen and the next
+   * tick is a whole period away, up to an hour. `refreshStatus` declines a
+   * source that is claimed here, and the commonest way to ARM a source is an
+   * **Edit Source** save, which emits `core.onDidChange` synchronously while
+   * this very claim is held (it is released when the form is disposed). So the
+   * arm fire landed inside the busy window and was lost.
    *
-   * The fix is one piece of state, here, where BOTH facts already live — the
-   * claim, and the knowledge that a refresh was refused. `releaseSourceClaim`
-   * makes good on it the moment the claim clears, so the outcome is
-   * deterministic rather than "some later event will re-evaluate", and it
-   * covers every `SourceBusyReason` because it hooks the release itself rather
-   * than any one command.
-   *
-   * ROUTINE ticks are deliberately NOT owed: another one follows in a period,
-   * and a deferred routine refresh would mean an extra lab crawl after every
-   * sync (which already applies fresh status itself) and every node control
-   * (which fires its own refresh). Only the fire with nothing behind it is
-   * remembered.
-   */
-  const armRefreshOwed = new Set<string>();
-
-  /**
-   * The ONE way a busy claim is dropped (review D6). Releasing is what makes an
-   * owed arm refresh runnable, so the two are the same step — a `delete` that
-   * bypasses this would silently reintroduce the swallow it exists to fix.
-   *
-   * The retry is re-flagged as an arm tick on purpose: if it is itself refused
-   * (another command claimed the source in between) it goes back into the owed
-   * set and runs on THAT release instead. So it self-heals, and it never
-   * retries on a timer.
+   * This layer keeps NO memory of that. It reports two facts it owns — which
+   * sources a refresh did not run for (`refreshStatus`'s return value), and
+   * that a claim has been released (`onSourceFree`) — and the poll, which owns
+   * arming and visibility, owns the debt they feed and decides whether paying
+   * it is still justified. A `delete` that bypassed this funnel would silently
+   * drop the notification for whichever command forgot it.
    */
   const releaseSourceClaim = (sourceId: string): void => {
     inFlightSourceIds.delete(sourceId);
-    if (armRefreshOwed.delete(sourceId)) {
-      // Not awaited: a release happens inside `finally` blocks and dispose
-      // listeners, which must not wait on a lab crawl — the same shape as the
-      // poll's own un-awaited fire.
-      void refreshStatus(sourceId, { manual: false, armTick: true });
-    }
+    observers?.onSourceFree?.(sourceId);
   };
 
   // LIVE STATUS (Phase 2) — monotonic status-refresh generation, PER SOURCE.
@@ -4691,17 +4692,16 @@ export function registerInventoryCommands(
    */
   async function refreshStatus(
     sourceIdArg?: string,
-    options?: {
-      manual?: boolean;
-      /**
-       * This invocation is the poll's ARM tick for `sourceIdArg` — the one fire
-       * that has nothing behind it (review D6). If the busy guard refuses the
-       * source, the refresh is REMEMBERED in `armRefreshOwed` and re-run when
-       * the claim clears, rather than lost until the next period.
-       */
-      armTick?: boolean;
-    }
-  ): Promise<void> {
+    options?: { manual?: boolean }
+  ): Promise<InventoryStatusRefreshOutcome> {
+    // REVIEW D6/E1 — targeted sources this invocation did NOT refresh, AND
+    // could not have: claimed by a sibling command, or missing a credential it
+    // declares. Both are temporary and both are somebody else's to clear, which
+    // is what makes them worth reporting — the caller (the poll) can make good
+    // on a declined arm fire instead of waiting a period. A provider with no
+    // status to give, or a lab box that answered with an error, is NOT here:
+    // the first can never be refreshed and the second was genuinely tried.
+    const unrefreshedSourceIds: string[] = [];
     const targets = sourceIdArg
       ? (() => {
           const source = core.getInventorySource(sourceIdArg);
@@ -4838,13 +4838,10 @@ export function registerInventoryCommands(
         continue;
       }
       if (inFlightSourceIds.get(source.id) !== undefined) {
-        // REVIEW D6 — a refused ARM tick is owed, not lost: `releaseSourceClaim`
-        // runs it as soon as this claim (whatever its reason) clears. Recording
-        // it is all that happens here; racing the operation holding the claim is
-        // exactly what the skip exists to prevent.
-        if (options?.armTick === true) {
-          armRefreshOwed.add(source.id);
-        }
+        // Declined, and SAID so (review D6). Racing the operation holding the
+        // claim is exactly what this skip exists to prevent; reporting it is
+        // what lets the poll redeem a declined arm fire when the claim clears.
+        unrefreshedSourceIds.push(source.id);
         continue; // busy with a sync/edit/remove — skip, don't race it
       }
       const provider = registry.get(source.providerId);
@@ -4878,6 +4875,22 @@ export function registerInventoryCommands(
         // fetchProviderStatus clones source.config internally (so the stored
         // record is never mutated) and degrades every provider failure to
         // undefined; secrets is a fresh local object, safe to pass as-is.
+        // REVIEW E1 — a source whose DECLARED secret the vault cannot supply
+        // cannot authenticate, so the crawl would be a guaranteed auth failure
+        // against the lab box. It is a decline, not a failure: a backup restore
+        // persists the source record BEFORE it restores that credential
+        // (`configCommands.importMergeReplaceLocked` — the record lands with
+        // the other imported buckets, the vault write comes later in the same
+        // locked run), so the arm fire fired at a source that could not
+        // possibly succeed. Reported, not attempted, so the poll can make good
+        // on it when the restore settles. `attempted` still counts it, so a
+        // MANUAL sweep whose only source has an unreadable keychain still warns
+        // exactly as it did when this made a doomed provider call instead.
+        const missingSecretFieldIds = source.secretFieldIds.filter((fieldId) => secrets[fieldId] === undefined);
+        if (missingSecretFieldIds.length > 0) {
+          unrefreshedSourceIds.push(source.id);
+          continue;
+        }
         const report = await fetchProviderStatus(provider, source.config, secrets);
         if (report) {
           // A report (even an empty one) means the source was reachable — count
@@ -5022,6 +5035,7 @@ export function registerInventoryCommands(
     // so it increments `succeeded`, and the warning above requires
     // `succeeded === 0`.
     warnIfTruncated();
+    return { unrefreshedSourceIds };
   }
 
   function manageSources(): void {
@@ -5211,12 +5225,10 @@ export function registerInventoryCommands(
     // is the MANUAL path and warns if every source failed.
     vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => {
       const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
-      // `__armTick` rides the same argument object as `__poll` and carries the
-      // scheduler's own answer to "is this the not-running → running fire?"
-      // (review D6). Only the poll sets it; a manual refresh is never owed,
-      // because the user can see it happen and can click it again.
-      const isArmTick = isPoll && (arg as { __armTick?: unknown }).__armTick === true;
-      return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll, armTick: isArmTick });
+      // Returns its outcome (review D6/E1): the poll reads which sources it did
+      // not refresh off the resolved value, so no extra argument or marker is
+      // needed to tell it apart from a refresh that happened.
+      return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
     }),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources),
     // NODE CONTROL (Phase 4) — gated in package.json to EVE-origin servers by

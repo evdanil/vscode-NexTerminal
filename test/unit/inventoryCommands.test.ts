@@ -8683,7 +8683,9 @@ describe("nexus.inventory.refreshStatus", () => {
     await core.addOrUpdateInventorySource(makeSource());
 
     const applySpy = vi.spyOn(core, "applyInventoryStatus");
-    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+    // Resolves rather than throwing — and names no source: one whose provider
+    // offers no status can never be refreshed, so nothing is deferred for it.
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toEqual({ unrefreshedSourceIds: [] });
     expect(applySpy).not.toHaveBeenCalled();
   });
 
@@ -8702,7 +8704,9 @@ describe("nexus.inventory.refreshStatus", () => {
     await core.addOrUpdateInventorySource(makeSource({ id: "good", name: "Good", config: { host: "ok" } }));
 
     const applySpy = vi.spyOn(core, "applyInventoryStatus");
-    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+    // A lab box that answered with an error was genuinely TRIED, so it is not
+    // named as unrefreshed: there is nothing for a later settle to make good on.
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toEqual({ unrefreshedSourceIds: [] });
 
     // The good source still applied; the throwing one degraded to no update.
     expect(applySpy).toHaveBeenCalledTimes(1);
@@ -8749,87 +8753,173 @@ describe("nexus.inventory.refreshStatus", () => {
   });
 
   /**
-   * REVIEW D6 — the arm fire, swallowed by a busy claim, used to be lost
-   * outright. The sequence the reviewer found: the Command Center is visible,
-   * an Edit Source save turns this source's interval from 0 to a positive
-   * value, and `core.onDidChange` fires SYNCHRONOUSLY from that save — while
-   * the edit still holds the source's `inFlightSourceIds` claim, which it keeps
-   * until the form is disposed. The scheduler's not-running → running fire
-   * therefore lands inside that window, `refreshStatus` skips the source at its
-   * busy check, and the scheduler considers the source armed and already fired.
-   * Releasing the claim triggered no re-evaluation, so the FIRST real refresh
-   * came a whole period later — up to 3600 s. What the user sees is that they
-   * turned polling on and nothing happened.
+   * REVIEW D6/E1/E2 — the arm fire and the sources that decline it.
    *
-   * The wiring below mirrors `extension.ts`'s `fire` (the scheduler is
-   * `vscode`-free, so it is driven here directly) so the whole path is under
-   * test: scheduler arm tick → the real refreshStatus command → busy skip →
-   * claim release.
+   * The scheduler fires once on a source's not-running → running transition,
+   * because a source that has just started polling has no status on screen and
+   * the next tick is a whole period away — up to an hour. `refreshStatus` is
+   * allowed to decline that fire: the source may be claimed in
+   * `inFlightSourceIds` (mid-sync/edit/remove/control), or its credentials may
+   * not be in the vault yet (mid-restore of a backup). Both declines used to be
+   * SILENT, so the arm fire was simply lost.
+   *
+   * The command layer now keeps no memory of any of this. It reports two facts
+   * it owns — which targeted sources did NOT run (`unrefreshedSourceIds`), and
+   * when a busy claim is released (`onSourceFree`) — and the scheduler, which
+   * owns arming, owns the debt those facts feed.
    */
-  describe("a poll arm tick refused by a busy claim", () => {
-    // `vi.clearAllMocks()` clears calls but KEEPS implementations, so the
-    // command routing set up below would otherwise leak into every later test.
+  describe("declining a refresh, and saying so", () => {
     afterEach(() => mockExecuteCommand.mockReset());
 
-    async function armWhileBusy(): Promise<{
-      core: NexusCore;
-      fetchStatus: ReturnType<typeof vi.fn>;
-      poll: { dispose(): void };
-      panel: FakePanel;
-      onSubmit: (values: FormValues) => Promise<void>;
-    }> {
+    it("names a source it skipped because the source is BUSY, and names none on an ordinary run (⊘ a silent skip is indistinguishable from a refresh that happened, so the caller cannot make good on it)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
-      registry.register(
-        makeProvider({
-          fetchStatus,
-          configFields: [
-            { id: "host", label: "Host", type: "string", required: true },
-            { id: "statusPollSeconds", label: "Poll", type: "number", required: false, min: 0, max: 3600, integer: true }
-          ]
-        })
-      );
+      registry.register(makeProvider({ fetchStatus }));
       registerInventoryCommands(core, registry, makeVault(), makeTeardown());
-      // Polling starts OFF for this source, exactly as the field ships.
-      await core.addOrUpdateInventorySource(makeSource({ config: { host: "eve.local" } }));
+      await core.addOrUpdateInventorySource(makeSource());
 
-      // Route refreshStatus to the real command for the whole test, so the
-      // scheduler's fire meets the live busy check rather than a recording mock.
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const busy = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(busy).toEqual({ unrefreshedSourceIds: ["src-1"] });
+      expect(fetchStatus).not.toHaveBeenCalled();
+
+      latestFormCall().panel.fireDispose();
+      const free = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(free).toEqual({ unrefreshedSourceIds: [] });
+      expect(fetchStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it("declines a source whose DECLARED credential is not in the vault — without calling the provider — and names it (⊘ a restore persists the source before its secrets, so the arm fire crawls with no password, fails silently, and counts as spent: the same 'polling does nothing for an hour' by another route)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(makeProvider({ fetchStatus }));
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      // The record declares a secret field; the vault does not hold it yet.
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(outcome).toEqual({ unrefreshedSourceIds: ["src-1"] });
+      expect(fetchStatus).not.toHaveBeenCalled();
+
+      // Once the credential lands the very same call runs, and passes it on.
+      await vault.store(inventorySecretKey("src-1", "apiToken"), "restored-token");
+      const after = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(after).toEqual({ unrefreshedSourceIds: [] });
+      expect(fetchStatus).toHaveBeenCalledWith(expect.anything(), { apiToken: "restored-token" });
+    });
+
+    it("names NO source for a provider that simply has no status to give (⊘ owing a debt for a NetBox source defers a refresh that can never happen, on every settle, forever)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider()); // no fetchStatus
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      await expect(registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" }))
+        .resolves.toEqual({ unrefreshedSourceIds: [] });
+    });
+
+    it("reports a source as free when its claim is released, for EVERY busy reason (⊘ hooking only the edit path leaves the same swallow behind a sync, a remove and a start/stop)", async () => {
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ controlNode: vi.fn(async () => {}), fetchStatus: vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} })) }));
+      const freed: string[] = [];
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), { onSourceFree: (id) => freed.push(id) });
+      await core.addOrUpdateInventorySource(makeSource());
+
+      // edit → released on dispose
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      latestFormCall().panel.fireDispose();
+      await vi.waitFor(() => expect(freed).toEqual(["src-1"]));
+
+      // control → released when the dispatch settles
+      await registeredCommands.get("nexus.inventory.startNode")!({ server });
+      expect(freed).toEqual(["src-1", "src-1"]);
+    });
+  });
+
+  /**
+   * The two ends joined: the real scheduler, wired to the real refreshStatus
+   * command exactly as `extension.ts` wires it, against the real busy claims.
+   */
+  describe("a poll arm fire declined by a busy source", () => {
+    afterEach(() => mockExecuteCommand.mockReset());
+
+    async function wire(core: NexusCore, registry: InventoryProviderRegistry, vault: ReturnType<typeof makeVault>, visible = true): Promise<{
+      poll: ReturnType<typeof startInventoryStatusPoll>;
+      view: { visible: boolean; onDidChangeVisibility: (l: (e: { visible: boolean }) => void) => { dispose(): void } };
+      setVisible: (v: boolean) => void;
+    }> {
+      let listener: ((e: { visible: boolean }) => void) | undefined;
+      const view = {
+        visible,
+        onDidChangeVisibility(l: (e: { visible: boolean }) => void) {
+          listener = l;
+          return { dispose: () => { listener = undefined; } };
+        }
+      };
+      let poll!: ReturnType<typeof startInventoryStatusPoll>;
+      registerInventoryCommands(core, registry, vault, makeTeardown(), { onSourceFree: (id) => poll?.sourceSettled(id) });
+      // Route refreshStatus to the real command, so the fire meets the live
+      // busy check rather than a recording mock.
       mockExecuteCommand.mockImplementation((cmd: string, ...rest: unknown[]) =>
         cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
       );
-
-      const view = { visible: true, onDidChangeVisibility: () => ({ dispose: () => {} }) };
-      const poll = startInventoryStatusPoll({
+      poll = startInventoryStatusPoll({
         view,
         getSources: () =>
           core.getSnapshot().inventorySources.map((source) => ({
             id: source.id,
             intervalSeconds: Number(source.config.statusPollSeconds ?? 0)
           })),
-        onDidChangeSources: (listener) => ({ dispose: core.onDidChange(listener) }),
-        // `mockExecuteCommand` IS what the mocked `vscode.commands.executeCommand`
-        // delegates to, so this is extension.ts's own call with the same argument
-        // object — including the routing above, which makes it run the command.
-        fire: (sourceId, { arm }) =>
-          Promise.resolve(
-            mockExecuteCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true, __armTick: arm })
-          ).then(() => undefined)
+        onDidChangeSources: (l) => ({ dispose: core.onDidChange(l) }),
+        // extension.ts's own fire: the command's outcome names the sources it
+        // did not refresh, and this one names exactly one source.
+        fire: (sourceId) =>
+          Promise.resolve(mockExecuteCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })).then((outcome) => ({
+            ran: !(outcome as { unrefreshedSourceIds?: string[] } | undefined)?.unrefreshedSourceIds?.includes(sourceId)
+          }))
       });
-
-      // The edit claims the source and holds it until the form is disposed.
-      await registeredCommands.get("nexus.inventory.editSource")!();
-      const { panel, onSubmit } = latestFormCall();
-      return { core, fetchStatus, poll, panel, onSubmit };
+      return { poll, view, setVisible: (v: boolean) => { view.visible = v; listener?.({ visible: v }); } };
     }
 
-    it("still refreshes as soon as the claim clears, instead of a whole period later (⊘ losing the swallowed arm tick means turning polling on does nothing visible for up to an hour)", async () => {
-      const { core, fetchStatus, poll, panel, onSubmit } = await armWhileBusy();
+    function pollingProvider(fetchStatus: ReturnType<typeof vi.fn>, extra: Partial<InventoryProvider> = {}): InventoryProvider {
+      return makeProvider({
+        fetchStatus,
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "statusPollSeconds", label: "Poll", type: "number", required: false, min: 0, max: 3600, integer: true }
+        ],
+        ...extra
+      });
+    }
 
-      // Save: 0 → 3600 s. The change event fires from inside the save, with the
-      // edit's claim still held, so the arm tick lands in the busy window.
+    it("still refreshes as soon as the claim clears, instead of a whole period later (⊘ losing the declined arm fire means turning polling on does nothing visible for up to an hour)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(pollingProvider(fetchStatus));
+      const { poll } = await wire(core, registry, makeVault());
+      await core.addOrUpdateInventorySource(makeSource({ config: { host: "eve.local" } }));
+
+      // The edit claims the source and holds it until the form is disposed; its
+      // SAVE fires core.onDidChange synchronously, so the arm fire lands inside
+      // the busy window.
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { panel, onSubmit } = latestFormCall();
       await onSubmit({
         name: "My Source",
         targetFolder: "Labs",
@@ -8839,19 +8929,25 @@ describe("nexus.inventory.refreshStatus", () => {
         cfg_statusPollSeconds: 3600
       });
       expect(core.getInventorySource("src-1")?.config.statusPollSeconds).toBe(3600);
-      // The premise: the arm tick really was refused.
       expect(fetchStatus).not.toHaveBeenCalled();
 
-      // Closing the form releases the claim. No timer is advanced — a period
-      // here would be an hour.
+      // No timer is advanced — a period here would be an hour.
       panel.fireDispose();
-
       await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
       poll.dispose();
     });
 
-    it("does not re-run the refresh a second time when a later claim on the same source is released (⊘ an owed refresh that is never consumed fires again after every sync, edit and node control, for the rest of the session)", async () => {
-      const { fetchStatus, poll, panel, onSubmit } = await armWhileBusy();
+    it("does NOT crawl on release when the panel was hidden while the claim was held (⊘ a debt with no re-validation pays out against the poll's own visible-gating: the user closed the Command Center and a lab crawl runs anyway)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(pollingProvider(fetchStatus));
+      const { poll, setVisible } = await wire(core, registry, makeVault());
+      await core.addOrUpdateInventorySource(makeSource({ config: { host: "eve.local" } }));
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { panel, onSubmit } = latestFormCall();
       await onSubmit({
         name: "My Source",
         targetFolder: "Labs",
@@ -8860,68 +8956,48 @@ describe("nexus.inventory.refreshStatus", () => {
         cfg_host: "eve.local",
         cfg_statusPollSeconds: 3600
       });
+      expect(fetchStatus).not.toHaveBeenCalled();
+
+      // The user closes the Command Center while the operation is still holding
+      // the claim: nothing is armed any more, so nothing is owed any more.
+      setVisible(false);
       panel.fireDispose();
-      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
-
-      // A second, unrelated edit: opened, claimed, closed. Nothing is owed now.
-      await registeredCommands.get("nexus.inventory.editSource")!();
-      latestFormCall().panel.fireDispose();
       await new Promise((resolve) => setTimeout(resolve, 0));
-
-      expect(fetchStatus).toHaveBeenCalledTimes(1);
+      expect(fetchStatus).not.toHaveBeenCalled();
       poll.dispose();
     });
 
-    it("does NOT owe a refused ROUTINE tick — only the arm one (⊘ deferring every skipped tick buys an extra lab crawl after every sync, which has already applied fresh status, and after every node control, which fires its own refresh)", async () => {
+    it("does not crawl on release when polling was turned OFF while the claim was held (⊘ a stale debt re-arms a source whose owner just set its interval to 0)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
-      registry.register(makeProvider({ fetchStatus }));
-      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
-      await core.addOrUpdateInventorySource(makeSource());
+      registry.register(pollingProvider(fetchStatus));
+      const { poll } = await wire(core, registry, makeVault());
+      await core.addOrUpdateInventorySource(makeSource({ config: { host: "eve.local" } }));
 
-      // Busy, and a ROUTINE poll tick lands on it: skipped, and nothing is owed.
       await registeredCommands.get("nexus.inventory.editSource")!();
-      await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1", __poll: true, __armTick: false });
-      expect(fetchStatus).not.toHaveBeenCalled();
+      const first = latestFormCall();
+      await first.onSubmit({
+        name: "My Source",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "eve.local",
+        cfg_statusPollSeconds: 3600
+      });
+      expect(fetchStatus).not.toHaveBeenCalled(); // the arm fire was declined
 
-      latestFormCall().panel.fireDispose();
+      // Polling is turned OFF while that claim is still held — by a writer that
+      // does not go through the form, which is what a settings-level change, the
+      // one-time migration and a config import all are.
+      const live = core.getInventorySource("src-1")!;
+      await core.addOrUpdateInventorySource({ ...live, config: { ...live.config, statusPollSeconds: 0 } });
+
+      first.panel.fireDispose();
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(fetchStatus).not.toHaveBeenCalled();
-    });
-
-    it("makes good on the arm tick after ANY busy reason, not just an open edit form — here a node control holding the claim (⊘ hooking only the edit path leaves the same swallow behind a sync, a remove and a start/stop)", async () => {
-      const server = makeServer({
-        id: "eve-1",
-        name: "R1",
-        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
-      });
-      const core = new NexusCore(new InMemoryConfigRepository([server]));
-      await core.initialize();
-      const registry = new InventoryProviderRegistry();
-      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
-      let releaseControl!: () => void;
-      const controlGate = new Promise<void>((resolve) => (releaseControl = resolve));
-      const controlNode = vi.fn(async () => {
-        await controlGate;
-      });
-      registry.register(makeProvider({ fetchStatus, controlNode }));
-      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
-      await core.addOrUpdateInventorySource(makeSource());
-
-      // Start a control and let it park inside controlNode — the "control" claim
-      // is held for as long as it stays parked.
-      const controlInFlight = registeredCommands.get("nexus.inventory.startNode")!({ server });
-      await vi.waitFor(() => expect(controlNode).toHaveBeenCalledTimes(1));
-
-      // The arm tick arrives mid-control and is refused.
-      await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1", __poll: true, __armTick: true });
-      expect(fetchStatus).not.toHaveBeenCalled();
-
-      releaseControl();
-      await controlInFlight;
-      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalled());
+      poll.dispose();
     });
   });
 

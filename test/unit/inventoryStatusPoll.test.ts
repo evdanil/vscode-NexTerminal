@@ -162,33 +162,203 @@ describe("startInventoryStatusPoll", () => {
   });
 
   /**
-   * REVIEW D6 — the arm fire is the one tick that cannot simply be missed: it
-   * exists because a source that has just started polling (enabled, added, view
-   * shown) has NO status on screen at all, and the alternative to firing now is
-   * waiting a whole period, up to an hour. The refresh it calls is allowed to
-   * REFUSE a source that is mid-sync/edit/remove/control, and the refusal is
-   * silent — so the caller has to be able to tell the arm fire apart from a
-   * routine one in order to make good on it later. The scheduler is the only
-   * layer that knows which tick is which, so it says so.
+   * REVIEW D6/E1/E2 — THE ARM DEBT.
+   *
+   * The arm fire is the one tick that cannot simply be missed: a source that
+   * has just started polling has no status on screen at all, and the next tick
+   * is a whole period away — up to an hour. But the refresh it calls can
+   * legitimately decline to run: the source may be mid-sync/edit/remove/control
+   * (`inFlightSourceIds`), or its credentials may not be in the vault yet
+   * (mid-restore of a backup). A decline that is silently treated as "fired" is
+   * the whole bug.
+   *
+   * So a declined arm fire becomes a DEBT — and the debt is a property of the
+   * ARM STATE, held here, rather than a note kept by the refresh. That is what
+   * gives it a lifecycle: it is created only by a decline, it dies with the
+   * schedule that owns it (interval to 0, source removed, no longer offered,
+   * view hidden), and it is redeemed only against live arm state. A debt cannot
+   * outlive the arming that justified it, and cannot resurrect after it dies.
    */
-  it("marks the not-running → running fire as the ARM tick, and every periodic tick as not (⊘ without it the refresh cannot tell the one fire that must not be lost from the ones another will follow in a period)", () => {
-    const view = makeView(true);
-    const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
-    const fire = vi.fn();
-    startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+  describe("the arm debt", () => {
+    /** A fire that declines everything, as a busy/credential-less refresh does. */
+    const declining = () => vi.fn(async () => ({ ran: false }));
 
-    expect(fire.mock.calls).toEqual([["a", { arm: true }]]);
-    fire.mockClear();
+    it("redeems a DECLINED arm fire when the source settles, and does not touch the schedule's phase (⊘ treating a decline as a fire loses the arm tick entirely: polling appears to do nothing for a whole period)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
+      const fire = declining();
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
-    vi.advanceTimersByTime(90_000);
-    expect(fire.mock.calls).toEqual([["a", { arm: false }], ["a", { arm: false }], ["a", { arm: false }]]);
-    fire.mockClear();
+      expect(firedIds(fire)).toEqual(["a"]);
+      await vi.advanceTimersByTimeAsync(0); // let the decline land
+      fire.mockClear();
 
-    // A hide/show cycle is a fresh not-running → running transition, so that
-    // fire is an arm tick again.
-    view.emit(false);
-    view.emit(true);
-    expect(fire.mock.calls).toEqual([["a", { arm: true }]]);
+      poll.sourceSettled("a");
+      expect(firedIds(fire)).toEqual(["a"]);
+      // The timer is untouched: still one, still on its own period.
+      expect(vi.getTimerCount()).toBe(1);
+    });
+
+    it("keeps owing while the redemption is declined too, and stops the moment one runs (⊘ clearing the debt on a declined retry drops it again, and re-owing on a successful one crawls the lab on every later settle)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
+      let ran = false;
+      const fire = vi.fn(async () => ({ ran }));
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      fire.mockClear();
+
+      // Still declined — still owed.
+      poll.sourceSettled("a");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(1);
+
+      // This one runs, so the debt is paid…
+      ran = true;
+      poll.sourceSettled("a");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      // …and no later settle fires again.
+      poll.sourceSettled("a");
+      poll.sourceSettled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2);
+    });
+
+    it("never owes anything for a fire that RAN, however many settles arrive (⊘ redeeming on settle without a debt turns every sync, edit and node control into an extra lab crawl)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
+      const fire = vi.fn(async () => ({ ran: true }));
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(1);
+
+      poll.sourceSettled("a");
+      poll.sourceSettled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(1);
+    });
+
+    it("treats a fire that reports NOTHING as one that ran — the shape a caller with no outcome to give returns (⊘ reading a void result as a decline owes a debt for every tick and crawls on every settle)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
+      const fire = vi.fn();
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      fire.mockClear();
+
+      poll.sourceSettled("a");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).not.toHaveBeenCalled();
+    });
+
+    it("owes nothing for a declined ROUTINE tick — only the arm one (⊘ deferring every declined tick buys an extra lab crawl after every sync, which has already applied fresh status, and after every node control, which fires its own refresh)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+      let ran = true;
+      const fire = vi.fn(async () => ({ ran }));
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0); // the ARM fire ran
+      ran = false;
+      await vi.advanceTimersByTimeAsync(30_000); // a routine tick — declined
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      poll.sourceSettled("a");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2);
+    });
+
+    it("CANCELS the debt when the view is hidden, and does not resurrect it when the view comes back (⊘ a debt with no cancellation crawls the lab after the user closed the panel — against the poll's own visible-gating — and then a second time on the next settle)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
+      const fire = declining();
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      fire.mockClear();
+
+      view.emit(false); // panel closed — nothing is armed any more
+      poll.sourceSettled("a");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).not.toHaveBeenCalled();
+
+      // Coming back is a fresh not-running → running transition: it fires its OWN
+      // arm tick (one), and the dead debt adds nothing on top.
+      view.emit(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(1);
+    });
+
+    it("CANCELS the debt when the source stops being polled at all — interval 0, removed, or no longer offered (⊘ a stale debt pays out after the user turned polling off, or for a source that is gone)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }, { id: "b", intervalSeconds: 3600 }]);
+      const fire = declining();
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      fire.mockClear();
+
+      // `a` turned off; `b` removed from the list entirely.
+      feed.set([{ id: "a", intervalSeconds: 0 }]);
+      await vi.advanceTimersByTimeAsync(0);
+      poll.sourceSettled("a");
+      poll.sourceSettled("b");
+      poll.sourceSettled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).not.toHaveBeenCalled();
+    });
+
+    it("stays owed when the LATCH swallows the redemption, and pays on the next settle (⊘ counting a tick the latch never dispatched as payment loses the arm fire to a sweep that was already running)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+      const pending = deferred();
+      let call = 0;
+      const fire = vi.fn(() => {
+        call++;
+        if (call === 1) return Promise.resolve({ ran: false }); // arm fire declined → owed
+        if (call === 2) return pending.promise.then(() => ({ ran: true })); // a routine sweep, still running
+        return Promise.resolve({ ran: true });
+      });
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(30_000); // routine tick — now in flight
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      // Settling now cannot dispatch: this source already has a sweep running.
+      poll.sourceSettled("a");
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      // The sweep finishes, and the NEXT settle finds the debt still owed.
+      pending.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      poll.sourceSettled("a");
+      expect(fire).toHaveBeenCalledTimes(3);
+    });
+
+    it("redeems EVERY armed source's debt when settled with no source id — the shape a finished config-level flow reports (⊘ a restore that persists sources before their credentials leaves every one of them waiting a full period)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }, { id: "b", intervalSeconds: 3600 }]);
+      const fire = declining();
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      fire.mockClear();
+
+      poll.sourceSettled();
+      expect(firedIds(fire).sort()).toEqual(["a", "b"]);
+    });
+
+    it("keeps a debt across a mere period change, which re-arms nothing (⊘ dropping it there loses the arm fire for a source the user just re-tuned)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
+      const fire = declining();
+      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      fire.mockClear();
+
+      feed.set([{ id: "a", intervalSeconds: 60 }]);
+      expect(fire).not.toHaveBeenCalled(); // a period change never re-fires by itself
+      poll.sourceSettled("a");
+      expect(firedIds(fire)).toEqual(["a"]);
+    });
   });
 
   it("replaces a source's timer on an interval change WITHOUT a fresh immediate fire (⊘ firing on every config event turns a settings edit into a refresh storm)", () => {

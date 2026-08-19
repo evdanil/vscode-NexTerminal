@@ -138,6 +138,9 @@ import { IMPORTED_CAPABILITY_RESET_NOTICE } from "../../src/models/terminalMacro
 import { SETTINGS_META } from "../../src/ui/settingsMetadata";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { registerInventoryCommands } from "../../src/commands/inventoryCommands";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { startInventoryStatusPoll } from "../../src/services/inventory/inventoryStatusPoll";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
@@ -7170,6 +7173,117 @@ describe("backup export round-trip", () => {
     // replace mode deletes it unconditionally before import runs. A validate-before-strip
     // rejection here is a silent, permanent credential loss.
     expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("backup-token");
+  });
+
+  /**
+   * REVIEW E1 — the arm fire that a RESTORE makes impossible.
+   *
+   * `importMergeReplaceLocked` persists an inventory source's RECORD with the
+   * other imported buckets and writes that source's CREDENTIALS into the vault
+   * much later in the same locked run. `core.addOrUpdateInventorySource` emits
+   * its change event synchronously, so with the Command Center visible the poll
+   * arms the restored source and fires its one arm refresh immediately —
+   * against a source whose password does not exist yet. That refresh used to
+   * fail silently, count as the arm fire, and leave the source waiting a whole
+   * period (up to an hour) for a picture it could have had as soon as the
+   * restore finished. Same user-visible outcome as a swallowed arm tick, by a
+   * different route.
+   *
+   * The refresh now DECLINES a source whose declared credential the vault
+   * cannot supply — reported, not attempted, and no doomed provider call — and
+   * the debt is redeemed when the config-mutation queue drains, which is after
+   * the restore has written the credential.
+   */
+  it("refreshes a restored source's lab status as soon as the restore finishes, not a period later (⊘ firing at a source whose password has not been restored yet spends the arm fire on a silent auth failure)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const vault = new MockVault();
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+    const registry = new InventoryProviderRegistry();
+    registry.register({
+      id: "fake",
+      label: "Fake Provider",
+      configFields: [{ id: "host", label: "Host", type: "string", required: true }],
+      testConnection: async () => {},
+      fetchInventory: async () => ({ contractVersion: 1, devices: [] }) as never,
+      fetchStatus
+    });
+
+    let poll: ReturnType<typeof startInventoryStatusPoll> | undefined;
+    const inventoryDisposables = registerInventoryCommands(
+      core,
+      registry,
+      vault,
+      { teardownServerRuntime: async () => {} },
+      { onSourceFree: (id) => poll?.sourceSettled(id) }
+    );
+    // extension.ts's own wiring, reproduced: the poll fires the real command and
+    // reads which sources it did not refresh off the answer.
+    mockExecuteCommand.mockImplementation((cmd: string, ...rest: unknown[]) =>
+      cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
+    );
+    poll = startInventoryStatusPoll({
+      view: { visible: true, onDidChangeVisibility: () => ({ dispose: () => {} }) },
+      getSources: () =>
+        core.getSnapshot().inventorySources.map((source) => ({
+          id: source.id,
+          intervalSeconds: Number(source.config.statusPollSeconds ?? 0)
+        })),
+      onDidChangeSources: (listener) => ({ dispose: core.onDidChange(listener) }),
+      fire: (sourceId) =>
+        Promise.resolve(mockExecuteCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })).then((outcome) => {
+          const unrefreshed = (outcome as { unrefreshedSourceIds?: unknown })?.unrefreshedSourceIds;
+          return { ran: !(Array.isArray(unrefreshed) && unrefreshed.includes(sourceId)) };
+        })
+    });
+    const idleSub = configMutationLock.onIdle(() => poll?.sourceSettled());
+
+    try {
+      const source = makeInventorySource({
+        id: "src1",
+        providerId: "fake",
+        secretFieldIds: ["apiToken"],
+        // Polling ON, at an interval whose next tick is an hour away.
+        config: { host: "eve.local", statusPollSeconds: 3600 }
+      });
+      const encryptedSecrets = encrypt(JSON.stringify({ inventorySourceSecrets: { src1: { apiToken: "restored-token" } } }), "masterpass1");
+      const importData = {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        inventorySources: [source],
+        encryptedSecrets
+      };
+
+      mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/restore.json", scheme: "file" }]);
+      mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+      mockShowInputBox.mockResolvedValueOnce("masterpass1");
+      mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+      mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+
+      registerConfigCommands(core, vault);
+      await registeredCommands.get("nexus.config.import")!();
+
+      // The credential really did arrive with the restore…
+      expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("restored-token");
+      // …and the refresh happened, WITH it, without any timer being advanced —
+      // a period here would be an hour.
+      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+      expect(fetchStatus).toHaveBeenCalledWith(expect.anything(), { apiToken: "restored-token" });
+    } finally {
+      idleSub.dispose();
+      poll.dispose();
+      for (const d of inventoryDisposables) d.dispose();
+      mockExecuteCommand.mockReset();
+    }
   });
 
   it("merge-mode import does not overwrite a retained source's vault secret with the backup's; a newly-imported source's secret still restores; replace mode restores everything", async () => {
