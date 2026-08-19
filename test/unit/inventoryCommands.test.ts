@@ -9021,6 +9021,152 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
+  /**
+   * PER-SOURCE SUPERSEDE (review H1) — the status-refresh generation is kept PER
+   * SOURCE, never as one global counter.
+   *
+   * A single global counter was sound while the poll issued ONE WHOLE SWEEP at a
+   * time: a superseding sweep always covered everything the superseded one would
+   * have applied, so dropping the older apply lost nothing. Per-source firing
+   * breaks that premise. Each source now ticks on its OWN cadence, so a tick of
+   * source B that starts while source A's crawl is in flight would bump a global
+   * counter and invalidate A's apply — even though the two write disjoint state.
+   * With A at 60 s / 10 s crawl and B at 10 s, EVERY A fetch overlaps a B tick
+   * and A's status would never reach the tree at all: exactly the "one slow lab
+   * box silently suppressed refreshes for every other source" failure that going
+   * per-source was meant to fix, with the roles swapped.
+   */
+  describe("per-source supersede", () => {
+    const deferred = (): { promise: Promise<void>; resolve: () => void } => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => (resolve = r));
+      return { promise, resolve };
+    };
+
+    it("applies a SLOW source's report even though a FAST source polled during its crawl, round after round — the two write disjoint state (⊘ one global refresh generation lets every tick of a 10 s source invalidate a 60 s source's in-flight crawl, so the slow lab's status NEVER applies and nothing warns)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      const ROUNDS = 2;
+      const slowGates = Array.from({ length: ROUNDS }, deferred);
+      const slowParked = Array.from({ length: ROUNDS }, deferred);
+      let slowCalls = 0;
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "slow") {
+          const round = slowCalls++;
+          slowParked[round].resolve();
+          await slowGates[round].promise; // the long lab crawl
+        }
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "slow", name: "Slow Lab", config: { host: "slow" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "fast", name: "Fast Lab", config: { host: "fast" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+
+      // Two full rounds, because "the slow source keeps applying" is the claim —
+      // one lucky apply would not distinguish a fix from a coincidence of timing.
+      for (let round = 0; round < ROUNDS; round++) {
+        const slowTick = cmd({ sourceId: "slow", __poll: true }) as Promise<void>;
+        await slowParked[round].promise;
+        // The fast source's own tick, start to finish, inside the slow crawl.
+        await cmd({ sourceId: "fast", __poll: true });
+        slowGates[round].resolve();
+        await slowTick;
+      }
+
+      expect(slowCalls).toBe(ROUNDS); // the fixture really did overlap both rounds
+      expect(applySpy.mock.calls.filter((c) => c[0] === "slow")).toHaveLength(ROUNDS);
+      expect(applySpy.mock.calls.filter((c) => c[0] === "fast")).toHaveLength(ROUNDS);
+    });
+
+    it("does not let a poll tick for ONE source truncate a running ALL-SOURCES manual refresh — the sweep still reaches the sources it had not got to yet (⊘ a mid-loop bail on a global generation abandons every remaining source, so Refresh Lab Status silently refreshes only the labs it happened to reach first)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let pollTick: Promise<void> | undefined;
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          // A background tick for a source in the MIDDLE of the sweep's list
+          // lands while the sweep is still inside the FIRST source's crawl —
+          // mid-list on purpose, so abandoning the loop there visibly loses the
+          // source that comes AFTER it.
+          pollTick ??= registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "b", __poll: true }) as Promise<void>;
+        }
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "c", name: "Lab C", config: { host: "c" } }));
+
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+      await pollTick;
+
+      expect(pollTick).toBeDefined(); // the fixture really did tick mid-sweep
+      // A and C are the manual sweep's own; B is the tick's, which superseded the
+      // sweep for THAT SOURCE ONLY. Every source ends up with fresh status — and
+      // C, which the sweep had not reached when the tick landed, is the one a
+      // mid-loop bail would silently drop.
+      expect([...applySpy.mock.calls.map((c) => c[0])].sort()).toEqual(["a", "b", "c"]);
+      // B is fetched ONCE, by the tick that claimed it — the sweep does not
+      // re-crawl a lab someone else is already crawling.
+      expect(fetchStatus).toHaveBeenCalledTimes(3);
+    });
+
+    it("still DROPS a superseded report for the SAME source, so an older crawl never repaints over a newer one (⊘ dropping the supersede guard lets a slow first crawl land its stale picture on top of the status the user's newer refresh just applied)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+
+      const externalId = "dev#1";
+      const node: ServerConfig = {
+        id: deterministicServerId("src-1", externalId),
+        name: "node",
+        host: "10.0.0.9",
+        port: 22,
+        username: "admin",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 22 }
+      };
+      await core.addServersBatch([node]);
+
+      const registry = new InventoryProviderRegistry();
+      const oldGate = deferred();
+      const oldParked = deferred();
+      let calls = 0;
+      const fetchStatus = vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) {
+          oldParked.resolve();
+          await oldGate.promise;
+          return { contractVersion: 1 as const, statuses: { [externalId]: { state: "stopped" as const } } };
+        }
+        return { contractVersion: 1 as const, statuses: { [externalId]: { state: "running" as const } } };
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const stale = cmd({ sourceId: "src-1" }) as Promise<void>; // parks mid-crawl
+      await oldParked.promise;
+      await cmd({ sourceId: "src-1" }); // the user refreshes again: node is RUNNING
+      oldGate.resolve();
+      await stale;
+
+      expect(calls).toBe(2); // the fixture really did overlap the two crawls
+      expect(core.getSnapshot().serverStatus.get(node.id)).toBe("running");
+    });
+  });
+
   it("P3-7: the manual refresh does NOT warn when at least one source produced a report", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
@@ -9159,12 +9305,12 @@ describe("nexus.inventory.refreshStatus", () => {
      * got wrong. Silence-on-supersede is correct only while NOTHING was applied.
      * A multi-source sweep can be superseded AFTER an earlier source's truncated
      * report already passed the apply guard: that source's partial status IS on
-     * screen, and the loop-top generation check then `return`s straight past the
-     * post-loop warning, so nothing ever explains it. The superseding sweep is
-     * typically targeted (the node-control path fires one for a single source),
-     * so it does not cover the earlier source either.
+     * screen, and a sweep that abandons its loop on supersede runs straight past
+     * the post-loop warning, so nothing ever explains it. The superseding sweep
+     * is typically targeted (the node-control path fires one for a single
+     * source), so it does not cover the earlier source either.
      */
-    it("STILL warns when the supersede lands AFTER an earlier source's truncated report was APPLIED — that partial status is on screen and nothing else will explain it (\u2298 bailing out of the loop skips the post-loop warning, so a user looking at Lab A's half-finished status is told nothing)", async () => {
+    it("STILL warns when the supersede lands AFTER an earlier source's truncated report was APPLIED — that partial status is on screen and nothing else will explain it (\u2298 abandoning the loop on supersede skips the post-loop warning, so a user looking at Lab A's half-finished status is told nothing)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -9178,9 +9324,9 @@ describe("nexus.inventory.refreshStatus", () => {
       const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
       // Supersede from INSIDE Lab A's apply, which is exactly the real shape:
       // the node-control path fires `void executeCommand("...refreshStatus",
-      // source.id)` un-awaited, and refreshStatus bumps the generation
+      // source.id)` un-awaited, and refreshStatus claims its generations
       // SYNCHRONOUSLY on entry. So gen 1 has already applied Lab A's partial
-      // status when gen 2 starts, and bails at the loop top before Lab B.
+      // status when gen 2 claims Lab B, and skips Lab B at the loop top.
       let superseding: Promise<void> | undefined;
       const applied = core.applyInventoryStatus.bind(core);
       vi.spyOn(core, "applyInventoryStatus").mockImplementation((sourceId, report) => {
@@ -9392,21 +9538,24 @@ describe("nexus.inventory.refreshStatus", () => {
     });
 
     /**
-     * R3 (review), the other half of the bail decision: why the bail is a
-     * `return` and not a `break`. `break` would fall through to the TOTAL-FAILURE
-     * warning, whose `succeeded === 0` is meant to say "every source failed" —
-     * true only of a COMPLETE sweep. On a bail it means merely "every source
-     * tried SO FAR failed", and the sources never reached might all be healthy.
+     * R3 (review), the other half of the bail decision, preserved through the
+     * per-source rework: the TOTAL-FAILURE warning's `succeeded === 0` is meant
+     * to say "every source failed" — a verdict only a COMPLETE sweep can deliver.
+     * Where a source was skipped because a newer invocation claimed it, it means
+     * merely "every source this sweep still owned failed", and the ones it handed
+     * over might all be healthy (they are being refreshed right now by whoever
+     * claimed them). R3 got this by bailing out of the loop entirely; the sweep
+     * now runs on past the skipped source, so the suppression is explicit.
      */
-    it("does NOT fire the total-failure warning from a sweep that bailed on supersede before trying every source (\u2298 a `break` instead of a `return` runs the post-loop total-failure check on a half-finished sweep and reports a total outage from one failed source)", async () => {
+    it("does NOT fire the total-failure warning from a sweep that skipped a superseded source instead of trying every source itself (\u2298 letting a sweep that handed a source over deliver the 'no source answered' verdict reports a total outage from one failed source)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const cmdRef: { fire?: () => Promise<void> } = {};
       let superseding: Promise<void> | undefined;
       // Lab A fails outright (no report \u2014 attempted 1, succeeded 0) and the
-      // supersede lands during its fetch, so gen 1 bails at the loop top before
-      // ever trying Lab B.
+      // supersede lands during its fetch, so gen 1 skips Lab B at the loop top
+      // rather than trying it itself.
       const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
         if (config.host === "a") {
           superseding ??= cmdRef.fire!();
