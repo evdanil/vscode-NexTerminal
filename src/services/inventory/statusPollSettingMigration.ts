@@ -19,7 +19,11 @@ export const RETIRED_STATUS_POLL_KEY = "statusPollSeconds";
  */
 export const STATUS_POLL_MIGRATION_DONE_KEY = "nexus.inventory.statusPollSettingMigrated";
 
-export type StatusPollSettingScope = "global" | "workspace" | "workspaceFolder";
+/**
+ * Only Global. The migration reads and clears exactly one scope — see the
+ * "Global only, in both directions" note on the function below.
+ */
+export type StatusPollSettingScope = "global";
 
 /**
  * The slice of `vscode.ExtensionContext.globalState` this needs — declared
@@ -47,8 +51,12 @@ export interface StatusPollMigrationResult {
  * file. A non-number, `NaN` or `Infinity` degraded to the fallback 0 there, so
  * it degrades to 0 here: that user's poll never ran, and there is nothing to
  * carry.
+ *
+ * Exported because config import carries the same retired key out of an old
+ * export (see `configCommands.applySettings`) and must land the same number on
+ * a source that this would — one coercion rule, not two that can drift.
  */
-function coerceRetiredValue(raw: unknown): number {
+export function coerceRetiredStatusPollSeconds(raw: unknown): number {
   if (typeof raw !== "number" || !Number.isFinite(raw)) {
     return EVE_NG_STATUS_POLL_MIN_SECONDS;
   }
@@ -68,19 +76,38 @@ function coerceRetiredValue(raw: unknown): number {
  *
  * DECISIONS, and why:
  *
- *  - **Every scope, most-specific wins.** `highlightRuleMigration` deliberately
- *    touches Global only, because it REWRITES the content of a live setting and
- *    a workspace file may be shared. This is the opposite case: the key is dead
- *    in every scope, and the value in the scope that was EFFECTIVE is the one
- *    the poll actually used. Reading Global while a Workspace override was in
- *    force would change the user's interval behind their back, and clearing
- *    only Global would leave the dead key exactly where it is most visible.
+ *  - **Global only, in both directions — read AND clear** (review C1), the same
+ *    rule `highlightRuleMigration` follows. An earlier revision read the
+ *    EFFECTIVE scope (workspace over global) on the grounds that it was the
+ *    value the poll actually used. That is true of one window and false of two:
+ *    `configMutationLock` is module-local, `globalState` has no
+ *    compare-and-set, and two windows opening different workspaces for the
+ *    first time can both see the marker absent before either writes it. With a
+ *    per-workspace read they then carry DIFFERENT numbers onto the same,
+ *    machine-wide sources and whichever host committed last decided the
+ *    cadence — a coin toss, and one workspace's preference destroyed by it.
  *
- *  - **Sources are global; the value lands on them regardless of which scope it
- *    came from.** A workspace-scoped interval therefore becomes window-wide.
- *    That is a real change in reach, accepted knowingly: inventory sources have
- *    never been workspace-scoped, so the alternative is not "keep it
- *    workspace-scoped", it is "lose it".
+ *    Reading Global makes the outcome a function of state both windows share:
+ *    the same number, onto the same sources, so the two runs are the same run
+ *    and the order they finish in stops mattering. (The second window's write
+ *    is either skipped by the per-source answered check or is a byte-identical
+ *    rewrite of what the first one stored.) No distributed lock, and nothing
+ *    that has to be right about timing.
+ *
+ *    What that gives up, stated plainly: a WORKSPACE- or FOLDER-scoped override
+ *    is not carried onto the sources. It is not deleted either — the clear is
+ *    Global-only too, so the number stays in the workspace's own
+ *    `settings.json`, flagged by VS Code as an unknown setting, where the user
+ *    can read it and type it into the source's Lab Status Poll Interval field.
+ *    Deleting a value we have decided not to honour is the one outcome with no
+ *    way back, so it is the one thing not done here.
+ *
+ *  - **Sources are global, so the value has to be too.** That is the substantive
+ *    reason the scope narrowing is not merely a race fix: a source is
+ *    machine-wide, and promoting a number scoped to ONE workspace onto it
+ *    changes the cadence in every other window, including workspaces the user
+ *    never set it in. The Global value is the only one that already means "how
+ *    this machine polls".
  *
  *  - **No EVE-NG sources: the key is still cleared, and nothing is applied.**
  *    The setting governed nothing for that user — only EVE-NG sources report
@@ -145,22 +172,20 @@ export async function migrateGlobalStatusPollSetting(
       return { applied: [], cleared: [] };
     }
     const config = vscode.workspace.getConfiguration(RETIRED_STATUS_POLL_SECTION);
-    const inspected = config.inspect<unknown>(RETIRED_STATUS_POLL_KEY);
-    // Least specific first, so the LAST entry is the effective one.
-    const present = [
-      { scope: "global" as const, target: vscode.ConfigurationTarget.Global, value: inspected?.globalValue },
-      { scope: "workspace" as const, target: vscode.ConfigurationTarget.Workspace, value: inspected?.workspaceValue },
-      { scope: "workspaceFolder" as const, target: vscode.ConfigurationTarget.WorkspaceFolder, value: inspected?.workspaceFolderValue }
-    ].filter((entry) => entry.value !== undefined);
+    // GLOBAL ONLY (review C1) — the one scope every window agrees on, which is
+    // what makes two concurrent first activations produce one outcome instead
+    // of a race. A workspace override is deliberately neither read nor cleared;
+    // see the scope note in the doc comment above.
+    const globalValue = config.inspect<unknown>(RETIRED_STATUS_POLL_KEY)?.globalValue;
 
-    if (present.length === 0) {
+    if (globalValue === undefined) {
       // A completed pass with nothing to carry — marked like any other, so a key
       // that reappears in the file afterwards is not migrated behind the user.
       await markMigrated(markers);
       return { applied: [], cleared: [] };
     }
 
-    const seconds = coerceRetiredValue(present[present.length - 1].value);
+    const seconds = coerceRetiredStatusPollSeconds(globalValue);
 
     const applied: string[] = [];
     if (seconds > EVE_NG_STATUS_POLL_MIN_SECONDS) {
@@ -199,16 +224,14 @@ export async function migrateGlobalStatusPollSetting(
     }
 
     const cleared: StatusPollSettingScope[] = [];
-    for (const entry of present) {
-      try {
-        await config.update(RETIRED_STATUS_POLL_KEY, undefined, entry.target);
-        cleared.push(entry.scope);
-      } catch {
-        // Read-only / policy-managed settings, or a file something else owns.
-        // The values are already on the sources and the marker below is what
-        // makes the next activation a no-op, so a dead key left in the file
-        // costs the user nothing but the key itself.
-      }
+    try {
+      await config.update(RETIRED_STATUS_POLL_KEY, undefined, vscode.ConfigurationTarget.Global);
+      cleared.push("global");
+    } catch {
+      // Read-only / policy-managed settings, or a file something else owns.
+      // The values are already on the sources and the marker below is what
+      // makes the next activation a no-op, so a dead key left in the file
+      // costs the user nothing but the key itself.
     }
 
     // LAST, and only on a pass that got this far: everything above either

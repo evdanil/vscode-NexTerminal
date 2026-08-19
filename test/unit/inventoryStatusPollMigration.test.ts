@@ -182,29 +182,75 @@ describe("migrateGlobalStatusPollSetting", () => {
     expect(updateMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, GLOBAL);
   });
 
-  it("preserves a value set in WORKSPACE scope and clears it there, not only in Global (⊘ a Global-only migration silently discards the value of a user who set it per-workspace, and leaves the dead key in the file)", async () => {
-    state.inspected = { workspaceValue: 20 };
-    const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+  /**
+   * REVIEW C1 — SCOPE. The migration used to read whichever scope was
+   * EFFECTIVE (workspace over global). One window at a time, that is the value
+   * the poll actually ran at. Two windows at a time, it is a coin toss: the
+   * durable marker lives in `globalState`, which has no compare-and-set, so two
+   * first activations can both see it absent, and with a per-workspace read
+   * they then carry DIFFERENT numbers onto the SAME machine-wide sources.
+   *
+   * The rule is now Global only, in both directions — read and clear.
+   */
+  describe("the Global-only scope rule", () => {
+    it("carries the GLOBAL value even when a workspace override is in force, and does not clear the workspace one (⊘ reading the effective scope promotes a value scoped to ONE workspace onto machine-wide sources, and clearing it there deletes the only copy of a number the migration declined to honour)", async () => {
+      state.inspected = { globalValue: 45, workspaceValue: 20, workspaceFolderValue: 5 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
 
-    const result = await migrate(core);
+      const result = await migrate(core);
 
-    expect(pollOf(core, "eve-1")).toBe(20);
-    expect(result.cleared).toEqual(["workspace"]);
-    expect(updateMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, WORKSPACE);
-    expect(updateMock).not.toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, GLOBAL);
-  });
+      expect(pollOf(core, "eve-1")).toBe(45);
+      expect(result.cleared).toEqual(["global"]);
+      expect(updateMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, GLOBAL);
+      expect(updateMock).not.toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, WORKSPACE);
+      expect(updateMock).not.toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, WORKSPACE_FOLDER);
+    });
 
-  it("takes the MOST SPECIFIC scope's value — the one the poll actually used — and clears every scope that held the key (⊘ migrating the Global value while a Workspace override was the effective one changes the interval behind the user's back)", async () => {
-    state.inspected = { globalValue: 45, workspaceValue: 20, workspaceFolderValue: 5 };
-    const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+    it("leaves a workspace-ONLY value exactly where the user wrote it — nothing carried, nothing deleted (⊘ clearing a scope whose value is not carried destroys the user's number with no way back; carrying it makes the two-window outcome a race)", async () => {
+      state.inspected = { workspaceValue: 20 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
 
-    const result = await migrate(core);
+      const result = await migrate(core);
 
-    expect(pollOf(core, "eve-1")).toBe(5);
-    expect(result.cleared).toEqual(["global", "workspace", "workspaceFolder"]);
-    expect(updateMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, GLOBAL);
-    expect(updateMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, WORKSPACE);
-    expect(updateMock).toHaveBeenCalledWith(RETIRED_STATUS_POLL_KEY, undefined, WORKSPACE_FOLDER);
+      expect(result).toEqual({ applied: [], cleared: [] });
+      expect(pollOf(core, "eve-1")).toBeUndefined();
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    it("gives two windows activating at once ONE outcome, in either finishing order (⊘ with a per-workspace read each window carries its own override onto the same shared sources and the surviving cadence is whichever extension host committed last)", async () => {
+      // One machine, two windows, two DIFFERENT workspace overrides over the
+      // same Global value. Separate marker stores because that is the premise:
+      // both windows read the durable marker before either had written it.
+      // Separate NexusCore instances over ONE repository, because that is what
+      // two extension hosts are — private in-memory state, one shared store,
+      // last writer wins.
+      async function raceWith(order: Array<{ workspaceValue: number }>): Promise<unknown> {
+        const repo = new InMemoryConfigRepository();
+        const seed = new NexusCore(repo);
+        await seed.initialize();
+        await seed.addOrUpdateInventorySource(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+
+        const windows = await Promise.all(
+          order.map(async () => {
+            const core = new NexusCore(repo);
+            await core.initialize();
+            return core;
+          })
+        );
+        for (let i = 0; i < windows.length; i++) {
+          state.inspected = { globalValue: 45, ...order[i] };
+          await migrate(windows[i], makeMarkerStore());
+        }
+        return (await repo.getInventorySources()).find((s) => s.id === "eve-1")?.config.statusPollSeconds;
+      }
+
+      const aThenB = await raceWith([{ workspaceValue: 20 }, { workspaceValue: 5 }]);
+      const bThenA = await raceWith([{ workspaceValue: 5 }, { workspaceValue: 20 }]);
+
+      expect(aThenB).toBe(45);
+      expect(bThenA).toBe(45);
+      expect(aThenB).toEqual(bThenA);
+    });
   });
 
   it("reproduces the retired setting's OWN coercion: clamped to 0..3600, floored, and anything non-finite read as 0 (⊘ carrying a hand-edited 99999 or NaN straight onto a source stores a value the field itself would refuse)", async () => {
