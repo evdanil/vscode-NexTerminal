@@ -2375,7 +2375,10 @@ describe("activation wiring", () => {
   });
 
   it("imports the EVE-NG factory from the provider module", () => {
-    expect(source).toMatch(/import \{ createEveNgProvider \} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
+    // The import also carries the per-source poll's field reader and provider
+    // id, which is why this matches the members rather than the exact line.
+    expect(source).toMatch(/import \{[^}]*\bcreateEveNgProvider\b[^}]*\} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
+    expect(source).toMatch(/import \{[^}]*\breadEveNgStatusPollSeconds\b[^}]*\} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
   });
 });
 
