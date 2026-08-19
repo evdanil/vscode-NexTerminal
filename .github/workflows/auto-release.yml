@@ -1,23 +1,32 @@
-# Releases automatically when a version bump lands on main.
+# Releases ONLY when a merge explicitly opts in.
 #
-# On every push to main this workflow compares package.json's version against
-# the previous commit. If the version changed, it creates the v{version} tag
-# and runs the full release pipeline (VSIX build + GitHub Release + VS Code
+# Version bumps are routine — every change PR carries one — so a version change
+# is NOT a release signal on its own. This workflow releases only when the merge
+# (squash) commit message contains "[release]". It then creates the v{version}
+# tag and runs the full pipeline (VSIX build + GitHub Release + VS Code
 # Marketplace, and Open VSX) by CALLING release.yml and publish-openvsx.yml
 # directly. Calling them is deliberate, not a convenience: tags pushed with the
 # workflow's own GITHUB_TOKEN do not trigger other workflows (a GitHub
 # safeguard against recursive Actions), so the tag alone would release nothing.
 #
-# ESCAPE HATCHES — three ways a merge to main does NOT release:
-#   1. Don't bump the version. Docs/CI-only merges release nothing.
-#   2. Put "[skip release]" anywhere in the merge (squash) commit message —
-#      the version bump lands, the tag is NOT created, nothing publishes.
-#      Releasing later = push the tag manually (tag push still triggers the
-#      release workflows exactly as before this workflow existed).
-#   3. The tag already exists (e.g. pushed manually first) — no-op.
+# WHY OPT-IN RATHER THAN OPT-OUT. This was previously the inverse: a version
+# change released unless the merge said "[skip release]". That default is unsafe
+# once every change PR bumps the version, because the failure mode of forgetting
+# the marker is publishing to two public registries immediately and
+# irreversibly — a version cannot be unpublished or re-used. With opt-in, the
+# failure mode of forgetting the marker is that nothing happens and you merge
+# again, or push the tag by hand. The safe outcome is the default one.
 #
-# Manual tag pushes keep working unchanged; this workflow only automates the
-# "merge a version-bumped PR" path.
+# TO RELEASE, either:
+#   1. Put "[release]" in the merge (squash) commit message, or
+#   2. Push the v{version} tag yourself — tag pushes trigger release.yml and
+#      publish-openvsx.yml directly, exactly as they did before this workflow
+#      existed.
+#
+# A release still requires the version to have CHANGED on this push: the tag
+# for an unchanged version already exists, and no version may be published
+# twice. Merging a bumped PR without "[release]" lands the version on main and
+# publishes nothing; releasing it later is a manual tag push.
 
 name: Auto Release
 
@@ -60,16 +69,20 @@ jobs:
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
           tag="v$version"
-          release=true
-          reason="version bumped to $version"
+          release=false
+          reason="no [release] marker in the head commit message"
 
-          # Escape hatch 2: explicit opt-out in the merge commit message.
-          if grep -qiF '[skip release]' <<<"$HEAD_MSG"; then
-            release=false
-            reason="head commit message contains [skip release]"
+          # THE OPT-IN. Nothing releases without this marker. Note it cannot be
+          # matched by the retired "[skip release]" opt-out: that string does
+          # not contain "[release]" as a substring, so an old merge message
+          # phrased the previous way still releases nothing.
+          if grep -qiF '[release]' <<<"$HEAD_MSG"; then
+            release=true
+            reason="head commit message contains [release]"
           fi
 
-          # Escape hatch 1: no version change since the pushed range's base.
+          # A release still requires a NEW version: the tag for an unchanged
+          # one already exists, and no version may be published twice.
           if [ "$release" = true ]; then
             base="$BASE_SHA"
             if [ -z "$base" ] \
@@ -87,7 +100,7 @@ jobs:
             fi
           fi
 
-          # Escape hatch 3: the tag already exists (manual release beat us).
+          # The tag already exists (a manual release beat us).
           if [ "$release" = true ] \
             && git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
             release=false
