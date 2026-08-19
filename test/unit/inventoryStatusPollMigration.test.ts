@@ -354,6 +354,42 @@ describe("migrateGlobalStatusPollSetting", () => {
   });
 
   /**
+   * ORDERING — apply first, clear second. Neither order can lose the value in
+   * the ordinary case, but only this one cannot lose it when a step FAILS: the
+   * retired key in `settings.json` is the sole remaining copy of the user's
+   * interval until a source actually holds it, so clearing first and then
+   * failing the source write destroys it outright — gone from settings and
+   * never written anywhere else. The module's doc comment spends a paragraph on
+   * this; nothing pinned it.
+   */
+  describe("the apply-then-clear ordering", () => {
+    it("has already carried the value onto the sources by the time it clears the key (⊘ clearing first leaves a window where the value exists nowhere)", async () => {
+      state.inspected = { globalValue: 45 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+      let pollAtClearTime: unknown = "never cleared";
+      state.updateImpl = async () => {
+        pollAtClearTime = pollOf(core, "eve-1");
+      };
+
+      await migrate(core);
+
+      expect(pollAtClearTime).toBe(45);
+    });
+
+    it("does NOT clear the key when the carry FAILED, so the retry still has something to read (⊘ clearing first and then failing the source write loses the user's interval permanently — out of settings.json and never onto a source)", async () => {
+      state.inspected = { globalValue: 45 };
+      const core = await coreWith(makeSource("eve-1", EVE_NG_PROVIDER_ID));
+      vi.spyOn(core, "addOrUpdateInventorySource").mockRejectedValueOnce(new Error("storage full"));
+
+      const result = await migrate(core);
+
+      expect(result).toEqual({ applied: [], cleared: [] });
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(pollOf(core, "eve-1")).toBeUndefined();
+    });
+  });
+
+  /**
    * The candidate list is computed from a snapshot taken OUTSIDE
    * `configMutationLock`, so by the time the migration's own locked section
    * runs, a lock-holding writer — a replace-mode config import, a complete
