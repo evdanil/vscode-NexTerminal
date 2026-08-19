@@ -313,13 +313,29 @@ describe("formDefinitions keyPath visibility", () => {
     const localShell = unifiedProfileFormDefinition({ addMode: "localShell" });
 
     expect(generic.title).toBe("Add Profile");
-    expect(ssh.title).toBe("Add SSH Server Profile");
+    expect(ssh.title).toBe("Add Network Device Profile");
     expect(serial.title).toBe("Add Serial Profile");
     expect(localShell.title).toBe("Add Local Shell Profile");
     expect(unifiedProfileFormId()).toBe("profile-add");
     expect(unifiedProfileFormId({ addMode: "ssh" })).toBe("server-add");
     expect(unifiedProfileFormId({ addMode: "serial" })).toBe("serial-add");
     expect(unifiedProfileFormId({ addMode: "localShell" })).toBe("local-shell-add");
+  });
+
+  /**
+   * The profile the "ssh" entry point creates has carried a Protocol selector
+   * (SSH / Telnet) since telnet support landed, so "SSH Server Profile" names
+   * only half of what the form makes. The select option keeps the SHORT form —
+   * it sits beside "Serial Profile" / "Local Shell Profile", and the Protocol
+   * selector is two fields below it, so the transports need no restating here.
+   */
+  it("calls the SSH/telnet profile a Network Device Profile in the type selector (\u2298 \"SSH Server Profile\" names one of the two protocols the form offers)", () => {
+    const profileType = keyedField(unifiedProfileFormDefinition(), "profileType");
+    expect(profileType).toMatchObject({ type: "select" });
+    if (profileType.type === "select") {
+      expect(profileType.options).toContainEqual({ label: "Network Device Profile", value: "ssh" });
+      expect(profileType.options.map((o) => o.label)).not.toContain("SSH Server Profile");
+    }
   });
 
   it("locks the profile type selector for explicit SSH, serial, and local shell add forms", () => {

@@ -1230,7 +1230,14 @@ export function unifiedProfileFormId(seed?: UnifiedProfileSeed): string {
 function unifiedProfileFormTitle(seed?: UnifiedProfileSeed): string {
   switch (normalizedUnifiedProfileMode(seed)) {
     case "ssh":
-      return "Add SSH Server Profile";
+      // NETWORK DEVICE PROFILE — this entry point creates a profile with a
+      // Protocol selector (SSH / Telnet), so naming it after one of the two
+      // was stale the moment telnet landed. The form title stays SHORT: the
+      // Protocol field is visible a few rows down and restates the choice.
+      // The `nexus.server.add` COMMAND title carries the "(SSH / Telnet)"
+      // parenthetical instead, where nothing else is on screen to say it and
+      // Command Palette matching runs on the title text.
+      return "Add Network Device Profile";
     case "serial":
       return "Add Serial Profile";
     case "localShell":
@@ -1260,7 +1267,7 @@ function unifiedProfileTypeField(seed?: UnifiedProfileSeed): FormFieldDescriptor
     key: "profileType",
     label: "Profile Type",
     options: [
-      { label: "SSH Server Profile", value: "ssh" },
+      { label: "Network Device Profile", value: "ssh" },
       { label: "Serial Profile", value: "serial" },
       { label: "Local Shell Profile", value: "localShell" }
     ],

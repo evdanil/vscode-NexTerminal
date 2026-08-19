@@ -339,6 +339,25 @@ describe("package contributions", () => {
     expect(settings).toContain("[Import…](command:nexus.config.import)");
   });
 
+  /**
+   * NETWORK DEVICE PROFILE — `nexus.server.add` creates a profile whose form
+   * carries a Protocol selector (SSH / Telnet), so a title naming only SSH is
+   * stale. The rename costs Command Palette discoverability, because VS Code
+   * matches palette entries on the TITLE text: "Add Network Device Profile"
+   * alone answers neither "ssh" nor "telnet". The parenthetical is what buys
+   * both back, and is the reason this is pinned rather than left to taste.
+   */
+  it("titles nexus.server.add for both protocols it can create, keeping \"ssh\" and \"telnet\" palette-searchable (\u2298 a bare rename makes a user typing \"ssh\" unable to find the command at all)", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.server.add");
+    expect(command?.title).toBe("Add Network Device Profile (SSH / Telnet)");
+    expect(command?.title?.toLowerCase()).toContain("ssh");
+    expect(command?.title?.toLowerCase()).toContain("telnet");
+
+    const welcome = packageJson.contributes.viewsWelcome?.find((item) => item.view === "nexusCommandCenter")?.contents ?? "";
+    expect(welcome).toContain("[Add Network Device Profile (SSH / Telnet)](command:nexus.server.add)");
+    expect(welcome).not.toContain("Add SSH Server Profile");
+  });
+
   it("links the unified importer — not the old inventory-only deep link — from the empty Command Center welcome view, second after Add Profile", () => {
     const welcome = packageJson.contributes.viewsWelcome ?? [];
     const hub = welcome.find((item) => item.view === "nexusCommandCenter");
