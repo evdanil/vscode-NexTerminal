@@ -1,32 +1,46 @@
 # Releases ONLY when a merge explicitly opts in.
 #
 # Version bumps are routine — every change PR carries one — so a version change
-# is NOT a release signal on its own. This workflow releases only when the merge
-# (squash) commit message contains "[release]". It then creates the v{version}
-# tag and runs the full pipeline (VSIX build + GitHub Release + VS Code
-# Marketplace, and Open VSX) by CALLING release.yml and publish-openvsx.yml
-# directly. Calling them is deliberate, not a convenience: tags pushed with the
-# workflow's own GITHUB_TOKEN do not trigger other workflows (a GitHub
-# safeguard against recursive Actions), so the tag alone would release nothing.
+# is NOT a release signal, and is not consulted here at all. This workflow
+# releases when the head commit message of a push to main carries the marker
+# `[release]` on a LINE OF ITS OWN. It then creates the v{version} tag and runs
+# the full pipeline (VSIX build + GitHub Release + VS Code Marketplace, and Open
+# VSX) by CALLING release.yml and publish-openvsx.yml directly. Calling them is
+# deliberate, not a convenience: tags pushed with the workflow's own
+# GITHUB_TOKEN do not trigger other workflows (a GitHub safeguard against
+# recursive Actions), so the tag alone would release nothing.
 #
 # WHY OPT-IN RATHER THAN OPT-OUT. This was previously the inverse: a version
-# change released unless the merge said "[skip release]". That default is unsafe
-# once every change PR bumps the version, because the failure mode of forgetting
-# the marker is publishing to two public registries immediately and
-# irreversibly — a version cannot be unpublished or re-used. With opt-in, the
-# failure mode of forgetting the marker is that nothing happens and you merge
-# again, or push the tag by hand. The safe outcome is the default one.
+# change released unless the merge said so. That default is unsafe once every
+# change PR bumps the version, because the failure mode of forgetting the marker
+# is publishing to two public registries immediately and irreversibly — a
+# version cannot be unpublished or re-used. With opt-in, the failure mode of
+# forgetting the marker is that nothing happens and you merge again, or push the
+# tag by hand. The safe outcome is the default one.
 #
 # TO RELEASE, either:
-#   1. Put "[release]" in the merge (squash) commit message, or
+#   1. Put `[release]` on a LINE OF ITS OWN in the merge (squash) commit
+#      message — its own line in the body, not appended to the PR title and not
+#      as a bullet, both of which are deliberately not matched; or
 #   2. Push the v{version} tag yourself — tag pushes trigger release.yml and
 #      publish-openvsx.yml directly, exactly as they did before this workflow
 #      existed.
 #
-# A release still requires the version to have CHANGED on this push: the tag
-# for an unchanged version already exists, and no version may be published
-# twice. Merging a bumped PR without "[release]" lands the version on main and
-# publishes nothing; releasing it later is a manual tag push.
+# NEVER WRITE A BARE `[release]` LINE IN A BRANCH COMMIT MESSAGE. GitHub composes
+# a squash body out of the branch's commit messages, and while each SUBJECT is
+# bulleted (`* subject`, which this does not match), body lines are carried over
+# verbatim — so a body line that is exactly the marker becomes a marker line in
+# the merge commit. Mention releasing in prose if you must; never on its own
+# line.
+#
+# THE VERSION IS NOT A GATE. An earlier revision also required package.json's
+# version to have CHANGED on the push. That made sense under the opt-out model,
+# where every push was a release candidate. Under opt-in it only ever refused a
+# release somebody had explicitly asked for: a version that lands on main
+# unmarked, and is marked for release by a later docs-only merge, has no tag
+# yet, has never been published, and is exactly what the maintainer is asking to
+# ship. Publishing a version twice is prevented where it actually happens — the
+# tag check below, and the atomic tag push in the `tag` job.
 
 name: Auto Release
 
@@ -40,13 +54,13 @@ permissions:
   actions: write
 
 # DELIBERATELY NO concurrency group. GitHub keeps at most ONE pending run per
-# group, so a version-bump run queued behind an active release could be
-# replaced (canceled) by a later docs-only push — and because the decision
-# below compares each push against its own base, the replaced push's version
-# would then never release. Correctness here relies on every push run being
-# allowed to complete. Races between simultaneous runs are serialized by the
-# tag push itself instead: a git ref creation is atomic server-side, so the
-# loser sees the tag exist and skips the release jobs (see the tag job).
+# group, so a marked run queued behind an active release could be replaced
+# (canceled) by a later unmarked push — and the marker lives on that push's own
+# head commit, which no later run will ever see again, so the release it asked
+# for would simply never happen. Correctness here relies on every push run being
+# allowed to complete. Races between simultaneous runs are serialized by the tag
+# push itself instead: a git ref creation is atomic server-side, so the loser
+# sees the tag exist and skips the release jobs (see the tag job).
 
 jobs:
   decide:
@@ -55,15 +69,18 @@ jobs:
       release: ${{ steps.decide.outputs.release }}
       tag: ${{ steps.decide.outputs.tag }}
     steps:
+      # Shallow is enough: nothing here reads history — only package.json at
+      # HEAD, the head commit's message (from the event payload), and the
+      # remote's tags.
       - uses: actions/checkout@v4
-        with:
-          # Full history: the base of a multi-commit push may not be HEAD^.
-          fetch-depth: 0
 
       - name: Decide whether this push releases
         id: decide
         env:
-          BASE_SHA: ${{ github.event.before }}
+          # From the event payload, never interpolated into the script body — a
+          # commit message is attacker-influenced text and must reach the shell
+          # as data. Empty (no head_commit, e.g. a push with nothing new) simply
+          # fails the match, which is the safe direction.
           HEAD_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
@@ -79,33 +96,25 @@ jobs:
           # make impossible; prose about releasing must never be able to
           # release. A whole-line match makes the marker a deliberate act that
           # cannot be produced by discussing one. Surrounding whitespace (and a
-          # CR from a CRLF message) is tolerated; nothing else on the line is.
-          # This also cannot be matched by the retired "[skip release]" opt-out.
-          if grep -qiE '^[[:space:]]*\[release\][[:space:]]*$' <<<"$HEAD_MSG"; then
+          # CR from a CRLF message) is tolerated; nothing else on the line is —
+          # a bulleted "* [release]", which is how GitHub renders a branch
+          # commit SUBJECT into a squash body, is not a match.
+          #
+          # CASE-SENSITIVE, deliberately. The documented contract (CLAUDE.md) is
+          # a line that is exactly `[release]`, and this is what makes that
+          # true rather than approximately true. The cost of the stricter read
+          # is a merge that has to be repeated or a tag pushed by hand; the cost
+          # of the looser one is a publication that cannot be taken back, and
+          # this workflow resolves that trade the same way everywhere.
+          if grep -qE '^[[:space:]]*\[release\][[:space:]]*$' <<<"$HEAD_MSG"; then
             release=true
-            reason="head commit message contains [release]"
+            reason="head commit message carries the [release] marker on its own line"
           fi
 
-          # A release still requires a NEW version: the tag for an unchanged
-          # one already exists, and no version may be published twice.
-          if [ "$release" = true ]; then
-            base="$BASE_SHA"
-            if [ -z "$base" ] \
-              || [ "$base" = "0000000000000000000000000000000000000000" ] \
-              || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-              base=$(git rev-parse -q --verify HEAD^ || true)
-            fi
-            if [ -n "$base" ]; then
-              prev=$(git show "$base:package.json" \
-                | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
-              if [ "$prev" = "$version" ]; then
-                release=false
-                reason="version unchanged ($version)"
-              fi
-            fi
-          fi
-
-          # The tag already exists (a manual release beat us).
+          # The tag already exists (a manual release beat us). THE ONLY
+          # version-level gate, and the only one needed: it is the condition
+          # that actually means "this version has been published", where a
+          # version that merely did not change on this push does not.
           if [ "$release" = true ] \
             && git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
             release=false
