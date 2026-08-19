@@ -768,11 +768,11 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
  * purpose is to detect a DIFFERENT provider answering to the SAME id; hashing
  * the id would make every mismatch invisible). It also excludes every field
  * member that describes HOW a value is entered rather than WHAT the source is
- * configured with — `advanced`, `defaultValue`, `min`/`max` — each documented
- * at its declaration above and each PINNED by a test, because an unpinned
- * exclusion here is a latent re-prompt-every-user bug: this hash gates a modal
- * asking the user to re-confirm handing a re-registered provider their saved
- * credentials. No `vscode` import — callable from models/ and safe for both the
+ * configured with — `advanced`, `defaultValue`, `min`/`max`, `integer`,
+ * `placeholder` — each documented at its declaration above and each
+ * constraint among them PINNED by a test, because an unpinned exclusion here is
+ * a latent re-prompt-every-user bug: this hash gates a modal asking the user to
+ * re-confirm handing a re-registered provider their saved credentials. No `vscode` import — callable from models/ and safe for both the
  * command layer and tests.
  *
  * sha256, hex-encoded, truncated to the first 16 characters — this is a
