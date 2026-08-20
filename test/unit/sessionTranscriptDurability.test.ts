@@ -105,6 +105,118 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Wait (bounded) until the writer has no work in motion: no flush timer
+ * armed, no drain running or queued on the chain, and no append inside
+ * `fs.write`. This is the deterministic form of "the 250 ms timer drain has
+ * run to completion", which the bare `sleep(400)`s only approximated — under
+ * load a late timer turned the approximation into a spurious failure. It
+ * reads scheduling state only, never the byte counts the assertions are
+ * about, so it cannot mask a wrong outcome: a drain that drops, misplaces,
+ * or miscounts bytes still settles, and the assertions that follow see the
+ * wrong bytes. Gives up after the deadline instead of throwing, so a writer
+ * that genuinely never settles still fails on the real assertion's diff.
+ */
+async function drainSettled(transcript: SessionTranscript): Promise<void> {
+  const t = transcript as unknown as {
+    flushTimer?: unknown;
+    draining: boolean;
+    drainQueued: boolean;
+    inFlight: Buffer;
+  };
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (t.flushTimer === undefined && !t.draining && !t.drainQueued && t.inFlight.length === 0) {
+      return;
+    }
+    await sleep(5);
+  }
+}
+
+/**
+ * {@link drainSettled}, plus every stage empty: the writer has nothing left
+ * to do and nothing left to hold. This is the only sound synchronization
+ * point for comparing `currentSize` against the file: bytes appear on disk
+ * one event-loop phase before the drain's callback adds them to
+ * `currentSize` (timers run before I/O callbacks within a loop turn), so a
+ * poll watching the file alone can observe the final content while the
+ * accounting is still one callback behind — measured at 3 in 500 tries, and
+ * exactly the intermittent `currentSize` failures this file used to produce.
+ * Like {@link drainSettled} it reads scheduling state and emptiness, never
+ * the values under test, and gives up after the deadline rather than
+ * throwing.
+ */
+async function writerIdle(transcript: SessionTranscript): Promise<void> {
+  const t = transcript as unknown as {
+    flushTimer?: unknown;
+    draining: boolean;
+    drainQueued: boolean;
+    inFlight: Buffer;
+    owed: Buffer;
+    pending: Buffer[];
+  };
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (
+      t.flushTimer === undefined &&
+      !t.draining &&
+      !t.drainQueued &&
+      t.inFlight.length === 0 &&
+      t.owed.length === 0 &&
+      t.pending.length === 0
+    ) {
+      return;
+    }
+    await sleep(5);
+  }
+}
+
+/**
+ * Wait (bounded) for the deferring stub to have parked at least `count`
+ * writes — the deterministic form of "the timer drain has started and is now
+ * wedged mid-syscall". Gives up after the deadline; the `expect` that
+ * follows each call still makes the claim.
+ */
+async function parkedCount(count: number): Promise<void> {
+  for (let attempt = 0; attempt < 400 && parked.length < count; attempt += 1) {
+    await sleep(5);
+  }
+}
+
+/**
+ * Wait until a closed transcript has finished everything it will ever do —
+ * chained drains, close retries, the descriptor handed back. Cleanup used to
+ * give this two macrotask turns and move on, which was the root cause of
+ * this file's wandering intermittent failures: a drain that `close()` had
+ * chained behind a released write (the 64 MiB backlog fixture most of all)
+ * kept running into the NEXT test, and because `node:fs` is mocked at module
+ * level, its `fs.write` calls were handed to that test's freshly armed stub
+ * — consuming a one-shot fault, or parking forever in a deferring stub —
+ * observed directly as the previous test's fd draining through the next
+ * test's short-write stub. `fd === NO_FD` is the writer's own signal that
+ * `finishClose`/`abandonTail` ran to completion, and with the hooks already
+ * reset to the real fs there is no path that keeps it open, so a timeout
+ * here is a loud bug, not a flake.
+ */
+async function fullyClosed(transcript: SessionTranscript): Promise<void> {
+  const t = transcript as unknown as {
+    fd?: number;
+    draining?: boolean;
+    drainQueued?: boolean;
+    inFlight?: Buffer;
+  };
+  if (typeof t.fd !== "number") {
+    return; // a NOOP transcript holds nothing
+  }
+  for (let attempt = 0; attempt < 1600; attempt += 1) {
+    if (t.fd === -1 && !t.draining && !t.drainQueued && (t.inFlight?.length ?? 0) === 0) {
+      return;
+    }
+    await sleep(5);
+  }
+  throw new Error(
+    "transcript still active after close() in cleanup — it would contaminate the next test's fs stubs"
+  );
+}
+
 function transcriptPath(dir: string, prefix: string): string {
   const name = readdirSync(dir).find((entry) => entry.startsWith(prefix) && entry.endsWith(".log"));
   if (!name) {
@@ -228,11 +340,16 @@ afterEach(async () => {
     write.fail(new Error("released by test cleanup"));
   }
   await sleep(0);
-  for (const transcript of openTranscripts.splice(0, openTranscripts.length)) {
+  const transcripts = openTranscripts.splice(0, openTranscripts.length);
+  for (const transcript of transcripts) {
     transcript.close();
   }
-  await sleep(0);
-  await sleep(0);
+  // Wait for each transcript to actually finish — close() only *starts* the
+  // teardown when a drain is in flight, and a drain that outlives this hook
+  // keeps calling the mocked fs.write into the next test's stubs.
+  for (const transcript of transcripts) {
+    await fullyClosed(transcript);
+  }
   for (const dir of tempDirs.splice(0, tempDirs.length)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -266,12 +383,12 @@ describe("session transcript failure paths", () => {
     for (const line of lines) {
       transcript.write(line);
     }
-    await sleep(400); // timer drain — fails on the first batch
+    await drainSettled(transcript); // timer drain — fails on the first batch
     expect(failed).toBe(true);
 
     // A later write pulls the retained batches out with it.
     transcript.write("chunk-024 pay\n");
-    await sleep(400);
+    await writerIdle(transcript);
 
     const text = allTranscriptText(dir, "retry_");
     const order = [...text.matchAll(/chunk-(\d{3})/g)].map((match) => Number(match[1]));
@@ -314,9 +431,10 @@ describe("session transcript failure paths", () => {
 
     const file = transcriptPath(dir, "short_");
     const expectedTail = lines.join("");
-    for (let attempt = 0; attempt < 100 && !readFileSync(file, "utf8").endsWith(expectedTail); attempt += 1) {
-      await sleep(20);
-    }
+    // Wait for the writer, not the file: the bytes are visible on disk one
+    // event-loop phase before the write callback advances `currentSize`, so
+    // a content poll can win the race and read stale accounting below.
+    await writerIdle(transcript);
 
     const text = readFileSync(file, "utf8");
     expect(text).toContain("--- Session started");
@@ -343,7 +461,7 @@ describe("session transcript failure paths", () => {
     hooks.write = deferringWrite(1);
 
     transcript.write("alpha\n");
-    await sleep(400); // timer drain starts and parks inside fs.write
+    await parkedCount(1); // timer drain starts and parks inside fs.write
     expect(parked).toHaveLength(1);
 
     // The tail a PTY writes between the drain starting and teardown.
@@ -419,14 +537,14 @@ describe("session transcript failure paths", () => {
     for (const line of lines) {
       transcript.write(line);
     }
-    await sleep(400); // timer drain — the rotation's open fails
+    await drainSettled(transcript); // timer drain — the rotation's open fails
     expect(openFailures).toBe(1); // non-vacuous: a rotation really did break
 
     // A later write drives the retry that has to recover the descriptor.
     transcript.write("chunk-024 pay\n");
-    await sleep(400);
+    await drainSettled(transcript);
     transcript.flush?.();
-    await sleep(50);
+    await writerIdle(transcript);
 
     // The fd-reuse hazard: the failed rotation must not leave a stale number
     // behind for a later close to hand back to the OS. Checked first — a
@@ -549,7 +667,7 @@ describe("session transcript failure paths", () => {
     transcript.write(`HEAD-MARKER${"a".repeat(1024 * 1024 - 11)}`);
     transcript.write("b".repeat(1024 * 1024));
     transcript.write(`${"c".repeat(1024 * 1024 - 11)}TAIL-MARKER`);
-    await sleep(400); // timer drain — the write fails
+    await drainSettled(transcript); // timer drain — the write fails
 
     // Non-vacuous: the fd really did refuse, so nothing left memory through
     // the file — and the admission cap shed two thirds of the 3 MiB as it
@@ -570,12 +688,9 @@ describe("session transcript failure paths", () => {
     transcript.flush?.();
     transcript.write("after the drop\n");
     const file = transcriptPath(dir, "cap_");
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (readFileSync(file, "utf8").endsWith("after the drop\n")) {
-        break;
-      }
-      await sleep(20);
-    }
+    // Wait for the writer, not the file — see D2: a content poll can observe
+    // the landed bytes one phase before `currentSize` counts them.
+    await writerIdle(transcript);
 
     const text = readFileSync(file, "utf8");
     expect(text.endsWith("after the drop\n")).toBe(true);
@@ -602,7 +717,7 @@ describe("session transcript failure paths", () => {
 
     // Land a first drain so the live file has content worth not shifting away.
     transcript.write("PRECIOUS\n");
-    await sleep(400);
+    await writerIdle(transcript);
     const file = transcriptPath(dir, "rotcap_");
     expect(readFileSync(file, "utf8")).toContain("PRECIOUS");
 
@@ -617,7 +732,7 @@ describe("session transcript failure paths", () => {
     // really holds: no rotation, because the shed bytes never filled it.
     transcript.write("a".repeat(1536 * 1024));
     transcript.write("b".repeat(1024 * 1024));
-    await sleep(400);
+    await drainSettled(transcript);
 
     const { owed, pending } = stagesOf(transcript);
     // Non-vacuous: shedding really did happen — everything that arrived ahead
@@ -630,12 +745,9 @@ describe("session transcript failure paths", () => {
     hooks.write = undefined;
     transcript.flush?.();
     transcript.write("after the drop\n");
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (readFileSync(file, "utf8").endsWith("after the drop\n")) {
-        break;
-      }
-      await sleep(20);
-    }
+    // Wait for the writer, not the file — see D2: a content poll can observe
+    // the landed bytes one phase before `currentSize` counts them.
+    await writerIdle(transcript);
 
     // No generation was shifted, and the live file kept everything it had.
     expect(readdirSync(dir).filter((entry) => /\.log\.\d+$/.test(entry))).toEqual([]);
@@ -666,7 +778,7 @@ describe("session transcript failure paths", () => {
     // One drain that lands first, so the surviving bytes are measured against
     // a live file that already holds something.
     transcript.write("P".repeat(100_000));
-    await sleep(400);
+    await writerIdle(transcript);
     const file = transcriptPath(dir, "stale_");
     const headerBytes = statSync(file).size - 100_000;
     expect(headerBytes).toBeGreaterThan(0);
@@ -678,7 +790,7 @@ describe("session transcript failure paths", () => {
     // stays undecided. Still under the 1 MiB cap, so nothing is trimmed yet.
     transcript.write("A".repeat(250_000));
     transcript.write("B".repeat(250_000));
-    await sleep(400);
+    await drainSettled(transcript);
     expect(stagesOf(transcript).owed.length).toBe(250_000);
     expect(stagesOf(transcript).pending.map((chunk) => chunk.length)).toEqual([250_000]);
 
@@ -687,7 +799,7 @@ describe("session transcript failure paths", () => {
     transcript.write("C".repeat(100_000));
     transcript.write("D".repeat(300_000));
     transcript.write("E".repeat(200_000));
-    await sleep(400);
+    await drainSettled(transcript);
 
     // The cap shed exactly the oldest 51,424 bytes — the head of "A" — and
     // nothing else: the bound holds while every newer byte survives. The
@@ -703,12 +815,7 @@ describe("session transcript failure paths", () => {
     hooks.write = undefined;
     transcript.flush?.();
     transcript.write("after the drop\n");
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if (allTranscriptText(dir, "stale_").endsWith("after the drop\n")) {
-        break;
-      }
-      await sleep(20);
-    }
+    await writerIdle(transcript);
 
     // The invariant this design holds by construction: the transcript rotates
     // at the same byte boundaries the synchronous writer would have produced
@@ -744,7 +851,7 @@ describe("session transcript failure paths", () => {
   it("does not rotate the same chunk twice when its remainder is retried after a partial failure", async () => {
     const dir = makeTempDir();
     const transcript = open(dir, "double", 2 * 1024 * 1024, 0);
-    await sleep(400); // the session header lands before the fault is armed
+    await writerIdle(transcript); // the session header lands before the fault is armed
 
     // One write() call, over maxFileSizeBytes on its own: 1.5 MiB of it will
     // reach disk — more than one append batch, so the writer has to split it
@@ -790,7 +897,7 @@ describe("session transcript failure paths", () => {
     };
 
     transcript.write(chunk);
-    await sleep(400); // timer drain: rotate once, prefix lands, resume fails
+    await drainSettled(transcript); // timer drain: rotate once, prefix lands, resume fails
 
     // Non-vacuous: the rotation really happened — at maxRotatedFiles: 0 that
     // is one unlink of the live file — the prefix really is on disk, and the
@@ -823,7 +930,7 @@ describe("session transcript failure paths", () => {
   it("keeps earlier generations when an oversized chunk's remainder is retried", async () => {
     const dir = makeTempDir();
     const transcript = open(dir, "keepgen", 2 * 1024 * 1024, 1);
-    await sleep(400); // header lands; the first rotation will shift it to .1
+    await writerIdle(transcript); // header lands; the first rotation will shift it to .1
 
     const partial = 1536 * 1024;
     const chunk = `PREFIX-MARKER${"x".repeat(3 * 1024 * 1024 - 24)}TAIL-MARKER`;
@@ -852,7 +959,7 @@ describe("session transcript failure paths", () => {
     };
 
     transcript.write(chunk);
-    await sleep(400);
+    await drainSettled(transcript);
     // Non-vacuous: the partial write and the failure both happened.
     expect(landed).toBe(partial);
     expect(refused).toBe(true);
@@ -881,10 +988,10 @@ describe("session transcript failure paths", () => {
   it("lands a failed remainder in the generation it was placed in, and later chunks behind it", async () => {
     const dir = makeTempDir();
     const transcript = open(dir, "placed", 200, 3);
-    await sleep(400); // header (49 bytes) lands
+    await writerIdle(transcript); // header (49 bytes) lands
 
     transcript.write("X".repeat(140)); // 49 + 140 ≤ 200 — same file
-    await sleep(400);
+    await writerIdle(transcript);
 
     let writes = 0;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -903,12 +1010,12 @@ describe("session transcript failure paths", () => {
       (hooks.actual!.write as any)(...args);
     };
     transcript.write("Y".repeat(100)); // 189 + 100 > 200 — rotates, then fails mid-write
-    await sleep(400);
+    await drainSettled(transcript);
     expect(writes).toBe(2);
 
     hooks.write = undefined;
     transcript.write("Z".repeat(10));
-    await sleep(400);
+    await writerIdle(transcript);
 
     // One rotation, exactly where the synchronous writer would have put it:
     // the shifted generation ends at the X chunk, and the Y remainder landed
@@ -927,7 +1034,7 @@ describe("session transcript failure paths", () => {
     hooks.write = deferringWrite(Number.MAX_SAFE_INTEGER); // never calls back
 
     transcript.write("never lands\n");
-    await sleep(400);
+    await parkedCount(1);
     expect(parked.length).toBeGreaterThan(0);
 
     const started = Date.now();
@@ -962,7 +1069,7 @@ describe("session transcript failure paths", () => {
     // hears back. From here on no drain can ever complete, so nothing but
     // admission-time enforcement stands between this session and the heap.
     transcript.write("wedge me\n");
-    await sleep(400);
+    await parkedCount(1);
     expect(parked).toHaveLength(1);
 
     // The hot path must stay off blocking syscalls even while the bound is
@@ -1325,7 +1432,7 @@ describe("session transcript failure paths", () => {
     const dir = makeTempDir();
     const cap = 2 * 1024 * 1024;
     const transcript = open(dir, "lone", 64 * 1024 * 1024, 1, cap);
-    await sleep(400); // header lands first, so the chunk is all the writer holds
+    await writerIdle(transcript); // header lands first, so the chunk is all the writer holds
     const file = transcriptPath(dir, "lone_");
     const preSize = statSync(file).size;
 
@@ -1336,7 +1443,7 @@ describe("session transcript failure paths", () => {
     // Bounded before any drain has run — admission alone did it.
     expect(heldBytesOf(transcript)).toBeLessThanOrEqual(cap);
 
-    await sleep(400); // the drain starts and wedges on its first append
+    await parkedCount(1); // the drain starts and wedges on its first append
     expect(parked).toHaveLength(1);
 
     // No arrivals from here on, ever — the bound must hold on its own.
@@ -1365,7 +1472,7 @@ describe("session transcript failure paths", () => {
   it("keeps a backlog under the cap intact across a transient outage, byte for byte", async () => {
     const dir = makeTempDir();
     const transcript = open(dir, "outage", 64 * 1024 * 1024, 1); // production default cap
-    await sleep(400); // header lands before the outage starts
+    await writerIdle(transcript); // header lands before the outage starts
 
     hooks.write = failingWrite; // every append fails, asynchronously
 
@@ -1376,11 +1483,11 @@ describe("session transcript failure paths", () => {
     for (let index = 0; index < 24; index += 1) {
       transcript.write(line(index));
     }
-    await sleep(400); // a drain fails against the dead share
+    await drainSettled(transcript); // a drain fails against the dead share
     for (let index = 24; index < 48; index += 1) {
       transcript.write(line(index));
     }
-    await sleep(400); // and another
+    await drainSettled(transcript); // and another
 
     // Non-vacuous: 6 MiB is held right through the outage — nothing shed.
     expect(heldBytesOf(transcript)).toBe(48 * 128 * 1024);
@@ -1442,7 +1549,7 @@ describe("session transcript failure paths", () => {
 
     hooks.write = deferringWrite(Number.MAX_SAFE_INTEGER); // never calls back
     transcript.write("wedge me\n");
-    await sleep(400);
+    await parkedCount(1);
     expect(parked).toHaveLength(1);
 
     const chunk = 128 * 1024;
@@ -1476,7 +1583,7 @@ describe("session transcript failure paths", () => {
     const dir = makeTempDir();
     const cap = 2 * 1024 * 1024;
     const transcript = open(dir, "gapfile", 64 * 1024 * 1024, 1, cap);
-    await sleep(400); // header lands
+    await writerIdle(transcript); // header lands
     const file = transcriptPath(dir, "gapfile_");
     const headerBytes = statSync(file).size;
 
@@ -1494,7 +1601,7 @@ describe("session transcript failure paths", () => {
     };
 
     transcript.write(`${"A".repeat(1024 * 1024)}${"B".repeat(1024 * 1024)}`);
-    await sleep(400);
+    await drainSettled(transcript);
 
     // 600 KiB of "A" is on disk; the rest of the chunk is owed.
     expect(statSync(file).size).toBe(headerBytes + 600 * 1024);
@@ -1600,7 +1707,7 @@ describe("session transcript failure paths", () => {
   it("hands the kernel no buffer that pins more than one append batch", async () => {
     const dir = makeTempDir();
     const transcript = open(dir, "pinned", 64 * 1024 * 1024, 1);
-    await sleep(400); // the session header lands before the probe is installed
+    await writerIdle(transcript); // the session header lands before the probe is installed
     const file = transcriptPath(dir, "pinned_");
     const headerBytes = statSync(file).size;
 
@@ -1616,7 +1723,7 @@ describe("session transcript failure paths", () => {
 
     const chunk = 4 * 1024 * 1024;
     transcript.write("x".repeat(chunk));
-    await sleep(600);
+    await writerIdle(transcript);
 
     // Non-vacuous: the chunk really was split into batches, and the last of
     // them really did take the whole-of-`owed` path.
@@ -1641,7 +1748,7 @@ describe("session transcript failure paths", () => {
   it("puts a short write's remainder back without copying what is still owed", async () => {
     const dir = makeTempDir();
     const transcript = open(dir, "remainder", 64 * 1024 * 1024, 1);
-    await sleep(400);
+    await writerIdle(transcript);
     const file = transcriptPath(dir, "remainder_");
     const headerBytes = statSync(file).size;
 
@@ -1679,7 +1786,7 @@ describe("session transcript failure paths", () => {
 
       recording = true;
       transcript.write("x".repeat(chunk));
-      await sleep(600);
+      await drainSettled(transcript);
       recording = false;
     } finally {
       Buffer.concat = realConcat;
