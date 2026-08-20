@@ -114,10 +114,21 @@ describe("package contributions", () => {
       expect(readme).toMatch(/EVE-NG/);
     });
 
-    it("does not tell the reader to run a command title that no longer exists (\u2298 docs pinned to \"Add Inventory Source (NetBox)\" send an EVE-NG user looking for a NetBox-only command)", () => {
-      const staleTitle = "Add Inventory Source (NetBox)";
-      expect(readme).not.toContain(staleTitle);
-      expect(functionalDocs).not.toContain(staleTitle);
+    /**
+     * Rejecting ONE known-stale string cannot catch the next rename — it only
+     * knows the title we already stopped using. This reads the CONTRIBUTED
+     * title and holds the docs to it, so any future retitle that leaves the
+     * README behind fails here rather than sending a reader to the palette
+     * for a command label that does not exist.
+     */
+    it("quotes the CURRENT contributed title wherever docs present it as a literal command (\u2298 a rename that updates package.json and leaves the README pointing at the old label)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      expect(title).not.toBe("");
+      const quoted = [...readme.matchAll(/`Nexus: Add Inventory Source[^`]*`/g)].map((m) => m[0]);
+      expect(quoted.length).toBeGreaterThan(0);
+      for (const occurrence of quoted) {
+        expect(occurrence).toBe(`\`Nexus: ${title}\``);
+      }
     });
 
     it("documents the Settings tree's per-source rows", () => {
