@@ -8753,7 +8753,7 @@ describe("nexus.inventory.refreshStatus", () => {
   });
 
   /**
-   * REVIEW D6/E1/E2 — the arm fire and the sources that decline it.
+   * REVIEW D6/E1 — the arm fire and the sources that decline it.
    *
    * The scheduler fires once on a source's not-running → running transition,
    * because a source that has just started polling has no status on screen and
@@ -8763,10 +8763,10 @@ describe("nexus.inventory.refreshStatus", () => {
    * not be in the vault yet (mid-restore of a backup). Both declines used to be
    * SILENT, so the arm fire was simply lost.
    *
-   * The command layer now keeps no memory of any of this. It reports two facts
-   * it owns — which targeted sources did NOT run (`unrefreshedSourceIds`), and
-   * when a busy claim is released (`onSourceFree`) — and the scheduler, which
-   * owns arming, owns the debt those facts feed.
+   * The command layer keeps no memory of any of this, and notifies nobody of
+   * anything. It reports ONE fact it owns — which targeted sources did NOT run
+   * (`unrefreshedSourceIds`) — and the scheduler, which owns arming, keeps a
+   * declined source WARMING and retries it on its own short clock.
    */
   describe("declining a refresh, and saying so", () => {
     afterEach(() => mockExecuteCommand.mockReset());
@@ -8824,38 +8824,22 @@ describe("nexus.inventory.refreshStatus", () => {
       await expect(registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" }))
         .resolves.toEqual({ unrefreshedSourceIds: [] });
     });
-
-    it("reports a source as free when its claim is released, for EVERY busy reason (⊘ hooking only the edit path leaves the same swallow behind a sync, a remove and a start/stop)", async () => {
-      const server = makeServer({
-        id: "eve-1",
-        name: "R1",
-        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
-      });
-      const core = new NexusCore(new InMemoryConfigRepository([server]));
-      await core.initialize();
-      const registry = new InventoryProviderRegistry();
-      registry.register(makeProvider({ controlNode: vi.fn(async () => {}), fetchStatus: vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} })) }));
-      const freed: string[] = [];
-      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), { onSourceFree: (id) => freed.push(id) });
-      await core.addOrUpdateInventorySource(makeSource());
-
-      // edit → released on dispose
-      await registeredCommands.get("nexus.inventory.editSource")!();
-      latestFormCall().panel.fireDispose();
-      await vi.waitFor(() => expect(freed).toEqual(["src-1"]));
-
-      // control → released when the dispatch settles
-      await registeredCommands.get("nexus.inventory.startNode")!({ server });
-      expect(freed).toEqual(["src-1", "src-1"]);
-    });
   });
 
   /**
    * The two ends joined: the real scheduler, wired to the real refreshStatus
    * command exactly as `extension.ts` wires it, against the real busy claims.
+   * Nothing notifies the poll when a claim clears — the poll's own WARM-UP
+   * (a short self-clocked retry while no fire has run since arming) is what
+   * turns a declined arm fire into a refresh moments later, so these tests
+   * drive fake interval timers instead of settle events.
    */
   describe("a poll arm fire declined by a busy source", () => {
-    afterEach(() => mockExecuteCommand.mockReset());
+    beforeEach(() => vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] }));
+    afterEach(() => {
+      vi.useRealTimers();
+      mockExecuteCommand.mockReset();
+    });
 
     async function wire(core: NexusCore, registry: InventoryProviderRegistry, vault: ReturnType<typeof makeVault>, visible = true): Promise<{
       poll: ReturnType<typeof startInventoryStatusPoll>;
@@ -8870,19 +8854,19 @@ describe("nexus.inventory.refreshStatus", () => {
           return { dispose: () => { listener = undefined; } };
         }
       };
-      let poll!: ReturnType<typeof startInventoryStatusPoll>;
-      registerInventoryCommands(core, registry, vault, makeTeardown(), { onSourceFree: (id) => poll?.sourceSettled(id) });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
       // Route refreshStatus to the real command, so the fire meets the live
       // busy check rather than a recording mock.
       mockExecuteCommand.mockImplementation((cmd: string, ...rest: unknown[]) =>
         cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
       );
-      poll = startInventoryStatusPoll({
+      const poll = startInventoryStatusPoll({
         view,
         getSources: () =>
           core.getSnapshot().inventorySources.map((source) => ({
             id: source.id,
-            intervalSeconds: Number(source.config.statusPollSeconds ?? 0)
+            intervalSeconds: Number(source.config.statusPollSeconds ?? 0),
+            incarnation: source.revision
           })),
         onDidChangeSources: (l) => ({ dispose: core.onDidChange(l) }),
         // extension.ts's own fire: the command's outcome names the sources it
@@ -8906,7 +8890,7 @@ describe("nexus.inventory.refreshStatus", () => {
       });
     }
 
-    it("still refreshes as soon as the claim clears, instead of a whole period later (⊘ losing the declined arm fire means turning polling on does nothing visible for up to an hour)", async () => {
+    it("still refreshes within the warm window after the claim clears, instead of a whole period later (⊘ losing the declined arm fire means turning polling on does nothing visible for up to an hour)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -8931,13 +8915,15 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(core.getInventorySource("src-1")?.config.statusPollSeconds).toBe(3600);
       expect(fetchStatus).not.toHaveBeenCalled();
 
-      // No timer is advanced — a period here would be an hour.
+      // The claim clears; nothing tells the poll so. Its warm timer retries on
+      // its own clock — 5 s here, where a period would be an hour.
       panel.fireDispose();
-      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(fetchStatus).toHaveBeenCalledTimes(1);
       poll.dispose();
     });
 
-    it("does NOT crawl on release when the panel was hidden while the claim was held (⊘ a debt with no re-validation pays out against the poll's own visible-gating: the user closed the Command Center and a lab crawl runs anyway)", async () => {
+    it("does NOT crawl after the claim clears when the panel was hidden while it was held (⊘ a warm-up that survives the disarm pays out against the poll's own visible-gating: the user closed the Command Center and a lab crawl runs anyway)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -8959,15 +8945,15 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(fetchStatus).not.toHaveBeenCalled();
 
       // The user closes the Command Center while the operation is still holding
-      // the claim: nothing is armed any more, so nothing is owed any more.
+      // the claim: nothing is armed any more, so nothing keeps warming.
       setVisible(false);
       panel.fireDispose();
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await vi.advanceTimersByTimeAsync(3_600_000);
       expect(fetchStatus).not.toHaveBeenCalled();
       poll.dispose();
     });
 
-    it("does not crawl on release when polling was turned OFF while the claim was held (⊘ a stale debt re-arms a source whose owner just set its interval to 0)", async () => {
+    it("does not crawl after the claim clears when polling was turned OFF while it was held (⊘ a stale warm-up re-arms a source whose owner just set its interval to 0)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -8995,7 +8981,7 @@ describe("nexus.inventory.refreshStatus", () => {
       await core.addOrUpdateInventorySource({ ...live, config: { ...live.config, statusPollSeconds: 0 } });
 
       first.panel.fireDispose();
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await vi.advanceTimersByTimeAsync(3_600_000);
       expect(fetchStatus).not.toHaveBeenCalled();
       poll.dispose();
     });
