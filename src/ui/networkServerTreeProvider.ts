@@ -46,9 +46,10 @@ const SERVICE_ICONS: Record<NetworkServerKind, string> = {
  * Status → icon/colour, following the same status-to-visual conventions the
  * other Nexus tree surfaces use so every view reads identically.
  *
- * `icon` is only set for the transitional states: a spinner is the one thing a
- * static colour cannot express, and those are exactly the states where the user
- * is waiting on something. Every other state keeps the service's own codicon.
+ * `icon` is set only where the service's own codicon would understate what is
+ * going on: a spinner for the transitional states (the one thing a static
+ * colour cannot express, and exactly where the user is waiting on something),
+ * and a warning/error glyph where the row is reporting a fault.
  */
 function networkServerStatusVisuals(status: NetworkServerStatus): {
   icon?: string;
@@ -70,6 +71,29 @@ function networkServerStatusVisuals(status: NetworkServerStatus): {
   }
 }
 
+/**
+ * Whether a running service is bound somewhere its clients will not look.
+ *
+ * Both adapters answer an `EACCES` on the IANA port by binding an unprivileged
+ * one instead (69 → 1069, 67 → 1067) rather than failing to start. That keeps
+ * the service usable for a client you can point at a port — but TFTP and DHCP
+ * clients target the well-known port, and a DHCP client cannot be redirected at
+ * all, so in the ordinary case the service is up and unreachable. A plain green
+ * "running" is the one thing the row must not say about that.
+ *
+ * The test is "bound somewhere other than where it was asked to bind", not a
+ * comparison against the literal 1069/1067: a user who deliberately configures
+ * TFTP on 6969 gets exactly that port and is not degraded, and any future
+ * fallback target is covered without a second constant to keep in sync.
+ */
+function isFallbackPortBind(
+  status: NetworkServerStatus,
+  boundPort: number | null | undefined,
+  configuredPort: number
+): boolean {
+  return status === "running" && typeof boundPort === "number" && boundPort !== configuredPort;
+}
+
 function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return "expired";
   const hours = Math.floor(seconds / 3600);
@@ -84,19 +108,41 @@ function formatLeaseTime(seconds: number): string {
 }
 
 export class NetworkServerRootTreeItem extends vscode.TreeItem {
+  /**
+   * @param configuredPort Port the service was asked to bind — TFTP's `port`
+   *   setting, or DHCP's fixed IANA 67. The row shows the port actually bound
+   *   once there is one, and compares the two to spot a fallback bind.
+   */
   public constructor(
     public readonly kind: NetworkServerKind,
     public readonly session: ActiveNetworkServerSession | undefined,
-    port: number
+    configuredPort: number
   ) {
     super(SERVICE_LABELS[kind], vscode.TreeItemCollapsibleState.Collapsed);
     const status = session?.status ?? "stopped";
     const visuals = networkServerStatusVisuals(status);
+    const port = session?.boundPort ?? configuredPort;
+    const onFallbackPort = isFallbackPortBind(status, session?.boundPort, configuredPort);
     this.id = `networkServer:${kind}`;
     this.contextValue = `nexus.networkServer.${status}`;
-    this.description = `${visuals.description} · UDP ${String(port)}`;
-    this.iconPath = new vscode.ThemeIcon(visuals.icon ?? SERVICE_ICONS[kind], visuals.color);
+    // The same inline "⚠ …" idiom the Lease Time row uses for a nearly
+    // exhausted pool: the service really is running, so the row keeps saying
+    // so, with the caveat that makes the difference attached to it.
+    this.description = onFallbackPort
+      ? `${visuals.description} · UDP ${String(port)} · ⚠ fallback port`
+      : `${visuals.description} · UDP ${String(port)}`;
+    this.iconPath = new vscode.ThemeIcon(
+      onFallbackPort ? "warning" : (visuals.icon ?? SERVICE_ICONS[kind]),
+      onFallbackPort ? new vscode.ThemeColor("testing.iconQueued") : visuals.color
+    );
     const tooltipLines = [`${SERVICE_LABELS[kind]} — ${visuals.description}`, `Port: UDP ${String(port)}`];
+    if (onFallbackPort) {
+      tooltipLines.push(
+        `Wanted UDP ${String(configuredPort)} but could not bind it (a privileged port needs Administrator/root), so it fell back to ${String(port)}.`,
+        `${SERVICE_LABELS[kind]} clients target UDP ${String(configuredPort)}, so ordinary clients will not reach this service${kind === "dhcp" ? " — a DHCP client cannot be pointed at another port at all" : " unless you can point them at port " + String(port)}.`,
+        `Restart VS Code with elevated privileges to bind UDP ${String(configuredPort)}.`
+      );
+    }
     if (session?.startedAt) {
       tooltipLines.push(`Started: ${new Date(session.startedAt).toLocaleString()}`);
     }
@@ -219,7 +265,7 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
   private toRootItem(kind: NetworkServerKind): NetworkServerRootTreeItem {
     const session = this.sessionFor(kind);
     const configuredPort = kind === "tftp" ? readTftpConfig().port ?? 69 : DHCP_IANA_PORT;
-    return new NetworkServerRootTreeItem(kind, session, session?.boundPort ?? configuredPort);
+    return new NetworkServerRootTreeItem(kind, session, configuredPort);
   }
 
   private buildTftpChildren(root: NetworkServerRootTreeItem): NetworkServerDetailTreeItem[] {

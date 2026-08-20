@@ -42,6 +42,7 @@ import type {
   TftpAdapterConfig
 } from "./core/index";
 import { isValidSubOptionCode } from "./dhcp/engine/dhcpBootOptions";
+import { compareIpv4, isContiguousMask, isValidIpv4 } from "./dhcp/engine/dhcpNetworkUtils";
 import {
   NetworkServerDaemonHost,
   type DhcpRuntimeSnapshot,
@@ -197,6 +198,58 @@ function readVendorSpecificOptions(section: string, key: string): DhcpVendorSpec
 }
 
 /**
+ * Reads a dotted-quad IPv4 setting, discarding a value that is not one.
+ *
+ * The editors refuse a malformed address before it is ever written
+ * (`validateDhcpValues`), but `settings.json` is a text file: a user — or a
+ * Settings Sync conflict, or a profile hand-edited outside the extension — can
+ * put `192.168.2.` or `not-an-ip` under any of these keys without going near a
+ * form. Forwarding that verbatim hands the daemon a pool it cannot allocate
+ * from and paints the bad value into the sidebar as if it were in effect.
+ *
+ * Degrading to `undefined` rather than throwing is the same contract every
+ * other reader in this file already has: an unset key means "use the packaged
+ * default", and a value the daemon could not have used is, in practice, unset.
+ *
+ * @param problems Collector; a rejected value appends its reason here so the
+ *   caller can report every fault in one line rather than one line per key.
+ */
+function readOptionalIpv4(
+  section: string,
+  key: string,
+  label: string,
+  problems: string[]
+): string | undefined {
+  const value = readOptionalString(section, key);
+  if (value === undefined || isValidIpv4(value)) return value;
+  problems.push(`${label} ("${value}") is not a dotted-quad IPv4 address`);
+  return undefined;
+}
+
+/**
+ * The last set of problems reported, so a standing fault is logged once rather
+ * than on every read.
+ *
+ * `readDhcpConfig` is called from the tree provider on every expansion as well
+ * as at start/restart, so an unconditional log would fill the console with one
+ * copy of the same complaint per render. Keying on the joined text (rather than
+ * a boolean) means a *different* fault, or the same fault reappearing after the
+ * user fixed it, is still reported.
+ */
+let lastReportedDhcpConfigProblems = "";
+
+/** Reports malformed DHCP settings once per distinct set of faults. */
+function reportDhcpConfigProblems(problems: readonly string[]): void {
+  const summary = problems.join("; ");
+  if (summary === lastReportedDhcpConfigProblems) return;
+  lastReportedDhcpConfigProblems = summary;
+  if (problems.length === 0) return;
+  console.warn(
+    `[Nexus Network Servers] Ignoring malformed nexus.networkServers.dhcp settings — the packaged defaults apply instead: ${summary}.`
+  );
+}
+
+/**
  * The TFTP service's own bind address, when it is one a client could reach.
  *
  * `0.0.0.0` (or unset) means "every interface", which is not an address a
@@ -222,11 +275,49 @@ export function readTftpConfig(): TftpAdapterConfig {
 /**
  * Resolves current `nexus.networkServers.dhcp.*` settings.
  *
+ * **This is a validating read, not a raw one.** The form and the quick pick
+ * check what they write, but they are not the only way these keys get set —
+ * `settings.json` is editable by hand, Settings Sync can land a conflicted
+ * value, and another extension can write the section outright. Anything that
+ * arrives malformed by one of those routes would otherwise reach the daemon
+ * (which allocates from an inverted pool by handing out nothing at all — the
+ * service binds, answers no DISCOVER, and reads as "DHCP is broken") and the
+ * sidebar, which would display it as the configuration in force. Each faulty
+ * field is dropped back to its packaged default and the whole set is reported
+ * once, in the console, per distinct fault.
+ *
+ * This is defence in depth behind {@link validateDhcpValues}, not a substitute
+ * for it: refusing at the point of entry with a message naming the field is
+ * still much better than silently substituting a default later.
+ *
  * @param globalStoragePath - Where the lease store lives. Omitted leaves
  *   `leaseStorePath` unset, i.e. leases stay in memory only.
  */
 export function readDhcpConfig(globalStoragePath?: string): DhcpAdapterConfig {
   const section = "nexus.networkServers.dhcp";
+  const problems: string[] = [];
+  let rangeStart = readOptionalIpv4(section, "rangeStart", "Pool Start", problems);
+  let rangeEnd = readOptionalIpv4(section, "rangeEnd", "Pool End", problems);
+  let subnet = readOptionalIpv4(section, "subnet", "Subnet Mask", problems);
+  if (subnet !== undefined && !isContiguousMask(subnet)) {
+    problems.push(`Subnet Mask ("${subnet}") is not a netmask — its set bits must be contiguous`);
+    subnet = undefined;
+  }
+  // Both ends go back to the defaults together. Dropping only one of an
+  // inverted pair leaves the survivor paired with a default from another
+  // subnet entirely, which can be inverted all over again — and the pair, not
+  // either address on its own, is what is wrong.
+  if (rangeStart !== undefined && rangeEnd !== undefined && compareIpv4(rangeStart, rangeEnd) > 0) {
+    problems.push(
+      `Pool Start (${rangeStart}) is above Pool End (${rangeEnd}), which describes an empty pool`
+    );
+    rangeStart = undefined;
+    rangeEnd = undefined;
+  }
+  const gateway = readOptionalIpv4(section, "gateway", "Gateway", problems);
+  const serverId = readOptionalIpv4(section, "serverId", "Server Identifier", problems);
+  const broadcast = readOptionalIpv4(section, "broadcast", "Broadcast Address", problems);
+  reportDhcpConfigProblems(problems);
   const nextServer = readOptionalString(section, "nextServer");
   const tftpServerAddresses = readOptionalStringArray(section, "tftpServerAddresses");
   // All-or-nothing on purpose: an explicit address in *either* key means the
@@ -240,16 +331,16 @@ export function readDhcpConfig(globalStoragePath?: string): DhcpAdapterConfig {
       ? resolveTftpLinkAddress()
       : undefined;
   return {
-    rangeStart: readOptionalString(section, "rangeStart"),
-    rangeEnd: readOptionalString(section, "rangeEnd"),
-    subnet: readOptionalString(section, "subnet"),
-    gateway: readOptionalString(section, "gateway"),
+    rangeStart,
+    rangeEnd,
+    subnet,
+    gateway,
     dns: readOptionalStringArray(section, "dns"),
     // 60s floor: shorter leases make clients renew faster than the server can
     // meaningfully track. 7-day ceiling matches common DHCP practice.
     leaseTimeSec: readBoundedNumber(section, "leaseTimeSec", 86_400, 60, 604_800),
-    serverId: readOptionalString(section, "serverId"),
-    broadcast: readOptionalString(section, "broadcast"),
+    serverId,
+    broadcast,
     static: readStaticLeaseMap(section, "static"),
     bindAddress: readOptionalString(section, "interface"),
     leaseStorePath: globalStoragePath ? resolveDhcpLeaseStorePath(globalStoragePath) : undefined,
