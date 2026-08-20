@@ -31,6 +31,19 @@ import { syncOwnsHost, syncOwnsPort } from "../services/inventory/syncEngine";
 import { validateServerConfig } from "../utils/validation";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
+import type {
+  ActiveNetworkServerSession,
+  NetworkServerKind,
+  NetworkServerRuntimeDetail,
+  NetworkServerStatus,
+  NetworkServerTransferHistoryEntry
+} from "../models/networkServer";
+import {
+  cloneDhcpProfile,
+  cloneTftpProfile,
+  type DhcpConfigProfile,
+  type TftpConfigProfile
+} from "../models/networkServerProfile";
 import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
@@ -116,6 +129,15 @@ export class NexusCore {
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly activeSerialSessions = new Map<string, ActiveSerialSession>();
   private readonly activeLocalShellSessions = new Map<string, ActiveLocalShellSession>();
+  // Keyed by kind, not by a generated session id: TFTP and DHCP are fixed
+  // singletons, so the kind IS the identity. Runtime-only — nothing here is
+  // persisted, because their configuration lives in VS Code settings.
+  private readonly activeNetworkServerSessions = new Map<NetworkServerKind, ActiveNetworkServerSession>();
+  // Persisted, unlike the sessions above: these are named snapshots of the two
+  // services' settings, kept in separate maps because TFTP and DHCP presets
+  // are independent of each other and share no fields.
+  private readonly tftpProfiles = new Map<string, TftpConfigProfile>();
+  private readonly dhcpProfiles = new Map<string, DhcpConfigProfile>();
   private readonly activeTunnels = new Map<string, ActiveTunnel>();
   private readonly activitySessionIds = new Set<string>();
   // LIVE STATUS (Phase 2) — runtime-only running/stopped state per server,
@@ -160,7 +182,7 @@ export class NexusCore {
   public constructor(private readonly repository: ConfigRepository) {}
 
   public async initialize(): Promise<void> {
-    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources, deviceTemplates, savedFilters] =
+    const [servers, tunnels, serialProfiles, localShellProfiles, groups, authProfiles, inventorySources, deviceTemplates, savedFilters, tftpProfiles, dhcpProfiles] =
       await Promise.all([
         this.repository.getServers(),
         this.repository.getTunnels(),
@@ -170,7 +192,9 @@ export class NexusCore {
         this.repository.getAuthProfiles(),
         this.repository.getInventorySources(),
         this.repository.getDeviceTemplates(),
-        this.repository.getSavedFilters()
+        this.repository.getSavedFilters(),
+        this.repository.getTftpProfiles(),
+        this.repository.getDhcpProfiles()
       ]);
     this.servers.clear();
     this.tunnels.clear();
@@ -181,6 +205,8 @@ export class NexusCore {
     this.inventorySources.clear();
     this.deviceTemplates.clear();
     this.savedFilters.clear();
+    this.tftpProfiles.clear();
+    this.dhcpProfiles.clear();
     const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
     for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
@@ -209,6 +235,12 @@ export class NexusCore {
     for (const filter of savedFilters) {
       this.savedFilters.set(filter.id, filter);
     }
+    for (const profile of tftpProfiles) {
+      this.tftpProfiles.set(profile.id, profile);
+    }
+    for (const profile of dhcpProfiles) {
+      this.dhcpProfiles.set(profile.id, profile);
+    }
     if (normalizedServers.changed) {
       await this.repository.saveServers(normalizedServers.servers);
     }
@@ -224,6 +256,9 @@ export class NexusCore {
       activeSessions: [...this.activeSessions.values()],
       activeSerialSessions: [...this.activeSerialSessions.values()],
       activeLocalShellSessions: [...this.activeLocalShellSessions.values()],
+      activeNetworkServerSessions: [...this.activeNetworkServerSessions.values()],
+      tftpProfiles: [...this.tftpProfiles.values()],
+      dhcpProfiles: [...this.dhcpProfiles.values()],
       activeTunnels: [...this.activeTunnels.values()],
       remoteTunnels: [...this.remoteTunnels],
       explicitGroups: [...this.explicitGroups],
@@ -256,6 +291,14 @@ export class NexusCore {
 
   public getLocalShellProfile(id: string): LocalShellProfile | undefined {
     return this.localShellProfiles.get(id);
+  }
+
+  public getTftpProfile(id: string): TftpConfigProfile | undefined {
+    return this.tftpProfiles.get(id);
+  }
+
+  public getDhcpProfile(id: string): DhcpConfigProfile | undefined {
+    return this.dhcpProfiles.get(id);
   }
 
   public getAuthProfile(id: string): AuthProfile | undefined {
@@ -2252,6 +2295,31 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  public async addOrUpdateTftpProfile(profile: TftpConfigProfile): Promise<void> {
+    this.tftpProfiles.set(profile.id, cloneTftpProfile(profile));
+    await this.repository.saveTftpProfiles([...this.tftpProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async addOrUpdateDhcpProfile(profile: DhcpConfigProfile): Promise<void> {
+    this.dhcpProfiles.set(profile.id, cloneDhcpProfile(profile));
+    await this.repository.saveDhcpProfiles([...this.dhcpProfiles.values()]);
+    this.emitChanged();
+  }
+
+  // A profile owns no runtime state, so removing one never touches a live service.
+  public async removeTftpProfile(profileId: string): Promise<void> {
+    this.tftpProfiles.delete(profileId);
+    await this.repository.saveTftpProfiles([...this.tftpProfiles.values()]);
+    this.emitChanged();
+  }
+
+  public async removeDhcpProfile(profileId: string): Promise<void> {
+    this.dhcpProfiles.delete(profileId);
+    await this.repository.saveDhcpProfiles([...this.dhcpProfiles.values()]);
+    this.emitChanged();
+  }
+
   public async removeSerialProfile(profileId: string): Promise<void> {
     this.serialProfiles.delete(profileId);
     this.removeSerialProfileSessions(profileId);
@@ -2523,6 +2591,109 @@ export class NexusCore {
     }
     this.activeLocalShellSessions.delete(sessionId);
     this.activitySessionIds.delete(sessionId);
+    this.emitChanged();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Embedded network servers (TFTP / DHCP) — runtime state only.
+  //
+  // There is deliberately NO config half here (no addOrUpdate/remove/rename):
+  // these are two fixed singleton services whose settings live in VS Code's own
+  // configuration store, so there is nothing for ConfigRepository to persist.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Registers (or replaces) the runtime record for a network service.
+   * Keyed by kind, so starting `tftp` twice updates one record rather than
+   * accumulating sessions.
+   */
+  public registerNetworkServerSession(session: ActiveNetworkServerSession): void {
+    this.activeNetworkServerSessions.set(session.kind, session);
+    this.emitChanged();
+  }
+
+  public getNetworkServerSession(kind: NetworkServerKind): ActiveNetworkServerSession | undefined {
+    return this.activeNetworkServerSessions.get(kind);
+  }
+
+  /**
+   * Applies a lifecycle transition reported by the daemon.
+   *
+   * `boundPort` is threaded through here rather than inferred because the
+   * adapters fall back to unprivileged ports (69 → 1069, 67 → 1067) when they
+   * cannot bind the IANA port — the configured port is frequently NOT the port
+   * that ended up serving traffic, and the UI must show the real one.
+   *
+   * Stamps `startedAt` on the first transition into `running`, and clears the
+   * stale `errorMessage` on any non-error transition so a recovered service
+   * does not keep rendering a previous failure.
+   */
+  public updateNetworkServerSessionStatus(
+    kind: NetworkServerKind,
+    status: NetworkServerStatus,
+    options?: { boundPort?: number | null; errorMessage?: string }
+  ): void {
+    const existing = this.activeNetworkServerSessions.get(kind);
+    const base: ActiveNetworkServerSession = existing ?? { kind, status, boundPort: null };
+    const next: ActiveNetworkServerSession = {
+      ...base,
+      status,
+      boundPort: options?.boundPort !== undefined ? options.boundPort : base.boundPort,
+      errorMessage: status === "error" ? (options?.errorMessage ?? base.errorMessage) : undefined,
+      startedAt: status === "running" ? (base.status === "running" ? base.startedAt : Date.now()) : base.startedAt
+    };
+    this.activeNetworkServerSessions.set(kind, next);
+    this.emitChanged();
+  }
+
+  /**
+   * Replaces the live detail (transfers / leases / counters) for a service.
+   *
+   * Called on every `runtimeUpdate` push, so it must stay cheap: it swaps the
+   * detail object wholesale instead of merging field by field.
+   */
+  public setNetworkServerRuntimeSnapshot(
+    kind: NetworkServerKind,
+    detail: NetworkServerRuntimeDetail,
+    boundPort?: number | null
+  ): void {
+    const existing = this.activeNetworkServerSessions.get(kind);
+    if (!existing) return;
+    this.activeNetworkServerSessions.set(kind, {
+      ...existing,
+      detail,
+      boundPort: boundPort !== undefined ? boundPort : existing.boundPort
+    });
+    this.emitChanged();
+  }
+
+  /**
+   * Replaces the completed-transfer history for a service.
+   *
+   * Separate from {@link setNetworkServerRuntimeSnapshot} because the two have
+   * different owners and different lifetimes: the runtime detail is whatever
+   * the daemon reports right now, while the history is accumulated host-side by
+   * `NetworkServerManager` across the whole run. The manager owns the list and
+   * pushes the current value; this method only mirrors it into the snapshot so
+   * the tree can render it, and no-ops when the service is not registered.
+   *
+   * Transient by construction — nothing here reaches `ConfigRepository`.
+   *
+   * @param kind Which service the history belongs to (TFTP today).
+   * @param entries Newest-first history, already capped by the manager.
+   */
+  public setNetworkServerTransferHistory(
+    kind: NetworkServerKind,
+    entries: readonly NetworkServerTransferHistoryEntry[]
+  ): void {
+    const existing = this.activeNetworkServerSessions.get(kind);
+    if (!existing) return;
+    this.activeNetworkServerSessions.set(kind, { ...existing, transferHistory: entries });
+    this.emitChanged();
+  }
+
+  public unregisterNetworkServerSession(kind: NetworkServerKind): void {
+    if (!this.activeNetworkServerSessions.delete(kind)) return;
     this.emitChanged();
   }
 

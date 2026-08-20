@@ -54,6 +54,9 @@ function renderField(field: FormFieldDescriptor): string {
     const vw = visibleWhenAttrs(field);
     return `<div class="form-group form-illustration"${vw}>${field.content}</div>`;
   }
+  if (field.type === "section") {
+    return `<div class="form-section"${visibleWhenAttrs(field)}>${escapeHtml(field.label)}</div>`;
+  }
   const key = escapeHtml(field.key);
   const id = `field-${key}`;
   const req = "required" in field && field.required ? " required" : "";
@@ -268,6 +271,19 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     }
     .advanced-fields .form-group {
       margin-bottom: 14px;
+    }
+    .form-section {
+      margin: 22px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+    .form-section:first-child {
+      margin-top: 4px;
     }
     .actions button[data-visible-when] {
       display: none;
