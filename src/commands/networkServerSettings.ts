@@ -10,11 +10,14 @@
  */
 
 import {
+  compareIpv4,
   computeBroadcastAddress,
   computePoolSize,
   computeRangeEnd,
   intToIp,
-  ipToInt
+  ipToInt,
+  isContiguousMask,
+  isValidIpv4
 } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
 import type { DhcpVendorSpecificEntry } from "../services/networkServers/core/index";
@@ -55,27 +58,16 @@ export function readSettingBoolean(value: FormValues[string]): boolean {
   return value === true || value === "on" || value === "true";
 }
 
-const DOTTED_QUAD = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
-
-export function isValidIpv4(value: string): boolean {
-  return DOTTED_QUAD.test(value);
-}
-
-export function compareIpv4(left: string, right: string): number {
-  const a = left.split(".").map(Number);
-  const b = right.split(".").map(Number);
-  for (let i = 0; i < 4; i += 1) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return 0;
-}
-
-/** A mask is usable only if its set bits are contiguous from the top — `255.0.255.0` is not a subnet. */
-export function isContiguousMask(mask: string): boolean {
-  const value = mask.split(".").reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
-  const inverted = ~value >>> 0;
-  return ((inverted + 1) & inverted) === 0;
-}
+/**
+ * The address predicates live beside the rest of the pure IPv4 arithmetic in
+ * `dhcpNetworkUtils`, and are re-exported here because this module has always
+ * been where the editors import them from.
+ *
+ * They moved because the settings *read* path needs them too
+ * (`readDhcpConfig`), and `src/services` must not reach into `src/commands` to
+ * get at a regex. Nothing about the checks themselves changed.
+ */
+export { compareIpv4, isContiguousMask, isValidIpv4 };
 
 /**
  * The pool size currently configured, for seeding a "how many addresses?"

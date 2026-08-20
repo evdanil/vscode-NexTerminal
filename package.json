@@ -461,79 +461,79 @@
       {
         "command": "nexus.networkServer.start",
         "title": "Start Service",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(play)"
       },
       {
         "command": "nexus.networkServer.stop",
         "title": "Stop Service",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(debug-stop)"
       },
       {
         "command": "nexus.networkServer.restart",
         "title": "Restart Service",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(sync)"
       },
       {
         "command": "nexus.networkServer.quickAdjust",
         "title": "Quick Settings",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(gear)"
       },
       {
         "command": "nexus.networkServer.edit",
         "title": "Open Full Settings",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(gear)"
       },
       {
         "command": "nexus.networkServer.inspectLogs",
         "title": "Inspect Logs",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(list-flat)"
       },
       {
         "command": "nexus.networkServer.tftp.cancelTransfer",
         "title": "Cancel Transfer",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(circle-slash)"
       },
       {
         "command": "nexus.networkServer.tftp.clearHistory",
         "title": "Clear Transfer History",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(clear-all)"
       },
       {
         "command": "nexus.networkServer.profile.saveCurrent",
         "title": "Save Current Settings as Profile",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(save)"
       },
       {
         "command": "nexus.networkServer.profile.apply",
         "title": "Load Profile",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(archive)"
       },
       {
         "command": "nexus.networkServer.profile.rename",
         "title": "Rename Profile",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(edit)"
       },
       {
         "command": "nexus.networkServer.profile.duplicate",
         "title": "Duplicate Profile",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(copy)"
       },
       {
         "command": "nexus.networkServer.profile.remove",
         "title": "Remove Profile",
-        "category": "Nexus Network Server",
+        "category": "Nexus",
         "icon": "$(trash)"
       },
       {

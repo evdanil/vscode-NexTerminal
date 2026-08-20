@@ -8,6 +8,47 @@
 
 import { DEFAULTS } from './dhcpConstants';
 
+/**
+ * Strict dotted-quad matcher.
+ *
+ * {@link ipToInt} is deliberately lenient — it maps anything it cannot parse to
+ * `0`, which is also a perfectly legal address — so it cannot answer "is this
+ * string a valid IPv4 address?". Validation needs its own predicate, and both
+ * the editors (which refuse bad input outright) and the settings read path
+ * (which falls back to the packaged default) share this one.
+ */
+const DOTTED_QUAD = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/;
+
+/** Whether `value` is a dotted-quad IPv4 address. */
+export function isValidIpv4(value: string): boolean {
+  return DOTTED_QUAD.test(value);
+}
+
+/**
+ * Orders two dotted-quad addresses, octet by octet as numbers.
+ *
+ * A lexicographic string compare would place `10.0.0.100` *below* `10.0.0.99`,
+ * which is exactly the pair an inverted-pool check has to catch.
+ *
+ * @returns Negative when `left` sorts first, positive when `right` does, `0`
+ *   when they are equal.
+ */
+export function compareIpv4(left: string, right: string): number {
+  const a = left.split('.').map(Number);
+  const b = right.split('.').map(Number);
+  for (let i = 0; i < 4; i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+/** A mask is usable only if its set bits are contiguous from the top — `255.0.255.0` is not a subnet. */
+export function isContiguousMask(mask: string): boolean {
+  const value = mask.split('.').reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
+  const inverted = ~value >>> 0;
+  return ((inverted + 1) & inverted) === 0;
+}
+
 /** Converts a dotted-quad IPv4 (e.g. 192.168.2.10) to a 32-bit integer. Returns 0 on invalid parse. */
 export function ipToInt(ip: string): number {
   const parts = ip.split('.').map((p) => Number(p) >>> 0);
