@@ -27,20 +27,40 @@ describe("package contributions", () => {
   });
 
   /**
-   * EVE-NG (Phase 1) — a SECOND inventory provider ships, so the entry points
-   * into the add-source flow are provider-agnostic. Naming one provider in
-   * them tells a user looking for the other that the feature is not there.
+   * EVE-NG (Phase 1) established that naming ONE provider in the add-source
+   * entry points tells a user looking for the other that the feature is not
+   * there. That was right, but the remedy — naming NEITHER — hands BOTH users
+   * that outcome: the Command Palette matches on command title, so a user
+   * searching "netbox" or "eve-ng" against a title reading only "Add Inventory
+   * Source" gets nothing and concludes the feature does not exist.
+   *
+   * So the rule is not "name no provider", it is "exclude no provider": name
+   * every shipped one, with a trailing ellipsis for the next — the same shape
+   * the neighbouring "Import Servers (CSV, MobaXterm, SecureCRT…)" line uses,
+   * for the same reason.
    */
-  describe("provider-agnostic inventory entry points", () => {
-    it("titles nexus.inventory.addSource without naming a provider (\u2298 \"Add Inventory Source (NetBox)\" reads as NetBox-only to an EVE-NG user)", () => {
-      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title;
-      expect(title).toBe("Add Inventory Source");
+  describe("provider-inclusive inventory entry points", () => {
+    const shippedProviders = [/NetBox/i, /EVE-NG/i];
+
+    it("names EVERY shipped provider in nexus.inventory.addSource's title (\u2298 \"(NetBox)\" reads as NetBox-only; \u2298 naming none is unsearchable for both)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      for (const provider of shippedProviders) {
+        expect(title).toMatch(provider);
+      }
     });
 
-    it("offers the same neutral wording in the Command Center welcome view", () => {
+    it("carries the same inclusive wording into the Command Center welcome view", () => {
       const welcome = packageJson.contributes.viewsWelcome?.find((w) => w.view === "nexusCommandCenter")?.contents ?? "";
-      expect(welcome).toContain("[Add Inventory Source](command:nexus.inventory.addSource)");
-      expect(welcome).not.toMatch(/NetBox/i);
+      const line = welcome.split("\n").find((l) => l.includes("nexus.inventory.addSource")) ?? "";
+      expect(line).not.toBe("");
+      for (const provider of shippedProviders) {
+        expect(line).toMatch(provider);
+      }
+    });
+
+    it("signals that the list is open-ended rather than the complete set of providers Nexus will ever have", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      expect(title).toContain("\u2026");
     });
   });
 
@@ -94,10 +114,21 @@ describe("package contributions", () => {
       expect(readme).toMatch(/EVE-NG/);
     });
 
-    it("does not tell the reader to run a command title that no longer exists (\u2298 docs pinned to \"Add Inventory Source (NetBox)\" send an EVE-NG user looking for a NetBox-only command)", () => {
-      const staleTitle = "Add Inventory Source (NetBox)";
-      expect(readme).not.toContain(staleTitle);
-      expect(functionalDocs).not.toContain(staleTitle);
+    /**
+     * Rejecting ONE known-stale string cannot catch the next rename — it only
+     * knows the title we already stopped using. This reads the CONTRIBUTED
+     * title and holds the docs to it, so any future retitle that leaves the
+     * README behind fails here rather than sending a reader to the palette
+     * for a command label that does not exist.
+     */
+    it("quotes the CURRENT contributed title wherever docs present it as a literal command (\u2298 a rename that updates package.json and leaves the README pointing at the old label)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      expect(title).not.toBe("");
+      const quoted = [...readme.matchAll(/`Nexus: Add Inventory Source[^`]*`/g)].map((m) => m[0]);
+      expect(quoted.length).toBeGreaterThan(0);
+      for (const occurrence of quoted) {
+        expect(occurrence).toBe(`\`Nexus: ${title}\``);
+      }
     });
 
     it("documents the Settings tree's per-source rows", () => {

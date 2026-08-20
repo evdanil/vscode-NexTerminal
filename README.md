@@ -95,7 +95,7 @@ Nexus Terminal is available from both the VS Code Marketplace and Open VSX regis
 
 ### First Use Flow
 
-1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile` — or sync your whole device inventory in one go with `Nexus: Add Inventory Source`.
+1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile` — or sync your whole device inventory in one go with `Nexus: Add Inventory Source (NetBox, EVE-NG…)`.
 2. Select **Connect** / **Open Local Shell** on the profile to open an SSH, Serial, or Local Shell terminal.
 3. For SSH profiles, open **File Explorer** and run **Browse Files** to choose the connected profile and browse SFTP files.
 4. Open **Port Forwarding**, add a tunnel with `Nexus: Add Tunnel`, assign an SSH server, then select **Start**.
@@ -144,7 +144,7 @@ If your target server is behind a firewall or bastion host:
 
 If your device inventory already lives in NetBox, you don't have to re-type it:
 
-1. Run `Nexus: Add Inventory Source` and choose **NetBox** — the first step is choosing a provider — or open **Settings → Inventory Sources**, which lists every configured source with inline **Sync Now**, **Edit**, **Template Rules**, and **Remove**
+1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG…)` and choose **NetBox** — the first step is choosing a provider — or open **Settings → Inventory Sources**, which lists every configured source with inline **Sync Now**, **Edit**, **Template Rules**, and **Remove**
 2. Enter your NetBox base URL and an API token with read access to DCIM (and Virtualization, if you include VMs). The token is stored in VS Code SecretStorage. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check that the token can read your devices, so a token NetBox accepts but hasn't granted DCIM access will pass here and fail on the first sync
 3. Optionally narrow the sync with a device filter (e.g. `status=active&site=syd`), shape the folder layout with a template (`{site}/{rack}` by default), and set a **Target Folder** to keep synced servers under
 4. Pick an **Auth Profile** so the servers the sync creates can actually connect — choose an existing profile or create one inline without leaving the form. Its username fills the **Default SSH Username** field; with **(None)**, servers use the default username with SSH agent authentication
@@ -175,7 +175,7 @@ Credentials stay yours. If a source gains an auth profile later, servers from ea
 
 EVE-NG labs are an inventory source too, and the shape is the same: **labs become folders, nodes become servers**, each pointed at the node's native telnet console.
 
-1. Run `Nexus: Add Inventory Source`, choose **EVE-NG**, and enter the base URL of the EVE-NG web UI plus the username and password you log into it with. The password is stored in VS Code SecretStorage
+1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG…)`, choose **EVE-NG**, and enter the base URL of the EVE-NG web UI plus the username and password you log into it with. The password is stored in VS Code SecretStorage
 2. Optionally set a **Root Folder** to scan only part of the lab tree, a **Lab Filter** (a case-insensitive substring of a lab's full path), and a **Console Host Override** for when EVE-NG sits behind NAT and reports console addresses you cannot reach
 3. **Include Stopped Nodes** is on by default. Turning it off makes a stopped node look deleted to the sync, so the source's Removed-Device Policy applies to it — leave it on unless you only ever want running gear
 4. If the base URL is `https://` and the server holds EVE-NG's own self-signed certificate — or you reach it by IP address and its certificate does not list that address (a certificate *can* cover an IP, so check before assuming) — tick **Allow a Self-Signed or Mismatched Certificate** under **Advanced options**. It is off by default; read the note below the list before turning it on
