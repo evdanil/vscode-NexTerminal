@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.8.199] — 2026-08-20
+
+### Fixed
+
+- **A save no longer fails because something else was listening to it.** Every part of Nexus that reacts to a configuration change — the sidebar, the Port Forwarding view, the settings panel — is notified in turn when you add a server, edit a tunnel, or rename a profile. One of those notifications throwing used to abort the whole run, so listeners after it were never told and the write appeared to half-happen: the change was saved, but a view still showed the old state until you reloaded the window. Each listener is now isolated, so one misbehaving consumer can no longer take the others down with it, and the failure is logged rather than swallowed. You are most likely to have met this as a tree that would not refresh until a reload.
+- **Editing Nexus configuration in two VS Code windows no longer loses one window's work in silence.** Nexus configuration is shared across every open window, the last write wins, and each save writes the whole list — so a change made in one window could be overwritten by a save from another that had loaded the list before your edit. That has always been true; what is new is that it no longer happens quietly. When a save actually overwrites another window's change, Nexus now says so, names what was affected, and tells you to redo the edit. Two limits, stated plainly: this **reports** the loss, it does not prevent it — there is no compare-and-swap available at this storage layer, so preventing it is not possible here — and it only fires when the other window's change genuinely differs from what is being written. The honest advice remains to make Nexus configuration changes in one window at a time.
+- **Turning lab status polling on, or clearing whatever was blocking it, now recovers by itself.** 2.8.192 fixed the case where enabling a source's interval could leave the first refresh up to a full period away. That fix worked, but it was built on cross-module notifications that had to stay in step with a recorded obligation across asynchronous boundaries — and seven consecutive review rounds each found a further way for the two to drift apart. The mechanism has been replaced rather than patched again: a source that has not yet completed a refresh simply retries on a short timer (5 seconds, backing off to no faster than its own configured interval) until one succeeds. A repeating timer cannot miss a wakeup, so the entire class of defect is gone rather than guarded. **One trade, so it is not a surprise:** a blocker clearing is now noticed by the next short retry rather than at the instant it clears — within about 5 seconds of a source arming, longer after repeated retries — where before it was immediate. For a background status highlight on a cadence measured in minutes, that is the requirement's own word, *soon*. A retry that is declined never reaches your lab box: the checks that decline it are local, so only a retry that succeeds costs a request.
+
+### Changed
+
+- **Saving an Edit Source form now restarts that source's polling cadence from the save.** Previously the pre-edit schedule was preserved, so the next poll could arrive at an arbitrary point. Since the save has just fetched fresh status, "the configured interval from now" is the honest next due. An edit to an *unrelated* source still never disturbs a long-interval source's timing.
+
+### Repository
+
+- **`CONTRIBUTING.md` and `SECURITY.md` now exist**, prompted by the project's first outside contribution. `SECURITY.md` is the one worth knowing about as a user: it sets up private vulnerability reporting through GitHub advisories rather than a public issue, and scopes what is in and out of scope in both directions — with the clause that anything on the out-of-scope list behaving differently from how it is documented **is** in scope, so "it's documented" cannot be used to wave away a real bug.
+
 ## [2.8.192] — 2026-08-20
 
 ### Changed
