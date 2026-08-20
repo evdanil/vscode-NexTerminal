@@ -52,7 +52,7 @@ Large changes are welcome. Large *mixed* changes are the problem.
 
 ## Development setup
 
-You need Node.js 20.x (the version VS Code's extension host runs) and a recent VS Code — this extension targets `^1.105.0`.
+You need Node.js and a recent VS Code — this extension targets `^1.105.0`, whose desktop extension host runs **Node 22**, which is what the code is type-checked against (`@types/node` 22). The release workflows build on Node 20, so either works for developing.
 
 ```bash
 npm install
@@ -62,8 +62,9 @@ npm test               # full suite with coverage
 npm run test:unit      # unit tests only
 npm run test:integration
 npm run watch          # watch-mode type-checking
-npm run package:vsix   # production build, packaged as an installable VSIX
 ```
+
+`npm run package:vsix` is **not** part of the normal loop and will fail on a fresh checkout: it runs `prepare:local-pty:required`, which demands prebuilt Local Shell PTY binaries for all six supported platforms under `native/local-pty-artifacts/`. CI manufactures those before packaging. You do not need a VSIX to develop or to open a pull request — use `npm run build` and the Extension Development Host below.
 
 To run one test file or one test:
 
@@ -74,7 +75,7 @@ npx vitest run -t "pattern"
 
 Press <kbd>F5</kbd> in VS Code to launch an Extension Development Host with the extension loaded.
 
-**Both bundles must build.** The extension has two esbuild targets: `dist/extension.js` (Node, the real extension) and `dist/webExtension.js` (browser, a deliberately degraded fallback). A Node-only import that reaches the browser graph breaks the web build — `npm run build` will tell you.
+**All four bundles must build.** esbuild emits two *host* targets — `dist/extension.js` (Node, the real extension) and `dist/webExtension.js` (browser, a deliberately degraded fallback) — plus two isolated workers, `dist/services/serial/serialSidecarWorker.js` and `dist/services/scripts/scriptWorker.js`. A Node-only import that reaches the browser graph breaks the web build, and the worker bundles must not import `vscode`. `npm run build` will tell you.
 
 ---
 
@@ -148,7 +149,7 @@ If your change adds or alters user-facing behaviour, update `README.md` and `doc
 ### What not to commit
 
 - Secrets, tokens, private keys, real hostnames or credentials — including in tests and fixtures.
-- Anything under `docs/plans/`, `docs/superpowers/`, `.claude/`, `.specify/`, or `specs/` (other than the whitelisted `specs/001-scripting-support/contracts/`). These are local-only working notes and are already in `.gitignore`.
+- Anything under `docs/plans/`, `docs/superpowers/`, `.claude/`, `.specify/`, or `specs/`. These are local-only working notes and are already in `.gitignore`. Exactly **one** file under `specs/` is tracked — `specs/001-scripting-support/contracts/script-api.d.ts` — and the directory around it is still ignored, so do not add siblings to it expecting them to be committed.
 - Generated output: `dist/`, `node_modules/`, `*.vsix`, coverage reports.
 
 ### New dependencies
