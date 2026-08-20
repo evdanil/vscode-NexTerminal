@@ -73,9 +73,11 @@ npx vitest run test/unit/nexusCore.test.ts
 npx vitest run -t "pattern"
 ```
 
-Press <kbd>F5</kbd> in VS Code to launch an Extension Development Host with the extension loaded.
+Run `npm run build`, then press <kbd>F5</kbd> in VS Code to launch an Extension Development Host with the extension loaded. The `Run Extension` configuration is committed to `.vscode/launch.json`, so F5 works on a fresh checkout. There is deliberately no pre-launch build task wired up — which means a stale `dist/` gives you a stale Development Host, so build first when you have changed anything.
 
-**All four bundles must build.** esbuild emits two *host* targets — `dist/extension.js` (Node, the real extension) and `dist/webExtension.js` (browser, a deliberately degraded fallback) — plus two isolated workers, `dist/services/serial/serialSidecarWorker.js` and `dist/services/scripts/scriptWorker.js`. A Node-only import that reaches the browser graph breaks the web build, and the worker bundles must not import `vscode`. `npm run build` will tell you.
+**All four bundles must build.** esbuild emits two *host* targets — `dist/extension.js` (Node, the real extension) and `dist/webExtension.js` (browser, a deliberately degraded fallback) — plus two isolated workers, `dist/services/serial/serialSidecarWorker.js` and `dist/services/scripts/scriptWorker.js`. A Node-only import that reaches the browser graph breaks the web build, and `npm run build` will tell you.
+
+The worker bundles must not import `vscode` — they run outside the extension host, where that module does not exist. **The build only half-enforces this, so do not rely on it.** `serialSidecarWorker` does not list `vscode` as external, so an accidental import fails to resolve and the build stops. `scriptWorker` *does* list it external (`esbuild.mjs`), so the identical mistake bundles cleanly and leaves a runtime `require("vscode")` in a worker that has no extension host around it — every script then fails at startup, with nothing said at build time. When you touch `src/services/scripts/scriptWorker.ts` or anything it imports, check that constraint by eye.
 
 ---
 
