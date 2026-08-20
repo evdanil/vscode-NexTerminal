@@ -618,3 +618,106 @@ describe("VscodeConfigRepository cross-window overwrite detection", () => {
     }
   });
 });
+
+/**
+ * REVIEW FIXES E1/E2/E3 (PR #93) — the guard itself must not cry wolf: a
+ * warning that fires when nothing was lost trains the user to ignore the one
+ * that matters. E1: two windows converging on the SAME value is not a loss.
+ * E2: the Memento mutates its cache synchronously inside update(), before the
+ * returned promise settles, so an overlapping same-collection save in ONE
+ * window must never observe its own predecessor as a foreign write. E3: the
+ * steady-state save path must not serialize whole collections (multi-thousand
+ * -row imports run on the extension-host thread). Each test names the wrong
+ * implementation it fails against.
+ */
+describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () => {
+  const KEY = "nexus.groups";
+
+  function makeRepo(initial: unknown) {
+    const state: Record<string, unknown> = { [KEY]: initial };
+    const onConcurrentOverwrite = vi.fn();
+    const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+    return { state, onConcurrentOverwrite, repo };
+  }
+
+  it("E1: a foreign write whose content is identical to the pending save warns about nothing (kills the baseline-only comparison, which reports byte-identical data as overwritten)", async () => {
+    const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+    await repo.getGroups();
+    // Window B lands a change... which is exactly the value window A is about
+    // to save (deep-equal, different object — foreign propagation always
+    // yields fresh objects).
+    state[KEY] = ["Prod", "Shared"];
+
+    await repo.saveGroups(["Prod", "Shared"]);
+
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state[KEY]).toEqual(["Prod", "Shared"]);
+  });
+
+  it("E2: two overlapping same-collection saves in one window warn about nothing (kills the baseline refreshed only AFTER the awaited update — the cache mutates synchronously inside update(), so the second save would observe its own predecessor as foreign)", async () => {
+    const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+    await repo.getGroups();
+
+    // Neither save is awaited before the next starts — exactly the overlap
+    // NexusCore can produce with back-to-back persistence calls.
+    const first = repo.saveGroups(["Prod", "A"]);
+    const second = repo.saveGroups(["Prod", "A", "B"]);
+    await Promise.all([first, second]);
+
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state[KEY]).toEqual(["Prod", "A", "B"]);
+  });
+
+  it("E2 counter-direction: a genuinely foreign write landing between two local saves in the same window STILL warns (kills 'fixing' E2 by suppressing detection around local saves altogether)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+      await repo.getGroups();
+      await repo.saveGroups(["Prod", "A"]);
+      expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+
+      state[KEY] = ["From window B"];
+
+      await repo.saveGroups(["Prod", "A", "C"]);
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+      expect(state[KEY]).toEqual(["Prod", "A", "C"]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("E2 counter-direction: a foreign write landing DURING an overlap of two local saves still warns (kills a same-key queue that skips comparison for queued saves)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+      await repo.getGroups();
+
+      const first = repo.saveGroups(["Prod", "A"]);
+      state[KEY] = ["From window B"]; // propagation lands mid-overlap
+      const second = repo.saveGroups(["Prod", "A", "B"]);
+      await Promise.all([first, second]);
+
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+      expect(state[KEY]).toEqual(["Prod", "A", "B"]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("E3: steady-state saves perform NO JSON serialization of the collections (kills stringify-both-sides-per-save, whose two O(n) passes stall multi-thousand-row imports on the extension-host thread)", async () => {
+    const bigList = Array.from({ length: 2000 }, (_, i) => `Folder ${i}`);
+    const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+    await repo.getGroups();
+
+    const stringifySpy = vi.spyOn(JSON, "stringify");
+    try {
+      await repo.saveGroups(bigList);
+      await repo.saveGroups([...bigList, "one more"]);
+      expect(stringifySpy).not.toHaveBeenCalled();
+    } finally {
+      stringifySpy.mockRestore();
+    }
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state[KEY]).toEqual([...bigList, "one more"]);
+  });
+});

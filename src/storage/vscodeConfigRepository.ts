@@ -40,14 +40,19 @@ import { asArray } from "../utils/helpers";
  *     with no event exposed to extensions.
  *
  * So prevention is not available at this layer, but detection is: remember
- * the JSON of the raw stored value this window last read or wrote per key
- * (`lastSeenJson`), and on each save compare it against what the cache holds
- * NOW. A mismatch means another window wrote this collection in between; the
- * save still proceeds exactly as before (never blocked, never slower in any
- * measurable way, never able to fail because of the guard — detection errors
- * are swallowed), but the overwrite is no longer silent: it is logged and
- * surfaced through `onConcurrentOverwrite` so the user can redo the
- * superseded edit.
+ * the raw object this window last read or wrote per key (`lastSeenValue`,
+ * compared BY REFERENCE — see its doc comment) and, on each save, check
+ * whether the cache now holds something else. A changed reference means
+ * another window wrote this collection in between; the content is then
+ * confirmed to actually differ from what this save is writing (two windows
+ * converging on the same value lose nothing and stay silent). The save still
+ * proceeds exactly as before — never blocked, never able to fail because of
+ * the guard (detection errors are swallowed), and at zero serialization cost
+ * on the steady-state path: one cached synchronous read plus one reference
+ * comparison per save, with whole-collection JSON serialization only in the
+ * rare case that a foreign write was actually detected. The overwrite is no
+ * longer silent: it is logged and surfaced through `onConcurrentOverwrite`
+ * so the user can redo the superseded edit.
  *
  * KNOWN RESIDUAL (deliberate — a full optimistic-concurrency merge is out of
  * proportion here and would have to be fed back through NexusCore, whose sync
@@ -84,12 +89,18 @@ const SAVED_FILTERS_KEY = "nexus.savedFilters";
 
 export class VscodeConfigRepository implements ConfigRepository {
   /**
-   * Per-key JSON of the raw stored value this window last read or wrote. See
-   * the cross-window overwrite detection comment above. A key with no entry
-   * (never read nor written by this repository instance) is never warned
-   * about — there is no baseline to have diverged from.
+   * BASELINE, BY REFERENCE — the raw object this window last read from or
+   * wrote into the Memento cache, per key. See the cross-window overwrite
+   * detection comment above. Reference identity is the honest signal here:
+   * the Memento hands back the very object our own update() stored, while a
+   * foreign window's write replaces the cached state object wholesale with
+   * freshly deserialized objects — so `stored !== baseline` means precisely
+   * "a write this repository did not make landed in the cache". `undefined`
+   * as a VALUE means "key was absent when read"; a key with no ENTRY (never
+   * read nor written by this instance) is never warned about — there is no
+   * baseline to have diverged from.
    */
-  private readonly lastSeenJson = new Map<string, string>();
+  private readonly lastSeenValue = new Map<string, unknown>();
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
@@ -98,15 +109,9 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   /** Read the raw stored value and record it as this window's baseline. */
   private readRaw<T>(key: string): T {
-    const raw = this.context.globalState.get<T>(key, [] as T);
-    try {
-      this.lastSeenJson.set(key, JSON.stringify(raw));
-    } catch {
-      // A baseline that cannot be serialized is dropped rather than left
-      // stale: no baseline -> no warning, never a broken read.
-      this.lastSeenJson.delete(key);
-    }
-    return raw;
+    const raw = this.context.globalState.get<T>(key);
+    this.lastSeenValue.set(key, raw);
+    return raw === undefined ? ([] as T) : raw;
   }
 
   /**
@@ -114,15 +119,37 @@ export class VscodeConfigRepository implements ConfigRepository {
    * that would overwrite another window's change to the same key. The guard
    * must never make a save fail or change what gets written — detection
    * errors are swallowed and the update below runs unconditionally.
+   *
+   * Detection is two-stage so the steady state costs nothing (E3):
+   *   1. reference check — `get` returns the exact object our own update()
+   *      stored, so a changed reference means a write we did not make. O(1),
+   *      no serialization, and no false negatives are on offer at this layer
+   *      anyway (a foreign write that has not propagated is invisible to ANY
+   *      comparison, JSON included).
+   *   2. content confirmation — only on a changed reference (rare: a foreign
+   *      write actually propagated), serialize both sides once and warn only
+   *      if the stored content differs from what this save is writing. Two
+   *      windows converging on the SAME value lose nothing and must not warn
+   *      (E1). This is the irreducible cost: confirming content divergence
+   *      requires comparing content, and anything cheaper (lengths, samples)
+   *      would silently reintroduce the original silent-loss defect.
+   *
+   * BASELINE REFRESH IS SYNCHRONOUS WITH THE CACHE MUTATION (E2): VS Code's
+   * ExtensionMemento.update() assigns the new value into its cache
+   * synchronously and returns a promise only for the disk flush. The baseline
+   * is therefore refreshed between the update() CALL and its await — never
+   * after — so an overlapping same-collection save from this window sees a
+   * baseline that already reflects its predecessor and cannot mistake it for
+   * a foreign write. (If update() itself throws synchronously, the baseline
+   * is deliberately left untouched: the cache was not mutated either.) No
+   * locking, so no deadlock and no reordering: update() calls reach the
+   * Memento in exactly the order the callers made them.
    */
   private async guardedUpdate(key: string, collection: string, value: unknown): Promise<void> {
-    let newJson: string | undefined;
     try {
-      newJson = JSON.stringify(value);
-      const baseline = this.lastSeenJson.get(key);
-      if (baseline !== undefined) {
-        const stored = JSON.stringify(this.context.globalState.get(key, []));
-        if (stored !== baseline) {
+      if (this.lastSeenValue.has(key)) {
+        const stored = this.context.globalState.get(key);
+        if (stored !== this.lastSeenValue.get(key) && JSON.stringify(stored) !== JSON.stringify(value)) {
           console.warn(
             `[Nexus] The ${collection} list was changed by another VS Code window since this window last loaded it; this window's save is overwriting that change.`
           );
@@ -132,12 +159,9 @@ export class VscodeConfigRepository implements ConfigRepository {
     } catch (error) {
       console.warn("[Nexus] Concurrent-write detection failed; saving anyway:", error);
     }
-    await this.context.globalState.update(key, value);
-    if (newJson !== undefined) {
-      this.lastSeenJson.set(key, newJson);
-    } else {
-      this.lastSeenJson.delete(key);
-    }
+    const pending = this.context.globalState.update(key, value);
+    this.lastSeenValue.set(key, value);
+    await pending;
   }
 
   public async getServers(): Promise<ServerConfig[]> {
