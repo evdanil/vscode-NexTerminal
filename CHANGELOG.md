@@ -2,6 +2,10 @@
 
 ## [2.8.200] — 2026-08-20
 
+### Changed
+
+- **The Command Center now names NetBox and EVE-NG where you would go looking for them.** Importing devices from either has been possible since 2.8.189, behind an entry called **Add Inventory Source** — which names neither product, so searching the Command Palette for "netbox" or "eve-ng" found nothing and the reasonable conclusion was that Nexus could not do it. It now reads **Add Inventory Source (NetBox, EVE-NG…)**, in the Command Palette and in the Command Center's welcome view, so either search finds it. Nothing about the feature changed — only whether you can find it. The neutral wording was a deliberate choice when EVE-NG shipped, on the grounds that naming one provider tells the other's user the feature is absent; that was right, but naming *neither* gave both users exactly that outcome, so both are named now, with the trailing `…` for the providers that come next.
+
 ### Corrected
 
 Three statements in the 2.8.199 notes below were wrong. That entry is left as published, because a changelog is a record rather than a draft — the corrections belong here instead.

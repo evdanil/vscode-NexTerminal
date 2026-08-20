@@ -27,20 +27,40 @@ describe("package contributions", () => {
   });
 
   /**
-   * EVE-NG (Phase 1) — a SECOND inventory provider ships, so the entry points
-   * into the add-source flow are provider-agnostic. Naming one provider in
-   * them tells a user looking for the other that the feature is not there.
+   * EVE-NG (Phase 1) established that naming ONE provider in the add-source
+   * entry points tells a user looking for the other that the feature is not
+   * there. That was right, but the remedy — naming NEITHER — hands BOTH users
+   * that outcome: the Command Palette matches on command title, so a user
+   * searching "netbox" or "eve-ng" against a title reading only "Add Inventory
+   * Source" gets nothing and concludes the feature does not exist.
+   *
+   * So the rule is not "name no provider", it is "exclude no provider": name
+   * every shipped one, with a trailing ellipsis for the next — the same shape
+   * the neighbouring "Import Servers (CSV, MobaXterm, SecureCRT…)" line uses,
+   * for the same reason.
    */
-  describe("provider-agnostic inventory entry points", () => {
-    it("titles nexus.inventory.addSource without naming a provider (\u2298 \"Add Inventory Source (NetBox)\" reads as NetBox-only to an EVE-NG user)", () => {
-      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title;
-      expect(title).toBe("Add Inventory Source");
+  describe("provider-inclusive inventory entry points", () => {
+    const shippedProviders = [/NetBox/i, /EVE-NG/i];
+
+    it("names EVERY shipped provider in nexus.inventory.addSource's title (\u2298 \"(NetBox)\" reads as NetBox-only; \u2298 naming none is unsearchable for both)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      for (const provider of shippedProviders) {
+        expect(title).toMatch(provider);
+      }
     });
 
-    it("offers the same neutral wording in the Command Center welcome view", () => {
+    it("carries the same inclusive wording into the Command Center welcome view", () => {
       const welcome = packageJson.contributes.viewsWelcome?.find((w) => w.view === "nexusCommandCenter")?.contents ?? "";
-      expect(welcome).toContain("[Add Inventory Source](command:nexus.inventory.addSource)");
-      expect(welcome).not.toMatch(/NetBox/i);
+      const line = welcome.split("\n").find((l) => l.includes("nexus.inventory.addSource")) ?? "";
+      expect(line).not.toBe("");
+      for (const provider of shippedProviders) {
+        expect(line).toMatch(provider);
+      }
+    });
+
+    it("signals that the list is open-ended rather than the complete set of providers Nexus will ever have", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      expect(title).toContain("\u2026");
     });
   });
 
