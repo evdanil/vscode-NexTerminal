@@ -107,18 +107,6 @@ export interface InventoryStatusRefreshOutcome {
   unrefreshedSourceIds: string[];
 }
 
-/**
- * Optional collaborators the inventory commands report runtime facts to.
- * Everything here is a FACT this layer owns, never a request: what the observer
- * does with it is the observer's business (see `extension.ts`, where the status
- * poll uses `onSourceFree` to bring a source the arm fire it is still
- * waiting for).
- */
-export interface InventoryCommandObservers {
-  /** A source's busy claim has just been released, whatever had held it. */
-  onSourceFree?: (sourceId: string) => void;
-}
-
 function providerMissingMessage(providerId: string): string {
   return `Inventory provider "${providerId}" is not available (the extension providing it may be disabled).`;
 }
@@ -2254,8 +2242,7 @@ export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
   vault: SecretVault,
-  teardown: InventoryRuntimeTeardown,
-  observers?: InventoryCommandObservers
+  teardown: InventoryRuntimeTeardown
 ): vscode.Disposable[] {
   // F4 — shared by all four commands: syncNow holds a source's id for its whole
   // run; editSource/removeSource hold it for their whole run too (they mutate
@@ -2269,28 +2256,21 @@ export function registerInventoryCommands(
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
   /**
-   * REVIEW D6/E1/E2 — the ONE way a busy claim is dropped, and the one place
-   * that says so.
-   *
-   * The poll's arm fire — a source's not-running → running tick — is the fire
-   * with nothing behind it: the source has no status on screen and the next
-   * tick is a whole period away, up to an hour. `refreshStatus` declines a
-   * source that is claimed here, and the commonest way to ARM a source is an
-   * **Edit Source** save, which emits `core.onDidChange` synchronously while
-   * this very claim is held (it is released when the form is disposed). So the
-   * arm fire landed inside the busy window and was lost.
-   *
-   * This layer keeps NO memory of that. It reports two facts it owns — which
-   * sources a refresh did not run for (`refreshStatus`'s return value), and
-   * that a claim has been released (`onSourceFree`) — and the poll, which owns
-   * arming and visibility, owns the one piece of state they feed — has a fire
-   * RUN for this source since it armed? — and decides whether firing again is
-   * still justified. A `delete` that bypassed this funnel would silently
-   * drop the notification for whichever command forgot it.
+   * The ONE way a busy claim is dropped (review D6/E1/E2's funnel, kept as a
+   * funnel even though it no longer notifies anyone). `refreshStatus` DECLINES
+   * a source that is claimed here rather than racing whichever command holds
+   * it — and the commonest way to arm the status poll is an **Edit Source**
+   * save, which emits `core.onDidChange` synchronously while this very claim
+   * is held (it is released when the form is disposed), so the poll's arm fire
+   * routinely lands inside the busy window. Nothing here reports the release:
+   * the poll's own WARM-UP retries a declined source on its own short clock
+   * (see `inventoryStatusPoll.ts`), so the next warm tick after this delete
+   * finds the source free. This layer's whole contribution is the decline
+   * itself being visible — `refreshStatus` returns `unrefreshedSourceIds` —
+   * which is what lets the poll tell a fire that ran from one it must retry.
    */
   const releaseSourceClaim = (sourceId: string): void => {
     inFlightSourceIds.delete(sourceId);
-    observers?.onSourceFree?.(sourceId);
   };
 
   // LIVE STATUS (Phase 2) — monotonic status-refresh generation, PER SOURCE.

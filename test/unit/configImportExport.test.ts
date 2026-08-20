@@ -7189,12 +7189,14 @@ describe("backup export round-trip", () => {
    * restore finished. Same user-visible outcome as a swallowed arm tick, by a
    * different route.
    *
-   * The refresh now DECLINES a source whose declared credential the vault
-   * cannot supply — reported, not attempted, and no doomed provider call — and
-   * the debt is redeemed when the config-mutation queue drains, which is after
-   * the restore has written the credential.
+   * The refresh DECLINES a source whose declared credential the vault cannot
+   * supply — reported, not attempted, and no doomed provider call — and the
+   * poll keeps a declined source WARMING: its own short retry clock asks again
+   * moments later, by which time the restore has written the credential.
+   * Nothing notifies the poll that the restore finished; the warm tick simply
+   * finds the vault populated.
    */
-  it("refreshes a restored source's lab status as soon as the restore finishes, not a period later (⊘ firing at a source whose password has not been restored yet spends the arm fire on a silent auth failure)", async () => {
+  it("refreshes a restored source's lab status within the warm window after the restore, not a period later (⊘ firing at a source whose password has not been restored yet spends the arm fire on a silent auth failure)", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
@@ -7214,25 +7216,27 @@ describe("backup export round-trip", () => {
       fetchStatus
     });
 
-    let poll: ReturnType<typeof startInventoryStatusPoll> | undefined;
     const inventoryDisposables = registerInventoryCommands(
       core,
       registry,
       vault,
-      { teardownServerRuntime: async () => {} },
-      { onSourceFree: (id) => poll?.sourceSettled(id) }
+      { teardownServerRuntime: async () => {} }
     );
+    // Fake ONLY the interval clock (the poll's warm-up runs on it); everything
+    // else in the import flow keeps real timers.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     // extension.ts's own wiring, reproduced: the poll fires the real command and
     // reads which sources it did not refresh off the answer.
     mockExecuteCommand.mockImplementation((cmd: string, ...rest: unknown[]) =>
       cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
     );
-    poll = startInventoryStatusPoll({
+    const poll = startInventoryStatusPoll({
       view: { visible: true, onDidChangeVisibility: () => ({ dispose: () => {} }) },
       getSources: () =>
         core.getSnapshot().inventorySources.map((source) => ({
           id: source.id,
-          intervalSeconds: Number(source.config.statusPollSeconds ?? 0)
+          intervalSeconds: Number(source.config.statusPollSeconds ?? 0),
+          incarnation: source.revision
         })),
       onDidChangeSources: (listener) => ({ dispose: core.onDidChange(listener) }),
       fire: (sourceId) =>
@@ -7241,7 +7245,6 @@ describe("backup export round-trip", () => {
           return { ran: !(Array.isArray(unrefreshed) && unrefreshed.includes(sourceId)) };
         })
     });
-    const idleSub = configMutationLock.onIdle(() => poll?.sourceSettled());
 
     try {
       const source = makeInventorySource({
@@ -7274,12 +7277,14 @@ describe("backup export round-trip", () => {
 
       // The credential really did arrive with the restore…
       expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("restored-token");
-      // …and the refresh happened, WITH it, without any timer being advanced —
-      // a period here would be an hour.
-      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+      // …but the arm fire beat it there and was DECLINED, not spent.
+      expect(fetchStatus).not.toHaveBeenCalled();
+      // The warm retry — 5 s where a period would be an hour — runs WITH it.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(fetchStatus).toHaveBeenCalledTimes(1);
       expect(fetchStatus).toHaveBeenCalledWith(expect.anything(), { apiToken: "restored-token" });
     } finally {
-      idleSub.dispose();
+      vi.useRealTimers();
       poll.dispose();
       for (const d of inventoryDisposables) d.dispose();
       mockExecuteCommand.mockReset();
