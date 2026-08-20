@@ -219,6 +219,19 @@ interface SourceSchedule {
    * reached the tree.
    */
   armedIncarnation: string | undefined;
+  /**
+   * WHICH ARMING is currently live — a serial bumped on EVERY fresh arming,
+   * including one that re-arms the same record (a hide/show cycle). It exists
+   * because the incarnation is DELIBERATELY too coarse for one of the two
+   * rules a completed fire drives (see `release`): one record can be armed
+   * many times, and while a fire that RAN under an earlier arming of the same
+   * record still serves the current one (its report landed — promotion is
+   * per-RECORD), a fire that was DECLINED says something only about the
+   * arming that dispatched it. The current arming has its own fresh warm
+   * timer already counting; a stale decline must not double its delay or
+   * restart its phase (backoff is per-ARMING).
+   */
+  armingSerial: number;
 }
 
 export interface InventoryStatusPoll {
@@ -275,6 +288,7 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
     // under, and by the time it reports, the schedule may have been re-armed
     // in place for a DIFFERENT incarnation of the record.
     const dispatchedFor = schedule.armedIncarnation;
+    const dispatchedUnderArming = schedule.armingSerial;
     const result = options.fire(id);
     // Latch only while a real (pending) sweep is outstanding: a fire that
     // returns a thenable (the executeCommand path / a gated test) holds the
@@ -293,21 +307,38 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
           schedules.delete(id);
           return;
         }
-        // A fire that outlived its incarnation says nothing about the record
-        // standing here now — its report was dropped by `refreshStatus`'s own
-        // revision guard — so it neither promotes nor backs off the new
-        // arming, whose own warm timer is already retrying.
-        if (schedule.armedIncarnation !== dispatchedFor) {
+        // TWO RULES, AT TWO DELIBERATELY DIFFERENT GRANULARITIES. Do not
+        // "fix" the asymmetry: each guard is load-bearing for a case the
+        // other would get wrong.
+        if (!(outcome && outcome.ran === false)) {
+          // PROMOTION IS PER-RECORD (the incarnation). ANYTHING BUT AN
+          // EXPLICIT DECLINE PROMOTES — a `void` result (a caller with
+          // nothing to say) and a REJECTED sweep (a lab box that is down)
+          // both read as "ran": the tick reached the provider, and there is
+          // nothing a retry would do differently. A fire that outlived its
+          // RECORD promotes nothing — its report was dropped by
+          // `refreshStatus`'s own revision guard — but a fire that merely
+          // outlived its ARMING of the same record (a hide/show cycle) still
+          // put this record's status on screen, which is everything the new
+          // arming is warming FOR. Keying this to the arming instead would
+          // leave the source warming and buy a redundant crawl of the lab
+          // box for status already applied.
+          if (schedule.armedIncarnation === dispatchedFor) {
+            schedule.state = "steady";
+            syncTimer(id, schedule);
+          }
           return;
         }
-        if (!(outcome && outcome.ran === false)) {
-          // ANYTHING BUT AN EXPLICIT DECLINE PROMOTES — a `void` result (a
-          // caller with nothing to say) and a REJECTED sweep (a lab box that
-          // is down) both read as "ran": the tick reached the provider, and
-          // there is nothing a retry would do differently.
-          schedule.state = "steady";
-          syncTimer(id, schedule);
-        } else if (schedule.state === "warming") {
+        // BACKOFF IS PER-ARMING (the serial). A decline is a statement about
+        // THIS dispatched attempt, and an attempt belongs to the arming whose
+        // timer (or arm transition) dispatched it — not to the record. A
+        // fresh arming of the SAME record resets its warm delay to 5 s and
+        // starts its own timer; a stale decline passes the incarnation test,
+        // and letting it through here would double that delay and replace
+        // that timer, silently breaking "the first retry after a fresh
+        // arming is 5 s". The stale decline is simply dropped: the live
+        // arming's own warm tick is already on its way to retry.
+        if (schedule.armingSerial === dispatchedUnderArming && schedule.state === "warming") {
           if (viaTimer) {
             schedule.warmDelaySeconds *= 2;
           }
@@ -378,7 +409,8 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
           inFlight: false,
           state: "warming",
           warmDelaySeconds: WARM_INITIAL_DELAY_SECONDS,
-          armedIncarnation: source.incarnation
+          armedIncarnation: source.incarnation,
+          armingSerial: 0
         };
         schedules.set(id, schedule);
       }
@@ -402,6 +434,9 @@ export function startInventoryStatusPoll(options: InventoryStatusPollOptions): I
         // reading as satisfied by history.
         schedule.state = "warming";
         schedule.warmDelaySeconds = WARM_INITIAL_DELAY_SECONDS;
+        // THIS arming's identity, for the backoff rule: a decline reported by
+        // a fire an EARLIER arming dispatched must not be charged to this one.
+        schedule.armingSerial += 1;
         // P3-8 — fire immediately on the fresh arming, so a reload (or an
         // edit that just blanked the row) does not sit on an empty status map.
         // `tick` still honours the latch, so a source re-armed while its

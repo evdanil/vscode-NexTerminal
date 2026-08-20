@@ -489,12 +489,23 @@ describe("startInventoryStatusPoll", () => {
     });
 
     /**
-     * A RE-ARMING the latch swallowed. A source re-armed while a ROUTINE sweep
-     * is outstanding gets no arm fire (the latch swallows it, correctly), and
-     * that sweep may then DECLINE. Nothing external announces anything — the
-     * new arming is simply still warming, and its warm timer retries.
+     * A RE-ARMING the latch swallowed — and the seam between the two identity
+     * rules. A source re-armed while a ROUTINE sweep is outstanding gets no
+     * arm fire (the latch swallows it, correctly), and that sweep may then
+     * DECLINE. Nothing external announces anything — the new arming is simply
+     * still warming, and its warm timer retries at ITS OWN 5 s.
+     *
+     * The sting is in whose backoff that stale decline charges. The record is
+     * the SAME (a hide/show cycle), so the incarnation matches — and the
+     * incarnation is the right guard for PROMOTION (see the twin above: a
+     * sweep that RAN across a hide/show serves the new arming). But the
+     * decline was a fact about the PREVIOUS arming's attempt, dispatched by
+     * the previous arming's timer: letting it double the fresh arming's
+     * warm delay — and replace its already-pending 5 s timer — makes "the
+     * first retry after a fresh arming is 5 s" silently false. Backoff is
+     * therefore keyed to the ARMING (per-arming serial), not the record.
      */
-    it("keeps a source re-armed behind an outstanding sweep warming when that sweep declines, so its warm tick brings the fire (⊘ trusting the swallowed arm tick, or the declined routine sweep, as the arming's fire leaves the source on an empty status map for a full period)", async () => {
+    it("keeps a source re-armed behind an outstanding sweep warming when that sweep declines, and the fresh arming's FIRST retry is still at its own 5 s — a stale decline neither doubles its delay nor restarts its timer (⊘ charging a previous arming's decline to the new arming turns the pinned 5 s first retry into 10 s, off a phase the new arming never set)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
       const gate = deferred();
@@ -507,17 +518,48 @@ describe("startInventoryStatusPoll", () => {
       });
       startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(30_000); // routine tick (timer-dispatched) — in flight
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      view.emit(false); // disarmed; the entry survives only to hold its latch
+      view.emit(true); // re-armed — its arm tick is swallowed by that latch; its 5 s warm timer starts NOW
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      // The old sweep declines two seconds INTO the fresh arming's warm window.
+      await vi.advanceTimersByTimeAsync(2_000);
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2); // the retry is the warm TICK, not the release
+
+      // 5 s from the RE-ARM — not 5 s from the decline (a restarted timer), and
+      // not 10 s from anywhere (a doubled delay the new arming never earned).
+      await vi.advanceTimersByTimeAsync(2_999); // t = re-arm + 4.999 s
+      expect(fire).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1); // t = re-arm + 5 s
+      expect(fire).toHaveBeenCalledTimes(3);
+    });
+
+    it("prunes a schedule whose sweep declines AFTER a disarm — the retained latch entry goes, nothing retries, no timer survives (⊘ a stale decline resurrecting a warm-up for a source nothing is polling crawls a lab behind a closed panel)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+      const gate = deferred();
+      let call = 0;
+      const fire = vi.fn(() => {
+        call++;
+        if (call === 1) return Promise.resolve({ ran: true }); // arm fire ran
+        return gate.promise.then(() => ({ ran: false })); // routine tick, slow, declined
+      });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(30_000); // routine tick — in flight
       expect(fire).toHaveBeenCalledTimes(2);
 
       view.emit(false); // disarmed; the entry survives only to hold its latch
-      view.emit(true); // re-armed — its arm tick is swallowed by that latch
-      expect(fire).toHaveBeenCalledTimes(2);
-
       gate.resolve();
-      await vi.advanceTimersByTimeAsync(0); // the outstanding sweep DECLINED
-      await vi.advanceTimersByTimeAsync(10_000); // within the warm window, not 30 s later
-      expect(fire).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(0); // the sweep DECLINED, after the disarm
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(3_600_000);
+      expect(fire).toHaveBeenCalledTimes(2);
     });
 
     it("warms EVERY declined source independently — the shape a restore that persists sources before their credentials leaves behind (⊘ a lost arm fire per source leaves every one of them waiting a full period)", async () => {
