@@ -2806,10 +2806,36 @@ export class NexusCore {
     this.emitChanged();
   }
 
+  /**
+   * OBSERVER ISOLATION — each listener is invoked inside its own try/catch,
+   * and a throw is logged and swallowed. Two invariants, both load-bearing:
+   *
+   *   1. Every listener runs. emitChanged() is the only change signal the UI
+   *      layer gets; a tree provider must not miss a refresh because an
+   *      unrelated observer (e.g. a status poll) threw first.
+   *   2. emitChanged() never throws. It is called synchronously at the END of
+   *      persistence methods — after the repository write has already
+   *      succeeded — and several call sites sit in a `finally` while an error
+   *      is already in flight. A throw escaping here would make a COMPLETED
+   *      persist look like a failed one to the command layer (whose rollback
+   *      logic assumes rejection means "nothing was saved"), or replace a real
+   *      persistence error with an observer's. Only the notification failed;
+   *      the data landed.
+   *
+   * Swallow-and-log (not aggregate-and-rethrow) is the repo-wide convention
+   * for observer dispatch — see ptyObserverHub.notifyOutput ("one throw must
+   * not break delivery to the others") and AsyncMutex.notifyIdle ("a throwing
+   * observer must never wedge the mutex"). The log line keeps a genuine
+   * programming error visible in the extension host log instead of silent.
+   */
   private emitChanged(): void {
     const snapshot = this.getSnapshot();
     for (const listener of this.listeners) {
-      listener(snapshot);
+      try {
+        listener(snapshot);
+      } catch (error) {
+        console.error("[Nexus] NexusCore onDidChange listener threw; the change was persisted and other listeners still run:", error);
+      }
     }
   }
 

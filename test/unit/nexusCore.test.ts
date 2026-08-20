@@ -1290,3 +1290,108 @@ describe("NexusCore", () => {
     expect(recursive.servers).toHaveLength(2);
   });
 });
+
+/**
+ * DEFECT A (observer isolation) — emitChanged() runs synchronously at the end
+ * of every persistence method, AFTER the repository write has succeeded. A
+ * listener that throws must not (1) make the completed save look failed to its
+ * caller, (2) starve later listeners of the notification, or (3) replace a
+ * real persistence error on the finally-emitting paths. Each test here fails
+ * against a specific wrong implementation, named inline.
+ */
+describe("NexusCore emitChanged observer isolation", () => {
+  it("a throwing listener does not reject a save whose write already landed (kills the unguarded dispatch loop, where the observer's throw escapes emitChanged and the persisted save reports failure)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      core.onDidChange(() => {
+        throw new Error("observer bug");
+      });
+
+      await expect(
+        core.addOrUpdateInventorySource({
+          id: "source-1",
+          providerId: "netbox",
+          name: "NetBox",
+          targetFolder: "NetBox",
+          prunePolicy: "orphan",
+          defaultUsername: "admin",
+          config: {},
+          secretFieldIds: []
+        })
+      ).resolves.toBeUndefined();
+
+      // The write really landed — in memory AND in the repository — so a
+      // rejection would have been a lie, and so would any caller rollback.
+      expect(core.getInventorySource("source-1")?.name).toBe("NetBox");
+      expect(await repository.getInventorySources()).toHaveLength(1);
+      // Swallowed but not silent: the programming error is logged.
+      expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("onDidChange listener threw"), expect.any(Error));
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("every listener still runs after an earlier one throws (kills a try/catch wrapped around the WHOLE loop, which silences the throw but starves listeners registered after the thrower)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const seenServerCounts: number[] = [];
+      core.onDidChange(() => {
+        throw new Error("observer bug");
+      });
+      core.onDidChange((snapshot) => {
+        seenServerCounts.push(snapshot.servers.length);
+      });
+
+      await core.addOrUpdateServer({
+        id: "s1",
+        name: "S1",
+        host: "h",
+        port: 22,
+        username: "u",
+        authType: "password",
+        isHidden: false
+      });
+
+      // The later listener got the real post-save snapshot, not nothing.
+      expect(seenServerCounts).toEqual([1]);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("on a finally-emitting path a throwing listener does not REPLACE a real persistence error (kills the unguarded loop from the other direction: removeDeviceTemplate's caller must see the repository's error, not the observer's)", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    // Template exists before the failure is armed, so removeDeviceTemplate
+    // reaches its saveDeviceTemplates call (hadPrevious === true).
+    await core.addOrUpdateDeviceTemplate({ id: "tpl1", name: "T", fields: {} });
+    const persistenceError = new Error("disk full");
+    vi.spyOn(repository, "saveDeviceTemplates").mockRejectedValue(persistenceError);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      core.onDidChange(() => {
+        throw new Error("observer bug");
+      });
+
+      // removeDeviceTemplate emits from a `finally` while the save's rejection
+      // is in flight; an unguarded listener throw there would supersede it.
+      await core.removeDeviceTemplate("tpl1").then(
+        () => {
+          throw new Error("expected the persistence rejection to propagate");
+        },
+        (error: unknown) => {
+          expect(error).toBe(persistenceError);
+        }
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+});
