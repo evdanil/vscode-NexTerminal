@@ -144,7 +144,9 @@ If your change adds or alters user-facing behaviour, update `README.md` and `doc
 - Keep unrelated reformatting out of the diff.
 - Rebase on `main` rather than merging it in, if you're comfortable doing so.
 
-**Do not bump the version.** The maintainer handles versioning and releases when merging, so that concurrent pull requests don't collide on `package.json` and so release timing stays a maintainer decision.
+**Do not bump the version.** Leave `package.json` alone. Concurrent pull requests would otherwise collide on that one line, and release timing stays a maintainer decision.
+
+To be concrete about what happens instead, since nothing automates it: the maintainer bumps the patch version in a separate commit when merging your work. There is no merge-time bump in CI — `release.yml` only sets `package.json` to match a tag that already exists at publish time, which is not the same thing. If you see `CLAUDE.md` say that every change pull request bumps the patch version, that rule is addressed to maintainer-authored pull requests, not to yours.
 
 **Never put a line containing only `[release]` in a commit message.** That string on its own line is the live release trigger for this repository — it publishes to the VS Code Marketplace and Open VSX, irreversibly, and a published version can never be withdrawn or re-used.
 
