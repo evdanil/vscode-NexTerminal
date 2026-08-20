@@ -7,10 +7,12 @@ import type { VisibilityAwareView } from "../../src/services/terminal/viewVisibi
  * inventory source rather than as one global sweep. Each source with a positive
  * interval gets its own timer: it fires once immediately on arm (so a window
  * reload / becoming-visible does not sit on an empty status map for a whole
- * period), then every N seconds while the Command Center is visible. A
- * PER-SOURCE in-flight latch keeps one slow lab box from stacking concurrent
- * crawls against itself — without slowing down every other source, which a
- * single global latch did.
+ * period), WARMS at a short self-clocked retry cadence until a fire actually
+ * RUNS (a fire can be declined — source busy, or credentials not in the vault
+ * yet), and then runs STEADY at its own N seconds while the Command Center is
+ * visible. A PER-SOURCE in-flight latch keeps one slow lab box from stacking
+ * concurrent crawls against itself — without slowing down every other source,
+ * which a single global latch did.
  *
  * This file deliberately does NOT mock `vscode`: the module under test must
  * stay `vscode`-free (type-only imports), and an accidental runtime import
@@ -174,176 +176,180 @@ describe("startInventoryStatusPoll", () => {
   });
 
   /**
-   * REVIEW D6/E1/E2 — THE ARM DEBT.
+   * THE WARM-UP, replacing the settle-notification protocol (reviews D6-G1).
    *
    * The arm fire is the one tick that cannot simply be missed: a source that
    * has just started polling has no status on screen at all, and the next tick
    * is a whole period away — up to an hour. But the refresh it calls can
-   * legitimately decline to run: the source may be mid-sync/edit/remove/control
+   * legitimately DECLINE to run: the source may be mid-sync/edit/remove/control
    * (`inFlightSourceIds`), or its credentials may not be in the vault yet
-   * (mid-restore of a backup). A decline that is silently treated as "fired" is
-   * the whole bug.
+   * (mid-restore of a backup). A decline that is silently treated as "fired"
+   * is the whole bug.
    *
-   * So a declined arm fire becomes a DEBT — and the debt is a property of the
-   * ARM STATE, held here, rather than a note kept by the refresh. That is what
-   * gives it a lifecycle: it is created only by a decline, it dies with the
-   * schedule that owns it (interval to 0, source removed, no longer offered,
-   * view hidden), and it is redeemed only against live arm state. A debt cannot
-   * outlive the arming that justified it, and cannot resurrect after it dies.
+   * Earlier shapes answered a decline with a NOTIFICATION: the command layer
+   * reported "this source's claim was released", the config-mutation lock
+   * reported "the queue drained", and the scheduler redeemed the arming when
+   * one arrived. Every review round found a new way for the obligation and the
+   * notification meant to discharge it to get out of step — a settle landing
+   * while the fire was still deciding, an arm tick the latch swallowed, a
+   * record replaced under a live arming. The warm-up deletes the notifications
+   * instead of patching them: a schedule that has NOT yet had a fire RUN since
+   * it armed is WARMING and retries on its own short clock (5 s, backing off
+   * 5 → 10 → 20 → …, never slower than the source's own period); the first
+   * fire that RUNS promotes it to STEADY at the configured period. A wakeup
+   * that is a repeating timer cannot be lost, so there is no check-then-act
+   * window to straddle. A declined fire costs nothing on the network — both
+   * declines are refused before any provider call — so the only warm retry
+   * that reaches the lab box is the one that succeeds.
    */
-  /**
-   * ARMING, AND THE FIRE A SOURCE IS STILL WAITING FOR.
-   *
-   * The scheduler remembers ONE thing about a source's arming: whether any fire
-   * has RUN since it armed (`SourceSchedule.firedSinceArm`). A settle brings the
-   * source that fire if it is still waiting for one, and does nothing at all if
-   * it is not. That replaced an `armOwed` DEBT — created only by a declined ARM
-   * fire, cancelled on disarm, redeemed on settle — whose obligation and
-   * notification kept getting out of step across an await.
-   */
-  describe("arming, and the fire a source is still waiting for", () => {
+  describe("the warm-up, and the fire a source is still waiting for", () => {
     /** A fire that declines everything, as a busy / credential-less refresh does. */
     const declining = () => vi.fn(async () => ({ ran: false }));
 
-    it("brings a source its fire when it settles after a DECLINED arm fire, and does not touch the schedule's phase (⊘ treating a decline as a fire loses the arm tick entirely: polling appears to do nothing for a whole period)", async () => {
+    it("retries a DECLINED arm fire on the warm cadence — 5 s — instead of waiting the configured period (⊘ treating a decline as a fire loses the arm tick entirely: polling appears to do nothing for an hour)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = declining();
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
 
       expect(firedIds(fire)).toEqual(["a"]);
-      await vi.advanceTimersByTimeAsync(0); // let the decline land
-      fire.mockClear();
-
-      poll.sourceSettled("a");
-      expect(firedIds(fire)).toEqual(["a"]);
-      // The timer is untouched: still one, still on its own period.
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(fire).toHaveBeenCalledTimes(1); // not before the warm delay
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fire).toHaveBeenCalledTimes(2); // the warm retry, at 5 s
+      // Still exactly one timer for the source — warm scheduling replaces, never layers.
       expect(vi.getTimerCount()).toBe(1);
     });
 
-    it("keeps waiting while each retry is declined too, and stops the moment one runs (⊘ counting a declined retry as the fire drops the source again, and re-arming the wait after a successful one crawls the lab on every later settle)", async () => {
+    it("backs off while each retry is declined too — 5, 10, 20 s between attempts — and stops warming the moment one runs (⊘ a fixed 5 s retry polls the vault every 5 s forever for a source whose credentials never arrive; not stopping on a run crawls the lab on every warm tick)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       let ran = false;
       const fire = vi.fn(async () => ({ ran }));
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
-      await vi.advanceTimersByTimeAsync(0);
-      fire.mockClear();
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      expect(fire).toHaveBeenCalledTimes(1); // arm fire (t=0) — declined
 
-      // Still declined — still owed.
-      poll.sourceSettled("a");
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fire).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5_000); // t=5s
+      expect(fire).toHaveBeenCalledTimes(2); // first retry — declined
+      await vi.advanceTimersByTimeAsync(9_000); // t=14s
+      expect(fire).toHaveBeenCalledTimes(2); // the next gap is 10 s, not 5
+      await vi.advanceTimersByTimeAsync(1_000); // t=15s
+      expect(fire).toHaveBeenCalledTimes(3); // second retry — declined
+      await vi.advanceTimersByTimeAsync(19_000); // t=34s
+      expect(fire).toHaveBeenCalledTimes(3); // the next gap is 20 s
+      await vi.advanceTimersByTimeAsync(1_000); // t=35s
+      expect(fire).toHaveBeenCalledTimes(4); // third retry — declined; next gap 40 s
 
-      // This one runs, so the debt is paid…
       ran = true;
-      poll.sourceSettled("a");
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fire).toHaveBeenCalledTimes(2);
-
-      // …and no later settle fires again.
-      poll.sourceSettled("a");
-      poll.sourceSettled();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fire).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(40_000); // t=75s — this retry RUNS
+      expect(fire).toHaveBeenCalledTimes(5);
+      // STEADY now: no warm retry follows a fire that ran; the next tick is a
+      // whole configured period away.
+      await vi.advanceTimersByTimeAsync(200_000);
+      expect(fire).toHaveBeenCalledTimes(5);
     });
 
-    it("asks for nothing more once a fire has RUN, however many settles arrive (⊘ firing on settle without checking turns every sync, edit and node control into an extra lab crawl)", async () => {
+    it("never warms SLOWER than the source's own cadence — the warm delay is capped at configuredSeconds (⊘ uncapped doubling makes the 'warm' retry of a 3 s source arrive after its own routine tick would have)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3 }]);
+      const fire = declining();
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      expect(fire).toHaveBeenCalledTimes(1); // arm fire — declined
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(fire).toHaveBeenCalledTimes(2); // min(5, 3) = 3 s
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(fire).toHaveBeenCalledTimes(3); // min(10, 3) = 3 s — capped, not backed off past the period
+    });
+
+    it("asks for nothing more once a fire has RUN — no warm retry follows a successful arm fire (⊘ warming regardless of the outcome turns every arming into an extra lab crawl 5 s later)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = vi.fn(async () => ({ ran: true }));
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
-      await vi.advanceTimersByTimeAsync(0);
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       expect(fire).toHaveBeenCalledTimes(1);
 
-      poll.sourceSettled("a");
-      poll.sourceSettled();
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(60_000);
       expect(fire).toHaveBeenCalledTimes(1);
     });
 
-    it("treats a fire that reports NOTHING as one that ran — the shape a caller with no outcome to give returns (⊘ reading a void result as a decline leaves every source waiting after every tick and crawls on every settle)", async () => {
+    it("treats a fire that reports NOTHING as one that ran — the shape a caller with no outcome to give returns (⊘ reading a void result as a decline leaves every source warming after every tick, retrying forever)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = vi.fn();
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
-      await vi.advanceTimersByTimeAsync(0);
-      fire.mockClear();
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      expect(fire).toHaveBeenCalledTimes(1);
 
-      poll.sourceSettled("a");
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fire).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fire).toHaveBeenCalledTimes(1);
     });
 
-    it("leaves a source that has ALREADY had a fire run alone when a later routine tick is declined (⊘ deferring every declined tick buys an extra lab crawl after every sync, which has already applied fresh status, and after every node control, which fires its own refresh)", async () => {
+    it("leaves a STEADY source alone when a later routine tick is declined — a decline never demotes (⊘ demoting on any decline buys an extra lab crawl after every sync, which has already applied fresh status, and after every node control, which fires its own refresh)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
       let ran = true;
       const fire = vi.fn(async () => ({ ran }));
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
-      await vi.advanceTimersByTimeAsync(0); // the ARM fire ran
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0); // the ARM fire ran → STEADY
       ran = false;
-      await vi.advanceTimersByTimeAsync(30_000); // a routine tick — declined
+      await vi.advanceTimersByTimeAsync(30_000); // routine tick at t=30 — declined
       expect(fire).toHaveBeenCalledTimes(2);
 
-      poll.sourceSettled("a");
-      await vi.advanceTimersByTimeAsync(0);
+      // No warm retry sneaks in: the next fire is the routine tick at t=60.
+      await vi.advanceTimersByTimeAsync(29_000);
       expect(fire).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fire).toHaveBeenCalledTimes(3);
     });
 
-    it("stops waiting when the view is hidden, and does not resurrect the wait when the view comes back (⊘ a wait that survives the disarm crawls the lab after the user closed the panel — against the poll's own visible-gating — and then a second time on the next settle)", async () => {
+    it("stops warming when the view is hidden, and a fresh show starts its own warm-up (⊘ a warm timer that survives the disarm crawls the lab after the user closed the panel — against the poll's own visible-gating)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = declining();
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       await vi.advanceTimersByTimeAsync(0);
       fire.mockClear();
 
       view.emit(false); // panel closed — nothing is armed any more
-      poll.sourceSettled("a");
-      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(3_600_000);
       expect(fire).not.toHaveBeenCalled();
 
-      // Coming back is a fresh not-running → running transition: it fires its OWN
-      // arm tick (one), and the ended wait adds nothing on top.
+      // Coming back is a fresh not-running → running transition: it fires its
+      // OWN arm tick (one), with nothing carried over from the ended warm-up.
       view.emit(true);
       await vi.advanceTimersByTimeAsync(0);
       expect(fire).toHaveBeenCalledTimes(1);
     });
 
-    it("stops waiting when the source stops being polled at all — interval 0, removed, or no longer offered (⊘ a stale wait fires after the user turned polling off, or for a source that is gone)", async () => {
+    it("stops warming when the source stops being polled at all — interval 0, removed, or no longer offered (⊘ a stale warm timer fires after the user turned polling off, or for a source that is gone)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }, { id: "b", intervalSeconds: 3600 }]);
       const fire = declining();
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       await vi.advanceTimersByTimeAsync(0);
       fire.mockClear();
 
       // `a` turned off; `b` removed from the list entirely.
       feed.set([{ id: "a", intervalSeconds: 0 }]);
-      await vi.advanceTimersByTimeAsync(0);
-      poll.sourceSettled("a");
-      poll.sourceSettled("b");
-      poll.sourceSettled();
-      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(3_600_000);
       expect(fire).not.toHaveBeenCalled();
     });
 
     /**
-     * THE LOST WAKEUP (review F1) — the bug a debt made possible and a state
-     * plus a recorded wakeup makes impossible.
-     *
-     * The arm refresh is ASYNCHRONOUS: `refreshStatus` awaits a vault read
-     * before it can say whether it ran. The config-mutation queue can drain in
-     * that window, so `sourceSettled` arrives while the source has neither run
-     * a fire nor yet reported that it could not. A protocol that reads a DEBT
-     * at that instant finds none, discards the settle, and only then does the
-     * fire resolve `ran: false` and create the debt — after the one
-     * notification that could ever have discharged it. This is the live
-     * ordering of a backup restore: sources are persisted, credentials are
-     * written later in the same locked run, and the drain fires in between.
+     * THE RESTORE ORDERING (review F1's scenario, without review F1's bug
+     * class). The arm refresh is ASYNCHRONOUS: `refreshStatus` awaits a vault
+     * read before it can say whether it ran, and a backup restore's mutation
+     * queue routinely drains inside that window — the record lands, the arm
+     * fire goes off to read the vault, the credentials are written, and only
+     * then does the fire resolve `ran: false`. Under a settle-notification
+     * protocol this was the lost-wakeup race. Under the warm-up there is no
+     * notification to lose: the warm timer keeps its own clock, its ticks are
+     * swallowed by the latch while the fire is still deciding (never stacking
+     * a second crawl), and the first tick after the late decline retries.
      */
-    it("answers a settle that arrives BEFORE the arm fire has reported, the moment it reports a decline (⊘ reading the debt at settle time finds none, discards the notification, and the source then waits its whole configured period — an hour — for a status a restore had already made available)", async () => {
+    it("retries after a fire that reports its decline LATE, while warm ticks during the in-flight window are swallowed by the latch (⊘ counting the latch-swallowed tick as a retry stacks a second crawl; not retrying after the late decline strands a restored source for its whole configured period)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const gate = deferred();
@@ -353,95 +359,39 @@ describe("startInventoryStatusPoll", () => {
         // The arm fire reads the vault first, so it reports LATE — and declines.
         return call === 1 ? gate.promise.then(() => ({ ran: false })) : Promise.resolve({ ran: true });
       });
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       expect(fire).toHaveBeenCalledTimes(1); // armed; the fire is still in flight
 
-      // The mutation queue drains while the arm fire is still deciding.
-      poll.sourceSettled();
-      expect(fire).toHaveBeenCalledTimes(1); // nothing to dispatch yet — the latch is held
+      // Two warm ticks pass while the arm fire is still deciding — both
+      // swallowed by the in-flight latch, neither reaching `fire`.
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(fire).toHaveBeenCalledTimes(1);
 
-      gate.resolve();
+      gate.resolve(); // the decline lands (the restore has written the credential by now)
       await vi.advanceTimersByTimeAsync(0);
-      // No further settle arrives, and none is needed.
+      expect(fire).toHaveBeenCalledTimes(1); // the retry is the next warm TICK, not the release itself
+      await vi.advanceTimersByTimeAsync(3_000); // t=15s — the warm timer's next tick
       expect(fire).toHaveBeenCalledTimes(2);
-    });
-
-    it("answers a settle the LATCH swallowed the moment the outstanding fire declines, without waiting for another one (⊘ leaving it owed for a NEXT settle strands the source when no next settle comes — the restore that drained the queue was the last event of the flow)", async () => {
-      const view = makeView(true);
-      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
-      const gate = deferred();
-      let call = 0;
-      const fire = vi.fn(() => {
-        call++;
-        if (call === 1) return Promise.resolve({ ran: false }); // arm fire declined
-        if (call === 2) return gate.promise.then(() => ({ ran: false })); // routine tick, slow, declined too
-        return Promise.resolve({ ran: true });
-      });
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
-      await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(30_000); // routine tick — now in flight
-      expect(fire).toHaveBeenCalledTimes(2);
-
-      // Settling now cannot dispatch: this source already has a sweep running.
-      poll.sourceSettled("a");
-      expect(fire).toHaveBeenCalledTimes(2);
-
-      gate.resolve();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fire).toHaveBeenCalledTimes(3);
-    });
-
-    /**
-     * The other half of the same rule, and a DELIBERATE change from the debt:
-     * an outstanding fire that RAN discharges the arming. It put this source's
-     * status on screen, which is the entire point of the arm fire, so a settle
-     * recorded behind it has nothing left to buy. The debt could not see that —
-     * it was created by the ARM tick and only a redemption could clear it — so
-     * it spent a redundant lab crawl here.
-     */
-    it("treats an outstanding fire that RAN as the fire the source was waiting for, so a settle recorded behind it buys nothing (⊘ a debt only a redemption can clear crawls the lab again for status the sweep it was queued behind has already applied)", async () => {
-      const view = makeView(true);
-      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
-      const gate = deferred();
-      let call = 0;
-      const fire = vi.fn(() => {
-        call++;
-        if (call === 1) return Promise.resolve({ ran: false }); // arm fire declined
-        if (call === 2) return gate.promise.then(() => ({ ran: true })); // routine tick — this one RUNS
-        return Promise.resolve({ ran: true });
-      });
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
-      await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(fire).toHaveBeenCalledTimes(2);
-
-      poll.sourceSettled("a");
-      gate.resolve();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fire).toHaveBeenCalledTimes(2);
-
-      // …and it stays discharged for every later settle.
-      poll.sourceSettled("a");
-      poll.sourceSettled();
-      await vi.advanceTimersByTimeAsync(0);
+      // That one ran → STEADY: nothing more until the configured period.
+      await vi.advanceTimersByTimeAsync(100_000);
       expect(fire).toHaveBeenCalledTimes(2);
     });
 
     /**
-     * THE ABA (review G1). `firedSinceArm` records THAT a fire ran; on its own
-     * it does not record WHICH arming it ran under, and the retained-schedule
+     * THE ABA (review G1). Promotion records THAT a fire ran; on its own that
+     * does not record WHICH arming it ran under, and the retained-schedule
      * trick turns that into an identity bug.
      *
      * A replace-mode restore removes and recreates a source under the SAME id
      * while its sweep is outstanding. The schedule object is deliberately kept
      * alive to hold the latch, so it is re-armed IN PLACE — same object, same
-     * map entry, which is why the `schedules.get(id) !== schedule` guard cannot
-     * see it. The old fire then resolves `ran: true` and discharges an arming
-     * it never served. The recreated source is left showing nothing at all:
-     * removal cleared its status, and `refreshStatus` dropped the old report on
-     * its own revision guard.
+     * map entry, which is why a `schedules.get(id) !== schedule` guard cannot
+     * see it. Without the incarnation stamp the old fire resolves `ran: true`
+     * and promotes an arming it never served; the recreated source is left
+     * showing nothing at all (removal cleared its status, and `refreshStatus`
+     * dropped the old report on its own revision guard) for a whole period.
      */
-    it("does not let a sweep from the PREVIOUS incarnation discharge a recreated source's arming, and gives that source its fire as soon as the latch opens (⊘ an id is not an identity: the retained schedule is re-armed in place, so a fire that outlived the record it was dispatched for silently satisfies the new arming and the recreated source shows nothing for a whole period)", async () => {
+    it("does not let a sweep from the PREVIOUS incarnation promote a recreated source, which keeps warming and gets its fire on the next warm tick (⊘ an id is not an identity: the retained schedule is re-armed in place, so a fire that outlived the record it was dispatched for silently satisfies the new arming and the recreated source shows nothing for a whole period)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600, incarnation: "rev-1" }]);
       const gate = deferred();
@@ -451,7 +401,7 @@ describe("startInventoryStatusPoll", () => {
         // The old incarnation's sweep runs to completion and reports that it RAN.
         return call === 1 ? gate.promise.then(() => ({ ran: true })) : Promise.resolve({ ran: true });
       });
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       expect(fire).toHaveBeenCalledTimes(1); // armed; its sweep is outstanding
 
       // A replace-mode restore: the source is removed…
@@ -462,7 +412,9 @@ describe("startInventoryStatusPoll", () => {
 
       gate.resolve();
       await vi.advanceTimersByTimeAsync(0);
-      // No settle, and not one second of the 3600 s period has elapsed.
+      // The old fire promoted NOTHING: the new arming is still warming, so its
+      // next warm tick — not one second of the 3600 s period — brings the fire.
+      await vi.advanceTimersByTimeAsync(5_000);
       expect(fire).toHaveBeenCalledTimes(2);
       expect(vi.getTimerCount()).toBe(1);
     });
@@ -476,12 +428,12 @@ describe("startInventoryStatusPoll", () => {
      * separates this from the case above, and it separates them by the same
      * test `refreshStatus` uses to decide whether the report was worth applying.
      */
-    it("lets a sweep outstanding across a HIDE/SHOW cycle discharge the new arming, because it is the same record and its report still lands (⊘ a counter bumped on every arming cannot tell a source that came back from one that was only hidden, and crawls the lab again for status already on screen)", async () => {
+    it("lets a sweep outstanding across a HIDE/SHOW cycle promote the new arming, because it is the same record and its report still lands (⊘ a counter bumped on every arming cannot tell a source that came back from one that was only hidden, and warm-crawls the lab again for status already on screen)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600, incarnation: "rev-1" }]);
       const gate = deferred();
       const fire = vi.fn(() => gate.promise.then(() => ({ ran: true })));
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       expect(fire).toHaveBeenCalledTimes(1);
 
       view.emit(false); // disarmed; the entry survives only to hold its latch
@@ -492,9 +444,8 @@ describe("startInventoryStatusPoll", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(fire).toHaveBeenCalledTimes(1);
 
-      // …and it stays discharged, so no settle crawls the lab for it either.
-      poll.sourceSettled("a");
-      await vi.advanceTimersByTimeAsync(0);
+      // STEADY — no warm retry crawls the lab for status already on screen.
+      await vi.advanceTimersByTimeAsync(60_000);
       expect(fire).toHaveBeenCalledTimes(1);
     });
 
@@ -502,17 +453,22 @@ describe("startInventoryStatusPoll", () => {
      * The same identity assumption, reached without any disarm at all (review
      * G1 sweep). An **Edit Source** save REPLACES the record under a live
      * arming: the id never leaves the source list, so nothing disarms and
-     * re-arms it, and `firedSinceArm` stays set from an arming made for a
-     * record that no longer exists. `addOrUpdateInventorySource` drops the
-     * source's runtime status whenever a config value changed, so the row is
-     * blank — and stays blank until the next routine tick, up to an hour after
-     * an edit the user just made.
+     * re-arms it. `addOrUpdateInventorySource` drops the source's runtime
+     * status whenever a config value changed, so the row is blank — and would
+     * stay blank until the next routine tick, up to an hour after an edit the
+     * user just made. A new incarnation under a live arming is therefore a
+     * FRESH ARMING in every sense: it fires immediately, and the steady
+     * cadence restarts from the fire that served it. (Restarting THIS source's
+     * phase on ITS OWN edit is deliberate — the fresh fire just put fresh
+     * status on screen, so "configured seconds from now" is the honest next
+     * due time. What must never restart is an UNRELATED source's phase, which
+     * the transition test above pins.)
      */
-    it("asks for a fire when the record is REPLACED under a live arming, and leaves the timer's phase alone (⊘ an edit drops the source's runtime status while `firedSinceArm` still reads as satisfied, so the row goes blank and no settle will refill it; re-arming the timer instead would restart the phase on every edit)", async () => {
+    it("treats a record REPLACED under a live arming as a fresh arming: fires immediately, and the steady cadence restarts from the fire that served it (⊘ an edit drops the source's runtime status while the old arming still reads as satisfied, so the row goes blank for up to an hour)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30, incarnation: "rev-1" }]);
       const fire = vi.fn(async () => ({ ran: true }));
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       await vi.advanceTimersByTimeAsync(0);
       expect(fire).toHaveBeenCalledTimes(1);
 
@@ -520,26 +476,36 @@ describe("startInventoryStatusPoll", () => {
       await vi.advanceTimersByTimeAsync(15_000);
       expect(fire).toHaveBeenCalledTimes(1);
       feed.set([{ id: "a", intervalSeconds: 30, incarnation: "rev-2" }]);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fire).toHaveBeenCalledTimes(2);
+      expect(fire).toHaveBeenCalledTimes(2); // the fresh arming's immediate fire
+      await vi.advanceTimersByTimeAsync(0); // …which RAN → STEADY
 
-      // The phase is UNTOUCHED: the routine tick still lands at the original
-      // 30 s mark, not 30 s after the edit.
+      // The cadence restarts from that fire: nothing at the OLD phase mark
+      // (t=30), the next routine tick lands 30 s after the edit (t=45).
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(fire).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(15_000);
       expect(fire).toHaveBeenCalledTimes(3);
       expect(vi.getTimerCount()).toBe(1);
     });
 
     /**
-     * A RE-ARMING the latch swallowed. The debt was created only by a declined
-     * ARM tick, so a source re-armed while a ROUTINE sweep was outstanding
-     * recorded nothing: the arm tick was dropped by the latch, and the routine
-     * sweep's own decline was (correctly, for a routine tick) not deferred.
-     * Nothing was owed, nothing settled, and the source sat on an empty status
-     * map for a full period. Asking "has a fire RUN since this arming?" answers
-     * it without needing to know which kind of tick was in flight.
+     * A RE-ARMING the latch swallowed — and the seam between the two identity
+     * rules. A source re-armed while a ROUTINE sweep is outstanding gets no
+     * arm fire (the latch swallows it, correctly), and that sweep may then
+     * DECLINE. Nothing external announces anything — the new arming is simply
+     * still warming, and its warm timer retries at ITS OWN 5 s.
+     *
+     * The sting is in whose backoff that stale decline charges. The record is
+     * the SAME (a hide/show cycle), so the incarnation matches — and the
+     * incarnation is the right guard for PROMOTION (see the twin above: a
+     * sweep that RAN across a hide/show serves the new arming). But the
+     * decline was a fact about the PREVIOUS arming's attempt, dispatched by
+     * the previous arming's timer: letting it double the fresh arming's
+     * warm delay — and replace its already-pending 5 s timer — makes "the
+     * first retry after a fresh arming is 5 s" silently false. Backoff is
+     * therefore keyed to the ARMING (per-arming serial), not the record.
      */
-    it("leaves a source re-armed behind an outstanding sweep still waiting when that sweep declines (⊘ recording the wait only for a DECLINED ARM tick misses the re-arming entirely, because the arm tick was never dispatched and the routine sweep in flight defers nothing)", async () => {
+    it("keeps a source re-armed behind an outstanding sweep warming when that sweep declines, and the fresh arming's FIRST retry is still at its own 5 s — a stale decline neither doubles its delay nor restarts its timer (⊘ charging a previous arming's decline to the new arming turns the pinned 5 s first retry into 10 s, off a phase the new arming never set)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
       const gate = deferred();
@@ -550,44 +516,75 @@ describe("startInventoryStatusPoll", () => {
         if (call === 2) return gate.promise.then(() => ({ ran: false })); // routine tick, slow, declined
         return Promise.resolve({ ran: true });
       });
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(30_000); // routine tick (timer-dispatched) — in flight
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      view.emit(false); // disarmed; the entry survives only to hold its latch
+      view.emit(true); // re-armed — its arm tick is swallowed by that latch; its 5 s warm timer starts NOW
+      expect(fire).toHaveBeenCalledTimes(2);
+
+      // The old sweep declines two seconds INTO the fresh arming's warm window.
+      await vi.advanceTimersByTimeAsync(2_000);
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fire).toHaveBeenCalledTimes(2); // the retry is the warm TICK, not the release
+
+      // 5 s from the RE-ARM — not 5 s from the decline (a restarted timer), and
+      // not 10 s from anywhere (a doubled delay the new arming never earned).
+      await vi.advanceTimersByTimeAsync(2_999); // t = re-arm + 4.999 s
+      expect(fire).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1); // t = re-arm + 5 s
+      expect(fire).toHaveBeenCalledTimes(3);
+    });
+
+    it("prunes a schedule whose sweep declines AFTER a disarm — the retained latch entry goes, nothing retries, no timer survives (⊘ a stale decline resurrecting a warm-up for a source nothing is polling crawls a lab behind a closed panel)", async () => {
+      const view = makeView(true);
+      const feed = makeSourceFeed([{ id: "a", intervalSeconds: 30 }]);
+      const gate = deferred();
+      let call = 0;
+      const fire = vi.fn(() => {
+        call++;
+        if (call === 1) return Promise.resolve({ ran: true }); // arm fire ran
+        return gate.promise.then(() => ({ ran: false })); // routine tick, slow, declined
+      });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(30_000); // routine tick — in flight
       expect(fire).toHaveBeenCalledTimes(2);
 
       view.emit(false); // disarmed; the entry survives only to hold its latch
-      view.emit(true); // re-armed — its arm tick is swallowed by that latch
-      expect(fire).toHaveBeenCalledTimes(2);
-
       gate.resolve();
-      await vi.advanceTimersByTimeAsync(0); // the outstanding sweep DECLINED
-      poll.sourceSettled("a");
-      expect(fire).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(0); // the sweep DECLINED, after the disarm
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(3_600_000);
+      expect(fire).toHaveBeenCalledTimes(2);
     });
 
-    it("brings EVERY armed source still waiting its fire when settled with no source id — the shape a finished config-level flow reports (⊘ a restore that persists sources before their credentials leaves every one of them waiting a full period)", async () => {
+    it("warms EVERY declined source independently — the shape a restore that persists sources before their credentials leaves behind (⊘ a lost arm fire per source leaves every one of them waiting a full period)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }, { id: "b", intervalSeconds: 3600 }]);
       const fire = declining();
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       await vi.advanceTimersByTimeAsync(0);
       fire.mockClear();
 
-      poll.sourceSettled();
+      await vi.advanceTimersByTimeAsync(5_000);
       expect(firedIds(fire).sort()).toEqual(["a", "b"]);
     });
 
-    it("keeps a source waiting across a mere period change, which is not a re-arming (⊘ treating the replaced timer as a fresh arming, or clearing the wait there, loses the arm fire for a source the user just re-tuned)", async () => {
+    it("keeps warming across a mere period change, which is not a re-arming (⊘ treating the replaced timer as a fresh arming re-fires on every re-tune; clearing the warm state there loses the arm fire for a source the user just re-tuned)", async () => {
       const view = makeView(true);
       const feed = makeSourceFeed([{ id: "a", intervalSeconds: 3600 }]);
       const fire = declining();
-      const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+      startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
       await vi.advanceTimersByTimeAsync(0);
       fire.mockClear();
 
       feed.set([{ id: "a", intervalSeconds: 60 }]);
       expect(fire).not.toHaveBeenCalled(); // a period change never re-fires by itself
-      poll.sourceSettled("a");
+      await vi.advanceTimersByTimeAsync(5_000); // the warm retry still comes, on its own clock
       expect(firedIds(fire)).toEqual(["a"]);
     });
   });

@@ -1349,17 +1349,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const inventoryTeardown: InventoryRuntimeTeardown = {
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
-  // The poll is created just below (it needs the Command Center view), so its
-  // redemption entry point is reached through this holder rather than by
-  // reordering: creating the poll FIRST would let its arm fire run
-  // `nexus.inventory.refreshStatus` before that command is registered.
-  let notifyPollSourceSettled: ((sourceId: string) => void) | undefined;
-  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown, {
-    // A FACT the command layer owns — "this source's busy claim is gone" — not
-    // a request to refresh. The poll decides whether it owes that source an arm
-    // fire and whether paying it is still justified (review D6/E2).
-    onSourceFree: (sourceId) => notifyPollSourceSettled?.(sourceId)
-  });
+  // Registered BEFORE the poll is created: the poll's arm fire runs
+  // `nexus.inventory.refreshStatus`, so that command must exist first.
+  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
   // LIVE STATUS — opt-in poll of EVE-NG lab running status, gated on the Command
   // Center being visible and on the SOURCE's own Lab Status Poll Interval field
   // being > 0. Seeds from commandCenterView.visible up front (createTreeView
@@ -1401,7 +1393,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // The command answers with the sources it did NOT refresh — busy with a
     // sibling command, or missing a declared credential (review D6/E1). This
     // fire names exactly one source, so that answer is the whole verdict on it,
-    // and the poll uses it to tell a fire that ran from one that was declined.
+    // and the poll uses it to tell a fire that ran from one that was declined —
+    // a declined source keeps WARMING (short self-clocked retries; see the
+    // poll's own doc), which is how an Edit Source save that held the source's
+    // claim across the change event, or a backup restore whose credentials
+    // land after the record, still gets fresh status within seconds. Nothing
+    // here (or anywhere else) notifies the poll when those blockers clear.
     fire: (sourceId) =>
       Promise.resolve(
         vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })
@@ -1412,21 +1409,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         return { ran: !(Array.isArray(unrefreshed) && unrefreshed.includes(sourceId)) };
       })
   });
-  notifyPollSourceSettled = (sourceId) => inventoryStatusPoll.sourceSettled(sourceId);
-  // The other half of the same rule (review E1): a config-level flow — a backup
-  // restore, a complete reset, the one-time poll-setting migration — persists a
-  // source's record before its credentials, so the arm fire it triggers can be
-  // declined for want of a password that arrives moments later, inside the same
-  // locked run. When that queue drains, every armed source that has still not
-  // had a fire RUN since it armed gets one. No source id: the flow that just
-  // finished may have touched any of them.
-  //
-  // This drain routinely lands while that arm fire is still awaiting its vault
-  // read, so the notification arrives before the source can possibly say whether
-  // it ran. The poll records it against the fire in flight and re-tests when it
-  // reports (`SourceSchedule.pendingRecheck`) — which is why this is safe to
-  // fire exactly once, with nothing here retrying.
-  context.subscriptions.push(configMutationLock.onIdle(() => inventoryStatusPoll.sourceSettled()));
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {
