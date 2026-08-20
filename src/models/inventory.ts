@@ -186,6 +186,51 @@ export interface InventoryConfigField {
    */
   options?: { label: string; value: string }[];
   /**
+   * PER-SOURCE LAB STATUS POLL — the inclusive bounds of a `type: "number"`
+   * field. Rendered as the input's native `min`/`max` (so the browser blocks a
+   * Save that is out of range) and re-checked server-side in
+   * `formValuesToProviderConfig`, which is the layer a programmatically posted
+   * value has to pass. Ignored for every other field type.
+   *
+   * NOT part of `computeProviderFingerprint` — like `advanced` and
+   * `defaultValue`, a bound says how a field is entered, not what the source is
+   * configured with, so widening or narrowing one must never make every
+   * existing source re-confirm its saved credentials. Providers still clamp at
+   * READ time (see `readEveNgStatusPollSeconds`): a config restored from a
+   * hand-edited backup never passed through this form at all.
+   */
+  min?: number;
+  max?: number;
+  /**
+   * PER-SOURCE LAB STATUS POLL (review D2) — a `type: "number"` field whose
+   * values are WHOLE numbers. Rendered as the input's native `step="1"` (so the
+   * browser refuses a fraction where it is typed, instead of the `step="any"`
+   * every other number field gets) and re-checked in
+   * `formValuesToProviderConfig`, which is the layer a programmatically posted
+   * value has to pass. Ignored for every other field type.
+   *
+   * It belongs on the CONTRACT rather than in one provider's own submit
+   * handling because both enforcement layers are generic: the descriptor and
+   * the collection parse know about fields, not about EVE-NG, and a
+   * provider-specific rule would have to hard-code a field id in one of them.
+   * `min`/`max` set that precedent, and this is the same kind of statement —
+   * which values are acceptable — expressed the same way.
+   *
+   * Declare it only where a fraction has NO runtime meaning. EVE-NG's poll
+   * interval is the first such field: `readEveNgStatusPollSeconds` floors it, so
+   * an accepted `0.4` silently means OFF and `1.9` silently means one second,
+   * while the form reports back the number the user typed. Refusing the
+   * fraction at collection time is the honest direction; a field that genuinely
+   * measures in halves simply omits this and keeps `step: "any"`.
+   *
+   * NOT part of `computeProviderFingerprint`, for the reason `min`/`max` are
+   * not: a constraint says how a value is entered, not what the source is
+   * configured with, so tightening one must never make every existing source
+   * re-confirm its saved credentials. Providers still coerce at READ time — a
+   * config restored from a hand-edited backup never passed through this form.
+   */
+  integer?: boolean;
+  /**
    * EVE-NG (Phase 1) — the value a `type: "boolean"` field starts at on the ADD
    * form, when the source has no stored value for it yet. Ignored for every
    * other field type, and ignored on EDIT (a stored `false` is a real answer the
@@ -721,8 +766,14 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
  * testConnection/fetchInventory (functions — not hashable, and not what the
  * user "configured against") and `id` itself (the fingerprint's whole
  * purpose is to detect a DIFFERENT provider answering to the SAME id; hashing
- * the id would make every mismatch invisible). No `vscode` import — callable
- * from models/ and safe for both the command layer and tests.
+ * the id would make every mismatch invisible). It also excludes every field
+ * member that describes HOW a value is entered rather than WHAT the source is
+ * configured with — `advanced`, `defaultValue`, `min`/`max`, `integer`,
+ * `placeholder` — each documented at its declaration above and each
+ * constraint among them PINNED by a test, because an unpinned exclusion here is
+ * a latent re-prompt-every-user bug: this hash gates a modal asking the user to
+ * re-confirm handing a re-registered provider their saved credentials. No `vscode` import — callable from models/ and safe for both the
+ * command layer and tests.
  *
  * sha256, hex-encoded, truncated to the first 16 characters — this is a
  * drift-detection fingerprint, not a security credential, so collision

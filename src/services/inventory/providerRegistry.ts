@@ -49,6 +49,36 @@ export function validateProviderShape(provider: unknown): asserts provider is In
     if (f.defaultValue !== undefined && typeof f.defaultValue !== "boolean") {
       throw new Error(`Inventory provider configFields entry "${f.id}" has a non-boolean defaultValue.`);
     }
+    // REVIEW L3 — the twin of the `defaultValue` clause above, for the same
+    // class of typo and on the same public boundary. Checked for EVERY field
+    // type, exactly as `defaultValue` is: a bound is ignored on a non-number
+    // field, but a malformed one there is still a typo worth naming rather than
+    // a shape worth accepting.
+    //
+    // Two things go wrong silently without this. A NON-FINITE bound makes the
+    // collection-side re-check in `formValuesToProviderConfig` INERT — `numeric
+    // < min` is false when `min` is NaN, so the bound the provider documented is
+    // not enforced anywhere — while still rendering into the input's native
+    // `min`/`max` attribute, where the browser reads it as no bound either. And
+    // a TRANSPOSED pair declares a field no value can ever satisfy: every save
+    // is refused, by both layers, with nothing to say the schema is at fault.
+    for (const bound of ["min", "max"] as const) {
+      if (f[bound] !== undefined && (typeof f[bound] !== "number" || !Number.isFinite(f[bound]))) {
+        throw new Error(`Inventory provider configFields entry "${f.id}" has a non-finite ${bound} (a bound must be a finite number when present).`);
+      }
+    }
+    // REVIEW D2 — the third member of the `defaultValue` / `min`-`max` family,
+    // on the same public boundary and failing the same silent way: the
+    // collection-side check reads this as a truthy flag, so `integer: "yes"`
+    // constrains a field the provider never meant to constrain, and `integer: 0`
+    // leaves one it did mean to constrain wide open — with nothing naming the
+    // schema either way.
+    if (f.integer !== undefined && typeof f.integer !== "boolean") {
+      throw new Error(`Inventory provider configFields entry "${f.id}" has a non-boolean integer flag.`);
+    }
+    if (typeof f.min === "number" && typeof f.max === "number" && f.min > f.max) {
+      throw new Error(`Inventory provider configFields entry "${f.id}" declares min ${f.min} greater than max ${f.max}, which no value can satisfy.`);
+    }
     if (f.type === "select") {
       if (!Array.isArray(f.options) || f.options.length === 0) {
         throw new Error(`Inventory provider configFields entry "${f.id}" of type "select" must declare a non-empty options array.`);

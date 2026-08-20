@@ -19,6 +19,7 @@ import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
 import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
+import { migrateGlobalStatusPollSetting } from "./services/inventory/statusPollSettingMigration";
 import { InventoryStatusDecorationProvider } from "./ui/inventoryStatusDecorationProvider";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
 import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
@@ -75,7 +76,7 @@ import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
 import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
-import { createEveNgProvider } from "./services/inventory/providers/eveNgProvider";
+import { EVE_NG_PROVIDER_ID, createEveNgProvider, readEveNgStatusPollSeconds } from "./services/inventory/providers/eveNgProvider";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
@@ -335,6 +336,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const repository = new VscodeConfigRepository(context);
   const core = new NexusCore(repository);
   await core.initialize();
+
+  // ONE-TIME MOVE of the retired global `nexus.inventory.statusPollSeconds`
+  // onto each EVE-NG source's own Lab Status Poll Interval field. Needs the
+  // sources, so it runs after initialize(); fire-and-forget and non-fatal,
+  // because a value-preserving tidy-up must never delay or break activation.
+  // The status poll below does not have to wait for it either: a source it
+  // writes fires NexusCore's change event, which is exactly what re-evaluates
+  // the schedule.
+  //
+  // `globalState` carries its "already ran" marker, which is what makes it
+  // one-time even when the settings clear cannot be written (review M1).
+  void migrateGlobalStatusPollSetting(core, context.globalState);
 
   terminalOutputTraceEnabled = readTerminalOutputTrace();
   const loggerFactory = new TerminalLoggerFactory(
@@ -1324,26 +1337,84 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const inventoryTeardown: InventoryRuntimeTeardown = {
     teardownServerRuntime: (serverId: string, shouldAbort?: () => boolean) => teardownServerRuntime(ctx, serverId, shouldAbort)
   };
-  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
-  // LIVE STATUS (Phase 2) — opt-in poll of EVE-NG lab running status, gated on
-  // the Command Center being visible and nexus.inventory.statusPollSeconds > 0.
-  // Seeds from commandCenterView.visible up front (createTreeView never fires the
-  // visibility event at registration), re-arms/stops on the config change, and
-  // is disposed with the extension.
+  // The poll is created just below (it needs the Command Center view), so its
+  // redemption entry point is reached through this holder rather than by
+  // reordering: creating the poll FIRST would let its arm fire run
+  // `nexus.inventory.refreshStatus` before that command is registered.
+  let notifyPollSourceSettled: ((sourceId: string) => void) | undefined;
+  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown, {
+    // A FACT the command layer owns — "this source's busy claim is gone" — not
+    // a request to refresh. The poll decides whether it owes that source an arm
+    // fire and whether paying it is still justified (review D6/E2).
+    onSourceFree: (sourceId) => notifyPollSourceSettled?.(sourceId)
+  });
+  // LIVE STATUS — opt-in poll of EVE-NG lab running status, gated on the Command
+  // Center being visible and on the SOURCE's own Lab Status Poll Interval field
+  // being > 0. Seeds from commandCenterView.visible up front (createTreeView
+  // never fires the visibility event at registration), re-arms/stops whenever a
+  // source is added, edited or removed, and is disposed with the extension.
+  //
+  // Only EVE-NG sources are offered: it is the only built-in provider that
+  // implements `fetchStatus`, and the interval field is declared on it. A source
+  // of any other provider simply never appears in this list.
   const inventoryStatusPoll = startInventoryStatusPoll({
     view: commandCenterView,
-    getIntervalSeconds: () => Math.floor(readBoundedNumber("nexus.inventory", "statusPollSeconds", 0, 0, 3600)),
-    onDidChangeInterval: (listener) =>
-      vscode.workspace.onDidChangeConfiguration((e) => {
-        if (e.affectsConfiguration("nexus.inventory.statusPollSeconds")) {
-          listener();
-        }
-      }),
-    // Return the thenable so the poll's in-flight latch can await the sweep.
-    // The `__poll` marker tells refreshStatus this is the background path, so it
-    // stays silent on total failure (the manual command warns instead).
-    fire: () => Promise.resolve(vscode.commands.executeCommand("nexus.inventory.refreshStatus", { __poll: true })).then(() => undefined)
+    getSources: () =>
+      core
+        .getSnapshot()
+        .inventorySources.filter((source) => source.providerId === EVE_NG_PROVIDER_ID)
+        .map((source) => ({
+          id: source.id,
+          intervalSeconds: readEveNgStatusPollSeconds(source.config),
+          // WHICH INCARNATION of the record this is (review G1). `revision` is
+          // minted afresh by `addOrUpdateInventorySource` on every write and is
+          // assigned nowhere else, so it changes exactly when the record is
+          // replaced — a remove-and-recreate under the same id, or an Edit
+          // Source save — and not when a routine sync merely stamps it. That
+          // is what lets the scheduler tell a source that came back from one
+          // that was only hidden, and it is the same value `refreshStatus`
+          // compares before applying a report.
+          incarnation: source.revision
+        })),
+    // NexusCore's own change event covers every way the set or its intervals can
+    // move — add/edit/remove a source, a backup import, the one-time migration
+    // of the retired global setting — so no separate configuration listener is
+    // needed now that the interval no longer lives in settings.
+    onDidChangeSources: (listener) => ({ dispose: core.onDidChange(listener) }),
+    // Return the thenable so the source's in-flight latch can await its sweep.
+    // `sourceId` narrows the refresh to this one source (refreshStatus already
+    // takes a source id, and `resolveSourceIdArg` reads it off the argument
+    // object), and the `__poll` marker tells it this is the background path, so
+    // it stays silent on total failure (the manual command warns instead).
+    // The command answers with the sources it did NOT refresh — busy with a
+    // sibling command, or missing a declared credential (review D6/E1). This
+    // fire names exactly one source, so that answer is the whole verdict on it,
+    // and the poll uses it to tell a fire that ran from one that was declined.
+    fire: (sourceId) =>
+      Promise.resolve(
+        vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })
+      ).then((outcome) => {
+        const unrefreshed = (outcome as { unrefreshedSourceIds?: unknown })?.unrefreshedSourceIds;
+        // Anything that is not an explicit "did not run for this source" reads
+        // as RAN — the conservative direction, since only a decline defers.
+        return { ran: !(Array.isArray(unrefreshed) && unrefreshed.includes(sourceId)) };
+      })
   });
+  notifyPollSourceSettled = (sourceId) => inventoryStatusPoll.sourceSettled(sourceId);
+  // The other half of the same rule (review E1): a config-level flow — a backup
+  // restore, a complete reset, the one-time poll-setting migration — persists a
+  // source's record before its credentials, so the arm fire it triggers can be
+  // declined for want of a password that arrives moments later, inside the same
+  // locked run. When that queue drains, every armed source that has still not
+  // had a fire RUN since it armed gets one. No source id: the flow that just
+  // finished may have touched any of them.
+  //
+  // This drain routinely lands while that arm fire is still awaiting its vault
+  // read, so the notification arrives before the source can possibly say whether
+  // it ran. The poll records it against the fire in flight and re-tests when it
+  // reports (`SourceSchedule.pendingRecheck`) — which is why this is safe to
+  // fire exactly once, with nothing here retrying.
+  context.subscriptions.push(configMutationLock.onIdle(() => inventoryStatusPoll.sourceSettled()));
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
   const macroDisposables = registerMacroCommands(() => {

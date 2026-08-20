@@ -4,9 +4,11 @@ import { describe, expect, it, vi } from "vitest";
 import {
   EVE_NG_INSECURE_TLS_WARNING,
   EVE_NG_PROVIDER_ID,
+  EVE_NG_STATUS_POLL_FIELD_ID,
   createEveNgProvider,
   eveNgInstanceKey,
-  labFolderPath
+  labFolderPath,
+  readEveNgStatusPollSeconds
 } from "../../src/services/inventory/providers/eveNgProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
@@ -115,7 +117,12 @@ describe("createEveNgProvider — shape", () => {
       // INSECURE TLS — appended LAST on purpose: the order is part of the
       // provider fingerprint, and adding the field at the end keeps every
       // existing field where the user last saw it.
-      "allowInsecureTls"
+      "allowInsecureTls",
+      // PER-SOURCE POLL — appended after `allowInsecureTls` for the same
+      // reason it was appended after `consoleHost`: the order is part of the
+      // provider fingerprint, and adding at the end keeps every existing field
+      // where the user last saw it.
+      "statusPollSeconds"
     ]);
   });
 
@@ -2368,7 +2375,10 @@ describe("activation wiring", () => {
   });
 
   it("imports the EVE-NG factory from the provider module", () => {
-    expect(source).toMatch(/import \{ createEveNgProvider \} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
+    // The import also carries the per-source poll's field reader and provider
+    // id, which is why this matches the members rather than the exact line.
+    expect(source).toMatch(/import \{[^}]*\bcreateEveNgProvider\b[^}]*\} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
+    expect(source).toMatch(/import \{[^}]*\breadEveNgStatusPollSeconds\b[^}]*\} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
   });
 });
 
@@ -2844,6 +2854,131 @@ describe("createEveNgProvider — allowInsecureTls field", () => {
     expect(computeProviderFingerprint({ label: "EVE-NG", configFields: fields(true) })).not.toBe(
       computeProviderFingerprint({ label: "EVE-NG", configFields: [...fields(true), { id: "extra", label: "Extra", type: "string" }] })
     );
+  });
+});
+
+/**
+ * PER-SOURCE LAB STATUS POLL — the interval moved out of the global
+ * `nexus.inventory.statusPollSeconds` setting and onto the source, so a user
+ * running two lab servers can poll a busy one often and a quiet one not at all.
+ * The provider owns the field AND its interpretation: `readEveNgStatusPollSeconds`
+ * is the one place that turns a stored value into seconds, so the poll
+ * scheduler, the migration and a hand-edited backup all agree.
+ */
+describe("createEveNgProvider — statusPollSeconds field", () => {
+  const field = (): InventoryConfigField => {
+    const found = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.find((f) => f.id === EVE_NG_STATUS_POLL_FIELD_ID);
+    expect(found).toBeDefined();
+    return found!;
+  };
+
+  it("is an OPTIONAL, ADVANCED number bounded 0..3600 with no defaultValue, so an unanswered field reads as OFF (\u2298 a required field would block every existing source's next edit, and a non-zero default would silently start polling every lab box)", () => {
+    const f = field();
+    expect(f.type).toBe("number");
+    expect(f.required).not.toBe(true);
+    expect(f.advanced).toBe(true);
+    expect(f.defaultValue).toBeUndefined();
+    expect(f.min).toBe(0);
+    expect(f.max).toBe(3600);
+    expect(EVE_NG_STATUS_POLL_FIELD_ID).toBe("statusPollSeconds");
+  });
+
+  /**
+   * REVIEW D2 — the runtime FLOORS this value, so a fraction is never the
+   * cadence that runs: `0.4` disables polling although the hint says only `0`
+   * does, and `1.9` polls every second while the form shows 1.9 as saved. The
+   * field declares `integer`, which both layers enforce — the rendered input's
+   * native `step="1"` and the collection-side parse a posted value has to pass.
+   */
+  it("declares itself an INTEGER field, since a fractional poll period has no runtime meaning (\u2298 without it the form accepts 0.4 and the runtime floors it to OFF, telling the user one thing and doing another)", () => {
+    expect(field().integer).toBe(true);
+  });
+
+  it("says in its hint that 0 is off and that a poll can evict the browser's EVE-NG session, pointing at a dedicated account (\u2298 a bare 'seconds between refreshes' hint sends the user to turn polling on with no idea it will log them out of the web UI)", () => {
+    const hint = String(field().description ?? "").toLowerCase();
+    expect(hint).toMatch(/\b0\b/);
+    expect(hint).toMatch(/off|disable/);
+    expect(hint).toMatch(/log(s|ged)? (you )?out|evict|session/);
+    expect(hint).toMatch(/separate account|its own eve-ng account|dedicated account/);
+  });
+
+  it("still passes the provider-shape validation the registry runs, with the new field in place", () => {
+    expect(() => validateProviderShape(createEveNgProvider(vi.fn() as unknown as typeof fetch))).not.toThrow();
+  });
+
+  /**
+   * The `advanced` exclusion's twin, and the same latent bug. `min`/`max` are
+   * BOUNDS ON A VALUE, not part of the shape a user configured a source
+   * against, and `computeProviderFingerprint` excludes them — but only by
+   * projection: adding them to it failed no test.
+   *
+   * They must stay out. The fingerprint gates a MODAL asking the user to
+   * re-confirm handing a re-registered provider their saved credentials, and
+   * this field's ceiling is exactly the kind of thing a later release widens
+   * (3600 → 86400, say). Projecting the bounds would make that one-word change
+   * re-prompt EVERY existing EVE-NG source for its credentials, which is how a
+   * security modal stops being read.
+   */
+  it("keeps `min`/`max` OUT of the provider fingerprint — widening a bound must not re-prompt every source for its credentials (⊘ projecting the bounds turns a raised ceiling into a credential re-confirmation modal for every existing user)", () => {
+    const fields = (max: number | undefined, min?: number): InventoryConfigField[] => [
+      { id: "baseUrl", label: "EVE-NG Base URL", type: "string", required: true },
+      { id: EVE_NG_STATUS_POLL_FIELD_ID, label: "Lab Status Poll Interval (seconds)", type: "number", required: false, min, max }
+    ];
+    const fingerprint = (max: number | undefined, min?: number): string =>
+      computeProviderFingerprint({ label: "EVE-NG", configFields: fields(max, min) });
+
+    // A widened ceiling, a raised floor, and dropping the bounds entirely: all
+    // the same shape as far as the user's configuration is concerned.
+    expect(fingerprint(3600, 0)).toBe(fingerprint(86_400, 0));
+    expect(fingerprint(3600, 0)).toBe(fingerprint(3600, 5));
+    expect(fingerprint(3600, 0)).toBe(fingerprint(undefined, undefined));
+    // …and the projection is not simply inert: a change that IS material still moves the hash.
+    expect(fingerprint(3600, 0)).not.toBe(
+      computeProviderFingerprint({ label: "EVE-NG", configFields: [...fields(3600, 0), { id: "extra", label: "Extra", type: "string" }] })
+    );
+  });
+
+  /**
+   * REVIEW D2 — `integer` joins `advanced`, `defaultValue` and `min`/`max` in
+   * the excluded set, for their reason: it says how a value is ENTERED, not
+   * what the source is configured with. Declaring it on a field that already
+   * shipped without it must not re-prompt every existing source to re-confirm
+   * handing the provider its saved credentials — which is exactly what this
+   * release does to EVE-NG's poll interval.
+   */
+  it("keeps `integer` OUT of the provider fingerprint — constraining an existing field to whole numbers must not re-prompt every source for its credentials (\u2298 projecting it turns a tightened constraint into a credential re-confirmation modal for every existing user)", () => {
+    const withIntegerFlag = (integer?: boolean): string =>
+      computeProviderFingerprint({
+        label: "EVE-NG",
+        configFields: [
+          { id: "baseUrl", label: "EVE-NG Base URL", type: "string", required: true },
+          { id: EVE_NG_STATUS_POLL_FIELD_ID, label: "Lab Status Poll Interval (seconds)", type: "number", required: false, min: 0, max: 3600, integer }
+        ]
+      });
+
+    expect(withIntegerFlag(true)).toBe(withIntegerFlag(undefined));
+    expect(withIntegerFlag(true)).toBe(withIntegerFlag(false));
+  });
+
+  describe("readEveNgStatusPollSeconds", () => {
+    it("reads a stored positive value", () => {
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 30 })).toBe(30);
+    });
+
+    it("treats an ABSENT value as 0 — off (\u2298 defaulting a legacy source to a non-zero interval starts polling every lab box the user already had)", () => {
+      expect(readEveNgStatusPollSeconds({})).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: undefined as unknown as number })).toBe(0);
+    });
+
+    it("clamps to the declared bounds and floors to whole seconds, and reads anything non-numeric as OFF (\u2298 an unclamped hand-edited backup arms a 10 ms timer against a lab box, or NaN * 1000 arms a timer that never fires but reports itself as running)", () => {
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: -5 })).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 99_999 })).toBe(3600);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 30.9 })).toBe(30);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: 0.4 })).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: Number.NaN })).toBe(0);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: Number.POSITIVE_INFINITY })).toBe(3600);
+      expect(readEveNgStatusPollSeconds({ statusPollSeconds: "30" as unknown as number })).toBe(0);
+    });
   });
 });
 

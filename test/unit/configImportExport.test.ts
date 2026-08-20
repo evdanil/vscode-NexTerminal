@@ -31,6 +31,10 @@ const mockShowTextDocument = vi.fn();
 const mockExecuteCommand = vi.fn();
 const configStore = new Map<string, unknown>();
 const configDefaults = new Map<string, unknown>();
+// WORKSPACE-scoped values, separate from `configStore` (which models GLOBAL scope).
+// `getConfiguredSettingValue` prefers a workspace value over a global one, so the two
+// have to be distinguishable for any test about WHICH scope a read picks up.
+const configWorkspaceStore = new Map<string, unknown>();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -74,6 +78,9 @@ vi.mock("vscode", () => ({
     getConfiguration: vi.fn((section: string) => ({
       get: (key: string, fallback?: unknown) => {
         const fullKey = `${section}.${key}`;
+        // Workspace wins over global, as it does in VS Code, so a test that sets one
+        // cannot make a `get`-based read disagree with an `inspect`-based one.
+        if (configWorkspaceStore.has(fullKey)) return configWorkspaceStore.get(fullKey);
         if (configStore.has(fullKey)) return configStore.get(fullKey);
         if (configDefaults.has(fullKey)) return configDefaults.get(fullKey);
         return fallback;
@@ -82,7 +89,8 @@ vi.mock("vscode", () => ({
         const fullKey = `${section}.${key}`;
         return {
           defaultValue: configDefaults.get(fullKey),
-          globalValue: configStore.has(fullKey) ? configStore.get(fullKey) : undefined
+          globalValue: configStore.has(fullKey) ? configStore.get(fullKey) : undefined,
+          workspaceValue: configWorkspaceStore.has(fullKey) ? configWorkspaceStore.get(fullKey) : undefined
         };
       },
       update: (key: string, value: unknown) => {
@@ -130,6 +138,9 @@ import { IMPORTED_CAPABILITY_RESET_NOTICE } from "../../src/models/terminalMacro
 import { SETTINGS_META } from "../../src/ui/settingsMetadata";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { registerInventoryCommands } from "../../src/commands/inventoryCommands";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { startInventoryStatusPoll } from "../../src/services/inventory/inventoryStatusPoll";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroStore";
@@ -141,6 +152,7 @@ import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import { inventorySecretKey, type InventorySourceConfig } from "../../src/models/inventory";
+import { EVE_NG_PROVIDER_ID, EVE_NG_STATUS_POLL_FIELD_ID } from "../../src/services/inventory/providers/eveNgProvider";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
@@ -253,6 +265,7 @@ function makeExportData(overrides: Record<string, unknown> = {}) {
 // both of which call getMacros()/saveMacros().
 beforeEach(async () => {
   configDefaults.clear();
+  configWorkspaceStore.clear();
   const store = new InMemoryMacroStore();
   await store.initialize();
   setActiveMacroStore(store);
@@ -694,6 +707,244 @@ describe("config import command (legacy)", () => {
     );
     }
   );
+
+  /**
+   * REVIEW L2 / C2 — `nexus.inventory.statusPollSeconds` was RETIRED (its value
+   * now lives on each EVE-NG source's own Lab Status Poll Interval field), so it
+   * is no longer contributed and no longer in SETTINGS_META. Import drops every
+   * key outside SETTINGS_KEY_SET silently and uncounted, which means an export
+   * taken BEFORE the retirement, restored on a fresh machine, lost the user's
+   * interval with no message — the same loss the activation migration exists to
+   * prevent. `EXTRA_IMPORT_KEYS` is what stops that drop.
+   *
+   * The FIRST attempt then wrote the key into settings and left the rest to the
+   * activation migration. That is unreachable by construction: the extension
+   * must ACTIVATE before its own import command can run, and an activation that
+   * finds no key marks the migration done, so the restored key is read by
+   * nobody — polling stays off and a stale key is all the import achieves. The
+   * carry therefore happens HERE, during the import, onto the sources this run
+   * created — and the key is never written to settings at all.
+   */
+  describe("the retired lab-status poll interval", () => {
+    const eveSource = (id: string, overrides: Partial<InventorySourceConfig> = {}) =>
+      makeInventorySource({ id, providerId: EVE_NG_PROVIDER_ID, name: id, config: {}, secretFieldIds: [], ...overrides });
+
+    const pollOf = (id: string): unknown => core.getInventorySource(id)?.config[EVE_NG_STATUS_POLL_FIELD_ID];
+
+    it.each(["merge", "replace"] as const)(
+      "carries the interval from an older export onto the EVE-NG sources that import created, and never writes the dead key back into settings, in %s mode (⊘ storing the key and leaving it to the activation migration carries nothing: that migration already ran and marked itself done before this command could exist, so polling stays off and only a stale key lands)",
+      async (mode) => {
+        const exportData = makeExportData({
+          exportType: "backup",
+          inventorySources: [eveSource("eve-1"), eveSource("eve-2"), makeInventorySource({ id: "nb-1", secretFieldIds: [] })],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        });
+
+        await runImport(exportData, mode);
+
+        expect(pollOf("eve-1")).toBe(45);
+        expect(pollOf("eve-2")).toBe(45);
+        // A NetBox source has no such field and reports no status at all.
+        expect(core.getInventorySource("nb-1")?.config[EVE_NG_STATUS_POLL_FIELD_ID]).toBeUndefined();
+        expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+        expect(mockConfigUpdate).not.toHaveBeenCalledWith("nexus.inventory", "statusPollSeconds", expect.anything());
+        expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+          "1 imported Nexus setting had an invalid value and was skipped."
+        );
+      }
+    );
+
+    it("does NOT re-arm a source that was already on this machine, whose interval the user had blanked (⊘ applying the carried value to every EVE-NG source turns polling back on for the one source its owner deliberately switched off — the exact harm the activation migration's durable marker exists to prevent)", async () => {
+      // Already here, field blanked: `formValuesToProviderConfig` stores NO key
+      // for an empty number field, so it looks exactly like one that never
+      // answered. Merge mode skips the same id in the payload, so this record
+      // is not one the import created.
+      await core.addOrUpdateInventorySource(eveSource("eve-local"));
+      const revision = core.getInventorySource("eve-local")?.revision;
+
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [eveSource("eve-local", { name: "from the backup" }), eveSource("eve-new")],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        }),
+        "merge"
+      );
+
+      expect(pollOf("eve-local")).toBeUndefined();
+      expect(core.getInventorySource("eve-local")?.revision).toBe(revision);
+      // The source this run DID create still gets it.
+      expect(pollOf("eve-new")).toBe(45);
+    });
+
+    it("carries nothing at all when ANY source in the payload answers the field — the ones that did keep their own values, and the one that did not is a deliberate blank (⊘ treating a per-source absence as \"predates the field\" re-arms polling on the one source whose owner switched it off, in a payload that provably knew the field)", async () => {
+      // A source carrying `statusPollSeconds` can only have come from a build
+      // that HAS the per-source field. In such a payload an ABSENT value is not
+      // "this export predates the field" — it is the shape the edit form stores
+      // for a number field the user BLANKED. That is evidence a deliberate
+      // blank cannot forge: blanking one source cannot remove the field from
+      // the others.
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [
+            eveSource("explicit-off", { config: { [EVE_NG_STATUS_POLL_FIELD_ID]: 0 } }),
+            eveSource("explicit-on", { config: { [EVE_NG_STATUS_POLL_FIELD_ID]: 10 } }),
+            eveSource("unanswered")
+          ],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        })
+      );
+
+      expect(pollOf("explicit-off")).toBe(0);
+      expect(pollOf("explicit-on")).toBe(10);
+      expect(pollOf("unanswered")).toBeUndefined();
+    });
+
+    it("still carries onto legacy EVE-NG sources when the only source answering `statusPollSeconds` belongs to ANOTHER provider (⊘ reading the field id across every provider lets a third-party source that happens to use the same id classify a genuinely old backup as post-migration, and the EVE-NG sources it was written to rescue silently lose the interval)", async () => {
+      // Provider registration is a PUBLIC API with no reserved field ids, so a
+      // third-party inventory provider may define its own `statusPollSeconds`.
+      // Such a source proves nothing about whether the exporting build knew
+      // EVE-NG's field, so it must not speak for the payload.
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [
+            makeInventorySource({ id: "other-1", providerId: "third-party", secretFieldIds: [], config: { [EVE_NG_STATUS_POLL_FIELD_ID]: 10 } }),
+            eveSource("eve-legacy")
+          ],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        })
+      );
+
+      expect(pollOf("eve-legacy")).toBe(45);
+      // …and the other provider's own value is left exactly as it came in.
+      expect(core.getInventorySource("other-1")?.config[EVE_NG_STATUS_POLL_FIELD_ID]).toBe(10);
+    });
+
+    it("carries nothing when the export STAMPS itself as coming from a build that has the per-source field, even with no source answering it (⊘ with every source blanked there is nothing else left to tell a deliberately-silenced machine from a pre-field one, and the carry turns polling back on behind the user)", async () => {
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventoryStatusPollPerSource: true,
+          inventorySources: [eveSource("eve-1"), eveSource("eve-2")],
+          settings: { "nexus.inventory.statusPollSeconds": 45 }
+        })
+      );
+
+      expect(pollOf("eve-1")).toBeUndefined();
+      expect(pollOf("eve-2")).toBeUndefined();
+      // Still never written back into settings, stamped or not.
+      expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+    });
+
+    it("does NOT re-arm a blanked source when restoring a backup THIS build wrote on a machine whose settings clear had failed (⊘ the stale global key rides the backup onto a source its owner silenced, which is the durable marker's guarantee broken by way of the file)", async () => {
+      // The failed-clear machine: the activation migration could not remove the
+      // key (policy-managed settings.json), so it is still in Global scope and
+      // export captures it. The user has since turned this source's polling OFF
+      // by blanking the field, which stores NO key — the same shape as a source
+      // that predates the field entirely.
+      configStore.set("nexus.inventory.statusPollSeconds", 45);
+      await core.addOrUpdateInventorySource(eveSource("eve-blanked"));
+
+      mockShowInputBox.mockResolvedValue("testpass123");
+      mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+      mockWriteFile.mockResolvedValue(undefined);
+      await registeredCommands.get("nexus.config.export.backup")!();
+      const written = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+
+      // The premise really holds: the backup carries the stale key, and the
+      // source in it carries no interval of its own.
+      expect(written.settings["nexus.inventory.statusPollSeconds"]).toBe(45);
+      expect(written.inventorySources[0].config).toEqual({});
+
+      // Replace mode deletes and re-creates every source, so this one IS in the
+      // list the carry applies to — nothing else stands between it and 45.
+      await runImport(written, "replace");
+
+      expect(pollOf("eve-blanked")).toBeUndefined();
+    });
+
+    it("carries a 0 onto nothing — it was the shipped default and it polled nothing (⊘ writing the 0 answers the field on every imported source, so the user's own blank-means-off default is replaced by a stored 0 and every later carry is blocked)", async () => {
+      await runImport(
+        makeExportData({
+          exportType: "backup",
+          inventorySources: [eveSource("eve-1")],
+          settings: { "nexus.inventory.statusPollSeconds": 0 }
+        })
+      );
+
+      expect(core.getInventorySource("eve-1")?.config).toEqual({});
+      expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+        "1 imported Nexus setting had an invalid value and was skipped."
+      );
+    });
+
+    /**
+     * REVIEW D4 — the carry used to be RETURNED by `applySettings`, after its
+     * writes. So one ordinary setting whose global `config.update` rejects
+     * (policy-managed configuration, or a settings file something else owns)
+     * threw before the retired interval could be handed back, and the sources
+     * had already been persisted earlier in the same import — retrying in merge
+     * mode skips those ids, `importedIds` comes back empty, and the cadence can
+     * never be applied by the retry. A partial settings failure stranded
+     * freshly imported sources with polling off, permanently.
+     */
+    it("applies the carry even when an ordinary setting's write rejects (⊘ extracting it behind the fallible writes strands it: the sources are already persisted, so the retry skips them and no later run can ever apply the cadence)", async () => {
+      // Reset in `finally`: `vi.clearAllMocks()` clears calls but KEEPS
+      // implementations, so a rejecting `update` would otherwise leak into
+      // every test after this one.
+      mockConfigUpdate.mockImplementation((_section: string, key: string) => {
+        if (key === "openLocation") {
+          throw new Error("Unable to write to User Settings because nexus.terminal.openLocation is not a registered configuration.");
+        }
+      });
+
+      try {
+        await expect(
+          runImport(
+            makeExportData({
+              exportType: "backup",
+              inventorySources: [eveSource("eve-1")],
+              settings: {
+                "nexus.terminal.openLocation": "editor",
+                "nexus.inventory.statusPollSeconds": 45
+              }
+            })
+          )
+        ).rejects.toThrow(/openLocation/);
+
+        // The source was persisted before the settings phase, so it is the
+        // record the retry can no longer reach — and it carries the cadence.
+        expect(pollOf("eve-1")).toBe(45);
+      } finally {
+        mockConfigUpdate.mockReset();
+      }
+    });
+
+    it("skips an out-of-range or non-numeric interval, counting it, and carries nothing (⊘ a key with no validator at all lets a hand-edited 99999 or \"45\" through to be coerced into a number the user never chose, silently and uncounted)", async () => {
+      for (const bad of [99_999, -1, "45", Number.NaN]) {
+        configStore.clear();
+        mockShowWarningMessage.mockClear();
+        await core.removeInventorySource("eve-1");
+
+        await runImport(
+          makeExportData({
+            exportType: "backup",
+            inventorySources: [eveSource("eve-1")],
+            settings: { "nexus.inventory.statusPollSeconds": bad }
+          })
+        );
+
+        expect(configStore.has("nexus.inventory.statusPollSeconds")).toBe(false);
+        expect(pollOf("eve-1")).toBeUndefined();
+        expect(mockShowWarningMessage).toHaveBeenCalledWith(
+          "1 imported Nexus setting had an invalid value and was skipped."
+        );
+      }
+    });
+  });
 
   it("skips unsafe imported highlighting rules", async () => {
     const exportData = makeExportData({
@@ -1535,6 +1786,11 @@ describe("share export command", () => {
 
     expect(writtenData.exportType).toBe("share");
     expect(writtenData.version).toBe(2);
+    // REVIEW D3 — the same stamp a backup carries. A share export carries no
+    // inventorySources, so nothing here can receive the retired interval; it is
+    // stamped anyway so there is ONE rule about what this build's exports say
+    // about themselves, rather than a per-path exemption to remember.
+    expect(writtenData.inventoryStatusPollPerSource).toBe(true);
     expect(writtenData.servers).toHaveLength(1);
     expect(writtenData.servers[0].id).not.toBe("s1");
     expect(writtenData.servers[0].username).toBe("user");
@@ -1649,6 +1905,63 @@ describe("backup export command", () => {
     core = new NexusCore(repo);
     await core.initialize();
     registerConfigCommands(core, vault);
+  });
+
+  /**
+   * REVIEW D1 — the retired `nexus.inventory.statusPollSeconds` is in
+   * `SETTINGS_KEYS` so an old export keeps carrying it, which means EXPORT reads
+   * it too, through `getConfiguredSettingValue` — and that reader prefers a
+   * WORKSPACE (or folder) value over the global one. The activation migration
+   * deliberately refuses to promote a workspace-scoped number onto machine-wide
+   * sources; capturing one here and carrying it through a restore promotes it
+   * anyway, one machine later. Export therefore reads exactly the scope the
+   * migration reads, through the migration's own reader.
+   */
+  describe("the retired lab-status poll interval, on export", () => {
+    async function exportBackupPayload(): Promise<Record<string, unknown>> {
+      mockShowInputBox.mockResolvedValueOnce("testpass123").mockResolvedValueOnce("testpass123");
+      mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/backup.json", scheme: "file" });
+      mockWriteFile.mockResolvedValue(undefined);
+      await registeredCommands.get("nexus.config.export.backup")!();
+      return JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+    }
+
+    it("captures the GLOBAL value even when a workspace override is in effect (\u2298 reading the effective scope captures the workspace number the migration refuses to promote, and a restore then applies it to every imported machine-wide source)", async () => {
+      configStore.set("nexus.inventory.statusPollSeconds", 30);
+      configWorkspaceStore.set("nexus.inventory.statusPollSeconds", 45);
+
+      const written = await exportBackupPayload();
+
+      expect(written.settings).toMatchObject({ "nexus.inventory.statusPollSeconds": 30 });
+    });
+
+    it("captures nothing when the interval is set ONLY in a workspace (\u2298 as above, with no global value to hide behind: the workspace number becomes the backup's own)", async () => {
+      configWorkspaceStore.set("nexus.inventory.statusPollSeconds", 45);
+
+      const written = await exportBackupPayload();
+
+      expect(written.settings).not.toHaveProperty("nexus.inventory.statusPollSeconds");
+    });
+
+    /**
+     * REVIEW D3 — the stamp import gates the carry on. It is written
+     * UNCONDITIONALLY, by every export this build makes, because its whole job
+     * is to be un-forgeable by anything a user does in the UI: blanking a
+     * source's interval removes that source's key, and can remove nothing else.
+     */
+    it("stamps every backup as written by a build that has the per-source interval field (\u2298 an unstamped export from this build is indistinguishable from a pre-field one, and a restore re-arms every source whose interval its owner had blanked)", async () => {
+      const written = await exportBackupPayload();
+
+      expect(written.inventoryStatusPollPerSource).toBe(true);
+    });
+
+    it("still captures an ORDINARY setting's effective value, workspace included (\u2298 narrowing every key to Global drops the workspace settings a backup has always carried)", async () => {
+      configWorkspaceStore.set("nexus.logging.sessionLogDirectory", "/workspace/logs");
+
+      const written = await exportBackupPayload();
+
+      expect(written.settings).toMatchObject({ "nexus.logging.sessionLogDirectory": "/workspace/logs" });
+    });
   });
 
   it("exports with encrypted secrets and strips secret macro text from top-level macros", async () => {
@@ -6860,6 +7173,117 @@ describe("backup export round-trip", () => {
     // replace mode deletes it unconditionally before import runs. A validate-before-strip
     // rejection here is a silent, permanent credential loss.
     expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("backup-token");
+  });
+
+  /**
+   * REVIEW E1 — the arm fire that a RESTORE makes impossible.
+   *
+   * `importMergeReplaceLocked` persists an inventory source's RECORD with the
+   * other imported buckets and writes that source's CREDENTIALS into the vault
+   * much later in the same locked run. `core.addOrUpdateInventorySource` emits
+   * its change event synchronously, so with the Command Center visible the poll
+   * arms the restored source and fires its one arm refresh immediately —
+   * against a source whose password does not exist yet. That refresh used to
+   * fail silently, count as the arm fire, and leave the source waiting a whole
+   * period (up to an hour) for a picture it could have had as soon as the
+   * restore finished. Same user-visible outcome as a swallowed arm tick, by a
+   * different route.
+   *
+   * The refresh now DECLINES a source whose declared credential the vault
+   * cannot supply — reported, not attempted, and no doomed provider call — and
+   * the debt is redeemed when the config-mutation queue drains, which is after
+   * the restore has written the credential.
+   */
+  it("refreshes a restored source's lab status as soon as the restore finishes, not a period later (⊘ firing at a source whose password has not been restored yet spends the arm fire on a silent auth failure)", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    const { encrypt } = await import("../../src/utils/configCrypto");
+    const vault = new MockVault();
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+
+    const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+    const registry = new InventoryProviderRegistry();
+    registry.register({
+      id: "fake",
+      label: "Fake Provider",
+      configFields: [{ id: "host", label: "Host", type: "string", required: true }],
+      testConnection: async () => {},
+      fetchInventory: async () => ({ contractVersion: 1, devices: [] }) as never,
+      fetchStatus
+    });
+
+    let poll: ReturnType<typeof startInventoryStatusPoll> | undefined;
+    const inventoryDisposables = registerInventoryCommands(
+      core,
+      registry,
+      vault,
+      { teardownServerRuntime: async () => {} },
+      { onSourceFree: (id) => poll?.sourceSettled(id) }
+    );
+    // extension.ts's own wiring, reproduced: the poll fires the real command and
+    // reads which sources it did not refresh off the answer.
+    mockExecuteCommand.mockImplementation((cmd: string, ...rest: unknown[]) =>
+      cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
+    );
+    poll = startInventoryStatusPoll({
+      view: { visible: true, onDidChangeVisibility: () => ({ dispose: () => {} }) },
+      getSources: () =>
+        core.getSnapshot().inventorySources.map((source) => ({
+          id: source.id,
+          intervalSeconds: Number(source.config.statusPollSeconds ?? 0)
+        })),
+      onDidChangeSources: (listener) => ({ dispose: core.onDidChange(listener) }),
+      fire: (sourceId) =>
+        Promise.resolve(mockExecuteCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })).then((outcome) => {
+          const unrefreshed = (outcome as { unrefreshedSourceIds?: unknown })?.unrefreshedSourceIds;
+          return { ran: !(Array.isArray(unrefreshed) && unrefreshed.includes(sourceId)) };
+        })
+    });
+    const idleSub = configMutationLock.onIdle(() => poll?.sourceSettled());
+
+    try {
+      const source = makeInventorySource({
+        id: "src1",
+        providerId: "fake",
+        secretFieldIds: ["apiToken"],
+        // Polling ON, at an interval whose next tick is an hour away.
+        config: { host: "eve.local", statusPollSeconds: 3600 }
+      });
+      const encryptedSecrets = encrypt(JSON.stringify({ inventorySourceSecrets: { src1: { apiToken: "restored-token" } } }), "masterpass1");
+      const importData = {
+        version: 2,
+        exportType: "backup",
+        exportedAt: new Date().toISOString(),
+        servers: [],
+        tunnels: [],
+        serialProfiles: [],
+        inventorySources: [source],
+        encryptedSecrets
+      };
+
+      mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/restore.json", scheme: "file" }]);
+      mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(importData), "utf8"));
+      mockShowInputBox.mockResolvedValueOnce("masterpass1");
+      mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+      mockShowQuickPick.mockResolvedValueOnce({ label: "Replace", value: "replace" });
+
+      registerConfigCommands(core, vault);
+      await registeredCommands.get("nexus.config.import")!();
+
+      // The credential really did arrive with the restore…
+      expect(await vault.get(inventorySecretKey("src1", "apiToken"))).toBe("restored-token");
+      // …and the refresh happened, WITH it, without any timer being advanced —
+      // a period here would be an hour.
+      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+      expect(fetchStatus).toHaveBeenCalledWith(expect.anything(), { apiToken: "restored-token" });
+    } finally {
+      idleSub.dispose();
+      poll.dispose();
+      for (const d of inventoryDisposables) d.dispose();
+      mockExecuteCommand.mockReset();
+    }
   });
 
   it("merge-mode import does not overwrite a retained source's vault secret with the backup's; a newly-imported source's secret still restores; replace mode restores everything", async () => {

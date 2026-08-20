@@ -92,6 +92,33 @@ export interface InventoryRuntimeTeardown {
   teardownServerRuntime(serverId: string, shouldAbort?: () => boolean): Promise<void>;
 }
 
+/**
+ * What `refreshStatus` reports back about the sources it was asked to refresh
+ * (review D6/E1).
+ */
+export interface InventoryStatusRefreshOutcome {
+  /**
+   * Targeted sources this invocation did NOT refresh and could not have — busy
+   * with a sibling command, or missing a credential the record declares — both
+   * of which somebody else will clear. Everything else is absent: a provider
+   * with no status to give can never be refreshed, and a lab box that answered
+   * with an error was genuinely tried.
+   */
+  unrefreshedSourceIds: string[];
+}
+
+/**
+ * Optional collaborators the inventory commands report runtime facts to.
+ * Everything here is a FACT this layer owns, never a request: what the observer
+ * does with it is the observer's business (see `extension.ts`, where the status
+ * poll uses `onSourceFree` to bring a source the arm fire it is still
+ * waiting for).
+ */
+export interface InventoryCommandObservers {
+  /** A source's busy claim has just been released, whatever had held it. */
+  onSourceFree?: (sourceId: string) => void;
+}
+
 function providerMissingMessage(providerId: string): string {
   return `Inventory provider "${providerId}" is not available (the extension providing it may be disabled).`;
 }
@@ -487,6 +514,27 @@ function formValuesToProviderConfig(
         numeric = Number(raw);
       }
       if (numeric !== undefined) {
+        // PER-SOURCE LAB STATUS POLL — the declared bounds re-checked on the
+        // COLLECTION side. The rendered input carries the same min/max
+        // natively, but that is the browser layer: this is what a value posted
+        // programmatically (or by a form opened before a provider schema change)
+        // has to pass. Rejects rather than clamps — silently storing a
+        // different number than the user typed is how a source ends up polling
+        // at a cadence nobody chose.
+        const { min, max } = field;
+        if ((min !== undefined && numeric < min) || (max !== undefined && numeric > max)) {
+          throw new Error(`${field.label} must be between ${min ?? "-\u221e"} and ${max ?? "\u221e"}`);
+        }
+        // WHOLE NUMBERS (review D2) — the twin of the bounds check above, and
+        // the same reason for living here: the rendered input carries the
+        // native `step="1"`, but that is the browser's word, and a value can be
+        // posted without one. Rejects rather than rounds, exactly as the bounds
+        // do — storing a different number than the user typed is how a source
+        // ends up polling at a cadence nobody chose, and here the runtime's own
+        // floor is what would change it (0.4 becomes OFF, 1.9 becomes 1).
+        if (field.integer && !Number.isInteger(numeric)) {
+          throw new Error(`${field.label} must be a whole number`);
+        }
         config[field.id] = numeric;
       } else if (field.required) {
         throw new Error(`${field.label} is required`);
@@ -2206,7 +2254,8 @@ export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
   vault: SecretVault,
-  teardown: InventoryRuntimeTeardown
+  teardown: InventoryRuntimeTeardown,
+  observers?: InventoryCommandObservers
 ): vscode.Disposable[] {
   // F4 — shared by all four commands: syncNow holds a source's id for its whole
   // run; editSource/removeSource hold it for their whole run too (they mutate
@@ -2219,22 +2268,106 @@ export function registerInventoryCommands(
   // one-size-fits-all "is currently syncing" this used to be.
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
-  // LIVE STATUS (Phase 2) — monotonic status-refresh generation. Each
-  // refreshStatus sweep captures the value it bumps to; before applying any
-  // report it checks it still holds the latest generation, so a slow older
-  // sweep that resolves AFTER a newer one started drops its (now stale) apply
-  // rather than clobbering the fresher state. The poll's in-flight latch stops
-  // poll ticks from stacking; this covers poll-vs-manual and any residual race.
-  let statusRefreshGeneration = 0;
+  /**
+   * REVIEW D6/E1/E2 — the ONE way a busy claim is dropped, and the one place
+   * that says so.
+   *
+   * The poll's arm fire — a source's not-running → running tick — is the fire
+   * with nothing behind it: the source has no status on screen and the next
+   * tick is a whole period away, up to an hour. `refreshStatus` declines a
+   * source that is claimed here, and the commonest way to ARM a source is an
+   * **Edit Source** save, which emits `core.onDidChange` synchronously while
+   * this very claim is held (it is released when the form is disposed). So the
+   * arm fire landed inside the busy window and was lost.
+   *
+   * This layer keeps NO memory of that. It reports two facts it owns — which
+   * sources a refresh did not run for (`refreshStatus`'s return value), and
+   * that a claim has been released (`onSourceFree`) — and the poll, which owns
+   * arming and visibility, owns the one piece of state they feed — has a fire
+   * RUN for this source since it armed? — and decides whether firing again is
+   * still justified. A `delete` that bypassed this funnel would silently
+   * drop the notification for whichever command forgot it.
+   */
+  const releaseSourceClaim = (sourceId: string): void => {
+    inFlightSourceIds.delete(sourceId);
+    observers?.onSourceFree?.(sourceId);
+  };
 
-  // TRUNCATED STATUS (follow-up 2; R4 review) — which sweep generation last
-  // APPLIED status for each source id. The generation counter above orders
-  // sweeps; this records the outcome per source, which is what the truncation
-  // warning needs: a sweep may only claim a source's status is partial while
-  // its own truncated apply is still the newest one for that source. Written on
+  // LIVE STATUS (Phase 2) — monotonic status-refresh generation, PER SOURCE.
+  // Each refreshStatus invocation claims a fresh generation for every source it
+  // targets; before applying that source's report it checks it still holds the
+  // latest generation FOR THAT SOURCE, so a slow older crawl that resolves after
+  // a newer one started drops its (now stale) apply rather than clobbering the
+  // fresher state. The poll's in-flight latch stops a source's ticks from
+  // stacking; this covers poll-vs-manual and any residual race.
+  //
+  // PER SOURCE, not one global counter (review H1). A global counter was sound
+  // while the poll issued ONE WHOLE SWEEP at a time — a superseding sweep always
+  // covered everything the superseded one would have applied, so dropping the
+  // older apply lost nothing. The poll now fires ONE SOURCE PER TICK at that
+  // source's own cadence, and under a global counter any tick of a fast source
+  // would invalidate a slow source's in-flight crawl even though the two write
+  // disjoint state: with a 60 s source whose crawl takes 10 s and a 10 s source
+  // beside it, EVERY slow fetch overlaps a fast tick and the slow lab's status
+  // would never reach the tree at all. That is the "one slow lab box suppressed
+  // every other source" failure this feature went per-source to fix, mirrored.
+  //
+  // Keyed by source id and never pruned: it is a monotonic counter, and letting
+  // a removed-then-recreated id restart at 1 would let an in-flight claim from
+  // the PREVIOUS incarnation match again. One number per source id ever seen in
+  // a session is not a leak worth the incarnation hazard.
+  const statusRefreshGenerations = new Map<string, number>();
+
+  /**
+   * Claim the next generation for each of `sourceIds` and return the claims, to
+   * be checked with `holdsStatusClaim` before anything is applied.
+   *
+   * Claimed UP FRONT for the whole target list, not lazily as each source's turn
+   * comes: the ordering this implements is "last INVOCATION wins", which is what
+   * the single counter meant and what the poll's own latch assumes. Claiming
+   * lazily would let an all-sources sweep re-claim (and so re-crawl) a source a
+   * targeted refresh had already started on, which is precisely the duplicated
+   * lab crawl the supersede rule exists to avoid.
+   */
+  const claimStatusRefresh = (sourceIds: readonly string[]): ReadonlyMap<string, number> => {
+    const claims = new Map<string, number>();
+    for (const id of sourceIds) {
+      const next = (statusRefreshGenerations.get(id) ?? 0) + 1;
+      statusRefreshGenerations.set(id, next);
+      claims.set(id, next);
+    }
+    return claims;
+  };
+
+  /**
+   * Does this invocation still hold the newest claim on `sourceId`? False both
+   * when a newer invocation has claimed it and when this invocation never
+   * targeted it at all (`undefined === undefined` would otherwise read as a
+   * hold on a source nobody has ever refreshed).
+   */
+  const holdsStatusClaim = (claims: ReadonlyMap<string, number>, sourceId: string): boolean => {
+    const mine = claims.get(sourceId);
+    return mine !== undefined && statusRefreshGenerations.get(sourceId) === mine;
+  };
+
+  // TRUNCATED STATUS (follow-up 2; R4 review) — which generation last APPLIED
+  // status for each source id. The counters above order invocations per source;
+  // this records the outcome per source, which is what the truncation warning
+  // needs: an invocation may only claim a source's status is partial while its
+  // own truncated apply is still the newest one for that source. Written on
   // EVERY apply, not just truncated ones — a later COMPLETE apply is precisely
-  // what has to invalidate an earlier truncated claim. Entries are dropped when
-  // the source is removed (see removeSource).
+  // what has to invalidate an earlier truncated claim. Both sides are drawn from
+  // the SAME per-source counter, so the comparison stays exact now that the
+  // counters are per source.
+  //
+  // NEVER PRUNED, including when the source is removed — an earlier revision of
+  // this note claimed otherwise, and `removeSource` has never done it. It is
+  // safe for the reason `statusRefreshGenerations` is never pruned either, and
+  // the two facts are the same fact: that counter is monotonic per id and is not
+  // reset by removal, so an entry left behind by a REMOVED-AND-RECREATED id
+  // holds a strictly lower number than any claim the new incarnation can be
+  // issued, and can never match one. A stale entry is unreachable, not
+  // misleading — the failure mode a per-incarnation reset would have created.
   const statusAppliedGeneration = new Map<string, number>();
 
   /**
@@ -2486,7 +2619,7 @@ export function registerInventoryCommands(
         }
         if (!releasedInFlight) {
           releasedInFlight = true;
-          inFlightSourceIds.delete(source.id);
+          releaseSourceClaim(source.id);
         }
       })();
       return releasing;
@@ -3168,7 +3301,7 @@ export function registerInventoryCommands(
         `Inventory source "${source.name}" removed.${skippedNote}${recreatedNote}${teardownFailureNote}`
       );
     } finally {
-      inFlightSourceIds.delete(source.id);
+      releaseSourceClaim(source.id);
     }
   }
 
@@ -3337,18 +3470,18 @@ export function registerInventoryCommands(
           }
           core.applyInventoryStatus(source.id, fetchedStatus);
           // R3 (follow-up #43 review) — THE SECOND APPLIER. `refreshStatus`
-          // records the sweep generation that last applied status for a source
-          // and only warns "this source's lab status is partial" while its own
-          // apply is still the newest one. That record exists precisely so a
-          // later COMPLETE apply invalidates an earlier partial claim — but a
-          // sync belongs to no sweep and does not bump `source.revision`, so
+          // records the generation that last applied status for a source and
+          // only warns "this source's lab status is partial" while its own apply
+          // is still the newest one. That record exists precisely so a later
+          // COMPLETE apply invalidates an earlier partial claim — but a sync
+          // holds no generation claim and does not bump `source.revision`, so
           // without this line a truncated claim collected before the sync would
           // still match at warning time and the user would be told to narrow a
           // Root Folder for a tree this sync has just brought fully current.
           // DELETING the entry (rather than writing some generation of our own)
-          // is the minimal shape: the filter is `get(id) !== myGeneration`, and
-          // a missing entry fails it for every sweep, which is exactly the claim
-          // this apply supersedes.
+          // is the minimal shape: the filter compares the record against the
+          // warning sweep's OWN claim for this source, and a missing entry fails
+          // it for every sweep — exactly the claim this apply supersedes.
           //
           // ONLY WHEN THIS SYNC'S OWN REPORT IS COMPLETE (review). The
           // claim being invalidated is "this source's status is partial", and
@@ -4482,7 +4615,7 @@ export function registerInventoryCommands(
         return;
       }
     } finally {
-      inFlightSourceIds.delete(source.id);
+      releaseSourceClaim(source.id);
     }
   }
 
@@ -4560,23 +4693,45 @@ export function registerInventoryCommands(
    *    sync/edit/remove) is skipped so this never races the vault read or
    *    provider call that operation is making — refresh never CLAIMS the guard
    *    itself, so it can never block a real operation and overlapping refreshes
-   *    stay harmless (fetchProviderStatus is idempotent);
+   *    stay harmless (fetchProviderStatus is idempotent). A skip is silent, and
+   *    for a routine caller that is right: a poll tick will come round again,
+   *    and a manual sweep is one click. `armTick` is the exception — see
+   *    `armRefreshOwed`;
    *  - `fetchProviderStatus` swallows a throwing/ malformed provider answer into
    *    `undefined`, and a vault read that rejects is caught here.
    */
-  async function refreshStatus(sourceIdArg?: string, options?: { manual?: boolean }): Promise<void> {
-    const myGeneration = ++statusRefreshGeneration;
+  async function refreshStatus(
+    sourceIdArg?: string,
+    options?: { manual?: boolean }
+  ): Promise<InventoryStatusRefreshOutcome> {
+    // REVIEW D6/E1 — targeted sources this invocation did NOT refresh, AND
+    // could not have: claimed by a sibling command, or missing a credential it
+    // declares. Both are temporary and both are somebody else's to clear, which
+    // is what makes them worth reporting — the caller (the poll) can make good
+    // on a declined arm fire instead of waiting a period. A provider with no
+    // status to give, or a lab box that answered with an error, is NOT here:
+    // the first can never be refreshed and the second was genuinely tried.
+    const unrefreshedSourceIds: string[] = [];
     const targets = sourceIdArg
       ? (() => {
           const source = core.getInventorySource(sourceIdArg);
           return source ? [source] : [];
         })()
       : core.getSnapshot().inventorySources;
+    // One claim per targeted source (see claimStatusRefresh) — taken here, at
+    // invocation, so ordering against every other invocation is decided before
+    // the first await, exactly as the single counter decided it.
+    const myClaims = claimStatusRefresh(targets.map((source) => source.id));
+    const holdsClaim = (sourceId: string): boolean => holdsStatusClaim(myClaims, sourceId);
     // P3-7 — on the MANUAL path only, warn once if every source we actually
     // tried failed to produce a report (all auth broken / unreachable). The
     // poll path stays silent (a warning per tick would nag).
     let attempted = 0;
     let succeeded = 0;
+    // Did a NEWER invocation take over any source before we reached it? Only the
+    // loop-top skip sets this, and only the total-failure warning reads it: see
+    // that warning for why an incomplete sweep may not deliver its verdict.
+    let superseded = false;
     // TRUNCATED STATUS (follow-up 2) — the sources whose report came back
     // `truncated` AND was applied, by name, for one manual-only warning after the
     // loop. `fetchStatus` sets the flag when the lab crawl hits its own time
@@ -4587,11 +4742,13 @@ export function registerInventoryCommands(
     // Entries carry the source ID as well as the name: the name is what the
     // message renders, the id is what `warnIfTruncated` filters by.
     const truncatedSources: { id: string; name: string; revision: string | undefined }[] = [];
-    // TRUNCATED STATUS (follow-up 2; R3 review) — ONE renderer, because this
-    // warning has TWO exits: the normal end of the sweep, and the supersede bail
-    // inside the loop below. Written twice they would drift; written once they
-    // cannot. It is self-gating (manual-only, and silent with nothing collected),
-    // so both call sites are an unconditional call.
+    // TRUNCATED STATUS (follow-up 2; R3 review) — a named renderer with ONE call
+    // site, at the end of the sweep. It had two while a supersede bailed out of
+    // the loop mid-list; per-source supersede (review H1) skips the superseded
+    // SOURCE and lets the sweep reach its natural end, so the mid-loop exit is
+    // gone. It stays a function because it is self-gating (manual-only, and
+    // silent with nothing collected) and because the filtering below is the
+    // substance, not the call.
     //
     // MANUAL ONLY, exactly like the total-failure warning and for the same
     // reason: the poll fires on a timer, and a warning per tick would nag about a
@@ -4648,7 +4805,7 @@ export function registerInventoryCommands(
       // live read is immune to all of them by construction, which a growing list
       // of notification call sites would not be.
       const live = truncatedSources.filter((s) => {
-        if (statusAppliedGeneration.get(s.id) !== myGeneration) {
+        if (statusAppliedGeneration.get(s.id) !== myClaims.get(s.id)) {
           return false;
         }
         // BOTH halves, deliberately. `revision` is optional (older records are
@@ -4673,26 +4830,28 @@ export function registerInventoryCommands(
       );
     };
     for (const source of targets) {
-      // A newer sweep has started while this one was awaiting — stop applying
-      // stale results (last-STARTED-wins, so an older completion never
-      // overwrites a newer apply).
-      if (myGeneration !== statusRefreshGeneration) {
-        // R3 (review) — but NOT silently, if this sweep already APPLIED a
-        // truncated report. Silence-on-supersede is right only while nothing
-        // reached the tree; here an earlier source's partial status is on screen
-        // and returning past the post-loop warning would leave it unexplained
-        // (the superseding sweep is often targeted at ONE source, so it covers
-        // neither that source nor its truncation).
-        //
-        // Deliberately a warn-then-`return` rather than a `break`: a `break`
-        // would also drop the sweep into the TOTAL-FAILURE warning below, whose
-        // `succeeded === 0` means "every source failed" — false on a bail, where
-        // it only means every source TRIED SO FAR failed. That warning needs a
-        // complete sweep to mean anything, so it stays suppressed here.
-        warnIfTruncated();
-        return;
+      // A newer invocation has claimed THIS SOURCE while we were awaiting — skip
+      // it and move on (last-INVOCATION-wins per source, so an older completion
+      // never overwrites a newer apply).
+      //
+      // A `continue`, NOT the `return` this used to be (review H1). Supersede is
+      // per source now, so a tick that took over ONE source says nothing about
+      // the rest of this sweep's list: abandoning them would let any background
+      // tick silently truncate a manual all-sources Refresh Lab Status, which is
+      // the same class of bug (one source suppressing work on the others) the
+      // per-source counters exist to remove. The sweep therefore runs to its
+      // single exit below, where `warnIfTruncated` renders whatever it applied —
+      // including an earlier source's partial status, which is on screen and
+      // would otherwise go unexplained.
+      if (!holdsClaim(source.id)) {
+        superseded = true;
+        continue;
       }
       if (inFlightSourceIds.get(source.id) !== undefined) {
+        // Declined, and SAID so (review D6). Racing the operation holding the
+        // claim is exactly what this skip exists to prevent; reporting it is
+        // what lets the poll bring the source its arm fire when the claim clears.
+        unrefreshedSourceIds.push(source.id);
         continue; // busy with a sync/edit/remove — skip, don't race it
       }
       const provider = registry.get(source.providerId);
@@ -4726,6 +4885,22 @@ export function registerInventoryCommands(
         // fetchProviderStatus clones source.config internally (so the stored
         // record is never mutated) and degrades every provider failure to
         // undefined; secrets is a fresh local object, safe to pass as-is.
+        // REVIEW E1 — a source whose DECLARED secret the vault cannot supply
+        // cannot authenticate, so the crawl would be a guaranteed auth failure
+        // against the lab box. It is a decline, not a failure: a backup restore
+        // persists the source record BEFORE it restores that credential
+        // (`configCommands.importMergeReplaceLocked` — the record lands with
+        // the other imported buckets, the vault write comes later in the same
+        // locked run), so the arm fire fired at a source that could not
+        // possibly succeed. Reported, not attempted, so the poll can make good
+        // on it when the restore settles. `attempted` still counts it, so a
+        // MANUAL sweep whose only source has an unreadable keychain still warns
+        // exactly as it did when this made a doomed provider call instead.
+        const missingSecretFieldIds = source.secretFieldIds.filter((fieldId) => secrets[fieldId] === undefined);
+        if (missingSecretFieldIds.length > 0) {
+          unrefreshedSourceIds.push(source.id);
+          continue;
+        }
         const report = await fetchProviderStatus(provider, source.config, secrets);
         if (report) {
           // A report (even an empty one) means the source was reachable — count
@@ -4733,8 +4908,11 @@ export function registerInventoryCommands(
           // the guards below actually apply it.
           succeeded++;
           // Re-check AFTER the (awaited) fetch, three guards:
-          //  - the global generation: a NEWER sweep may have started and applied
-          //    while this fetch was in flight (applying now would clobber it);
+          //  - this source's generation claim: a NEWER invocation may have
+          //    started and applied FOR THIS SOURCE while the fetch was in flight
+          //    (applying now would clobber it). Per source, so a different
+          //    source's tick — which writes disjoint state — does not drop this
+          //    report (review H1);
           //  - this source's revision: an Edit Source may have superseded the
           //    config this report was fetched under (P2-1b);
           //  - this source's MUTATION EPOCH: a syncNow that completed while this
@@ -4743,7 +4921,7 @@ export function registerInventoryCommands(
           //    — the epoch was already re-checked before the heal below; the
           //    apply needs it too now that a sync writes status at all, and it
           //    is the only one of the three that catches a ROUTINE sync (which
-          //    changes neither the sweep generation nor `source.revision` — a
+          //    changes neither the generation claim nor `source.revision` — a
           //    sync that RESTAMPS the provider fingerprint does mint a fresh
           //    revision and is caught one check earlier). Dropping the
           //    apply usually loses nothing: the sync that bumped the epoch
@@ -4757,7 +4935,7 @@ export function registerInventoryCommands(
           //    as it is.
           const currentSource = core.getInventorySource(source.id);
           if (
-            myGeneration === statusRefreshGeneration &&
+            holdsClaim(source.id) &&
             currentSource?.revision === startRevision &&
             core.getSourceMutationEpoch(source.id) === startEpoch
           ) {
@@ -4766,14 +4944,15 @@ export function registerInventoryCommands(
             // source, for every report and not only truncated ones (see the map's
             // note above). Set immediately after the apply, inside the same
             // guard, so it can never claim an apply that was dropped.
-            statusAppliedGeneration.set(source.id, myGeneration);
+            statusAppliedGeneration.set(source.id, myClaims.get(source.id)!);
             // TRUNCATED STATUS (follow-up 2) — collected INSIDE the apply guard,
             // not on receipt of the report. The warning explains the status the
             // user is now LOOKING AT, so a report the guards dropped (a superseded
             // sweep, or a config edit mid-fetch) must not produce one: nothing
             // partial reached the tree. This also makes the single-source
-            // supersede case silent, which the loop-top generation check alone
-            // cannot do — it only catches a supersede before the NEXT source.
+            // supersede case silent, which the loop-top claim check alone cannot
+            // do — that one only catches a supersede landing before the NEXT
+            // source, never one landing inside this source's own fetch.
             if (report.truncated === true) {
               truncatedSources.push({ id: source.id, name: source.name, revision: startRevision });
             }
@@ -4822,7 +5001,7 @@ export function registerInventoryCommands(
                 // epoch check catches a report that straddled a completed sync; the
                 // revision guard would let it heal stale over the synced records.
                 if (
-                  myGeneration !== statusRefreshGeneration ||
+                  !holdsClaim(source.id) ||
                   core.getInventorySource(source.id)?.revision !== startRevision ||
                   core.getSourceMutationEpoch(source.id) !== startEpoch ||
                   inFlightSourceIds.get(source.id) !== undefined
@@ -4840,7 +5019,16 @@ export function registerInventoryCommands(
       }
     }
     // P3-7 — every attempted source failed to report: surface it, manual only.
-    if (options?.manual && attempted > 0 && succeeded === 0) {
+    //
+    // AND ONLY FROM A SWEEP THAT COVERED ITS WHOLE LIST (R3, preserved through
+    // review H1). "Could not refresh from ANY source" is a verdict only a
+    // complete sweep is entitled to deliver: with a source skipped because a
+    // newer invocation took it over, `succeeded === 0` means merely "every source
+    // this sweep still owned failed", and the ones it handed over may be
+    // perfectly healthy — and are being refreshed right now by the invocation
+    // that claimed them. This is the check the old mid-loop `return` performed by
+    // never reaching this line.
+    if (options?.manual && attempted > 0 && succeeded === 0 && !superseded) {
       void vscode.window.showWarningMessage(
         "Could not refresh lab status from any inventory source — check the source's credentials and connectivity."
       );
@@ -4848,13 +5036,16 @@ export function registerInventoryCommands(
     // TRUNCATED STATUS (follow-up 2) — a partial refresh leaves some nodes' state
     // stale or `unknown`, which is indistinguishable from a confirmed state in the
     // tree, so say so. The wording, the manual-only gate and the one-message rule
-    // live in `warnIfTruncated` above, shared with the supersede bail.
+    // live in `warnIfTruncated` above. THE SINGLE EXIT: the per-source supersede
+    // skip (review H1) keeps the sweep in its loop, so this is now the only place
+    // the warning is rendered from.
     //
     // No guard is needed against this and the total-failure warning both firing:
     // they are mutually exclusive by construction. A truncated report IS a report,
     // so it increments `succeeded`, and the warning above requires
     // `succeeded === 0`.
     warnIfTruncated();
+    return { unrefreshedSourceIds };
   }
 
   function manageSources(): void {
@@ -5010,7 +5201,7 @@ export function registerInventoryCommands(
         }
       );
     } finally {
-      inFlightSourceIds.delete(source.id);
+      releaseSourceClaim(source.id);
     }
     if (!dispatched) {
       return;
@@ -5044,6 +5235,9 @@ export function registerInventoryCommands(
     // is the MANUAL path and warns if every source failed.
     vscode.commands.registerCommand("nexus.inventory.refreshStatus", (arg?: unknown) => {
       const isPoll = typeof arg === "object" && arg !== null && (arg as { __poll?: unknown }).__poll === true;
+      // Returns its outcome (review D6/E1): the poll reads which sources it did
+      // not refresh off the resolved value, so no extra argument or marker is
+      // needed to tell it apart from a refresh that happened.
       return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
     }),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources),

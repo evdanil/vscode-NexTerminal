@@ -75,6 +75,18 @@ import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
 import { MAX_SCRIPT_WAIT_TIMEOUT_MS, MAX_SCRIPT_WAIT_TIMEOUT_SECONDS } from "../services/scripts/defaultTimeout";
 import { getConfiguredSettingValue } from "../utils/configurationInspection";
 import { configMutationLock } from "../services/configMutationLock";
+import {
+  coerceRetiredStatusPollSeconds,
+  readGlobalRetiredStatusPollValue,
+  RETIRED_STATUS_POLL_KEY,
+  RETIRED_STATUS_POLL_SECTION
+} from "../services/inventory/statusPollSettingMigration";
+import {
+  EVE_NG_PROVIDER_ID,
+  EVE_NG_STATUS_POLL_FIELD_ID,
+  EVE_NG_STATUS_POLL_MAX_SECONDS,
+  EVE_NG_STATUS_POLL_MIN_SECONDS
+} from "../services/inventory/providers/eveNgProvider";
 
 interface NexusConfigExport {
   version: 1 | 2;
@@ -107,6 +119,25 @@ interface NexusConfigExport {
   /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
   macroFolders?: string[];
   settings?: Record<string, unknown>;
+  /**
+   * RETIRED LAB-STATUS POLL INTERVAL (review D3) — `true` on every export
+   * written by a build that HAS the per-source **Lab Status Poll Interval**
+   * field, and absent on every export written before it. It exists for exactly
+   * one decision: whether an imported source's MISSING interval means "this
+   * export predates the field" (carry the retired global value onto it) or "its
+   * owner blanked the field to stop polling" (leave it alone) — two states with
+   * the identical shape, since the edit form stores no key at all for a blanked
+   * number field.
+   *
+   * Absence is what the import treats as evidence of a pre-field export, and
+   * that is sound because the field and this stamp ship in the SAME build: no
+   * release writes exports that know the field but omit the stamp. What makes
+   * it better than the per-source absence it replaces is that no action in the
+   * UI can produce it — blanking a source's interval removes that source's key
+   * and can touch nothing else, while removing this would take a text editor.
+   * See `importPredatesPerSourceStatusPoll`.
+   */
+  inventoryStatusPollPerSource?: boolean;
   encryptedSecrets?: EncryptedPayload;
 }
 
@@ -137,7 +168,24 @@ const DEFAULT_SCRIPTS_RELATIVE_PATH = ".nexus/scripts";
 const EXTRA_IMPORT_KEYS: Array<{ section: string; key: string }> = [
   { section: "nexus.terminal.highlighting", key: "rules" },
   { section: "nexus.scripts", key: "defaultTimeout" },
-  { section: "nexus.scripts", key: "maxRuntimeMs" }
+  { section: "nexus.scripts", key: "maxRuntimeMs" },
+  // RETIRED (2.8.191) — the global lab-status poll interval, whose value now
+  // lives on each EVE-NG source's own Lab Status Poll Interval field. Listed
+  // for the same reason the legacy script-timeout key above is: an export taken
+  // BEFORE the retirement still holds the user's interval, and import drops
+  // every key outside SETTINGS_KEY_SET silently and uncounted — the same silent
+  // loss the activation migration exists to prevent. Listing it is also what
+  // keeps `readSettings` picking it up on a machine whose activation clear
+  // could not write (read-only / policy-managed settings.json), so the value
+  // survives into the next export instead of dying with the old machine.
+  //
+  // Like that key, it is CONSUMED by the import and never written back into
+  // settings — see the `RETIRED_STATUS_POLL_FULL_KEY` branch in applySettings
+  // and the carry in importMergeReplaceLocked. Writing it would only mint a
+  // dead key: the extension must ACTIVATE before its own import command can
+  // run, and that activation has already marked the migration done, so the
+  // restored key would never be read by anything.
+  { section: RETIRED_STATUS_POLL_SECTION, key: RETIRED_STATUS_POLL_KEY }
 ];
 
 // Derived from SETTINGS_META (single source of truth for contributed settings) plus the
@@ -151,6 +199,69 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));
 const SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY = "nexus.scripts.defaultTimeoutSeconds";
 const LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY = "nexus.scripts.defaultTimeout";
+const RETIRED_STATUS_POLL_FULL_KEY = `${RETIRED_STATUS_POLL_SECTION}.${RETIRED_STATUS_POLL_KEY}`;
+
+/**
+ * Does this payload predate the per-source Lab Status Poll Interval field —
+ * i.e. may the retired GLOBAL interval it carries be applied to the sources it
+ * creates? (Review D3.)
+ *
+ * The question exists because the two payload shapes that matter are the same
+ * shape. A source exported before the field HAS no interval; a source whose
+ * owner BLANKED the field to stop polling also has none, because the edit form
+ * stores no key for an empty number field. Carrying onto the first is the point
+ * of the whole mechanism; carrying onto the second re-enables unattended
+ * polling somebody deliberately switched off — the exact harm the migration's
+ * durable marker prevents locally, arriving through a backup instead.
+ *
+ * So the gate is payload-wide, and rests on two pieces of evidence that a
+ * deliberate blank cannot produce:
+ *
+ *  1. **The export's own stamp.** `inventoryStatusPollPerSource` is written by
+ *     every export from a build that has the field. Blanking a field in the UI
+ *     cannot remove it; only hand-editing the JSON can.
+ *  2. **Any EVE-NG source in the payload answering the field.** One EVE-NG
+ *     source carrying `statusPollSeconds` proves the exporting build knew the
+ *     field, so every ABSENT value in that same payload is an answer ("off"),
+ *     not a gap. Blanking one source cannot remove the key from the others.
+ *     Scoped to EVE-NG because the id is a provider's field name and not a
+ *     reserved word — see the note at the check itself.
+ *
+ * Be straight about the limit: a genuinely old export contains no positive "I
+ * predate the field" marker — there was nothing to write one with — so the
+ * decision to carry ultimately rests on the ABSENCE of both signals above.
+ * That absence is sound rather than circular because the field and the stamp
+ * ship in the same build: no released version produces an export that knows the
+ * field yet lacks the stamp. The residual case is a payload from an
+ * intermediate development build (field present, stamp absent) in which EVERY
+ * source's interval was blanked, so signal 2 has nothing to find either. That
+ * one is chosen against knowingly, and it is the direction the choice should
+ * fall: not carrying is recoverable — the user types the number into the
+ * field — while re-enabling polling behind somebody's back is not.
+ */
+function importPredatesPerSourceStatusPoll(data: NexusConfigExport): boolean {
+  if (data.inventoryStatusPollPerSource === true) {
+    return false;
+  }
+  const sources = Array.isArray(data.inventorySources) ? data.inventorySources : [];
+  // EVE-NG SOURCES ONLY. `statusPollSeconds` is EVE-NG's field id, not a
+  // reserved word: provider registration is a public API and puts no constraint
+  // on field ids, so a third-party provider may define one of its own under the
+  // same name. Reading the id across every provider would let such a source
+  // classify a genuinely OLD backup as post-migration, and the legacy EVE-NG
+  // sources in that same backup would silently lose the interval this carry
+  // exists to preserve. Only an EVE-NG source answering the field is evidence
+  // that the exporting build knew EVE-NG's new field — the same reason the
+  // carry itself, and the activation migration, re-check `providerId` before
+  // writing an EVE-NG-only field into a source's config.
+  return !sources.some(
+    (source) =>
+      source
+      && typeof source === "object"
+      && source.providerId === EVE_NG_PROVIDER_ID
+      && source.config?.[EVE_NG_STATUS_POLL_FIELD_ID] !== undefined
+  );
+}
 
 function legacyDefaultTimeoutMsToSeconds(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 100) {
@@ -184,15 +295,39 @@ const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingVali
     validBoundedNumber(value, 0, MAX_SCRIPT_RUNTIME_MS) ? { ok: true, value } : { ok: false },
   "nexus.scripts.defaultTimeout": (value) =>
     validBoundedNumber(value, 100, MAX_SCRIPT_WAIT_TIMEOUT_MS) ? { ok: true, value } : { ok: false }
+  // No entry for the retired `nexus.inventory.statusPollSeconds`: this table is
+  // consulted only for keys that go THROUGH to settings, and that one is
+  // consumed by applySettings' own branch instead (which validates it there).
 };
+
+/** What `applySettings` extracted but did NOT write to settings. */
+interface AppliedSettingsCarry {
+  /**
+   * The retired global lab-status poll interval, after the migration's own
+   * coercion. Present only when the payload carried a valid one; the caller
+   * decides which sources (if any) may receive it.
+   */
+  retiredStatusPollSeconds?: number;
+}
 
 function readSettings(): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const { section, key } of SETTINGS_KEYS) {
     const config = vscode.workspace.getConfiguration(section);
-    const value = getConfiguredSettingValue(config, key);
+    const fullKey = `${section}.${key}`;
+    // RETIRED LAB-STATUS POLL INTERVAL (review D1) — GLOBAL ONLY, through the
+    // migration's own reader. Every other key is captured at its EFFECTIVE
+    // scope, which is what a backup of "how this install behaves" should hold.
+    // This one is different because of where its value ENDS UP: the import
+    // carries it onto inventory sources, and a source is machine-wide. Reading
+    // the effective scope here would capture the very workspace-scoped number
+    // the activation migration refuses to promote, and the restore would then
+    // promote it on the next machine — the outcome the Global-only rule was
+    // adopted to remove, re-entering through the export instead of activation.
+    const value = fullKey === RETIRED_STATUS_POLL_FULL_KEY
+      ? readGlobalRetiredStatusPollValue(config)
+      : getConfiguredSettingValue(config, key);
     if (value !== undefined) {
-      const fullKey = `${section}.${key}`;
       if (fullKey === LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY) {
         if (result[SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY] === undefined) {
           const seconds = legacyDefaultTimeoutMsToSeconds(value);
@@ -209,12 +344,54 @@ function readSettings(): Record<string, unknown> {
 }
 
 
-async function applySettings(settings: Record<string, unknown>): Promise<void> {
+/** The result of reading a payload's settings, before anything is written. */
+interface PartitionedImportSettings {
+  /** Keys destined for `settings.json`, still to be validated at write time. */
+  writable: Record<string, unknown>;
+  /** Keys consumed here and never written — see `AppliedSettingsCarry`. */
+  carry: AppliedSettingsCarry;
+  /** Values rejected during the partition; the write phase adds its own. */
+  invalidCount: number;
+}
+
+/**
+ * Reads the payload and decides what each key is, WITHOUT writing anything
+ * (review D4). Split out from the write phase because the two have different
+ * failure modes and only one of them is fallible: `config.update` rejects on
+ * policy-managed or otherwise unwritable configuration, and when the carry was
+ * extracted behind those writes, one such rejection threw before it could be
+ * returned. The inventory sources are persisted EARLIER in the same import, so
+ * a retry in merge mode skips their ids, `importedIds` comes back empty, and
+ * the cadence could never be applied by any later run — a partial settings
+ * failure stranding freshly imported sources with polling off, for good.
+ *
+ * Pure: no `vscode` writes, nothing to throw, so a caller can take the carry
+ * first and let the writes fail on their own terms.
+ */
+function partitionImportedSettings(settings: Record<string, unknown>): PartitionedImportSettings {
   const allowedSettings: Record<string, unknown> = {};
   let invalidCount = 0;
   let legacyDefaultTimeoutSeconds: number | undefined;
+  let retiredStatusPollSeconds: number | undefined;
   for (const [fullKey, value] of Object.entries(settings)) {
     if (!SETTINGS_KEY_SET.has(fullKey)) {
+      continue;
+    }
+
+    // RETIRED lab-status poll interval (review C2) — extracted, never written.
+    // The activation migration cannot pick this up: activation necessarily
+    // happened before this command could run, and a pass that found no key
+    // marks itself done, so a key restored here is read by nobody. Bounded
+    // exactly as the retired setting itself was, so a hand-edited or corrupt
+    // export is skipped and COUNTED rather than silently coerced into a number
+    // the user never chose; the coercion below is the migration's own, so an
+    // in-range value lands identically whichever path carried it.
+    if (fullKey === RETIRED_STATUS_POLL_FULL_KEY) {
+      if (validBoundedNumber(value, EVE_NG_STATUS_POLL_MIN_SECONDS, EVE_NG_STATUS_POLL_MAX_SECONDS)) {
+        retiredStatusPollSeconds = coerceRetiredStatusPollSeconds(value);
+      } else {
+        invalidCount++;
+      }
       continue;
     }
 
@@ -237,7 +414,19 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
   // — macros now live in MacroStore, not settings. The allowedSettings filter above
   // will already exclude it, but delete explicitly in case any stale reference slips through.
 
-  for (const [fullKey, value] of Object.entries(allowedSettings)) {
+  return { writable: allowedSettings, carry: { retiredStatusPollSeconds }, invalidCount };
+}
+
+/**
+ * The fallible half: validates and WRITES what the partition kept, then warns
+ * once about everything either half rejected. Rejects exactly as
+ * `config.update` does, so an import still reports a settings write it could
+ * not make — the caller decides what it has already committed by then.
+ */
+async function writeImportedSettings(partitioned: PartitionedImportSettings): Promise<void> {
+  let invalidCount = partitioned.invalidCount;
+
+  for (const [fullKey, value] of Object.entries(partitioned.writable)) {
     const lastDot = fullKey.lastIndexOf(".");
     if (lastDot < 0) {
       continue;
@@ -265,6 +454,18 @@ async function applySettings(settings: Record<string, unknown>): Promise<void> {
         : `${invalidCount} imported Nexus settings had invalid values and were skipped.`
     );
   }
+}
+
+/**
+ * Partition + write, for the callers that have nothing to do with the carry (a
+ * share import, which discards it). The import that DOES use the carry calls
+ * the two halves itself, so a failed write cannot strand it — see review D4 in
+ * `partitionImportedSettings`.
+ */
+async function applySettings(settings: Record<string, unknown>): Promise<AppliedSettingsCarry> {
+  const partitioned = partitionImportedSettings(settings);
+  await writeImportedSettings(partitioned);
+  return partitioned.carry;
 }
 
 function isFile(type: vscode.FileType): boolean {
@@ -1470,6 +1671,10 @@ export function registerConfigCommands(
           version: 2,
           exportType: "backup",
           exportedAt: new Date().toISOString(),
+          // Review D3 — unconditional, on both export paths, so an import can
+          // tell a source with no interval apart from a source whose interval
+          // its owner blanked. See the field's contract on NexusConfigExport.
+          inventoryStatusPollPerSource: true,
           servers: captured.servers,
           tunnels: snapshot.tunnels,
           serialProfiles: snapshot.serialProfiles,
@@ -1531,6 +1736,11 @@ export function registerConfigCommands(
       version: 2,
       exportType: "share",
       exportedAt: new Date().toISOString(),
+      // Stamped like a backup (review D3). A share export carries no
+      // `inventorySources`, so nothing in it can receive the retired interval —
+      // it is stamped anyway so this build has ONE rule about what its exports
+      // say about themselves, not a per-path exemption to remember.
+      inventoryStatusPollPerSource: true,
       servers: sanitized.servers,
       tunnels: sanitized.tunnels,
       serialProfiles: sanitized.serialProfiles,
@@ -2023,6 +2233,12 @@ export function registerConfigCommands(
     }
 
     if (data.settings && typeof data.settings === "object") {
+      // The retired poll interval this may extract is DROPPED on the share
+      // path, and that is the whole point of dropping it: a share export never
+      // carries `inventorySources` (§B6/A-M5), so this import creates no
+      // source it could belong to, and the only sources on the machine are the
+      // importer's own — the exact records the "never re-arm a field the user
+      // blanked" rule protects. There is nothing here it may be written to.
       await applySettings(data.settings);
     }
 
@@ -2490,9 +2706,95 @@ export function registerConfigCommands(
       }
     }
 
-    // Apply settings
+    // Apply settings. The READ is separated from the WRITES (review D4): the
+    // retired interval below is extracted by the partition, which cannot throw,
+    // so a `config.update` that rejects — policy-managed configuration, a
+    // settings file something else owns — can no longer take the carry down
+    // with it. The sources were persisted earlier in this same import, so a
+    // retry in merge mode would skip their ids and leave the cadence
+    // unappliable by any later run. The rejection is kept and re-thrown after
+    // the carry, so the import still fails exactly where and how it did.
+    let settingsCarry: AppliedSettingsCarry = {};
+    let settingsWriteError: unknown;
     if (data.settings && typeof data.settings === "object") {
-      await applySettings(data.settings);
+      const partitioned = partitionImportedSettings(data.settings);
+      settingsCarry = partitioned.carry;
+      try {
+        await writeImportedSettings(partitioned);
+      } catch (error) {
+        settingsWriteError = error;
+      }
+    }
+
+    /**
+     * RETIRED LAB-STATUS POLL INTERVAL (review C2) — carried onto the sources
+     * HERE, during the import, because the activation migration provably
+     * cannot: the extension has to activate before this command exists to run,
+     * and an activation that found no key marks itself done, so a key restored
+     * into settings afterwards is read by nothing. Restoring a pre-2.8.191
+     * backup on a new machine used to leave polling off with no message and a
+     * stale key in the file.
+     *
+     * WHICH SOURCES: exactly the ones THIS RUN created
+     * (`inventorySourceTally.importedIds`) — still EVE-NG on the re-read, and
+     * still without an answer of their own. Nothing that was already on this
+     * machine is touched, in either mode: replace deleted its sources before
+     * importing, and merge skips an id that already exists, so a pre-existing
+     * id is never in that list. That is what keeps the durable marker's
+     * guarantee intact — a user who turned polling off by BLANKING the field
+     * keeps it off, because their source is not one this import created.
+     *
+     * WHICH PAYLOADS (review D3): only one that shows no sign of coming from a
+     * build that HAS the per-source field — no export stamp, and no source in
+     * it answering the field. Being in `importedIds` is not enough on its own:
+     * a source exported before the field and a source whose owner BLANKED the
+     * field to stop polling are the same shape, and replace mode re-creates
+     * every source, so restoring your own backup puts the blanked one squarely
+     * in that list. `importPredatesPerSourceStatusPoll` carries the full
+     * argument, including what it knowingly gives up.
+     *
+     * A source that reaches the write below came out of a payload from the era
+     * when the interval was global, so that number is literally the cadence it
+     * was polled at, and it has no answer of its own to overwrite — the
+     * per-source re-read still refuses to overwrite one, `0` included, as a
+     * rule about answers rather than about vintage. A carried value of 0
+     * applies to nothing, exactly as in the migration — it was the shipped
+     * default and it polled nothing.
+     *
+     * Already inside `configMutationLock` (importMergeReplace holds it across
+     * this whole function), so no second acquisition: the lock is not
+     * reentrant.
+     */
+    const carriedPollSeconds = settingsCarry.retiredStatusPollSeconds;
+    if (
+      carriedPollSeconds !== undefined
+      && carriedPollSeconds > EVE_NG_STATUS_POLL_MIN_SECONDS
+      && importPredatesPerSourceStatusPoll(data)
+    ) {
+      for (const sourceId of inventorySourceTally.importedIds) {
+        // Re-read: the dangling-reference sweeps above rewrite sources, so the
+        // record to extend is the live one, not the payload's copy.
+        const live = core.getInventorySource(sourceId);
+        if (
+          !live ||
+          live.providerId !== EVE_NG_PROVIDER_ID ||
+          live.config[EVE_NG_STATUS_POLL_FIELD_ID] !== undefined
+        ) {
+          continue;
+        }
+        await core.addOrUpdateInventorySource({
+          ...live,
+          config: { ...live.config, [EVE_NG_STATUS_POLL_FIELD_ID]: carriedPollSeconds }
+        });
+      }
+    }
+
+    // Re-thrown HERE and not earlier (review D4): everything above this line is
+    // what the failed settings write must not be allowed to strand. Everything
+    // below it aborted on a settings write before this change too, so the
+    // import fails in exactly the same place it always did.
+    if (settingsWriteError !== undefined) {
+      throw settingsWriteError;
     }
 
     // Restore passwords/passphrases from decrypted secrets

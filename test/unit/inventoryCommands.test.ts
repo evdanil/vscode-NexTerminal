@@ -21,6 +21,7 @@ import {
   type InventoryTree
 } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { startInventoryStatusPoll } from "../../src/services/inventory/inventoryStatusPoll";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { ORPHAN_FOLDER_NAME, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import { configMutationLock } from "../../src/services/configMutationLock";
@@ -463,6 +464,122 @@ describe("inventoryCommands", () => {
       expect(byKey("cfg_apiToken")).toEqual(expect.objectContaining({ type: "password" }));
       expect(byKey("cfg_port")).toEqual(expect.objectContaining({ type: "number" }));
       expect(byKey("cfg_verifyTls")).toEqual(expect.objectContaining({ type: "checkbox" }));
+    });
+
+    /**
+     * PER-SOURCE LAB STATUS POLL — a bounded number field (EVE-NG's poll
+     * interval is the first one). The bound has to survive BOTH layers: the
+     * rendered input's native min/max, which is what stops a typo at the
+     * browser, and the parse, which is the only layer a programmatically
+     * posted value meets.
+     */
+    it("carries a number field's declared bounds onto the rendered input (\u2298 dropping min/max lets the browser accept 99999 with no complaint)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "pollSeconds", label: "Poll Seconds", type: "number", required: false, min: 0, max: 3600 }
+        ]
+      });
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const field = latestFormCall().definition.fields.find((f) => "key" in f && f.key === "cfg_pollSeconds");
+      expect(field).toEqual(expect.objectContaining({ type: "number", min: 0, max: 3600 }));
+    });
+
+    it("rejects a number field posted outside its declared bounds and persists nothing (\u2298 trusting the browser's min/max lets a posted 99999 arm an hour-plus poll, or a negative one a timer that never fires)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "pollSeconds", label: "Poll Seconds", type: "number", required: false, min: 0, max: 3600 }
+        ]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await expect(
+        onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: 99_999 })
+      ).rejects.toThrow(/Poll Seconds must be between 0 and 3600/);
+      await expect(
+        onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: -1 })
+      ).rejects.toThrow(/Poll Seconds must be between 0 and 3600/);
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+      // …and a value INSIDE the bounds still saves, so the check is a bound and
+      // not a blanket rejection of the field.
+      await onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: 3600 });
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ host: "eve.local", pollSeconds: 3600 });
+    });
+
+    /**
+     * REVIEW D2 — the bound is only half the story. The runtime FLOORS this
+     * value (`readEveNgStatusPollSeconds`), so a fraction the form accepts is
+     * not the cadence that runs: `0.4` disables polling although the field's
+     * own description says only `0` does, and `1.9` is shown as saved while the
+     * poll ticks every second. The honest direction is to refuse the fraction at
+     * collection time — there is no runtime meaning for one — and this is the
+     * layer that has to do it, because the native `step` is the browser's word
+     * and a value can be posted without one.
+     */
+    it("rejects a fractional value on an INTEGER number field and persists nothing (\u2298 accepting it stores a number the runtime floors: 0.4 silently turns polling off, 1.9 silently polls every second, and the form reports both as saved)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "pollSeconds", label: "Poll Seconds", type: "number", required: false, min: 0, max: 3600, integer: true }
+        ]
+      });
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+      const post = (pollSeconds: unknown) =>
+        onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: pollSeconds });
+
+      await expect(post(0.4)).rejects.toThrow(/Poll Seconds must be a whole number/);
+      await expect(post(1.9)).rejects.toThrow(/Poll Seconds must be a whole number/);
+      // A numeric STRING posts the same way an input does, and must be judged the same.
+      await expect(post("2.5")).rejects.toThrow(/Poll Seconds must be a whole number/);
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+      // …and a whole number still saves, so this is a constraint and not a
+      // blanket rejection of the field.
+      await post(30);
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ host: "eve.local", pollSeconds: 30 });
+    });
+
+    it("leaves a number field that does NOT declare `integer` accepting fractions (\u2298 refusing every fraction everywhere breaks a provider whose field legitimately measures in halves)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "timeout", label: "Timeout", type: "number", required: false, min: 0, max: 60 }
+        ]
+      });
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { onSubmit } = latestFormCall();
+
+      await onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_timeout: 2.5 });
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ host: "eve.local", timeout: 2.5 });
     });
 
     it("titles the form with the provider label and prefills Default SSH Username with mostCommonUsername", async () => {
@@ -8566,7 +8683,9 @@ describe("nexus.inventory.refreshStatus", () => {
     await core.addOrUpdateInventorySource(makeSource());
 
     const applySpy = vi.spyOn(core, "applyInventoryStatus");
-    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+    // Resolves rather than throwing — and names no source: one whose provider
+    // offers no status can never be refreshed, so nothing is deferred for it.
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toEqual({ unrefreshedSourceIds: [] });
     expect(applySpy).not.toHaveBeenCalled();
   });
 
@@ -8585,7 +8704,9 @@ describe("nexus.inventory.refreshStatus", () => {
     await core.addOrUpdateInventorySource(makeSource({ id: "good", name: "Good", config: { host: "ok" } }));
 
     const applySpy = vi.spyOn(core, "applyInventoryStatus");
-    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toBeUndefined();
+    // A lab box that answered with an error was genuinely TRIED, so it is not
+    // named as unrefreshed: there is nothing for a later settle to make good on.
+    await expect(registeredCommands.get("nexus.inventory.refreshStatus")!()).resolves.toEqual({ unrefreshedSourceIds: [] });
 
     // The good source still applied; the throwing one degraded to no update.
     expect(applySpy).toHaveBeenCalledTimes(1);
@@ -8629,6 +8750,255 @@ describe("nexus.inventory.refreshStatus", () => {
     panel.fireDispose();
     await registeredCommands.get("nexus.inventory.refreshStatus")!();
     expect(fetchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * REVIEW D6/E1/E2 — the arm fire and the sources that decline it.
+   *
+   * The scheduler fires once on a source's not-running → running transition,
+   * because a source that has just started polling has no status on screen and
+   * the next tick is a whole period away — up to an hour. `refreshStatus` is
+   * allowed to decline that fire: the source may be claimed in
+   * `inFlightSourceIds` (mid-sync/edit/remove/control), or its credentials may
+   * not be in the vault yet (mid-restore of a backup). Both declines used to be
+   * SILENT, so the arm fire was simply lost.
+   *
+   * The command layer now keeps no memory of any of this. It reports two facts
+   * it owns — which targeted sources did NOT run (`unrefreshedSourceIds`), and
+   * when a busy claim is released (`onSourceFree`) — and the scheduler, which
+   * owns arming, owns the debt those facts feed.
+   */
+  describe("declining a refresh, and saying so", () => {
+    afterEach(() => mockExecuteCommand.mockReset());
+
+    it("names a source it skipped because the source is BUSY, and names none on an ordinary run (⊘ a silent skip is indistinguishable from a refresh that happened, so the caller cannot make good on it)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const busy = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(busy).toEqual({ unrefreshedSourceIds: ["src-1"] });
+      expect(fetchStatus).not.toHaveBeenCalled();
+
+      latestFormCall().panel.fireDispose();
+      const free = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(free).toEqual({ unrefreshedSourceIds: [] });
+      expect(fetchStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it("declines a source whose DECLARED credential is not in the vault — without calling the provider — and names it (⊘ a restore persists the source before its secrets, so the arm fire crawls with no password, fails silently, and counts as spent: the same 'polling does nothing for an hour' by another route)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(makeProvider({ fetchStatus }));
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      // The record declares a secret field; the vault does not hold it yet.
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(outcome).toEqual({ unrefreshedSourceIds: ["src-1"] });
+      expect(fetchStatus).not.toHaveBeenCalled();
+
+      // Once the credential lands the very same call runs, and passes it on.
+      await vault.store(inventorySecretKey("src-1", "apiToken"), "restored-token");
+      const after = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" });
+      expect(after).toEqual({ unrefreshedSourceIds: [] });
+      expect(fetchStatus).toHaveBeenCalledWith(expect.anything(), { apiToken: "restored-token" });
+    });
+
+    it("names NO source for a provider that simply has no status to give (⊘ owing a debt for a NetBox source defers a refresh that can never happen, on every settle, forever)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider()); // no fetchStatus
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      await expect(registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-1" }))
+        .resolves.toEqual({ unrefreshedSourceIds: [] });
+    });
+
+    it("reports a source as free when its claim is released, for EVERY busy reason (⊘ hooking only the edit path leaves the same swallow behind a sync, a remove and a start/stop)", async () => {
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ controlNode: vi.fn(async () => {}), fetchStatus: vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} })) }));
+      const freed: string[] = [];
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), { onSourceFree: (id) => freed.push(id) });
+      await core.addOrUpdateInventorySource(makeSource());
+
+      // edit → released on dispose
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      latestFormCall().panel.fireDispose();
+      await vi.waitFor(() => expect(freed).toEqual(["src-1"]));
+
+      // control → released when the dispatch settles
+      await registeredCommands.get("nexus.inventory.startNode")!({ server });
+      expect(freed).toEqual(["src-1", "src-1"]);
+    });
+  });
+
+  /**
+   * The two ends joined: the real scheduler, wired to the real refreshStatus
+   * command exactly as `extension.ts` wires it, against the real busy claims.
+   */
+  describe("a poll arm fire declined by a busy source", () => {
+    afterEach(() => mockExecuteCommand.mockReset());
+
+    async function wire(core: NexusCore, registry: InventoryProviderRegistry, vault: ReturnType<typeof makeVault>, visible = true): Promise<{
+      poll: ReturnType<typeof startInventoryStatusPoll>;
+      view: { visible: boolean; onDidChangeVisibility: (l: (e: { visible: boolean }) => void) => { dispose(): void } };
+      setVisible: (v: boolean) => void;
+    }> {
+      let listener: ((e: { visible: boolean }) => void) | undefined;
+      const view = {
+        visible,
+        onDidChangeVisibility(l: (e: { visible: boolean }) => void) {
+          listener = l;
+          return { dispose: () => { listener = undefined; } };
+        }
+      };
+      let poll!: ReturnType<typeof startInventoryStatusPoll>;
+      registerInventoryCommands(core, registry, vault, makeTeardown(), { onSourceFree: (id) => poll?.sourceSettled(id) });
+      // Route refreshStatus to the real command, so the fire meets the live
+      // busy check rather than a recording mock.
+      mockExecuteCommand.mockImplementation((cmd: string, ...rest: unknown[]) =>
+        cmd === "nexus.inventory.refreshStatus" ? registeredCommands.get(cmd)!(...rest) : undefined
+      );
+      poll = startInventoryStatusPoll({
+        view,
+        getSources: () =>
+          core.getSnapshot().inventorySources.map((source) => ({
+            id: source.id,
+            intervalSeconds: Number(source.config.statusPollSeconds ?? 0)
+          })),
+        onDidChangeSources: (l) => ({ dispose: core.onDidChange(l) }),
+        // extension.ts's own fire: the command's outcome names the sources it
+        // did not refresh, and this one names exactly one source.
+        fire: (sourceId) =>
+          Promise.resolve(mockExecuteCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })).then((outcome) => ({
+            ran: !(outcome as { unrefreshedSourceIds?: string[] } | undefined)?.unrefreshedSourceIds?.includes(sourceId)
+          }))
+      });
+      return { poll, view, setVisible: (v: boolean) => { view.visible = v; listener?.({ visible: v }); } };
+    }
+
+    function pollingProvider(fetchStatus: ReturnType<typeof vi.fn>, extra: Partial<InventoryProvider> = {}): InventoryProvider {
+      return makeProvider({
+        fetchStatus,
+        configFields: [
+          { id: "host", label: "Host", type: "string", required: true },
+          { id: "statusPollSeconds", label: "Poll", type: "number", required: false, min: 0, max: 3600, integer: true }
+        ],
+        ...extra
+      });
+    }
+
+    it("still refreshes as soon as the claim clears, instead of a whole period later (⊘ losing the declined arm fire means turning polling on does nothing visible for up to an hour)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(pollingProvider(fetchStatus));
+      const { poll } = await wire(core, registry, makeVault());
+      await core.addOrUpdateInventorySource(makeSource({ config: { host: "eve.local" } }));
+
+      // The edit claims the source and holds it until the form is disposed; its
+      // SAVE fires core.onDidChange synchronously, so the arm fire lands inside
+      // the busy window.
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { panel, onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "eve.local",
+        cfg_statusPollSeconds: 3600
+      });
+      expect(core.getInventorySource("src-1")?.config.statusPollSeconds).toBe(3600);
+      expect(fetchStatus).not.toHaveBeenCalled();
+
+      // No timer is advanced — a period here would be an hour.
+      panel.fireDispose();
+      await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1));
+      poll.dispose();
+    });
+
+    it("does NOT crawl on release when the panel was hidden while the claim was held (⊘ a debt with no re-validation pays out against the poll's own visible-gating: the user closed the Command Center and a lab crawl runs anyway)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(pollingProvider(fetchStatus));
+      const { poll, setVisible } = await wire(core, registry, makeVault());
+      await core.addOrUpdateInventorySource(makeSource({ config: { host: "eve.local" } }));
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { panel, onSubmit } = latestFormCall();
+      await onSubmit({
+        name: "My Source",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "eve.local",
+        cfg_statusPollSeconds: 3600
+      });
+      expect(fetchStatus).not.toHaveBeenCalled();
+
+      // The user closes the Command Center while the operation is still holding
+      // the claim: nothing is armed any more, so nothing is owed any more.
+      setVisible(false);
+      panel.fireDispose();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(fetchStatus).not.toHaveBeenCalled();
+      poll.dispose();
+    });
+
+    it("does not crawl on release when polling was turned OFF while the claim was held (⊘ a stale debt re-arms a source whose owner just set its interval to 0)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} }));
+      registry.register(pollingProvider(fetchStatus));
+      const { poll } = await wire(core, registry, makeVault());
+      await core.addOrUpdateInventorySource(makeSource({ config: { host: "eve.local" } }));
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const first = latestFormCall();
+      await first.onSubmit({
+        name: "My Source",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "eve.local",
+        cfg_statusPollSeconds: 3600
+      });
+      expect(fetchStatus).not.toHaveBeenCalled(); // the arm fire was declined
+
+      // Polling is turned OFF while that claim is still held — by a writer that
+      // does not go through the form, which is what a settings-level change, the
+      // one-time migration and a config import all are.
+      const live = core.getInventorySource("src-1")!;
+      await core.addOrUpdateInventorySource({ ...live, config: { ...live.config, statusPollSeconds: 0 } });
+
+      first.panel.fireDispose();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(fetchStatus).not.toHaveBeenCalled();
+      poll.dispose();
+    });
   });
 
   it("P3-4 — re-checks the busy latch immediately before the persisting heal: a source that becomes busy DURING the awaited fetch has its heal SKIPPED, while the pure applyInventoryStatus still runs (⊘ persisting the heal while a concurrent sync/edit writes the same servers races two persisted writes)", async () => {
@@ -8940,6 +9310,177 @@ describe("nexus.inventory.refreshStatus", () => {
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
+  /**
+   * PER-SOURCE LAB STATUS POLL — the poll now fires one source at a time, and
+   * it does so through the argument shapes this command already understood:
+   * `resolveSourceIdArg` reads `sourceId` off the argument object, and the
+   * `__poll` marker keeps the background path silent. No command-layer change
+   * was needed for per-source firing; this is what pins that.
+   */
+  it("takes a { sourceId, __poll } argument as a SILENT refresh of that ONE source (⊘ ignoring sourceId on the poll path makes every tick of one 10 s source sweep every lab server the user has)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => { throw new Error("auth broken"); });
+    registry.register(makeProvider({ fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", config: { host: "one" } }));
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-2", config: { host: "two" } }));
+
+    await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "src-2", __poll: true });
+
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    expect(fetchStatus.mock.calls[0][0]).toEqual({ host: "two" });
+    // …and it is still the background path, so a total failure stays silent.
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  /**
+   * PER-SOURCE SUPERSEDE (review H1) — the status-refresh generation is kept PER
+   * SOURCE, never as one global counter.
+   *
+   * A single global counter was sound while the poll issued ONE WHOLE SWEEP at a
+   * time: a superseding sweep always covered everything the superseded one would
+   * have applied, so dropping the older apply lost nothing. Per-source firing
+   * breaks that premise. Each source now ticks on its OWN cadence, so a tick of
+   * source B that starts while source A's crawl is in flight would bump a global
+   * counter and invalidate A's apply — even though the two write disjoint state.
+   * With A at 60 s / 10 s crawl and B at 10 s, EVERY A fetch overlaps a B tick
+   * and A's status would never reach the tree at all: exactly the "one slow lab
+   * box silently suppressed refreshes for every other source" failure that going
+   * per-source was meant to fix, with the roles swapped.
+   */
+  describe("per-source supersede", () => {
+    const deferred = (): { promise: Promise<void>; resolve: () => void } => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => (resolve = r));
+      return { promise, resolve };
+    };
+
+    it("applies a SLOW source's report even though a FAST source polled during its crawl, round after round — the two write disjoint state (⊘ one global refresh generation lets every tick of a 10 s source invalidate a 60 s source's in-flight crawl, so the slow lab's status NEVER applies and nothing warns)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      const ROUNDS = 2;
+      const slowGates = Array.from({ length: ROUNDS }, deferred);
+      const slowParked = Array.from({ length: ROUNDS }, deferred);
+      let slowCalls = 0;
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "slow") {
+          const round = slowCalls++;
+          slowParked[round].resolve();
+          await slowGates[round].promise; // the long lab crawl
+        }
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "slow", name: "Slow Lab", config: { host: "slow" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "fast", name: "Fast Lab", config: { host: "fast" } }));
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+
+      // Two full rounds, because "the slow source keeps applying" is the claim —
+      // one lucky apply would not distinguish a fix from a coincidence of timing.
+      for (let round = 0; round < ROUNDS; round++) {
+        const slowTick = cmd({ sourceId: "slow", __poll: true }) as Promise<void>;
+        await slowParked[round].promise;
+        // The fast source's own tick, start to finish, inside the slow crawl.
+        await cmd({ sourceId: "fast", __poll: true });
+        slowGates[round].resolve();
+        await slowTick;
+      }
+
+      expect(slowCalls).toBe(ROUNDS); // the fixture really did overlap both rounds
+      expect(applySpy.mock.calls.filter((c) => c[0] === "slow")).toHaveLength(ROUNDS);
+      expect(applySpy.mock.calls.filter((c) => c[0] === "fast")).toHaveLength(ROUNDS);
+    });
+
+    it("does not let a poll tick for ONE source truncate a running ALL-SOURCES manual refresh — the sweep still reaches the sources it had not got to yet (⊘ a mid-loop bail on a global generation abandons every remaining source, so Refresh Lab Status silently refreshes only the labs it happened to reach first)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+
+      let pollTick: Promise<void> | undefined;
+      const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "a") {
+          // A background tick for a source in the MIDDLE of the sweep's list
+          // lands while the sweep is still inside the FIRST source's crawl —
+          // mid-list on purpose, so abandoning the loop there visibly loses the
+          // source that comes AFTER it.
+          pollTick ??= registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: "b", __poll: true }) as Promise<void>;
+        }
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Lab A", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Lab B", config: { host: "b" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "c", name: "Lab C", config: { host: "c" } }));
+
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+      await pollTick;
+
+      expect(pollTick).toBeDefined(); // the fixture really did tick mid-sweep
+      // A and C are the manual sweep's own; B is the tick's, which superseded the
+      // sweep for THAT SOURCE ONLY. Every source ends up with fresh status — and
+      // C, which the sweep had not reached when the tick landed, is the one a
+      // mid-loop bail would silently drop.
+      expect([...applySpy.mock.calls.map((c) => c[0])].sort()).toEqual(["a", "b", "c"]);
+      // B is fetched ONCE, by the tick that claimed it — the sweep does not
+      // re-crawl a lab someone else is already crawling.
+      expect(fetchStatus).toHaveBeenCalledTimes(3);
+    });
+
+    it("still DROPS a superseded report for the SAME source, so an older crawl never repaints over a newer one (⊘ dropping the supersede guard lets a slow first crawl land its stale picture on top of the status the user's newer refresh just applied)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+
+      const externalId = "dev#1";
+      const node: ServerConfig = {
+        id: deterministicServerId("src-1", externalId),
+        name: "node",
+        host: "10.0.0.9",
+        port: 22,
+        username: "admin",
+        authType: "agent",
+        isHidden: false,
+        origin: { sourceId: "src-1", externalId, syncedAt: 1, syncedHost: "10.0.0.9", syncedPort: 22 }
+      };
+      await core.addServersBatch([node]);
+
+      const registry = new InventoryProviderRegistry();
+      const oldGate = deferred();
+      const oldParked = deferred();
+      let calls = 0;
+      const fetchStatus = vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) {
+          oldParked.resolve();
+          await oldGate.promise;
+          return { contractVersion: 1 as const, statuses: { [externalId]: { state: "stopped" as const } } };
+        }
+        return { contractVersion: 1 as const, statuses: { [externalId]: { state: "running" as const } } };
+      });
+      registry.register(makeProvider({ fetchStatus }));
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
+      const stale = cmd({ sourceId: "src-1" }) as Promise<void>; // parks mid-crawl
+      await oldParked.promise;
+      await cmd({ sourceId: "src-1" }); // the user refreshes again: node is RUNNING
+      oldGate.resolve();
+      await stale;
+
+      expect(calls).toBe(2); // the fixture really did overlap the two crawls
+      expect(core.getSnapshot().serverStatus.get(node.id)).toBe("running");
+    });
+  });
+
   it("P3-7: the manual refresh does NOT warn when at least one source produced a report", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
@@ -9078,12 +9619,12 @@ describe("nexus.inventory.refreshStatus", () => {
      * got wrong. Silence-on-supersede is correct only while NOTHING was applied.
      * A multi-source sweep can be superseded AFTER an earlier source's truncated
      * report already passed the apply guard: that source's partial status IS on
-     * screen, and the loop-top generation check then `return`s straight past the
-     * post-loop warning, so nothing ever explains it. The superseding sweep is
-     * typically targeted (the node-control path fires one for a single source),
-     * so it does not cover the earlier source either.
+     * screen, and a sweep that abandons its loop on supersede runs straight past
+     * the post-loop warning, so nothing ever explains it. The superseding sweep
+     * is typically targeted (the node-control path fires one for a single
+     * source), so it does not cover the earlier source either.
      */
-    it("STILL warns when the supersede lands AFTER an earlier source's truncated report was APPLIED — that partial status is on screen and nothing else will explain it (\u2298 bailing out of the loop skips the post-loop warning, so a user looking at Lab A's half-finished status is told nothing)", async () => {
+    it("STILL warns when the supersede lands AFTER an earlier source's truncated report was APPLIED — that partial status is on screen and nothing else will explain it (\u2298 abandoning the loop on supersede skips the post-loop warning, so a user looking at Lab A's half-finished status is told nothing)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -9097,9 +9638,9 @@ describe("nexus.inventory.refreshStatus", () => {
       const cmd = registeredCommands.get("nexus.inventory.refreshStatus")!;
       // Supersede from INSIDE Lab A's apply, which is exactly the real shape:
       // the node-control path fires `void executeCommand("...refreshStatus",
-      // source.id)` un-awaited, and refreshStatus bumps the generation
+      // source.id)` un-awaited, and refreshStatus claims its generations
       // SYNCHRONOUSLY on entry. So gen 1 has already applied Lab A's partial
-      // status when gen 2 starts, and bails at the loop top before Lab B.
+      // status when gen 2 claims Lab B, and skips Lab B at the loop top.
       let superseding: Promise<void> | undefined;
       const applied = core.applyInventoryStatus.bind(core);
       vi.spyOn(core, "applyInventoryStatus").mockImplementation((sourceId, report) => {
@@ -9311,21 +9852,24 @@ describe("nexus.inventory.refreshStatus", () => {
     });
 
     /**
-     * R3 (review), the other half of the bail decision: why the bail is a
-     * `return` and not a `break`. `break` would fall through to the TOTAL-FAILURE
-     * warning, whose `succeeded === 0` is meant to say "every source failed" —
-     * true only of a COMPLETE sweep. On a bail it means merely "every source
-     * tried SO FAR failed", and the sources never reached might all be healthy.
+     * R3 (review), the other half of the bail decision, preserved through the
+     * per-source rework: the TOTAL-FAILURE warning's `succeeded === 0` is meant
+     * to say "every source failed" — a verdict only a COMPLETE sweep can deliver.
+     * Where a source was skipped because a newer invocation claimed it, it means
+     * merely "every source this sweep still owned failed", and the ones it handed
+     * over might all be healthy (they are being refreshed right now by whoever
+     * claimed them). R3 got this by bailing out of the loop entirely; the sweep
+     * now runs on past the skipped source, so the suppression is explicit.
      */
-    it("does NOT fire the total-failure warning from a sweep that bailed on supersede before trying every source (\u2298 a `break` instead of a `return` runs the post-loop total-failure check on a half-finished sweep and reports a total outage from one failed source)", async () => {
+    it("does NOT fire the total-failure warning from a sweep that skipped a superseded source instead of trying every source itself (\u2298 letting a sweep that handed a source over deliver the 'no source answered' verdict reports a total outage from one failed source)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const cmdRef: { fire?: () => Promise<void> } = {};
       let superseding: Promise<void> | undefined;
       // Lab A fails outright (no report \u2014 attempted 1, succeeded 0) and the
-      // supersede lands during its fetch, so gen 1 bails at the loop top before
-      // ever trying Lab B.
+      // supersede lands during its fetch, so gen 1 skips Lab B at the loop top
+      // rather than trying it itself.
       const fetchStatus = vi.fn(async (config: InventorySourceValues) => {
         if (config.host === "a") {
           superseding ??= cmdRef.fire!();

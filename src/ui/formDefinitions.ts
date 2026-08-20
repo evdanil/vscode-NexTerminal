@@ -1230,7 +1230,14 @@ export function unifiedProfileFormId(seed?: UnifiedProfileSeed): string {
 function unifiedProfileFormTitle(seed?: UnifiedProfileSeed): string {
   switch (normalizedUnifiedProfileMode(seed)) {
     case "ssh":
-      return "Add SSH Server Profile";
+      // NETWORK DEVICE PROFILE — this entry point creates a profile with a
+      // Protocol selector (SSH / Telnet), so naming it after one of the two
+      // was stale the moment telnet landed. The form title stays SHORT: the
+      // Protocol field is visible a few rows down and restates the choice.
+      // The `nexus.server.add` COMMAND title carries the "(SSH / Telnet)"
+      // parenthetical instead, where nothing else is on screen to say it and
+      // Command Palette matching runs on the title text.
+      return "Add Network Device Profile";
     case "serial":
       return "Add Serial Profile";
     case "localShell":
@@ -1260,7 +1267,7 @@ function unifiedProfileTypeField(seed?: UnifiedProfileSeed): FormFieldDescriptor
     key: "profileType",
     label: "Profile Type",
     options: [
-      { label: "SSH Server Profile", value: "ssh" },
+      { label: "Network Device Profile", value: "ssh" },
       { label: "Serial Profile", value: "serial" },
       { label: "Local Shell Profile", value: "localShell" }
     ],
@@ -1402,13 +1409,21 @@ function inventoryConfigFieldDescriptor(
       key,
       label: field.label,
       required: field.required,
-      // The provider contract (`InventoryConfigField`) has no integer
-      // constraint — providers may store fractional values (e.g. a 0.5-second
-      // poll interval). `step: "any"` disables the browser's default
-      // step="1" native validation, which otherwise silently blocks Save
-      // (including on reopening a source that already has a fractional value
-      // saved) with no visible error.
-      step: "any",
+      // A field that declares `integer` gets the native `step="1"` (review
+      // D2): its runtime has no meaning for a fraction, so the browser should
+      // catch one where it is typed rather than let it be stored and silently
+      // floored. Every other number field keeps `step: "any"`, which disables
+      // the browser's DEFAULT step="1" validation — that default otherwise
+      // silently blocks Save, with no visible error, for a provider whose field
+      // legitimately measures in halves (including on reopening a source that
+      // already has a fractional value saved).
+      step: field.integer ? 1 : "any",
+      // PER-SOURCE LAB STATUS POLL — the provider's declared bounds, rendered
+      // as the input's native min/max so a typo is caught where it is typed.
+      // Both are optional on the contract, so a provider that declares neither
+      // renders exactly the unbounded input it always did.
+      min: field.min,
+      max: field.max,
       placeholder: field.placeholder,
       value: typeof existing === "number" ? existing : undefined,
       hint: field.description,

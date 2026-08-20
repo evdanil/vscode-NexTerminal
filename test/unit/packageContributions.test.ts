@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
+import { createEveNgProvider, readEveNgStatusPollSeconds } from "../../src/services/inventory/providers/eveNgProvider";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const readmePath = path.resolve(__dirname, "..", "..", "README.md");
@@ -337,6 +338,25 @@ describe("package contributions", () => {
     expect(settings).toContain("command:nexus.config.import");
     // Relabeled alongside the command's own retitle to "Import…" (was "Import Configuration").
     expect(settings).toContain("[Import…](command:nexus.config.import)");
+  });
+
+  /**
+   * NETWORK DEVICE PROFILE — `nexus.server.add` creates a profile whose form
+   * carries a Protocol selector (SSH / Telnet), so a title naming only SSH is
+   * stale. The rename costs Command Palette discoverability, because VS Code
+   * matches palette entries on the TITLE text: "Add Network Device Profile"
+   * alone answers neither "ssh" nor "telnet". The parenthetical is what buys
+   * both back, and is the reason this is pinned rather than left to taste.
+   */
+  it("titles nexus.server.add for both protocols it can create, keeping \"ssh\" and \"telnet\" palette-searchable (\u2298 a bare rename makes a user typing \"ssh\" unable to find the command at all)", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.server.add");
+    expect(command?.title).toBe("Add Network Device Profile (SSH / Telnet)");
+    expect(command?.title?.toLowerCase()).toContain("ssh");
+    expect(command?.title?.toLowerCase()).toContain("telnet");
+
+    const welcome = packageJson.contributes.viewsWelcome?.find((item) => item.view === "nexusCommandCenter")?.contents ?? "";
+    expect(welcome).toContain("[Add Network Device Profile (SSH / Telnet)](command:nexus.server.add)");
+    expect(welcome).not.toContain("Add SSH Server Profile");
   });
 
   it("links the unified importer — not the old inventory-only deep link — from the empty Command Center welcome view, second after Add Profile", () => {
@@ -1015,23 +1035,61 @@ describe("package contributions", () => {
       expect(rowMenus.map((m) => m.command)).not.toContain("nexus.inventory.refreshStatus");
     });
 
-    it("contributes nexus.inventory.statusPollSeconds as an integer setting defaulting to 0 (off), bounded 0..3600", () => {
-      // ⊘ registering it only in SETTINGS_META: VS Code's settings.json UI would
-      // not know the key, and the poll timer in extension.ts reads it via
-      // workspace.getConfiguration — an unregistered key returns undefined and the
-      // poll never arms.
-      const prop = packageJson.contributes.configuration?.properties?.["nexus.inventory.statusPollSeconds"];
-      expect(prop).toBeDefined();
-      expect(prop?.type).toBe("integer");
-      expect(prop?.default).toBe(0);
-      expect(prop?.minimum).toBe(0);
-      expect(prop?.maximum).toBe(3600);
-      const description = prop?.markdownDescription || prop?.description || "";
-      expect(description).toMatch(/0 disables|0 = off|disables/i);
+    /**
+     * OBSERVED, NOT VERIFIED — a user running EVE-NG Community reports that a
+     * sync or poll logs them out of the EVE-NG web UI, which reads as one
+     * active session per account. It is very likely what actually produces the
+     * mid-sync 412/(90001) the released one-shot re-login recovers from, and
+     * with polling on and a browser open the two sessions keep evicting each
+     * other. There is deliberately NO runtime warning for it — nothing on the
+     * wire separates eviction from ordinary expiry — so the documentation is
+     * the whole of the remedy, and it has to name the fix: a separate EVE-NG
+     * account for Nexus.
+     */
+    it("documents the one-session-per-EVE-NG-account behaviour and names the dedicated-account remedy in both documents (\u2298 leaving it undocumented makes a user who turns polling on read their own web UI logging out as a Nexus bug, with nothing anywhere telling them what to do about it)", () => {
+      for (const [name, doc] of [["functional docs", functionalDocs], ["README", readme]] as const) {
+        expect(doc, name).toMatch(/one active session per user|one session per (EVE-NG )?account/i);
+        expect(doc, name).toMatch(/logs? (you|them) out of the EVE-NG web UI/i);
+        expect(doc, name).toMatch(/(separate|its own|second) EVE-NG account|account for Nexus/i);
+      }
+      // The fuller treatment connects it to the released 412/(90001) retry.
+      expect(functionalDocs).toMatch(/90001/);
+      expect(functionalDocs).toMatch(/observed|not verified/i);
+    });
+
+    it("no longer contributes nexus.inventory.statusPollSeconds, or any other nexus.inventory setting (\u2298 a key left contributed after the code stops reading it is a setting the user can still change and nothing obeys)", () => {
+      const properties = packageJson.contributes.configuration?.properties ?? {};
+      expect(properties["nexus.inventory.statusPollSeconds"]).toBeUndefined();
+      expect(Object.keys(properties).filter((key) => key.startsWith("nexus.inventory."))).toEqual([]);
+    });
+
+    it("declares the poll interval on the EVE-NG SOURCE instead, bounded 0..3600 and defaulting to off (\u2298 retiring the global setting without a per-source replacement removes the feature rather than moving it)", () => {
+      const provider = createEveNgProvider(undefined as unknown as typeof fetch);
+      const field = provider.configFields.find((f) => f.id === "statusPollSeconds");
+      expect(field).toBeDefined();
+      expect(field?.type).toBe("number");
+      expect(field?.required).not.toBe(true);
+      expect(field?.min).toBe(0);
+      expect(field?.max).toBe(3600);
+      // Absent reads as 0 — the same "off" the retired setting shipped with.
+      expect(readEveNgStatusPollSeconds({})).toBe(0);
+      // …and it is the LAST field, so no existing field moved.
+      expect(provider.configFields[provider.configFields.length - 1]?.id).toBe("statusPollSeconds");
     });
 
     it("documents the live-status feature, the poll setting, and the BMC-menu gating in the functional docs and README", () => {
-      expect(functionalDocs).toContain("nexus.inventory.statusPollSeconds");
+      // The poll is a PER-SOURCE field now. The functional docs may still NAME
+      // the retired key — that is how a user who has it in settings.json finds
+      // out where it went — but never as a live setting: no settings-table row
+      // for it, and every mention has to sit beside the words that retire it.
+      // The README, which is the user-facing document, must not name it at all.
+      expect(functionalDocs).not.toContain("| `nexus.inventory.statusPollSeconds` |");
+      expect(readme).not.toContain("nexus.inventory.statusPollSeconds");
+      for (const line of functionalDocs.split("\n").filter((l) => l.includes("nexus.inventory.statusPollSeconds"))) {
+        expect(line, line.slice(0, 80)).toMatch(/used to|no longer|stopped being|retired/i);
+      }
+      expect(functionalDocs).toMatch(/Lab Status Poll Interval/);
+      expect(readme).toMatch(/Lab Status Poll Interval/);
       expect(functionalDocs).toMatch(/Refresh Lab Status/);
       expect(functionalDocs).toMatch(/Live lab status/i);
       // BMC-menu gating note.

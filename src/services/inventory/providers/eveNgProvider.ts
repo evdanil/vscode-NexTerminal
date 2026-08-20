@@ -69,6 +69,55 @@ export const EVE_NG_INSECURE_TLS_WARNING =
   `Certificate verification is off for this source (\u201c${ALLOW_INSECURE_TLS_LABEL}\u201d) \u2014 the connection is encrypted but unauthenticated, and the EVE-NG password is sent over it.`;
 
 /**
+ * PER-SOURCE LAB STATUS POLL — the field id, its bounds, and the ONE place a
+ * stored value is turned into seconds.
+ *
+ * The interval used to be a single global setting
+ * (`nexus.inventory.statusPollSeconds`), which forced one cadence onto every
+ * lab server a user had. It is a property of the SOURCE: a busy lab wants a
+ * short interval, a quiet one wants none at all, and only EVE-NG sources report
+ * status in the first place — so a global Inventory settings category holding
+ * exactly one EVE-NG-only knob was the wrong home for it.
+ *
+ * `readEveNgStatusPollSeconds` is deliberately total: absent, non-numeric,
+ * negative, fractional and out-of-range values all resolve to something a timer
+ * can be armed with. The form bounds the value on the way IN, but a source
+ * restored from a hand-edited backup never went through the form, and an
+ * unclamped read there would arm a millisecond-period timer against a lab box
+ * (or a `NaN` period, which reports itself as running and never fires).
+ */
+export const EVE_NG_STATUS_POLL_FIELD_ID = "statusPollSeconds";
+export const EVE_NG_STATUS_POLL_MIN_SECONDS = 0;
+export const EVE_NG_STATUS_POLL_MAX_SECONDS = 3600;
+
+export function readEveNgStatusPollSeconds(config: InventorySourceValues): number {
+  const raw = config[EVE_NG_STATUS_POLL_FIELD_ID];
+  if (typeof raw !== "number" || Number.isNaN(raw)) {
+    // Includes the ABSENT case (every source that predates the field) and a
+    // numeric STRING, which the form never stores but a backup could carry.
+    return EVE_NG_STATUS_POLL_MIN_SECONDS;
+  }
+  const clamped = Math.min(Math.max(raw, EVE_NG_STATUS_POLL_MIN_SECONDS), EVE_NG_STATUS_POLL_MAX_SECONDS);
+  // Floor rather than round: a value between 0 and 1 must land on OFF, not on a
+  // sub-second period, and no user typing "1.9" meant "poll twice as often".
+  return Math.floor(clamped);
+}
+
+/**
+ * PER-SOURCE LAB STATUS POLL — the field's hint. Its LAST clause is the one
+ * that earns its length: EVE-NG (at least Community) appears to allow one
+ * active session per user account, so a poll's login evicts the session the
+ * user's own browser is holding — and the browser logging back in evicts
+ * Nexus, which is very likely what produces the mid-sync
+ * `412 … unauthorized (90001)` the one-shot re-login recovers from. This field
+ * is exactly where a user decides to turn polling on, so it is where the
+ * caveat and its remedy (a separate EVE-NG account for Nexus) belong. The full
+ * account is in the functional documentation, §4.12.4.
+ */
+const EVE_NG_STATUS_POLL_DESCRIPTION =
+  "How often, in seconds, to refresh this source's lab running status while the Command Center is visible. 0 turns polling off for this source — use Refresh Lab Status when you want it. Note that EVE-NG (at least Community) appears to allow only one active session per user, so each poll can log you out of the EVE-NG web UI: give Nexus its own EVE-NG account, or leave this at 0.";
+
+/**
  * THE CONFIG FIELD LIST IS PART OF THE PROVIDER FINGERPRINT
  * (`computeProviderFingerprint`, models/inventory.ts): its ids, labels, types,
  * required flags and ORDER are hashed and stamped onto every source at save
@@ -156,6 +205,38 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
     // softened — it is what the user is actually agreeing to send.
     description:
       "Connects over https without checking the server's certificate. The traffic is encrypted but unauthenticated, so anything on the network path can intercept it \u2014 including the EVE-NG username and password, which are sent over that connection. Reasonable for a lab box on a network you trust; not for one reachable from outside it. Has no effect on an http base URL, which is not encrypted at all."
+  },
+  {
+    // PER-SOURCE LAB STATUS POLL \u2014 appended LAST, for the same reason
+    // `allowInsecureTls` was: the field ORDER is part of the fingerprint, and
+    // appending keeps every existing field on the same row of the sequential
+    // add-source prompts. Adding it does move the fingerprint, so every
+    // existing EVE-NG source re-confirms its saved credentials once \u2014 the
+    // gate working as designed, not a bug, and not something to dodge by
+    // exempting the field from the hash.
+    //
+    // NO `defaultValue`: that member is boolean-only by contract
+    // (`validateProviderShape` rejects a non-boolean), and it is not needed \u2014
+    // an absent value reads as 0 through `readEveNgStatusPollSeconds`, which is
+    // exactly the OFF the old global setting shipped with. Advanced, because
+    // turning it on starts unattended requests against a lab box.
+    id: EVE_NG_STATUS_POLL_FIELD_ID,
+    label: "Lab Status Poll Interval (seconds)",
+    type: "number",
+    required: false,
+    advanced: true,
+    min: EVE_NG_STATUS_POLL_MIN_SECONDS,
+    max: EVE_NG_STATUS_POLL_MAX_SECONDS,
+    // WHOLE SECONDS ONLY (review D2). `readEveNgStatusPollSeconds` floors what
+    // it reads, so a fraction is never the cadence that runs: 0.4 would be OFF
+    // and 1.9 would be one second, both reported back by the form as the number
+    // the user typed. There is no runtime meaning to give a fractional poll
+    // period, so the field refuses one at both layers instead of accepting a
+    // value it will quietly change. Not part of the fingerprint (pinned by a
+    // test), so adding it re-prompts nobody.
+    integer: true,
+    placeholder: "0",
+    description: EVE_NG_STATUS_POLL_DESCRIPTION
   }
 ];
 

@@ -313,13 +313,29 @@ describe("formDefinitions keyPath visibility", () => {
     const localShell = unifiedProfileFormDefinition({ addMode: "localShell" });
 
     expect(generic.title).toBe("Add Profile");
-    expect(ssh.title).toBe("Add SSH Server Profile");
+    expect(ssh.title).toBe("Add Network Device Profile");
     expect(serial.title).toBe("Add Serial Profile");
     expect(localShell.title).toBe("Add Local Shell Profile");
     expect(unifiedProfileFormId()).toBe("profile-add");
     expect(unifiedProfileFormId({ addMode: "ssh" })).toBe("server-add");
     expect(unifiedProfileFormId({ addMode: "serial" })).toBe("serial-add");
     expect(unifiedProfileFormId({ addMode: "localShell" })).toBe("local-shell-add");
+  });
+
+  /**
+   * The profile the "ssh" entry point creates has carried a Protocol selector
+   * (SSH / Telnet) since telnet support landed, so "SSH Server Profile" names
+   * only half of what the form makes. The select option keeps the SHORT form —
+   * it sits beside "Serial Profile" / "Local Shell Profile", and the Protocol
+   * selector is two fields below it, so the transports need no restating here.
+   */
+  it("calls the SSH/telnet profile a Network Device Profile in the type selector (\u2298 \"SSH Server Profile\" names one of the two protocols the form offers)", () => {
+    const profileType = keyedField(unifiedProfileFormDefinition(), "profileType");
+    expect(profileType).toMatchObject({ type: "select" });
+    if (profileType.type === "select") {
+      expect(profileType.options).toContainEqual({ label: "Network Device Profile", value: "ssh" });
+      expect(profileType.options.map((o) => o.label)).not.toContain("SSH Server Profile");
+    }
   });
 
   it("locks the profile type selector for explicit SSH, serial, and local shell add forms", () => {
@@ -564,6 +580,24 @@ describe("inventorySourceFormDefinition", () => {
     const field = keyedField(definition, "cfg_pollInterval");
     expect(field.type).toBe("number");
     expect((field as Extract<FormFieldDescriptor, { type: "number" }>).step).toBe("any");
+  });
+
+  /**
+   * REVIEW D2 — `step: "any"` is right for a field that HAS a meaning for
+   * fractions, and wrong for one that does not. EVE-NG's poll interval is
+   * floored at read time, so `0.4` silently means OFF and `1.9` silently means
+   * one second, while the form shows the number the user typed as saved. A
+   * field that declares `integer` renders the native `step="1"` that catches it
+   * where it is typed.
+   */
+  it("steps a provider-declared INTEGER number field by 1, so the browser catches a fraction where it is typed (\u2298 step \"any\" accepts 0.4 on a field whose runtime floors it to OFF, and the form reports it as saved)", () => {
+    const definition = inventorySourceFormDefinition({
+      ...fakeProvider,
+      configFields: [{ id: "pollInterval", label: "Poll Interval", type: "number", integer: true }]
+    });
+    const field = keyedField(definition, "cfg_pollInterval") as Extract<FormFieldDescriptor, { type: "number" }>;
+    expect(field.type).toBe("number");
+    expect(field.step).toBe(1);
   });
 
   it("carries the fractional value through unchanged when reopening a source that already stores one", () => {
