@@ -61,6 +61,9 @@ function lease(overrides: Partial<DhcpLeaseInfo> = {}): DhcpLeaseInfo {
     boundAt,
     leaseSec,
     expiresAt: boundAt + leaseSec * 1000,
+    // Required on DhcpLeaseInfo, and derived rather than hard-coded so it stays
+    // consistent with whatever boundAt/leaseSec an override supplies.
+    remainingSec: Math.max(0, Math.round((boundAt + leaseSec * 1000 - NOW) / 1000)),
     hostname: "bench-switch",
     leaseType: "dynamic",
     ...overrides

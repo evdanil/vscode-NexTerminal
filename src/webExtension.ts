@@ -166,7 +166,25 @@ const unsupportedCommands = [
   "nexus.terminal.reset",
   "nexus.terminal.clearScrollback",
   "nexus.terminal.copyAll",
-  "nexus.files.editAsRoot"
+  "nexus.files.editAsRoot",
+  // The embedded TFTP and DHCP services bind privileged UDP ports from a
+  // spawned Node daemon and serve a directory off the local filesystem. The web
+  // host has no child processes, no UDP sockets and no filesystem, so every one
+  // of these is desktop-only — including the profile and transfer commands,
+  // which are meaningless without a service to point them at.
+  "nexus.networkServer.start",
+  "nexus.networkServer.stop",
+  "nexus.networkServer.restart",
+  "nexus.networkServer.quickAdjust",
+  "nexus.networkServer.edit",
+  "nexus.networkServer.inspectLogs",
+  "nexus.networkServer.tftp.cancelTransfer",
+  "nexus.networkServer.tftp.clearHistory",
+  "nexus.networkServer.profile.saveCurrent",
+  "nexus.networkServer.profile.apply",
+  "nexus.networkServer.profile.rename",
+  "nexus.networkServer.profile.duplicate",
+  "nexus.networkServer.profile.remove"
 ];
 
 export function activate(context: vscode.ExtensionContext): NexusExtensionApi {
@@ -176,6 +194,10 @@ export function activate(context: vscode.ExtensionContext): NexusExtensionApi {
   });
   const tunnelsView = vscode.window.createTreeView("nexusTunnels", {
     treeDataProvider: new StaticTreeProvider("Nexus tunnels require desktop VS Code"),
+    showCollapseAll: false
+  });
+  const networkServersView = vscode.window.createTreeView("nexusNetworkServers", {
+    treeDataProvider: new StaticTreeProvider("Nexus network servers require desktop VS Code"),
     showCollapseAll: false
   });
   const fileExplorerView = vscode.window.createTreeView("nexusFileExplorer", {
@@ -193,7 +215,14 @@ export function activate(context: vscode.ExtensionContext): NexusExtensionApi {
     await vscode.env.openExternal(vscode.Uri.parse(repositoryBlobUrl("docs/macros.md")));
   });
 
-  context.subscriptions.push(commandCenterView, tunnelsView, fileExplorerView, ...commandRegistrations, macroDocsCommand);
+  context.subscriptions.push(
+    commandCenterView,
+    tunnelsView,
+    networkServersView,
+    fileExplorerView,
+    ...commandRegistrations,
+    macroDocsCommand
+  );
 
   // F17 — web build parity: same API shape as the desktop activate(), but every
   // call throws rather than silently no-opping a third party's provider registration.

@@ -100,9 +100,30 @@ describe("TFTP PathGuard (PathGuard.ts) — Pure+fs", () => {
       expect(() => guard.resolve("..")).toThrow(PathViolationError);
     });
 
-    it("absolute path /etc/passwd → PathViolationError (outside root)", () => {
-      expect(() => guard.resolve(path.resolve(root, "..", "outside.bin"))).toThrow(PathViolationError);
-    });
+    // Platform split: a client-supplied ABSOLUTE path has no single answer here,
+    // because `PathGuard.resolve()` strips leading `/` and `\` before resolving.
+    // See the class-level doc on `PathGuard` for why that strip is deliberate
+    // (RFC 1350 gives absolute paths no meaning — the root IS the client's whole
+    // namespace, so `/etc/passwd` means "etc/passwd under root", not "reject").
+    //
+    // On POSIX that strip alone contains the path, so it lands inside root.
+    // On Windows a drive-qualified path (`C:\...`) has no LEADING separator to
+    // strip, so it survives into `path.resolve`, wins as an absolute path, and
+    // is then caught by the `path.relative` escape check.
+    // Either way nothing outside root is reachable — only the mechanism differs.
+    it.skipIf(process.platform === "win32")(
+      "POSIX: absolute /etc/passwd is re-anchored under root, not rejected",
+      () => {
+        expect(guard.resolve("/etc/passwd")).toBe(path.join(root, "etc", "passwd"));
+      }
+    );
+
+    it.skipIf(process.platform !== "win32")(
+      "Windows: a drive-qualified absolute path outside root → PathViolationError",
+      () => {
+        expect(() => guard.resolve(path.resolve(root, "..", "outside.bin"))).toThrow(PathViolationError);
+      }
+    );
 
     it(".. in middle of name (not traversal) ex: my..file.bin → OK", () => {
       const p = guard.resolve("my..file.bin");

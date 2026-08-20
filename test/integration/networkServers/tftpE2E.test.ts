@@ -126,11 +126,13 @@ describe("TFTP E2E — Critical Paths", () => {
     });
   });
 
-  it("RRQ PathTraversal ..\\etc → ERROR code=2 AccessViolation", async () => {
+  // Forward slash is a separator everywhere, so this traversal is a traversal on
+  // every platform and the assertion is unconditional.
+  it("RRQ PathTraversal ../escape.bin → ERROR code=2 AccessViolation", async () => {
     await withEngine(root, false, {}, async (_engine, port) => {
       const c = await createUdpClient();
       try {
-        c.sendTo(encodeRRQ("..\\escape.bin", "octet"), port);
+        c.sendTo(encodeRRQ("../escape.bin", "octet"), port);
         const { message } = await c.nextMsg(4000);
         assertErrorMessage(message, ErrorCode.AccessViolation);
       } finally {
@@ -138,6 +140,44 @@ describe("TFTP E2E — Critical Paths", () => {
       }
     });
   });
+
+  // Platform split: a BACKSLASH is a path separator on Windows and an ordinary
+  // filename character on POSIX, so the same wire bytes are a traversal on one
+  // host and a single legal filename on the other. Both outcomes are correct —
+  // nothing outside root is served either way. See the class-level doc on
+  // `PathGuard` for the related decision about leading separators being
+  // stripped rather than rejected (RFC 1350 defines no absolute-path semantics).
+  it.skipIf(process.platform !== "win32")(
+    "Windows: RRQ PathTraversal ..\\escape.bin → ERROR code=2 AccessViolation",
+    async () => {
+      await withEngine(root, false, {}, async (_engine, port) => {
+        const c = await createUdpClient();
+        try {
+          c.sendTo(encodeRRQ("..\\escape.bin", "octet"), port);
+          const { message } = await c.nextMsg(4000);
+          assertErrorMessage(message, ErrorCode.AccessViolation);
+        } finally {
+          c.close();
+        }
+      });
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "POSIX: RRQ ..\\escape.bin is one legal filename, not a traversal → ERROR code=1 FileNotFound",
+    async () => {
+      await withEngine(root, false, {}, async (_engine, port) => {
+        const c = await createUdpClient();
+        try {
+          c.sendTo(encodeRRQ("..\\escape.bin", "octet"), port);
+          const { message } = await c.nextMsg(4000);
+          assertErrorMessage(message, ErrorCode.FileNotFound);
+        } finally {
+          c.close();
+        }
+      });
+    }
+  );
 
   it("RRQ file does not exist → ERROR code=1 FileNotFound", async () => {
     await withEngine(root, false, {}, async (_engine, port) => {
