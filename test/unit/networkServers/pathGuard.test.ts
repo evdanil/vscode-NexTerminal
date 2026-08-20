@@ -138,6 +138,26 @@ describe("TFTP PathGuard (PathGuard.ts) — Pure+fs", () => {
       expect(res.size).toBe(size);
       expect(res.absPath).toBe(p);
     });
+
+    it.skipIf(process.platform === "win32")(
+      "SECURITY: a symlink inside root pointing OUTSIDE it → PathViolationError, not a followed read",
+      async () => {
+        // ⊘ lexical containment only (path.relative(root, abs) on the link's
+        // own path, never on where it resolves): `abs` for "leak" sits
+        // squarely inside root, so a guard that stops at resolve() sees
+        // nothing wrong and hands the caller a size/path pair for a file
+        // that physically lives outside the sandbox.
+        const outsideDir = fs.mkdtempSync(path.join(path.dirname(root), "nexus-pg-outside-"));
+        try {
+          const secret = path.join(outsideDir, "secret.txt");
+          fs.writeFileSync(secret, "outside the sandbox");
+          fs.symlinkSync(secret, path.join(root, "leak"));
+          await expect(guard.statFile("leak")).rejects.toThrow(PathViolationError);
+        } finally {
+          fs.rmSync(outsideDir, { recursive: true, force: true });
+        }
+      }
+    );
   });
 
   describe("ensureWritableNew()", () => {
@@ -176,5 +196,45 @@ describe("TFTP PathGuard (PathGuard.ts) — Pure+fs", () => {
       // Second call must block
       await expect(guard.ensureWritableNew(nested)).rejects.toThrow(FileAlreadyExistsError);
     });
+
+    it.skipIf(process.platform === "win32")(
+      "SECURITY: a DANGLING symlink at the destination → FileAlreadyExistsError, not an arbitrary-write primitive",
+      async () => {
+        // ⊘ access(F_OK)/stat(), which both follow the final symlink: a
+        // symlink whose target does not exist yet reports ENOENT there — as
+        // if nothing were at that path — so the caller proceeds to
+        // `fs.open(abs, 'w')`, which follows the same symlink and creates
+        // its target. lstat inspects the directory entry itself, so it
+        // reports the symlink regardless of whether its target exists.
+        const outsideDir = fs.mkdtempSync(path.join(path.dirname(root), "nexus-pg-outside-"));
+        try {
+          const target = path.join(outsideDir, "arbitrary.txt");
+          fs.symlinkSync(target, path.join(root, "danger")); // target does not exist — dangling
+          await expect(guard.ensureWritableNew("danger")).rejects.toThrow(FileAlreadyExistsError);
+          expect(fs.existsSync(target)).toBe(false);
+        } finally {
+          fs.rmSync(outsideDir, { recursive: true, force: true });
+        }
+      }
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "SECURITY: an ancestor directory that is a symlink OUTSIDE root → PathViolationError, not a created escape",
+      async () => {
+        // ⊘ checking only that the LEXICAL parent path.relative(root, parent)
+        // stays inside root: "linkedDir" itself resolves fine, so recursive
+        // mkdir happily walks through the symlink and the caller ends up
+        // holding a path that is lexically "inside root" but physically
+        // writes wherever the symlink points.
+        const outsideDir = fs.mkdtempSync(path.join(path.dirname(root), "nexus-pg-outside-"));
+        try {
+          fs.symlinkSync(outsideDir, path.join(root, "linkedDir"), "dir");
+          await expect(guard.ensureWritableNew("linkedDir/upload.bin")).rejects.toThrow(PathViolationError);
+          expect(fs.existsSync(path.join(outsideDir, "upload.bin"))).toBe(false);
+        } finally {
+          fs.rmSync(outsideDir, { recursive: true, force: true });
+        }
+      }
+    );
   });
 });

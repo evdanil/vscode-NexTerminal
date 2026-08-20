@@ -618,7 +618,14 @@ export class TftpEngine extends EventEmitter {
       initial = transfer.initForWRQ(hasOptions);
       this.transfers.set(transfer.transferId, transfer);
       try {
-        const h = await fsPromises.open(absPath, 'w');
+        // 'wx' = O_CREAT|O_EXCL|O_WRONLY. The real defense against a symlink
+        // at absPath is ensureWritableNew's lstat check, above — this flag is
+        // secondary hardening against the narrow TOCTOU race between that
+        // check and this open (another request replacing absPath in
+        // between), which O_EXCL closes atomically on POSIX. It is NOT relied
+        // on for the symlink case itself: Windows' CREATE_NEW still follows a
+        // reparse point rather than refusing it, unlike POSIX's O_EXCL.
+        const h = await fsPromises.open(absPath, 'wx');
         this.writeHandles.set(transfer.transferId, h);
       } catch (err) {
         void this.cleanup(transfer.transferId).catch(() => {});
@@ -630,6 +637,9 @@ export class TftpEngine extends EventEmitter {
           if (errCode === 'ENOSPC') {
             code = ErrorCode.DiskFull;
             msg = 'Disk full or allocation exceeded';
+          } else if (errCode === 'EEXIST') {
+            code = ErrorCode.FileAlreadyExists;
+            msg = undefined;
           }
         }
         this.sendRaw(rinfo, encodeERROR(code, msg));

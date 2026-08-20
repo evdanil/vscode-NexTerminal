@@ -244,8 +244,10 @@ describe("TFTP E2E — Critical Paths", () => {
       let triggeredENOSPC = false;
       try {
         (fs.promises as any).open = async (filePath: string, flag: string) => {
-          // Trigger ENOSPC only on WRQ file "diskfull.bin" flag 'w' or 'a'
-          if (String(filePath).endsWith(path.join("diskfull.bin")) && (flag === "w" || flag === "a")) {
+          // Trigger ENOSPC only on WRQ file "diskfull.bin" flag 'wx' (initial
+          // create, O_EXCL — see PathGuard's symlink-write fix) or 'a'
+          // (appendWrite's lazy-reopen fallback)
+          if (String(filePath).endsWith(path.join("diskfull.bin")) && (flag === "wx" || flag === "a")) {
             const err: NodeJS.ErrnoException = new Error(`ENOSPC: no space left on device, open '${filePath}'`);
             err.code = "ENOSPC";
             err.errno = -28;

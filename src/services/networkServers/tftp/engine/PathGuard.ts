@@ -89,6 +89,11 @@ export class PathGuard {
     const abs = this.resolve(filename);
     const st = await fsPromises.stat(abs);
     if (!st.isFile()) throw new NotAFileError(filename);
+    // `abs` is only lexically inside `root` — a symlink at `abs` itself, or at
+    // any ancestor, can still resolve outside it. `stat` above already
+    // followed that chain to answer `isFile()`; verify the same real path it
+    // followed is still contained before anything reads through it.
+    this.assertRealPathContained(await fsPromises.realpath(abs), filename);
     return { size: st.size, absPath: abs };
   }
 
@@ -107,14 +112,43 @@ export class PathGuard {
     const abs = this.resolve(filename);
     const parent = path.dirname(abs);
     await fsPromises.mkdir(parent, { recursive: true });
+    // `parent` is only lexically inside `root` — if an ancestor directory
+    // component is itself a symlink pointing outside root, the recursive
+    // mkdir above just created (or reused) directories through it. `parent`
+    // is guaranteed to exist now, so resolve its real path and confirm.
+    this.assertRealPathContained(await fsPromises.realpath(parent), filename);
     try {
-      await fsPromises.access(abs, fs.constants.F_OK);
+      // lstat, not access()/stat(): both of those follow the final symlink,
+      // so a *dangling* symlink at `abs` reports ENOENT — as if nothing
+      // exists — even though a symlink file already sits at that path. lstat
+      // inspects the directory entry itself and never follows it, so a
+      // symlink (dangling or not) is correctly seen as "already something
+      // here." This is also the only *portable* defense against it: POSIX's
+      // O_EXCL refuses to create through an existing symlink, but Windows'
+      // CreateFile(CREATE_NEW) does not — it follows the reparse point and
+      // creates the symlink's target — so the actual `open()` this path is
+      // handed to cannot be relied on to catch this on every platform.
+      await fsPromises.lstat(abs);
       throw new FileAlreadyExistsError(filename);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
     await fsPromises.access(parent, fs.constants.W_OK);
     return abs;
+  }
+
+  /**
+   * Confirms a real (symlink-resolved) path is still inside {@link root}.
+   * Shares the same relative-path containment logic as {@link resolve},
+   * applied to a path the OS has already dereferenced rather than one built
+   * lexically from client input.
+   */
+  private assertRealPathContained(real: string, filename: string): void {
+    const relative = path.relative(this.root, real);
+    if (relative === '' ) return;
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+      throw new PathViolationError(filename);
+    }
   }
 }
 
