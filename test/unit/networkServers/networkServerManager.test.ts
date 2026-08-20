@@ -66,6 +66,7 @@ vi.mock("../../../src/services/networkServers/daemonHost", () => ({
     }
     public onDidChangeStatus = vi.fn(() => vi.fn());
     public onDidUpdateRuntime = vi.fn(() => vi.fn());
+    public onDidConnection = vi.fn(() => vi.fn());
     public onDidLog = vi.fn(() => vi.fn());
     public onDidExit = vi.fn(() => vi.fn());
     public startServer = (...args: unknown[]) => hostState.startServer(...args);
@@ -98,6 +99,7 @@ function fakeCore() {
     getNetworkServerSession: vi.fn((kind: string) => sessions.get(kind)),
     updateNetworkServerSessionStatus: vi.fn(),
     setNetworkServerRuntimeSnapshot: vi.fn(),
+    setNetworkServerTransferHistory: vi.fn(),
     unregisterNetworkServerSession: vi.fn()
   } as any;
 }

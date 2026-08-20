@@ -111,12 +111,19 @@ beforeEach(() => {
 });
 
 describe("registerNetworkServerCommands — registration", () => {
-  it("registers exactly the five singleton-service commands and no CRUD surface", () => {
+  // Six, not five: `quickAdjust` (the Quick Settings pick) is a later addition
+  // that is contributed in package.json and implemented in
+  // `networkServerQuickAdjust.ts`. It is still not a CRUD surface — there is no
+  // add/remove here, because TFTP and DHCP are singletons, not a list the user
+  // creates entries in. The profile and transfer commands are registered by
+  // their own modules and so are deliberately absent from this assertion.
+  it("registers exactly the six singleton-service commands and no CRUD surface", () => {
     const disposables = registerNetworkServerCommands(fakeContext(fakeManager()));
-    expect(disposables).toHaveLength(5);
+    expect(disposables).toHaveLength(6);
     expect([...registeredCommands.keys()].sort()).toEqual([
       "nexus.networkServer.edit",
       "nexus.networkServer.inspectLogs",
+      "nexus.networkServer.quickAdjust",
       "nexus.networkServer.restart",
       "nexus.networkServer.start",
       "nexus.networkServer.stop"

@@ -138,6 +138,36 @@ export function dhcpPoolProblem(
 }
 
 /**
+ * Why an explicit `rangeStart`/`rangeEnd` pair is unusable, or `undefined` if
+ * it is fine.
+ *
+ * The form asks for a pool *size* and derives the end (see
+ * {@link dhcpRangeEndForCount}), but `rangeEnd` is still the stored setting, so
+ * it arrives directly from a hand-edited `settings.json` and from a restored
+ * profile. An inverted pair is silently empty at runtime — the server binds,
+ * answers nothing, and the fault reads as "DHCP is broken" — so it is worth
+ * refusing at the point of entry.
+ *
+ * Ordering goes through {@link compareIpv4}, which compares the four octets as
+ * numbers. A lexicographic string compare would place `10.0.0.100` *below*
+ * `10.0.0.99` and wave the inversion through.
+ *
+ * Anything that fails to parse is left alone: the per-field dotted-quad checks
+ * report that, and two messages for one typo is worse than one. A blank end is
+ * not an inversion either — it means "clear the key and use the packaged
+ * default".
+ */
+export function dhcpRangeOrderProblem(
+  rangeStart: string | undefined,
+  rangeEnd: string | undefined
+): string | undefined {
+  if (!rangeStart || !rangeEnd) return undefined;
+  if (!isValidIpv4(rangeStart) || !isValidIpv4(rangeEnd)) return undefined;
+  if (compareIpv4(rangeStart, rangeEnd) <= 0) return undefined;
+  return `Pool Start (${rangeStart}) must not be higher than Pool End (${rangeEnd}).`;
+}
+
+/**
  * The addresses that follow from a pool start, for the editors that offer to
  * fill them in rather than making the user work the subnet out by hand.
  */
@@ -249,9 +279,11 @@ export function networkServerProfileSettingUpdates(
  */
 export function validateDhcpValues(values: FormValues): string | undefined {
   const rangeStart = readSettingString(values.rangeStart);
+  const rangeEnd = readSettingString(values.rangeEnd);
   const subnet = readSettingString(values.subnet);
   for (const [label, value] of [
     ["Pool Start", rangeStart],
+    ["Pool End", rangeEnd],
     ["Subnet Mask", subnet],
     ["Gateway", readSettingString(values.gateway)],
     ["Server Identifier", readSettingString(values.serverId)],
@@ -264,5 +296,7 @@ export function validateDhcpValues(values: FormValues): string | undefined {
   if (subnet && !isContiguousMask(subnet)) {
     return `Subnet Mask "${subnet}" is not a valid netmask — its set bits must be contiguous (e.g. 255.255.255.0).`;
   }
+  const inverted = dhcpRangeOrderProblem(rangeStart, rangeEnd);
+  if (inverted) return inverted;
   return dhcpPoolProblem(rangeStart, readSettingNumber(values.poolCount), subnet);
 }
