@@ -333,7 +333,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // must never delay or break activation.
   void migrateHighlightRulesGlobalSetting();
 
-  const repository = new VscodeConfigRepository(context);
+  const repository = new VscodeConfigRepository(context, {
+    // CROSS-WINDOW OVERWRITE DETECTION (see VscodeConfigRepository's doc
+    // comment): a save from this window is overwriting a change another VS
+    // Code window persisted to the same collection. The save itself is not
+    // blocked — last-writer-wins is all globalState offers — but the loss must
+    // not be silent: tell the user which data was superseded so they can redo
+    // the other window's edit.
+    onConcurrentOverwrite: (collection) => {
+      void vscode.window.showWarningMessage(
+        `Nexus: the ${collection} were also changed in another VS Code window; that window's change has been overwritten by this one. If you edited ${collection} elsewhere, redo the edit — and prefer making Nexus configuration changes in one window at a time.`
+      );
+    }
+  });
   const core = new NexusCore(repository);
   await core.initialize();
 

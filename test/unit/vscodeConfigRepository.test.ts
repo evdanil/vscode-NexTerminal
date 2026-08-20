@@ -409,3 +409,315 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     warnSpy.mockRestore();
   });
 });
+
+/**
+ * DEFECT B (cross-window overwrite detection) — every save*() persists the
+ * whole in-memory list, and globalState is shared across windows with
+ * last-writer-wins and no compare-and-swap, so a save from window A silently
+ * reverts anything window B persisted since A last loaded. Prevention is not
+ * available at the Memento layer (whole-blob writes, no CAS); the repository
+ * therefore DETECTS the overwrite — baseline JSON per key, recorded on read
+ * and write, compared against the store at save time — and warns without ever
+ * blocking or failing the save. The fake context's shared `state` object
+ * stands in for the cross-window-propagated globalState cache. Each test
+ * names the wrong implementation it fails against.
+ */
+describe("VscodeConfigRepository cross-window overwrite detection", () => {
+  const validSource = {
+    id: "source-1",
+    providerId: "netbox",
+    name: "NetBox",
+    targetFolder: "NetBox",
+    prunePolicy: "orphan",
+    defaultUsername: "admin",
+    config: {},
+    secretFieldIds: []
+  };
+
+  // Every collection, exercised through its own get/save pair: the defect is
+  // general, so the guard must be too. Values are minimal but VALID for their
+  // reader (reads sanitize), and `changed` differs from both `initial` and
+  // `saved` so the buggy paths visibly diverge.
+  const COLLECTIONS: Array<{
+    label: string;
+    key: string;
+    initial: unknown[];
+    changed: unknown[];
+    saved: unknown[];
+    read: (r: VscodeConfigRepository) => Promise<unknown>;
+    save: (r: VscodeConfigRepository, value: unknown[]) => Promise<void>;
+  }> = [
+    {
+      label: "servers",
+      key: "nexus.servers",
+      initial: [validServer],
+      changed: [{ ...validServer, name: "Renamed in window B" }],
+      saved: [{ ...validServer, name: "Saved by window A" }],
+      read: (r) => r.getServers(),
+      save: (r, v) => r.saveServers(v as never)
+    },
+    {
+      label: "tunnel profiles",
+      key: "nexus.tunnels",
+      initial: [],
+      changed: [{ id: "t1", name: "B", localPort: 1, remoteIP: "h", remotePort: 2, autoStart: false }],
+      saved: [{ id: "t2", name: "A", localPort: 3, remoteIP: "h", remotePort: 4, autoStart: false }],
+      read: (r) => r.getTunnels(),
+      save: (r, v) => r.saveTunnels(v as never)
+    },
+    {
+      label: "serial profiles",
+      key: "nexus.serialProfiles",
+      initial: [],
+      changed: [{ id: "sp1", name: "B", path: "/dev/ttyUSB0", baudRate: 9600 }],
+      saved: [{ id: "sp2", name: "A", path: "/dev/ttyUSB1", baudRate: 115200 }],
+      read: (r) => r.getSerialProfiles(),
+      save: (r, v) => r.saveSerialProfiles(v as never)
+    },
+    {
+      label: "local shell profiles",
+      key: "nexus.localShellProfiles",
+      initial: [],
+      changed: [{ id: "l1", name: "B", launchMode: "custom", shellPath: "/bin/sh" }],
+      saved: [{ id: "l2", name: "A", launchMode: "custom", shellPath: "/bin/bash" }],
+      read: (r) => r.getLocalShellProfiles(),
+      save: (r, v) => r.saveLocalShellProfiles(v as never)
+    },
+    {
+      label: "folders",
+      key: "nexus.groups",
+      initial: ["Prod"],
+      changed: ["Prod", "Added in window B"],
+      saved: ["Prod", "Added in window A"],
+      read: (r) => r.getGroups(),
+      save: (r, v) => r.saveGroups(v as never)
+    },
+    {
+      label: "auth profiles",
+      key: "nexus.authProfiles",
+      initial: [],
+      changed: [{ id: "a1", name: "B", username: "u", authType: "password" }],
+      saved: [{ id: "a2", name: "A", username: "u", authType: "password" }],
+      read: (r) => r.getAuthProfiles(),
+      save: (r, v) => r.saveAuthProfiles(v as never)
+    },
+    {
+      label: "inventory sources",
+      key: "nexus.inventorySources",
+      initial: [validSource],
+      changed: [{ ...validSource, name: "Renamed in window B" }],
+      saved: [{ ...validSource, name: "Saved by window A" }],
+      read: (r) => r.getInventorySources(),
+      save: (r, v) => r.saveInventorySources(v as never)
+    },
+    {
+      label: "device templates",
+      key: "nexus.deviceTemplates",
+      initial: [],
+      changed: [{ id: "d1", name: "B", fields: {} }],
+      saved: [{ id: "d2", name: "A", fields: {} }],
+      read: (r) => r.getDeviceTemplates(),
+      save: (r, v) => r.saveDeviceTemplates(v as never)
+    },
+    {
+      label: "saved filters",
+      key: "nexus.savedFilters",
+      initial: [],
+      changed: [{ id: "11111111-1111-4111-8111-111111111111", name: "B", providerId: "netbox", filter: "x" }],
+      saved: [{ id: "22222222-2222-4222-8222-222222222222", name: "A", providerId: "netbox", filter: "y" }],
+      read: (r) => r.getSavedFilters(),
+      save: (r, v) => r.saveSavedFilters(v as never)
+    }
+  ];
+
+  for (const c of COLLECTIONS) {
+    it(`${c.key}: a save that overwrites another window's change warns AND still writes (kills the guard-less save — the silent revert this detection exists to expose — and kills a guard that blocks the write)`, async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const state: Record<string, unknown> = { [c.key]: c.initial };
+        const onConcurrentOverwrite = vi.fn();
+        const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+
+        await c.read(repo); // window A loads (activation) -> baseline
+        state[c.key] = c.changed; // window B's edit propagates into the store
+
+        await c.save(repo, c.saved); // window A saves
+
+        expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+        expect(onConcurrentOverwrite).toHaveBeenCalledWith(c.label);
+        // The write itself is NOT blocked or altered: last-writer-wins stands,
+        // it just stops being silent.
+        expect(state[c.key]).toEqual(c.saved);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  }
+
+  it("this window's own saves never trip the detector, even across several different writes (kills a baseline that is not refreshed after a save, and kills naive 'warn whenever the new value differs from the stored one' — which would fire on every genuine change)", async () => {
+    const state: Record<string, unknown> = { "nexus.inventorySources": [validSource] };
+    const onConcurrentOverwrite = vi.fn();
+    const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+
+    await repo.getInventorySources();
+    await repo.saveInventorySources([{ ...validSource, name: "First edit" }] as never);
+    await repo.saveInventorySources([{ ...validSource, name: "Second edit" }] as never);
+    await repo.saveInventorySources([] as never);
+
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state["nexus.inventorySources"]).toEqual([]);
+  });
+
+  it("a save with no baseline (key never read or written by this window) does not warn (kills a detector that compares against undefined and cries foul on first contact)", async () => {
+    const state: Record<string, unknown> = { "nexus.groups": ["Pre-existing"] };
+    const onConcurrentOverwrite = vi.fn();
+    const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+
+    await repo.saveGroups(["Fresh"]);
+
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state["nexus.groups"]).toEqual(["Fresh"]);
+  });
+
+  it("a save after a detected overwrite re-baselines: the NEXT save does not warn again without a new foreign write (kills a baseline frozen at read time, which would nag on every subsequent save forever)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const state: Record<string, unknown> = { "nexus.groups": ["Prod"] };
+      const onConcurrentOverwrite = vi.fn();
+      const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+
+      await repo.getGroups();
+      state["nexus.groups"] = ["Prod", "From window B"];
+      await repo.saveGroups(["Prod", "From window A"]);
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+
+      await repo.saveGroups(["Prod"]);
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a throwing onConcurrentOverwrite callback does not fail the save (kills a guard able to break persistence — the one regression the detection must never introduce)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const state: Record<string, unknown> = { "nexus.groups": ["Prod"] };
+      const repo = new VscodeConfigRepository(makeContext(state), {
+        onConcurrentOverwrite: () => {
+          throw new Error("notifier bug");
+        }
+      });
+
+      await repo.getGroups();
+      state["nexus.groups"] = ["From window B"];
+
+      await expect(repo.saveGroups(["From window A"])).resolves.toBeUndefined();
+      expect(state["nexus.groups"]).toEqual(["From window A"]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+/**
+ * REVIEW FIXES E1/E2/E3 (PR #93) — the guard itself must not cry wolf: a
+ * warning that fires when nothing was lost trains the user to ignore the one
+ * that matters. E1: two windows converging on the SAME value is not a loss.
+ * E2: the Memento mutates its cache synchronously inside update(), before the
+ * returned promise settles, so an overlapping same-collection save in ONE
+ * window must never observe its own predecessor as a foreign write. E3: the
+ * steady-state save path must not serialize whole collections (multi-thousand
+ * -row imports run on the extension-host thread). Each test names the wrong
+ * implementation it fails against.
+ */
+describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () => {
+  const KEY = "nexus.groups";
+
+  function makeRepo(initial: unknown) {
+    const state: Record<string, unknown> = { [KEY]: initial };
+    const onConcurrentOverwrite = vi.fn();
+    const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+    return { state, onConcurrentOverwrite, repo };
+  }
+
+  it("E1: a foreign write whose content is identical to the pending save warns about nothing (kills the baseline-only comparison, which reports byte-identical data as overwritten)", async () => {
+    const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+    await repo.getGroups();
+    // Window B lands a change... which is exactly the value window A is about
+    // to save (deep-equal, different object — foreign propagation always
+    // yields fresh objects).
+    state[KEY] = ["Prod", "Shared"];
+
+    await repo.saveGroups(["Prod", "Shared"]);
+
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state[KEY]).toEqual(["Prod", "Shared"]);
+  });
+
+  it("E2: two overlapping same-collection saves in one window warn about nothing (kills the baseline refreshed only AFTER the awaited update — the cache mutates synchronously inside update(), so the second save would observe its own predecessor as foreign)", async () => {
+    const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+    await repo.getGroups();
+
+    // Neither save is awaited before the next starts — exactly the overlap
+    // NexusCore can produce with back-to-back persistence calls.
+    const first = repo.saveGroups(["Prod", "A"]);
+    const second = repo.saveGroups(["Prod", "A", "B"]);
+    await Promise.all([first, second]);
+
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state[KEY]).toEqual(["Prod", "A", "B"]);
+  });
+
+  it("E2 counter-direction: a genuinely foreign write landing between two local saves in the same window STILL warns (kills 'fixing' E2 by suppressing detection around local saves altogether)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+      await repo.getGroups();
+      await repo.saveGroups(["Prod", "A"]);
+      expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+
+      state[KEY] = ["From window B"];
+
+      await repo.saveGroups(["Prod", "A", "C"]);
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+      expect(state[KEY]).toEqual(["Prod", "A", "C"]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("E2 counter-direction: a foreign write landing DURING an overlap of two local saves still warns (kills a same-key queue that skips comparison for queued saves)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+      await repo.getGroups();
+
+      const first = repo.saveGroups(["Prod", "A"]);
+      state[KEY] = ["From window B"]; // propagation lands mid-overlap
+      const second = repo.saveGroups(["Prod", "A", "B"]);
+      await Promise.all([first, second]);
+
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+      expect(state[KEY]).toEqual(["Prod", "A", "B"]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("E3: steady-state saves perform NO JSON serialization of the collections (kills stringify-both-sides-per-save, whose two O(n) passes stall multi-thousand-row imports on the extension-host thread)", async () => {
+    const bigList = Array.from({ length: 2000 }, (_, i) => `Folder ${i}`);
+    const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+    await repo.getGroups();
+
+    const stringifySpy = vi.spyOn(JSON, "stringify");
+    try {
+      await repo.saveGroups(bigList);
+      await repo.saveGroups([...bigList, "one more"]);
+      expect(stringifySpy).not.toHaveBeenCalled();
+    } finally {
+      stringifySpy.mockRestore();
+    }
+    expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    expect(state[KEY]).toEqual([...bigList, "one more"]);
+  });
+});

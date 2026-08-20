@@ -85,6 +85,8 @@ Tries saved password from `VscodeSecretVault` → falls back to `VscodePasswordP
 
 Passwords stored separately via VS Code `SecretStorage` with key pattern `password-{serverId}`.
 
+Cross-window writes: `globalState` is shared across VS Code windows, last-writer-wins, no compare-and-swap — and every `save*` persists the whole collection list, so a save from one window can overwrite another window's edit to the same collection. `VscodeConfigRepository` keeps a per-key baseline (the raw object last read/written, compared by reference — the Memento returns our own object back, while a foreign write replaces it) and, when a save would overwrite a foreign change whose content actually differs from what is being written, warns via its `onConcurrentOverwrite` hook (wired to a notification in `extension.ts`) — the write still proceeds; the loss is surfaced, not prevented (prevention isn't possible at the Memento layer). Steady-state cost is one cached read plus a reference compare (no serialization); the baseline refreshes synchronously with the Memento's own cache mutation, so overlapping local saves never read as foreign. Full semantics and residual gaps in the doc comment atop `vscodeConfigRepository.ts`.
+
 ### UI components
 - **NexusTreeProvider**: Command Center sidebar — servers, sessions, serial profiles. Supports drag-and-drop of tunnel profiles onto servers
 - **TunnelTreeProvider**: Port Forwarding — tunnel profiles with live traffic counters

@@ -18,6 +18,65 @@ import {
 } from "../utils/validation";
 import { asArray } from "../utils/helpers";
 
+/**
+ * CROSS-WINDOW OVERWRITE DETECTION (defect: "a second window's edit is lost").
+ *
+ * Every save*() below persists the ENTIRE in-memory list for its collection,
+ * and `globalState` is shared across VS Code windows with last-writer-wins
+ * semantics and no compare-and-swap: window A's next save of a collection
+ * silently reverts anything window B persisted to it since A last loaded.
+ * NexusCore loads once at activation and never re-reads, so the window in
+ * which this bites is unbounded. This is general to all nine collections, not
+ * inventory-specific.
+ *
+ * What the storage layer actually allows (verified against VS Code's
+ * extHostMemento implementation):
+ *   - `Memento.get` reads only this extension host's in-memory cache;
+ *   - `Memento.update` writes the extension's WHOLE key/value state object
+ *     from that cache — there is no per-key write, no CAS, and no way to
+ *     "persist only the changed record" beneath this API;
+ *   - another window's write DOES propagate back into this host's cache
+ *     (the cached state object is replaced wholesale), asynchronously and
+ *     with no event exposed to extensions.
+ *
+ * So prevention is not available at this layer, but detection is: remember
+ * the raw object this window last read or wrote per key (`lastSeenValue`,
+ * compared BY REFERENCE — see its doc comment) and, on each save, check
+ * whether the cache now holds something else. A changed reference means
+ * another window wrote this collection in between; the content is then
+ * confirmed to actually differ from what this save is writing (two windows
+ * converging on the same value lose nothing and stay silent). The save still
+ * proceeds exactly as before — never blocked, never able to fail because of
+ * the guard (detection errors are swallowed), and at zero serialization cost
+ * on the steady-state path: one cached synchronous read plus one reference
+ * comparison per save, with whole-collection JSON serialization only in the
+ * rare case that a foreign write was actually detected. The overwrite is no
+ * longer silent: it is logged and surfaced through `onConcurrentOverwrite`
+ * so the user can redo the superseded edit.
+ *
+ * KNOWN RESIDUAL (deliberate — a full optimistic-concurrency merge is out of
+ * proportion here and would have to be fed back through NexusCore, whose sync
+ * engine, rollback captures and revision semantics all assume it is the sole
+ * authority):
+ *   - the foreign edit is still overwritten; the user is told, not saved;
+ *   - a foreign write that has not yet propagated into this host's cache when
+ *     this window saves is undetectable (bounded by propagation latency,
+ *     typically well under a second — not by window lifetime as before);
+ *   - because Memento.update writes the whole extension blob from the local
+ *     cache, a not-yet-propagated foreign write to collection X can also be
+ *     clobbered by this window saving unrelated collection Y — same latency
+ *     bound, equally undetectable at this layer.
+ */
+interface VscodeConfigRepositoryOptions {
+  /**
+   * Called when a save is about to overwrite a change some other VS Code
+   * window persisted to the same collection. `collection` is a human-readable
+   * plural label ("servers", "inventory sources", ...). Must not throw the
+   * save off course — invoked inside the guard's own try/catch regardless.
+   */
+  onConcurrentOverwrite?: (collection: string) => void;
+}
+
 const SERVERS_KEY = "nexus.servers";
 const TUNNELS_KEY = "nexus.tunnels";
 const SERIAL_PROFILES_KEY = "nexus.serialProfiles";
@@ -29,10 +88,84 @@ const DEVICE_TEMPLATES_KEY = "nexus.deviceTemplates";
 const SAVED_FILTERS_KEY = "nexus.savedFilters";
 
 export class VscodeConfigRepository implements ConfigRepository {
-  public constructor(private readonly context: vscode.ExtensionContext) {}
+  /**
+   * BASELINE, BY REFERENCE — the raw object this window last read from or
+   * wrote into the Memento cache, per key. See the cross-window overwrite
+   * detection comment above. Reference identity is the honest signal here:
+   * the Memento hands back the very object our own update() stored, while a
+   * foreign window's write replaces the cached state object wholesale with
+   * freshly deserialized objects — so `stored !== baseline` means precisely
+   * "a write this repository did not make landed in the cache". `undefined`
+   * as a VALUE means "key was absent when read"; a key with no ENTRY (never
+   * read nor written by this instance) is never warned about — there is no
+   * baseline to have diverged from.
+   */
+  private readonly lastSeenValue = new Map<string, unknown>();
+
+  public constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly options: VscodeConfigRepositoryOptions = {}
+  ) {}
+
+  /** Read the raw stored value and record it as this window's baseline. */
+  private readRaw<T>(key: string): T {
+    const raw = this.context.globalState.get<T>(key);
+    this.lastSeenValue.set(key, raw);
+    return raw === undefined ? ([] as T) : raw;
+  }
+
+  /**
+   * Write through to globalState, first flagging (never blocking) a write
+   * that would overwrite another window's change to the same key. The guard
+   * must never make a save fail or change what gets written — detection
+   * errors are swallowed and the update below runs unconditionally.
+   *
+   * Detection is two-stage so the steady state costs nothing (E3):
+   *   1. reference check — `get` returns the exact object our own update()
+   *      stored, so a changed reference means a write we did not make. O(1),
+   *      no serialization, and no false negatives are on offer at this layer
+   *      anyway (a foreign write that has not propagated is invisible to ANY
+   *      comparison, JSON included).
+   *   2. content confirmation — only on a changed reference (rare: a foreign
+   *      write actually propagated), serialize both sides once and warn only
+   *      if the stored content differs from what this save is writing. Two
+   *      windows converging on the SAME value lose nothing and must not warn
+   *      (E1). This is the irreducible cost: confirming content divergence
+   *      requires comparing content, and anything cheaper (lengths, samples)
+   *      would silently reintroduce the original silent-loss defect.
+   *
+   * BASELINE REFRESH IS SYNCHRONOUS WITH THE CACHE MUTATION (E2): VS Code's
+   * ExtensionMemento.update() assigns the new value into its cache
+   * synchronously and returns a promise only for the disk flush. The baseline
+   * is therefore refreshed between the update() CALL and its await — never
+   * after — so an overlapping same-collection save from this window sees a
+   * baseline that already reflects its predecessor and cannot mistake it for
+   * a foreign write. (If update() itself throws synchronously, the baseline
+   * is deliberately left untouched: the cache was not mutated either.) No
+   * locking, so no deadlock and no reordering: update() calls reach the
+   * Memento in exactly the order the callers made them.
+   */
+  private async guardedUpdate(key: string, collection: string, value: unknown): Promise<void> {
+    try {
+      if (this.lastSeenValue.has(key)) {
+        const stored = this.context.globalState.get(key);
+        if (stored !== this.lastSeenValue.get(key) && JSON.stringify(stored) !== JSON.stringify(value)) {
+          console.warn(
+            `[Nexus] The ${collection} list was changed by another VS Code window since this window last loaded it; this window's save is overwriting that change.`
+          );
+          this.options.onConcurrentOverwrite?.(collection);
+        }
+      }
+    } catch (error) {
+      console.warn("[Nexus] Concurrent-write detection failed; saving anyway:", error);
+    }
+    const pending = this.context.globalState.update(key, value);
+    this.lastSeenValue.set(key, value);
+    await pending;
+  }
 
   public async getServers(): Promise<ServerConfig[]> {
-    const raw = asArray<ServerConfig>(this.context.globalState.get(SERVERS_KEY, []));
+    const raw = asArray<ServerConfig>(this.readRaw(SERVERS_KEY));
     const result: ServerConfig[] = [];
     for (const item of raw) {
       if (!validateServerConfig(item)) {
@@ -94,11 +227,11 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveServers(servers: ServerConfig[]): Promise<void> {
-    await this.context.globalState.update(SERVERS_KEY, servers);
+    await this.guardedUpdate(SERVERS_KEY, "servers", servers);
   }
 
   public async getTunnels(): Promise<TunnelProfile[]> {
-    const raw = asArray<TunnelProfile>(this.context.globalState.get(TUNNELS_KEY, []));
+    const raw = asArray<TunnelProfile>(this.readRaw(TUNNELS_KEY));
     return raw.filter((item) => {
       if (validateTunnelProfile(item)) {
         return true;
@@ -109,11 +242,11 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveTunnels(tunnels: TunnelProfile[]): Promise<void> {
-    await this.context.globalState.update(TUNNELS_KEY, tunnels);
+    await this.guardedUpdate(TUNNELS_KEY, "tunnel profiles", tunnels);
   }
 
   public async getSerialProfiles(): Promise<SerialProfile[]> {
-    const raw = asArray<SerialProfile>(this.context.globalState.get(SERIAL_PROFILES_KEY, []));
+    const raw = asArray<SerialProfile>(this.readRaw(SERIAL_PROFILES_KEY));
     return raw.filter((item) => {
       if (validateSerialProfile(item)) {
         return true;
@@ -124,11 +257,11 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveSerialProfiles(profiles: SerialProfile[]): Promise<void> {
-    await this.context.globalState.update(SERIAL_PROFILES_KEY, profiles);
+    await this.guardedUpdate(SERIAL_PROFILES_KEY, "serial profiles", profiles);
   }
 
   public async getLocalShellProfiles(): Promise<LocalShellProfile[]> {
-    const raw = asArray<LocalShellProfile>(this.context.globalState.get(LOCAL_SHELL_PROFILES_KEY, []));
+    const raw = asArray<LocalShellProfile>(this.readRaw(LOCAL_SHELL_PROFILES_KEY));
     return raw.filter((item) => {
       if (validateLocalShellProfile(item)) {
         return true;
@@ -139,21 +272,21 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveLocalShellProfiles(profiles: LocalShellProfile[]): Promise<void> {
-    await this.context.globalState.update(LOCAL_SHELL_PROFILES_KEY, profiles);
+    await this.guardedUpdate(LOCAL_SHELL_PROFILES_KEY, "local shell profiles", profiles);
   }
 
   public async getGroups(): Promise<string[]> {
-    return asArray<string>(this.context.globalState.get(GROUPS_KEY, [])).filter(
+    return asArray<string>(this.readRaw(GROUPS_KEY)).filter(
       (item): item is string => typeof item === "string"
     );
   }
 
   public async saveGroups(groups: string[]): Promise<void> {
-    await this.context.globalState.update(GROUPS_KEY, groups);
+    await this.guardedUpdate(GROUPS_KEY, "folders", groups);
   }
 
   public async getAuthProfiles(): Promise<AuthProfile[]> {
-    const raw = asArray<AuthProfile>(this.context.globalState.get(AUTH_PROFILES_KEY, []));
+    const raw = asArray<AuthProfile>(this.readRaw(AUTH_PROFILES_KEY));
     return raw.filter((item) => {
       if (validateAuthProfile(item)) {
         return true;
@@ -164,11 +297,11 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
-    await this.context.globalState.update(AUTH_PROFILES_KEY, profiles);
+    await this.guardedUpdate(AUTH_PROFILES_KEY, "auth profiles", profiles);
   }
 
   public async getInventorySources(): Promise<InventorySourceConfig[]> {
-    const raw = asArray<InventorySourceConfig>(this.context.globalState.get(INVENTORY_SOURCES_KEY, []));
+    const raw = asArray<InventorySourceConfig>(this.readRaw(INVENTORY_SOURCES_KEY));
     // FINDING 1 (removal-identity review) — a record persisted before the
     // `revision` field existed (a "legacy" record) is backfilled with one
     // here, at LOAD time, so every in-memory InventorySourceConfig this
@@ -190,7 +323,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveInventorySources(sources: InventorySourceConfig[]): Promise<void> {
-    await this.context.globalState.update(INVENTORY_SOURCES_KEY, sources);
+    await this.guardedUpdate(INVENTORY_SOURCES_KEY, "inventory sources", sources);
   }
 
   public async getDeviceTemplates(): Promise<DeviceTemplateProfile[]> {
@@ -198,7 +331,7 @@ export class VscodeConfigRepository implements ConfigRepository {
     // a template persisted before the `revision` field existed is given one
     // here, so every in-memory record this process hands out has one. Does not
     // rewrite disk (the next saveDeviceTemplates does, incidentally).
-    const raw = asArray<DeviceTemplateProfile>(this.context.globalState.get(DEVICE_TEMPLATES_KEY, []));
+    const raw = asArray<DeviceTemplateProfile>(this.readRaw(DEVICE_TEMPLATES_KEY));
     return raw
       .filter((item) => {
         if (validateDeviceTemplate(item)) {
@@ -211,7 +344,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveDeviceTemplates(templates: DeviceTemplateProfile[]): Promise<void> {
-    await this.context.globalState.update(DEVICE_TEMPLATES_KEY, templates);
+    await this.guardedUpdate(DEVICE_TEMPLATES_KEY, "device templates", templates);
   }
 
   public async getSavedFilters(): Promise<SavedFilterDefinition[]> {
@@ -219,7 +352,7 @@ export class VscodeConfigRepository implements ConfigRepository {
     // other store: a whole entry is skipped if its shape guard fails, never a
     // partial one. No `revision` machinery (a saved filter is a copy-from template
     // with no in-flight-sync semantics), so no load-time backfill.
-    const raw = asArray<SavedFilterDefinition>(this.context.globalState.get(SAVED_FILTERS_KEY, []));
+    const raw = asArray<SavedFilterDefinition>(this.readRaw(SAVED_FILTERS_KEY));
     return raw.filter((item) => {
       if (validateSavedFilter(item)) {
         return true;
@@ -230,6 +363,6 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async saveSavedFilters(filters: SavedFilterDefinition[]): Promise<void> {
-    await this.context.globalState.update(SAVED_FILTERS_KEY, filters);
+    await this.guardedUpdate(SAVED_FILTERS_KEY, "saved filters", filters);
   }
 }
