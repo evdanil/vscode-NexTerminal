@@ -34,7 +34,8 @@ import {
   Opcode,
   ErrorCode,
   DEFAULT_BLOCK_SIZE,
-  DEFAULT_WINDOW_SIZE
+  DEFAULT_WINDOW_SIZE,
+  MAX_IN_FLIGHT_BYTES
 } from "../../../src/services/networkServers/tftp/engine/types";
 
 describe("TFTP Protocol (protocol.ts)", () => {
@@ -217,6 +218,32 @@ describe("TFTP Protocol (protocol.ts)", () => {
 
     it("negative tsize → ProtocolError", () => {
       expect(() => validateOptions({ tsize: "-1" })).toThrow(ProtocolError);
+    });
+
+    // The two options are each bounded by their own RFC, but the PRODUCT is
+    // what `TransferSession.produceNextSendPackets` allocates in one go. At the
+    // RFC maxima that is 65464 * 65535 ≈ 4.3 GB per session, negotiated by a
+    // single unauthenticated datagram — so the bound has to be on the product.
+    describe("in-flight byte budget (blksize * windowsize)", () => {
+      it("clamps windowsize so the window never exceeds MAX_IN_FLIGHT_BYTES", () => {
+        const v = validateOptions({ blksize: "65464", windowsize: "65535" });
+        expect(v.blksize, "blksize is the client's MTU choice and must survive intact").toBe(65464);
+        expect(v.windowsize).toBe(Math.floor(MAX_IN_FLIGHT_BYTES / 65464));
+        expect(v.blksize * v.windowsize).toBeLessThanOrEqual(MAX_IN_FLIGHT_BYTES);
+      });
+
+      it("clamps at any blksize, not just the maximum", () => {
+        const v = validateOptions({ blksize: "8192", windowsize: "4096" });
+        expect(v.windowsize).toBe(MAX_IN_FLIGHT_BYTES / 8192);
+        expect(v.blksize * v.windowsize).toBeLessThanOrEqual(MAX_IN_FLIGHT_BYTES);
+      });
+
+      it("leaves a window that already fits the budget untouched", () => {
+        // 1468 * 64 ≈ 94 KB — a realistic PXE/ZTP negotiation. The clamp must
+        // not slow down transfers it has no reason to touch.
+        const v = validateOptions({ blksize: "1468", windowsize: "64" });
+        expect(v.windowsize).toBe(64);
+      });
     });
 
     it("validatedToRaw omits defaults (blksize=512 not included, windowsize=1 also not)", () => {
