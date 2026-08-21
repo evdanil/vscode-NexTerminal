@@ -58,8 +58,13 @@ describe("TFTP PathGuard (PathGuard.ts) — Pure+fs", () => {
       expect(() => new PathGuard(f)).toThrow();
     });
 
-    it("valid root: this.root === path.resolve(...)", () => {
-      expect(guard.root).toBe(path.resolve(root));
+    // realpath, not resolve: the constructor dereferences the root so that
+    // `assertRealPathContained` can compare like with like. Asserting
+    // `path.resolve` passes on Linux only because /tmp happens not to be a
+    // symlink there; on macOS os.tmpdir() sits under /var → /private/var and
+    // the two differ, so the assertion failed for the wrong reason.
+    it("valid root: this.root === fs.realpathSync(...)", () => {
+      expect(guard.root).toBe(fs.realpathSync(root));
     });
   });
 
@@ -257,5 +262,84 @@ describe("TFTP PathGuard (PathGuard.ts) — Pure+fs", () => {
         }
       }
     );
+
+    it.skipIf(process.platform === "win32")(
+      "SECURITY: a DEEP path through a symlinked ancestor creates nothing outside root",
+      async () => {
+        // The shallow case above cannot distinguish the two implementations:
+        // "linkedDir" already exists, so `mkdir(parent, {recursive:true})` has
+        // nothing to create and the post-mkdir check rejects either way. The
+        // ordering only becomes observable when the path names directories
+        // that do NOT exist yet — then a mkdir performed before the
+        // containment check walks straight through the symlink and
+        // manufactures real directories on the far side of the sandbox. That
+        // is a filesystem-modifying primitive reachable from an unauthenticated
+        // WRQ, whether or not the write that follows is blocked.
+        const outsideDir = fs.mkdtempSync(path.join(path.dirname(root), "nexus-pg-outside-"));
+        try {
+          fs.symlinkSync(outsideDir, path.join(root, "linkedDir"), "dir");
+          await expect(
+            guard.ensureWritableNew("linkedDir/a/b/c/upload.bin")
+          ).rejects.toThrow(PathViolationError);
+          expect(
+            fs.existsSync(path.join(outsideDir, "a")),
+            "recursive mkdir must not run before the escape is detected"
+          ).toBe(false);
+          expect(fs.readdirSync(outsideDir), "nothing at all may be created outside root").toEqual([]);
+        } finally {
+          fs.rmSync(outsideDir, { recursive: true, force: true });
+        }
+      }
+    );
+  });
+
+  describe("a root that itself sits behind a symlink", () => {
+    // The mirror image of the tests above, and the reason the constructor
+    // realpaths its root: a legitimate file under such a root must still be
+    // served. Comparing an already-dereferenced descendant against a root that
+    // was only lexically resolved makes every file under it look like an
+    // escape — which is exactly what happens on macOS, where os.tmpdir() lives
+    // under /var → /private/var.
+    let realDir: string;
+    let linkedRoot: string;
+
+    beforeEach(() => {
+      realDir = mkdtemp("nexus-pg-real-");
+      linkedRoot = path.join(path.dirname(realDir), path.basename(realDir) + "-link");
+      fs.symlinkSync(realDir, linkedRoot, "dir");
+    });
+
+    afterEach(() => {
+      try {
+        fs.unlinkSync(linkedRoot);
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.rmSync(realDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    it.skipIf(process.platform === "win32")("serves a file that lives under it", async () => {
+      fs.writeFileSync(path.join(realDir, "firmware.bin"), randomPayload(2048));
+      const linkedGuard = new PathGuard(linkedRoot);
+      const res = await linkedGuard.statFile("firmware.bin");
+      expect(res.size).toBe(2048);
+      expect(res.absPath).toBe(path.join(linkedGuard.root, "firmware.bin"));
+    });
+
+    it.skipIf(process.platform === "win32")("accepts a deep upload under it", async () => {
+      const linkedGuard = new PathGuard(linkedRoot);
+      const abs = await linkedGuard.ensureWritableNew("a/b/upload.bin");
+      expect(abs).toBe(path.join(linkedGuard.root, "a", "b", "upload.bin"));
+      expect(fs.existsSync(path.join(realDir, "a", "b"))).toBe(true);
+    });
+
+    it.skipIf(process.platform === "win32")("still blocks traversal out of it", async () => {
+      const linkedGuard = new PathGuard(linkedRoot);
+      expect(() => linkedGuard.resolve("../escape.bin")).toThrow(PathViolationError);
+    });
   });
 });
