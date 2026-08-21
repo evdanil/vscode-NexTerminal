@@ -102,6 +102,27 @@ export class VscodeConfigRepository implements ConfigRepository {
    */
   private readonly lastSeenValue = new Map<string, unknown>();
 
+  /**
+   * The CONTENT of each baseline, frozen as a string at the moment it was
+   * taken. Required because `lastSeenValue` holds a live reference and the
+   * objects behind it are NOT ours alone: `getServers` and friends hand the
+   * raw stored rows straight to `NexusCore`, and the core mutates them IN
+   * PLACE — `_renameFolderPath` and `removeFolderCascade` both rewrite
+   * `server.group` on the object already in `this.servers` (see the FINDING 2
+   * comment at nexusCore.ts:1223). A baseline that can be edited from under us
+   * is not a record of what this window last saw, so comparing content against
+   * it reported a folder rename as somebody else's overwrite. Costs one
+   * serialization per read and per save; the comparison path below still costs
+   * nothing when the reference is unchanged.
+   */
+  private readonly lastSeenJson = new Map<string, string | undefined>();
+
+  /** Record both halves of a baseline together — they must never drift. */
+  private rememberBaseline(key: string, value: unknown): void {
+    this.lastSeenValue.set(key, value);
+    this.lastSeenJson.set(key, JSON.stringify(value));
+  }
+
   public constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly options: VscodeConfigRepositoryOptions = {}
@@ -110,7 +131,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   /** Read the raw stored value and record it as this window's baseline. */
   private readRaw<T>(key: string): T {
     const raw = this.context.globalState.get<T>(key);
-    this.lastSeenValue.set(key, raw);
+    this.rememberBaseline(key, raw);
     return raw === undefined ? ([] as T) : raw;
   }
 
@@ -120,12 +141,19 @@ export class VscodeConfigRepository implements ConfigRepository {
    * must never make a save fail or change what gets written — detection
    * errors are swallowed and the update below runs unconditionally.
    *
-   * Detection is two-stage so the steady state costs nothing (E3):
-   *   1. reference check — `get` returns the exact object our own update()
-   *      stored, so a changed reference means a write we did not make. O(1),
-   *      no serialization, and no false negatives are on offer at this layer
-   *      anyway (a foreign write that has not propagated is invisible to ANY
-   *      comparison, JSON included).
+   * Detection is two-stage. NOTE the premise of stage 1 changed in 2.8.201:
+   * it used to read "a changed reference means a write we did not make", and
+   * that was false — `Memento.update` rewrites the whole blob and a dozen
+   * writers outside this class disturb it, so a reference can move with the
+   * content untouched. The reference check survives as a cheap NEGATIVE
+   * ("unchanged reference means nothing to check"), never as evidence of a
+   * foreign write:
+   *   1. reference check — an unchanged reference still proves nothing moved,
+   *      so the comparison below is skipped entirely. O(1). A CHANGED
+   *      reference now proves only that something replaced the object, which
+   *      is not the same question. No false negatives are on offer at this
+   *      layer anyway (a foreign write that has not propagated is invisible to
+   *      ANY comparison, JSON included).
    *   2. content confirmation — only on a changed reference (rare: a foreign
    *      write actually propagated), serialize both sides once and warn only
    *      if the stored content differs from what this save is writing. Two
@@ -149,7 +177,6 @@ export class VscodeConfigRepository implements ConfigRepository {
     try {
       if (this.lastSeenValue.has(key)) {
         const stored = this.context.globalState.get(key);
-        const baseline = this.lastSeenValue.get(key);
         // A CHANGED REFERENCE IS NOT EVIDENCE OF A FOREIGN EDIT. It was
         // treated as such until 2.8.201, and it is not: `Memento.update`
         // writes the extension's WHOLE key/value blob, and this extension
@@ -162,15 +189,15 @@ export class VscodeConfigRepository implements ConfigRepository {
         // only as the cheap first gate it always was, and what it gates is
         // now a CONTENT question: did the stored value actually diverge from
         // the one this window last saw?
-        if (stored !== baseline) {
+        if (stored !== this.lastSeenValue.get(key)) {
           const storedJson = JSON.stringify(stored);
           // Two content tests, both required. The first is the finding: a
           // reference that moved while the content stood still is nobody's
           // edit. The second preserves the pre-existing rule that two windows
           // converging on the same value lose nothing and stay silent.
-          if (storedJson !== JSON.stringify(baseline) && storedJson !== JSON.stringify(value)) {
+          if (storedJson !== this.lastSeenJson.get(key) && storedJson !== JSON.stringify(value)) {
             console.warn(
-              `[Nexus] The ${collection} list changed in storage since this window last loaded it; this window's save is overwriting that change.`
+              `[Nexus] The ${collection} list changed in storage since this window last read or wrote it; this window's save is overwriting that change.`
             );
             this.options.onConcurrentOverwrite?.(collection);
           }
@@ -180,7 +207,7 @@ export class VscodeConfigRepository implements ConfigRepository {
       console.warn("[Nexus] Concurrent-write detection failed; saving anyway:", error);
     }
     const pending = this.context.globalState.update(key, value);
-    this.lastSeenValue.set(key, value);
+    this.rememberBaseline(key, value);
     await pending;
   }
 

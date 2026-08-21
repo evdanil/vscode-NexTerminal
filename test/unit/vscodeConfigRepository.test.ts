@@ -591,6 +591,29 @@ describe("VscodeConfigRepository cross-window overwrite detection", () => {
     }
   });
 
+  it("an IN-PLACE mutation of the rows this repository handed to the core is not a foreign edit (kills a baseline that stores a live reference: getServers returns the raw stored rows, and NexusCore._renameFolderPath rewrites server.group ON those objects, so a mutable baseline drifts to match the pending value and reports a folder rename as somebody else's overwrite)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const state: Record<string, unknown> = { "nexus.servers": [{ ...validServer, group: "Lab" }] };
+      const onConcurrentOverwrite = vi.fn();
+      const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+
+      const servers = await repo.getServers(); // the core is handed the RAW rows
+
+      // An unrelated whole-blob write leaves an equal clone behind this key.
+      state["nexus.servers"] = JSON.parse(JSON.stringify(state["nexus.servers"]));
+
+      // The core renames a folder — mutating the very object it was handed.
+      servers[0].group = "Lab renamed";
+
+      await repo.saveServers(servers);
+
+      expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("a foreign edit is still caught when the reference AND the content both moved (kills over-correcting the above into a detector that never fires)", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -746,7 +769,17 @@ describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () =
     }
   });
 
-  it("E3: steady-state saves perform NO JSON serialization of the collections (kills stringify-both-sides-per-save, whose two O(n) passes stall multi-thousand-row imports on the extension-host thread)", async () => {
+  it("E3 (revised in 2.8.201): a steady-state save serializes the saved collection EXACTLY ONCE and never both sides (kills stringify-both-sides-per-save, the two O(n) passes this test was written against; the single remaining pass is the immutable baseline snapshot, which correctness now requires — see the note below)", async () => {
+    // WHY THIS TEST CHANGED. It originally asserted ZERO serialization, which
+    // was affordable only while the reference check was believed to prove a
+    // foreign write. It does not (2.8.201): the baseline must be a frozen
+    // record of CONTENT, because the objects behind it are handed to NexusCore
+    // and mutated in place there. One O(n) pass per save is the price of that,
+    // and it is strictly smaller than what the save already costs — the
+    // `globalState.update` on the next line marshals the extension's ENTIRE
+    // key/value blob across the extension-host RPC boundary regardless.
+    // Weakening this to "no assertion" would have been the wrong repair: the
+    // thing worth pinning is that the second pass never comes back.
     const bigList = Array.from({ length: 2000 }, (_, i) => `Folder ${i}`);
     const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
     await repo.getGroups();
@@ -755,7 +788,8 @@ describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () =
     try {
       await repo.saveGroups(bigList);
       await repo.saveGroups([...bigList, "one more"]);
-      expect(stringifySpy).not.toHaveBeenCalled();
+      // Two saves, two passes — one each. Four would mean both-sides-per-save.
+      expect(stringifySpy).toHaveBeenCalledTimes(2);
     } finally {
       stringifySpy.mockRestore();
     }
