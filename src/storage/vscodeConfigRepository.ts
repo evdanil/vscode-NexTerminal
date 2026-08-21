@@ -149,11 +149,31 @@ export class VscodeConfigRepository implements ConfigRepository {
     try {
       if (this.lastSeenValue.has(key)) {
         const stored = this.context.globalState.get(key);
-        if (stored !== this.lastSeenValue.get(key) && JSON.stringify(stored) !== JSON.stringify(value)) {
-          console.warn(
-            `[Nexus] The ${collection} list was changed by another VS Code window since this window last loaded it; this window's save is overwriting that change.`
-          );
-          this.options.onConcurrentOverwrite?.(collection);
+        const baseline = this.lastSeenValue.get(key);
+        // A CHANGED REFERENCE IS NOT EVIDENCE OF A FOREIGN EDIT. It was
+        // treated as such until 2.8.201, and it is not: `Memento.update`
+        // writes the extension's WHOLE key/value blob, and this extension
+        // writes that blob from a dozen places outside this class (tree
+        // collapse state, the settings guard's shadows and event log, colour
+        // schemes, one-shot hint flags). Any of them can leave the object
+        // behind THIS key a different instance carrying identical content,
+        // and a user with a single window open would then be told another
+        // window had overwritten their work. So the reference check is kept
+        // only as the cheap first gate it always was, and what it gates is
+        // now a CONTENT question: did the stored value actually diverge from
+        // the one this window last saw?
+        if (stored !== baseline) {
+          const storedJson = JSON.stringify(stored);
+          // Two content tests, both required. The first is the finding: a
+          // reference that moved while the content stood still is nobody's
+          // edit. The second preserves the pre-existing rule that two windows
+          // converging on the same value lose nothing and stay silent.
+          if (storedJson !== JSON.stringify(baseline) && storedJson !== JSON.stringify(value)) {
+            console.warn(
+              `[Nexus] The ${collection} list changed in storage since this window last loaded it; this window's save is overwriting that change.`
+            );
+            this.options.onConcurrentOverwrite?.(collection);
+          }
         }
       }
     } catch (error) {

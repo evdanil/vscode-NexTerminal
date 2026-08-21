@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.201] — 2026-08-21
+
+### Fixed
+
+- **The cross-window overwrite warning no longer appears when nothing was overwritten.** Reported from the field: a re-sync of a single EVE-NG source, with no other VS Code window open anywhere, produced the warning saying another window's change had been overwritten. Nothing had been. The check asked the wrong question — it compared what was in storage against *what the save was about to write*, so once the stored object had been replaced by any unrelated write it fired on every genuine edit, which is exactly what a sync is. It now compares against **what this window last saw**, which is the question that actually distinguishes somebody else's edit from your own. Two windows saving the same value still stay silent, and a real overwrite is still reported.
+
+  The underlying reason is worth stating, because it means the old check could never have been reliable: it assumed that if the stored object is not the one this window last handled, another window must have written it. Nexus stores its configuration in a single shared blob that is rewritten in full on every save, and a dozen places in the extension write that blob for unrelated reasons — remembering which tree folders you collapsed, colour schemes, dismissed hints. Any of those can leave the configuration object looking unfamiliar while its content is untouched.
+
+- **The warning no longer names a cause it cannot know.** It said another VS Code window had made the change. The check has no way to tell *who* wrote what it found — only that storage no longer matches what this window loaded. It now says that instead, and suggests the other-window explanation rather than asserting it.
+
 ## [2.8.200] — 2026-08-20
 
 ### Changed

@@ -342,7 +342,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // the other window's edit.
     onConcurrentOverwrite: (collection) => {
       void vscode.window.showWarningMessage(
-        `Nexus: the ${collection} were also changed in another VS Code window; that window's change has been overwritten by this one. If you edited ${collection} elsewhere, redo the edit — and prefer making Nexus configuration changes in one window at a time.`
+        `Nexus: the ${collection} changed in storage since this window loaded them, and this window's save has just overwritten that change. If you edited ${collection} in another window, redo the edit there. Making Nexus configuration changes in one window at a time avoids this.`
       );
     }
   });

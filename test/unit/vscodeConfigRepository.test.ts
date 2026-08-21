@@ -568,6 +568,48 @@ describe("VscodeConfigRepository cross-window overwrite detection", () => {
     expect(state["nexus.inventorySources"]).toEqual([]);
   });
 
+  it("a baseline whose REFERENCE moved while its CONTENT stood still does not warn, even when this window is making a real edit (kills the pre-2.8.201 predicate, which compared the stored value against the PENDING one and so fired on every genuine change once any unrelated write had replaced the cached object — reported in the field by a user with a single window open)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const state: Record<string, unknown> = { "nexus.inventorySources": [validSource] };
+      const onConcurrentOverwrite = vi.fn();
+      const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+
+      await repo.getInventorySources(); // activation seeds the baseline
+
+      // Nobody edited anything. The object behind this key is simply a
+      // different instance carrying identical content — what a whole-blob
+      // Memento write from anywhere else in the extension leaves behind.
+      state["nexus.inventorySources"] = [{ ...validSource }];
+
+      // ...and now the user does something that really does change content.
+      await repo.saveInventorySources([{ ...validSource, name: "Re-synced" }] as never);
+
+      expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a foreign edit is still caught when the reference AND the content both moved (kills over-correcting the above into a detector that never fires)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const state: Record<string, unknown> = { "nexus.inventorySources": [validSource] };
+      const onConcurrentOverwrite = vi.fn();
+      const repo = new VscodeConfigRepository(makeContext(state), { onConcurrentOverwrite });
+
+      await repo.getInventorySources();
+      state["nexus.inventorySources"] = [{ ...validSource, name: "Edited elsewhere" }];
+
+      await repo.saveInventorySources([{ ...validSource, name: "Edited here" }] as never);
+
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+      expect(onConcurrentOverwrite).toHaveBeenCalledWith("inventory sources");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("a save with no baseline (key never read or written by this window) does not warn (kills a detector that compares against undefined and cries foul on first contact)", async () => {
     const state: Record<string, unknown> = { "nexus.groups": ["Pre-existing"] };
     const onConcurrentOverwrite = vi.fn();
