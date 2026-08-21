@@ -44,19 +44,23 @@ path where the correct and broken implementations behave identically.
 
 ## 2. Open work
 
-### PR #100 — 2.8.201, the overwrite-warning fix (`claude/highlighting-rules-settings-qhepdg` @ `07fd600`)
+### PR #100 — 2.8.201, the overwrite-warning fix (`claude/highlighting-rules-settings-qhepdg`)
 
-**Status: awaiting Codex round five. Verified 6256/6256, build clean. Intended to release once clean.**
+**Status: round-five findings, the post-round Memento-fidelity issue, and the final fail-open
+finding are addressed. The focused storage suite is clean at 72/72, the final build is clean, and
+the unrestricted full suite is clean at 6260/6260 across 207 files. A clean review of the exact
+pushed head is required before publication; no publication had occurred as of this handover.**
 
 A user hit a false "another VS Code window overwrote your change" warning on an ordinary
-EVE-NG re-sync **with no other window open**. Four Codex rounds so far, all real:
+EVE-NG re-sync **with no other window open**. Five review rounds found substantive issues:
 
 1. The predicate compared stored content against the *pending* value — true of every genuine
    edit — so the whole detector rested on a reference check.
-2. That reference check's premise was false. `Memento.update` rewrites the extension's whole
-   key/value blob, and ~9 writers outside `VscodeConfigRepository` disturb it
-   (`extension.ts:848`,`:1010` tree collapse state; `settingsGuardController.ts:248,283,649,705`;
-   `vscodeColorSchemeStorage.ts:17`; `extension.ts:255`,`:395`).
+2. The direct VS Code 1.105 boundary was missed: `ExtensionMemento.update` synchronously
+   JSON-clones every object/array update into its cache before returning its persistence promise.
+   A caller-owned object therefore cannot be the post-update reference baseline; using it opens
+   the reference gate on the next ordinary same-window save. Whole-state cache replacements from
+   unrelated writers remain secondary examples of why a replacement does not identify a writer.
 3. The baseline was a **live reference the core mutates in place** — `getServers` hands
    `NexusCore` the raw stored rows and `_renameFolderPath`/`removeFolderCascade` rewrite
    `server.group` on them (`nexusCore.ts:1223` documents this). A folder rename produced a
@@ -66,116 +70,85 @@ EVE-NG re-sync **with no other window open**. Four Codex rounds so far, all real
 5. The class-level contract and `lastSeenValue` doc still asserted the disproved premise; the
    CHANGELOG still said "loaded" where the code says "read or saved".
 
+**Separate post-round boundary audit:** the test Memento had stored caller values by reference
+rather than modelling VS Code's synchronous clone. It now clones first, and the repository
+re-reads the actual cache object immediately after `update()` as the reference baseline. This was
+the sixth numbered finding in the working notes, not a sixth review round.
+
 **Current predicate** — three conditions, all required:
 ```
-stored !== baseline                        // cheap gate; NOT evidence of a foreign write
-&& JSON(stored) !== JSON(baseline)         // did content actually diverge?
-&& JSON(stored) !== JSON(value)            // convergence stays silent (pre-existing rule, test E1)
+stored !== baselineRef                      // cheap gate; NOT evidence of a foreign write
+&& storedJson !== baselineJson              // did content actually diverge?
+&& storedJson !== valueJson                 // convergence stays silent (pre-existing rule, test E1)
 ```
 
+`baselineRef` is re-read from the Memento cache immediately after the prior `update()` call and
+before its persistence promise is awaited; it is never the caller-owned update value.
+`baselineJson` is the immutable content snapshot, while `valueJson` is the already-computed JSON
+for the pending save. If that post-update cache read throws, the detector clears both baseline
+entries and logs the fail-open failure, then still awaits the already-returned persistence promise;
+the cache-read error cannot replace a persistence rejection.
+
 **E3 was changed deliberately** — it asserted *zero* serialization on the steady-state save
-path, which was affordable only while the reference check was believed sound. It now pins
-**exactly one** pass per save and never both sides; E3b/E3c cover the replaced-reference and
-warning paths. The maintainer approved this trade explicitly. Do not quietly revert it.
+path, which was affordable only while the reference check was believed sound. It now pins one
+**repository-added** pass over the pending value on every steady-state save. E3b/E3c pin two
+repository-added passes after the cache object was replaced: that pending-value pass plus one over
+the stored value. These counts exclude VS Code's own JSON clone and its storage marshalling. The
+maintainer approved this trade explicitly. Do not quietly revert it.
 
-**Open questions put to Codex, unanswered:** are there *other* in-place mutators of
-handed-out rows? Is the serialization budget right when re-derived from the code rather than
-from my tests? Is the PR description stale after four rounds?
+**Audit answers:** six actual in-place assignments span server, serial, and local-shell group
+mutations. The serialization budget is one repository-added pending-value pass in steady state and
+two after reference replacement. Task 2's gated PR and issue drafts are prepared locally but remain
+unpublished.
+The genuine residual caveat remains that a change not yet propagated into this host's Memento
+cache is undetectable at this layer.
 
-### PR #99 / branch `claude/network-servers` @ `a9247f3` — Embedded TFTP + DHCP
+### PR #99 / branch `network-servers-only` @ `2c0b2ed` — Embedded TFTP + DHCP
 
 External contribution from **Brandon Mejia (@kanekitakitos)** — the project's first. He has
 confirmed Apache-2.0 inbound licensing and CONTRIBUTING compliance (on #92, carried over).
 
-We took over the remaining fixes with his knowledge (told on #99 before the work started).
-**We branched from his head, so his four commits and authorship are intact** — verify with
-`git merge-base --is-ancestor 500e525 origin/claude/network-servers`. It merges as his feature.
+The live PR head is contributor branch `network-servers-only` at `2c0b2ed`, rebased directly
+onto `main` `842057f` and currently reported clean/mergeable. Its twelve patches are
+stable-patch-ID-identical to the former `claude/network-servers` history through `a9247f3`;
+authorship was preserved. Retain `a9247f3` only as the pre-rebase verification source.
 
-**Eight fixes pushed on top of his commits**, one per finding:
+**Verification status:** `6577 passed / 2 skipped` is the independently reproduced pre-rebase
+result. `6538 passed / 29 failed / 13 skipped` is contributor-reported for the current head. The
+6,580 total reconciles, but no CI/check run verifies that result or the attribution of the
+failures.
 
-| Commit | Fix |
-|---|---|
-| `95083d5` | P1 — bound the negotiated window's in-flight bytes |
-| `52f27e5` | P1 — 16-bit block-number sequence comparison |
-| `75a464f` | P1 — reserve transfer slot synchronously, release on every path |
-| `6875ccc` | P1 — a start that cannot bind must reject, not report success |
-| `d876f47` | P2 — validate the served root at startup |
-| `e510c82` | P2 — refuse `netascii` rather than serving raw bytes |
-| `f53fefa` | P2 — kill the daemon child that never reported ready |
-| `a9247f3` | make the PathGuard symlink guards actually bite |
+Eight follow-up fixes on the pre-rebase exact head covered the in-flight byte bound, 16-bit block
+sequencing, synchronous transfer-slot reservation/release, start/bind rejection, served-root
+validation, refusal of unsupported `netascii`, daemon child teardown, and effective PathGuard
+symlink tests. Evidence remains weak or locally unprovable for throw-path slot release, the
+cast-driven burst test, signal-specific teardown, and the macOS realpath assertion on Linux.
+Current-head review must also inspect the additional post-wrap memory-bound fix and the deliberate
+existing-test change from `netascii` to `octet` for option round-trip coverage.
 
-**Verification — reproduced independently, not taken on trust.** The agent reported build
-clean and 6577 passed / 2 skipped (229 files); I re-ran it on a fresh checkout of the branch
-and got **the identical numbers**. The pre-existing `test/integration/scripts/*` flakes did not
-surface in either run, so there is nothing to dismiss. Every mutation the agent reports was run
-by editing source in place, running the suite, and restoring.
+**Local Servers:** the six files and 2,063 lines remain intact on fork `main` and
+`feature/local-servers` at `6114ded`; no separate PR existed at audit time.
 
-**One trap when verifying:** the first build I ran **failed** with
-`Could not resolve "dhcp"` at `DhcpEngine.ts:46`. That is *not* a code defect — it is the new
-runtime dependency missing from a stale `node_modules`. Run `npm install` first.
-
-**Caveats the agent disclosed — treat these as open, not closed:**
-- The `finally` that releases a reserved slot on a **throw** out of `admitNewRequest` has
-  **no test**. Every failure path currently `return`s, so a deterministic throw could not be
-  constructed without contorting the fixture. Its first attempt at this mutation *passed both
-  ways* and it replaced it — but this specific path is unguarded.
-- The `maxTransfers` burst test drives `handleMessage` through an `as unknown as` cast, because
-  a real socket cannot deliver a deterministic burst. The property under test is exactly "every
-  request runs its synchronous prefix before any resumes".
-- Removing **only** the SIGTERM from daemon teardown still passes — the SIGKILL escalation kills
-  the child inside the test window. The tests assert "the process dies", not by which signal.
-- `pathGuard.test.ts:61` (the macOS `realpathSync` assertion) **cannot be mutation-demonstrated
-  on Linux** — both forms pass. It is a portability fix with no local proof.
-
-**Two things the agent changed beyond the brief, both flagged by it rather than slipped in:**
-- It found an *additional* bug in `produceNextSendPackets`: after a block-number wrap its window
-  bound stopped bounding, draining the rest of the file into memory in one call. Same root cause
-  as P1-3, fixed and tested.
-- It changed an existing test, `"WRQ netascii with options … round-trip"`, to round-trip `octet`,
-  since `netascii` is now refused. What that test covers (the option round-trip) is untouched.
-  This is a behaviour change, not a quiet weakening — but review it as one.
-
-**Design decisions worth knowing:**
-- `MAX_IN_FLIGHT_BYTES = 1 MiB`. `windowsize` is **clamped**, not rejected (RFC 2347 §2 /
-  RFC 7440 §3 permit the server to answer lower). `blksize` is untouched — that is the client's
-  MTU choice. The clamp lives in `validateOptions` because that is the only place option strings
-  become numbers, so it lands *before* the OACK is built; clamping later would answer with one
-  window and serve another.
-- Mod-65536 comparison costs one block of window width for one round after each wrap. Never a
-  stall, never an over-fill.
-
-**Why those P1s existed and we nearly missed them:** the first two reviews (mine, and a
-commissioned expert review) both aimed at `PathGuard`, because that is where the PR's history
-was. They verified those fixes by executing the attacks and found no escapes — and
-"no escapes found" then read as a conclusion about the feature when it was only a conclusion
-about one file. Codex looked at the transfer engine, adapter error paths and daemon lifecycle,
-which nobody had examined, and found four P1s including an unauthenticated remote DoS
-(`blksize` 65464 × `windowsize` 65535 ≈ 4.3 GB allocated before a byte is sent; nothing bounded
-the product). **Lesson: scope reviews by surface, not by history.**
+Keep current-head review and PR-description reconciliation open. Do not mutate issue #101 or
+PR #99 remotely from this work.
 
 ---
 
 ## 3. TODO, in order
 
-1. **#100:** read Codex round five, verify each finding against the code, fix, push, re-nudge.
-   Loop until clean. **Then ask the maintainer before merging.**
+1. **#100:** require current-head Codex review and loop until clean. **Then ask the maintainer
+   before merging or releasing.**
 2. **#100:** merge with the `[release]` marker → 2.8.201. Verify the pipeline's *individual*
    publish steps (Marketplace + Open VSX), not just the top-level green.
-3. **#99:** verify the eight fixes independently — do not trust the agent's report or mine.
-   Re-run the mutation checks, especially the four the agent flagged as weak or unprovable
-   (see its caveats above). **Its first attempt at one mutation passed both ways** and it
-   caught that itself; assume there may be another it did not catch.
-   **`npm install` before building** — see §4.
-4. **#99:** rebase `claude/network-servers` onto `main`. **`README.md` and `package.json` will
-   conflict — that is our mess**, caused by the 2.8.200 retitle landing after Brandon branched.
-   Resolve it ourselves; do not ask him to.
-5. **#99:** Codex loop until clean. This is an unauthenticated network daemon — do not
+3. **#99:** review the current `network-servers-only` head and reconcile the PR description.
+   The current-head contributor-reported test result is not independently verified; do not
+   dismiss or attribute its failures without evidence.
+4. **#99:** Codex loop until clean. This is an unauthenticated network daemon — do not
    short-circuit it.
-6. **#99:** write the feature's CHANGELOG entry (he correctly did not, per CONTRIBUTING) and
+5. **#99:** write the feature's CHANGELOG entry (he correctly did not, per CONTRIBUTING) and
    bump the version. Then ask before merging.
-7. **Ask Brandon about Local Servers** — ~2,063 lines, 12 commands, 5 settings keys, its own
-   globalState collection. He read "split out" as *remove*, not *raise separately*, so it is
-   in limbo and no PR exists. He may be sitting on finished work believing it was rejected.
+6. **Local Servers:** if its separate work is resumed, start from the intact six files on fork
+   `main` / `feature/local-servers` at `6114ded`; no separate PR existed at audit time.
 
 ### Deferred, recorded on #95 rather than lost
 
@@ -213,7 +186,7 @@ the product). **Lesson: scope reviews by surface, not by history.**
   a review was requested and then not waited for.
 - Expert reviews via `Agent` (Opus or Fable) in isolated worktrees for implementation and
   adversarial review; Codex is the gate.
-- **`npm install` first on `claude/network-servers`.** It adds a new runtime dependency (`dhcp`),
+- **`npm install` first on `network-servers-only`.** It adds a new runtime dependency (`dhcp`),
   and a worktree carrying stale `node_modules` fails the build with
   `Could not resolve "dhcp"` — which looks like a code defect and is not.
 - Verification is `npm run build` then `npm test`. The full suite is ~6250 tests / 207 files.
@@ -226,7 +199,7 @@ the product). **Lesson: scope reviews by surface, not by history.**
 
 Recorded because they recurred despite being known:
 
-1. **Fixing the instance, not the claim.** Four rounds on #100 and eight on #95 came from
+1. **Fixing the instance, not the claim.** Five rounds on #100 and eight on #95 came from
    repairing what the reviewer pointed at and leaving identical claims standing elsewhere.
    *Sweep for the claim across `src/`, `docs/`, `CLAUDE.md`, `CHANGELOG.md`.*
 2. **Describing async lifecycle from the happy path** rather than following what the settle
@@ -267,8 +240,8 @@ Placement notes for whoever maintains it:
 - It is under `docs/` rather than `docs/plans/` deliberately. A tracked file inside a gitignored
   directory is a trap — it survives `git clean` inconsistently and misleads anyone who assumes
   the directory is ignored.
-- The same content is mirrored at **issue #101**, which is where it was published first. If you
-  update one, update the other or delete the stale copy. Two sources of truth is worse than one
-  in the wrong place.
+- **Issue #101 is currently stale.** Task 2's synchronized draft is prepared locally but remains
+  unpublished; no remote update has occurred. Keep the two sources aligned when that authorized
+  update is made.
 - The filename is stable rather than date-stamped so successive handovers replace it instead of
   accumulating. The date at the top is the thing to trust.

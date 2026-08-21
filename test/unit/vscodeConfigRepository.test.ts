@@ -8,9 +8,16 @@ import type { ServerConfig } from "../../src/models/config";
 /**
  * A fake ExtensionContext whose globalState mirrors VS Code semantics: the
  * default is returned ONLY when the key is absent. A stored value of any shape
- * (including a corrupt non-array) is returned verbatim.
+ * (including a corrupt non-array) is returned verbatim. `update` models VS
+ * Code 1.105's ExtensionMemento boundary: object and array values are
+ * JSON-cloned into the cache synchronously before the returned persistence
+ * promise settles.
  */
 function makeContext(state: Record<string, unknown>) {
+  // Capture these before a performance test spies on JSON.stringify: the
+  // Memento's internal clone is outside the repository work E3 measures.
+  const jsonStringify = JSON.stringify;
+  const jsonParse = JSON.parse;
   return {
     globalState: {
       get(key: string, fallback: unknown) {
@@ -18,7 +25,34 @@ function makeContext(state: Record<string, unknown>) {
       },
       async update(key: string, value: unknown) {
         if (value === undefined) delete state[key];
-        else state[key] = value;
+        else state[key] = jsonParse(jsonStringify(value));
+      }
+    }
+  } as unknown as import("vscode").ExtensionContext;
+}
+
+function makePostUpdateGetFailureContext(
+  state: Record<string, unknown>,
+  cacheReadError: Error,
+  persistence: Promise<void>
+) {
+  let failNextGet = false;
+  let failuresRemaining = 1;
+  return {
+    globalState: {
+      get<T>(key: string, fallback?: T): T | undefined {
+        if (failNextGet) {
+          failNextGet = false;
+          failuresRemaining -= 1;
+          throw cacheReadError;
+        }
+        return key in state ? (state[key] as T) : fallback;
+      },
+      update(key: string, value: unknown): Promise<void> {
+        if (value === undefined) delete state[key];
+        else state[key] = JSON.parse(JSON.stringify(value));
+        failNextGet = failuresRemaining > 0;
+        return persistence;
       }
     }
   } as unknown as import("vscode").ExtensionContext;
@@ -682,18 +716,123 @@ describe("VscodeConfigRepository cross-window overwrite detection", () => {
       warnSpy.mockRestore();
     }
   });
+
+  it("a post-update cache read failure is fail-open and clears both stale baselines after the cache already accepted the pending value (kills baseline refresh outside the detector catch)", async () => {
+    const cacheReadError = new Error("cache unavailable after update");
+    const state: Record<string, unknown> = { "nexus.groups": ["Prod"] };
+    const onConcurrentOverwrite = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const repo = new VscodeConfigRepository(
+      makePostUpdateGetFailureContext(state, cacheReadError, Promise.resolve()),
+      { onConcurrentOverwrite }
+    );
+    try {
+      await repo.getGroups();
+
+      await expect(repo.saveGroups(["Saved"])).resolves.toBeUndefined();
+      expect(state["nexus.groups"]).toEqual(["Saved"]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[Nexus] Concurrent-write detection failed; saving anyway:",
+        cacheReadError
+      );
+      const baselines = repo as unknown as {
+        lastSeenValue: Map<string, unknown>;
+        lastSeenJson: Map<string, string | undefined>;
+      };
+      expect(baselines.lastSeenValue.has("nexus.groups")).toBe(false);
+      expect(baselines.lastSeenJson.has("nexus.groups")).toBe(false);
+
+      // If either old map entry survived, this later replacement would be
+      // compared with the stale pre-failure baseline and reported.
+      state["nexus.groups"] = ["From elsewhere"];
+      await repo.saveGroups(["Saved again"]);
+      expect(onConcurrentOverwrite).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a post-update cache read failure preserves and awaits a rejecting persistence verdict (kills adopting the cache-read error and abandoning the update promise)", async () => {
+    const cacheReadError = new Error("cache unavailable after update");
+    const persistenceError = new Error("disk unavailable");
+    const persistence = Promise.reject(persistenceError);
+    // Keep the deliberately leaked promise from becoming an unhandled test-run
+    // rejection against the broken implementation; the repository still gets
+    // the original rejecting promise and must await its verdict.
+    void persistence.catch(() => undefined);
+    const state: Record<string, unknown> = { "nexus.groups": ["Prod"] };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const repo = new VscodeConfigRepository(
+      makePostUpdateGetFailureContext(state, cacheReadError, persistence)
+    );
+    try {
+      await repo.getGroups();
+
+      await expect(repo.saveGroups(["Saved"])).rejects.toBe(persistenceError);
+      expect(state["nexus.groups"]).toEqual(["Saved"]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[Nexus] Concurrent-write detection failed; saving anyway:",
+        cacheReadError
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("the repository warning describes the baseline as the last value read or saved (kills the stale 'read or wrote' wording)", async () => {
+    const state: Record<string, unknown> = { "nexus.groups": ["Prod"] };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const repo = new VscodeConfigRepository(makeContext(state));
+    try {
+      await repo.getGroups();
+      state["nexus.groups"] = ["From elsewhere"];
+
+      await repo.saveGroups(["Saved"]);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[Nexus] The folders list changed in storage since this window last read or saved it; this window's save is overwriting that change."
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a persistence rejection still rejects the save after the synchronous cache baseline refresh (kills swallowing update failures while capturing the cloned cache object)", async () => {
+    const persistenceError = new Error("disk unavailable");
+    const state: Record<string, unknown> = { "nexus.groups": ["Prod"] };
+    const context = {
+      globalState: {
+        get<T>(key: string, fallback?: T): T | undefined {
+          return key in state ? (state[key] as T) : fallback;
+        },
+        update(key: string, value: unknown): Promise<void> {
+          if (value === undefined) delete state[key];
+          else state[key] = JSON.parse(JSON.stringify(value));
+          return Promise.reject(persistenceError);
+        }
+      }
+    } as unknown as import("vscode").ExtensionContext;
+    const repo = new VscodeConfigRepository(context);
+
+    await repo.getGroups();
+
+    await expect(repo.saveGroups(["Saved"])).rejects.toThrow(persistenceError);
+    expect(state["nexus.groups"]).toEqual(["Saved"]);
+  });
 });
 
 /**
  * REVIEW FIXES E1/E2/E3 (PR #93) — the guard itself must not cry wolf: a
  * warning that fires when nothing was lost trains the user to ignore the one
  * that matters. E1: two windows converging on the SAME value is not a loss.
- * E2: the Memento mutates its cache synchronously inside update(), before the
- * returned promise settles, so an overlapping same-collection save in ONE
- * window must never observe its own predecessor as a foreign write. E3: the
- * steady-state save path must not serialize whole collections (multi-thousand
- * -row imports run on the extension-host thread). Each test names the wrong
- * implementation it fails against.
+ * E2: the Memento synchronously JSON-clones an object/array into its cache
+ * inside update(), before the returned promise settles, so an overlapping
+ * same-collection save in ONE window must never observe its own predecessor as
+ * a foreign write. E3: the
+ * steady-state save path serializes the pending collection exactly once and
+ * must not also serialize the stored side when the cache object was not
+ * replaced (multi-thousand-row imports run on the extension-host thread).
+ * Each test names the wrong implementation it fails against.
  */
 describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () => {
   const KEY = "nexus.groups";
@@ -769,16 +908,20 @@ describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () =
     }
   });
 
-  it("E3 (revised in 2.8.201): a steady-state save serializes the saved collection EXACTLY ONCE and never both sides (kills stringify-both-sides-per-save, the two O(n) passes this test was written against; the single remaining pass is the immutable baseline snapshot, which correctness now requires)", async () => {
+  it("E3 (revised in 2.8.201): consecutive ordinary same-window saves each serialize only the pending collection once and never the stored side (kills a post-update baseline that retains the caller object instead of the synchronously cloned cache object)", async () => {
     // WHY THIS TEST CHANGED. It originally asserted ZERO serialization, which
     // was affordable only while the reference check was believed to prove a
     // foreign write. It does not (2.8.201): the baseline must be a frozen
     // record of CONTENT, because the objects behind it are handed to NexusCore
-    // and mutated in place there. One O(n) pass per save is the price, and it
+    // and mutated in place there. One O(n) pass over the pending value per save
+    // is the price; that same serialization becomes the immutable baseline. It
     // is strictly smaller than the `globalState.update` beside it, which
     // marshals the extension's ENTIRE blob across the extension-host RPC
     // boundary regardless. Weakening this to "no assertion" would have been the
-    // wrong repair: what is worth pinning is that the second pass never returns.
+    // wrong repair: what is worth pinning is that the stored-side pass is not
+    // added until the cache object is actually replaced. The test fake performs
+    // its own clone using the pre-spy JSON functions, so this count is solely
+    // repository serialization work.
     const bigList = Array.from({ length: 2000 }, (_, i) => `Folder ${i}`);
     const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
     await repo.getGroups();
