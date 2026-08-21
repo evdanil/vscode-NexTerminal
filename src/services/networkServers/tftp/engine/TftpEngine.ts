@@ -170,6 +170,21 @@ export class TftpEngine extends EventEmitter {
   /** Open handles for WRQ (indexed by transferId). */
   private writeHandles = new Map<string, fsPromises.FileHandle>();
   /**
+   * Filesystem sandbox for `opts.root`, built once in {@link start}.
+   *
+   * Built at startup rather than per request for two reasons. The visible one
+   * is that the {@link PathGuard} constructor is where a missing or
+   * non-directory root is detected: doing it per request meant a misconfigured
+   * root still bound the socket and reported "running", then threw outside the
+   * request's own try block so no TFTP ERROR was ever sent — every client just
+   * timed out, with nothing anywhere saying why. Failing in `start()` turns
+   * that into one honest bind failure the adapter and UI can report. The
+   * incidental one is that the constructor does synchronous `existsSync` +
+   * `statSync` + `realpathSync`, which has no business running on the datagram
+   * path of every request.
+   */
+  private guard: PathGuard | null = null;
+  /**
    * Sessions whose finalization is in flight.
    *
    * `cleanupDone` / `cleanupErroneous` are async and only remove the session
@@ -261,6 +276,10 @@ export class TftpEngine extends EventEmitter {
    * @throws Bind errors (EACCES, EADDRINUSE, etc.) as Promise rejection.
    */
   public async start(): Promise<void> {
+    // Before the socket, not after: a root that does not exist is a
+    // configuration failure the operator has to see, and a bound socket that
+    // can serve nothing is the worst possible way to tell them.
+    this.guard = new PathGuard(this.opts.root);
     this.socket = dgram.createSocket('udp4');
 
     const listeningPromise = new Promise<void>((resolve, reject) => {
@@ -345,6 +364,7 @@ export class TftpEngine extends EventEmitter {
       }
     }
     this.writeHandles.clear();
+    this.guard = null;
     if (this.socket) {
       const sock = this.socket;
       this.socket = null;
@@ -568,7 +588,14 @@ export class TftpEngine extends EventEmitter {
       return;
     }
 
-    const guard = new PathGuard(this.opts.root);
+    const guard = this.guard;
+    if (!guard) {
+      // Unreachable while the engine is running (`start` builds the guard
+      // before it binds), but a request arriving without one must still get an
+      // answer rather than a silent drop the client can only read as a timeout.
+      this.sendRaw(rinfo, encodeERROR(ErrorCode.NotDefined, 'TFTP root is not available'));
+      return;
+    }
     let absPath: string;
     let fileSize = 0;
 

@@ -86,6 +86,38 @@ describe("TFTP E2E — Critical Paths", () => {
     }
   });
 
+  // The sandbox is what validates the root, and it used to be built on the
+  // first request — outside that request's own try block. A misconfigured root
+  // therefore bound the socket, reported "running", answered nothing, and left
+  // every client to time out with no diagnosis anywhere.
+  describe("root validation happens at startup, not on the first datagram", () => {
+    it("a root that does not exist fails start() and binds no port", async () => {
+      const engine = new TftpEngine({
+        root: path.join(root, "no-such-directory"),
+        port: 0,
+        address: "127.0.0.1"
+      });
+      try {
+        await expect(engine.start()).rejects.toThrow(/root does not exist/i);
+        expect(engine.boundPort, "a service that can serve nothing must not hold a port").toBeNull();
+      } finally {
+        await engine.stop();
+      }
+    });
+
+    it("a root that is a file, not a directory, fails start() too", async () => {
+      const notADir = path.join(root, "root-is-a-file");
+      fs.writeFileSync(notADir, "x");
+      const engine = new TftpEngine({ root: notADir, port: 0, address: "127.0.0.1" });
+      try {
+        await expect(engine.start()).rejects.toThrow(/not a directory/i);
+        expect(engine.boundPort).toBeNull();
+      } finally {
+        await engine.stop();
+      }
+    });
+  });
+
   it("UnknownTransferID: stray ACK(1) without active transfer → ERROR code=5 RFC1350", async () => {
     await withEngine(root, false, {}, async (_engine, port) => {
       const c = await createUdpClient();
