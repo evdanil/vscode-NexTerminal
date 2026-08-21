@@ -132,23 +132,23 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("root items", () => {
-    it("returns 13 root items", () => {
+    it("returns 14 root items", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
-      expect(roots).toHaveLength(13);
+      expect(roots).toHaveLength(14);
     });
 
     // PER-SOURCE LAB STATUS POLL — the Inventory category is gone with the one
     // setting it held. Every remaining category still has settings behind it:
     // this tree renders a row per CATEGORY_ORDER entry regardless, so an
     // emptied category would open onto nothing.
-    it("has 9 category items first, with Security & Data after SSH and no empty Inventory row (\u2298 a category kept after its last setting is removed is a settings row that opens onto nothing)", () => {
+    it("has 10 category items first, with Security & Data after SSH and no empty Inventory row (\u2298 a category kept after its last setting is removed is a settings row that opens onto nothing)", () => {
       const provider = createProvider();
       const roots = provider.getChildren();
       const categories = roots.filter((r) => r instanceof SettingsCategoryItem);
-      expect(categories).toHaveLength(9);
+      expect(categories).toHaveLength(10);
       expect(categories.map((c) => (c as SettingsCategoryItem).categoryKey))
-        .toEqual(["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"]);
+        .toEqual(["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts", "localServers"]);
     });
 
     it("has 3 root link items for Macros, Auth Profiles and Device Templates — Inventory Sources is a GROUP now, not a link", () => {

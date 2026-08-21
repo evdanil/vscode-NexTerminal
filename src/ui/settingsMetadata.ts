@@ -3,7 +3,7 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "securityData" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts";
+  category: "logging" | "ssh" | "securityData" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts" | "localServers";
   description?: string;
   badge?: string;
   badgeClass?: string;
@@ -529,6 +529,73 @@ export const SETTINGS_META: SettingMeta[] = [
     description:
       "Automatically restore terminal.integrated.commandsToSkipShell when an external program strips it. Forensic logging stays active even when disabled.",
     default: true
+  },
+  // --- Local Servers ---
+  {
+    key: "defaultMaxAutoRestarts",
+    section: "nexus.localServers",
+    label: "Default Max Auto-Restarts",
+    type: "number",
+    category: "localServers",
+    subgroup: "Auto-Restart",
+    description:
+      "Maximum automatic restarts per local server when auto-restart is enabled and the profile sets no explicit limit of its own. 0 disables auto-restart globally. Restarts use exponential backoff and stop counting attempts once the server has run for the stable-runtime threshold.",
+    min: 0,
+    max: 100,
+    default: 5
+  },
+  {
+    key: "stableRuntimeMs",
+    section: "nexus.localServers",
+    label: "Stable Runtime Threshold",
+    type: "number",
+    category: "localServers",
+    subgroup: "Auto-Restart",
+    description:
+      "Continuous runtime after which a local server counts as stable and its auto-restart attempt counter resets. Must be long enough to distinguish a real crash from a graceful exit triggered just after startup.",
+    min: 1000,
+    max: 600000,
+    unit: "ms",
+    default: 10000
+  },
+  {
+    key: "initialBackoffMs",
+    section: "nexus.localServers",
+    label: "Initial Restart Backoff",
+    type: "number",
+    category: "localServers",
+    subgroup: "Auto-Restart",
+    description: "Delay before the first auto-restart. Each subsequent attempt doubles it, up to the maximum backoff.",
+    min: 50,
+    max: 60000,
+    unit: "ms",
+    default: 500
+  },
+  {
+    key: "maxBackoffMs",
+    section: "nexus.localServers",
+    label: "Max Restart Backoff",
+    type: "number",
+    category: "localServers",
+    subgroup: "Auto-Restart",
+    description: "Ceiling for the exponential backoff delay between auto-restart attempts.",
+    min: 100,
+    max: 600000,
+    unit: "ms",
+    default: 30000
+  },
+  {
+    key: "restrictToWorkspaceRoots",
+    section: "nexus.localServers",
+    label: "Restrict Working Directories to Workspace",
+    type: "boolean",
+    category: "localServers",
+    subgroup: "Security",
+    description:
+      "Refuse to start a local server whose working directory resolves outside the currently-open workspace roots. Disabling this allows any absolute path, including system directories — turn it off only if you trust every profile in storage.",
+    default: true,
+    badge: "Safety limit",
+    badgeClass: "setting-badge-safety"
   }
 ];
 
@@ -541,7 +608,7 @@ export const SETTINGS_META: SettingMeta[] = [
 // whether anything carries that category, so an emptied category is a row that
 // opens onto nothing.
 
-export const CATEGORY_ORDER = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"] as const;
+export const CATEGORY_ORDER = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts", "localServers"] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
@@ -552,7 +619,8 @@ export const CATEGORY_LABELS: Record<string, string> = {
   ui: "Interface",
   sftp: "SFTP / File Explorer",
   serial: "Serial",
-  scripts: "Scripts"
+  scripts: "Scripts",
+  localServers: "Local Servers"
 };
 
 export const CATEGORY_ICONS: Record<string, string> = {
@@ -564,7 +632,8 @@ export const CATEGORY_ICONS: Record<string, string> = {
   ui: "layout",
   sftp: "folder-opened",
   serial: "circuit-board",
-  scripts: "play"
+  scripts: "play",
+  localServers: "server-process"
 };
 
 export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
@@ -576,7 +645,8 @@ export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   ui: "Adjust how Nexus connection details are shown in the VS Code views.",
   sftp: "Configure remote file browsing, caching, watching, transfer timeouts, and delete safety limits.",
   serial: "Set serial command timeout behavior.",
-  scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs."
+  scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs.",
+  localServers: "Tune auto-restart limits, backoff timing, and working-directory safety for local server processes."
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {
