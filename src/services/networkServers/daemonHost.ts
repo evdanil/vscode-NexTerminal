@@ -324,26 +324,8 @@ export class NetworkServerDaemonHost {
     this.disposed = true;
     this.readyFlag = false;
 
-    if (this.killTimer) {
-      clearTimeout(this.killTimer);
-      this.killTimer = undefined;
-    }
-    this.closeReadlineInterfaces();
-
     const child = this.child;
-    this.child = undefined;
-    if (child) {
-      child.removeAllListeners();
-      try { child.stdin?.end(); } catch { /* pipe already gone */ }
-      try { child.kill("SIGTERM"); } catch { /* already dead */ }
-      if (child.exitCode === null && child.signalCode === null) {
-        const timer = setTimeout(() => {
-          try { child.kill("SIGKILL"); } catch { /* already dead */ }
-        }, 2000);
-        timer.unref();
-        this.killTimer = timer;
-      }
-    }
+    if (child) this.terminateChild(child);
 
     this.rejectAllPending(new Error("Network servers daemon host disposed"));
     this.rejectAllReadyWaiters(new Error("Network servers daemon host disposed"));
@@ -357,6 +339,44 @@ export class NetworkServerDaemonHost {
   // ---------------------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------------------
+
+  /**
+   * Detaches a child from the bridge and kills it: SIGTERM, escalating to
+   * SIGKILL after 2s if it is still alive.
+   *
+   * Shared by {@link dispose} and by the ready-timeout path in {@link launch},
+   * which needs exactly the same teardown — a child that never reported ready
+   * is still a live process holding open pipes, and abandoning it means a
+   * retry silently accumulates daemons that no `dispose()` can ever reach.
+   *
+   * The host-level state (readline interfaces, `child`, `readyFlag`) is only
+   * cleared when `child` really is the current one. Detaching a child that has
+   * already been replaced must not close the live one's pipes.
+   */
+  private terminateChild(child: ChildProcess): void {
+    if (this.child === child) {
+      this.child = undefined;
+      this.readyFlag = false;
+      // These interfaces are attached to THIS child's stdout/stderr. Leaving
+      // them open is what lets a late `ready` line from a daemon nobody is
+      // waiting on any more resolve waiters that belong to its replacement.
+      this.closeReadlineInterfaces();
+    }
+    if (this.killTimer) {
+      clearTimeout(this.killTimer);
+      this.killTimer = undefined;
+    }
+    child.removeAllListeners();
+    try { child.stdin?.end(); } catch { /* pipe already gone */ }
+    try { child.kill("SIGTERM"); } catch { /* already dead */ }
+    if (child.exitCode === null && child.signalCode === null) {
+      const timer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      }, 2000);
+      timer.unref();
+      this.killTimer = timer;
+    }
+  }
 
   private async launch(): Promise<void> {
     if (!existsSync(this.daemonScriptPath)) {
@@ -404,24 +424,37 @@ export class NetworkServerDaemonHost {
       this.rlStderr = rl;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const waiter = {
-        resolve: () => {
-          clearTimeout(timer);
-          this.readyWaiters.delete(waiter);
-          resolve();
-        },
-        reject: (error: unknown) => {
-          clearTimeout(timer);
-          this.readyWaiters.delete(waiter);
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      };
-      const timer = setTimeout(() => {
-        waiter.reject(new Error(`Network servers daemon did not report ready within ${this.readyTimeoutMs / 1000}s`));
-      }, this.readyTimeoutMs);
-      this.readyWaiters.add(waiter);
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const waiter = {
+          resolve: () => {
+            clearTimeout(timer);
+            this.readyWaiters.delete(waiter);
+            resolve();
+          },
+          reject: (error: unknown) => {
+            clearTimeout(timer);
+            this.readyWaiters.delete(waiter);
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        };
+        const timer = setTimeout(() => {
+          waiter.reject(new Error(`Network servers daemon did not report ready within ${this.readyTimeoutMs / 1000}s`));
+        }, this.readyTimeoutMs);
+        this.readyWaiters.add(waiter);
+      });
+    } catch (error) {
+      // A spawn that times out leaves a live process behind. `ensureStarted`
+      // does not cache a failed attempt, so the next call spawns another one
+      // and overwrites `this.child` — the first daemon then holds its pipes
+      // (and any UDP port it went on to bind) forever, unreachable by
+      // `dispose()`, and its late `ready` would resolve waiters belonging to
+      // its replacement. Kill it before allowing that retry. The `exit`
+      // handler's own rejections are harmless here: the waiter is already
+      // settled and the pending map is empty this early.
+      this.terminateChild(child);
+      throw error;
+    }
   }
 
   private async request(method: string, params?: Record<string, unknown>): Promise<unknown> {
