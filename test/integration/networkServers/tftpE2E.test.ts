@@ -24,6 +24,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import dgram from "node:dgram";
 import fs from "node:fs";
 import path from "node:path";
 import { TftpEngine } from "../../../src/services/networkServers/tftp/engine/TftpEngine";
@@ -84,6 +85,66 @@ describe("TFTP E2E — Critical Paths", () => {
     } catch {
       /* ignore */
     }
+  });
+
+  // `maxTransfers` used to be a check-then-act: read `transfers.size`, then
+  // `await` the filesystem, then register. Requests that interleave inside that
+  // gap all see a below-limit size and all get in.
+  //
+  // The interleaving is driven through the engine's own message entry point
+  // rather than through the socket, because a real burst cannot be made to
+  // land deterministically — the point is precisely that every request runs its
+  // synchronous prefix before any of them resumes past its first `await`, and
+  // calling the handler N times without awaiting between the calls is the only
+  // way to guarantee exactly that. Everything else in the path is real: real
+  // engine, real bound socket, real sandbox, real file reads.
+  describe("maxTransfers admission is a reservation, not a check-then-act", () => {
+    /** The engine's UDP entry point, reached without the scheduling noise of a real socket. */
+    type MessageEntryPoint = { handleMessage(msg: Buffer, rinfo: dgram.RemoteInfo): Promise<void> };
+    const rinfoFor = (port: number, size: number): dgram.RemoteInfo => ({
+      address: "127.0.0.1",
+      family: "IPv4",
+      port,
+      size
+    });
+
+    it("a simultaneous burst cannot exceed the cap", async () => {
+      fs.writeFileSync(path.join(root, "boot.bin"), randomPayload(200_000));
+      await withEngine(root, false, { maxTransfers: 2 }, async (engine, _port) => {
+        const rrq = encodeRRQ("boot.bin", "octet");
+        const entry = engine as unknown as MessageEntryPoint;
+        await Promise.all(
+          Array.from({ length: 8 }, (_, i) => entry.handleMessage(rrq, rinfoFor(41000 + i, rrq.length)))
+        );
+        expect(
+          engine.activeTransfers().length,
+          "eight requests raced the admission check; the cap must still hold"
+        ).toBe(2);
+      });
+    });
+
+    it("a failed request releases its slot instead of leaking it", async () => {
+      fs.writeFileSync(path.join(root, "real.bin"), randomPayload(4096));
+      await withEngine(root, false, { maxTransfers: 1 }, async (engine, _port) => {
+        const entry = engine as unknown as MessageEntryPoint;
+        // Three requests for a file that does not exist: each is admitted,
+        // fails in statFile, and answers FileNotFound. A reservation released
+        // only on the success path would consume the single slot three times
+        // over and wedge the service permanently.
+        for (let i = 0; i < 3; i++) {
+          const miss = encodeRRQ("absent.bin", "octet");
+          await entry.handleMessage(miss, rinfoFor(42000 + i, miss.length));
+        }
+        expect(engine.activeTransfers().length).toBe(0);
+
+        const rrq = encodeRRQ("real.bin", "octet");
+        await entry.handleMessage(rrq, rinfoFor(42100, rrq.length));
+        expect(
+          engine.activeTransfers().length,
+          "the slot the failed requests borrowed must have come back"
+        ).toBe(1);
+      });
+    });
   });
 
   // The sandbox is what validates the root, and it used to be built on the
