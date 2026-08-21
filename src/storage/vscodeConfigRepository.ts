@@ -39,20 +39,26 @@ import { asArray } from "../utils/helpers";
  *     (the cached state object is replaced wholesale), asynchronously and
  *     with no event exposed to extensions.
  *
- * So prevention is not available at this layer, but detection is: remember
- * the raw object this window last read or wrote per key (`lastSeenValue`,
- * compared BY REFERENCE — see its doc comment) and, on each save, check
- * whether the cache now holds something else. A changed reference means
- * another window wrote this collection in between; the content is then
- * confirmed to actually differ from what this save is writing (two windows
- * converging on the same value lose nothing and stay silent). The save still
- * proceeds exactly as before — never blocked, never able to fail because of
- * the guard (detection errors are swallowed), and at zero serialization cost
- * on the steady-state path: one cached synchronous read plus one reference
- * comparison per save, with whole-collection JSON serialization only in the
- * rare case that a foreign write was actually detected. The overwrite is no
- * longer silent: it is logged and surfaced through `onConcurrentOverwrite`
- * so the user can redo the superseded edit.
+ * So prevention is not available at this layer, but detection is — and 2.8.201
+ * corrected what it detects. Remember, per key, BOTH the object this window
+ * last read or wrote (`lastSeenValue`) and a frozen serialization of its
+ * content at that moment (`lastSeenJson`). On each save, a reference that has
+ * not moved proves nothing happened and the check stops there. A reference
+ * that HAS moved proves only that something replaced the object — NOT that
+ * another window wrote it, which is what this was originally built on and is
+ * false: `Memento.update` rewrites the whole extension blob and a dozen
+ * writers outside this class disturb it. So a moved reference is merely the
+ * cheap gate in front of the real question: did the CONTENT diverge from what
+ * this window last saw? Only then, and only when the stored content also
+ * differs from what is being written (two windows converging on the same value
+ * lose nothing and stay silent), is anything reported. The save still proceeds
+ * exactly as before — never blocked, never able to fail because of the guard
+ * (detection errors are swallowed). COST: one serialization of the pending
+ * value per save, taken once and reused for both the comparison and the new
+ * baseline, plus one of the stored value only when the reference moved. Two
+ * passes worst case, one at rest — see E3/E3b/E3c, which pin exactly that. The
+ * overwrite is no longer silent: it is logged and surfaced through
+ * `onConcurrentOverwrite` so the user can redo the superseded edit.
  *
  * KNOWN RESIDUAL (deliberate — a full optimistic-concurrency merge is out of
  * proportion here and would have to be fed back through NexusCore, whose sync
@@ -89,16 +95,25 @@ const SAVED_FILTERS_KEY = "nexus.savedFilters";
 
 export class VscodeConfigRepository implements ConfigRepository {
   /**
-   * BASELINE, BY REFERENCE — the raw object this window last read from or
-   * wrote into the Memento cache, per key. See the cross-window overwrite
-   * detection comment above. Reference identity is the honest signal here:
-   * the Memento hands back the very object our own update() stored, while a
-   * foreign window's write replaces the cached state object wholesale with
-   * freshly deserialized objects — so `stored !== baseline` means precisely
-   * "a write this repository did not make landed in the cache". `undefined`
-   * as a VALUE means "key was absent when read"; a key with no ENTRY (never
-   * read nor written by this instance) is never warned about — there is no
-   * baseline to have diverged from.
+   * BASELINE REFERENCE — the raw object this window last read from or wrote
+   * into the Memento cache, per key. Kept ONLY as a cheap negative: if the
+   * cache still holds this exact object, nothing has touched the key and the
+   * content comparison can be skipped entirely.
+   *
+   * It is NOT evidence of a foreign write, and this comment said the opposite
+   * until 2.8.201. The claim was that the Memento hands back the very object
+   * our own update() stored, so a moved reference means somebody else wrote
+   * it. `Memento.update` rewrites the extension's whole key/value blob, and
+   * this extension writes that blob from a dozen places outside this class
+   * (tree collapse state, the settings guard's shadows and event log, colour
+   * schemes, one-shot hint flags), so the object behind an untouched key can
+   * be replaced by an equal one at any time. A user with a single window open
+   * was told another window had overwritten their work. Judge divergence by
+   * `lastSeenJson`, never by this map alone.
+   *
+   * `undefined` as a VALUE means "key was absent when read"; a key with no
+   * ENTRY (never read nor written by this instance) is never warned about —
+   * there is no baseline to have diverged from.
    */
   private readonly lastSeenValue = new Map<string, unknown>();
 

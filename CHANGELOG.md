@@ -8,7 +8,7 @@
 
   The underlying reason is worth stating, because it means the old check could never have been reliable: it assumed that if the stored object is not the one this window last handled, another window must have written it. Nexus stores its configuration in a single shared blob that is rewritten in full on every save, and a dozen places in the extension write that blob for unrelated reasons — remembering which tree folders you collapsed, colour schemes, dismissed hints. Any of those can leave the configuration object looking unfamiliar while its content is untouched.
 
-- **The warning no longer names a cause it cannot know.** It said another VS Code window had made the change. The check has no way to tell *who* wrote what it found — only that storage no longer matches what this window loaded. It now says that instead, and suggests the other-window explanation rather than asserting it.
+- **The warning no longer names a cause it cannot know.** It said another VS Code window had made the change. The check has no way to tell *who* wrote what it found — only that storage no longer matches what this window last read or saved. It now says that instead, and suggests the other-window explanation rather than asserting it.
 
 ## [2.8.200] — 2026-08-20
 
