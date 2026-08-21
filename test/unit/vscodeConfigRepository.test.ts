@@ -769,17 +769,16 @@ describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () =
     }
   });
 
-  it("E3 (revised in 2.8.201): a steady-state save serializes the saved collection EXACTLY ONCE and never both sides (kills stringify-both-sides-per-save, the two O(n) passes this test was written against; the single remaining pass is the immutable baseline snapshot, which correctness now requires — see the note below)", async () => {
+  it("E3 (revised in 2.8.201): a steady-state save serializes the saved collection EXACTLY ONCE and never both sides (kills stringify-both-sides-per-save, the two O(n) passes this test was written against; the single remaining pass is the immutable baseline snapshot, which correctness now requires)", async () => {
     // WHY THIS TEST CHANGED. It originally asserted ZERO serialization, which
     // was affordable only while the reference check was believed to prove a
     // foreign write. It does not (2.8.201): the baseline must be a frozen
     // record of CONTENT, because the objects behind it are handed to NexusCore
-    // and mutated in place there. One O(n) pass per save is the price of that,
-    // and it is strictly smaller than what the save already costs — the
-    // `globalState.update` on the next line marshals the extension's ENTIRE
-    // key/value blob across the extension-host RPC boundary regardless.
-    // Weakening this to "no assertion" would have been the wrong repair: the
-    // thing worth pinning is that the second pass never comes back.
+    // and mutated in place there. One O(n) pass per save is the price, and it
+    // is strictly smaller than the `globalState.update` beside it, which
+    // marshals the extension's ENTIRE blob across the extension-host RPC
+    // boundary regardless. Weakening this to "no assertion" would have been the
+    // wrong repair: what is worth pinning is that the second pass never returns.
     const bigList = Array.from({ length: 2000 }, (_, i) => `Folder ${i}`);
     const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
     await repo.getGroups();
@@ -788,12 +787,53 @@ describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () =
     try {
       await repo.saveGroups(bigList);
       await repo.saveGroups([...bigList, "one more"]);
-      // Two saves, two passes — one each. Four would mean both-sides-per-save.
       expect(stringifySpy).toHaveBeenCalledTimes(2);
     } finally {
       stringifySpy.mockRestore();
     }
     expect(onConcurrentOverwrite).not.toHaveBeenCalled();
     expect(state[KEY]).toEqual([...bigList, "one more"]);
+  });
+
+  it("E3b: a save whose stored REFERENCE was replaced costs at most TWO passes — one for the pending value, one for the stored one (kills recomputing the pending serialization for the baseline after already serializing it for the comparison, which made the path this guard exists for the most expensive one; the unchanged-reference case above never exercised it)", async () => {
+    const bigList = Array.from({ length: 2000 }, (_, i) => `Folder ${i}`);
+    const { state, repo } = makeRepo(["Prod"]);
+    await repo.getGroups();
+
+    // The scenario this whole change is about: an unrelated whole-blob write
+    // leaves an equal clone behind this key, so the reference no longer matches.
+    state[KEY] = JSON.parse(JSON.stringify(state[KEY]));
+
+    const stringifySpy = vi.spyOn(JSON, "stringify");
+    try {
+      await repo.saveGroups(bigList);
+      expect(stringifySpy).toHaveBeenCalledTimes(2);
+    } finally {
+      stringifySpy.mockRestore();
+    }
+    expect(state[KEY]).toEqual(bigList);
+  });
+
+  it("E3c: a save that actually WARNS still costs at most two passes (kills a third pass hidden behind the divergence branch)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const bigList = Array.from({ length: 2000 }, (_, i) => `Folder ${i}`);
+      const { state, onConcurrentOverwrite, repo } = makeRepo(["Prod"]);
+      await repo.getGroups();
+
+      // A genuine foreign edit: reference AND content both moved.
+      state[KEY] = ["Prod", "From another window"];
+
+      const stringifySpy = vi.spyOn(JSON, "stringify");
+      try {
+        await repo.saveGroups(bigList);
+        expect(stringifySpy).toHaveBeenCalledTimes(2);
+      } finally {
+        stringifySpy.mockRestore();
+      }
+      expect(onConcurrentOverwrite).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

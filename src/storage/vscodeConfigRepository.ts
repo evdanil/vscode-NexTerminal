@@ -117,10 +117,15 @@ export class VscodeConfigRepository implements ConfigRepository {
    */
   private readonly lastSeenJson = new Map<string, string | undefined>();
 
-  /** Record both halves of a baseline together — they must never drift. */
-  private rememberBaseline(key: string, value: unknown): void {
+  /**
+   * Record both halves of a baseline together — they must never drift. `json`
+   * is a parameter rather than computed here so a caller that has ALREADY
+   * serialized this exact value can hand its pass over instead of paying for a
+   * second one (see `guardedUpdate`).
+   */
+  private rememberBaseline(key: string, value: unknown, json = JSON.stringify(value)): void {
     this.lastSeenValue.set(key, value);
-    this.lastSeenJson.set(key, JSON.stringify(value));
+    this.lastSeenJson.set(key, json);
   }
 
   public constructor(
@@ -174,6 +179,13 @@ export class VscodeConfigRepository implements ConfigRepository {
    * Memento in exactly the order the callers made them.
    */
   private async guardedUpdate(key: string, collection: string, value: unknown): Promise<void> {
+    // EXACTLY ONE pass over `value`, taken here and reused twice: by the
+    // comparison below, and by the baseline recorded after the write. Computing
+    // it in either place alone cost a second pass on the replaced-reference
+    // path — which is not the rare path, it is the one this whole guard exists
+    // to handle. The only other pass is `stored`, and only when the reference
+    // actually moved. Two passes worst case, one at rest.
+    const valueJson = JSON.stringify(value);
     try {
       if (this.lastSeenValue.has(key)) {
         const stored = this.context.globalState.get(key);
@@ -195,7 +207,7 @@ export class VscodeConfigRepository implements ConfigRepository {
           // reference that moved while the content stood still is nobody's
           // edit. The second preserves the pre-existing rule that two windows
           // converging on the same value lose nothing and stay silent.
-          if (storedJson !== this.lastSeenJson.get(key) && storedJson !== JSON.stringify(value)) {
+          if (storedJson !== this.lastSeenJson.get(key) && storedJson !== valueJson) {
             console.warn(
               `[Nexus] The ${collection} list changed in storage since this window last read or wrote it; this window's save is overwriting that change.`
             );
@@ -207,7 +219,7 @@ export class VscodeConfigRepository implements ConfigRepository {
       console.warn("[Nexus] Concurrent-write detection failed; saving anyway:", error);
     }
     const pending = this.context.globalState.update(key, value);
-    this.rememberBaseline(key, value);
+    this.rememberBaseline(key, value, valueJson);
     await pending;
   }
 
