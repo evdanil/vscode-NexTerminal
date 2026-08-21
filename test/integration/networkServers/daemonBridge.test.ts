@@ -341,6 +341,30 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     expect(stopped.status).toBe("stopped");
   });
 
+  it("`start` on a port that is already taken answers an RPC error, not ok:true", async () => {
+    // The failure has to travel: the adapter records ERROR *and* rejects, the
+    // daemon turns the rejection into a JSON-RPC error, and only then can
+    // NetworkServerManager throw and the command layer tell the user. When the
+    // adapter swallowed its own failure this reply was `{ok: true}` and every
+    // layer above it stayed silent.
+    const squatter = dgram.createSocket({ type: "udp4", reuseAddr: false });
+    const port = await new Promise<number>((resolve, reject) => {
+      squatter.once("error", reject);
+      squatter.bind(0, "0.0.0.0", () => resolve((squatter.address() as { port: number }).port));
+    });
+    try {
+      const reply = await client.send("start", { id: "tftp", config: { root, port, allowWrite: false } });
+      expect(reply.result, "a service that could not bind must not report success").toBeUndefined();
+      expect(reply.error?.message).toMatch(/already in use/i);
+
+      // And the daemon itself is still healthy afterwards.
+      const status = await client.call<{ id: string; status: string }>("getStatus", { id: "tftp" });
+      expect(status.status).toBe("error");
+    } finally {
+      await new Promise<void>((done) => squatter.close(() => done()));
+    }
+  });
+
   it("`restart` picks up a `configure` that landed while the service was running (stale-config eviction)", async () => {
     await client.call("start", { id: "tftp", config: { root, port: 0, allowWrite: false } });
     await client.waitForEvent("statusChange", 10_000, (d) => d?.id === "tftp" && d?.status === "running");
