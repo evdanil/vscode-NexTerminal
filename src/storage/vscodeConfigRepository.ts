@@ -4,6 +4,7 @@ import { ensureInventorySourceRevision, type InventorySourceConfig } from "../mo
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
+import type { LocalServerConfig } from "../models/localServer";
 import type { ConfigRepository } from "../core/contracts";
 import {
   validateServerConfig,
@@ -13,6 +14,7 @@ import {
   validateSerialProfile,
   validateAuthProfile,
   validateLocalShellProfile,
+  validateLocalServerConfig,
   validateInventorySource,
   validateDeviceTemplate,
   validateSavedFilter,
@@ -100,6 +102,7 @@ const SERVERS_KEY = "nexus.servers";
 const TUNNELS_KEY = "nexus.tunnels";
 const SERIAL_PROFILES_KEY = "nexus.serialProfiles";
 const LOCAL_SHELL_PROFILES_KEY = "nexus.localShellProfiles";
+const LOCAL_SERVERS_KEY = "nexus.localServers";
 const GROUPS_KEY = "nexus.groups";
 const AUTH_PROFILES_KEY = "nexus.authProfiles";
 const INVENTORY_SOURCES_KEY = "nexus.inventorySources";
@@ -413,6 +416,21 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveDhcpProfiles(profiles: DhcpConfigProfile[]): Promise<void> {
     await this.guardedUpdate(DHCP_PROFILES_KEY, "DHCP profiles", profiles);
+  }
+
+  public async getLocalServers(): Promise<LocalServerConfig[]> {
+    const raw = asArray<LocalServerConfig>(this.readRaw(LOCAL_SERVERS_KEY));
+    return raw.filter((item) => {
+      if (validateLocalServerConfig(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid local server entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveLocalServers(servers: LocalServerConfig[]): Promise<void> {
+    await this.guardedUpdate(LOCAL_SERVERS_KEY, "local servers", servers);
   }
 
   public async getGroups(): Promise<string[]> {

@@ -15,6 +15,7 @@ import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { ActiveNetworkServerSession } from "../models/networkServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
+import type { ActiveLocalServerSession, LocalServerConfig } from "../models/localServer";
 
 export interface ConfigRepository {
   getServers(): Promise<ServerConfig[]>;
@@ -29,6 +30,8 @@ export interface ConfigRepository {
   saveTftpProfiles(profiles: TftpConfigProfile[]): Promise<void>;
   getDhcpProfiles(): Promise<DhcpConfigProfile[]>;
   saveDhcpProfiles(profiles: DhcpConfigProfile[]): Promise<void>;
+  getLocalServers(): Promise<LocalServerConfig[]>;
+  saveLocalServers(servers: LocalServerConfig[]): Promise<void>;
   getGroups(): Promise<string[]>;
   saveGroups(groups: string[]): Promise<void>;
   getAuthProfiles(): Promise<AuthProfile[]>;
@@ -46,6 +49,7 @@ export interface SessionSnapshot {
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
   localShellProfiles: LocalShellProfile[];
+  localServers: LocalServerConfig[];
   activeSessions: ActiveSession[];
   activeSerialSessions: ActiveSerialSession[];
   activeLocalShellSessions: ActiveLocalShellSession[];
@@ -66,6 +70,7 @@ export interface SessionSnapshot {
    */
   tftpProfiles: TftpConfigProfile[];
   dhcpProfiles: DhcpConfigProfile[];
+  activeLocalServerSessions: ActiveLocalServerSession[];
   activeTunnels: ActiveTunnel[];
   remoteTunnels: TunnelRegistryEntry[];
   explicitGroups: string[];

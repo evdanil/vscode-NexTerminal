@@ -4,6 +4,7 @@ import { ensureInventorySourceRevision, type InventorySourceConfig } from "../mo
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
+import type { LocalServerConfig } from "../models/localServer";
 
 export class InMemoryConfigRepository implements ConfigRepository {
   public constructor(
@@ -13,6 +14,7 @@ export class InMemoryConfigRepository implements ConfigRepository {
     private groups: string[] = [],
     private authProfiles: AuthProfile[] = [],
     private localShellProfiles: LocalShellProfile[] = [],
+    private localServers: LocalServerConfig[] = [],
     private inventorySources: InventorySourceConfig[] = [],
     private deviceTemplates: DeviceTemplateProfile[] = [],
     private savedFilters: SavedFilterDefinition[] = [],
@@ -66,6 +68,14 @@ export class InMemoryConfigRepository implements ConfigRepository {
 
   public async saveDhcpProfiles(profiles: DhcpConfigProfile[]): Promise<void> {
     this.dhcpProfiles = [...profiles];
+  }
+
+  public async getLocalServers(): Promise<LocalServerConfig[]> {
+    return [...this.localServers];
+  }
+
+  public async saveLocalServers(servers: LocalServerConfig[]): Promise<void> {
+    this.localServers = [...servers];
   }
 
   public async getGroups(): Promise<string[]> {
