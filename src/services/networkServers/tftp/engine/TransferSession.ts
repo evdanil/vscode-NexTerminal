@@ -43,6 +43,41 @@ import {
 /** Default timeout (5s). RFC 2349 allows negotiation via the "timeout" option. */
 export const DEFAULT_TIMEOUT_MS = 5000;
 
+/** Size of the block-number space: block numbers are a 16-bit wire field. */
+const BLOCK_SPACE = 0x10000;
+
+/**
+ * Forward distance from `from` to `to` in the 16-bit block-number space.
+ *
+ * Block numbers are 16 bits on the wire and this implementation wraps
+ * 65535 → 1, so plain `<` / `>=` comparisons are wrong the moment a transfer
+ * passes 65535 blocks (32 MB at the default blksize, one PXE image at any
+ * realistic one): the sender's numbers restart while `lastAcked` is still up
+ * at 65535, every subsequent ACK reads as "older than what we already have"
+ * and the transfer stalls with no error on either side.
+ *
+ * Distance is computed modulo 65536 rather than modulo the 65535-value space
+ * the wrap-to-1 actually walks. That costs one block of window width for the
+ * single round after each wrap — never a stall, never an over-fill — and keeps
+ * this the standard sequence-space arithmetic a reader already knows, instead
+ * of a bespoke variant that has to be re-derived to be trusted.
+ */
+function blockDistance(from: number, to: number): number {
+  return (to - from + BLOCK_SPACE) % BLOCK_SPACE;
+}
+
+/**
+ * True when `later` is at or ahead of `earlier` in the block-number space —
+ * the wrap-safe replacement for `later >= earlier`.
+ *
+ * "Ahead" is the near half of the space: an ACK more than 32768 blocks forward
+ * is read as a stale duplicate lagging behind, which is what it always is in
+ * practice (the window is bounded far below that).
+ */
+function blockAtOrAfter(earlier: number, later: number): boolean {
+  return blockDistance(earlier, later) < BLOCK_SPACE / 2;
+}
+
 /** Maximum number of retransmission attempts before aborting the session. */
 export const DEFAULT_MAX_RETRIES = 5;
 
@@ -353,7 +388,11 @@ export class TransferSession {
     let i = 0;
     while (i < this.outboundQueue.length) {
       const p = this.outboundQueue[i];
-      if (p.blockNum !== null && p.blockNum <= ackBlockNum) {
+      // `p.blockNum <= ackBlockNum` would stop dead at the wrap: a queue
+      // holding 65534, 65535, 1, 2 confirmed by ACK(2) drains nothing, and the
+      // session then retransmits blocks the peer already has until the queue
+      // cap silently drops them.
+      if (p.blockNum !== null && blockAtOrAfter(p.blockNum, ackBlockNum)) {
         i++;
       } else {
         break;
@@ -489,12 +528,15 @@ export class TransferSession {
       if (blockNum === 0 && this.blockNum === 0) {
         return { send: [], produceMore: true, done: false };
       }
-      if (blockNum < this.lastAcked) {
+      // Wrap-safe form of `blockNum < this.lastAcked` — past block 65535 the
+      // peer's ACKs restart at 1 while `lastAcked` is still 65535, and a
+      // numeric compare discards every one of them: the window never advances,
+      // no more DATA is produced, and the transfer stalls silently.
+      if (!blockAtOrAfter(this.lastAcked, blockNum)) {
         return { send: [], produceMore: false, done: false };
       }
       this.lastAcked = blockNum;
-      const windowEnd = this.lastAcked + this.opts.windowsize;
-      if (this.blockNum < windowEnd) {
+      if (blockDistance(this.lastAcked, this.blockNum) < this.opts.windowsize) {
         return { send: [], produceMore: true, done: false };
       }
       return { send: [], produceMore: false, done: false };
@@ -526,8 +568,15 @@ export class TransferSession {
     if (this.phase !== TransferPhase.Receiving) {
       return { send: [], write: null, done: false };
     }
-    if (blockNum === this.blockNum - 1) {
-      return { send: [encodeACK(this.blockNum - 1)], write: null, done: false };
+    // The block before the expected one, in the space this implementation
+    // actually walks (65535 is followed by 1, not by 0 — see the wrap in the
+    // advance below). Computing it as `this.blockNum - 1` yields 0 right after
+    // a wrap, so a perfectly ordinary retransmission of block 65535 matches
+    // nothing, falls through to the mismatch branch below, and kills a
+    // transfer that was merely recovering from a lost ACK.
+    const previousBlock = this.blockNum <= 1 ? 65535 : this.blockNum - 1;
+    if (blockNum === previousBlock) {
+      return { send: [encodeACK(previousBlock)], write: null, done: false };
     }
     if (blockNum !== this.blockNum) {
       this.setError(ErrorCode.IllegalOperation, `Block ${blockNum} expected ${this.blockNum}`);
@@ -544,8 +593,10 @@ export class TransferSession {
     if (!isLast) {
       this.blockNum = this.blockNum >= 65535 ? 1 : this.blockNum + 1;
     }
-    const windowEnd = this.lastAcked + this.opts.windowsize;
-    const shouldAck = isLast || currentBlock >= windowEnd;
+    // Same wrap hazard as the RRQ side: `currentBlock >= lastAcked + windowsize`
+    // is never true again once the client's numbering restarts at 1, so the
+    // server stops ACKing entirely and the upload dies on the client's retries.
+    const shouldAck = isLast || blockDistance(this.lastAcked, currentBlock) >= this.opts.windowsize;
     if (shouldAck) {
       this.lastAcked = currentBlock;
       if (isLast) this.phase = TransferPhase.Done;
@@ -573,10 +624,16 @@ export class TransferSession {
    */
   public async produceNextSendPackets(abortAtEOF = false): Promise<Buffer[]> {
     const out: Buffer[] = [];
-    const windowEnd = this.lastAcked + this.opts.windowsize;
     let reachedEOF = abortAtEOF;
     const startBytes = this.bytesTransferred;
-    while (this.phase === TransferPhase.Sending && this.blockNum < windowEnd) {
+    // Wrap-safe window bound. `this.blockNum < this.lastAcked + windowsize`
+    // stops bounding anything once the sender wraps past 65535: the sum stays
+    // up at ~65536 while `blockNum` restarts at 1, so the loop would run until
+    // EOF and push the entire remaining file into memory in one call.
+    while (
+      this.phase === TransferPhase.Sending &&
+      blockDistance(this.lastAcked, this.blockNum) < this.opts.windowsize
+    ) {
       if (this.fileHandle === null) {
         this.fileHandle = await fsPromises.open(this.absFilePath, 'r');
       }
