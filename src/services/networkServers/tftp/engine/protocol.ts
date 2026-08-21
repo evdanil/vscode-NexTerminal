@@ -295,6 +295,20 @@ function parseRRQorWRQ(
   if (!VALID_MODES.has(mode as TransferMode)) {
     throw new ProtocolError(`Unknown mode: ${mode}`);
   }
+  // `netascii` (RFC 1350 §2) is not a labelling convention — it is a transform:
+  // the sender rewrites its host line endings to CR/LF on the wire and the
+  // receiver rewrites them back. This engine does neither; RRQ and WRQ are raw
+  // byte operations end to end. Accepting the mode therefore corrupted every
+  // text transfer between hosts with different line conventions, silently, with
+  // both sides believing the transfer succeeded.
+  //
+  // Refusing is the honest answer, and it costs nothing in this product's
+  // actual use: network devices fetch and store images and configs in `octet`.
+  // A client that asks for netascii gets a specific error and can retry in
+  // binary, which is what it wanted anyway.
+  if (mode === 'netascii') {
+    throw new ProtocolError('Unsupported mode: netascii (this server implements octet only)');
+  }
   const optionTokens = parts.slice(2);
   if (optionTokens.length % 2 !== 0) throw new ProtocolError('Malformed option list');
   const options: RawOptions = {};

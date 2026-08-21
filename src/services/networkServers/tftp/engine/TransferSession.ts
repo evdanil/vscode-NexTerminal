@@ -151,7 +151,11 @@ export class TransferSession {
   public readonly filename: string;
   /** Safe absolute path (via PathGuard) for FS operations. */
   public readonly absFilePath: string;
-  /** Transfer mode (RFC 1350). Only "octet" is used in practice. */
+  /**
+   * Transfer mode (RFC 1350). Always `octet` in practice: `netascii` is
+   * refused during parsing (see `parseRRQorWRQ`) because the CR/LF conversion
+   * it requires is not implemented, so a session is never built for one.
+   */
   public readonly mode: 'octet' | 'netascii';
 
   /** Validated options after negotiation (RFC 2347+). */

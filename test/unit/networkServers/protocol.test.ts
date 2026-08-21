@@ -52,13 +52,18 @@ describe("TFTP Protocol (protocol.ts)", () => {
       }
     });
 
-    it("WRQ netascii with options (blksize=1400 windowsize=8 tsize=3000) round-trip", () => {
-      const pkt = encodeWRQ("upload.bin", "netascii", { blksize: "1400", windowsize: "8", tsize: "3000" });
+    // Was a netascii round-trip until netascii became a rejected mode (the
+    // engine never implemented its CR/LF conversion, so accepting it corrupted
+    // text transfers silently). The option round-trip this test exists for is
+    // unchanged; only the mode it carries is. Netascii's own behaviour is
+    // asserted in "malformed packets must throw ProtocolError" below.
+    it("WRQ with options (blksize=1400 windowsize=8 tsize=3000) round-trip", () => {
+      const pkt = encodeWRQ("upload.bin", "octet", { blksize: "1400", windowsize: "8", tsize: "3000" });
       const parsed = parsePacket(pkt)!;
       expect(parsed.opcode).toBe(Opcode.WRQ);
       if (parsed.opcode === Opcode.WRQ) {
         expect(parsed.filename).toBe("upload.bin");
-        expect(parsed.mode).toBe("netascii");
+        expect(parsed.mode).toBe("octet");
         expect(parsed.options.blksize).toBe("1400");
         expect(parsed.options.windowsize).toBe("8");
         expect(parsed.options.tsize).toBe("3000");
@@ -147,6 +152,20 @@ describe("TFTP Protocol (protocol.ts)", () => {
     it('RRQ invalid mode "badmode"', () => {
       const buf = Buffer.concat([Buffer.from([0, 1]), Buffer.from("file.bin\x00badmode\x00", "ascii")]);
       expect(() => parsePacket(buf)).toThrow(ProtocolError);
+    });
+
+    // RRQ/WRQ are raw byte operations here — no CR/LF conversion anywhere in
+    // the read or write path. Accepting `netascii` and then not performing it
+    // corrupts text transferred between hosts with different line conventions,
+    // and does so silently: both ends believe the transfer succeeded. Refusing
+    // is the honest answer, and the error names the mode that does work.
+    it("RRQ netascii → ProtocolError naming octet, not a silently raw transfer", () => {
+      expect(() => parsePacket(encodeRRQ("cfg.txt", "netascii"))).toThrow(ProtocolError);
+      expect(() => parsePacket(encodeRRQ("cfg.txt", "netascii"))).toThrow(/octet/i);
+    });
+
+    it("WRQ netascii → ProtocolError as well (upload corrupts the same way)", () => {
+      expect(() => parsePacket(encodeWRQ("cfg.txt", "NETASCII"))).toThrow(ProtocolError);
     });
 
     it("RRQ with option list odd token count → malformed", () => {

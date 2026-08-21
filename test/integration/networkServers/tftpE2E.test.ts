@@ -272,6 +272,24 @@ describe("TFTP E2E — Critical Paths", () => {
     }
   );
 
+  it("RRQ netascii → ERROR code=4 on the wire, no session, no raw transfer", async () => {
+    fs.writeFileSync(path.join(root, "config.txt"), "line one\nline two\n");
+    await withEngine(root, false, {}, async (engine, port) => {
+      const c = await createUdpClient();
+      try {
+        c.sendTo(encodeRRQ("config.txt", "netascii"), port);
+        const { message } = await c.nextMsg(4000);
+        // The alternative is what used to happen: the file goes out byte for
+        // byte under a mode that promises CR/LF conversion, and a client on a
+        // different line convention writes silently corrupted text.
+        assertErrorMessage(message, ErrorCode.IllegalOperation, /netascii/i);
+        expect(engine.activeTransfers().length).toBe(0);
+      } finally {
+        c.close();
+      }
+    });
+  });
+
   it("RRQ file does not exist → ERROR code=1 FileNotFound", async () => {
     await withEngine(root, false, {}, async (_engine, port) => {
       const c = await createUdpClient();
