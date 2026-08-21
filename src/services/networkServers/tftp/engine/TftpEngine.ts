@@ -86,7 +86,7 @@ import dgram from 'node:dgram';
 import fsPromises from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import { Opcode, ErrorCode } from './types';
+import { Opcode, ErrorCode, type RRQPacket, type WRQPacket } from './types';
 import {
   parsePacket,
   getOpcode,
@@ -194,6 +194,11 @@ export class TftpEngine extends EventEmitter {
    * twice, which reaches the UI as duplicate toasts.
    */
   private readonly finalizing = new Set<string>();
+  /**
+   * Slots reserved by requests that have been admitted but are not yet in
+   * {@link transfers} — see the admission check in {@link handleNewRequest}.
+   */
+  private pendingAdmissions = 0;
 
   /**
    * Constructs a new TFTP engine. Does not start listening — use {@link start}.
@@ -582,12 +587,47 @@ export class TftpEngine extends EventEmitter {
     }
     if (!parsed || (parsed.opcode !== Opcode.RRQ && parsed.opcode !== Opcode.WRQ)) return;
 
-    if (this.transfers.size >= this.opts.maxTransfers) {
+    // Admission has to RESERVE the slot here, synchronously, rather than read
+    // `transfers.size` and register the session later: everything between the
+    // two is `await`ed filesystem work, and the session only lands in
+    // `transfers` on the far side of it. A burst of requests from distinct
+    // source ports therefore all run this check before any of them registers,
+    // all see a below-limit size, and all get admitted — the cap is trivially
+    // bypassed by an unauthenticated client, which is the whole point of
+    // having one.
+    if (this.transfers.size + this.pendingAdmissions >= this.opts.maxTransfers) {
       this.sendRaw(rinfo, encodeERROR(ErrorCode.IllegalOperation, 'Server busy'));
       this.log('warn', `max transfers reached; rejecting ${parsed.filename}`);
       return;
     }
+    this.pendingAdmissions++;
+    try {
+      await this.admitNewRequest(parsed, rinfo);
+    } finally {
+      // `finally`, and covering the whole body, because a reservation that
+      // leaks on any of the (many) failure paths below is a slot the engine
+      // never gets back — a handful of requests for files that do not exist
+      // would permanently wedge the service at "Server busy". By the time this
+      // runs, an admitted session is counted in `transfers` instead; the brief
+      // overlap where it is counted twice only ever rejects one extra request.
+      this.pendingAdmissions--;
+    }
+  }
 
+  /**
+   * Sets up an admitted RRQ/WRQ: resolves the path through the sandbox, opens
+   * the file, creates the session and sends the first response.
+   *
+   * Split out of {@link handleNewRequest} so the admission reservation there
+   * can wrap the whole thing in one `finally` — see the comment at that call.
+   *
+   * @param parsed Already-parsed RRQ or WRQ.
+   * @param rinfo  Source of the request.
+   */
+  private async admitNewRequest(
+    parsed: RRQPacket | WRQPacket,
+    rinfo: dgram.RemoteInfo,
+  ): Promise<void> {
     const guard = this.guard;
     if (!guard) {
       // Unreachable while the engine is running (`start` builds the guard
