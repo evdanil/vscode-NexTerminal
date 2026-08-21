@@ -30,6 +30,7 @@ import {
   DEFAULT_BLOCK_SIZE,
   DEFAULT_WINDOW_SIZE,
   OPTION_LIMITS,
+  MAX_IN_FLIGHT_BYTES,
   DATA_HEADER_LEN,
   type RawOptions,
   type ValidatedOptions,
@@ -412,6 +413,20 @@ export function validateOptions(
     }
     out.windowsize = v;
   }
+  // RFC 2347 §2 lets the server answer an option with a value the client must
+  // then use, and RFC 7440 §3 names windowsize explicitly as one the server may
+  // lower. So a window whose bytes exceed the in-flight budget is clamped here
+  // rather than refused: the transfer still runs, just with a window the server
+  // can afford to allocate. Clamping windowsize (and not blksize) is deliberate
+  // — blksize is what a client picks to match its MTU, and shrinking it below
+  // that would fragment every datagram of the transfer.
+  //
+  // This is the single place option values become numbers, so the clamp lands
+  // before anything can read them — including `validatedToRaw`, which is what
+  // the OACK is built from. Clamping later (say, in the engine) would answer
+  // the client with the value it asked for and then use a different one.
+  const maxWindow = Math.max(1, Math.floor(MAX_IN_FLIGHT_BYTES / out.blksize));
+  if (out.windowsize > maxWindow) out.windowsize = maxWindow;
   return out;
 }
 

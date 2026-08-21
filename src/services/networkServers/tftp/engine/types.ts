@@ -71,6 +71,25 @@ export const OPTION_LIMITS = {
   windowsize: { min: 1, max: 65535 } as const,
 } as const;
 
+/**
+ * Ceiling on `blksize * windowsize` — the bytes one session may hold in flight.
+ *
+ * The two options are individually bounded by their RFCs but their PRODUCT is
+ * not, and that product is what gets allocated: `produceNextSendPackets` builds
+ * a whole window of DATA buffers in memory before any of it is sent. At the
+ * RFC maxima an unauthenticated client can ask for 65464 * 65535 ≈ 4.3 GB in a
+ * single RRQ, and `maxTransfers` sessions can each ask for it — so the option
+ * negotiation of one datagram is a remote OOM.
+ *
+ * 1 MiB is chosen because it is far above what any real client uses and far
+ * below what hurts: RFC 7440 windows in the field are 4–64 blocks, and even a
+ * jumbo-frame blksize of 8192 still leaves room for 128 of them. At the
+ * absolute maximum blksize (65464) it still permits a 16-block window, so the
+ * clamp never degrades a transfer to stop-and-wait. Worst case across the
+ * default 64-session pool is 64 MiB rather than unbounded.
+ */
+export const MAX_IN_FLIGHT_BYTES = 1024 * 1024;
+
 /** Names of options recognized by the engine. */
 export type OptionName = 'blksize' | 'timeout' | 'tsize' | 'windowsize';
 

@@ -23,14 +23,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { Opcode, ErrorCode } from "../../../src/services/networkServers/tftp/engine/types";
+import { Opcode, ErrorCode, MAX_IN_FLIGHT_BYTES } from "../../../src/services/networkServers/tftp/engine/types";
 import {
   TransferSession,
   TransferPhase,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_MAX_RETRIES
 } from "../../../src/services/networkServers/tftp/engine/TransferSession";
-import { encodeACK, getOpcode } from "../../../src/services/networkServers/tftp/engine/protocol";
+import { encodeACK, getOpcode, parsePacket } from "../../../src/services/networkServers/tftp/engine/protocol";
 import { mkdtemp, randomPayload, sleep } from "../../helpers/networkServerTestHelpers";
 
 function mkPeer(port = 50000) {
@@ -423,6 +423,54 @@ describe("TFTP TransferSession (no network)", () => {
       const m = t.getMetrics();
       expect(typeof m.etaSec).toBe("number");
       expect((m.etaSec as number) > 0).toBe(true);
+    });
+  });
+
+  describe("Negotiated window is bounded (remote allocation DoS)", () => {
+    it("OACK reports the CLAMPED windowsize, so client and server agree on the window", async () => {
+      // A disagreement here is worse than the clamp itself: the client would
+      // send/expect a 65535-block window while the server serves 16.
+      const t = new TransferSession({
+        peer: mkPeer(),
+        opcode: Opcode.RRQ,
+        filename: "big.bin",
+        absFilePath: path.join(root, "big.bin"),
+        mode: "octet",
+        rawOptions: { blksize: "65464", windowsize: "65535" }
+      });
+      expect(t.phase, "an oversized window is clamped, not rejected (RFC 2347 §2)").not.toBe(TransferPhase.Error);
+      const [oack] = t.initForRRQ(true, 1000);
+      const parsed = parsePacket(oack!)!;
+      expect(parsed.opcode).toBe(Opcode.OACK);
+      if (parsed.opcode === Opcode.OACK) {
+        expect(parsed.options.windowsize).toBe(String(t.opts.windowsize));
+        expect(Number(parsed.options.windowsize) * Number(parsed.options.blksize)).toBeLessThanOrEqual(
+          MAX_IN_FLIGHT_BYTES
+        );
+      }
+    });
+
+    it("produceNextSendPackets builds at most the clamped window, not the requested one", async () => {
+      // The allocation this bounds is real: the loop below fills the whole
+      // window into memory before a single datagram is sent.
+      const blksize = 65464;
+      const expectedWindow = Math.floor(MAX_IN_FLIGHT_BYTES / blksize);
+      const p = path.join(root, "huge.bin");
+      fs.writeFileSync(p, randomPayload(blksize * (expectedWindow + 4)));
+      const t = new TransferSession({
+        peer: mkPeer(),
+        opcode: Opcode.RRQ,
+        filename: "huge.bin",
+        absFilePath: p,
+        mode: "octet",
+        rawOptions: { blksize: String(blksize), windowsize: "65535" }
+      });
+      t.initForRRQ(false, fs.statSync(p).size);
+      const pkts = await t.produceNextSendPackets();
+      expect(pkts.length).toBe(expectedWindow);
+      expect(t.phase, "the file is longer than the window, so the transfer is not finished").toBe(
+        TransferPhase.Sending
+      );
     });
   });
 
