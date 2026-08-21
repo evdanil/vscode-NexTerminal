@@ -239,6 +239,15 @@ export class DhcpAdapter extends BaseNexusServer {
       }
       const formatted = this.formatStartError(err);
       this.setStatus(ServerStatus.ERROR, formatted);
+      // Rethrow, don't swallow: the ERROR status alone only reaches the
+      // sidebar. `start()` resolving normally is what the daemon reports as
+      // `{ok: true}`, so the command layer never showed its failure message and
+      // Verbose Mode announced a service that had not started. Parity with
+      // TftpAdapter.start. The formatted message travels rather than the raw
+      // one because this is the text that ends up in the user's notification,
+      // and it is the half that names a remedy; the original is kept as
+      // `cause` for the log.
+      throw new Error(formatted, { cause: err });
     }
   }
 

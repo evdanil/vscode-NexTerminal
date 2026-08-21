@@ -305,19 +305,37 @@ export class TftpAdapter extends BaseNexusServer {
           return;
         } catch (altErr) {
           const altMsg = altErr instanceof Error ? altErr.message : String(altErr);
-          this.setStatus(
-            ServerStatus.ERROR,
+          throw this.failStart(
             `Failed to start (port ${DEFAULT_PORT} denied, fallback ${FALLBACK_ALT_PORT} failed: ${altMsg})`,
           );
-          return;
         }
       }
       if (isInUse) {
-        this.setStatus(ServerStatus.ERROR, `UDP port ${this.port} is already in use.`);
-        return;
+        throw this.failStart(`UDP port ${this.port} is already in use.`);
       }
-      this.setStatus(ServerStatus.ERROR, `Failed to start: ${message}`);
+      throw this.failStart(`Failed to start: ${message}`);
     }
+  }
+
+  /**
+   * Records a failed start and produces the error to throw for it.
+   *
+   * Both halves are needed. The status is what the sidebar renders; the throw
+   * is what makes `start()` reject, and every layer above depends on that —
+   * the daemon turns a rejection into a JSON-RPC error, the host turns that
+   * into a rejected `startServer`, and the command layer is what actually
+   * tells the user. Swallowing the failure after setting the status (which is
+   * what this used to do) meant the RPC answered `{ok: true}`: the command
+   * layer stayed silent and, with Verbose Mode on, the user was told the
+   * service had started.
+   *
+   * @param message Operator-facing reason, already specific about the port.
+   * @returns The error to throw — returned rather than thrown so the call site
+   *          reads `throw this.failStart(...)` and stays obviously terminal.
+   */
+  private failStart(message: string): Error {
+    this.setStatus(ServerStatus.ERROR, message);
+    return new Error(message);
   }
 
   /**
