@@ -30,7 +30,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   DEFAULT_MAX_RETRIES
 } from "../../../src/services/networkServers/tftp/engine/TransferSession";
-import { encodeACK, getOpcode, parsePacket } from "../../../src/services/networkServers/tftp/engine/protocol";
+import { encodeACK, encodeDATA, getOpcode, parsePacket } from "../../../src/services/networkServers/tftp/engine/protocol";
 import { mkdtemp, randomPayload, sleep } from "../../helpers/networkServerTestHelpers";
 
 function mkPeer(port = 50000) {
@@ -489,6 +489,118 @@ describe("TFTP TransferSession (no network)", () => {
       const r = t.handleDATA(65535, randomPayload(512)); // not last
       expect(r.done).toBe(false);
       expect(t.blockNum, "After 65535, next block should be 1 (TFTP wrap)").toBe(1);
+    });
+
+    // The block counter wraps but `lastAcked` and the window arithmetic were
+    // plain integers, so every comparison inverts the moment a transfer passes
+    // 65535 blocks — 32 MB at the default blksize, i.e. any real firmware
+    // image. The sessions below are placed AT the boundary rather than driven
+    // 65535 blocks to reach it; the state is identical and the test runs in ms.
+    it("RRQ: an ACK for a wrapped block still advances the window (does not stall)", async () => {
+      const blksize = 512;
+      const p = path.join(root, "wrap.bin");
+      fs.writeFileSync(p, randomPayload(blksize * 6));
+      const t = new TransferSession({
+        peer: mkPeer(),
+        opcode: Opcode.RRQ,
+        filename: "wrap.bin",
+        absFilePath: p,
+        mode: "octet",
+        rawOptions: {}
+      });
+      t.initForRRQ(false, blksize * 6);
+      // One block short of the wrap, mid-transfer: last sent block is also the
+      // last ACKed one, exactly as lock-step stop-and-wait leaves it.
+      t.blockNum = 65534;
+      t.lastAcked = 65534;
+
+      const before = await t.produceNextSendPackets();
+      expect(before[0]!.readUInt16BE(2)).toBe(65535);
+      expect(t.handleACK(65535).produceMore).toBe(true);
+
+      const wrapped = await t.produceNextSendPackets();
+      expect(wrapped[0]!.readUInt16BE(2), "the block after 65535 goes out as 1").toBe(1);
+      expect(
+        (await t.produceNextSendPackets()).length,
+        "block 1 is unacknowledged and windowsize is 1 — the wrap must not unbound the window"
+      ).toBe(0);
+
+      const r = t.handleACK(1);
+      expect(t.lastAcked, "ACK(1) after the wrap is the newest ACK, not a stale one").toBe(1);
+      expect(r.produceMore, "a stalled window here is a transfer that never finishes").toBe(true);
+
+      const after = await t.produceNextSendPackets();
+      expect(after.length, "the transfer must keep flowing past the wrap").toBe(1);
+      expect(after[0]!.readUInt16BE(2)).toBe(2);
+    });
+
+    it("WRQ: a retransmitted pre-wrap block is re-ACKed, not treated as a protocol violation", () => {
+      const t = new TransferSession({
+        peer: mkPeer(),
+        opcode: Opcode.WRQ,
+        filename: "w.bin",
+        absFilePath: path.join(root, "w.bin"),
+        mode: "octet",
+        rawOptions: {}
+      });
+      t.initForWRQ(false);
+      t.blockNum = 65535;
+      t.lastAcked = 65534;
+      t.handleDATA(65535, randomPayload(512));
+      expect(t.blockNum).toBe(1);
+
+      // The client never saw our ACK(65535) and sends the block again — the
+      // single most ordinary thing that happens on a lossy link.
+      const dup = t.handleDATA(65535, randomPayload(512));
+      expect(t.phase, "a duplicate block is not an illegal operation").not.toBe(TransferPhase.Error);
+      expect(dup.done).toBe(false);
+      expect(dup.write, "a duplicate must not be written to the file twice").toBeNull();
+      expect(dup.send.length).toBe(1);
+      expect(dup.send[0]!.readUInt16BE(2), "re-ACK the block the client repeated").toBe(65535);
+    });
+
+    it("the retransmission queue drains across the wrap instead of jamming", () => {
+      const t = new TransferSession({
+        peer: mkPeer(),
+        opcode: Opcode.RRQ,
+        filename: "q.bin",
+        absFilePath: path.join(root, "q.bin"),
+        mode: "octet",
+        rawOptions: { windowsize: "4" }
+      });
+      t.initForRRQ(false, 4096);
+      t.recordOutbound([65534, 65535, 1, 2].map((n) => encodeDATA(n, randomPayload(8))));
+      t.clearOutboundUpToAck(2);
+      // A numeric `p.blockNum <= ackBlockNum` stops at the first pre-wrap entry
+      // and drains nothing, so the peer keeps being sent blocks it has already
+      // acknowledged until the queue cap quietly discards them.
+      expect(
+        t.consumeRetransmission(),
+        "everything up to the ACKed block is confirmed and must leave the queue"
+      ).toBeNull();
+    });
+
+    it("WRQ: the windowed ACK still fires on the far side of the wrap", () => {
+      const t = new TransferSession({
+        peer: mkPeer(),
+        opcode: Opcode.WRQ,
+        filename: "w4.bin",
+        absFilePath: path.join(root, "w4.bin"),
+        mode: "octet",
+        rawOptions: { windowsize: "4" }
+      });
+      t.initForWRQ(false);
+      t.phase = TransferPhase.Receiving;
+      t.lastAcked = 65532;
+      t.blockNum = 65533;
+      for (const expected of [65533, 65534, 65535]) {
+        const mid = t.handleDATA(expected, randomPayload(512));
+        expect(mid.send.length, `block ${expected} is inside the window, no ACK yet`).toBe(0);
+      }
+      expect(t.blockNum).toBe(1);
+      const closing = t.handleDATA(1, randomPayload(512));
+      expect(closing.send.length, "the window closed across the wrap and must be ACKed").toBe(1);
+      expect(t.lastAcked).toBe(1);
     });
   });
 });
