@@ -9910,7 +9910,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
 </div>
   <div class="form-group">
   <label for="setting-nexus-networkServers-dhcp-leaseTimeSec">Lease Time</label>
-  <div class="setting-desc">Lease duration handed to clients (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum.</div>
+  <div class="setting-desc">Lease duration handed to clients (option 51). Values below 60 seconds — shorter leases make clients renew faster than the server can meaningfully track — or above 7 days fall back to the 24-hour default.</div>
   <div class="number-with-unit">
     <input type="number" id="setting-nexus-networkServers-dhcp-leaseTimeSec" data-section="nexus.networkServers" data-key="dhcp.leaseTimeSec" value="60" min="60" max="604800" />
     <span class="unit-suffix">seconds</span>

@@ -27,6 +27,7 @@ import type { NetworkServerManager } from "../services/networkServers/networkSer
 import type { DhcpAdapterConfig, DhcpVendorSpecificEntry } from "../services/networkServers/core/index";
 import { isValidSubOptionCode } from "../services/networkServers/dhcp/engine/dhcpBootOptions";
 import { networkServerFormDefinition, type DhcpServerFormSeed } from "../ui/formDefinitions";
+import { validateTftpFormInput } from "../services/networkServers/networkServerConfigValidation";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
@@ -206,7 +207,7 @@ export function registerNetworkServerCommands(
     const form = networkServerFormDefinition(kind, seed, { interfaceOptions: networkInterfaceBindOptions() });
     WebviewFormPanel.open(`network-server-edit-${kind}`, form, {
       onSubmit: async (values) => {
-        const problem = kind === "dhcp" ? validateDhcpValues(values) : undefined;
+        const problem = kind === "dhcp" ? validateDhcpValues(values) : validateTftpFormInput(values);
         if (problem) {
           // Thrown, not reported here: WebviewFormPanel turns this into a
           // "Save failed" message and leaves the panel open with the input.

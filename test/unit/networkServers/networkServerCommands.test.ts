@@ -258,6 +258,20 @@ describe("registerNetworkServerCommands — edit", () => {
     ]);
   });
 
+  it.each([
+    ["a malformed interface", { interface: "not-an-ip" }, /Interface/],
+    ["a fractional port", { port: "1.5" }, /Port/],
+    ["an out-of-range port", { port: "65536" }, /Port/],
+    ["an oversized root", { root: "x".repeat(4_097) }, /Root/],
+  ])("writes no TFTP settings for %s", async (_label, values, error) => {
+    const manager = fakeManager();
+    const cmd = register(fakeContext(manager));
+    await cmd("nexus.networkServer.edit")("tftp");
+
+    await expect(formPanelOpens[0].handlers.onSubmit(values)).rejects.toThrow(error);
+    expect(configUpdates).toEqual([]);
+  });
+
   it("parses the DHCP comma list and well-formed MAC=IP reservation textarea", async () => {
     const manager = fakeManager();
     const cmd = register(fakeContext(manager));

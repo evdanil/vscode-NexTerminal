@@ -176,7 +176,7 @@ describe("NetworkServerManager — settings resolution", () => {
     expect(config.interface).toBeUndefined();
   });
 
-  it("reads and trims configured TFTP values, clamping the port into range", () => {
+  it("reads and trims configured valid TFTP values", () => {
     mockConfig.set("nexus.networkServers.tftp.root", "  /srv/tftp  ");
     mockConfig.set("nexus.networkServers.tftp.port", 6900);
     mockConfig.set("nexus.networkServers.tftp.allowWrite", true);

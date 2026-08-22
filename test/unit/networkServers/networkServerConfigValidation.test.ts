@@ -3,8 +3,11 @@ import {
   MAX_DHCP_POOL_SIZE,
   parseDhcpConfig,
   parseNetworkServerConfigs,
+  sanitizeDhcpConfig,
+  sanitizeTftpConfig,
   type ValidationResult,
   validateDhcpFormInput,
+  validateTftpFormInput,
 } from "../../../src/services/networkServers/networkServerConfigValidation";
 
 function expectValid<T>(result: ValidationResult<T>): T {
@@ -39,6 +42,16 @@ const VALID_DHCP = {
   vendorClassId: "PXEClient",
   vendorSpecificOptions: [{ subOption: 1, value: "controller" }],
 };
+
+function staticReservations(count: number): Record<string, string> {
+  const reservations: Record<string, string> = {};
+  for (let index = 0; index < count; index += 1) {
+    const octets = [2, 0, 0, (index >>> 8) & 255, index & 255, 1];
+    const mac = octets.map((octet) => octet.toString(16).padStart(2, "0")).join(":");
+    reservations[mac] = `10.1.${Math.floor(index / 254)}.${(index % 254) + 1}`;
+  }
+  return reservations;
+}
 
 describe("network-server configuration validation", () => {
   it("uses omitted optional values so adapters retain their documented defaults", () => {
@@ -112,6 +125,99 @@ describe("network-server configuration validation", () => {
     );
   });
 
+  it("accepts exact lower and upper operational validation boundaries", () => {
+    expectValid(parseNetworkServerConfigs({
+      tftp: { root: "x", port: 0, interface: "0.0.0.0" },
+      dhcp: {
+        ...VALID_DHCP,
+        bootFileName: "x".repeat(255),
+        leaseTimeSec: 60,
+        dns: Array.from({ length: 16 }, () => "1.1.1.1"),
+        tftpServerAddresses: Array.from({ length: 16 }, () => "10.0.0.2"),
+        vendorSpecificOptions: [{ subOption: 1, value: "x".repeat(253) }],
+      },
+    }));
+    expectValid(parseNetworkServerConfigs({ tftp: { root: "x".repeat(4_096), port: 65_535 } }));
+    expectValid(parseDhcpConfig({
+      ...VALID_DHCP,
+      dns: [],
+      tftpServerAddresses: [],
+      static: {},
+      vendorSpecificOptions: [],
+      leaseTimeSec: 604_800,
+    }));
+  });
+
+  it("rejects values immediately beyond every bounded parser boundary", () => {
+    expectInvalid(parseNetworkServerConfigs({ tftp: { root: "x".repeat(4_097), port: 65_536 } }), "tftp");
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, bootFileName: "x".repeat(256) }), "dhcp.bootFileName");
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, dns: Array.from({ length: 17 }, () => "1.1.1.1") }), "dhcp.dns");
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, tftpServerAddresses: Array.from({ length: 17 }, () => "10.0.0.2") }), "dhcp.tftpServerAddresses");
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, leaseTimeSec: 604_801 }), "dhcp.leaseTimeSec");
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, vendorSpecificOptions: [{ subOption: 1, value: "x".repeat(254) }] }), "dhcp.vendorSpecificOptions");
+  });
+
+  it("accepts exact static/vendor entry limits and rejects the first excess entry", () => {
+    expectValid(parseDhcpConfig({
+      ...VALID_DHCP,
+      static: staticReservations(1_024),
+      vendorSpecificOptions: Array.from({ length: 64 }, (_, index) => ({ subOption: index + 1, value: "x" })),
+    }));
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, static: staticReservations(1_025) }), "dhcp.static");
+    expectInvalid(
+      parseDhcpConfig({
+        ...VALID_DHCP,
+        vendorSpecificOptions: Array.from({ length: 65 }, (_, index) => ({ subOption: index + 1, value: "x" })),
+      }),
+      "dhcp.vendorSpecificOptions",
+    );
+  });
+
+  it("drops an over-limit vendor TLV field when settings are tolerated", () => {
+    const exact = sanitizeDhcpConfig({ vendorSpecificOptions: [{ subOption: 1, value: "x".repeat(253) }] });
+    expect(exact.value.vendorSpecificOptions).toEqual([{ subOption: 1, value: "x".repeat(253) }]);
+    expect(exact.warnings).toEqual([]);
+
+    const oversize = sanitizeDhcpConfig({ vendorSpecificOptions: [{ subOption: 1, value: "x".repeat(254) }] });
+    expect(oversize.value.vendorSpecificOptions).toBeUndefined();
+    expect(oversize.warnings.join(" ")).toContain("256 bytes");
+  });
+
+  it("returns pathful validation results without coercing hostile root or nested values", () => {
+    const hostile = {
+      toString(): never {
+        throw new Error("unexpected coercion");
+      },
+      valueOf(): never {
+        throw new Error("unexpected coercion");
+      },
+    };
+
+    expect(() => parseDhcpConfig(hostile)).not.toThrow();
+    expectInvalid(parseDhcpConfig({ gateway: hostile }), "dhcp.gateway");
+    expect(() => parseNetworkServerConfigs(hostile)).not.toThrow();
+    expect(() => sanitizeDhcpConfig(hostile)).not.toThrow();
+    expect(() => sanitizeTftpConfig(hostile)).not.toThrow();
+    expect(() => sanitizeDhcpConfig({ gateway: hostile })).not.toThrow();
+    expect(() => sanitizeTftpConfig({ interface: hostile })).not.toThrow();
+    expect(() => validateDhcpFormInput(hostile)).not.toThrow();
+    expect(() => validateDhcpFormInput({ gateway: hostile })).not.toThrow();
+    expect(validateDhcpFormInput({ gateway: hostile })).toContain("Gateway");
+    expect(() => validateTftpFormInput(hostile)).not.toThrow();
+    expect(() => validateTftpFormInput({ interface: hostile })).not.toThrow();
+  });
+
+  it("uses the shared parser for TFTP form values while reserving port zero for non-form DTOs", () => {
+    expect(validateTftpFormInput({ root: "/srv/tftp", port: "69", allowWrite: "on", interface: "192.168.2.1" })).toBeUndefined();
+    expect(validateTftpFormInput({ port: "1" })).toBeUndefined();
+    expect(validateTftpFormInput({ port: "65535" })).toBeUndefined();
+    expect(validateTftpFormInput({ interface: "not-an-ip" })).toContain("Interface");
+    expect(validateTftpFormInput({ port: "1.5" })).toContain("Port");
+    expect(validateTftpFormInput({ port: "0" })).toContain("between 1 and 65535");
+    expect(validateTftpFormInput({ port: "65536" })).toContain("Port");
+    expect(validateTftpFormInput({ root: "x".repeat(4_097) })).toContain("Root");
+  });
+
   it("rejects unknown keys at every daemon DTO level", () => {
     expectInvalid(parseNetworkServerConfigs({ ftp: {} }), "configs.ftp");
     expectInvalid(parseNetworkServerConfigs({ dhcp: { ...VALID_DHCP, unexpected: true } }), "dhcp.unexpected");
@@ -125,5 +231,13 @@ describe("network-server configuration validation", () => {
     expect(validateDhcpFormInput({ rangeStart: "192.168.2.200", rangeEnd: "192.168.2.100" })).toBe(
       "Pool Start (192.168.2.200) must not be higher than Pool End (192.168.2.100).",
     );
+  });
+
+  it("treats any explicitly supplied invalid pool count as a form error", () => {
+    for (const value of ["not-a-number", Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, 1.5, 0, -1, 65_537]) {
+      expect(validateDhcpFormInput({ poolCount: value })).toMatch(/Pool Count/);
+    }
+    expect(validateDhcpFormInput({})).toBeUndefined();
+    expect(validateDhcpFormInput({ rangeStart: "10.0.0.0", poolCount: 65_536 })).toBeUndefined();
   });
 });

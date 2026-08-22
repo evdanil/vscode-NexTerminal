@@ -657,7 +657,7 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "dhcpServer",
     subgroup: "Address Pool",
     description:
-      "Lease duration handed to clients (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum.",
+      "Lease duration handed to clients (option 51). Values below 60 seconds — shorter leases make clients renew faster than the server can meaningfully track — or above 7 days fall back to the 24-hour default.",
     min: 60,
     max: 604800,
     unit: "seconds",

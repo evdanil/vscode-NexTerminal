@@ -51,6 +51,32 @@ function hasConfiguredValue(record: Record<string, unknown>, key: string): boole
   return hasOwn(record, key) && record[key] !== undefined;
 }
 
+/** Describes an untrusted value without invoking its coercion hooks. */
+function safeValueDescription(value: unknown): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "string":
+      return value;
+    case "number":
+      if (Number.isNaN(value)) return "NaN";
+      if (value === Number.POSITIVE_INFINITY) return "Infinity";
+      if (value === Number.NEGATIVE_INFINITY) return "-Infinity";
+      return `${value}`;
+    case "boolean":
+      return value ? "true" : "false";
+    case "undefined":
+      return "undefined";
+    case "bigint":
+      return "bigint";
+    case "symbol":
+      return "symbol";
+    case "function":
+      return "function";
+    default:
+      return "object";
+  }
+}
+
 function pushUnknownKeys(record: Record<string, unknown>, allowed: readonly string[], path: string, errors: string[]): void {
   const known = new Set(allowed);
   for (const key of Object.keys(record)) {
@@ -77,7 +103,7 @@ function ipv4ToInt(value: string): number | undefined {
 
 function parseIpv4(value: unknown, path: string, label: string, errors: string[]): { readonly value: string; readonly numeric: number } | undefined {
   if (typeof value !== "string") {
-    errors.push(`${path}: ${label} must be a dotted-quad IPv4 address (got "${String(value)}").`);
+    errors.push(`${path}: ${label} must be a dotted-quad IPv4 address (got "${safeValueDescription(value)}").`);
     return undefined;
   }
   const numeric = ipv4ToInt(value);
@@ -228,6 +254,7 @@ function parseVendorSpecificOptions(value: unknown, path: string, errors: string
   }
   if (totalBytes > MAX_DHCP_STRING_BYTES) {
     errors.push(`${path}: Vendor option 43 payload is ${totalBytes} bytes; the maximum is ${MAX_DHCP_STRING_BYTES}.`);
+    return undefined;
   }
   return parsed;
 }
@@ -484,27 +511,30 @@ export function sanitizeDhcpConfig(value: unknown): { readonly value: DhcpAdapte
     if (options && options.length > 0) parsed.vendorSpecificOptions = options;
   }
 
-  const rangeStartIsUsable = !hasConfiguredValue(value, "rangeStart") || numericRanges.rangeStart !== undefined;
-  const rangeEndIsUsable = !hasConfiguredValue(value, "rangeEnd") || numericRanges.rangeEnd !== undefined;
-  if (rangeStartIsUsable && rangeEndIsUsable && (numericRanges.rangeStart !== undefined || numericRanges.rangeEnd !== undefined)) {
+  if (numericRanges.rangeStart !== undefined || numericRanges.rangeEnd !== undefined) {
     const rangeStart = numericRanges.rangeStart ?? ipv4ToInt(DEFAULTS.rangeStart)!;
     const rangeEnd = numericRanges.rangeEnd ?? ipv4ToInt(DEFAULTS.rangeEnd)!;
-    const hasExplicitPair = numericRanges.rangeStart !== undefined && numericRanges.rangeEnd !== undefined;
     if (rangeStart > rangeEnd || rangeEnd - rangeStart + 1 > MAX_DHCP_POOL_SIZE) {
       const start = parsed.rangeStart ?? DEFAULTS.rangeStart;
       const end = parsed.rangeEnd ?? DEFAULTS.rangeEnd;
       if (rangeStart > rangeEnd) {
-        warnings.push(`dhcp.rangeStart: Pool Start (${start}) is above Pool End (${end}), which describes an empty pool.`);
+        if (numericRanges.rangeStart !== undefined) {
+          warnings.push(`dhcp.rangeStart: Pool Start (${start}) is above Pool End (${end}), which describes an empty pool.`);
+          delete parsed.rangeStart;
+        }
+        if (numericRanges.rangeEnd !== undefined) {
+          warnings.push(`dhcp.rangeEnd: Pool Start (${start}) is above Pool End (${end}), which describes an empty pool.`);
+          delete parsed.rangeEnd;
+        }
       } else {
-        warnings.push(`dhcp.rangeEnd: DHCP pool size must not exceed ${MAX_DHCP_POOL_SIZE.toLocaleString("en-US")} addresses.`);
-      }
-      if (hasExplicitPair) {
-        delete parsed.rangeStart;
-        delete parsed.rangeEnd;
-      } else if (numericRanges.rangeStart !== undefined) {
-        delete parsed.rangeStart;
-      } else {
-        delete parsed.rangeEnd;
+        if (numericRanges.rangeStart !== undefined) {
+          warnings.push(`dhcp.rangeStart: DHCP pool size must not exceed ${MAX_DHCP_POOL_SIZE.toLocaleString("en-US")} addresses.`);
+          delete parsed.rangeStart;
+        }
+        if (numericRanges.rangeEnd !== undefined) {
+          warnings.push(`dhcp.rangeEnd: DHCP pool size must not exceed ${MAX_DHCP_POOL_SIZE.toLocaleString("en-US")} addresses.`);
+          delete parsed.rangeEnd;
+        }
       }
     }
   }
@@ -550,6 +580,38 @@ function formNumber(values: Record<string, unknown>, key: string): unknown {
   return Number.isFinite(parsed) ? parsed : value;
 }
 
+function formBoolean(values: Record<string, unknown>, key: string): unknown {
+  const value = formString(values, key);
+  if (value === "on" || value === "true") return true;
+  if (value === "off" || value === "false") return false;
+  return value;
+}
+
+interface FormPoolCount {
+  readonly value?: number;
+  readonly error?: string;
+}
+
+function parseFormPoolCount(values: Record<string, unknown>): FormPoolCount {
+  if (!hasOwn(values, "poolCount") || values.poolCount === undefined) return {};
+  const raw = values.poolCount;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) {
+      return { error: 'Pool Count must be a whole number of at least 1 (got "").' };
+    }
+    value = Number(trimmed);
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    return { error: `Pool Count must be a safe whole number of at least 1 (got "${safeValueDescription(raw)}").` };
+  }
+  if (value > MAX_DHCP_POOL_SIZE) {
+    return { error: `Pool Count must not exceed ${MAX_DHCP_POOL_SIZE.toLocaleString("en-US")} addresses.` };
+  }
+  return { value };
+}
+
 function intToIpv4(value: number): string {
   return [
     Math.floor(value / 16_777_216) % 256,
@@ -559,10 +621,8 @@ function intToIpv4(value: number): string {
   ].join(".");
 }
 
-function formRangeEnd(values: Record<string, unknown>, rangeStart: unknown): string | undefined {
-  if (!hasOwn(values, "poolCount")) return undefined;
-  const count = formNumber(values, "poolCount");
-  if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 1) return undefined;
+function formRangeEnd(count: number | undefined, rangeStart: unknown): string | undefined {
+  if (count === undefined) return undefined;
   const start = typeof rangeStart === "string" ? ipv4ToInt(rangeStart) : undefined;
   const effectiveStart = start ?? ipv4ToInt(DEFAULTS.rangeStart);
   if (effectiveStart === undefined) return undefined;
@@ -619,7 +679,27 @@ function formVendorSpecificOptions(values: Record<string, unknown>): unknown {
  * It deliberately strips only the parser's leading field path; validation is
  * still performed by the same daemon-safe field validators.
  */
-export function validateDhcpFormInput(values: Record<string, unknown>): string | undefined {
+export function validateTftpFormInput(input: unknown): string | undefined {
+  if (!isPlainRecord(input)) return "TFTP form values must be an object.";
+  const values = input;
+  const config: Record<string, unknown> = {};
+  for (const key of ["root", "port", "interface"] as const) {
+    const value = key === "port" ? formNumber(values, key) : formString(values, key);
+    if (value !== undefined) config[key] = value;
+  }
+  const allowWrite = formBoolean(values, "allowWrite");
+  if (allowWrite !== undefined) config.allowWrite = allowWrite;
+  const result = parseNetworkServerConfigs({ tftp: config });
+  if (!result.ok) return result.errors[0]?.replace(/^tftp\.[^:]+:\s*/, "");
+  if (config.port === 0) return `Port must be a safe whole number between 1 and ${MAX_PORT}.`;
+  return undefined;
+}
+
+export function validateDhcpFormInput(input: unknown): string | undefined {
+  if (!isPlainRecord(input)) return "DHCP form values must be an object.";
+  const values = input;
+  const poolCount = parseFormPoolCount(values);
+  if (poolCount.error) return poolCount.error;
   const config: Record<string, unknown> = {};
   const fields: ReadonlyArray<readonly [string, string]> = [
     ["rangeStart", "rangeStart"], ["rangeEnd", "rangeEnd"], ["subnet", "subnet"], ["gateway", "gateway"],
@@ -629,7 +709,7 @@ export function validateDhcpFormInput(values: Record<string, unknown>): string |
     const value = formString(values, formKey);
     if (value !== undefined) config[configKey] = value;
   }
-  const derivedRangeEnd = formRangeEnd(values, config.rangeStart);
+  const derivedRangeEnd = formRangeEnd(poolCount.value, config.rangeStart);
   if (derivedRangeEnd !== undefined) config.rangeEnd = derivedRangeEnd;
   const arrays: ReadonlyArray<readonly [string, string]> = [
     ["dns", "dns"], ["tftpServerAddresses", "tftpServerAddresses"],

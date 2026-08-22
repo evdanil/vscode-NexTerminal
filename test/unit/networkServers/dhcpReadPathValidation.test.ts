@@ -246,6 +246,65 @@ describe("readDhcpConfig — shared parser coverage", () => {
     expect(warnings.calls()).toHaveLength(1);
     warnings.restore();
   });
+
+  it("drops a valid low end when a malformed start would pair it with an inverted default", () => {
+    const warnings = captureWarnings();
+    set("rangeStart", "not-an-ip");
+    set("rangeEnd", "192.168.2.1");
+
+    const config = readDhcpConfig();
+
+    expect(config.rangeStart).toBeUndefined();
+    expect(config.rangeEnd).toBeUndefined();
+    expect(warnings.calls().join(" ")).toContain("dhcp.rangeEnd");
+    warnings.restore();
+  });
+
+  it("drops a valid distant start when a malformed end would create an over-cap default pool", () => {
+    const warnings = captureWarnings();
+    set("rangeStart", "10.0.0.10");
+    set("rangeEnd", "not-an-ip");
+
+    const config = readDhcpConfig();
+
+    expect(config.rangeStart).toBeUndefined();
+    expect(config.rangeEnd).toBeUndefined();
+    expect(warnings.calls().join(" ")).toContain("dhcp.rangeStart");
+    warnings.restore();
+  });
+
+  it("drops a supplied endpoint that conflicts with an omitted default counterpart", () => {
+    const warnings = captureWarnings();
+    set("rangeEnd", "192.168.2.1");
+
+    const config = readDhcpConfig();
+
+    expect(config.rangeEnd).toBeUndefined();
+    expect(warnings.calls().join(" ")).toContain("dhcp.rangeEnd");
+    warnings.restore();
+  });
+
+  it("keeps exactly 65,536 range addresses but drops 65,537", () => {
+    const warnings = captureWarnings();
+    set("rangeStart", "10.0.0.0");
+    set("rangeEnd", "10.0.255.255");
+    expect(readDhcpConfig()).toMatchObject({ rangeStart: "10.0.0.0", rangeEnd: "10.0.255.255" });
+
+    set("rangeEnd", "10.1.0.0");
+    expect(readDhcpConfig().rangeStart).toBeUndefined();
+    expect(readDhcpConfig().rangeEnd).toBeUndefined();
+    expect(warnings.calls().join(" ")).toContain("65,536");
+    warnings.restore();
+  });
+
+  it("defaults an over-limit vendor TLV aggregate instead of forwarding the parsed entries", () => {
+    const warnings = captureWarnings();
+    set("vendorSpecificOptions", [{ subOption: 1, value: "x".repeat(254) }]);
+
+    expect(readDhcpConfig().vendorSpecificOptions).toBeUndefined();
+    expect(warnings.calls().join(" ")).toContain("256 bytes");
+    warnings.restore();
+  });
 });
 
 describe("readTftpConfig — shared parser coverage", () => {

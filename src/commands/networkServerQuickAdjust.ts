@@ -523,7 +523,7 @@ function dhcpQuickItems(): QuickAdjustItem[] {
           kind: "dhcp",
           key: "leaseTimeSec",
           title: "DHCP — Lease Time (seconds)",
-          prompt: "Lease duration handed to clients (option 51). Clamped to 60 seconds minimum and 7 days maximum.",
+          prompt: "Lease duration handed to clients (option 51). Values below 60 seconds or above 7 days fall back to the 24-hour default.",
           placeholder: String(DEFAULTS.leaseTimeSec),
           current: leaseTimeSec,
           min: 60,

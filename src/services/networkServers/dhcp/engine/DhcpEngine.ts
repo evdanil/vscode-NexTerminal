@@ -168,8 +168,8 @@ export interface DhcpEngineConfig {
   /** Option 67 — bootfile a PXE/ZTP client should fetch (e.g. `ios-image.bin`). */
   readonly bootFileName?: string;
   /**
-   * Option 66 — the TFTP server clients fetch {@link bootFileName} from,
-   * as a name or a dotted-quad address.
+   * Option 66 — the IPv4 TFTP-server address clients fetch
+   * {@link bootFileName} from.
    *
    * **Not** the BOOTP `siaddr` header field: `dhcp@0.2.20` hardcodes `siaddr`
    * to the server identifier in `sendOffer`/`sendAck` (dhcp.js:383, :426) with
@@ -401,7 +401,7 @@ export class DhcpEngine extends EventEmitter {
   public get bindAddress(): string { return this._cfg.bindAddress ?? '0.0.0.0'; }
   /** Option 67 — bootfile name, or `undefined` when ZTP boot info is not served. */
   public get bootFileName(): string | undefined { return this._cfg.bootFileName; }
-  /** Option 66 — TFTP server name/address. */
+  /** Option 66 — TFTP server IPv4 address. */
   public get nextServer(): string | undefined { return this._cfg.nextServer; }
   /** Option 150 — Cisco TFTP server address list. */
   public get tftpServerAddresses(): readonly string[] | undefined { return this._cfg.tftpServerAddresses; }

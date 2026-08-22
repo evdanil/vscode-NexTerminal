@@ -231,6 +231,18 @@ describe("DHCP submit validation — rejected input", () => {
     expect(configUpdates).toEqual([]);
   });
 
+  it.each(["not-a-number", Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, 1.5, 0, -1, 65_537])(
+    "rejects explicit invalid poolCount %s before writing settings",
+    async (poolCount) => {
+      await expect(submitDhcp({ poolCount })).rejects.toThrow(/Pool Count/);
+      expect(configUpdates).toEqual([]);
+    }
+  );
+
+  it("accepts the exact 65,536-address pool-count boundary", async () => {
+    await expect(submitDhcp({ rangeStart: "10.0.0.0", subnet: "255.0.0.0", poolCount: 65_536 })).resolves.toBeUndefined();
+  });
+
   it("rejects malformed DNS before writing any form settings through the shared parser", async () => {
     await expect(submitDhcp({ ...VALID, dns: "1.1.1.1, not-an-ip" })).rejects.toThrow(
       'DNS server must be a dotted-quad IPv4 address (got "not-an-ip").'
