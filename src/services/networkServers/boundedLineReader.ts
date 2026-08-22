@@ -11,6 +11,11 @@ type PendingEvent =
   | { readonly type: "data"; readonly value: Buffer | string; readonly queuedBytes: number }
   | { readonly type: "end" };
 
+interface PendingNode {
+  readonly event: PendingEvent;
+  next: PendingNode | undefined;
+}
+
 /**
  * Attaches a byte-bounded JSON-line reader to a stream.
  *
@@ -28,10 +33,17 @@ export function attachBoundedLineReader(
   let active = true;
   let bufferedBytes = 0;
   let fragments: Buffer[] = [];
-  let pendingEvents: PendingEvent[] = [];
+  let pendingHead: PendingNode | undefined;
+  let pendingTail: PendingNode | undefined;
   let queuedBytes = 0;
   let processing = false;
   let endQueued = false;
+
+  const clearPending = (): void => {
+    pendingHead = undefined;
+    pendingTail = undefined;
+    queuedBytes = 0;
+  };
 
   const clear = (): void => {
     bufferedBytes = 0;
@@ -42,8 +54,7 @@ export function attachBoundedLineReader(
     if (!active) return;
     active = false;
     clear();
-    pendingEvents = [];
-    queuedBytes = 0;
+    clearPending();
     stream.removeListener("data", onData);
     stream.removeListener("end", onEnd);
   };
@@ -72,6 +83,22 @@ export function attachBoundedLineReader(
     if (Buffer.isBuffer(value)) value.copy(snapshot);
     else snapshot.write(value, 0, length, "utf8");
     return snapshot;
+  };
+
+  const enqueue = (event: PendingEvent): void => {
+    const node: PendingNode = { event, next: undefined };
+    if (pendingTail) pendingTail.next = node;
+    else pendingHead = node;
+    pendingTail = node;
+  };
+
+  const dequeue = (): PendingEvent | undefined => {
+    const node = pendingHead;
+    if (!node) return undefined;
+    pendingHead = node.next;
+    if (!pendingHead) pendingTail = undefined;
+    node.next = undefined;
+    return node.event;
   };
 
   const processData = (value: Buffer | string): void => {
@@ -113,10 +140,10 @@ export function attachBoundedLineReader(
   const drain = (): void => {
     if (processing || !active) return;
     processing = true;
-    let index = 0;
     try {
-      while (active && index < pendingEvents.length) {
-        const event = pendingEvents[index++]!;
+      while (active) {
+        const event = dequeue();
+        if (!event) break;
         if (event.type === "data") {
           queuedBytes -= event.queuedBytes;
           processData(event.value);
@@ -124,8 +151,7 @@ export function attachBoundedLineReader(
         else processEnd();
       }
     } finally {
-      pendingEvents = [];
-      queuedBytes = 0;
+      clearPending();
       processing = false;
     }
   };
@@ -135,7 +161,7 @@ export function attachBoundedLineReader(
     const length = byteLength(value);
     if (length === 0) return;
     if (!processing) {
-      pendingEvents.push({ type: "data", value, queuedBytes: 0 });
+      enqueue({ type: "data", value, queuedBytes: 0 });
       drain();
       return;
     }
@@ -143,7 +169,7 @@ export function attachBoundedLineReader(
       rejectOversize();
       return;
     }
-    pendingEvents.push({ type: "data", value: snapshotQueuedInput(value, length), queuedBytes: length });
+    enqueue({ type: "data", value: snapshotQueuedInput(value, length), queuedBytes: length });
     queuedBytes += length;
     drain();
   };
@@ -151,7 +177,7 @@ export function attachBoundedLineReader(
   const onEnd = (): void => {
     if (!active || endQueued) return;
     endQueued = true;
-    pendingEvents.push({ type: "end" });
+    enqueue({ type: "end" });
     drain();
   };
 
