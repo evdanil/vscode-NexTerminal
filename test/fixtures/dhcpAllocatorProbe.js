@@ -10,11 +10,13 @@ const OCCUPIED_ADDRESS = "192.0.2.10";
 const mode = process.env.DHCP_ALLOCATOR_PROBE_MODE || "select-exhausted";
 const range = mode === "select-oversized"
   ? ["0.0.0.0", "255.255.255.255"]
-  : [OCCUPIED_ADDRESS, OCCUPIED_ADDRESS];
+  : mode === "select-cap-boundary"
+    ? ["192.0.0.0", "192.0.255.255"]
+    : [OCCUPIED_ADDRESS, OCCUPIED_ADDRESS];
 
 const server = dhcp.createServer({
   range,
-  randomIP: true,
+  randomIP: mode !== "select-cap-boundary",
   static: {},
   server: "192.0.2.1",
   leaseTime: 3600
@@ -45,6 +47,18 @@ if (mode === "select-exhausted") {
   value = server._selectAddress(REQUESTING_MAC, request);
 } else if (mode === "select-oversized") {
   value = server._selectAddress(REQUESTING_MAC, request);
+} else if (mode === "select-cap-boundary") {
+  const tooWide = dhcp.createServer({
+    range: ["192.0.0.0", "192.1.0.0"],
+    randomIP: false,
+    static: {},
+    server: "198.51.100.1",
+    leaseTime: 3600
+  });
+  value = {
+    max: server._selectAddress(REQUESTING_MAC, request),
+    over: tooWide._selectAddress(REQUESTING_MAC, request)
+  };
 } else if (mode === "discover-exhausted") {
   let offers = 0;
   const exhausted = [];

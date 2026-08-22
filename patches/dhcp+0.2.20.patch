@@ -1,5 +1,5 @@
 diff --git a/node_modules/dhcp/lib/dhcp.js b/node_modules/dhcp/lib/dhcp.js
-index e009e81..61f4166 100644
+index e009e81..775030b 100644
 --- a/node_modules/dhcp/lib/dhcp.js
 +++ b/node_modules/dhcp/lib/dhcp.js
 @@ -6,6 +6,8 @@
@@ -249,7 +249,7 @@ index e009e81..61f4166 100644
  
      this.sendAck(req);
    },
-@@ -470,8 +506,23 @@ Server.prototype = {
+@@ -470,8 +506,25 @@ Server.prototype = {
      this._send(this.config('broadcast'), ans);
    },
  
@@ -257,13 +257,15 @@ index e009e81..61f4166 100644
 +  handleRelease: function(req) {
 +    const lease = this._state[req.chaddr];
 +    const clientId = req.options[61] === undefined ? null : req.options[61];
-+    const leaseClientId = lease && lease.clientId === undefined ? null : lease && lease.clientId;
++    // Legacy restored leases have unknown identity (undefined). New leases
++    // record either known absence (null) or the exact option-61 string.
++    const identityMismatch = lease && lease.clientId !== undefined && lease.clientId !== clientId;
 +
 +    if (
 +      !lease ||
 +      lease.state !== 'BOUND' ||
 +      lease.address !== req.ciaddr ||
-+      leaseClientId !== clientId
++      identityMismatch
 +    ) {
 +      return;
 +    }

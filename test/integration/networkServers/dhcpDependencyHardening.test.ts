@@ -1,11 +1,18 @@
 /** @author kanekitakitos */
 
 import { fork, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as dhcp from "dhcp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { toRestoredLeaseState } from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
+import {
+  LEASE_STORE_VERSION,
+  loadLeases,
+  reconcilePersistedLeases,
+  toRestoredLeaseState
+} from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
 import type { DhcpLeaseInfo } from "../../../src/services/networkServers/dhcp/engine/dhcpLeaseUtils";
 
 const FIXTURE = path.resolve(__dirname, "..", "..", "fixtures", "dhcpAllocatorProbe.js");
@@ -177,6 +184,16 @@ describe("dhcp@0.2.20 dependency hardening", () => {
     await expect(runAllocatorProbe("select-oversized")).resolves.toEqual({ type: "result", value: null });
   });
 
+  it("accepts exactly 65,536 addresses and rejects 65,537 before scanning", async () => {
+    await expect(runAllocatorProbe("select-cap-boundary")).resolves.toEqual({
+      type: "result",
+      value: {
+        max: "192.0.0.0",
+        over: null
+      }
+    });
+  });
+
   it("can select the inclusive last address from a randomized range", () => {
     const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"], true);
     vi.spyOn(Math, "random").mockReturnValue(0.999);
@@ -332,6 +349,23 @@ describe("dhcp@0.2.20 dependency hardening", () => {
     expect(released).toEqual([]);
   });
 
+  it("preserves a known-null lease when RELEASE unexpectedly carries a client identifier", () => {
+    const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+    const mac = "AA-BB-CC-00-00-01";
+    server.sendOffer = () => undefined;
+    server.handleDiscover({ chaddr: mac, ciaddr: "0.0.0.0", options: {} });
+    server._state[mac].state = "BOUND";
+    server._state[mac].bindTime = new Date();
+    const released: Array<[string, string]> = [];
+    server.on("released", (releasedMac: string, address: string) => released.push([releasedMac, address]));
+
+    server._sock.emit("message", buildRelease(mac, "192.0.2.10", "client-a"));
+
+    expect(server._state[mac].clientId).toBeNull();
+    expect(server._state[mac].address).toBe("192.0.2.10");
+    expect(released).toEqual([]);
+  });
+
   it("preserves a lease when RELEASE carries a different hardware address", () => {
     const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
     const mac = "AA-BB-CC-00-00-01";
@@ -418,5 +452,55 @@ describe("dhcp@0.2.20 dependency hardening", () => {
 
     expect(server._state).not.toHaveProperty(mac);
     expect(released).toEqual([[mac, "192.0.2.10"]]);
+  });
+
+  it("releases a legacy disk-restored lease with unknown identity after exact MAC and ciaddr match", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-dhcp-legacy-release-"));
+    try {
+      const storePath = path.join(tempDir, "dhcp-leases.json");
+      const now = Date.now();
+      const mac = "AA-BB-CC-00-00-01";
+      fs.writeFileSync(
+        storePath,
+        JSON.stringify({
+          version: LEASE_STORE_VERSION,
+          savedAt: now,
+          leases: [{
+            mac,
+            ip: "192.0.2.10",
+            boundAt: now - 1_000,
+            leaseSec: 3600,
+            expiresAt: now + 3_599_000,
+            remainingSec: 3599,
+            hostname: null,
+            leaseType: "dynamic"
+          }]
+        }),
+        "utf8"
+      );
+      const loaded = loadLeases(storePath);
+      const { restored } = reconcilePersistedLeases(loaded, {
+        staticMap: {},
+        rangeStart: "192.0.2.10",
+        rangeEnd: "192.0.2.11",
+        now
+      });
+      expect(restored).toHaveLength(1);
+      expect(restored[0]).not.toHaveProperty("clientId");
+
+      const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+      server._state[mac] = toRestoredLeaseState(restored[0], "192.0.2.1");
+      expect(server._state[mac].clientId).toBeUndefined();
+      const released: Array<[string, string]> = [];
+      server.on("released", (releasedMac: string, address: string) => released.push([releasedMac, address]));
+
+      server._sock.emit("message", buildRelease(mac, "192.0.2.10", "legacy-client"));
+
+      expect(server._state).not.toHaveProperty(mac);
+      expect(released).toEqual([[mac, "192.0.2.10"]]);
+      expect(server._selectAddress(REQUEST.chaddr, REQUEST)).toBe("192.0.2.10");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });
