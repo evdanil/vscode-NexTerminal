@@ -9795,6 +9795,63 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.macroPolicy"></span>
 </div>
 
+  <h3 id="section-localServers">Local Servers</h3>
+  <h4 class="settings-subgroup">Auto-Restart</h4>
+  <div class="form-group">
+  <label for="setting-nexus-localServers-defaultMaxAutoRestarts">Default Max Auto-Restarts</label>
+  <div class="setting-desc">Maximum automatic restarts per local server when auto-restart is enabled and the profile sets no explicit limit of its own. 0 disables auto-restart globally. Restarts use exponential backoff and stop counting attempts once the server has run for the stable-runtime threshold.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-localServers-defaultMaxAutoRestarts" data-section="nexus.localServers" data-key="defaultMaxAutoRestarts" value="0" min="0" max="100" />
+    
+    <span class="range-hint">(0–100, default: 5)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.localServers.defaultMaxAutoRestarts"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.localServers.defaultMaxAutoRestarts"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-localServers-stableRuntimeMs">Stable Runtime Threshold</label>
+  <div class="setting-desc">Continuous runtime after which a local server counts as stable and its auto-restart attempt counter resets. Must be long enough to distinguish a real crash from a graceful exit triggered just after startup.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-localServers-stableRuntimeMs" data-section="nexus.localServers" data-key="stableRuntimeMs" value="1000" min="1000" max="600000" />
+    <span class="unit-suffix">ms</span>
+    <span class="range-hint">(1000–600000, default: 10000)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.localServers.stableRuntimeMs"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.localServers.stableRuntimeMs"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-localServers-initialBackoffMs">Initial Restart Backoff</label>
+  <div class="setting-desc">Delay before the first auto-restart. Each subsequent attempt doubles it, up to the maximum backoff.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-localServers-initialBackoffMs" data-section="nexus.localServers" data-key="initialBackoffMs" value="50" min="50" max="60000" />
+    <span class="unit-suffix">ms</span>
+    <span class="range-hint">(50–60000, default: 500)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.localServers.initialBackoffMs"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.localServers.initialBackoffMs"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-localServers-maxBackoffMs">Max Restart Backoff</label>
+  <div class="setting-desc">Ceiling for the exponential backoff delay between auto-restart attempts.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-localServers-maxBackoffMs" data-section="nexus.localServers" data-key="maxBackoffMs" value="100" min="100" max="600000" />
+    <span class="unit-suffix">ms</span>
+    <span class="range-hint">(100–600000, default: 30000)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.localServers.maxBackoffMs"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.localServers.maxBackoffMs"></span>
+</div>
+  <h4 class="settings-subgroup">Security</h4>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-localServers-restrictToWorkspaceRoots">
+    <input type="checkbox" id="setting-nexus-localServers-restrictToWorkspaceRoots" data-section="nexus.localServers" data-key="restrictToWorkspaceRoots" checked />
+    Restrict Working Directories to Workspace
+  </label>
+  <span class="setting-badge">Safety limit</span>
+  <div class="setting-desc">Refuse to start a local server whose working directory resolves outside the currently-open workspace roots. Disabling this allows any absolute path, including system directories — turn it off only if you trust every profile in storage.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.localServers.restrictToWorkspaceRoots"></span>
+</div>
+
   <h3 id="section-importexport">Import / Export</h3>
   <div class="setting-desc">Create an encrypted backup or export a sanitized copy to share.</div>
   <div class="button-row">

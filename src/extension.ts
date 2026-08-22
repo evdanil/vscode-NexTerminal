@@ -5,6 +5,7 @@ import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/c
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
+import { registerLocalServerCommands } from "./commands/localServerCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
@@ -22,7 +23,8 @@ import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPo
 import { migrateGlobalStatusPollSetting } from "./services/inventory/statusPollSettingMigration";
 import { InventoryStatusDecorationProvider } from "./ui/inventoryStatusDecorationProvider";
 import { registerTerminalTabCommands } from "./commands/terminalTabCommands";
-import type { CommandContext, LocalShellTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
+import type { CommandContext, LocalShellTerminalMap, LocalServerTerminalMap, SerialTerminalMap, ServerTerminalMap, SessionTerminalMap } from "./commands/types";
+import { LocalServerManager, wireLocalServerTerminalCloseListener } from "./services/local/localServerManager";
 import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
 import { flushSessionTranscripts } from "./logging/sessionTranscriptLogger";
@@ -502,6 +504,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const sessionTerminals: SessionTerminalMap = new Map();
   const serialTerminals: SerialTerminalMap = new Map();
   const localShellTerminals: LocalShellTerminalMap = new Map();
+  const localServerTerminals: LocalServerTerminalMap = new Map();
 
   const highlighter = new TerminalHighlighter();
   const macroAutoTrigger = new MacroAutoTrigger();
@@ -518,9 +521,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
   // Reverse-lookup: given a VS Code Terminal, find the Nexus session id that owns it.
   const resolveTrackedSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
-    resolveSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
+    resolveSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals, localServerTerminals);
   const resolveScriptCapableSessionForTerminal = (terminal: vscode.Terminal | undefined): string | undefined =>
-    resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
+    resolveScriptSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals, localServerTerminals);
   const globalStoragePath = context.globalStorageUri.fsPath;
   SettingsPanel.setGlobalStoragePath(globalStoragePath);
   const scriptTreeProvider = new ScriptTreeProvider(scriptRuntimeManager, globalStoragePath);
@@ -727,6 +730,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     sessionTerminals,
     serialTerminals,
     localShellTerminals,
+    localServerTerminals,
     highlighter,
     macroAutoTrigger,
     sftpService,
@@ -782,6 +786,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // persisted by the nexus.files.followTerminal / unfollowTerminal commands.
   cwdSyncCoordinator.setFollowing(context.globalState.get<boolean>(FOLLOW_TERMINAL_STATE_KEY, false));
 
+  const localServerManager = new LocalServerManager({
+    core,
+    extensionPath: context.extensionPath,
+    terminals: localServerTerminals,
+    terminalRegistry,
+    outputChannel: localShellOutputChannel,
+    highlighter,
+    diagnostics: (line) => localShellOutputChannel.appendLine(`${new Date().toISOString()} [Local Server] ${line}`)
+  });
+  context.subscriptions.push(localServerManager);
+
   const nexusTreeProvider = new NexusTreeProvider({
     async onTunnelDropped(serverId, tunnelProfileId) {
       const profile = core.getTunnel(tunnelProfileId);
@@ -823,10 +838,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         if (profile) {
           await core.addOrUpdateSerialProfile({ ...profile, group: newGroup });
         }
-      } else {
+      } else if (itemType === "localShell") {
         const profile = core.getLocalShellProfile(itemId);
         if (profile) {
           await core.addOrUpdateLocalShellProfile({ ...profile, group: newGroup });
+        }
+      } else if (itemType === "localServer") {
+        const config = core.getLocalServer(itemId);
+        if (config) {
+          await core.addOrUpdateLocalServerConfig({ ...config, group: newGroup });
         }
       }
     },
@@ -1334,11 +1354,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const tunnelDisposables = registerTunnelCommands(ctx);
   const serialDisposables = registerSerialCommands(ctx);
   const localShellDisposables = registerLocalShellCommands(ctx);
+  const localServerCloseListener = wireLocalServerTerminalCloseListener({
+    core,
+    localServerTerminals,
+    manager: localServerManager
+  });
+  const localServerCtx = { ...ctx, localServerManager } as const;
+  const localServerDisposables = registerLocalServerCommands(localServerCtx);
   registerTerminalTabCommands(context, {
     registry: terminalRegistry,
     sessionTerminals: ctx.sessionTerminals,
     serialTerminals: ctx.serialTerminals,
-    localShellTerminals: ctx.localShellTerminals
+    localShellTerminals: ctx.localShellTerminals,
+    localServerTerminals: ctx.localServerTerminals
   });
   const profileDisposables = registerProfileCommands(ctx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
@@ -1493,6 +1521,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     ...tunnelDisposables,
     ...serialDisposables,
     ...localShellDisposables,
+    localServerCloseListener,
+    ...localServerDisposables,
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,

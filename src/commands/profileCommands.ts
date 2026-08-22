@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { UnifiedProfileSeed } from "../ui/formDefinitions";
 import { unifiedProfileFormDefinition, unifiedProfileFormId , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
-import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
+import { FolderTreeItem, LocalShellProfileTreeItem, LocalServerConfigTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { authProfileCredentialMirror, formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
 import { serverConfigsEqual, type ServerConfig } from "../models/config";
@@ -10,6 +10,7 @@ import { configMutationLock } from "../services/configMutationLock";
 import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { formValuesToSerial, scanForPort } from "./serialCommands";
 import { formValuesToLocalShell, getConfiguredVscodeTerminalProfileNames } from "./localShellCommands";
+import { formValuesToLocalServer } from "./localServerCommands";
 import type { CommandContext } from "./types";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import {
@@ -51,10 +52,12 @@ function isUnifiedProfileSeed(arg: unknown): arg is UnifiedProfileSeed {
   return candidate.profileType === "ssh" ||
     candidate.profileType === "serial" ||
     candidate.profileType === "localShell" ||
+    candidate.profileType === "localServer" ||
     candidate.addMode === "profile" ||
     candidate.addMode === "ssh" ||
     candidate.addMode === "serial" ||
     candidate.addMode === "localShell" ||
+    candidate.addMode === "localServer" ||
     typeof candidate.group === "string";
 }
 
@@ -69,7 +72,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
     vscodeTerminalProfileNames: getConfiguredVscodeTerminalProfileNames()
   });
   const addMode = seed?.addMode ?? "profile";
-  definition.testable = addMode !== "localShell";
+  definition.testable = addMode !== "localShell" && addMode !== "localServer";
   if (addMode === "profile") {
     definition.testableWhen = { field: "profileType", value: ["ssh", "serial"] };
   }
@@ -91,6 +94,12 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           throw new Error("Fill in the required local shell fields before saving.");
         }
         await ctx.core.addOrUpdateLocalShellProfile(profile);
+      } else if (values.profileType === "localServer") {
+        const config = formValuesToLocalServer(values);
+        if (!config) {
+          throw new Error("Fill in the required local server fields (Name, Executable) before saving.");
+        }
+        await ctx.core.addOrUpdateLocalServerConfig(config);
       } else {
         const builtServer = formValuesToServer(values);
         if (!builtServer) {
@@ -303,7 +312,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           return;
         }
         await vscode.commands.executeCommand("nexus.serial.testConnection", { profile: draft });
-      } else if (values.profileType === "localShell") {
+      } else if (values.profileType === "localShell" || values.profileType === "localServer") {
         return;
       } else {
         const draft = formValuesToServer(values);
@@ -385,6 +394,24 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
       if (picked) {
         await vscode.commands.executeCommand(picked.command, arg);
       }
+      return;
+    }
+
+    if (arg instanceof LocalServerConfigTreeItem) {
+      const picks: ProfileActionPick[] = [
+        { label: "Start Server", command: "nexus.localServer.start" },
+        { label: "Stop Server", command: "nexus.localServer.stop" },
+        { label: "Restart Server", command: "nexus.localServer.restart" },
+        { label: "Inspect Logs", command: "nexus.localServer.inspectLogs" },
+        { label: "Edit", command: "nexus.localServer.edit" },
+        { label: "Duplicate", command: "nexus.localServer.duplicate" },
+        { label: "Copy Command Line", command: "nexus.localServer.copyInfo" },
+        { label: "Delete", command: "nexus.localServer.remove" }
+      ];
+      const picked = await vscode.window.showQuickPick(picks, { title: "Local Server Actions" });
+      if (picked) {
+        await vscode.commands.executeCommand(picked.command, arg);
+      }
     }
   };
 
@@ -446,7 +473,7 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
       }
       const folderPath = arg.folderPath;
       const items = ctx.core.getItemsInFolder(folderPath, true);
-      const itemCount = items.servers.length + items.serialProfiles.length + items.localShellProfiles.length;
+      const itemCount = items.servers.length + items.serialProfiles.length + items.localShellProfiles.length + (items.localServers?.length ?? 0);
       const hasContents = itemCount > 0;
 
       // #84 P1 (Codex, serialization audit) — removeFolderCascade reassigns or
