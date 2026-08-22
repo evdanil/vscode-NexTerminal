@@ -152,7 +152,8 @@ export class NetworkServerDaemonHost {
   private nextGeneration = 1;
   private activeGeneration?: number;
   private detachChildIo?: () => void;
-  private killTimer?: ReturnType<typeof setTimeout>;
+  /** SIGKILL escalation belongs to the specific child that received SIGTERM. */
+  private readonly killTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
   private readonly rpcTimeoutMs: number;
   private readonly readyTimeoutMs: number;
 
@@ -350,20 +351,9 @@ export class NetworkServerDaemonHost {
     // These readers are attached to THIS child's stdout/stderr. Leaving them
     // attached lets a late line from a dead generation mutate its replacement.
     this.closeChildIo();
-    if (this.killTimer) {
-      clearTimeout(this.killTimer);
-      this.killTimer = undefined;
-    }
-    child.removeAllListeners();
     try { child.stdin?.end(); } catch { /* pipe already gone */ }
     try { child.kill("SIGTERM"); } catch { /* already dead */ }
-    if (child.exitCode === null && child.signalCode === null) {
-      const timer = setTimeout(() => {
-        try { child.kill("SIGKILL"); } catch { /* already dead */ }
-      }, 2000);
-      timer.unref();
-      this.killTimer = timer;
-    }
+    this.scheduleChildEscalation(child);
   }
 
   private async launch(): Promise<void> {
@@ -385,6 +375,14 @@ export class NetworkServerDaemonHost {
     const generation = this.nextGeneration++;
     this.child = child;
     this.activeGeneration = generation;
+
+    // This observation deliberately survives bridge teardown. `terminateChild`
+    // clears current-host state before signalling, so the guarded lifecycle
+    // listener below must ignore its later exit; the child still owns the
+    // timer that would otherwise escalate an unrelated replacement.
+    const clearEscalation = () => this.clearChildEscalation(child);
+    child.once("exit", clearEscalation);
+    child.once("close", clearEscalation);
 
     child.on("error", (error) => {
       if (!this.isCurrentChild(child, generation)) return;
@@ -688,6 +686,33 @@ export class NetworkServerDaemonHost {
     this.terminateChild(child);
     this.rejectAllPending(error);
     this.rejectAllReadyWaiters(error);
+  }
+
+  /** Installs no more than one unref'd escalation timer for this exact child. */
+  private scheduleChildEscalation(child: ChildProcess): void {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      this.clearChildEscalation(child);
+      return;
+    }
+    if (this.killTimers.has(child)) return;
+
+    const timer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        this.clearChildEscalation(child);
+        return;
+      }
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+    }, 2000);
+    timer.unref();
+    this.killTimers.set(child, timer);
+  }
+
+  /** Clears only the escalation owned by the child known to have ended. */
+  private clearChildEscalation(child: ChildProcess): void {
+    const timer = this.killTimers.get(child);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.killTimers.delete(child);
   }
 
   private rejectAllPending(error: Error): void {
