@@ -23,7 +23,7 @@
  * Ported from the standalone add-on's `tests/e2e/tftp-critical.test.ts`.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import dgram from "node:dgram";
 import fs from "node:fs";
 import path from "node:path";
@@ -35,7 +35,16 @@ import {
   encodeACK,
   getOpcode
 } from "../../../src/services/networkServers/tftp/engine/protocol";
+import { PathGuard } from "../../../src/services/networkServers/tftp/engine/PathGuard";
 import { mkdtemp, randomPayload, createUdpClient, sleep } from "../../helpers/networkServerTestHelpers";
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 async function withEngine<T>(
   root: string,
@@ -144,6 +153,182 @@ describe("TFTP E2E — Critical Paths", () => {
           "the slot the failed requests borrowed must have come back"
         ).toBe(1);
       });
+    });
+
+    it("same-peer RRQ has one admission owner and stop closes every opened handle", async () => {
+      fs.writeFileSync(path.join(root, "same-peer-read.bin"), randomPayload(4096));
+      const enteredStat = deferred();
+      const releaseStat = deferred();
+      const originalStatFile = PathGuard.prototype.statFile;
+      let admissionOwners = 0;
+      const statSpy = vi.spyOn(PathGuard.prototype, "statFile").mockImplementation(async function (
+        this: PathGuard,
+        filename: string
+      ) {
+        admissionOwners++;
+        enteredStat.resolve();
+        await releaseStat.promise;
+        return originalStatFile.call(this, filename);
+      });
+      const originalOpen = fs.promises.open.bind(fs.promises);
+      const closeSpies: Array<ReturnType<typeof vi.spyOn>> = [];
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args: any[]) => {
+        const handle = await (originalOpen as any)(...args);
+        closeSpies.push(vi.spyOn(handle, "close"));
+        return handle;
+      });
+
+      try {
+        await withEngine(root, false, {}, async (engine, _port) => {
+          const entry = engine as unknown as MessageEntryPoint;
+          const rrq = encodeRRQ("same-peer-read.bin", "octet");
+          const rinfo = rinfoFor(42300, rrq.length);
+          let starts = 0;
+          engine.on("transfer:start", () => starts++);
+
+          const first = entry.handleMessage(rrq, rinfo);
+          await enteredStat.promise;
+          const duplicate = entry.handleMessage(rrq, rinfo);
+          releaseStat.resolve();
+          await Promise.all([first, duplicate]);
+
+          expect(admissionOwners, "one peer key must have exactly one admission owner").toBe(1);
+          expect(starts, "a duplicate request must not publish a second transfer").toBe(1);
+          expect(closeSpies, "the admitted RRQ must own its read handle").toHaveLength(1);
+
+          await engine.stop();
+          expect(engine.activeTransfers()).toHaveLength(0);
+          for (const closeSpy of closeSpies) {
+            expect(closeSpy, "stop must close every handle opened by admission").toHaveBeenCalledTimes(1);
+          }
+        });
+      } finally {
+        releaseStat.resolve();
+        statSpy.mockRestore();
+        openSpy.mockRestore();
+      }
+    });
+
+    it("same-peer WRQ loser cannot delete the owner or close its handle", async () => {
+      const enteredEnsure = deferred();
+      const releaseEnsure = deferred();
+      let admissionOwners = 0;
+      const ensureSpy = vi.spyOn(PathGuard.prototype, "ensureWritableNew").mockImplementation(async function (
+        this: PathGuard,
+        filename: string
+      ) {
+        admissionOwners++;
+        enteredEnsure.resolve();
+        await releaseEnsure.promise;
+        return this.resolve(filename);
+      });
+      const originalOpen = fs.promises.open.bind(fs.promises);
+      const winnerStarted = deferred();
+      const closeSpies: Array<ReturnType<typeof vi.spyOn>> = [];
+      let writeOpens = 0;
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args: any[]) => {
+        if (args[1] !== "wx") return (originalOpen as any)(...args);
+        writeOpens++;
+        if (writeOpens === 1) {
+          const handle = await (originalOpen as any)(...args);
+          closeSpies.push(vi.spyOn(handle, "close"));
+          return handle;
+        }
+        await winnerStarted.promise;
+        const err: NodeJS.ErrnoException = new Error("EEXIST: duplicate same-peer WRQ");
+        err.code = "EEXIST";
+        throw err;
+      });
+
+      try {
+        await withEngine(root, true, {}, async (engine, _port) => {
+          const entry = engine as unknown as MessageEntryPoint;
+          const wrq = encodeWRQ("same-peer-write.bin", "octet");
+          const rinfo = rinfoFor(42301, wrq.length);
+          let starts = 0;
+          engine.on("transfer:start", () => {
+            starts++;
+            winnerStarted.resolve();
+          });
+
+          const first = entry.handleMessage(wrq, rinfo);
+          await enteredEnsure.promise;
+          const duplicate = entry.handleMessage(wrq, rinfo);
+          releaseEnsure.resolve();
+          await Promise.all([first, duplicate]);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+
+          expect(admissionOwners, "one peer key must have exactly one admission owner").toBe(1);
+          expect(starts).toBe(1);
+          expect(engine.activeTransfers(), "the losing request must not delete the winning session").toHaveLength(1);
+          expect(closeSpies).toHaveLength(1);
+          expect(closeSpies[0], "the losing request must not close the winning handle").not.toHaveBeenCalled();
+
+          await engine.stop();
+          expect(engine.activeTransfers()).toHaveLength(0);
+          expect(closeSpies[0], "stop owns the winning WRQ handle").toHaveBeenCalledTimes(1);
+        });
+      } finally {
+        releaseEnsure.resolve();
+        winnerStarted.resolve();
+        ensureSpy.mockRestore();
+        openSpy.mockRestore();
+      }
+    });
+
+    it("stop during admission waits for the owner and prevents post-stop registration", async () => {
+      const opened = deferred();
+      const releaseOpen = deferred();
+      const originalOpen = fs.promises.open.bind(fs.promises);
+      const closeSpies: Array<ReturnType<typeof vi.spyOn>> = [];
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args: any[]) => {
+        const handle = await (originalOpen as any)(...args);
+        if (args[1] === "wx") {
+          closeSpies.push(vi.spyOn(handle, "close"));
+          opened.resolve();
+          await releaseOpen.promise;
+        }
+        return handle;
+      });
+
+      try {
+        await withEngine(root, true, {}, async (engine, _port) => {
+          const entry = engine as unknown as MessageEntryPoint;
+          const wrq = encodeWRQ("stop-during-admission.bin", "octet");
+          const rinfo = rinfoFor(42302, wrq.length);
+          const socketClosed = deferred();
+          let starts = 0;
+          let stopSettled = false;
+          engine.on("transfer:start", () => starts++);
+          engine.once("close", () => socketClosed.resolve());
+
+          const admission = entry.handleMessage(wrq, rinfo);
+          await opened.promise;
+          const stopping = engine.stop().then(() => {
+            stopSettled = true;
+          });
+
+          try {
+            await socketClosed.promise;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(stopSettled, "stop must remain pending while an admission owns an open handle").toBe(false);
+
+            releaseOpen.resolve();
+            await Promise.all([admission, stopping]);
+
+            expect(starts, "an invalidated admission must not emit transfer:start").toBe(0);
+            expect(engine.activeTransfers()).toHaveLength(0);
+            expect(closeSpies).toHaveLength(1);
+            expect(closeSpies[0], "the invalidated admission's handle must be closed").toHaveBeenCalledTimes(1);
+          } finally {
+            releaseOpen.resolve();
+            await Promise.allSettled([admission, stopping]);
+          }
+        });
+      } finally {
+        releaseOpen.resolve();
+        openSpy.mockRestore();
+      }
     });
   });
 

@@ -194,11 +194,14 @@ export class TftpEngine extends EventEmitter {
    * twice, which reaches the UI as duplicate toasts.
    */
   private readonly finalizing = new Set<string>();
-  /**
-   * Slots reserved by requests that have been admitted but are not yet in
-   * {@link transfers} — see the admission check in {@link handleNewRequest}.
-   */
-  private pendingAdmissions = 0;
+  /** Peer keys whose RRQ/WRQ admission is currently crossing async FS work. */
+  private readonly pendingAdmissionKeys = new Set<string>();
+  /** Admission work owned by this engine lifecycle and awaited by {@link stop}. */
+  private readonly admissionTasks = new Set<Promise<void>>();
+  /** Invalidates admissions captured by an earlier start/stop lifecycle. */
+  private lifecycleGeneration = 0;
+  /** Whether new RRQ/WRQ admissions may be created in the current lifecycle. */
+  private acceptingRequests = false;
 
   /**
    * Constructs a new TFTP engine. Does not start listening — use {@link start}.
@@ -285,10 +288,12 @@ export class TftpEngine extends EventEmitter {
     // configuration failure the operator has to see, and a bound socket that
     // can serve nothing is the worst possible way to tell them.
     this.guard = new PathGuard(this.opts.root);
-    this.socket = dgram.createSocket('udp4');
+    const generation = ++this.lifecycleGeneration;
+    this.acceptingRequests = false;
+    const socket = dgram.createSocket('udp4');
+    this.socket = socket;
 
     const listeningPromise = new Promise<void>((resolve, reject) => {
-      if (!this.socket) return reject(new Error('Socket missing'));
       const onListening = () => {
         cleanup();
         resolve();
@@ -298,16 +303,15 @@ export class TftpEngine extends EventEmitter {
         reject(err);
       };
       const cleanup = () => {
-        if (!this.socket) return;
-        this.socket.off('listening', onListening);
-        this.socket.off('error', onError);
+        socket.off('listening', onListening);
+        socket.off('error', onError);
       };
-      this.socket.once('listening', onListening);
-      this.socket.once('error', onError);
+      socket.once('listening', onListening);
+      socket.once('error', onError);
     });
 
     // P0-1 BUG: `.catch()` handler on async handleMessage — prevents UPR.
-    this.socket.on('message', (msg, rinfo) => {
+    socket.on('message', (msg, rinfo) => {
       this.handleMessage(msg, rinfo).catch((err: Error) => {
         this.log('error', `Unhandled error processing message from ${rinfo.address}:${rinfo.port}: ${err.message}`);
         try {
@@ -323,18 +327,20 @@ export class TftpEngine extends EventEmitter {
       });
     });
 
-    this.socket.on('error', (err) => {
+    socket.on('error', (err) => {
       this.emit('error', err);
     });
 
-    this.socket.on('close', () => {
+    socket.on('close', () => {
       this.emit('close');
     });
 
-    this.socket.bind(this.opts.port, this.opts.address);
+    socket.bind(this.opts.port, this.opts.address);
     await listeningPromise;
+    if (this.lifecycleGeneration !== generation || this.socket !== socket) return;
+    this.acceptingRequests = true;
 
-    const addr = this.socket.address() as AddressInfo;
+    const addr = socket.address() as AddressInfo;
     this.startGC();
     this.log('info', `listening on ${addr.address}:${addr.port} root=${this.opts.root}`);
     this.emit('listening', addr.address, addr.port);
@@ -348,10 +354,25 @@ export class TftpEngine extends EventEmitter {
    * @sideeffect Closes socket, closes FS handles, clears all structures.
    */
   public async stop(): Promise<void> {
+    this.acceptingRequests = false;
+    this.lifecycleGeneration++;
+    const admissions = Array.from(this.admissionTasks);
     if (this.gcTimer !== null) {
       clearInterval(this.gcTimer);
       this.gcTimer = null;
     }
+    if (this.socket) {
+      const sock = this.socket;
+      this.socket = null;
+      await new Promise<void>((resolve) => {
+        try {
+          sock.close(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    }
+    await Promise.allSettled(admissions);
     for (const t of this.transfers.values()) {
       try {
         await t.closeFile();
@@ -369,18 +390,9 @@ export class TftpEngine extends EventEmitter {
       }
     }
     this.writeHandles.clear();
+    this.pendingAdmissionKeys.clear();
+    this.admissionTasks.clear();
     this.guard = null;
-    if (this.socket) {
-      const sock = this.socket;
-      this.socket = null;
-      await new Promise<void>((resolve) => {
-        try {
-          sock.close(() => resolve());
-        } catch {
-          resolve();
-        }
-      });
-    }
     this.log('info', 'stopped.');
   }
 
@@ -575,6 +587,9 @@ export class TftpEngine extends EventEmitter {
     msg: Buffer,
     rinfo: dgram.RemoteInfo,
   ): Promise<void> {
+    if (!this.acceptingRequests) return;
+    const key = `${rinfo.address}:${rinfo.port}`;
+    if (this.pendingAdmissionKeys.has(key)) return;
     let parsed: ReturnType<typeof parsePacket>;
     try {
       parsed = parsePacket(msg);
@@ -595,23 +610,20 @@ export class TftpEngine extends EventEmitter {
     // all see a below-limit size, and all get admitted — the cap is trivially
     // bypassed by an unauthenticated client, which is the whole point of
     // having one.
-    if (this.transfers.size + this.pendingAdmissions >= this.opts.maxTransfers) {
+    if (this.transfers.size + this.pendingAdmissionKeys.size >= this.opts.maxTransfers) {
       this.sendRaw(rinfo, encodeERROR(ErrorCode.IllegalOperation, 'Server busy'));
       this.log('warn', `max transfers reached; rejecting ${parsed.filename}`);
       return;
     }
-    this.pendingAdmissions++;
-    try {
-      await this.admitNewRequest(parsed, rinfo);
-    } finally {
-      // `finally`, and covering the whole body, because a reservation that
-      // leaks on any of the (many) failure paths below is a slot the engine
-      // never gets back — a handful of requests for files that do not exist
-      // would permanently wedge the service at "Server busy". By the time this
-      // runs, an admitted session is counted in `transfers` instead; the brief
-      // overlap where it is counted twice only ever rejects one extra request.
-      this.pendingAdmissions--;
-    }
+    const generation = this.lifecycleGeneration;
+    this.pendingAdmissionKeys.add(key);
+    const admission = this.admitNewRequest(parsed, rinfo, generation);
+    const trackedAdmission = admission.finally(() => {
+      this.pendingAdmissionKeys.delete(key);
+      this.admissionTasks.delete(trackedAdmission);
+    });
+    this.admissionTasks.add(trackedAdmission);
+    await trackedAdmission;
   }
 
   /**
@@ -627,6 +639,7 @@ export class TftpEngine extends EventEmitter {
   private async admitNewRequest(
     parsed: RRQPacket | WRQPacket,
     rinfo: dgram.RemoteInfo,
+    generation: number,
   ): Promise<void> {
     const guard = this.guard;
     if (!guard) {
@@ -662,6 +675,8 @@ export class TftpEngine extends EventEmitter {
       }
     }
 
+    if (!this.ownsAdmission(generation)) return;
+
     const transfer = new TransferSession({
       peer: { address: rinfo.address, port: rinfo.port },
       opcode: parsed.opcode,
@@ -683,7 +698,6 @@ export class TftpEngine extends EventEmitter {
     } else {
       // P0-3 BUG: initForWRQ now retains tsizeAtStart + sets Receiving phase after OACK
       initial = transfer.initForWRQ(hasOptions);
-      this.transfers.set(transfer.transferId, transfer);
       try {
         // 'wx' = O_CREAT|O_EXCL|O_WRONLY. The real defense against a symlink
         // at absPath is ensureWritableNew's lstat check, above — this flag is
@@ -693,9 +707,17 @@ export class TftpEngine extends EventEmitter {
         // on for the symlink case itself: Windows' CREATE_NEW still follows a
         // reparse point rather than refusing it, unlike POSIX's O_EXCL.
         const h = await fsPromises.open(absPath, 'wx');
+        if (!this.ownsAdmission(generation)) {
+          try {
+            await h.close();
+          } catch {
+            // ignore
+          }
+          return;
+        }
         this.writeHandles.set(transfer.transferId, h);
       } catch (err) {
-        void this.cleanup(transfer.transferId).catch(() => {});
+        if (!this.ownsAdmission(generation)) return;
         // P0-6 BUG: ENOSPC → DiskFull (code=3), not AccessViolation
         let code = ErrorCode.AccessViolation;
         let msg: string | undefined = 'Cannot create file';
@@ -714,6 +736,18 @@ export class TftpEngine extends EventEmitter {
       }
     }
 
+    if (!this.ownsAdmission(generation)) {
+      const h = this.writeHandles.get(transfer.transferId);
+      if (h) {
+        this.writeHandles.delete(transfer.transferId);
+        try {
+          await h.close();
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
     this.transfers.set(transfer.transferId, transfer);
     this.emit('transfer:start', this.infoOf(transfer));
     this.log(
@@ -731,6 +765,11 @@ export class TftpEngine extends EventEmitter {
         this.emit('transfer:progress', this.infoOf(transfer));
       }
     }
+  }
+
+  /** Whether an admission still belongs to the currently accepting lifecycle. */
+  private ownsAdmission(generation: number): boolean {
+    return this.acceptingRequests && this.lifecycleGeneration === generation;
   }
 
   /**
