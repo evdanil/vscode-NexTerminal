@@ -74,11 +74,17 @@ function sendInvalidThenValid(id, invalid, request) {
   sendValidReply(id, request);
 }
 
-if (mode === "malformed-ready") {
+if (mode === "ready-then-invalid-same-chunk") {
+  // One real stdout write drives the installed bounded reader through ready
+  // and the malformed next line in the same synchronous processing turn.
+  process.stdout.write(`${JSON.stringify({ event: "ready", data: null })}\n{\n`);
+} else if (mode === "malformed-ready") {
   send({ event: "ready", data: {} });
   setTimeout(() => send({ event: "ready", data: null }), 20);
 } else if (mode === "delayed-ready-hold-all") {
   setTimeout(() => send({ event: "ready", data: null }), 500);
+} else if (mode === "exit-before-ready") {
+  setTimeout(() => process.exit(0), 20);
 } else {
   send({ event: "ready", data: null });
 }

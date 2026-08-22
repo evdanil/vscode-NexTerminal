@@ -114,6 +114,13 @@ interface ChildIoOwnership {
   readonly releaseTerminalGuards: () => void;
 }
 
+/** One cached startup promise belongs only to the child generation that spawned it. */
+interface StartupAttempt {
+  child?: ChildProcess;
+  generation?: number;
+  promise?: Promise<void>;
+}
+
 /** `getServiceRuntime` reply for the TFTP service. */
 export interface TftpRuntimeSnapshot {
   readonly snapshot: ServerSnapshot;
@@ -191,7 +198,7 @@ export class NetworkServerDaemonHost {
   private readonly readyWaiters = new Set<{ resolve: () => void; reject: (error: unknown) => void }>();
   private readyFlag = false;
   private disposed = false;
-  private startPromise?: Promise<void>;
+  private startAttempt?: StartupAttempt;
   private nextGeneration = 1;
   private activeGeneration?: number;
   private readonly childIo = new Map<ChildProcess, ChildIoOwnership>();
@@ -341,12 +348,29 @@ export class NetworkServerDaemonHost {
     if (this.child && this.readyFlag) {
       return;
     }
-    if (!this.startPromise) {
-      this.startPromise = this.launch().finally(() => {
-        this.startPromise = undefined;
-      });
+    const existingAttempt = this.startAttempt;
+    if (
+      existingAttempt?.promise
+      && existingAttempt.child
+      && existingAttempt.generation !== undefined
+      && this.isCurrentChild(existingAttempt.child, existingAttempt.generation)
+    ) {
+      return existingAttempt.promise;
     }
-    return this.startPromise;
+    // A retired generation must never lend its already-settled startup
+    // promise to a listener that synchronously starts a replacement.
+    if (existingAttempt) this.startAttempt = undefined;
+
+    const attempt: StartupAttempt = {};
+    this.startAttempt = attempt;
+    const promise = this.launch(attempt).finally(() => {
+      // A retired attempt's reaction runs after user callbacks. Only its own
+      // cache entry may be cleared; a replacement attempt belongs to another
+      // child generation.
+      if (this.startAttempt === attempt) this.startAttempt = undefined;
+    });
+    attempt.promise = promise;
+    return promise;
   }
 
   /**
@@ -390,6 +414,10 @@ export class NetworkServerDaemonHost {
    */
   private terminateChild(child: ChildProcess): void {
     if (this.child !== child) return;
+    const generation = this.activeGeneration;
+    if (this.startAttempt?.child === child && this.startAttempt.generation === generation) {
+      this.startAttempt = undefined;
+    }
     this.clearChildStdoutEofDeadline(child);
     this.child = undefined;
     this.activeGeneration = undefined;
@@ -404,7 +432,7 @@ export class NetworkServerDaemonHost {
     this.scheduleChildEscalation(child);
   }
 
-  private async launch(): Promise<void> {
+  private async launch(attempt: StartupAttempt): Promise<void> {
     if (!existsSync(this.daemonScriptPath)) {
       throw new Error(`Network servers daemon script not found: ${this.daemonScriptPath}`);
     }
@@ -423,6 +451,8 @@ export class NetworkServerDaemonHost {
     const generation = this.nextGeneration++;
     this.child = child;
     this.activeGeneration = generation;
+    attempt.child = child;
+    attempt.generation = generation;
     if (child.stdin) this.installChildWriteAuthority(child, generation, child.stdin);
 
     // This observation deliberately survives bridge teardown. `terminateChild`
@@ -446,6 +476,9 @@ export class NetworkServerDaemonHost {
 
     child.on("exit", (code, signal) => {
       if (!this.isCurrentChild(child, generation)) return;
+      if (this.startAttempt?.child === child && this.startAttempt.generation === generation) {
+        this.startAttempt = undefined;
+      }
       this.clearChildStdoutEofDeadline(child);
       this.readyFlag = false;
       this.detachChildProtocolIo(child);
@@ -539,6 +572,9 @@ export class NetworkServerDaemonHost {
         }, this.readyTimeoutMs);
         this.readyWaiters.add(waiter);
       });
+      if (!this.isCurrentChild(child, generation) || !this.readyFlag) {
+        throw new Error("Network servers daemon startup retired before ready state was stable");
+      }
     } catch (error) {
       // A spawn that times out leaves a live process behind. `ensureStarted`
       // does not cache a failed attempt, so the next call spawns another one

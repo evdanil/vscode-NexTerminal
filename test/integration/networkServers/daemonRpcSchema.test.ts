@@ -64,6 +64,8 @@ type HostOwnershipInternals = HostInternals & {
   childIo?: Map<unknown, unknown>;
   killTimers?: Map<unknown, unknown>;
   stdoutEofTimers?: Map<unknown, unknown>;
+  startAttempt?: unknown;
+  nextGeneration?: number;
 };
 
 type WritableWithCallback = NodeJS.WritableStream & {
@@ -110,7 +112,7 @@ function allDaemonOwnershipIsReleased(internals: HostOwnershipInternals): boolea
     internals.childIo,
     internals.killTimers,
     internals.stdoutEofTimers,
-  ].every((ownership) => ownership?.size === 0);
+  ].every((ownership) => ownership?.size === 0) && internals.startAttempt === undefined;
 }
 
 describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
@@ -408,6 +410,193 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
       (host) => host.listServers(),
       (result) => expect(result).toHaveLength(2),
     );
+  }, 30_000);
+
+  it("rejects a startup attempt when one bounded-reader chunk retires its generation after ready", async () => {
+    const host = create("ready-then-invalid-same-chunk");
+    const internals = host as unknown as HostOwnershipInternals;
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    host.onDidExit((code, signal) => exits.push({ code, signal }));
+
+    const startup = host.ensureStarted();
+    const failedPid = childPid(host);
+    expect(failedPid).toBeTypeOf("number");
+    pids.add(failedPid!);
+
+    await expect(startup).rejects.toThrow(/startup.*retired/i);
+    expect(host.isReady).toBe(false);
+    expect(exits).toEqual([{ code: null, signal: null }]);
+    expect(await waitForExit(failedPid!)).toBe(true);
+    host.dispose();
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }, 30_000);
+
+  async function expectSameChunkStartupReplacement(
+    reenter: (host: NetworkServerDaemonHost) => Promise<unknown>,
+    assertReentrantResult: (result: unknown) => void,
+  ): Promise<void> {
+    const host = create("ready-then-invalid-same-chunk");
+    const internals = host as unknown as HostOwnershipInternals;
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    let reentrant: Promise<unknown> | undefined;
+    let replacementPid: number | undefined;
+    let startAttemptAtExit: unknown = Symbol("unobserved startup attempt");
+
+    host.onDidExit((code, signal) => {
+      exits.push({ code, signal });
+      startAttemptAtExit = internals.startAttempt;
+      process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
+      reentrant = reenter(host);
+      void reentrant.catch(() => undefined);
+      replacementPid = childPid(host);
+      if (replacementPid !== undefined) pids.add(replacementPid);
+    });
+
+    const startup = host.ensureStarted();
+    const failedPid = childPid(host);
+    expect(failedPid).toBeTypeOf("number");
+    pids.add(failedPid!);
+
+    await expect(startup).rejects.toThrow(/startup.*retired/i);
+    expect(reentrant).toBeDefined();
+    expect(startAttemptAtExit).toBeUndefined();
+    expect(replacementPid).toBeTypeOf("number");
+    expect(replacementPid).not.toBe(failedPid);
+    if (!reentrant || replacementPid === undefined) {
+      throw new Error("synthetic exit listener did not start a replacement startup attempt");
+    }
+
+    assertReentrantResult(await reentrant);
+    expect(host.isReady).toBe(true);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(await waitForExit(failedPid!)).toBe(true);
+    expect(host.isReady).toBe(true);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(exits).toEqual([{ code: null, signal: null }]);
+
+    host.dispose();
+    expect(await waitForExit(replacementPid)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }
+
+  it("starts a ready replacement when a same-chunk synthetic exit listener immediately ensures", async () => {
+    await expectSameChunkStartupReplacement(
+      (host) => host.ensureStarted(),
+      (result) => expect(result).toBeUndefined(),
+    );
+  }, 30_000);
+
+  it("serves from a ready replacement when a same-chunk synthetic exit listener immediately lists", async () => {
+    await expectSameChunkStartupReplacement(
+      (host) => host.listServers(),
+      (result) => expect(result).toHaveLength(2),
+    );
+  }, 30_000);
+
+  it("invalidates a current physical startup exit before its lifecycle listener reenters", async () => {
+    const host = create("exit-before-ready");
+    const internals = host as unknown as HostOwnershipInternals;
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    let reentrant: Promise<void> | undefined;
+    let replacementPid: number | undefined;
+    let startAttemptAtExit: unknown = Symbol("unobserved startup attempt");
+    host.onDidExit((code, signal) => {
+      exits.push({ code, signal });
+      startAttemptAtExit = internals.startAttempt;
+      process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
+      reentrant = host.ensureStarted();
+      void reentrant.catch(() => undefined);
+      replacementPid = childPid(host);
+      if (replacementPid !== undefined) pids.add(replacementPid);
+    });
+
+    const startup = host.ensureStarted();
+    const failedPid = childPid(host);
+    expect(failedPid).toBeTypeOf("number");
+    pids.add(failedPid!);
+
+    await expect(startup).rejects.toThrow(/daemon exited/i);
+    expect(reentrant).toBeDefined();
+    expect(startAttemptAtExit).toBeUndefined();
+    expect(replacementPid).toBeTypeOf("number");
+    expect(replacementPid).not.toBe(failedPid);
+    if (!reentrant || replacementPid === undefined) {
+      throw new Error("physical exit listener did not start a replacement startup attempt");
+    }
+    await expect(reentrant).resolves.toBeUndefined();
+    expect(await waitForExit(failedPid!)).toBe(true);
+    expect(host.isReady).toBe(true);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(exits).toEqual([{ code: 0, signal: null }]);
+
+    host.dispose();
+    expect(await waitForExit(replacementPid)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }, 30_000);
+
+  it("coalesces concurrent callers onto one current startup attempt", async () => {
+    const host = create("delayed-ready-hold-all");
+    const internals = host as unknown as HostOwnershipInternals;
+    const first = host.ensureStarted();
+    const pid = childPid(host);
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+    const second = host.ensureStarted();
+
+    expect(internals.nextGeneration).toBe(2);
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+    expect(childPid(host)).toBe(pid);
+    expect(host.isReady).toBe(true);
+
+    host.dispose();
+    expect(await waitForExit(pid!)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }, 30_000);
+
+  it("keeps a replacement startup attempt cached when an old attempt finalizes", async () => {
+    const host = create("ready-then-invalid-same-chunk");
+    const internals = host as unknown as HostOwnershipInternals;
+    let reentrant: Promise<void> | undefined;
+    let replacementPid: number | undefined;
+    host.onDidExit(() => {
+      process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "delayed-ready-hold-all";
+      reentrant = host.ensureStarted();
+      void reentrant.catch(() => undefined);
+      replacementPid = childPid(host);
+      if (replacementPid !== undefined) pids.add(replacementPid);
+    });
+
+    const startup = host.ensureStarted();
+    const failedPid = childPid(host);
+    expect(failedPid).toBeTypeOf("number");
+    pids.add(failedPid!);
+
+    try {
+      await expect(startup).rejects.toThrow(/startup.*retired/i);
+      expect(reentrant).toBeDefined();
+      expect(replacementPid).toBeTypeOf("number");
+      expect(host.isReady).toBe(false);
+      if (!reentrant || replacementPid === undefined) {
+        throw new Error("synthetic exit listener did not start a delayed replacement startup attempt");
+      }
+
+      const follower = host.ensureStarted();
+      void follower.catch(() => undefined);
+      const followerPid = childPid(host);
+      if (followerPid !== undefined) pids.add(followerPid);
+      expect(followerPid).toBe(replacementPid);
+      expect(internals.nextGeneration).toBe(3);
+      await expect(Promise.all([reentrant, follower])).resolves.toEqual([undefined, undefined]);
+      expect(host.isReady).toBe(true);
+    } finally {
+      const currentPid = childPid(host);
+      if (currentPid !== undefined) pids.add(currentPid);
+      host.dispose();
+    }
+
+    expect(await waitForExit(failedPid!)).toBe(true);
+    expect(await waitForExit(replacementPid!)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
   }, 30_000);
 
   it("does not let a late physical exit from a retired generation reset a ready replacement", async () => {
