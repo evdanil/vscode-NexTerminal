@@ -1,4 +1,4 @@
-# Handover — 2026-08-21
+# Handover — 2026-08-22
 
 Written for the agent picking this up. `main` is at **`842057f` / 2.8.200**, released.
 
@@ -47,9 +47,10 @@ path where the correct and broken implementations behave identically.
 ### PR #100 — 2.8.201, the overwrite-warning fix (`claude/highlighting-rules-settings-qhepdg`)
 
 **Status: round-five findings, the post-round Memento-fidelity issue, and the final fail-open
-finding are addressed. The focused storage suite is clean at 72/72, the final build is clean, and
-the unrestricted full suite is clean at 6260/6260 across 207 files. A clean review of the exact
-pushed head is required before publication; no publication had occurred as of this handover.**
+finding are addressed. The implementation commit `b69eb62` received a clean review; four CodeQL
+checks are green; and the reviewed PR #100 body plus the replacement issue #101 body are published.
+Any later docs-only synchronization commit still requires clean review of the current PR head.
+No merge or release has occurred.**
 
 A user hit a false "another VS Code window overwrote your change" warning on an ordinary
 EVE-NG re-sync **with no other window open**. Five review rounds found substantive issues:
@@ -98,8 +99,9 @@ maintainer approved this trade explicitly. Do not quietly revert it.
 
 **Audit answers:** six actual in-place assignments span server, serial, and local-shell group
 mutations. The serialization budget is one repository-added pending-value pass in steady state and
-two after reference replacement. Task 2's gated PR and issue drafts are prepared locally but remain
-unpublished.
+two after reference replacement. The reviewed PR #100 body and replacement issue #101 body are
+published; any later docs-only synchronization commit still requires clean review of the current
+PR head. No merge or release has occurred.
 The genuine residual caveat remains that a change not yet propagated into this host's Memento
 cache is undetectable at this layer.
 
@@ -240,8 +242,8 @@ Placement notes for whoever maintains it:
 - It is under `docs/` rather than `docs/plans/` deliberately. A tracked file inside a gitignored
   directory is a trap — it survives `git clean` inconsistently and misleads anyone who assumes
   the directory is ignored.
-- **Issue #101 is currently stale.** Task 2's synchronized draft is prepared locally but remains
-  unpublished; no remote update has occurred. Keep the two sources aligned when that authorized
-  update is made.
+- **Issue #101 was updated from the reviewed handover after `b69eb62` received a clean review.**
+  Keep the two sources semantically synchronized: future changes to this handover must update the
+  issue body as well.
 - The filename is stable rather than date-stamped so successive handovers replace it instead of
   accumulating. The date at the top is the thing to trust.
