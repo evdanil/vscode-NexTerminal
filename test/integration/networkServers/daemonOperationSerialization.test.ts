@@ -44,4 +44,21 @@ describe("network-server daemon operation serialization", () => {
     await Promise.all([accepted, eof, sigint, sigterm]);
     expect(timeline).toEqual(["operation:start", "operation:end", "flush", "dispose", "flush", "exit"]);
   });
+
+  it("continues disposal and exit when runtime-update flushing throws", async () => {
+    const timeline: string[] = [];
+    const shutdown = createNetworkServerDaemonShutdown({
+      stopAccepting: () => timeline.push("stop"),
+      drain: async () => timeline.push("drain"),
+      flushRuntimeUpdates: () => {
+        timeline.push("flush");
+        throw new Error("flush exploded");
+      },
+      dispose: async () => timeline.push("dispose"),
+      exit: () => timeline.push("exit"),
+    });
+
+    await expect(shutdown.begin("stdin closed")).resolves.toBeUndefined();
+    expect(timeline).toEqual(["stop", "drain", "flush", "dispose", "flush", "exit"]);
+  });
 });

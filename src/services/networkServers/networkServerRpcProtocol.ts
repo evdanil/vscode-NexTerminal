@@ -566,6 +566,60 @@ export const rpcResultParsers = {
   getServiceRuntime: resultParser<"getServiceRuntime">(parseRuntime),
 } satisfies { readonly [Method in RpcMethod]: (value: unknown) => RpcParseResult<RpcResult<Method>> };
 
+/**
+ * Parses a method result and proves that its service identifiers belong to the
+ * request that is currently pending. A structurally valid response for a
+ * different request is a current-child protocol violation, not a success.
+ */
+export function parseRpcResultForRequest<M extends RpcMethod>(
+  method: M,
+  params: RpcParams<M> | undefined,
+  value: unknown,
+): RpcParseResult<RpcResult<M>> {
+  const parser = rpcResultParsers[method] as unknown as (input: unknown) => RpcParseResult<RpcResult<M>>;
+  const parsed = parser(value);
+  if (!parsed.ok) return parsed;
+
+  const result = parsed.value;
+  switch (method) {
+    case "list": {
+      const snapshots = result as RpcResult<"list">;
+      const ids = new Set(snapshots.map((snapshot) => snapshot.id));
+      return snapshots.length === 2 && ids.size === 2 && ids.has("tftp") && ids.has("dhcp")
+        ? parsed
+        : rejected("RPC list result must contain exactly the tftp and dhcp services.");
+    }
+    case "getStatus":
+      return (result as RpcResult<"getStatus">).id === (params as RpcParams<"getStatus">).id
+        ? parsed
+        : rejected("RPC getStatus result belongs to a different service.");
+    case "getServiceRuntime":
+      return (result as RpcResult<"getServiceRuntime">).snapshot.id === (params as RpcParams<"getServiceRuntime">).id
+        ? parsed
+        : rejected("RPC getServiceRuntime result belongs to a different service.");
+    case "start":
+    case "stop":
+    case "restart":
+      return (result as RpcResult<"start">).id === (params as RpcParams<"start">).id
+        ? parsed
+        : rejected(`RPC ${method} acknowledgement belongs to a different service.`);
+    case "cancelTransfer": {
+      const expected = params as RpcParams<"cancelTransfer">;
+      const acknowledgement = result as RpcResult<"cancelTransfer">;
+      return acknowledgement.id === expected.id && acknowledgement.transferId === expected.transferId
+        ? parsed
+        : rejected("RPC cancelTransfer acknowledgement belongs to a different transfer.");
+    }
+    case "configure": {
+      const configs = (params as RpcParams<"configure">).configs;
+      const changed = (result as RpcResult<"configure">).changed;
+      return changed.every((id) => configs[id] !== undefined)
+        ? parsed
+        : rejected("RPC configure result changed a service absent from the request.");
+    }
+  }
+}
+
 function parseConfig(value: unknown, id?: RpcServiceId): NetworkServerConfigs | undefined {
   const cloned = cloneJsonValue(value);
   if (cloned === undefined) return undefined;

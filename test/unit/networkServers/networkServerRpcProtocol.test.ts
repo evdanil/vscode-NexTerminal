@@ -1,18 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_DHCP_RUNTIME_LEASES,
   MAX_RPC_TEXT_BYTES,
   MAX_TFTP_TRANSFERS,
   MAX_TRANSFER_ID_BYTES,
   parseRpcEnvelope,
   parseRpcEvent,
   parseRpcRequest,
+  parseRpcResultForRequest,
   rpcResultParsers,
 } from "../../../src/services/networkServers/networkServerRpcProtocol";
 import { MAX_RPC_LINE_BYTES } from "../../../src/services/networkServers/boundedLineReader";
 import { validateOptions } from "../../../src/services/networkServers/tftp/engine/protocol";
-
-const DHCP_RUNTIME_LEASE_MAX = 65_536 + 1_024;
-const TEXT_FIELD_BYTE_LIMIT = 1_047_552;
 
 const TFTP_SNAPSHOT = {
   id: "tftp",
@@ -166,6 +165,14 @@ describe("network-server RPC protocol", () => {
       expect(parseRpcEnvelope({ id: 1, result: null, error: null })).toMatchObject({ ok: false });
     });
 
+    it("rejects invalid response ids at every finite-safe boundary", () => {
+      expectAccepted(parseRpcEnvelope({ id: 0, result: null }));
+      expectAccepted(parseRpcEnvelope({ id: Number.MAX_SAFE_INTEGER, result: null }));
+      for (const id of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, -Infinity]) {
+        expectRejected(parseRpcEnvelope({ id, result: null }));
+      }
+    });
+
     it("enforces text boundaries in errors without coercing values", () => {
       expectAccepted(parseRpcEnvelope({ id: 1, error: { code: "X", message: "x".repeat(MAX_RPC_TEXT_BYTES) } }));
       expectRejected(parseRpcEnvelope({ id: 1, error: { code: "X", message: "x".repeat(MAX_RPC_TEXT_BYTES + 1) } }));
@@ -174,8 +181,8 @@ describe("network-server RPC protocol", () => {
     });
 
     it("keeps generic envelope cloning within the combined dynamic-and-static DHCP lease domain", () => {
-      expectAccepted(parseRpcEnvelope({ id: 1, result: Array.from({ length: DHCP_RUNTIME_LEASE_MAX }, () => null) }));
-      expectRejected(parseRpcEnvelope({ id: 1, result: Array.from({ length: DHCP_RUNTIME_LEASE_MAX + 1 }, () => null) }));
+      expectAccepted(parseRpcEnvelope({ id: 1, result: Array.from({ length: MAX_DHCP_RUNTIME_LEASES }, () => null) }));
+      expectRejected(parseRpcEnvelope({ id: 1, result: Array.from({ length: MAX_DHCP_RUNTIME_LEASES + 1 }, () => null) }));
     });
   });
 
@@ -239,12 +246,12 @@ describe("network-server RPC protocol", () => {
     });
 
     it("accepts the full dynamic-plus-static DHCP lease maximum and rejects one more", () => {
-      const leasesAtLimit = Array.from({ length: DHCP_RUNTIME_LEASE_MAX }, () => DHCP_RUNTIME.leases[0]);
+      const leasesAtLimit = Array.from({ length: MAX_DHCP_RUNTIME_LEASES }, () => DHCP_RUNTIME.leases[0]);
       const poolInfoAtLimit = {
         rangeStart: "192.168.0.0",
         rangeEnd: "192.168.255.255",
         poolSize: 65_536,
-        activeCount: DHCP_RUNTIME_LEASE_MAX,
+        activeCount: MAX_DHCP_RUNTIME_LEASES,
         utilizationPct: 100,
         staticEntryCount: 1_024,
       };
@@ -252,7 +259,7 @@ describe("network-server RPC protocol", () => {
       expectRejected(rpcResultParsers.getServiceRuntime({
         ...DHCP_RUNTIME,
         leases: [...leasesAtLimit, DHCP_RUNTIME.leases[0]],
-        poolInfo: { ...poolInfoAtLimit, activeCount: DHCP_RUNTIME_LEASE_MAX + 1 },
+        poolInfo: { ...poolInfoAtLimit, activeCount: MAX_DHCP_RUNTIME_LEASES + 1 },
       }));
     });
 
@@ -263,6 +270,32 @@ describe("network-server RPC protocol", () => {
         ...TFTP_RUNTIME,
         transfers: [{ ...transfer(), totalBytes }],
       }));
+    });
+
+    it("rejects negative, fractional, and non-finite TFTP totalBytes values", () => {
+      for (const totalBytes of [-1, 1.5, NaN, Infinity, -Infinity]) {
+        expectRejected(rpcResultParsers.getServiceRuntime({
+          ...TFTP_RUNTIME,
+          transfers: [{ ...transfer(), totalBytes }],
+        }));
+      }
+    });
+
+    it("correlates parsed results with the request parameters that produced them", () => {
+      expectRejected(parseRpcResultForRequest("getStatus", { id: "tftp" }, DHCP_SNAPSHOT));
+      expectRejected(parseRpcResultForRequest("getServiceRuntime", { id: "dhcp" }, TFTP_RUNTIME));
+      expectRejected(parseRpcResultForRequest("start", { id: "tftp" }, { ok: true, id: "dhcp" }));
+      expectRejected(parseRpcResultForRequest("cancelTransfer", { id: "tftp", transferId: "127.0.0.1:1069" }, {
+        ok: true,
+        id: "tftp",
+        transferId: "127.0.0.1:1070",
+      }));
+      expectRejected(parseRpcResultForRequest("configure", { configs: { tftp: { port: 69 } } }, {
+        ok: true,
+        changed: ["dhcp"],
+      }));
+      expectRejected(parseRpcResultForRequest("list", undefined, [TFTP_SNAPSHOT]));
+      expectAccepted(parseRpcResultForRequest("list", undefined, [TFTP_SNAPSHOT, DHCP_SNAPSHOT]));
     });
 
     it("enforces bounded response collections at their exact limits", () => {
@@ -320,14 +353,14 @@ describe("network-server RPC protocol", () => {
     });
 
     it("keeps a multibyte log field within the planned JSON-line byte budget", () => {
-      const messageAtLimit = "é".repeat(TEXT_FIELD_BYTE_LIMIT / 2);
+      const messageAtLimit = "é".repeat(MAX_RPC_TEXT_BYTES / 2);
       const eventAtLimit = { event: "log", data: { id: "daemon", level: "info", message: messageAtLimit } } as const;
-      expect(Buffer.byteLength(messageAtLimit, "utf8")).toBe(TEXT_FIELD_BYTE_LIMIT);
+      expect(Buffer.byteLength(messageAtLimit, "utf8")).toBe(MAX_RPC_TEXT_BYTES);
       expectAccepted(parseRpcEvent(eventAtLimit));
       expect(Buffer.byteLength(`${JSON.stringify(eventAtLimit)}\n`, "utf8")).toBeLessThanOrEqual(MAX_RPC_LINE_BYTES);
 
       const messageOneByteOver = `${messageAtLimit}a`;
-      expect(Buffer.byteLength(messageOneByteOver, "utf8")).toBe(TEXT_FIELD_BYTE_LIMIT + 1);
+      expect(Buffer.byteLength(messageOneByteOver, "utf8")).toBe(MAX_RPC_TEXT_BYTES + 1);
       expectRejected(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: messageOneByteOver } }));
 
       expect(parseRpcEvent({ event: "ready", data: {} })).toMatchObject({ ok: false });

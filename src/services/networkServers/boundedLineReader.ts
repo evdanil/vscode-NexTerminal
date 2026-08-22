@@ -3,17 +3,9 @@ export const MAX_RPC_LINE_BYTES = 1_048_576;
 
 export interface BoundedLineReaderOptions {
   readonly onLine: (line: string) => void;
+  /** Receives terminal framing violations; transport `error` events stay owned by the caller. */
   readonly onError: (error: Error) => void;
   readonly maxBytes?: number;
-}
-
-type PendingEvent =
-  | { readonly type: "data"; readonly value: Buffer | string; readonly queuedBytes: number }
-  | { readonly type: "end" };
-
-interface PendingNode {
-  readonly event: PendingEvent;
-  next: PendingNode | undefined;
 }
 
 /**
@@ -32,99 +24,89 @@ export function attachBoundedLineReader(
 
   let active = true;
   let bufferedBytes = 0;
-  let fragments: Buffer[] = [];
-  let pendingHead: PendingNode | undefined;
-  let pendingTail: PendingNode | undefined;
-  let queuedBytes = 0;
+  let lineBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  let pendingBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  let pendingBytes = 0;
+  let processingBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let processing = false;
   let endQueued = false;
 
-  const clearPending = (): void => {
-    pendingHead = undefined;
-    pendingTail = undefined;
-    queuedBytes = 0;
-  };
-
   const clear = (): void => {
     bufferedBytes = 0;
-    fragments = [];
+    pendingBytes = 0;
+    endQueued = false;
   };
 
   const detach = (): void => {
     if (!active) return;
     active = false;
     clear();
-    clearPending();
     stream.removeListener("data", onData);
     stream.removeListener("end", onEnd);
   };
 
+  const grow = (buffer: Buffer<ArrayBufferLike>, usedBytes: number, neededBytes: number): Buffer<ArrayBufferLike> => {
+    if (buffer.length >= neededBytes) return buffer;
+    let capacity = Math.max(64, buffer.length || 1);
+    while (capacity < neededBytes) capacity = Math.max(neededBytes, capacity * 2);
+    const grown = Buffer.allocUnsafeSlow(capacity);
+    if (usedBytes > 0) buffer.copy(grown, 0, 0, usedBytes);
+    return grown;
+  };
+
+  const appendLine = (chunk: Buffer, start: number, end: number): boolean => {
+    const length = end - start;
+    if (bufferedBytes + length > maxBytes) {
+      rejectOversize();
+      return false;
+    }
+    if (length === 0) return true;
+    lineBuffer = grow(lineBuffer, bufferedBytes, bufferedBytes + length);
+    chunk.copy(lineBuffer, bufferedBytes, start, end);
+    bufferedBytes += length;
+    return true;
+  };
+
   const takeLine = (stripTrailingCarriageReturn: boolean): string => {
-    const line = fragments.length === 0
-      ? Buffer.alloc(0)
-      : fragments.length === 1
-        ? fragments[0]!
-        : Buffer.concat(fragments, bufferedBytes);
-    clear();
-    const payload = stripTrailingCarriageReturn && line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
-    return payload.toString("utf8");
+    const end = stripTrailingCarriageReturn && bufferedBytes > 0 && lineBuffer[bufferedBytes - 1] === 0x0d
+      ? bufferedBytes - 1
+      : bufferedBytes;
+    const line = lineBuffer.toString("utf8", 0, end);
+    bufferedBytes = 0;
+    return line;
   };
 
   const rejectOversize = (): void => {
     if (!active) return;
     detach();
+    // `detach()` precedes the callback so a reentrant source write is ignored.
     onError(new Error(`RPC line exceeds ${maxBytes} bytes.`));
   };
 
-  const byteLength = (value: Buffer | string): number => Buffer.isBuffer(value) ? value.length : Buffer.byteLength(value, "utf8");
-
-  const snapshotQueuedInput = (value: Buffer | string, length: number): Buffer => {
-    const snapshot = Buffer.allocUnsafeSlow(length);
-    if (Buffer.isBuffer(value)) value.copy(snapshot);
-    else snapshot.write(value, 0, length, "utf8");
-    return snapshot;
+  const deliverLine = (line: string): void => {
+    try {
+      onLine(line);
+    } catch (error) {
+      detach();
+      throw error;
+    }
   };
 
-  const enqueue = (event: PendingEvent): void => {
-    const node: PendingNode = { event, next: undefined };
-    if (pendingTail) pendingTail.next = node;
-    else pendingHead = node;
-    pendingTail = node;
-  };
-
-  const dequeue = (): PendingEvent | undefined => {
-    const node = pendingHead;
-    if (!node) return undefined;
-    pendingHead = node.next;
-    if (!pendingHead) pendingTail = undefined;
-    node.next = undefined;
-    return node.event;
-  };
-
-  const processData = (value: Buffer | string): void => {
+  const processData = (value: Buffer | string, inputBytes?: number): void => {
     if (!active) return;
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+    const chunkBytes = inputBytes ?? chunk.length;
     let offset = 0;
 
-    while (offset < chunk.length) {
-      const newline = chunk.indexOf(0x0a, offset);
-      const end = newline === -1 ? chunk.length : newline;
-      const length = end - offset;
-      if (bufferedBytes + length > maxBytes) {
-        rejectOversize();
-        return;
-      }
-
-      if (length > 0) {
-        const fragment = Buffer.allocUnsafeSlow(length);
-        chunk.copy(fragment, 0, offset, end);
-        fragments.push(fragment);
-        bufferedBytes += length;
-      }
+    while (offset < chunkBytes) {
+      const foundNewline = chunk.indexOf(0x0a, offset);
+      const newline = foundNewline >= chunkBytes ? -1 : foundNewline;
+      const end = newline === -1 ? chunkBytes : newline;
+      if (!appendLine(chunk, offset, end)) return;
 
       if (newline === -1) return;
 
-      onLine(takeLine(true));
+      deliverLine(takeLine(true));
       if (!active) return;
       offset = newline + 1;
     }
@@ -134,7 +116,7 @@ export function attachBoundedLineReader(
     if (!active) return;
     const finalLine = bufferedBytes === 0 ? undefined : takeLine(false);
     detach();
-    if (finalLine !== undefined) onLine(finalLine);
+    if (finalLine !== undefined) deliverLine(finalLine);
   };
 
   const drain = (): void => {
@@ -142,42 +124,50 @@ export function attachBoundedLineReader(
     processing = true;
     try {
       while (active) {
-        const event = dequeue();
-        if (!event) break;
-        if (event.type === "data") {
-          queuedBytes -= event.queuedBytes;
-          processData(event.value);
+        if (pendingBytes > 0) {
+          const nextBuffer = pendingBuffer;
+          const nextBytes = pendingBytes;
+          pendingBuffer = processingBuffer;
+          pendingBytes = 0;
+          processingBuffer = nextBuffer;
+          processData(processingBuffer, nextBytes);
+          continue;
         }
-        else processEnd();
+        if (endQueued) processEnd();
+        break;
       }
     } finally {
-      clearPending();
       processing = false;
     }
   };
 
   const onData = (value: Buffer | string): void => {
     if (!active || endQueued) return;
-    const length = byteLength(value);
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+    const length = chunk.length;
     if (length === 0) return;
     if (!processing) {
-      enqueue({ type: "data", value, queuedBytes: 0 });
+      processing = true;
+      try {
+        processData(chunk);
+      } finally {
+        processing = false;
+      }
       drain();
       return;
     }
-    if (queuedBytes + length > maxBytes) {
+    if (pendingBytes + length > maxBytes) {
       rejectOversize();
       return;
     }
-    enqueue({ type: "data", value: snapshotQueuedInput(value, length), queuedBytes: length });
-    queuedBytes += length;
-    drain();
+    pendingBuffer = grow(pendingBuffer, pendingBytes, pendingBytes + length);
+    chunk.copy(pendingBuffer, pendingBytes, 0, length);
+    pendingBytes += length;
   };
 
   const onEnd = (): void => {
     if (!active || endQueued) return;
     endQueued = true;
-    enqueue({ type: "end" });
     drain();
   };
 

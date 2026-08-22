@@ -31,14 +31,23 @@ export function createNetworkServerDaemonShutdown(
       } catch {
         // A terminal shutdown continues cleanup after an unexpected drain error.
       }
-      dependencies.flushRuntimeUpdates();
+      try {
+        dependencies.flushRuntimeUpdates();
+      } catch {
+        // Runtime updates are best-effort during terminal shutdown.
+      }
       try {
         await dependencies.dispose();
       } catch {
         // Disposal is best-effort; every terminal path still exits exactly once.
       }
-      dependencies.flushRuntimeUpdates();
-      dependencies.exit();
+      try {
+        dependencies.flushRuntimeUpdates();
+      } catch {
+        // A final coalesced update must never prevent process exit.
+      } finally {
+        dependencies.exit();
+      }
     })();
     return shutdownPromise;
   };

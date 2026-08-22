@@ -48,7 +48,7 @@ import type { DhcpPacketCounters, DhcpPoolInfo } from "./dhcp/engine/DhcpEngine"
 import {
   parseRpcEnvelope,
   parseRpcEvent,
-  rpcResultParsers,
+  parseRpcResultForRequest,
   type RpcEnvelope,
   type RpcEvent,
   type RpcMethod,
@@ -154,6 +154,8 @@ export class NetworkServerDaemonHost {
   private detachChildIo?: () => void;
   /** SIGKILL escalation belongs to the specific child that received SIGTERM. */
   private readonly killTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
+  /** A live child may close stdout only until this generation-owned deadline. */
+  private readonly stdoutEofTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
   private readonly rpcTimeoutMs: number;
   private readonly readyTimeoutMs: number;
 
@@ -339,7 +341,7 @@ export class NetworkServerDaemonHost {
    * is still a live process holding open pipes, and abandoning it means a
    * retry silently accumulates daemons that no `dispose()` can ever reach.
    *
-   * The host-level state (readline interfaces, `child`, `readyFlag`) is only
+   * The host-level state (pipe readers, `child`, `readyFlag`) is only
    * cleared when `child` really is the current one. Detaching a child that has
    * already been replaced must not close the live one's pipes.
    */
@@ -380,9 +382,12 @@ export class NetworkServerDaemonHost {
     // clears current-host state before signalling, so the guarded lifecycle
     // listener below must ignore its later exit; the child still owns the
     // timer that would otherwise escalate an unrelated replacement.
-    const clearEscalation = () => this.clearChildEscalation(child);
-    child.once("exit", clearEscalation);
-    child.once("close", clearEscalation);
+    const clearChildTimers = () => {
+      this.clearChildEscalation(child);
+      this.clearChildStdoutEofDeadline(child);
+    };
+    child.once("exit", clearChildTimers);
+    child.once("close", clearChildTimers);
 
     child.on("error", (error) => {
       if (!this.isCurrentChild(child, generation)) return;
@@ -400,7 +405,7 @@ export class NetworkServerDaemonHost {
       this.rejectAllPending(error);
       this.rejectAllReadyWaiters(error);
       for (const listener of this.exitListeners) {
-        listener(code, signal);
+        this.invokeUserListener(() => listener(code, signal));
       }
     });
 
@@ -414,16 +419,7 @@ export class NetworkServerDaemonHost {
         onError: (error) => this.failChildProtocol(child, generation, error.message),
       });
       const onStdoutEnd = () => {
-        // Node can deliver a pipe EOF several event-loop turns before its
-        // ChildProcess `exit` event. Give ordinary process teardown a short
-        // grace period; a live child that merely closed stdout remains a
-        // protocol failure once that period expires.
-        setTimeout(() => {
-          if (!this.isCurrentChild(child, generation)) return;
-          if (child.exitCode === null && child.signalCode === null) {
-            this.failChildProtocol(child, generation, "daemon stdout closed before the process exited");
-          }
-        }, 25);
+        this.scheduleChildStdoutEofDeadline(child, generation);
       };
       const onStdoutError = (error: Error) => {
         if (!this.isCurrentChild(child, generation)) return;
@@ -459,7 +455,7 @@ export class NetworkServerDaemonHost {
       const previousCleanup = this.detachChildIo;
       const onStdinError = (error: Error) => {
         if (!this.isCurrentChild(child, generation)) return;
-        this.emitLog("daemon", "warn", `Daemon stdin stream error: ${error.message}`);
+        this.failChildTransport(child, generation, `daemon stdin stream error: ${error.message}`);
       };
       child.stdin.on("error", onStdinError);
       this.detachChildIo = () => {
@@ -515,11 +511,11 @@ export class NetworkServerDaemonHost {
     // ChildProcess property itself is nullable in Node's declarations.
     const stdin = child.stdin;
 
-    const id = this.nextId++;
+    const id = this.allocateRequestId();
     const responsePromise = new Promise<unknown>((resolve, reject) => {
       const deferred: PendingRequest = {
         method,
-        parseResult: (value) => rpcResultParsers[method](value),
+        parseResult: (value) => parseRpcResultForRequest(method, params, value),
         resolve,
         reject,
       };
@@ -532,9 +528,7 @@ export class NetworkServerDaemonHost {
 
       const rejectWrite = (error: Error) => {
         if (!this.isCurrentChild(child, generation)) return;
-        this.settlePending(id, deferred, (entry) => entry.reject(
-          new Error(`Network servers daemon stdin write failed: ${error.message}`)
-        ));
+        this.failChildTransport(child, generation, `daemon stdin write failed: ${error.message}`);
       };
       stdin.once("error", rejectWrite);
       deferred.detachWriteError = () => stdin.removeListener("error", rejectWrite);
@@ -546,16 +540,12 @@ export class NetworkServerDaemonHost {
         // which is the only correct behaviour under pipe backpressure.
         stdin.write(`${JSON.stringify(request)}\n`, (error?: Error | null) => {
           if (!error || !this.isCurrentChild(child, generation)) return;
-          this.settlePending(id, deferred, (entry) => entry.reject(
-            new Error(`Network servers daemon stdin write failed: ${error.message}`)
-          ));
+          this.failChildTransport(child, generation, `daemon stdin write failed: ${error.message}`);
         });
       } catch (error) {
         if (!this.isCurrentChild(child, generation)) return;
         const message = error instanceof Error ? error.message : String(error);
-        this.settlePending(id, deferred, (entry) => entry.reject(
-          new Error(`Network servers daemon stdin write failed: ${message}`)
-        ));
+        this.failChildTransport(child, generation, `daemon stdin write failed: ${message}`);
       }
     });
 
@@ -633,21 +623,21 @@ export class NetworkServerDaemonHost {
         };
         for (const listener of this.statusChangeListeners) {
           if (!this.isCurrentChild(child, generation)) return;
-          listener(statusEvent);
+          this.invokeUserListener(() => listener(statusEvent));
         }
         return;
       }
       case "runtimeUpdate": {
         for (const listener of this.runtimeUpdateListeners) {
           if (!this.isCurrentChild(child, generation)) return;
-          listener(notification.data.id);
+          this.invokeUserListener(() => listener(notification.data.id));
         }
         return;
       }
       case "connection": {
         for (const listener of this.connectionListeners) {
           if (!this.isCurrentChild(child, generation)) return;
-          listener(notification.data.id, notification.data.connection);
+          this.invokeUserListener(() => listener(notification.data.id, notification.data.connection));
         }
         return;
       }
@@ -660,7 +650,7 @@ export class NetworkServerDaemonHost {
 
   private emitLog(id: string, level: string, message: string): void {
     for (const listener of this.logListeners) {
-      listener(id, level, message);
+      this.invokeUserListener(() => listener(id, level, message));
     }
   }
 
@@ -686,6 +676,59 @@ export class NetworkServerDaemonHost {
     this.terminateChild(child);
     this.rejectAllPending(error);
     this.rejectAllReadyWaiters(error);
+  }
+
+  /** Owns a terminal pipe failure exactly like protocol corruption, without blaming the peer's schema. */
+  private failChildTransport(child: ChildProcess, generation: number, reason: string): void {
+    if (!this.isCurrentChild(child, generation)) return;
+    const error = new Error(`Network servers daemon transport error: ${reason}`);
+    this.terminateChild(child);
+    this.rejectAllPending(error);
+    this.rejectAllReadyWaiters(error);
+  }
+
+  /** Allocates a finite request id and skips ids still owned by pending calls. */
+  private allocateRequestId(): number {
+    let id = Number.isSafeInteger(this.nextId) && this.nextId > 0 ? this.nextId : 1;
+    const first = id;
+    do {
+      if (!this.pending.has(id)) {
+        this.nextId = id === Number.MAX_SAFE_INTEGER ? 1 : id + 1;
+        return id;
+      }
+      id = id === Number.MAX_SAFE_INTEGER ? 1 : id + 1;
+    } while (id !== first);
+    throw new Error("Network servers daemon has exhausted safe RPC request ids");
+  }
+
+  /** Gives normal exit/close delivery a conservative chance before treating live EOF as corruption. */
+  private scheduleChildStdoutEofDeadline(child: ChildProcess, generation: number): void {
+    if (!this.isCurrentChild(child, generation) || this.stdoutEofTimers.has(child)) return;
+    const timer = setTimeout(() => {
+      this.stdoutEofTimers.delete(child);
+      if (!this.isCurrentChild(child, generation)) return;
+      if (child.exitCode === null && child.signalCode === null) {
+        this.failChildProtocol(child, generation, "daemon stdout closed before the process exited");
+      }
+    }, 1_000);
+    timer.unref();
+    this.stdoutEofTimers.set(child, timer);
+  }
+
+  private clearChildStdoutEofDeadline(child: ChildProcess): void {
+    const timer = this.stdoutEofTimers.get(child);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.stdoutEofTimers.delete(child);
+  }
+
+  /** A user callback must never break framing, child ownership, or later listeners. */
+  private invokeUserListener(callback: () => void): void {
+    try {
+      callback();
+    } catch {
+      // Listener exceptions are isolated at the host boundary by design.
+    }
   }
 
   /** Installs no more than one unref'd escalation timer for this exact child. */

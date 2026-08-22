@@ -154,7 +154,7 @@ class DaemonClient {
 
   public send(method: string, params?: Record<string, unknown>, timeoutMs = 15_000): Promise<RpcReply> {
     const id = this.nextId++;
-    return this.sendLine(`${JSON.stringify({ id, method, params })}\n`, id, timeoutMs);
+    return this.sendLine(`${JSON.stringify({ id, method, params })}\n`, id, timeoutMs, method);
   }
 
   /** Sends an untrusted JSON value and waits for its safe id or the daemon's reserved fallback id 0. */
@@ -166,19 +166,19 @@ class DaemonClient {
       && (payload as { id: number }).id >= 0
       ? (payload as { id: number }).id
       : 0;
-    return this.sendLine(`${JSON.stringify(payload)}\n`, id, timeoutMs);
+    return this.sendLine(`${JSON.stringify(payload)}\n`, id, timeoutMs, "raw JSON");
   }
 
   /** Sends raw JSON-line text, for parser failures which cannot be represented by JSON.stringify. */
   public sendRawLine(line: string, responseId = 0, timeoutMs = 15_000): Promise<RpcReply> {
-    return this.sendLine(`${line}\n`, responseId, timeoutMs);
+    return this.sendLine(`${line}\n`, responseId, timeoutMs, "raw line");
   }
 
-  private sendLine(line: string, id: number, timeoutMs: number): Promise<RpcReply> {
+  private sendLine(line: string, id: number, timeoutMs: number, description: string): Promise<RpcReply> {
     return new Promise<RpcReply>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`daemon RPC '${method}' timed out after ${timeoutMs}ms`));
+        reject(new Error(`daemon RPC '${description}' timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       this.pending.set(id, (reply) => {
         clearTimeout(timer);

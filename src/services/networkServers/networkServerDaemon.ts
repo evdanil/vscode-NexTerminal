@@ -36,7 +36,7 @@
  *
  * 4. **VS Code ↔ daemon Bridge**: the main extension process
  *    (`extension.ts`) does `spawn()` of this daemon as a child process and
- *    uses `stdout.on('data')` + `readline` to receive events and
+ *    uses the shared bounded byte-oriented reader to receive events and
  *    responses, while writing requests to `stdin`. The lifecycle
  *    becomes linked: when VS Code closes, `stdin` closes and the daemon
  *    shuts down gracefully.
@@ -61,6 +61,7 @@
 
 import { env, stdin, stdout } from 'node:process';
 import { attachBoundedLineReader } from './boundedLineReader';
+import { BoundedJsonLineWriter } from './boundedJsonLineWriter';
 import { DhcpAdapter, type DhcpLeaseInfo } from './dhcp/DhcpAdapter';
 import { TftpAdapter, type TftpTransferView } from './tftp/TftpAdapter';
 import { createRuntimeUpdateThrottle } from './runtimeUpdateThrottle';
@@ -117,23 +118,20 @@ const CONFIG_ENV_VAR = 'NEXUS_NETWORK_SERVERS_CONFIG';
 
 /**
  * Serializes a closed protocol envelope/event and writes it as **one line**
- * to the process `stdout`.
+ * to the process `stdout` through the owned bounded writer.
  *
- * Silently ignores write failures — if stdout is already closed
- * (VS Code end disconnected) there is no recovery action.
+ * Serialized payload bytes exclude the trailing newline delimiter. Oversized
+ * responses are converted to closed errors; terminal transport loss enters
+ * the daemon shutdown authority.
  *
  * @param obj — message to send to the parent process (VS Code UI).
  */
+let daemonWriter: BoundedJsonLineWriter | undefined;
+
 function writeLine(obj: RpcEnvelope | RpcEvent): void {
-  try {
-    const serialized = JSON.stringify(obj);
-    const wireValue: unknown = JSON.parse(serialized);
-    const parsed = 'id' in obj ? parseRpcEnvelope(wireValue) : parseRpcEvent(wireValue);
-    if (!parsed.ok) return;
-    stdout.write(serialized + '\n');
-  } catch {
-    // stdout unavailable; nothing we can do
-  }
+  const parsed = 'id' in obj ? parseRpcEnvelope(obj) : parseRpcEvent(obj);
+  if (!parsed.ok) return;
+  daemonWriter?.write(parsed.value);
 }
 
 /**
@@ -330,7 +328,16 @@ async function run(): Promise<void> {
     if (!alreadyShuttingDown) logDaemon('info', `Shutting down (${reason})...`);
     return promise;
   };
+  daemonWriter = new BoundedJsonLineWriter(stdout, {
+    onTerminal: (error) => {
+      void shutdown(`stdout terminal error: ${error.message}`).catch(writeShutdownError);
+    },
+    onNotificationDropped: (reason) => writeShutdownError(`daemon ${reason}`),
+  });
   onStdinEnd = (): void => { void shutdown('stdin closed').catch(writeShutdownError); };
+  stdin.on('error', (error) => {
+    void shutdown(`stdin stream error: ${error.message}`).catch(writeShutdownError);
+  });
 
   process.on('SIGINT', () => void shutdown('SIGINT').catch(writeShutdownError));
   process.on('SIGTERM', () => void shutdown('SIGTERM').catch(writeShutdownError));

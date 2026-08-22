@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MAX_RPC_LINE_BYTES, attachBoundedLineReader } from "../../../src/services/networkServers/boundedLineReader";
 
 type FramingCase = {
@@ -78,6 +78,33 @@ describe("bounded RPC line reader", () => {
     dispose();
   });
 
+  it("honors custom byte limits exactly and rejects the first byte over", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      maxBytes: 3,
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    stream.write(Buffer.from("abc\n"));
+    stream.write(Buffer.from("abcd\n"));
+
+    expect(lines).toEqual(["abc"]);
+    expect(errors).toHaveLength(1);
+    dispose();
+  });
+
+  it.each([-1, 1.5, NaN, Infinity, -Infinity])("rejects invalid maxBytes %s", (maxBytes) => {
+    const stream = new PassThrough();
+    expect(() => attachBoundedLineReader(stream, {
+      maxBytes,
+      onLine: () => undefined,
+      onError: () => undefined,
+    })).toThrow(RangeError);
+  });
+
   it("owns a tiny residual instead of retaining its large mutable backing buffer", () => {
     const stream = new PassThrough();
     const lines: string[] = [];
@@ -144,6 +171,87 @@ describe("bounded RPC line reader", () => {
     dispose();
   });
 
+  it("uses a bounded number of owned allocations for one-byte ordinary input", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const allocation = vi.spyOn(Buffer, "allocUnsafeSlow");
+    const dispose = attachBoundedLineReader(stream, {
+      maxBytes: 1_024,
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    for (let index = 0; index < 1_024; index += 1) stream.write(Buffer.from("a"));
+    stream.write(Buffer.from("\n"));
+
+    expect(lines).toEqual(["a".repeat(1_024)]);
+    expect(errors).toEqual([]);
+    expect(allocation.mock.calls.length).toBeLessThanOrEqual(16);
+    allocation.mockRestore();
+    dispose();
+  });
+
+  it("uses bounded queue storage across rolling reentrant one-byte input", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const allocation = vi.spyOn(Buffer, "allocUnsafeSlow");
+    let remaining = 1_024;
+    const dispose = attachBoundedLineReader(stream, {
+      maxBytes: 1_024,
+      onLine: (line) => {
+        lines.push(line);
+        if (remaining-- > 0) stream.emit("data", Buffer.from("x\n"));
+      },
+      onError: (error) => errors.push(error),
+    });
+
+    stream.write(Buffer.from("start\n"));
+
+    expect(lines).toHaveLength(1_025);
+    expect(errors).toEqual([]);
+    expect(allocation.mock.calls.length).toBeLessThanOrEqual(32);
+    allocation.mockRestore();
+    dispose();
+  });
+
+  it("does not scan stale queued-buffer capacity beyond the current reentrant payload", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => {
+        lines.push(line);
+        if (line === "start") stream.emit("data", Buffer.from("retained\n"));
+        if (line === "retained") stream.emit("data", Buffer.from("x\n"));
+        if (line === "x") stream.emit("data", Buffer.from("y"));
+      },
+      onError: (error) => { throw error; },
+    });
+
+    stream.write(Buffer.from("start\n"));
+    stream.emit("data", Buffer.from("\n"));
+
+    expect(lines).toEqual(["start", "retained", "x", "y"]);
+    dispose();
+  });
+
+  it("detaches before rethrowing a terminal line callback exception", () => {
+    const stream = new PassThrough();
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: () => { throw new Error("listener exploded"); },
+      onError: (error) => errors.push(error),
+    });
+
+    expect(() => stream.write(Buffer.from("first\nremainder\n"))).toThrow("listener exploded");
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+    stream.write(Buffer.from("late\n"));
+
+    expect(errors).toEqual([]);
+    dispose();
+  });
+
   it("terminates once and drops queued data when reentrant input exceeds its byte budget", () => {
     const stream = new PassThrough();
     const lines: string[] = [];
@@ -168,14 +276,32 @@ describe("bounded RPC line reader", () => {
     dispose();
   });
 
+  it("detaches before an oversize onError callback can reenter its source", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      maxBytes: 1,
+      onLine: (line) => lines.push(line),
+      onError: () => stream.emit("data", Buffer.from("late\n")),
+    });
+
+    stream.write(Buffer.from("xx"));
+
+    expect(lines).toEqual([]);
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+    dispose();
+  });
+
   it("releases historical queued snapshots during rolling reentrancy", () => {
     const fixture = resolve(process.cwd(), "test/unit/networkServers/fixtures/boundedLineReaderRollingRetention.fixture.mjs");
     const child = spawnSync(process.execPath, ["--expose-gc", fixture], {
       cwd: process.cwd(),
       encoding: "utf8",
+      timeout: 15_000,
     });
 
-    expect(child.status).toBe(0);
+    expect(child.error, child.stderr).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
     expect((JSON.parse(child.stdout) as { readonly liveSnapshots: number }).liveSnapshots).toBeLessThanOrEqual(2);
   });
 
