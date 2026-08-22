@@ -388,9 +388,8 @@ export class NetworkServerDaemonHost {
    * cleared when `child` really is the current one. Detaching a child that has
    * already been replaced must not close the live one's pipes.
    */
-  private terminateChild(child: ChildProcess, reportUnexpectedReadyExit = false): void {
+  private terminateChild(child: ChildProcess): void {
     if (this.child !== child) return;
-    const notifyUnexpectedReadyExit = reportUnexpectedReadyExit && this.readyFlag;
     this.clearChildStdoutEofDeadline(child);
     this.child = undefined;
     this.activeGeneration = undefined;
@@ -400,11 +399,6 @@ export class NetworkServerDaemonHost {
     // Stream error guards stay attached through this child's later `close`:
     // Node can deliver a buffered EPIPE after exit/termination.
     this.detachChildProtocolIo(child);
-    // A ready generation that failed protocol/transport validation has already
-    // lost all host ownership, but its process has not necessarily exited yet.
-    // Notify consumers once with honest unknown metadata now; its later
-    // physical exit is identity-gated and cannot reset a replacement.
-    if (notifyUnexpectedReadyExit) this.emitExit(null, null);
     try { child.stdin?.end(); } catch { /* pipe already gone */ }
     try { child.kill("SIGTERM"); } catch { /* already dead */ }
     this.scheduleChildEscalation(child);
@@ -843,19 +837,26 @@ export class NetworkServerDaemonHost {
   /** Rejects this generation and reaps only its process after an untrusted stdout violation. */
   private failChildProtocol(child: ChildProcess, generation: number, reason: string): void {
     if (!this.isCurrentChild(child, generation)) return;
+    const wasReady = this.readyFlag;
     const error = new Error(`Daemon protocol error: ${reason}`);
-    this.terminateChild(child, true);
+    this.terminateChild(child);
     this.rejectAllPending(error);
     this.rejectAllReadyWaiters(error);
+    // User lifecycle listeners may synchronously start or request from a
+    // replacement. Settle the failed generation first, then notify exactly
+    // once with unknown metadata; no old-generation cleanup may follow.
+    if (wasReady) this.emitExit(null, null);
   }
 
   /** Owns a terminal pipe failure exactly like protocol corruption, without blaming the peer's schema. */
   private failChildTransport(child: ChildProcess, generation: number, reason: string): void {
     if (!this.isCurrentChild(child, generation)) return;
+    const wasReady = this.readyFlag;
     const error = new Error(`Network servers daemon transport error: ${reason}`);
-    this.terminateChild(child, true);
+    this.terminateChild(child);
     this.rejectAllPending(error);
     this.rejectAllReadyWaiters(error);
+    if (wasReady) this.emitExit(null, null);
   }
 
   /** Allocates a finite request id and skips ids still owned by pending calls. */

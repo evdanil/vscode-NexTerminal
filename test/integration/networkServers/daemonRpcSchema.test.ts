@@ -58,6 +58,14 @@ type HostInternals = {
   handleMessage(child: HostInternals["child"] & object, generation: number, raw: string): void;
 };
 
+type HostOwnershipInternals = HostInternals & {
+  readyWaiters?: Set<unknown>;
+  childWrites?: Map<unknown, unknown>;
+  childIo?: Map<unknown, unknown>;
+  killTimers?: Map<unknown, unknown>;
+  stdoutEofTimers?: Map<unknown, unknown>;
+};
+
 type WritableWithCallback = NodeJS.WritableStream & {
   write(chunk: string, callback?: (error?: Error | null) => void): boolean;
 };
@@ -91,6 +99,18 @@ function blockHostEventLoop(durationMs: number): void {
     // The busy loop deliberately prevents queued child-process callbacks from
     // running until after the conservative stdout-EOF deadline has elapsed.
   }
+}
+
+function allDaemonOwnershipIsReleased(internals: HostOwnershipInternals): boolean {
+  return [
+    internals.pending,
+    internals.admissions,
+    internals.readyWaiters,
+    internals.childWrites,
+    internals.childIo,
+    internals.killTimers,
+    internals.stdoutEofTimers,
+  ].every((ownership) => ownership?.size === 0);
 }
 
 describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
@@ -324,6 +344,70 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     await expect(host.listServers()).resolves.toHaveLength(2);
     await sleep(50);
     expect(exits).toEqual([{ code: null, signal: null, ready: false }]);
+  }, 30_000);
+
+  async function expectReentrantSyntheticExitReplacement(
+    reenter: (host: NetworkServerDaemonHost) => Promise<unknown>,
+    assertReentrantResult: (result: unknown) => void,
+  ): Promise<void> {
+    const host = create("invalid-json");
+    const internals = host as unknown as HostOwnershipInternals;
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    let reentrant: Promise<unknown> | undefined;
+    let replacementPid: number | undefined;
+
+    host.onDidExit((code, signal) => {
+      exits.push({ code, signal });
+      process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
+      reentrant = reenter(host);
+      // Keep a rejection observed during RED from becoming an unhandled
+      // promise, while retaining the original promise for the assertion.
+      void reentrant.catch(() => undefined);
+      replacementPid = childPid(host);
+      if (replacementPid !== undefined) pids.add(replacementPid);
+    });
+
+    await host.ensureStarted();
+    const failedPid = childPid(host);
+    expect(failedPid).toBeTypeOf("number");
+    pids.add(failedPid!);
+
+    await expect(host.listServers()).rejects.toThrow(/Daemon protocol error/);
+    expect(reentrant).toBeDefined();
+    expect(replacementPid).toBeTypeOf("number");
+    expect(replacementPid).not.toBe(failedPid);
+
+    if (!reentrant || replacementPid === undefined) {
+      throw new Error("synthetic exit listener did not start a replacement generation");
+    }
+    assertReentrantResult(await reentrant);
+    await expect(waitFor(() => host.isReady ? true : undefined)).resolves.toBe(true);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+
+    // The old process closes after the reentrant replacement begins. Its
+    // physical lifecycle callbacks must stay isolated from the new generation.
+    expect(await waitForExit(failedPid!)).toBe(true);
+    expect(host.isReady).toBe(true);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(exits).toEqual([{ code: null, signal: null }]);
+
+    host.dispose();
+    expect(await waitForExit(replacementPid)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }
+
+  it("settles a failed generation before a synthetic exit listener immediately ensures a replacement", async () => {
+    await expectReentrantSyntheticExitReplacement(
+      (host) => host.ensureStarted(),
+      (result) => expect(result).toBeUndefined(),
+    );
+  }, 30_000);
+
+  it("settles a failed generation before a synthetic exit listener immediately lists from a replacement", async () => {
+    await expectReentrantSyntheticExitReplacement(
+      (host) => host.listServers(),
+      (result) => expect(result).toHaveLength(2),
+    );
   }, 30_000);
 
   it("does not let a late physical exit from a retired generation reset a ready replacement", async () => {
