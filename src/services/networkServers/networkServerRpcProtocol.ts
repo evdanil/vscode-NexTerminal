@@ -6,21 +6,23 @@
  * depending on VS Code or either process's lifecycle implementation.
  */
 
-import { MAX_DHCP_POOL_SIZE, parseNetworkServerConfigs } from "./networkServerConfigValidation";
+import { MAX_DHCP_POOL_SIZE, MAX_STATIC_RESERVATIONS, parseNetworkServerConfigs } from "./networkServerConfigValidation";
 import type { NetworkServerConfigs } from "./core/index";
 import type { DhcpAdapterConfig } from "./dhcp/DhcpAdapter";
 import type { TftpAdapterConfig } from "./tftp/TftpAdapter";
 
-/** Largest text field emitted by the current UDP-backed services (128 KiB). */
-export const MAX_RPC_TEXT_BYTES = 128 * 1024;
+/** Text is independently bounded at the planned JSON-line transport ceiling. */
+export const MAX_RPC_TEXT_BYTES = 1_048_576;
 /** Transfer ids are socket endpoint identifiers today; 1 KiB leaves ample protocol headroom. */
 export const MAX_TRANSFER_ID_BYTES = 1024;
 /** The TFTP engine's fixed default concurrent-transfer ceiling. */
 export const MAX_TFTP_TRANSFERS = 64;
+/** Dynamic-pool leases plus every configured static reservation may be active together. */
+export const MAX_DHCP_RUNTIME_LEASES = MAX_DHCP_POOL_SIZE + MAX_STATIC_RESERVATIONS;
 
 const MAX_SERVICE_COUNT = 2;
 const MAX_RPC_DEPTH = 16;
-const MAX_SAFE_JSON_ARRAY_ENTRIES = MAX_DHCP_POOL_SIZE;
+const MAX_SAFE_JSON_ARRAY_ENTRIES = MAX_DHCP_RUNTIME_LEASES;
 const MAX_PATH_BYTES = 4096;
 const MAX_NETWORK_ADDRESS_BYTES = 255;
 const MAX_DHCP_FIELD_BYTES = 255;
@@ -313,6 +315,11 @@ function safeInteger(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTE
   return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum && value <= maximum ? value : undefined;
 }
 
+/** TFTP's current tsize parser produces finite integers beyond Number.MAX_SAFE_INTEGER. */
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
 function finiteNumber(value: unknown, minimum = 0, maximum = Number.MAX_VALUE): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum ? value : undefined;
 }
@@ -372,7 +379,7 @@ function parseTftpTransfer(value: unknown): RpcTftpTransfer | undefined {
   const direction = rawDirection === "rrq" || rawDirection === "wrq" ? rawDirection : undefined;
   const filename = boundedString(fields.get("filename"), MAX_RPC_TEXT_BYTES);
   const bytes = safeInteger(fields.get("bytes"));
-  const totalBytes = fields.get("totalBytes") === null ? null : safeInteger(fields.get("totalBytes"));
+  const totalBytes = fields.get("totalBytes") === null ? null : nonnegativeInteger(fields.get("totalBytes"));
   const blockSize = safeInteger(fields.get("blockSize"), 1, MAX_PORT);
   const windowSize = safeInteger(fields.get("windowSize"), 1, MAX_PORT);
   const speedBps = finiteNumber(fields.get("speedBps"));
@@ -458,12 +465,12 @@ function parsePoolInfo(value: unknown): RpcDhcpPoolInfo | undefined {
   const rangeStart = boundedString(fields.get("rangeStart"), MAX_NETWORK_ADDRESS_BYTES);
   const rangeEnd = boundedString(fields.get("rangeEnd"), MAX_NETWORK_ADDRESS_BYTES);
   const poolSize = safeInteger(fields.get("poolSize"), 0, MAX_DHCP_POOL_SIZE);
-  const activeCount = safeInteger(fields.get("activeCount"), 0, MAX_DHCP_POOL_SIZE);
+  const activeCount = safeInteger(fields.get("activeCount"), 0, MAX_DHCP_RUNTIME_LEASES);
   const utilizationPct = finiteNumber(fields.get("utilizationPct"), 0, 100);
-  const staticEntryCount = safeInteger(fields.get("staticEntryCount"));
+  const staticEntryCount = safeInteger(fields.get("staticEntryCount"), 0, MAX_STATIC_RESERVATIONS);
   if (
     rangeStart === undefined || rangeEnd === undefined || poolSize === undefined || activeCount === undefined
-    || activeCount > poolSize || utilizationPct === undefined || staticEntryCount === undefined
+    || utilizationPct === undefined || staticEntryCount === undefined
   ) return undefined;
   return { rangeStart, rangeEnd, poolSize, activeCount, utilizationPct, staticEntryCount };
 }
@@ -482,7 +489,7 @@ function parseTftpRuntime(fields: Fields): RpcTftpRuntimeSnapshot | undefined {
 function parseDhcpRuntime(fields: Fields): RpcDhcpRuntimeSnapshot | undefined {
   if (!hasExactShape(fields, ["snapshot", "leases", "packetCounters", "poolInfo", "boundPort"], ["snapshot", "leases", "packetCounters", "poolInfo", "boundPort"])) return undefined;
   const snapshot = parseSnapshot(fields.get("snapshot"));
-  const leases = parsedArray(fields.get("leases"), MAX_DHCP_POOL_SIZE, parseDhcpLease);
+  const leases = parsedArray(fields.get("leases"), MAX_DHCP_RUNTIME_LEASES, parseDhcpLease);
   const packetCounters = parsePacketCounters(fields.get("packetCounters"));
   const poolInfo = parsePoolInfo(fields.get("poolInfo"));
   const boundPort = nullablePort(fields.get("boundPort"));

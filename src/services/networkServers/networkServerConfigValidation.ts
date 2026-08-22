@@ -32,7 +32,8 @@ const MAX_LEASE_SECONDS = 604_800;
 const MAX_DHCP_STRING_BYTES = 255;
 const MAX_PATH_BYTES = 4_096;
 const MAX_DHCP_ARRAY_ENTRIES = 16;
-const MAX_STATIC_RESERVATIONS = 1_024;
+/** Maximum configured static reservations accepted at every daemon ingress. */
+export const MAX_STATIC_RESERVATIONS = 1_024;
 const MAX_VENDOR_SUBOPTIONS = 64;
 
 type Mutable<T> = { -readonly [Key in keyof T]: T[Key] };

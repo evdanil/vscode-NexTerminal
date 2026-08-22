@@ -8,6 +8,10 @@ import {
   parseRpcRequest,
   rpcResultParsers,
 } from "../../../src/services/networkServers/networkServerRpcProtocol";
+import { validateOptions } from "../../../src/services/networkServers/tftp/engine/protocol";
+
+const DHCP_RUNTIME_LEASE_MAX = 65_536 + 1_024;
+const PLANNED_WIRE_TEXT_LIMIT = 1_048_576;
 
 const TFTP_SNAPSHOT = {
   id: "tftp",
@@ -167,6 +171,11 @@ describe("network-server RPC protocol", () => {
       expectRejected(parseRpcEnvelope({ id: 1, error: { code: "", message: "message" } }));
       expectRejected(parseRpcEnvelope({ id: 1, error: { code: 1, message: "message" } }));
     });
+
+    it("keeps generic envelope cloning within the combined dynamic-and-static DHCP lease domain", () => {
+      expectAccepted(parseRpcEnvelope({ id: 1, result: Array.from({ length: DHCP_RUNTIME_LEASE_MAX }, () => null) }));
+      expectRejected(parseRpcEnvelope({ id: 1, result: Array.from({ length: DHCP_RUNTIME_LEASE_MAX + 1 }, () => null) }));
+    });
   });
 
   describe("method-specific results", () => {
@@ -198,6 +207,40 @@ describe("network-server RPC protocol", () => {
       expectRejected(rpcResultParsers.getServiceRuntime({ ...DHCP_RUNTIME, packetCounters: { packetsReceived: 1 } }));
       expectRejected(rpcResultParsers.getServiceRuntime({ ...TFTP_RUNTIME, root: "", boundPort: 65_536 }));
       expectRejected(rpcResultParsers.getServiceRuntime({ ...DHCP_RUNTIME, poolInfo: { ...DHCP_RUNTIME.poolInfo, utilizationPct: 101 } }));
+    });
+
+    it("accepts a static lease outside a one-address dynamic pool", () => {
+      const staticLease = { ...DHCP_RUNTIME.leases[0], mac: "aa:bb:cc:dd:ee:01", ip: "192.168.2.250", leaseType: "static" };
+      expectAccepted(rpcResultParsers.getServiceRuntime({
+        ...DHCP_RUNTIME,
+        leases: [DHCP_RUNTIME.leases[0], staticLease],
+        poolInfo: {
+          rangeStart: "192.168.2.10",
+          rangeEnd: "192.168.2.10",
+          poolSize: 1,
+          activeCount: 2,
+          utilizationPct: 100,
+          staticEntryCount: 1,
+        },
+      }));
+    });
+
+    it("accepts the full dynamic-plus-static DHCP lease maximum and rejects one more", () => {
+      const leasesAtLimit = Array.from({ length: DHCP_RUNTIME_LEASE_MAX }, () => DHCP_RUNTIME.leases[0]);
+      expectAccepted(rpcResultParsers.getServiceRuntime({ ...DHCP_RUNTIME, leases: leasesAtLimit }));
+      expectRejected(rpcResultParsers.getServiceRuntime({
+        ...DHCP_RUNTIME,
+        leases: [...leasesAtLimit, DHCP_RUNTIME.leases[0]],
+      }));
+    });
+
+    it("accepts a totalBytes value emitted by the current TFTP tsize parser beyond Number.MAX_SAFE_INTEGER", () => {
+      const totalBytes = validateOptions({ tsize: "9007199254740992" }).tsize;
+      expect(totalBytes).toBe(9_007_199_254_740_992);
+      expectAccepted(rpcResultParsers.getServiceRuntime({
+        ...TFTP_RUNTIME,
+        transfers: [{ ...transfer(), totalBytes }],
+      }));
     });
 
     it("enforces bounded response collections at their exact limits", () => {
@@ -254,9 +297,9 @@ describe("network-server RPC protocol", () => {
       expectRejected(parseRpcEvent(payload));
     });
 
-    it("enforces the log message byte boundary", () => {
-      expectAccepted(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: "x".repeat(MAX_RPC_TEXT_BYTES) } }));
-      expectRejected(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: "x".repeat(MAX_RPC_TEXT_BYTES + 1) } }));
+    it("accepts current log text through the planned wire ceiling and rejects one byte more", () => {
+      expectAccepted(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: "x".repeat(PLANNED_WIRE_TEXT_LIMIT) } }));
+      expectRejected(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: "x".repeat(PLANNED_WIRE_TEXT_LIMIT + 1) } }));
 
       expect(parseRpcEvent({ event: "ready", data: {} })).toMatchObject({ ok: false });
     });
