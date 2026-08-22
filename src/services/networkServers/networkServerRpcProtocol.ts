@@ -11,8 +11,12 @@ import type { NetworkServerConfigs } from "./core/index";
 import type { DhcpAdapterConfig } from "./dhcp/DhcpAdapter";
 import type { TftpAdapterConfig } from "./tftp/TftpAdapter";
 
-/** Text is independently bounded at the planned JSON-line transport ceiling. */
-export const MAX_RPC_TEXT_BYTES = 1_048_576;
+/** Planned Task 2 framing ceiling, repeated locally so this pure contract has no transport dependency. */
+const MAX_RPC_LINE_BYTES = 1_048_576;
+/** More than the current log envelope's 67 serialized bytes, leaving room for protocol metadata. */
+const MAX_RPC_TEXT_FIELD_HEADROOM_BYTES = 1024;
+/** Text-field limit leaves envelope/newline headroom inside the planned JSON-line transport ceiling. */
+export const MAX_RPC_TEXT_BYTES = MAX_RPC_LINE_BYTES - MAX_RPC_TEXT_FIELD_HEADROOM_BYTES;
 /** Transfer ids are socket endpoint identifiers today; 1 KiB leaves ample protocol headroom. */
 export const MAX_TRANSFER_ID_BYTES = 1024;
 /** The TFTP engine's fixed default concurrent-transfer ceiling. */
@@ -493,7 +497,10 @@ function parseDhcpRuntime(fields: Fields): RpcDhcpRuntimeSnapshot | undefined {
   const packetCounters = parsePacketCounters(fields.get("packetCounters"));
   const poolInfo = parsePoolInfo(fields.get("poolInfo"));
   const boundPort = nullablePort(fields.get("boundPort"));
-  if (!snapshot || snapshot.id !== "dhcp" || !leases || !packetCounters || !poolInfo || boundPort === undefined) return undefined;
+  if (
+    !snapshot || snapshot.id !== "dhcp" || !leases || !packetCounters || !poolInfo || boundPort === undefined
+    || poolInfo.activeCount !== leases.length
+  ) return undefined;
   return { snapshot: snapshot as RpcDhcpRuntimeSnapshot["snapshot"], leases, packetCounters, poolInfo, boundPort };
 }
 

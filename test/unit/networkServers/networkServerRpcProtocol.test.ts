@@ -11,7 +11,8 @@ import {
 import { validateOptions } from "../../../src/services/networkServers/tftp/engine/protocol";
 
 const DHCP_RUNTIME_LEASE_MAX = 65_536 + 1_024;
-const PLANNED_WIRE_TEXT_LIMIT = 1_048_576;
+const PLANNED_LINE_BYTE_LIMIT = 1_048_576;
+const TEXT_FIELD_BYTE_LIMIT = 1_047_552;
 
 const TFTP_SNAPSHOT = {
   id: "tftp",
@@ -225,12 +226,33 @@ describe("network-server RPC protocol", () => {
       }));
     });
 
+    it("requires poolInfo.activeCount to match the returned DHCP leases", () => {
+      expectRejected(rpcResultParsers.getServiceRuntime({
+        ...DHCP_RUNTIME,
+        poolInfo: { ...DHCP_RUNTIME.poolInfo, activeCount: 0 },
+      }));
+      expectRejected(rpcResultParsers.getServiceRuntime({
+        ...DHCP_RUNTIME,
+        leases: [DHCP_RUNTIME.leases[0], { ...DHCP_RUNTIME.leases[0], mac: "aa:bb:cc:dd:ee:01", ip: "192.168.2.250", leaseType: "static" }],
+        poolInfo: { ...DHCP_RUNTIME.poolInfo, activeCount: 1, staticEntryCount: 1 },
+      }));
+    });
+
     it("accepts the full dynamic-plus-static DHCP lease maximum and rejects one more", () => {
       const leasesAtLimit = Array.from({ length: DHCP_RUNTIME_LEASE_MAX }, () => DHCP_RUNTIME.leases[0]);
-      expectAccepted(rpcResultParsers.getServiceRuntime({ ...DHCP_RUNTIME, leases: leasesAtLimit }));
+      const poolInfoAtLimit = {
+        rangeStart: "192.168.0.0",
+        rangeEnd: "192.168.255.255",
+        poolSize: 65_536,
+        activeCount: DHCP_RUNTIME_LEASE_MAX,
+        utilizationPct: 100,
+        staticEntryCount: 1_024,
+      };
+      expectAccepted(rpcResultParsers.getServiceRuntime({ ...DHCP_RUNTIME, leases: leasesAtLimit, poolInfo: poolInfoAtLimit }));
       expectRejected(rpcResultParsers.getServiceRuntime({
         ...DHCP_RUNTIME,
         leases: [...leasesAtLimit, DHCP_RUNTIME.leases[0]],
+        poolInfo: { ...poolInfoAtLimit, activeCount: DHCP_RUNTIME_LEASE_MAX + 1 },
       }));
     });
 
@@ -297,9 +319,16 @@ describe("network-server RPC protocol", () => {
       expectRejected(parseRpcEvent(payload));
     });
 
-    it("accepts current log text through the planned wire ceiling and rejects one byte more", () => {
-      expectAccepted(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: "x".repeat(PLANNED_WIRE_TEXT_LIMIT) } }));
-      expectRejected(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: "x".repeat(PLANNED_WIRE_TEXT_LIMIT + 1) } }));
+    it("keeps a multibyte log field within the planned JSON-line byte budget", () => {
+      const messageAtLimit = "é".repeat(TEXT_FIELD_BYTE_LIMIT / 2);
+      const eventAtLimit = { event: "log", data: { id: "daemon", level: "info", message: messageAtLimit } } as const;
+      expect(Buffer.byteLength(messageAtLimit, "utf8")).toBe(TEXT_FIELD_BYTE_LIMIT);
+      expectAccepted(parseRpcEvent(eventAtLimit));
+      expect(Buffer.byteLength(`${JSON.stringify(eventAtLimit)}\n`, "utf8")).toBeLessThanOrEqual(PLANNED_LINE_BYTE_LIMIT);
+
+      const messageOneByteOver = `${messageAtLimit}a`;
+      expect(Buffer.byteLength(messageOneByteOver, "utf8")).toBe(TEXT_FIELD_BYTE_LIMIT + 1);
+      expectRejected(parseRpcEvent({ event: "log", data: { id: "daemon", level: "info", message: messageOneByteOver } }));
 
       expect(parseRpcEvent({ event: "ready", data: {} })).toMatchObject({ ok: false });
     });
