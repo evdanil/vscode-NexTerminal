@@ -4,10 +4,10 @@
  * End-to-end integration tests for the TFTP engine over real UDP.
  *
  * A real `TftpEngine` is bound to `127.0.0.1` on a kernel-allocated port
- * (`port: 0`, then read back from `engine.boundPort`) and driven by real
- * `dgram` clients — no mocks anywhere in the path, so the wire bytes, the
- * session map, the retransmission timer and the filesystem sandbox are all
- * exercised together.
+ * (`port: 0`, then read back from `engine.boundPort`) and usually driven by
+ * real `dgram` clients, so the wire bytes, session map, retransmission timer
+ * and filesystem sandbox are exercised together. Race regressions call the
+ * same message entry point directly and gate only the filesystem boundary.
  *
  * Covered failure and edge paths (RFC 1350 §5.1 codes on the wire):
  *  - UnknownTransferID for a stray ACK with no session behind it;
@@ -85,6 +85,14 @@ function assertErrorMessage(m: Buffer, expectCode: ErrorCode, msgRegexp?: RegExp
 
 describe("TFTP E2E — Critical Paths", () => {
   let root: string;
+  /** The engine's UDP entry point, reached without the scheduling noise of a real socket. */
+  type MessageEntryPoint = { handleMessage(msg: Buffer, rinfo: dgram.RemoteInfo): Promise<void> };
+  const rinfoFor = (port: number, size: number): dgram.RemoteInfo => ({
+    address: "127.0.0.1",
+    family: "IPv4",
+    port,
+    size
+  });
   beforeEach(() => {
     root = mkdtemp("nexus-e2e-crit-");
   });
@@ -108,15 +116,6 @@ describe("TFTP E2E — Critical Paths", () => {
   // way to guarantee exactly that. Everything else in the path is real: real
   // engine, real bound socket, real sandbox, real file reads.
   describe("maxTransfers admission is a reservation, not a check-then-act", () => {
-    /** The engine's UDP entry point, reached without the scheduling noise of a real socket. */
-    type MessageEntryPoint = { handleMessage(msg: Buffer, rinfo: dgram.RemoteInfo): Promise<void> };
-    const rinfoFor = (port: number, size: number): dgram.RemoteInfo => ({
-      address: "127.0.0.1",
-      family: "IPv4",
-      port,
-      size
-    });
-
     it("a simultaneous burst cannot exceed the cap", async () => {
       fs.writeFileSync(path.join(root, "boot.bin"), randomPayload(200_000));
       await withEngine(root, false, { maxTransfers: 2 }, async (engine, _port) => {
@@ -327,6 +326,144 @@ describe("TFTP E2E — Critical Paths", () => {
         });
       } finally {
         releaseOpen.resolve();
+        openSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("lifecycle ownership", () => {
+    it("stop during bind settles start and leaves the engine stopped", async () => {
+      const engine = new TftpEngine({ root, port: 0, address: "127.0.0.1" });
+      engine.on("error", () => {});
+      let startOutcome: "pending" | "resolved" | "rejected" = "pending";
+      const starting = engine.start().then(
+        () => {
+          startOutcome = "resolved";
+        },
+        () => {
+          startOutcome = "rejected";
+        }
+      );
+
+      try {
+        await engine.stop();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(startOutcome, "stop must not strand start's bind promise").not.toBe("pending");
+        expect(engine.boundPort).toBeNull();
+        await starting;
+      } finally {
+        await engine.stop();
+      }
+    });
+
+    it("a restart cannot be cleared by an older stop", async () => {
+      fs.writeFileSync(path.join(root, "restart-readable.bin"), randomPayload(4096));
+      const closeEntered = deferred();
+      const releaseClose = deferred();
+      const originalOpen = fs.promises.open.bind(fs.promises);
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args: any[]) => {
+        const handle = await (originalOpen as any)(...args);
+        if (args[1] === "wx") {
+          const realClose = handle.close.bind(handle);
+          vi.spyOn(handle, "close").mockImplementation(async () => {
+            closeEntered.resolve();
+            await releaseClose.promise;
+            return realClose();
+          });
+        }
+        return handle;
+      });
+      const engine = new TftpEngine({ root, allowWrite: true, port: 0, address: "127.0.0.1" });
+      let stopping: Promise<void> | undefined;
+      let restarting: Promise<void> | undefined;
+
+      try {
+        await engine.start();
+        const entry = engine as unknown as MessageEntryPoint;
+        const wrq = encodeWRQ("restart-owner.bin", "octet");
+        await entry.handleMessage(wrq, rinfoFor(42303, wrq.length));
+
+        stopping = engine.stop();
+        await closeEntered.promise;
+        restarting = engine.start();
+        releaseClose.resolve();
+        await Promise.all([stopping, restarting]);
+
+        const rrq = encodeRRQ("restart-readable.bin", "octet");
+        await entry.handleMessage(rrq, rinfoFor(42304, rrq.length));
+        expect(engine.boundPort, "the newer start must still own a bound socket").not.toBeNull();
+        expect(engine.activeTransfers(), "the older stop must not clear the newer guard").toHaveLength(1);
+      } finally {
+        releaseClose.resolve();
+        await Promise.allSettled([stopping, restarting].filter((p): p is Promise<void> => p !== undefined));
+        await engine.stop();
+        openSpy.mockRestore();
+      }
+    });
+
+    it("simultaneous stops share teardown and close RRQ and WRQ handles once", async () => {
+      fs.writeFileSync(path.join(root, "stop-owner-read.bin"), randomPayload(4096));
+      const rrqCloseEntered = deferred();
+      const releaseRrqClose = deferred();
+      const wrqCloseEntered = deferred();
+      const releaseWrqClose = deferred();
+      const originalOpen = fs.promises.open.bind(fs.promises);
+      let rrqCloseCalls = 0;
+      let wrqCloseCalls = 0;
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args: any[]) => {
+        const handle = await (originalOpen as any)(...args);
+        const flag = args[1];
+        if (flag === "r" || flag === "wx") {
+          const realClose = handle.close.bind(handle);
+          vi.spyOn(handle, "close").mockImplementation(async () => {
+            const callNumber = flag === "r" ? ++rrqCloseCalls : ++wrqCloseCalls;
+            if (flag === "r") {
+              rrqCloseEntered.resolve();
+              await releaseRrqClose.promise;
+            } else {
+              wrqCloseEntered.resolve();
+              await releaseWrqClose.promise;
+            }
+            if (callNumber === 1) return realClose();
+          });
+        }
+        return handle;
+      });
+
+      try {
+        await withEngine(root, true, {}, async (engine, _port) => {
+          const entry = engine as unknown as MessageEntryPoint;
+          const rrq = encodeRRQ("stop-owner-read.bin", "octet");
+          const wrq = encodeWRQ("stop-owner-write.bin", "octet");
+          await entry.handleMessage(rrq, rinfoFor(42305, rrq.length));
+          await entry.handleMessage(wrq, rinfoFor(42306, wrq.length));
+          expect(engine.activeTransfers()).toHaveLength(2);
+
+          const firstStop = engine.stop();
+          const concurrentStop = engine.stop();
+          try {
+            await rrqCloseEntered.promise;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            releaseRrqClose.resolve();
+            await wrqCloseEntered.promise;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            releaseWrqClose.resolve();
+            await Promise.all([firstStop, concurrentStop]);
+
+            expect(
+              { rrqCloseCalls, wrqCloseCalls },
+              "concurrent stop must have one owner for each RRQ/WRQ handle"
+            ).toEqual({ rrqCloseCalls: 1, wrqCloseCalls: 1 });
+            expect(engine.activeTransfers()).toHaveLength(0);
+          } finally {
+            releaseRrqClose.resolve();
+            releaseWrqClose.resolve();
+            await Promise.allSettled([firstStop, concurrentStop]);
+          }
+        });
+      } finally {
+        releaseRrqClose.resolve();
+        releaseWrqClose.resolve();
         openSpy.mockRestore();
       }
     });

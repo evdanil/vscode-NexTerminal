@@ -202,6 +202,13 @@ export class TftpEngine extends EventEmitter {
   private lifecycleGeneration = 0;
   /** Whether new RRQ/WRQ admissions may be created in the current lifecycle. */
   private acceptingRequests = false;
+  /** Serializes start/stop transitions in caller order, even after a rejection. */
+  private lifecycleQueue: Promise<void> = Promise.resolve();
+  /** Adjacent equal operations share one promise (notably concurrent stops). */
+  private lastLifecycleOperation: {
+    readonly kind: 'start' | 'stop';
+    readonly promise: Promise<void>;
+  } | null = null;
 
   /**
    * Constructs a new TFTP engine. Does not start listening — use {@link start}.
@@ -283,7 +290,13 @@ export class TftpEngine extends EventEmitter {
    * @sideeffect Creates and `bind()`s the UDP socket. Starts the GC cycle.
    * @throws Bind errors (EACCES, EADDRINUSE, etc.) as Promise rejection.
    */
-  public async start(): Promise<void> {
+  public start(): Promise<void> {
+    return this.enqueueLifecycle('start', () => this.startOwned());
+  }
+
+  /** Performs one serialized start transition. */
+  private async startOwned(): Promise<void> {
+    if (this.acceptingRequests && this.socket) return;
     // Before the socket, not after: a root that does not exist is a
     // configuration failure the operator has to see, and a bound socket that
     // can serve nothing is the worst possible way to tell them.
@@ -353,7 +366,12 @@ export class TftpEngine extends EventEmitter {
    *
    * @sideeffect Closes socket, closes FS handles, clears all structures.
    */
-  public async stop(): Promise<void> {
+  public stop(): Promise<void> {
+    return this.enqueueLifecycle('stop', () => this.stopOwned());
+  }
+
+  /** Performs one serialized stop transition. */
+  private async stopOwned(): Promise<void> {
     this.acceptingRequests = false;
     this.lifecycleGeneration++;
     const admissions = Array.from(this.admissionTasks);
@@ -394,6 +412,33 @@ export class TftpEngine extends EventEmitter {
     this.admissionTasks.clear();
     this.guard = null;
     this.log('info', 'stopped.');
+  }
+
+  /**
+   * Queues one lifecycle transition and coalesces adjacent operations of the
+   * same kind. The rejection-swallowing tail keeps a failed start from
+   * preventing the following stop or restart from running.
+   */
+  private enqueueLifecycle(
+    kind: 'start' | 'stop',
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const pending = this.lastLifecycleOperation;
+    if (pending?.kind === kind) return pending.promise;
+
+    const promise = this.lifecycleQueue.then(operation);
+    this.lifecycleQueue = promise.catch(() => {});
+    const request = { kind, promise };
+    this.lastLifecycleOperation = request;
+    void promise.then(
+      () => {
+        if (this.lastLifecycleOperation === request) this.lastLifecycleOperation = null;
+      },
+      () => {
+        if (this.lastLifecycleOperation === request) this.lastLifecycleOperation = null;
+      },
+    );
+    return promise;
   }
 
   /**
