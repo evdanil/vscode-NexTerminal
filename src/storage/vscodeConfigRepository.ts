@@ -32,33 +32,46 @@ import { asArray } from "../utils/helpers";
  * What the storage layer actually allows (verified against VS Code's
  * extHostMemento implementation):
  *   - `Memento.get` reads only this extension host's in-memory cache;
- *   - `Memento.update` writes the extension's WHOLE key/value state object
- *     from that cache — there is no per-key write, no CAS, and no way to
- *     "persist only the changed record" beneath this API;
+ *   - `Memento.update` synchronously JSON-clones an object or array into that
+ *     cache before it returns its persistence promise, then writes the
+ *     extension's WHOLE key/value state object — there is no per-key write,
+ *     no CAS, and no way to "persist only the changed record" beneath this
+ *     API;
  *   - another window's write DOES propagate back into this host's cache
  *     (the cached state object is replaced wholesale), asynchronously and
  *     with no event exposed to extensions.
  *
- * So prevention is not available at this layer, but detection is: remember
- * the raw object this window last read or wrote per key (`lastSeenValue`,
- * compared BY REFERENCE — see its doc comment) and, on each save, check
- * whether the cache now holds something else. A changed reference means
- * another window wrote this collection in between; the content is then
- * confirmed to actually differ from what this save is writing (two windows
- * converging on the same value lose nothing and stay silent). The save still
- * proceeds exactly as before — never blocked, never able to fail because of
- * the guard (detection errors are swallowed), and at zero serialization cost
- * on the steady-state path: one cached synchronous read plus one reference
- * comparison per save, with whole-collection JSON serialization only in the
- * rare case that a foreign write was actually detected. The overwrite is no
- * longer silent: it is logged and surfaced through `onConcurrentOverwrite`
- * so the user can redo the superseded edit.
+ * So prevention is not available at this layer, but detection is — and 2.8.201
+ * corrected what it detects. Remember, per key, BOTH the object this window
+ * last read or captured from the cache immediately after its own update
+ * (`lastSeenValue`) and a frozen serialization of the pending content at that
+ * moment (`lastSeenJson`). On each save, reference identity is used only to
+ * determine whether the cache still holds the same object; when it does, the
+ * guard does not serialize the stored value. A different object means the
+ * cache object was replaced — NOT that another window wrote it,
+ * which is what this was originally built on and is false: `Memento.update`
+ * rewrites the whole extension blob and a dozen writers outside this class
+ * disturb it. That replacement is merely the cheap gate in front of the real
+ * question: did the CONTENT diverge from what this window last saw? Only then,
+ * and only when the stored content also
+ * differs from what is being written (two windows converging on the same value
+ * lose nothing and stay silent), is anything reported. The detector does not
+ * identify who or what changed storage. The save still proceeds exactly as
+ * before — never blocked, never able to fail because of the guard (detection
+ * errors are swallowed). COST: one serialization of the pending value on
+ * every save, taken once and reused for both the comparison and the new
+ * baseline, plus one of the stored value only when the cache object was
+ * replaced. Two passes worst case, one at rest — see E3/E3b/E3c, which pin
+ * exactly that. The divergent stored value is no longer overwritten silently:
+ * it is logged and surfaced through `onConcurrentOverwrite` so the user can
+ * investigate what was superseded.
  *
  * KNOWN RESIDUAL (deliberate — a full optimistic-concurrency merge is out of
  * proportion here and would have to be fed back through NexusCore, whose sync
  * engine, rollback captures and revision semantics all assume it is the sole
  * authority):
- *   - the foreign edit is still overwritten; the user is told, not saved;
+ *   - a divergent stored value is still overwritten; the user is told, not
+ *     saved, and the detector cannot attribute the change to a writer;
  *   - a foreign write that has not yet propagated into this host's cache when
  *     this window saves is undetectable (bounded by propagation latency,
  *     typically well under a second — not by window lifetime as before);
@@ -69,10 +82,13 @@ import { asArray } from "../utils/helpers";
  */
 interface VscodeConfigRepositoryOptions {
   /**
-   * Called when a save is about to overwrite a change some other VS Code
-   * window persisted to the same collection. `collection` is a human-readable
-   * plural label ("servers", "inventory sources", ...). Must not throw the
-   * save off course — invoked inside the guard's own try/catch regardless.
+   * Called when the cache object for a previously baselined collection was
+   * replaced and its serialized content differs both from that baseline and
+   * from the pending save. This reports a divergent stored value that the save
+   * will overwrite; it does not identify which writer produced it.
+   * `collection` is a human-readable plural label ("servers", "inventory
+   * sources", ...). Must not throw the save off course — invoked inside the
+   * guard's own try/catch regardless.
    */
   onConcurrentOverwrite?: (collection: string) => void;
 }
@@ -89,18 +105,57 @@ const SAVED_FILTERS_KEY = "nexus.savedFilters";
 
 export class VscodeConfigRepository implements ConfigRepository {
   /**
-   * BASELINE, BY REFERENCE — the raw object this window last read from or
-   * wrote into the Memento cache, per key. See the cross-window overwrite
-   * detection comment above. Reference identity is the honest signal here:
-   * the Memento hands back the very object our own update() stored, while a
-   * foreign window's write replaces the cached state object wholesale with
-   * freshly deserialized objects — so `stored !== baseline` means precisely
-   * "a write this repository did not make landed in the cache". `undefined`
-   * as a VALUE means "key was absent when read"; a key with no ENTRY (never
-   * read nor written by this instance) is never warned about — there is no
-   * baseline to have diverged from.
+   * BASELINE REFERENCE — the raw object this window last read from the Memento
+   * cache or captured from it immediately after its own update, per key. Kept
+   * ONLY as a cheap gate: equality says the cache object was not replaced, so
+   * serialization of the stored value can be skipped. It says nothing about
+   * whether that object's content was touched in place; the immutable content
+   * baseline is `lastSeenJson`.
+   *
+   * It is NOT evidence of a foreign write, and this comment said the opposite
+   * until 2.8.201. The claim was that the Memento hands back the caller's own
+   * object after update(), so a moved reference means somebody else wrote it.
+   * In fact update() synchronously JSON-clones object/array values into the
+   * cache, and `Memento.update` rewrites the extension's whole key/value blob.
+   * This extension writes that blob from a dozen places outside this class
+   * (tree collapse state, the settings guard's shadows and event log, colour
+   * schemes, one-shot hint flags), so the object behind a key can be replaced
+   * by an equal one at any time. A user with a single window open was told
+   * another window had overwritten their work. Judge divergence by
+   * `lastSeenJson`, never by this map alone.
+   *
+   * `undefined` as a VALUE means "key was absent when read"; a key with no
+   * ENTRY (never read nor written by this instance) is never warned about —
+   * there is no baseline to have diverged from.
    */
   private readonly lastSeenValue = new Map<string, unknown>();
+
+  /**
+   * The CONTENT of each baseline, frozen as a string at the moment it was
+   * taken. Required because `lastSeenValue` holds a live reference and the
+   * objects behind it are NOT ours alone: `getServers` and friends hand the
+   * raw stored rows straight to `NexusCore`, and the core mutates them IN
+   * PLACE — `_renameFolderPath` and `removeFolderCascade` both rewrite
+   * `server.group` on the object already in `this.servers` (see the FINDING 2
+   * comment at nexusCore.ts:1223). A baseline that can be edited from under us
+   * is not a record of what this window last saw, so comparing content against
+   * it reported a folder rename as somebody else's overwrite. Costs one
+   * serialization per read and one of the pending value per save; the
+   * confirmation path below adds no stored-value serialization when the cache
+   * object was not replaced.
+   */
+  private readonly lastSeenJson = new Map<string, string | undefined>();
+
+  /**
+   * Record both halves of a baseline together — they must never drift. `json`
+   * is a parameter rather than computed here so a caller that has ALREADY
+   * serialized this exact value can hand its pass over instead of paying for a
+   * second one (see `guardedUpdate`).
+   */
+  private rememberBaseline(key: string, value: unknown, json = JSON.stringify(value)): void {
+    this.lastSeenValue.set(key, value);
+    this.lastSeenJson.set(key, json);
+  }
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
@@ -110,57 +165,107 @@ export class VscodeConfigRepository implements ConfigRepository {
   /** Read the raw stored value and record it as this window's baseline. */
   private readRaw<T>(key: string): T {
     const raw = this.context.globalState.get<T>(key);
-    this.lastSeenValue.set(key, raw);
+    this.rememberBaseline(key, raw);
     return raw === undefined ? ([] as T) : raw;
   }
 
   /**
-   * Write through to globalState, first flagging (never blocking) a write
-   * that would overwrite another window's change to the same key. The guard
-   * must never make a save fail or change what gets written — detection
-   * errors are swallowed and the update below runs unconditionally.
+   * Write through to globalState, first flagging (never blocking) a divergent
+   * stored value that the pending write will overwrite. The guard cannot
+   * identify the writer. It must never make a save fail or change what gets
+   * written — detection errors are swallowed and the update below runs
+   * unconditionally.
    *
-   * Detection is two-stage so the steady state costs nothing (E3):
-   *   1. reference check — `get` returns the exact object our own update()
-   *      stored, so a changed reference means a write we did not make. O(1),
-   *      no serialization, and no false negatives are on offer at this layer
-   *      anyway (a foreign write that has not propagated is invisible to ANY
-   *      comparison, JSON included).
-   *   2. content confirmation — only on a changed reference (rare: a foreign
-   *      write actually propagated), serialize both sides once and warn only
-   *      if the stored content differs from what this save is writing. Two
-   *      windows converging on the SAME value lose nothing and must not warn
-   *      (E1). This is the irreducible cost: confirming content divergence
-   *      requires comparing content, and anything cheaper (lengths, samples)
-   *      would silently reintroduce the original silent-loss defect.
+   * Detection is two-stage. NOTE the premise of stage 1 changed in 2.8.201:
+   * it used to read "a changed reference means a write we did not make", and
+   * that was false — `Memento.update` rewrites the whole blob and a dozen
+   * writers outside this class disturb it, so a cache object can be replaced
+   * while its serialized content still equals the baseline. The reference
+   * check survives only as a gate for whether the cache object was replaced,
+   * never as evidence about its content or writer:
+   *   1. reference check — equality means the cache object was not replaced.
+   *      In that case the stored value is not serialized. The pending value
+   *      was already serialized once on every save so it can become the next
+   *      immutable baseline. Inequality means the cache returned a replacement
+   *      object, which is not the content question. This remains best-effort: a
+   *      foreign write that has not propagated is invisible to ANY comparison,
+   *      JSON included.
+   *   2. content confirmation — only when the cache object was replaced,
+   *      serialize the stored value once and warn only if its content differs
+   *      both from the immutable baseline and from the already-serialized
+   *      pending value. Two windows converging on the SAME value lose nothing
+   *      and must not warn (E1). This is the irreducible cost: confirming
+   *      content divergence requires comparing content, and anything cheaper
+   *      (lengths, samples) would silently reintroduce the original
+   *      silent-loss defect.
    *
    * BASELINE REFRESH IS SYNCHRONOUS WITH THE CACHE MUTATION (E2): VS Code's
-   * ExtensionMemento.update() assigns the new value into its cache
-   * synchronously and returns a promise only for the disk flush. The baseline
-   * is therefore refreshed between the update() CALL and its await — never
-   * after — so an overlapping same-collection save from this window sees a
-   * baseline that already reflects its predecessor and cannot mistake it for
-   * a foreign write. (If update() itself throws synchronously, the baseline
+   * ExtensionMemento.update() JSON-clones an object/array into its cache before
+   * returning its persistence promise. The baseline therefore captures the
+   * actual cached object between the update() CALL and its await — never after
+   * — so an overlapping same-collection save from this window sees a baseline
+   * that already reflects its predecessor and does not report an independent
+   * storage divergence. (If update() itself throws synchronously, the baseline
    * is deliberately left untouched: the cache was not mutated either.) No
-   * locking, so no deadlock and no reordering: update() calls reach the
-   * Memento in exactly the order the callers made them.
+   * locking, so no deadlock and no reordering: update() calls reach the Memento
+   * in exactly the order the callers made them.
    */
   private async guardedUpdate(key: string, collection: string, value: unknown): Promise<void> {
+    // EXACTLY ONE pass over `value`, taken here and reused twice: by the
+    // comparison below, and by the immutable content baseline recorded after
+    // the write. Computing it in either place alone cost a second pass on the
+    // replaced-reference
+    // path — which is not the rare path, it is the one this whole guard exists
+    // to handle. The only other pass is `stored`, and only when the cache object
+    // was replaced. Two passes worst case, one at rest.
+    const valueJson = JSON.stringify(value);
     try {
       if (this.lastSeenValue.has(key)) {
         const stored = this.context.globalState.get(key);
-        if (stored !== this.lastSeenValue.get(key) && JSON.stringify(stored) !== JSON.stringify(value)) {
-          console.warn(
-            `[Nexus] The ${collection} list was changed by another VS Code window since this window last loaded it; this window's save is overwriting that change.`
-          );
-          this.options.onConcurrentOverwrite?.(collection);
+        // A CHANGED REFERENCE IS NOT EVIDENCE OF A FOREIGN EDIT. It was
+        // treated as such until 2.8.201, and it is not: `Memento.update`
+        // writes the extension's WHOLE key/value blob, and this extension
+        // writes that blob from a dozen places outside this class (tree
+        // collapse state, the settings guard's shadows and event log, colour
+        // schemes, one-shot hint flags). Any of them can leave the object
+        // behind THIS key a different instance carrying identical serialized
+        // content, and a user with a single window open would then be told
+        // another window had overwritten their work. So the reference check
+        // is kept only as a gate for whether the cache object was replaced,
+        // and what it gates is now a CONTENT question: did the stored value
+        // actually diverge from the one this window last saw?
+        if (stored !== this.lastSeenValue.get(key)) {
+          const storedJson = JSON.stringify(stored);
+          // Two content tests, both required. The first confirms that the
+          // replaced cache object's serialization actually differs from the
+          // immutable baseline. The second preserves the pre-existing rule
+          // that two windows converging on the same value lose nothing and
+          // stay silent.
+          if (storedJson !== this.lastSeenJson.get(key) && storedJson !== valueJson) {
+            console.warn(
+              `[Nexus] The ${collection} list changed in storage since this window last read or saved it; this window's save is overwriting that change.`
+            );
+            this.options.onConcurrentOverwrite?.(collection);
+          }
         }
       }
     } catch (error) {
       console.warn("[Nexus] Concurrent-write detection failed; saving anyway:", error);
     }
     const pending = this.context.globalState.update(key, value);
-    this.lastSeenValue.set(key, value);
+    // update() has already synchronously cloned object/array values into the
+    // Memento cache. Keep that actual cached object for the next reference gate
+    // while retaining valueJson as the immutable pending-content baseline.
+    try {
+      this.rememberBaseline(key, this.context.globalState.get(key), valueJson);
+    } catch (error) {
+      // Baseline capture is detector bookkeeping, so its failure must neither
+      // replace nor abandon the persistence verdict. Remove both halves: a
+      // partial or stale baseline would make the next save report nonsense.
+      this.lastSeenValue.delete(key);
+      this.lastSeenJson.delete(key);
+      console.warn("[Nexus] Concurrent-write detection failed; saving anyway:", error);
+    }
     await pending;
   }
 
