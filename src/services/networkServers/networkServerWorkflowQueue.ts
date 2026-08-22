@@ -4,8 +4,18 @@
  * share this boundary so later JSON-line requests cannot overwrite a workflow
  * that is already waiting on asynchronous socket cleanup.
  */
+export const MAX_SERVICE_WORKFLOW_OPERATIONS = 32;
+
+function serverBusyError(): Error {
+  const error = new Error("Service workflow admission is full.");
+  error.name = "SERVER_BUSY";
+  return error;
+}
+
 export class ServiceWorkflowQueue {
   private readonly queues = new Map<string, Promise<void>>();
+  /** Every accepted operation, including no-key work, remains drain-owned. */
+  private readonly accepted = new Set<Promise<void>>();
   private closingError: Error | undefined;
 
   /** Rejects later work while retaining all accepted tails for {@link drain}. */
@@ -37,17 +47,18 @@ export class ServiceWorkflowQueue {
    */
   public enqueueMany<T>(ids: readonly string[], operation: () => Promise<T>): Promise<T> {
     if (this.closingError) return Promise.reject(this.closingError);
+    if (this.accepted.size >= MAX_SERVICE_WORKFLOW_OPERATIONS) return Promise.reject(serverBusyError());
     const keys = this.canonicalKeys(ids);
-    if (keys.length === 0) return Promise.resolve().then(operation);
-
     const previous = keys.map((id) => this.queues.get(id) ?? Promise.resolve());
     const operationPromise = Promise.all(previous).then(operation);
     const settled = operationPromise.then(
       () => undefined,
       () => undefined,
     );
+    this.accepted.add(settled);
     for (const id of keys) this.queues.set(id, settled);
     void settled.then(() => {
+      this.accepted.delete(settled);
       for (const id of keys) {
         if (this.queues.get(id) === settled) this.queues.delete(id);
       }
@@ -57,7 +68,7 @@ export class ServiceWorkflowQueue {
 
   /** Waits for every workflow accepted before this call. */
   public async drain(): Promise<void> {
-    await Promise.all([...this.queues.values()]);
+    await Promise.all([...this.accepted]);
   }
 
   private canonicalKeys(ids: readonly string[]): readonly string[] {

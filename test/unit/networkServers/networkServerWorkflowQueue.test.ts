@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { ServiceWorkflowQueue } from "../../../src/services/networkServers/networkServerWorkflowQueue";
 
+const MAX_SERVICE_WORKFLOW_OPERATIONS = 32;
+
 function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => {
@@ -222,5 +224,52 @@ describe("ServiceWorkflowQueue", () => {
     await expect(accepted).resolves.toBe("accepted");
     await draining;
     expect(drained).toBe(true);
+  });
+
+  it("retains zero-key work for drain until settlement", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const entered = deferred();
+    const release = deferred();
+    const accepted = queue.enqueueMany([], async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+
+    let drained = false;
+    const draining = queue.drain().then(() => { drained = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
+
+    release.resolve();
+    await Promise.all([accepted, draining]);
+    expect(drained).toBe(true);
+  });
+
+  it("caps every accepted workflow, including zero-key floods, and releases capacity exactly once", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const release = deferred();
+    const accepted = Array.from({ length: MAX_SERVICE_WORKFLOW_OPERATIONS }, () => queue.enqueueMany([], () => release.promise));
+    const all = [...accepted];
+    let rejected = 0;
+    for (let index = 0; index < 10_000; index += 1) {
+      const operation = queue.enqueueMany([], () => release.promise);
+      all.push(operation);
+      void operation.catch((error: unknown) => {
+        if (error instanceof Error && error.name === "SERVER_BUSY") rejected += 1;
+      });
+    }
+
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(rejected).toBe(10_000);
+      expect((queue as unknown as { accepted: Set<Promise<void>> }).accepted.size).toBe(MAX_SERVICE_WORKFLOW_OPERATIONS);
+    } finally {
+      release.resolve();
+      await Promise.allSettled(all);
+    }
+
+    await queue.drain();
+    expect((queue as unknown as { accepted: Set<Promise<void>> }).accepted.size).toBe(0);
   });
 });

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
@@ -39,6 +40,10 @@ function listenerCounts(stream: PassThrough): { readonly data: number; readonly 
 
 function ended(stream: PassThrough): Promise<void> {
   return new Promise((resolve) => stream.once("end", resolve));
+}
+
+function stringDataStream(): EventEmitter & NodeJS.ReadableStream {
+  return new EventEmitter() as EventEmitter & NodeJS.ReadableStream;
 }
 
 describe("bounded RPC line reader", () => {
@@ -189,6 +194,47 @@ describe("bounded RPC line reader", () => {
     expect(errors).toEqual([]);
     expect(allocation.mock.calls.length).toBeLessThanOrEqual(16);
     allocation.mockRestore();
+    dispose();
+  });
+
+  it("copies ordinary string fragments into reusable byte storage without Buffer.from per event", () => {
+    const stream = stringDataStream();
+    const lines: string[] = [];
+    const from = vi.spyOn(Buffer, "from");
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => { throw error; },
+    });
+
+    stream.emit("data", "first-");
+    stream.emit("data", "€");
+    stream.emit("data", "\nsecond\n");
+
+    expect(lines).toEqual(["first-€", "second"]);
+    expect(from).not.toHaveBeenCalled();
+    from.mockRestore();
+    dispose();
+  });
+
+  it("copies reentrant string fragments into reusable pending storage without Buffer.from per event", () => {
+    const stream = stringDataStream();
+    const lines: string[] = [];
+    const from = vi.spyOn(Buffer, "from");
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => {
+        lines.push(line);
+        if (line !== "first") return;
+        stream.emit("data", "next-");
+        stream.emit("data", "€\n");
+      },
+      onError: (error) => { throw error; },
+    });
+
+    stream.emit("data", "first\n");
+
+    expect(lines).toEqual(["first", "next-€"]);
+    expect(from).not.toHaveBeenCalled();
+    from.mockRestore();
     dispose();
   });
 

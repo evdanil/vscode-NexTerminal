@@ -15,6 +15,28 @@ export interface NetworkServerDaemonShutdown {
   readonly isShuttingDown: () => boolean;
 }
 
+/** The small injectable surface needed to own a daemon stdin terminal error. */
+export interface DaemonInputErrorStream {
+  on(event: "error", listener: (error: Error) => void): unknown;
+}
+
+/**
+ * Routes a terminal stdin error through the daemon's one shutdown authority.
+ *
+ * A child-process stdin error cannot be deterministically injected through an
+ * OS pipe on every supported platform, so this boundary stays deliberately
+ * narrow and is exercised with an EventEmitter harness.
+ */
+export function attachDaemonInputErrorShutdown(
+  stream: DaemonInputErrorStream,
+  shutdown: (reason: string) => Promise<void>,
+  reportFailure: (error: unknown) => void,
+): void {
+  stream.on("error", (error) => {
+    void shutdown(`stdin stream error: ${error.message}`).catch(reportFailure);
+  });
+}
+
 export function createNetworkServerDaemonShutdown(
   dependencies: NetworkServerDaemonShutdownDependencies,
 ): NetworkServerDaemonShutdown {

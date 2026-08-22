@@ -4,13 +4,14 @@
  * assertions cover the user-observable bridge behaviour, not private guards.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
 import { NetworkServerDaemonHost } from "../../../src/services/networkServers/daemonHost";
 import { sleep } from "../../helpers/networkServerTestHelpers";
 
 const FIXTURES = path.resolve(__dirname, "..", "..", "fixtures");
 const FIXTURE = path.join(FIXTURES, "mockNetworkServerDaemonMalformed.js");
+const MAX_DAEMON_RPC_IN_FLIGHT = 16;
 
 function isAlive(pid: number): boolean {
   try {
@@ -45,10 +46,25 @@ function childPid(host: NetworkServerDaemonHost): number | undefined {
 }
 
 type HostInternals = {
-  child?: object;
+  child?: {
+    readonly pid?: number;
+    readonly stdin?: NodeJS.WritableStream;
+    readonly stdout?: NodeJS.ReadableStream;
+    readonly stderr?: NodeJS.ReadableStream;
+    emit(event: string | symbol, ...args: unknown[]): boolean;
+  };
   activeGeneration?: number;
-  handleMessage(child: object, generation: number, raw: string): void;
+  pending?: Map<number, unknown>;
+  handleMessage(child: HostInternals["child"] & object, generation: number, raw: string): void;
 };
+
+function blockHostEventLoop(durationMs: number): void {
+  const deadline = Date.now() + durationMs;
+  while (Date.now() < deadline) {
+    // The busy loop deliberately prevents queued child-process callbacks from
+    // running until after the conservative stdout-EOF deadline has elapsed.
+  }
+}
 
 describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
   const hosts: NetworkServerDaemonHost[] = [];
@@ -315,6 +331,37 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     await expect(held).resolves.toBeInstanceOf(Error);
   }, 30_000);
 
+  it("rejects host overload before allocating or writing beyond the pending admission limit", async () => {
+    const host = create("hold-all-list");
+    const internals = host as unknown as HostInternals & { nextId: number };
+    await host.ensureStarted();
+    const pid = childPid(host);
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+
+    const accepted = Array.from(
+      { length: MAX_DAEMON_RPC_IN_FLIGHT },
+      () => host.listServers().then(() => undefined, (error: unknown) => error),
+    );
+    try {
+      await expect(waitFor(() => internals.pending?.size === MAX_DAEMON_RPC_IN_FLIGHT ? true : undefined)).resolves.toBe(true);
+      const nextIdBeforeOverload = internals.nextId;
+
+      expect(internals.child?.stdin?.listenerCount("error")).toBe(1);
+
+      const overload = await host.listServers().then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(overload).toMatchObject({ name: "SERVER_BUSY" });
+      expect(internals.pending?.size).toBe(MAX_DAEMON_RPC_IN_FLIGHT);
+      expect(internals.nextId).toBe(nextIdBeforeOverload);
+    } finally {
+      host.dispose();
+      await Promise.all(accepted);
+    }
+  }, 30_000);
+
   it("ignores a delayed stdout callback from the reaped generation after a clean restart", async () => {
     const host = create("invalid-json");
     const internals = host as unknown as HostInternals;
@@ -361,8 +408,11 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     expect(await waitForExit(pid!)).toBe(true);
   }, 30_000);
 
-  it("coordinates a delayed normal exit after stdout EOF without a fragile grace race", async () => {
+  it("gives a queued clean exit a poll/check turn after a stalled stdout-EOF deadline", async () => {
     const host = create("stdout-eof-delayed-exit");
+    const protocolFailure = vi.spyOn(host as unknown as {
+      failChildProtocol(child: object, generation: number, reason: string): void;
+    }, "failChildProtocol");
     let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     host.onDidExit((code, signal) => { exited = { code, signal }; });
 
@@ -370,7 +420,90 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     const pid = childPid(host);
     expect(pid).toBeTypeOf("number");
     pids.add(pid!);
+
+    // The fixture closes stdout at 20 ms and exits 125 ms later. Let the
+    // host observe EOF and arm its conservative deadline, then hold the host
+    // loop past that deadline while the child exits externally. Before the
+    // fix, the expired timer runs before the queued child exit callback and
+    // falsely tears this generation down as a protocol failure.
+    await sleep(60);
+    blockHostEventLoop(1_100);
+
     await expect(waitFor(() => exited)).resolves.toEqual({ code: 0, signal: null });
+    expect(protocolFailure).not.toHaveBeenCalled();
+    expect((host as unknown as { stdoutEofTimers: Map<object, unknown> }).stdoutEofTimers.size).toBe(0);
     expect(await waitForExit(pid!)).toBe(true);
+  }, 30_000);
+
+  it("keeps each exited child's terminal stdio guards through close without touching a replacement", async () => {
+    const host = create("clean");
+    const internals = host as unknown as HostInternals;
+    await host.ensureStarted();
+    const stale = internals.child!;
+    const stalePid = stale.pid;
+    const initialStdoutEndListeners = stale.stdout?.listenerCount("end") ?? 0;
+    expect(stalePid).toBeTypeOf("number");
+    pids.add(stalePid!);
+    expect(stale.stdout?.listenerCount("error")).toBeGreaterThanOrEqual(1);
+    expect(stale.stderr?.listenerCount("error")).toBeGreaterThanOrEqual(1);
+    expect(stale.stdin?.listenerCount("error")).toBeGreaterThanOrEqual(1);
+
+    // Model Node's real exit-before-close ordering: protocol/data listeners
+    // detach at exit, but terminal stream errors are still legal until close.
+    stale.emit("exit", 0, null);
+    expect(stale.stdout?.listenerCount("data")).toBe(0);
+    expect(stale.stdout?.listenerCount("end")).toBeLessThan(initialStdoutEndListeners);
+    expect(stale.stdout?.listenerCount("error")).toBe(1);
+    expect(stale.stderr?.listenerCount("error")).toBe(1);
+    expect(stale.stdin?.listenerCount("error")).toBe(1);
+
+    process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
+    await host.ensureStarted();
+    const replacementPid = childPid(host);
+    expect(replacementPid).toBeTypeOf("number");
+    expect(replacementPid).not.toBe(stalePid);
+    pids.add(replacementPid!);
+
+    expect(() => {
+      stale.stdout!.emit("error", new Error("late stdout EPIPE"));
+      stale.stderr!.emit("error", new Error("late stderr EPIPE"));
+      stale.stdin!.emit("error", new Error("late stdin EPIPE"));
+    }).not.toThrow();
+    expect(host.isReady).toBe(true);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+
+    stale.emit("close", 0, null);
+    expect(stale.stdout?.listenerCount("error")).toBe(0);
+    expect(stale.stderr?.listenerCount("error")).toBe(0);
+    expect(stale.stdin?.listenerCount("error")).toBe(0);
+  }, 30_000);
+
+  it("consumes a buffered-write EPIPE after termination until the exact child closes", async () => {
+    const host = create("late-stdio");
+    const internals = host as unknown as HostInternals;
+    await host.ensureStarted();
+    const child = internals.child!;
+    const pid = child.pid;
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+
+    const pending = host.listServers();
+    await expect(waitFor(() => internals.pending?.size === 1 ? true : undefined)).resolves.toBe(true);
+    host.dispose();
+    await expect(pending).rejects.toThrow(/disposed/i);
+
+    expect(child.stdout?.listenerCount("error")).toBe(1);
+    expect(child.stderr?.listenerCount("error")).toBe(1);
+    expect(child.stdin?.listenerCount("error")).toBe(1);
+    expect(() => {
+      child.stdout!.emit("error", new Error("late stdout EPIPE"));
+      child.stderr!.emit("error", new Error("late stderr EPIPE"));
+      child.stdin!.emit("error", new Error("late buffered-write EPIPE"));
+    }).not.toThrow();
+
+    child.emit("close", null, "SIGTERM");
+    expect(child.stdout?.listenerCount("error")).toBe(0);
+    expect(child.stderr?.listenerCount("error")).toBe(0);
+    expect(child.stdin?.listenerCount("error")).toBe(0);
   }, 30_000);
 });

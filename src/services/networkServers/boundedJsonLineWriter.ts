@@ -24,6 +24,9 @@ const NOTIFICATION_BACKPRESSURED = "outbound notification dropped while stdout i
 const MAX_QUEUED_OUTPUT_BYTES = MAX_RPC_LINE_BYTES * 4;
 const MAX_QUEUED_OUTPUT_LINES = 16;
 
+/** A stderr diagnostic is deliberately small and never queues behind a flood. */
+export const MAX_DAEMON_DIAGNOSTIC_BYTES = 512;
+
 function correlatedResponseId(value: unknown): number | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   if (!Object.prototype.hasOwnProperty.call(value, "id")) return undefined;
@@ -173,5 +176,83 @@ export class BoundedJsonLineWriter {
     } catch {
       // Notification diagnostics are deliberately isolated from transport state.
     }
+  }
+}
+
+/**
+ * Owns daemon stderr diagnostics without turning an stdout backpressure flood
+ * into unbounded stderr buffering. One write remains in flight until both its
+ * callback and any required drain arrive; every later diagnostic is coalesced
+ * by dropping it. Terminal stderr failure is intentionally isolated from the
+ * daemon shutdown authority, which is already owned by stdout/lifecycle code.
+ */
+export class BoundedDaemonDiagnosticWriter {
+  private active = true;
+  private inFlight = false;
+  private waitingForDrain = false;
+  private writeCallbackDone = false;
+
+  private readonly onDrain = (): void => {
+    this.waitingForDrain = false;
+    this.finishWriteIfReady();
+  };
+
+  private readonly onStreamError = (_error: Error): void => this.terminal();
+
+  private readonly onStreamClose = (): void => this.terminal();
+
+  public constructor(private readonly stream: Writable) {
+    stream.on("error", this.onStreamError);
+    stream.on("close", this.onStreamClose);
+  }
+
+  /** Emits one bounded diagnostic only when stderr has no retained write. */
+  public write(message: string): void {
+    if (!this.active || this.inFlight) return;
+    const line = `${this.truncate(message, MAX_DAEMON_DIAGNOSTIC_BYTES - 1)}\n`;
+    this.inFlight = true;
+    this.waitingForDrain = false;
+    this.writeCallbackDone = false;
+    try {
+      const accepted = this.stream.write(line, (error?: Error | null) => {
+        if (error) {
+          this.terminal();
+          return;
+        }
+        this.writeCallbackDone = true;
+        this.finishWriteIfReady();
+      });
+      if (!accepted) {
+        this.waitingForDrain = true;
+        this.stream.once("drain", this.onDrain);
+      }
+    } catch {
+      this.terminal();
+    }
+  }
+
+  private finishWriteIfReady(): void {
+    if (!this.active || !this.inFlight || !this.writeCallbackDone || this.waitingForDrain) return;
+    this.inFlight = false;
+  }
+
+  private terminal(): void {
+    if (!this.active) return;
+    this.active = false;
+    this.inFlight = false;
+    this.waitingForDrain = false;
+    this.stream.removeListener("drain", this.onDrain);
+  }
+
+  private truncate(value: string, maxBytes: number): string {
+    let bytes = 0;
+    let result = "";
+    for (const character of value) {
+      const characterBytes = Buffer.byteLength(character, "utf8");
+      if (bytes + characterBytes > maxBytes) break;
+      result += character;
+      bytes += characterBytes;
+    }
+    return result;
   }
 }

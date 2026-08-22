@@ -67,6 +67,19 @@ export function attachBoundedLineReader(
     return true;
   };
 
+  const appendString = (value: string): boolean => {
+    const length = Buffer.byteLength(value, "utf8");
+    if (bufferedBytes + length > maxBytes) {
+      rejectOversize();
+      return false;
+    }
+    if (length === 0) return true;
+    lineBuffer = grow(lineBuffer, bufferedBytes, bufferedBytes + length);
+    lineBuffer.write(value, bufferedBytes, length, "utf8");
+    bufferedBytes += length;
+    return true;
+  };
+
   const takeLine = (stripTrailingCarriageReturn: boolean): string => {
     const end = stripTrailingCarriageReturn && bufferedBytes > 0 && lineBuffer[bufferedBytes - 1] === 0x0d
       ? bufferedBytes - 1
@@ -92,9 +105,8 @@ export function attachBoundedLineReader(
     }
   };
 
-  const processData = (value: Buffer | string, inputBytes?: number): void => {
+  const processBufferData = (chunk: Buffer, inputBytes?: number): void => {
     if (!active) return;
-    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
     const chunkBytes = inputBytes ?? chunk.length;
     let offset = 0;
 
@@ -103,6 +115,23 @@ export function attachBoundedLineReader(
       const newline = foundNewline >= chunkBytes ? -1 : foundNewline;
       const end = newline === -1 ? chunkBytes : newline;
       if (!appendLine(chunk, offset, end)) return;
+
+      if (newline === -1) return;
+
+      deliverLine(takeLine(true));
+      if (!active) return;
+      offset = newline + 1;
+    }
+  };
+
+  const processStringData = (value: string): void => {
+    if (!active) return;
+    let offset = 0;
+
+    while (offset < value.length) {
+      const newline = value.indexOf("\n", offset);
+      const end = newline === -1 ? value.length : newline;
+      if (!appendString(value.slice(offset, end))) return;
 
       if (newline === -1) return;
 
@@ -130,7 +159,7 @@ export function attachBoundedLineReader(
           pendingBuffer = processingBuffer;
           pendingBytes = 0;
           processingBuffer = nextBuffer;
-          processData(processingBuffer, nextBytes);
+          processBufferData(processingBuffer, nextBytes);
           continue;
         }
         if (endQueued) processEnd();
@@ -143,13 +172,14 @@ export function attachBoundedLineReader(
 
   const onData = (value: Buffer | string): void => {
     if (!active || endQueued) return;
-    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
-    const length = chunk.length;
+    const isBuffer = Buffer.isBuffer(value);
+    const length = isBuffer ? value.length : Buffer.byteLength(value, "utf8");
     if (length === 0) return;
     if (!processing) {
       processing = true;
       try {
-        processData(chunk);
+        if (isBuffer) processBufferData(value);
+        else processStringData(value);
       } finally {
         processing = false;
       }
@@ -161,7 +191,8 @@ export function attachBoundedLineReader(
       return;
     }
     pendingBuffer = grow(pendingBuffer, pendingBytes, pendingBytes + length);
-    chunk.copy(pendingBuffer, pendingBytes, 0, length);
+    if (isBuffer) value.copy(pendingBuffer, pendingBytes, 0, length);
+    else pendingBuffer.write(value, pendingBytes, length, "utf8");
     pendingBytes += length;
   };
 

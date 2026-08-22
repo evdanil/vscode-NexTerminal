@@ -39,7 +39,7 @@
  * and port release only.
  */
 
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import dgram from "node:dgram";
 import fs from "node:fs";
@@ -52,27 +52,35 @@ import { createUdpClient, mkdtemp, sleep } from "../../helpers/networkServerTest
 import { MAX_RPC_LINE_BYTES } from "../../../src/services/networkServers/boundedLineReader";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
+const MAX_DAEMON_RPC_IN_FLIGHT = 16;
 
 let daemonScript: string;
+let daemonBundleDir: string | undefined;
 
 /** Builds the daemon entry point exactly as `esbuild.mjs` does, into a temp dir. */
 async function buildDaemonBundle(): Promise<string> {
   const esbuild = await import("esbuild");
   const outdir = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-daemon-build-"));
   const outfile = path.join(outdir, "networkServerDaemon.js");
-  await esbuild.build({
-    bundle: true,
-    platform: "node",
-    target: "es2022",
-    format: "cjs",
-    sourcemap: false,
-    loader: { ".node": "empty" },
-    absWorkingDir: REPO_ROOT,
-    entryPoints: ["src/services/networkServers/networkServerDaemon.ts"],
-    outfile,
-    external: ["vscode"]
-  });
-  return outfile;
+  try {
+    await esbuild.build({
+      bundle: true,
+      platform: "node",
+      target: "es2022",
+      format: "cjs",
+      sourcemap: false,
+      loader: { ".node": "empty" },
+      absWorkingDir: REPO_ROOT,
+      entryPoints: ["src/services/networkServers/networkServerDaemon.ts"],
+      outfile,
+      external: ["vscode"]
+    });
+    daemonBundleDir = outdir;
+    return outfile;
+  } catch (error) {
+    fs.rmSync(outdir, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 /** Reserves a free UDP port by binding and immediately releasing it. */
@@ -106,6 +114,7 @@ class DaemonClient {
   private readonly pending = new Map<number, (reply: RpcReply) => void>();
   public readonly events: DaemonEvent[] = [];
   public readonly stderr: string[] = [];
+  public readonly unsolicitedReplyCounts = new Map<string, number>();
   private rl?: Interface;
   private rlErr?: Interface;
   public exited?: { code: number | null; signal: NodeJS.Signals | null };
@@ -144,6 +153,9 @@ class DaemonClient {
       if (resolve) {
         this.pending.delete(payload.id);
         resolve(payload as RpcReply);
+      } else {
+        const kind = payload?.error?.code === "SERVER_BUSY" ? "SERVER_BUSY" : "RESULT";
+        this.unsolicitedReplyCounts.set(kind, (this.unsolicitedReplyCounts.get(kind) ?? 0) + 1);
       }
       return;
     }
@@ -218,6 +230,12 @@ class DaemonClient {
 
   public closeStdin(): void {
     this.child.stdin!.end();
+  }
+
+  /** Simulates the host disappearing from the daemon's real stdout pipe. */
+  public closeStdout(): void {
+    this.rl?.close();
+    this.child.stdout?.destroy();
   }
 
   public kill(signal: NodeJS.Signals = "SIGKILL"): void {
@@ -295,6 +313,12 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
   beforeAll(async () => {
     daemonScript = await buildDaemonBundle();
   }, 60_000);
+
+  afterAll(() => {
+    if (!daemonBundleDir) return;
+    fs.rmSync(daemonBundleDir, { recursive: true, force: true });
+    daemonBundleDir = undefined;
+  });
 
   beforeEach(async () => {
     root = mkdtemp("nexus-daemon-root-");
@@ -398,6 +422,35 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     expect(reply.id).toBe(0);
     expect(reply.error?.code).toBe("INVALID_REQUEST");
     await expect(client.waitForExit(15_000)).resolves.toEqual({ code: 0, signal: null });
+  });
+
+  it("admits only the fixed number of same-chunk daemon requests and returns correlated SERVER_BUSY overloads", async () => {
+    const firstId = 80_000;
+    const frames = Array.from({ length: MAX_DAEMON_RPC_IN_FLIGHT + 1 }, (_unused, index) => JSON.stringify({
+      id: firstId + index,
+      method: "list",
+    })).join("\n");
+    client.child.stdin!.write(`${frames}\n`);
+
+    const expectedReplies = MAX_DAEMON_RPC_IN_FLIGHT + 1;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const observed = [...client.unsolicitedReplyCounts.values()].reduce((total, count) => total + count, 0);
+      if (observed === expectedReplies) break;
+      await sleep(25);
+    }
+
+    expect(client.unsolicitedReplyCounts.get("SERVER_BUSY")).toBe(1);
+    expect(client.unsolicitedReplyCounts.get("RESULT")).toBe(MAX_DAEMON_RPC_IN_FLIGHT);
+    await expect(client.call("list")).resolves.toHaveLength(2);
+  }, 30_000);
+
+  it("shuts down when the real bundled daemon loses its stdout reader", async () => {
+    client.closeStdout();
+    client.child.stdin!.write(`${JSON.stringify({ id: 90_000, method: "list" })}\n`);
+
+    const exit = await client.waitForExit(15_000);
+    if (process.platform !== "win32") expect(exit.code).toBe(0);
   });
 
   it("rejects an invalid environment seed before the daemon announces readiness", async () => {
@@ -598,7 +651,7 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     client.closeStdin();
     client.kill("SIGTERM");
     const exit = await client.waitForExit(15_000);
-    expect(exit.code).toBe(0);
+    if (process.platform !== "win32") expect(exit.code).toBe(0);
     expect(await isUdpPortFree(port), "daemon exit must release the UDP port").toBe(true);
   });
 

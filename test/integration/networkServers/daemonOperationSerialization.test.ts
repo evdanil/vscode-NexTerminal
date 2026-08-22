@@ -1,5 +1,9 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
-import { createNetworkServerDaemonShutdown } from "../../../src/services/networkServers/networkServerDaemonShutdown";
+import {
+  attachDaemonInputErrorShutdown,
+  createNetworkServerDaemonShutdown,
+} from "../../../src/services/networkServers/networkServerDaemonShutdown";
 import { ServiceWorkflowQueue } from "../../../src/services/networkServers/networkServerWorkflowQueue";
 
 function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
@@ -60,5 +64,22 @@ describe("network-server daemon operation serialization", () => {
 
     await expect(shutdown.begin("stdin closed")).resolves.toBeUndefined();
     expect(timeline).toEqual(["stop", "drain", "flush", "dispose", "flush", "exit"]);
+  });
+
+  it("routes an injected stdin terminal error through the shared shutdown latch", async () => {
+    const stdin = new EventEmitter();
+    const reasons: string[] = [];
+    const failures: unknown[] = [];
+    attachDaemonInputErrorShutdown(
+      stdin,
+      async (reason) => { reasons.push(reason); },
+      (error) => failures.push(error),
+    );
+
+    stdin.emit("error", new Error("injected stdin failure"));
+    await Promise.resolve();
+
+    expect(reasons).toEqual(["stdin stream error: injected stdin failure"]);
+    expect(failures).toEqual([]);
   });
 });

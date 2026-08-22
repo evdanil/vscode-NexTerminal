@@ -61,14 +61,15 @@
 
 import { env, stdin, stdout } from 'node:process';
 import { attachBoundedLineReader } from './boundedLineReader';
-import { BoundedJsonLineWriter } from './boundedJsonLineWriter';
+import { BoundedDaemonDiagnosticWriter, BoundedJsonLineWriter } from './boundedJsonLineWriter';
 import { DhcpAdapter, type DhcpLeaseInfo } from './dhcp/DhcpAdapter';
 import { TftpAdapter, type TftpTransferView } from './tftp/TftpAdapter';
 import { createRuntimeUpdateThrottle } from './runtimeUpdateThrottle';
 import { parseNetworkServerConfigs } from './networkServerConfigValidation';
 import { NetworkServerConfigController, type NetworkServerConfigStore } from './networkServerConfigController';
-import { createNetworkServerDaemonShutdown } from './networkServerDaemonShutdown';
+import { attachDaemonInputErrorShutdown, createNetworkServerDaemonShutdown } from './networkServerDaemonShutdown';
 import {
+  MAX_DAEMON_RPC_IN_FLIGHT,
   parseRpcEnvelope,
   parseRpcEvent,
   parseRpcRequest,
@@ -174,6 +175,14 @@ function internalError(id: number, error: unknown): RpcEnvelope {
     bytes += characterBytes;
   }
   return { id, error: { code: 'INTERNAL_ERROR', message: bounded || 'Daemon operation failed.' } };
+}
+
+function serverBusy(id: number): RpcEnvelope {
+  return { id, error: { code: 'SERVER_BUSY', message: 'Network servers daemon is busy.' } };
+}
+
+function isServerBusy(error: unknown): boolean {
+  return error instanceof Error && error.name === 'SERVER_BUSY';
 }
 
 function resultEnvelope(id: number, method: RpcMethod, result: unknown): RpcEnvelope {
@@ -304,12 +313,9 @@ async function run(): Promise<void> {
    */
   let detachInput: (() => void) | undefined;
   let onStdinEnd: () => void = () => undefined;
+  const diagnostics = new BoundedDaemonDiagnosticWriter(process.stderr);
   const writeShutdownError = (err: unknown): void => {
-    try {
-      process.stderr.write('shutdown error: ' + (err instanceof Error ? err.message : String(err)) + '\n');
-    } catch {
-      // stderr is unavailable during process teardown.
-    }
+    diagnostics.write('shutdown error: ' + (err instanceof Error ? err.message : String(err)));
   };
   const daemonShutdown = createNetworkServerDaemonShutdown({
     stopAccepting: () => {
@@ -332,12 +338,10 @@ async function run(): Promise<void> {
     onTerminal: (error) => {
       void shutdown(`stdout terminal error: ${error.message}`).catch(writeShutdownError);
     },
-    onNotificationDropped: (reason) => writeShutdownError(`daemon ${reason}`),
+    onNotificationDropped: (reason) => diagnostics.write(`daemon ${reason}`),
   });
   onStdinEnd = (): void => { void shutdown('stdin closed').catch(writeShutdownError); };
-  stdin.on('error', (error) => {
-    void shutdown(`stdin stream error: ${error.message}`).catch(writeShutdownError);
-  });
+  attachDaemonInputErrorShutdown(stdin, shutdown, writeShutdownError);
 
   process.on('SIGINT', () => void shutdown('SIGINT').catch(writeShutdownError));
   process.on('SIGTERM', () => void shutdown('SIGTERM').catch(writeShutdownError));
@@ -428,9 +432,12 @@ async function run(): Promise<void> {
         }
       }
     } catch (err) {
+      if (isServerBusy(err)) return serverBusy(req.id);
       return internalError(req.id, err);
     }
   };
+
+  let activeRequestHandlers = 0;
 
   const handleLine = (line: string): void => {
     let payload: unknown;
@@ -445,8 +452,21 @@ async function run(): Promise<void> {
       writeLine(invalidRequest(responseIdFor(payload), parsed.error));
       return;
     }
+    if (daemonShutdown.isShuttingDown()) {
+      writeLine({ id: parsed.value.id, error: { code: 'SHUTTING_DOWN', message: 'Network servers daemon is shutting down.' } });
+      return;
+    }
+    if (activeRequestHandlers >= MAX_DAEMON_RPC_IN_FLIGHT) {
+      writeLine(serverBusy(parsed.value.id));
+      return;
+    }
+    // Increment synchronously before another line from this same input chunk
+    // can run. This caps live handler promises, not merely workflow map tails.
+    activeRequestHandlers += 1;
     void handleRequest(parsed.value).then(writeLine, (err) => {
       writeLine(internalError(parsed.value.id, err));
+    }).finally(() => {
+      activeRequestHandlers -= 1;
     });
   };
 

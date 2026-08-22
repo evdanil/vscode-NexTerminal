@@ -12,6 +12,9 @@ import type { NetworkServerConfigs } from "./core/index";
 import type { DhcpAdapterConfig } from "./dhcp/DhcpAdapter";
 import type { TftpAdapterConfig } from "./tftp/TftpAdapter";
 
+/** Finite daemon-safe admission shared by the host and daemon dispatcher. */
+export const MAX_DAEMON_RPC_IN_FLIGHT = 16;
+
 /** More than the current log envelope's 67 serialized bytes, leaving room for protocol metadata. */
 const MAX_RPC_TEXT_FIELD_HEADROOM_BYTES = 1024;
 /** Text-field limit leaves envelope/newline headroom inside the planned JSON-line transport ceiling. */

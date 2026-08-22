@@ -46,6 +46,7 @@ import type {
 import type { DhcpLeaseInfo } from "./dhcp/DhcpAdapter";
 import type { DhcpPacketCounters, DhcpPoolInfo } from "./dhcp/engine/DhcpEngine";
 import {
+  MAX_DAEMON_RPC_IN_FLIGHT,
   parseRpcEnvelope,
   parseRpcEvent,
   parseRpcResultForRequest,
@@ -71,7 +72,18 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
-  detachWriteError?: () => void;
+}
+
+/** The EOF grace resources owned by one exact child generation. */
+interface ChildStdoutEofDeadline {
+  timer?: ReturnType<typeof setTimeout>;
+  check?: ReturnType<typeof setImmediate>;
+}
+
+/** Protocol detachment and terminal error ownership have different lifetimes. */
+interface ChildIoOwnership {
+  readonly detachProtocol: () => void;
+  readonly releaseTerminalGuards: () => void;
 }
 
 /** `getServiceRuntime` reply for the TFTP service. */
@@ -151,11 +163,11 @@ export class NetworkServerDaemonHost {
   private startPromise?: Promise<void>;
   private nextGeneration = 1;
   private activeGeneration?: number;
-  private detachChildIo?: () => void;
+  private readonly childIo = new Map<ChildProcess, ChildIoOwnership>();
   /** SIGKILL escalation belongs to the specific child that received SIGTERM. */
   private readonly killTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
   /** A live child may close stdout only until this generation-owned deadline. */
-  private readonly stdoutEofTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
+  private readonly stdoutEofTimers = new Map<ChildProcess, ChildStdoutEofDeadline>();
   private readonly rpcTimeoutMs: number;
   private readonly readyTimeoutMs: number;
 
@@ -347,12 +359,15 @@ export class NetworkServerDaemonHost {
    */
   private terminateChild(child: ChildProcess): void {
     if (this.child !== child) return;
+    this.clearChildStdoutEofDeadline(child);
     this.child = undefined;
     this.activeGeneration = undefined;
     this.readyFlag = false;
     // These readers are attached to THIS child's stdout/stderr. Leaving them
     // attached lets a late line from a dead generation mutate its replacement.
-    this.closeChildIo();
+    // Stream error guards stay attached through this child's later `close`:
+    // Node can deliver a buffered EPIPE after exit/termination.
+    this.detachChildProtocolIo(child);
     try { child.stdin?.end(); } catch { /* pipe already gone */ }
     try { child.kill("SIGTERM"); } catch { /* already dead */ }
     this.scheduleChildEscalation(child);
@@ -388,6 +403,7 @@ export class NetworkServerDaemonHost {
     };
     child.once("exit", clearChildTimers);
     child.once("close", clearChildTimers);
+    child.once("close", () => this.releaseChildTerminalGuards(child));
 
     child.on("error", (error) => {
       if (!this.isCurrentChild(child, generation)) return;
@@ -397,8 +413,9 @@ export class NetworkServerDaemonHost {
 
     child.on("exit", (code, signal) => {
       if (!this.isCurrentChild(child, generation)) return;
+      this.clearChildStdoutEofDeadline(child);
       this.readyFlag = false;
-      this.closeChildIo();
+      this.detachChildProtocolIo(child);
       this.child = undefined;
       this.activeGeneration = undefined;
       const error = new Error(`Network servers daemon exited (code=${String(code ?? "null")})`);
@@ -408,6 +425,9 @@ export class NetworkServerDaemonHost {
         this.invokeUserListener(() => listener(code, signal));
       }
     });
+
+    const protocolDetachers: Array<() => void> = [];
+    const terminalGuardDetachers: Array<() => void> = [];
 
     if (child.stdout) {
       const stdout = child.stdout;
@@ -426,15 +446,17 @@ export class NetworkServerDaemonHost {
         this.failChildProtocol(child, generation, `daemon stdout stream error: ${error.message}`);
       };
       stdout.once("end", onStdoutEnd);
-      stdout.once("error", onStdoutError);
-      this.detachChildIo = () => {
+      // Keep this guard until the exact child closes. A late stream error
+      // after generation teardown must be consumed, never handed to a
+      // replacement generation or Node's unhandled-error path.
+      stdout.on("error", onStdoutError);
+      protocolDetachers.push(() => {
         detachReader();
         stdout.removeListener("end", onStdoutEnd);
-        stdout.removeListener("error", onStdoutError);
-      };
+      });
+      terminalGuardDetachers.push(() => stdout.removeListener("error", onStdoutError));
     }
     if (child.stderr) {
-      const previousCleanup = this.detachChildIo;
       const rl = createInterface({ input: child.stderr });
       rl.on("line", (line) => {
         if (!this.isCurrentChild(child, generation)) return;
@@ -445,24 +467,27 @@ export class NetworkServerDaemonHost {
         this.emitLog("daemon", "warn", `Daemon stderr stream error: ${error.message}`);
       };
       child.stderr.on("error", onStderrError);
-      this.detachChildIo = () => {
-        previousCleanup?.();
+      protocolDetachers.push(() => {
         try { rl.close(); } catch { /* already closed */ }
-        child.stderr?.removeListener("error", onStderrError);
-      };
+      });
+      terminalGuardDetachers.push(() => child.stderr?.removeListener("error", onStderrError));
     }
     if (child.stdin) {
-      const previousCleanup = this.detachChildIo;
       const onStdinError = (error: Error) => {
         if (!this.isCurrentChild(child, generation)) return;
         this.failChildTransport(child, generation, `daemon stdin stream error: ${error.message}`);
       };
       child.stdin.on("error", onStdinError);
-      this.detachChildIo = () => {
-        previousCleanup?.();
-        child.stdin?.removeListener("error", onStdinError);
-      };
+      terminalGuardDetachers.push(() => child.stdin?.removeListener("error", onStdinError));
     }
+    this.childIo.set(child, {
+      detachProtocol: () => {
+        for (const detach of protocolDetachers) detach();
+      },
+      releaseTerminalGuards: () => {
+        for (const detach of terminalGuardDetachers) detach();
+      },
+    });
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -507,6 +532,11 @@ export class NetworkServerDaemonHost {
     if (generation === undefined) {
       throw new Error("Network servers daemon generation is unavailable");
     }
+    if (this.pending.size >= MAX_DAEMON_RPC_IN_FLIGHT) {
+      const error = new Error("Network servers daemon RPC admission is full");
+      error.name = "SERVER_BUSY";
+      throw error;
+    }
     // Capture the narrowed stream before entering deferred callbacks; the
     // ChildProcess property itself is nullable in Node's declarations.
     const stdin = child.stdin;
@@ -525,13 +555,6 @@ export class NetworkServerDaemonHost {
         ));
       }, this.rpcTimeoutMs);
       this.pending.set(id, deferred);
-
-      const rejectWrite = (error: Error) => {
-        if (!this.isCurrentChild(child, generation)) return;
-        this.failChildTransport(child, generation, `daemon stdin write failed: ${error.message}`);
-      };
-      stdin.once("error", rejectWrite);
-      deferred.detachWriteError = () => stdin.removeListener("error", rejectWrite);
 
       try {
         const request = params === undefined ? { id, method } : { id, method, params };
@@ -663,8 +686,6 @@ export class NetworkServerDaemonHost {
     if (this.pending.get(id) !== expected) return false;
     this.pending.delete(id);
     if (expected.timer) clearTimeout(expected.timer);
-    expected.detachWriteError?.();
-    expected.detachWriteError = undefined;
     settle(expected);
     return true;
   }
@@ -704,21 +725,36 @@ export class NetworkServerDaemonHost {
   /** Gives normal exit/close delivery a conservative chance before treating live EOF as corruption. */
   private scheduleChildStdoutEofDeadline(child: ChildProcess, generation: number): void {
     if (!this.isCurrentChild(child, generation) || this.stdoutEofTimers.has(child)) return;
-    const timer = setTimeout(() => {
-      this.stdoutEofTimers.delete(child);
-      if (!this.isCurrentChild(child, generation)) return;
-      if (child.exitCode === null && child.signalCode === null) {
-        this.failChildProtocol(child, generation, "daemon stdout closed before the process exited");
-      }
+    const deadline: ChildStdoutEofDeadline = {};
+    deadline.timer = setTimeout(() => {
+      deadline.timer = undefined;
+      if (this.stdoutEofTimers.get(child) !== deadline || !this.isCurrentChild(child, generation)) return;
+
+      // An expired timer runs before the poll phase. A child can have exited
+      // while the host loop was stalled, leaving its normal `exit`/`close`
+      // callbacks queued behind this timer. Defer the live-EOF verdict to one
+      // check-phase turn so those process callbacks get their normal poll
+      // opportunity first; the exact child still owns this short resource.
+      deadline.check = setImmediate(() => {
+        deadline.check = undefined;
+        if (this.stdoutEofTimers.get(child) !== deadline) return;
+        this.stdoutEofTimers.delete(child);
+        if (!this.isCurrentChild(child, generation)) return;
+        if (child.exitCode === null && child.signalCode === null) {
+          this.failChildProtocol(child, generation, "daemon stdout closed before the process exited");
+        }
+      });
+      deadline.check.unref();
     }, 1_000);
-    timer.unref();
-    this.stdoutEofTimers.set(child, timer);
+    deadline.timer.unref();
+    this.stdoutEofTimers.set(child, deadline);
   }
 
   private clearChildStdoutEofDeadline(child: ChildProcess): void {
-    const timer = this.stdoutEofTimers.get(child);
-    if (!timer) return;
-    clearTimeout(timer);
+    const deadline = this.stdoutEofTimers.get(child);
+    if (!deadline) return;
+    if (deadline.timer) clearTimeout(deadline.timer);
+    if (deadline.check) clearImmediate(deadline.check);
     this.stdoutEofTimers.delete(child);
   }
 
@@ -771,8 +807,17 @@ export class NetworkServerDaemonHost {
     this.readyWaiters.clear();
   }
 
-  private closeChildIo(): void {
-    this.detachChildIo?.();
-    this.detachChildIo = undefined;
+  /** Stops this child's protocol/data callbacks without releasing terminal guards. */
+  private detachChildProtocolIo(child: ChildProcess): void {
+    this.childIo.get(child)?.detachProtocol();
+  }
+
+  /** Releases only the terminal guards owned by the child that actually closed. */
+  private releaseChildTerminalGuards(child: ChildProcess): void {
+    const ownership = this.childIo.get(child);
+    if (!ownership) return;
+    ownership.detachProtocol();
+    ownership.releaseTerminalGuards();
+    this.childIo.delete(child);
   }
 }

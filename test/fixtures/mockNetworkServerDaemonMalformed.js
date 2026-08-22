@@ -92,6 +92,12 @@ if (mode === "stdout-eof-delayed-exit") {
   }, 20);
 }
 
+if (mode === "late-stdio") {
+  // Keeps the exact terminate-to-close interval open for the host's terminal
+  // stream-ownership regression. The test performs its own final reap.
+  process.on("SIGTERM", () => undefined);
+}
+
 let requestCount = 0;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -161,6 +167,12 @@ process.stdin.on("data", (chunk) => {
         break;
       case "hold-first-list":
         if (requestCount > 1) sendValidReply(id, request);
+        break;
+      case "hold-all-list":
+        break;
+      case "late-stdio":
+        // Hold a real host write pending until the test has torn its
+        // generation down and delivers the buffered terminal callback/error.
         break;
       case "stdout-eof":
         process.stdout.end();

@@ -1,7 +1,12 @@
 import { Writable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MAX_RPC_LINE_BYTES } from "../../../src/services/networkServers/boundedLineReader";
-import { BoundedJsonLineWriter } from "../../../src/services/networkServers/boundedJsonLineWriter";
+import { rpcResultParsers } from "../../../src/services/networkServers/networkServerRpcProtocol";
+import {
+  BoundedDaemonDiagnosticWriter,
+  BoundedJsonLineWriter,
+  MAX_DAEMON_DIAGNOSTIC_BYTES,
+} from "../../../src/services/networkServers/boundedJsonLineWriter";
 
 class ControlledWritable extends Writable {
   public readonly chunks: Buffer[] = [];
@@ -21,15 +26,72 @@ async function turn(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+function dhcpRuntimeResponse(id: number, leaseCount: number, finalClientId: string): { readonly id: number; readonly result: object } {
+  return {
+    id,
+    result: {
+      snapshot: { id: "dhcp", name: "DHCP Server", port: 67, status: "running" },
+      leases: Array.from({ length: leaseCount }, (_unused, index) => ({
+        mac: "aa:bb:cc:dd:ee:ff",
+        ip: "192.168.2.10",
+        boundAt: 1_700_000_000_000,
+        leaseSec: 3_600,
+        expiresAt: 1_700_000_003_600,
+        remainingSec: 3_599,
+        hostname: null,
+        leaseType: "dynamic",
+        clientId: index === leaseCount - 1 ? finalClientId : "",
+      })),
+      packetCounters: {
+        packetsReceived: 0,
+        packetsSentEstimate: 0,
+        discoverCount: 0,
+        offerCount: 0,
+        requestCount: 0,
+        declineCount: 0,
+        ackCount: 0,
+        nakCount: 0,
+        releaseCount: 0,
+        informCount: 0,
+      },
+      poolInfo: {
+        rangeStart: "192.168.2.10",
+        rangeEnd: "192.168.2.199",
+        poolSize: 190,
+        activeCount: leaseCount,
+        utilizationPct: 0,
+        staticEntryCount: 0,
+      },
+      boundPort: null,
+    },
+  };
+}
+
+function dhcpRuntimeResponseAtWireBytes(id: number, payloadBytes: number): { readonly id: number; readonly result: object } {
+  let low = 1;
+  let high = 10_000;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const bytes = Buffer.byteLength(JSON.stringify(dhcpRuntimeResponse(id, middle, "")), "utf8");
+    if (bytes <= payloadBytes) low = middle;
+    else high = middle - 1;
+  }
+  const baseline = dhcpRuntimeResponse(id, low, "");
+  const padding = payloadBytes - Buffer.byteLength(JSON.stringify(baseline), "utf8");
+  return dhcpRuntimeResponse(id, low, "x".repeat(padding));
+}
+
 describe("bounded daemon JSON-line writer", () => {
-  it("keeps an exact maximum producer result and converts its first-over peer to RESPONSE_TOO_LARGE", async () => {
+  it("keeps an exact maximum parser-accepted DHCP runtime response and converts its first-over peer to RESPONSE_TOO_LARGE", async () => {
     const stream = new ControlledWritable({ highWaterMark: 1 });
     const writer = new BoundedJsonLineWriter(stream, { onTerminal: () => undefined });
-    const overhead = Buffer.byteLength(JSON.stringify({ id: 4, result: "" }), "utf8");
-    const atLimit = "x".repeat(MAX_RPC_LINE_BYTES - overhead);
+    const atLimit = dhcpRuntimeResponseAtWireBytes(4, MAX_RPC_LINE_BYTES);
+    const firstOver = dhcpRuntimeResponseAtWireBytes(5, MAX_RPC_LINE_BYTES + 1);
+    expect(rpcResultParsers.getServiceRuntime(atLimit.result).ok).toBe(true);
+    expect(rpcResultParsers.getServiceRuntime(firstOver.result).ok).toBe(true);
 
-    writer.write({ id: 4, result: atLimit });
-    writer.write({ id: 5, result: `${atLimit}x` });
+    writer.write(atLimit);
+    writer.write(firstOver);
     stream.release();
     await turn();
     stream.release();
@@ -37,7 +99,7 @@ describe("bounded daemon JSON-line writer", () => {
 
     const first = stream.chunks[0]!.toString("utf8");
     expect(Buffer.byteLength(first.slice(0, -1), "utf8")).toBe(MAX_RPC_LINE_BYTES);
-    expect(JSON.parse(first)).toEqual({ id: 4, result: atLimit });
+    expect(JSON.parse(first)).toEqual(atLimit);
     expect(JSON.parse(stream.chunks[1]!.toString("utf8"))).toEqual({
       id: 5,
       error: { code: "RESPONSE_TOO_LARGE", message: "Daemon response exceeds the RPC line limit." },
@@ -114,5 +176,27 @@ describe("bounded daemon JSON-line writer", () => {
     }
 
     expect(drops).toEqual(["outbound notification dropped while stdout is backpressured"]);
+  });
+
+  it("retains at most one bounded stderr diagnostic under backpressure and consumes terminal failures", () => {
+    const stream = new ControlledWritable({ highWaterMark: 1 });
+    const diagnostics = new BoundedDaemonDiagnosticWriter(stream);
+    const write = vi.spyOn(stream, "write");
+
+    for (let index = 0; index < 1_000; index += 1) {
+      diagnostics.write(`dropped notification ${index}: ${"x".repeat(MAX_DAEMON_DIAGNOSTIC_BYTES)}`);
+    }
+
+    expect(stream.chunks).toHaveLength(1);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(Buffer.byteLength(stream.chunks[0]!, "utf8")).toBeLessThanOrEqual(MAX_DAEMON_DIAGNOSTIC_BYTES);
+    expect(() => {
+      stream.emit("error", new Error("stderr EPIPE"));
+      stream.emit("close");
+      diagnostics.write("late diagnostic after stderr failure");
+      stream.release(new Error("late callback error"));
+    }).not.toThrow();
+    expect(stream.chunks).toHaveLength(1);
+    write.mockRestore();
   });
 });
