@@ -32,8 +32,9 @@
  *   - Lease events formatted for human logs (bound/renewed/released).
  *   - Engine `on('error')` → `setStatus(ERROR)` so UI reflects failures
  *     during RUNNING (e.g. unexpectedly closed socket).
- *   - EACCES fallback with P0 cleanup (removeAllListeners + stop of
- *     firstEngine).
+ *   - Serialized, resource-based lifecycle cleanup: a provisional or
+ *     ERROR-owned engine remains reachable until its asynchronous stop
+ *     succeeds, so replacement cannot leak a UDP socket.
  *
  * Lifecycle:
  *   ```
@@ -96,6 +97,13 @@ export class DhcpAdapter extends BaseNexusServer {
   private engine: DhcpEngine | null = null;
   /** Effective configuration (with defaults applied in the constructor). */
   private config: DhcpAdapterConfig;
+  /** Serializes start/stop transitions in caller order. */
+  private lifecycleQueue: Promise<void> = Promise.resolve();
+  /** Coalesces adjacent duplicate lifecycle requests. */
+  private lastLifecycleOperation: {
+    readonly kind: 'start' | 'stop';
+    readonly promise: Promise<void>;
+  } | null = null;
 
   public constructor(config: DhcpAdapterConfig = {}) {
     const port = DEFAULT_PORT;
@@ -202,18 +210,27 @@ export class DhcpAdapter extends BaseNexusServer {
    * Starts the DHCP server with port fallback (67 → 1067) and creates
    * a new `DhcpEngine` instance (clean state per startup, like TFTP).
    */
-  public override async start(): Promise<void> {
-    if (this.status === ServerStatus.STARTING || this.status === ServerStatus.RUNNING) return;
+  public override start(): Promise<void> {
+    return this.enqueueLifecycle('start', () => this.startOwned());
+  }
+
+  /** Performs one serialized start transition. */
+  private async startOwned(): Promise<void> {
+    if (this.engine && this.status === ServerStatus.RUNNING) return;
+    if (this.engine) {
+      const cleanupError = await this.releaseEngine(this.engine);
+      if (cleanupError) {
+        throw this.failStart(`Cannot replace the previous DHCP engine: ${cleanupError.message}`);
+      }
+    }
     this.setStatus(ServerStatus.STARTING);
     this.log('info', `Starting DHCP service on UDP port ${this.port} · range ${this.rangeStart}→${this.rangeEnd} · gateway=${this.gateway} · lease=${this.leaseTimeSec}s.`);
 
-    let firstEngine: DhcpEngine | null = null;
-
     const tryStart = async (port: number): Promise<DhcpEngine> => {
       const engine = new DhcpEngine(this.config, (level, msg) => this.log(level as ServerLogLevel, msg));
-      if (port === this.port) {
-        firstEngine = engine;
-      }
+      // Publish ownership before binding. A queued stop/dispose must be able
+      // to find the provisional engine if start fails after allocating it.
+      this.engine = engine;
       this.bindEngineLogging(engine);
       this.bindEngineEvents(engine);
       await engine.start(port);
@@ -230,14 +247,12 @@ export class DhcpAdapter extends BaseNexusServer {
       const actualPort = engine.boundPort ?? this.port;
       this.log('info', `DHCP service RUNNING on UDP port ${actualPort} · pool ${this.poolInfo.poolSize} addresses (${this.poolInfo.staticEntryCount} static).`);
     } catch (err) {
-      // P0 cleanup: first engine removeAllListeners + stop anti-leak.
-      const failedEngine = firstEngine as DhcpEngine | null;
-      if (failedEngine) {
-        try { failedEngine.removeAllListeners(); } catch { /* swallow */ }
-        try { void failedEngine.stop().catch(() => {}); } catch { /* swallow */ }
-        firstEngine = null;
-      }
+      const failedEngine = this.engine;
+      const cleanupError = failedEngine ? await this.releaseEngine(failedEngine) : null;
       const formatted = this.formatStartError(err);
+      if (cleanupError) {
+        throw this.failStart(`${formatted} Cleanup failed: ${cleanupError.message}`, err);
+      }
       this.setStatus(ServerStatus.ERROR, formatted);
       // Rethrow, don't swallow: the ERROR status alone only reaches the
       // sidebar. `start()` resolving normally is what the daemon reports as
@@ -255,22 +270,76 @@ export class DhcpAdapter extends BaseNexusServer {
    * Stops the DHCP server, destroys the engine, closes sockets and sets
    * status to STOPPED. Idempotent.
    */
-  public override async stop(): Promise<void> {
-    if (this.status === ServerStatus.STOPPING || this.status === ServerStatus.STOPPED) return;
+  public override stop(): Promise<void> {
+    return this.enqueueLifecycle('stop', () => this.stopOwned());
+  }
+
+  /** Performs one serialized, resource-based stop transition. */
+  private async stopOwned(): Promise<void> {
+    if (!this.engine && this.status === ServerStatus.STOPPED) return;
     this.setStatus(ServerStatus.STOPPING);
     this.log('info', 'Stopping DHCP service…');
     const engine = this.engine;
-    this.engine = null;
     if (engine) {
-      try {
-        engine.removeAllListeners();
-        await engine.stop();
-      } catch (e) {
-        this.log('warn', `cleanup issue (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+      const cleanupError = await this.releaseEngine(engine);
+      if (cleanupError) {
+        this.setStatus(ServerStatus.ERROR, `cleanup issue: ${cleanupError.message}`);
+        throw cleanupError;
       }
     }
     this.setStatus(ServerStatus.STOPPED);
     this.log('info', 'DHCP service stopped.');
+  }
+
+  /**
+   * Stops one captured engine and clears ownership only after cleanup succeeds.
+   * A failed cleanup leaves the engine reachable so a later stop/dispose can
+   * retry it instead of silently losing a live UDP socket.
+   */
+  private async releaseEngine(engine: DhcpEngine): Promise<Error | null> {
+    try {
+      engine.removeAllListeners();
+    } catch {
+      // Listener cleanup must not prevent the resource-owning stop attempt.
+    }
+    try {
+      await engine.stop();
+    } catch (err) {
+      const cleanupError = err instanceof Error ? err : new Error(String(err));
+      this.log('warn', `cleanup issue: ${cleanupError.message}`);
+      return cleanupError;
+    }
+    if (this.engine === engine) this.engine = null;
+    return null;
+  }
+
+  /** Queues one lifecycle transition and keeps the queue usable after errors. */
+  private enqueueLifecycle(
+    kind: 'start' | 'stop',
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const pending = this.lastLifecycleOperation;
+    if (pending?.kind === kind) return pending.promise;
+
+    const promise = this.lifecycleQueue.then(operation);
+    this.lifecycleQueue = promise.catch(() => {});
+    const request = { kind, promise };
+    this.lastLifecycleOperation = request;
+    void promise.then(
+      () => {
+        if (this.lastLifecycleOperation === request) this.lastLifecycleOperation = null;
+      },
+      () => {
+        if (this.lastLifecycleOperation === request) this.lastLifecycleOperation = null;
+      },
+    );
+    return promise;
+  }
+
+  /** Records a failed start and preserves its resource/error ownership. */
+  private failStart(message: string, cause?: unknown): Error {
+    this.setStatus(ServerStatus.ERROR, message);
+    return new Error(message, cause === undefined ? undefined : { cause });
   }
 
   // ---------------------------------------------------------------------------
@@ -431,4 +500,3 @@ function describeDecline(req: unknown): { mac: string; address?: string } {
         : undefined;
   return { mac, address };
 }
-

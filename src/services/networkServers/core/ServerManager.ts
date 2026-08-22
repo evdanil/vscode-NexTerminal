@@ -76,6 +76,8 @@ export interface ServerManagerEvents {
 export class ServerManager extends EventEmitter {
   private readonly registry: ServerRegistry;
   private readonly instances: Map<string, NexusServer> = new Map();
+  /** In-flight evictions, coalesced so one instance is never disposed twice. */
+  private readonly dropOperations: Map<string, Promise<boolean>> = new Map();
 
   /**
    * Creates a new `ServerManager`.
@@ -238,21 +240,42 @@ export class ServerManager extends EventEmitter {
    * configuration) runs again. Without this, the daemon would serve the first
    * configuration it ever saw for the rest of its lifetime.
    *
-   * Never throws — a failing `dispose()` still results in the instance being
-   * forgotten, which is the outcome the caller actually needs.
+   * The instance remains mapped until disposal succeeds. A failed disposal is
+   * propagated with the server id and leaves the instance reachable so callers
+   * can retry instead of replacing a resource that may still be live.
    *
    * @param id - Server identifier to evict from the instance cache.
    * @returns `true` if an instance existed and was dropped; `false` otherwise.
+   * @throws {Error} When disposal fails; the mapped instance is retained.
    */
-  public async dropInstance(id: string): Promise<boolean> {
+  public dropInstance(id: string): Promise<boolean> {
+    const pending = this.dropOperations.get(id);
+    if (pending) return pending;
     const instance = this.instances.get(id);
-    if (!instance) return false;
-    this.instances.delete(id);
+    if (!instance) return Promise.resolve(false);
+
+    const operation = this.disposeAndDrop(id, instance);
+    this.dropOperations.set(id, operation);
+    void operation.then(
+      () => {
+        if (this.dropOperations.get(id) === operation) this.dropOperations.delete(id);
+      },
+      () => {
+        if (this.dropOperations.get(id) === operation) this.dropOperations.delete(id);
+      },
+    );
+    return operation;
+  }
+
+  /** Disposes one captured instance before evicting the matching map entry. */
+  private async disposeAndDrop(id: string, instance: NexusServer): Promise<boolean> {
     try {
       await instance.dispose();
-    } catch {
-      // swallow; the instance is already unreachable from the Manager
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to dispose server '${id}': ${message}`, { cause: err });
     }
+    if (this.instances.get(id) === instance) this.instances.delete(id);
     return true;
   }
 

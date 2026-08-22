@@ -125,8 +125,9 @@ export abstract class BaseNexusServer extends EventEmitter implements NexusServe
    * Releases all server resources in a terminal and safe manner.
    *
    * ### Internal flow:
-   * 1. If the server is **not** already `STOPPED` or `ERROR`, tries to call
-   *    `stop()` to perform a graceful shutdown.
+   * 1. If the server is not already `STOPPED`, tries to call `stop()` to
+   *    perform a graceful shutdown. `ERROR` is a status, not proof that a
+   *    subclass has released the resource that caused it.
    * 2. Any error from `stop()` is **silently swallowed**. The goal of
    *    `dispose` is to clean up, not propagate failures — if `stop` failed, there
    *    is nothing more to do anyway.
@@ -137,7 +138,7 @@ export abstract class BaseNexusServer extends EventEmitter implements NexusServe
    * @returns A Promise that **always** resolves (never rejects).
    */
   public async dispose(): Promise<void> {
-    if (this._status !== ServerStatus.STOPPED && this._status !== ServerStatus.ERROR) {
+    if (this._status !== ServerStatus.STOPPED) {
       try {
         await this.stop();
       } catch {
