@@ -1986,7 +1986,7 @@ function dhcpServerFields(current: DhcpServerFormSeed, options?: NetworkServerFo
       max: 604_800,
       placeholder: "86400",
       value: current.leaseTimeSec,
-      hint: "Clamped to 60 seconds minimum and 7 days maximum (option 51)."
+      hint: "Enter a whole number from 60 seconds to 7 days (option 51). The form rejects invalid values; invalid saved settings fall back to the 24-hour default."
     },
     {
       type: "text",
