@@ -1,0 +1,415 @@
+diff --git a/node_modules/dhcp/lib/dhcp.js b/node_modules/dhcp/lib/dhcp.js
+index e009e81..222bf0a 100644
+--- a/node_modules/dhcp/lib/dhcp.js
++++ b/node_modules/dhcp/lib/dhcp.js
+@@ -6,6 +6,8 @@
+  * Dual licensed under the MIT or GPL Version 2 licenses.
+  **/
+ 
++// Nexus applies bounded allocator/dispatch corrections to dhcp@0.2.20.
++
+ const util = require('util');
+ const dgram = require('dgram');
+ const os = require('os');
+@@ -27,6 +29,10 @@ const DHCPINFORM = 8;
+ 
+ const SERVER_PORT = 67;
+ const CLIENT_PORT = 68;
++const OFFER_TTL_MS = 60 * 1000;
++// A /16 is already larger than an ordinary DHCP broadcast domain and keeps a
++// worst-case synchronous allocation scan operationally finite.
++const MAX_POOL_SIZE = 65_536;
+ 
+ const INADDR_ANY = '0.0.0.0';
+ const INADDR_BROADCAST = '255.255.255.255';
+@@ -36,6 +42,18 @@ const BOOTREPLY = 2;
+ 
+ 
+ 
++function normalizeMac(mac) {
++  const value = String(mac);
++  const hex = value.replace(/[^0-9a-f]/gi, '').toUpperCase();
++  return hex.length === 12 ? hex.match(/../g).join('-') : value.trim().toUpperCase();
++}
++
++function asPacketError(error) {
++  return error instanceof Error ? error : new Error(String(error));
++}
++
++
++
+ function Lease() {
+ 
+ }
+@@ -64,40 +82,64 @@ function Server(config, listenOnly) {
+   sock.on('message', function(buf) {
+ 
+     let req;
++    let messageEmitted = false;
+ 
+     try {
+       req = Protocol.parse(buf);
+-    } catch (e) {
+-      self.emit('error', e);
+-      return;
+-    }
++      if (!req || typeof req !== 'object' || !req.options || typeof req.options !== 'object') {
++        throw new Error('Malformed packet');
++      }
+ 
+-    self._req = req;
++      self._req = req;
+ 
+-    if (req.op !== BOOTREQUEST) {
+-      self.emit('error', new Error('Malformed packet'), req);
+-      return;
+-    }
++      if (req.op !== BOOTREQUEST && (!listenOnly || req.op !== BOOTREPLY)) {
++        throw new Error('Malformed packet');
++      }
+ 
+-    if (!req.options[53]) {
+-      self.emit('error', new Error('Got message, without valid message type'), req);
+-      return;
+-    }
++      const messageType = req.options[53];
++      if (!Number.isInteger(messageType) || messageType < DHCPDISCOVER || messageType > DHCPINFORM) {
++        throw new Error('Got message, without valid message type');
++      }
+ 
+-    self.emit('message', req);
++      // Passive broadcast listeners observe every DHCP type. An active server
++      // only accepts client-originated types; DECLINE/INFORM are intentionally
++      // no-ops after observation because this dependency has no response path.
++      if (!listenOnly &&
++        messageType !== DHCPDISCOVER &&
++        messageType !== DHCPREQUEST &&
++        messageType !== DHCPDECLINE &&
++        messageType !== DHCPRELEASE &&
++        messageType !== DHCPINFORM
++      ) {
++        throw new Error('Got message, without valid message type');
++      }
+ 
+-    if (!listenOnly) {
+-      // Handle request
+-      switch (req.options[53]) {
+-        case DHCPDISCOVER: // 1.
+-          self.handleDiscover(req);
+-          break;
+-        case DHCPREQUEST: // 3.
+-          self.handleRequest(req);
+-          break;
+-        default:
+-          console.error("Not implemented method", req.options[53]);
++      // The engine receives this metadata on a later packetError so it can
++      // count one datagram once even if a message observer/handler then fails.
++      messageEmitted = true;
++      self.emit('message', req);
++
++      if (!listenOnly) {
++        // Handle request
++        switch (messageType) {
++          case DHCPDISCOVER: // 1.
++            self.handleDiscover(req);
++            break;
++          case DHCPREQUEST: // 3.
++            self.handleRequest(req);
++            break;
++          case DHCPRELEASE: // 7.
++            self.handleRelease(req);
++            break;
++          case DHCPDECLINE: // 4.
++          case DHCPINFORM: // 8.
++            break;
++          default:
++            throw new Error('Unsupported DHCP message type ' + messageType);
++        }
+       }
++    } catch (error) {
++      self.emit('packetError', asPacketError(error), req, {messageEmitted: messageEmitted});
+     }
+   });
+ 
+@@ -199,7 +241,7 @@ Server.prototype = {
+         }
+ 
+       } else {
+-        this.emit('error', 'Unknown option ' + req);
++        throw new Error('Unknown option ' + req);
+       }
+     }
+ 
+@@ -221,7 +263,7 @@ Server.prototype = {
+           }
+ 
+         } else {
+-          this.emit('error', 'Unknown option ' + req);
++          throw new Error('Unknown option ' + req);
+         }
+       }
+     }
+@@ -257,19 +299,49 @@ Server.prototype = {
+      *
+      * 1. Is there a wish for static binding?
+      *
+-     * 2. Are all available IP's occupied?
+-     *    - Send release to oldest lease and reuse
+-     *
+-     * 3. is config randomIP?
+-     *    - Select random IP of range, until no occupied slot is found
+-     *
+-     * 4. Take first unmapped IP of range
++     * 2. Select an address from the configured inclusive range, visiting each
++     *    candidate at most once.
+      *
+      * TODO:
+      * - Incorporate user preference, sent to us
+      * - Check APR if IP exists on net
+      */
+ 
++    const _static = this.config('static');
++    const staticByMac = Object.create(null);
++    const staticAddresses = new Set;
++    if (_static && typeof _static === 'object') {
++      for (let mac in _static) {
++        const address = _static[mac];
++        staticByMac[normalizeMac(mac)] = address;
++        if (address) {
++          staticAddresses.add(address);
++        }
++      }
++    }
++
++    const now = Date.now();
++    for (let mac in this._state) {
++      const lease = this._state[mac];
++      const bindTime = lease.bindTime instanceof Date ? lease.bindTime.getTime() : NaN;
++      const isStatic = staticByMac[normalizeMac(mac)] === lease.address;
++      if (
++        !isStatic &&
++        lease.state === 'BOUND' &&
++        Number.isFinite(bindTime) &&
++        Number.isFinite(lease.leasePeriod) &&
++        bindTime + lease.leasePeriod * 1000 <= now
++      ) {
++        delete this._state[mac];
++      } else if (
++        lease.state === 'OFFERED' &&
++        Number.isFinite(lease.offerTime) &&
++        lease.offerTime + OFFER_TTL_MS <= now
++      ) {
++        delete this._state[mac];
++      }
++    }
++
+ 
+     // If existing lease for a mac address is present, re-use the IP
+     if (this._state[clientMAC] && this._state[clientMAC].address) {
+@@ -279,89 +351,66 @@ Server.prototype = {
+ 
+ 
+     // Is there a static binding?
+-    const _static = this.config('static');
+     if (typeof _static === "function") {
+       const staticResult = _static(clientMAC, req);
+       if (staticResult)
+         return staticResult;
+-    } else if (_static[clientMAC]) {
+-      return _static[clientMAC];
++    } else if (staticByMac[normalizeMac(clientMAC)]) {
++      return staticByMac[normalizeMac(clientMAC)];
+     }
+ 
+ 
+     const randIP = this.config('randomIP');
+     const _tmp = this.config('range');
+-    const firstIP = Tools.parseIp(_tmp[0]);
+-    const lastIP = Tools.parseIp(_tmp[1]);
+-
+-
+-
+-    // Add all known addresses and save the oldest lease
+-    const ips = [this.config('server')]; // Exclude our own server IP from pool
+-    let oldestMac = null;
+-    let oldestTime = Infinity;
+-    let leases = 0;
+-    for (let mac in this._state) {
+-      if (this._state[mac].address)
+-        ips.push(this._state[mac].address);
+-
+-      if (this._state[mac].leaseTime < oldestTime) {
+-        oldestTime = this._state[mac].leaseTime;
+-        oldestMac = mac;
+-      }
+-      leases++;
+-    }
++    const firstIP = Tools.parseIp(_tmp[0]) >>> 0;
++    const lastIP = Tools.parseIp(_tmp[1]) >>> 0;
++    const poolSize = lastIP - firstIP + 1;
+ 
+-
+-
+-
+-    // Check if all IP's are used and delete the oldest
+-    if (oldestMac !== null && lastIP - firstIP === leases) {
+-      const ip = this._state[oldestMac].address;
+-
+-      // TODO: Notify deleted client
+-      delete this._state[oldestMac];
+-
+-      return ip;
++    if (!Number.isSafeInteger(poolSize) || poolSize < 1 || poolSize > MAX_POOL_SIZE) {
++      return null;
+     }
+ 
+ 
+ 
+-
+-    // Select a random IP, maybe not the best algorithm for quick selection if lots of ip's are given: TODO
+-    if (randIP) {
+-
+-      while (1) {
+-
+-        const ip = Tools.formatIp(firstIP + Math.random() * (lastIP - firstIP) | 0);
+-
+-        if (ips.indexOf(ip) === -1) {
+-          return ip;
+-        }
+-      }
++    // Add all known addresses.
++    const ips = new Set([this.config('server'), ...staticAddresses]); // Exclude server/static IPs from pool
++    for (let mac in this._state) {
++      if (this._state[mac].address)
++        ips.add(this._state[mac].address);
+     }
+ 
+ 
+ 
+-    // Choose first free IP in subnet
+-    for (let i = firstIP; i <= lastIP; i++) {
+-
+-      const ip = Tools.formatIp(i);
++    const startOffset = randIP ? Math.floor(Math.random() * poolSize) : 0;
++    for (let attempt = 0; attempt < poolSize; attempt++) {
++      const offset = (startOffset + attempt) % poolSize;
++      const ip = Tools.formatIp((firstIP + offset) >>> 0);
+ 
+-      if (ips.indexOf(ip) === -1) {
++      if (!ips.has(ip)) {
+         return ip;
+       }
+     }
++    return null;
+   },
+ 
+   handleDiscover: function(req) {
+     //console.log('Handle Discover', req);
+ 
++    const address = this._selectAddress(req.chaddr, req);
++    if (address === null) {
++      this.emit('poolExhausted', req);
++      return;
++    }
++
+     const lease = this._state[req.chaddr] = this._state[req.chaddr] || new Lease;
+-    lease.address = this._selectAddress(req.chaddr, req);
++    lease.address = address;
+     lease.leasePeriod = this.config('leaseTime');
+     lease.server = this.config('server');
+     lease.state = 'OFFERED';
++    lease.offerTime = Date.now();
++    if (lease.clientId === undefined) {
++      lease.clientId = req.options[61] === undefined ? null : req.options[61];
++    }
+ 
+     this.sendOffer(req);
+   },
+@@ -401,12 +450,24 @@ Server.prototype = {
+   handleRequest: function(req) {
+     //console.log('Handle Request', req);
+ 
++    const address = this._selectAddress(req.chaddr, req);
++    if (address === null) {
++      if (this._state[req.chaddr] && !this._state[req.chaddr].address) {
++        delete this._state[req.chaddr];
++      }
++      this.emit('poolExhausted', req);
++      return;
++    }
++
+     const lease = this._state[req.chaddr] = this._state[req.chaddr] || new Lease;
+-    lease.address = this._selectAddress(req.chaddr);
++    lease.address = address;
+     lease.leasePeriod = this.config('leaseTime');
+     lease.server = this.config('server');
+     lease.state = 'BOUND';
+     lease.bindTime = new Date;
++    if (lease.clientId === undefined) {
++      lease.clientId = req.options[61] === undefined ? null : req.options[61];
++    }
+ 
+     this.sendAck(req);
+   },
+@@ -470,8 +531,25 @@ Server.prototype = {
+     this._send(this.config('broadcast'), ans);
+   },
+ 
+-  handleRelease: function() {
++  handleRelease: function(req) {
++    const lease = this._state[req.chaddr];
++    const clientId = req.options[61] === undefined ? null : req.options[61];
++    // Legacy restored leases have unknown identity (undefined). New leases
++    // record either known absence (null) or the exact option-61 string.
++    const identityMismatch = lease && lease.clientId !== undefined && lease.clientId !== clientId;
++
++    if (
++      !lease ||
++      lease.state !== 'BOUND' ||
++      lease.address !== req.ciaddr ||
++      identityMismatch
++    ) {
++      return;
++    }
+ 
++    const address = lease.address;
++    delete this._state[req.chaddr];
++    this.emit('released', req.chaddr, address);
+   },
+ 
+   handleRenew: function() {
+@@ -497,14 +575,26 @@ Server.prototype = {
+   _send: function(host, data) {
+ 
+     const sb = Protocol.format(data);
+-
+-    this._sock.send(sb._data, 0, sb._w, CLIENT_PORT, host, function(err, bytes) {
+-      if (err) {
+-        console.log(err);
+-      } else {
+-        //console.log('Sent ', bytes, 'bytes');
+-      }
+-    });
++    const self = this;
++    const req = this._req;
++
++    // A reply send failure is not a malformed client packet: it means the
++    // server's own UDP resource cannot answer. Escalate through `error` so
++    // the owning adapter enters ERROR and can release the retained socket.
++    const emitSocketError = function(error) {
++      self.emit('error', asPacketError(error), req);
++    };
++    try {
++      this._sock.send(sb._data, 0, sb._w, CLIENT_PORT, host, function(err, bytes) {
++        if (err) {
++          emitSocketError(err);
++        } else {
++          //console.log('Sent ', bytes, 'bytes');
++        }
++      });
++    } catch (error) {
++      emitSocketError(error);
++    }
+   }
+ 
+ };

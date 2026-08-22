@@ -1479,6 +1479,19 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     .advanced-fields .form-group {
       margin-bottom: 14px;
     }
+    .form-section {
+      margin: 22px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+    .form-section:first-child {
+      margin-top: 4px;
+    }
     .actions button[data-visible-when] {
       display: none;
     }
@@ -2960,6 +2973,19 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     }
     .advanced-fields .form-group {
       margin-bottom: 14px;
+    }
+    .form-section {
+      margin: 22px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-input-border, rgba(128,128,128,0.35)));
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+    .form-section:first-child {
+      margin-top: 4px;
     }
     .actions button[data-visible-when] {
       display: none;
@@ -9795,6 +9821,148 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.scripts.macroPolicy"></span>
 </div>
 
+  <h3 id="section-networkServers">Network Servers</h3>
+  <h4 class="settings-subgroup">Notifications</h4>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-networkServers-verboseMode">
+    <input type="checkbox" id="setting-nexus-networkServers-verboseMode" data-section="nexus.networkServers" data-key="verboseMode" />
+    Verbose Mode
+  </label>
+  
+  <div class="setting-desc">Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the Nexus Network Servers output channel records everything either way.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.verboseMode"></span>
+</div>
+
+  <h3 id="section-tftpServer">TFTP Server</h3>
+  <h4 class="settings-subgroup">Network</h4>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-tftp-root">TFTP Root Directory</label>
+  <div class="setting-desc">Directory served by the embedded TFTP service. Leave empty to use ~/Nexus/tftp-root, which is created on first start (falling back to the system temp directory if it cannot be created). Every file beneath this directory is readable by any host that can reach the bound port — point it at a staging directory, not at a source tree or a home directory.</div>
+  <div class="file-input-row">
+    <input type="text" id="setting-nexus-networkServers-tftp-root" data-section="nexus.networkServers" data-key="tftp.root" value="" />
+    <button type="button" class="browse-btn" data-section="nexus.networkServers" data-key="tftp.root">Browse</button>
+  </div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.tftp.root"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-tftp-interface">TFTP Bind Interface</label>
+  <div class="setting-desc">Local IPv4 address to bind the TFTP socket to, i.e. which network interface serves TFTP. Leave empty for 0.0.0.0 (all interfaces). On a multi-homed machine, set this to the lab-facing NIC so the service is not also reachable over the corporate LAN or VPN. This address is also what Auto-Link TFTP advertises to DHCP clients, so binding all interfaces leaves the DHCP boot options unset.</div>
+  <input type="text" id="setting-nexus-networkServers-tftp-interface" data-section="nexus.networkServers" data-key="tftp.interface" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.tftp.interface"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-tftp-port">TFTP Port</label>
+  <div class="setting-desc">UDP port for the embedded TFTP service. The IANA port 69 is privileged: if binding it is denied (no root/Administrator), the service automatically falls back to 1069 and logs a warning instead of failing. Clients must then be pointed at the fallback port — the port actually in use is shown next to the service.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-networkServers-tftp-port" data-section="nexus.networkServers" data-key="tftp.port" value="1" min="1" max="65535" />
+    
+    <span class="range-hint">(1–65535, default: 69)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.networkServers.tftp.port"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.tftp.port"></span>
+</div>
+  <h4 class="settings-subgroup">Access</h4>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-networkServers-tftp-allowWrite">
+    <input type="checkbox" id="setting-nexus-networkServers-tftp-allowWrite" data-section="nexus.networkServers" data-key="tftp.allowWrite" />
+    Allow TFTP Uploads
+  </label>
+  
+  <div class="setting-desc">Accept TFTP write requests (WRQ), letting remote clients upload files into the TFTP root. TFTP has no authentication whatsoever, so anything that can reach the port can overwrite files. Leave disabled unless a device genuinely needs to push configs or crash dumps back.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.tftp.allowWrite"></span>
+</div>
+
+  <div class="button-row">
+    <button type="button" class="btn-secondary" id="open-tftp-settings-btn">Open TFTP Settings…</button>
+  </div>
+  <h3 id="section-dhcpServer">DHCP Server</h3>
+  <h4 class="settings-subgroup">Network</h4>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-interface">DHCP Bind Interface</label>
+  <div class="setting-desc">Local IPv4 address to bind the DHCP socket to, i.e. which network interface serves DHCP. Leave empty for 0.0.0.0 (all interfaces) — on a multi-homed machine this is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The service always uses the IANA port 67; if binding it is denied, it falls back to 1067 and logs a warning, which normal DHCP clients will not reach.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-interface" data-section="nexus.networkServers" data-key="dhcp.interface" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.interface"></span>
+</div>
+  <h4 class="settings-subgroup">Address Pool</h4>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-rangeStart">Pool Start Address</label>
+  <div class="setting-desc">First address of the dynamic pool. Leave empty for 192.168.2.10. Must not be higher than the pool end address; static reservations are handed out regardless of this range.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-rangeStart" data-section="nexus.networkServers" data-key="dhcp.rangeStart" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.rangeStart"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-rangeEnd">Pool End Address</label>
+  <div class="setting-desc">Last address of the dynamic pool. Leave empty for 192.168.2.199. The pool size this implies drives the utilization figure shown beside the running service.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-rangeEnd" data-section="nexus.networkServers" data-key="dhcp.rangeEnd" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.rangeEnd"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-subnet">Subnet Mask</label>
+  <div class="setting-desc">Subnet mask handed to clients (option 1). Leave empty for 255.255.255.0. Its set bits must be contiguous (255.255.254.0 is a mask, 255.0.255.0 is not); together with the gateway it also derives the broadcast address when that is left empty.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-subnet" data-section="nexus.networkServers" data-key="dhcp.subnet" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.subnet"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-gateway">Default Gateway</label>
+  <div class="setting-desc">Default gateway handed to clients (option 3). Leave empty for 192.168.2.1.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-gateway" data-section="nexus.networkServers" data-key="dhcp.gateway" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.gateway"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-leaseTimeSec">Lease Time</label>
+  <div class="setting-desc">Lease duration handed to clients (option 51). Values below 60 seconds — shorter leases make clients renew faster than the server can meaningfully track — or above 7 days fall back to the 24-hour default.</div>
+  <div class="number-with-unit">
+    <input type="number" id="setting-nexus-networkServers-dhcp-leaseTimeSec" data-section="nexus.networkServers" data-key="dhcp.leaseTimeSec" value="60" min="60" max="604800" />
+    <span class="unit-suffix">seconds</span>
+    <span class="range-hint">(60–604800, default: 86400)</span>
+  </div>
+  <span class="validation-error" data-for="nexus.networkServers.dhcp.leaseTimeSec"></span>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.leaseTimeSec"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-serverId">Server Identifier</label>
+  <div class="setting-desc">Server identifier advertised to clients (option 54). Leave empty for 192.168.2.1. This should be the address clients see this machine on, otherwise renewals are sent to the wrong host. It is also the value carried in the BOOTP siaddr header field, which devices that ignore option 66 boot from.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-serverId" data-section="nexus.networkServers" data-key="dhcp.serverId" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.serverId"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-broadcast">Broadcast Address</label>
+  <div class="setting-desc">Broadcast address handed to clients (option 28). Leave empty to derive it from the gateway and the subnet mask.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-broadcast" data-section="nexus.networkServers" data-key="dhcp.broadcast" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.broadcast"></span>
+</div>
+  <h4 class="settings-subgroup">Boot / ZTP</h4>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-bootFileName">Boot File Name</label>
+  <div class="setting-desc">Option 67 (bootfile-name) — the file a PXE or ZTP client fetches from the boot server once it has an address, for example ios-image.bin, pxelinux.0 or ztp.py. Leave empty to send no bootfile, in which case a device gets an address and nothing to boot from.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-bootFileName" data-section="nexus.networkServers" data-key="dhcp.bootFileName" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.bootFileName"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-nextServer">Boot Server (TFTP)</label>
+  <div class="setting-desc">Option 66 (tftp-server-name) — the boot server IPv4 address clients fetch the boot file from, as a dotted-quad address. Leave empty and Auto-Link TFTP fills it in from the embedded TFTP service&#39;s own interface. The BOOTP siaddr header field is not configurable — it always carries the server identifier — so devices that read siaddr instead of option 66 follow that address.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-nextServer" data-section="nexus.networkServers" data-key="dhcp.nextServer" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.nextServer"></span>
+</div>
+  <div class="form-group form-group-checkbox">
+  <label for="setting-nexus-networkServers-dhcp-autoLinkTftp">
+    <input type="checkbox" id="setting-nexus-networkServers-dhcp-autoLinkTftp" data-section="nexus.networkServers" data-key="dhcp.autoLinkTftp" checked />
+    Auto-Link TFTP
+  </label>
+  
+  <div class="setting-desc">Point DHCP clients at this machine&#39;s own TFTP service. When the boot server and the option 150 address list are both empty, options 66 and 150 are filled in from the TFTP bind interface so ZTP works without typing the same address twice. Setting either one by hand turns the link off for both — quietly advertising a second, different boot server under the other option number is how a device boots from the wrong host. If TFTP is bound to all interfaces there is no single address to advertise, and both options are left unset rather than guessed.</div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.autoLinkTftp"></span>
+</div>
+  <div class="form-group">
+  <label for="setting-nexus-networkServers-dhcp-vendorClassId">Vendor Class Identifier Filter</label>
+  <div class="setting-desc">Option 60 (vendor class identifier) to match on. When set, the boot options (66, 67, 150 and 43) are served only to clients whose DISCOVER carries this exact identifier — everyone else still gets an address from the pool, just no boot information. The match is case-insensitive but otherwise exact, so Cisco will not match Cisco Systems, Inc.; the value each client actually sends is logged in the Nexus Network Servers channel at debug level. Leave empty to serve the boot options to every client.</div>
+  <input type="text" id="setting-nexus-networkServers-dhcp-vendorClassId" data-section="nexus.networkServers" data-key="dhcp.vendorClassId" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.vendorClassId"></span>
+</div>
+
+  <div class="button-row">
+    <button type="button" class="btn-secondary" id="open-dhcp-settings-btn">Open DHCP Settings…</button>
+  </div>
   <h3 id="section-importexport">Import / Export</h3>
   <div class="setting-desc">Create an encrypted backup or export a sanitized copy to share.</div>
   <div class="button-row">
@@ -10253,6 +10421,12 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
       });
       bindClick("open-highlight-editor-btn", function() {
         vscode.postMessage({ type: "openHighlightRuleEditor" });
+      });
+      bindClick("open-tftp-settings-btn", function() {
+        vscode.postMessage({ type: "openTftpSettings" });
+      });
+      bindClick("open-dhcp-settings-btn", function() {
+        vscode.postMessage({ type: "openDhcpSettings" });
       });
       bindClick("open-all-settings-btn", function() {
         vscode.postMessage({ type: "openAllSettings" });
@@ -11517,6 +11691,12 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
       });
       bindClick("open-highlight-editor-btn", function() {
         vscode.postMessage({ type: "openHighlightRuleEditor" });
+      });
+      bindClick("open-tftp-settings-btn", function() {
+        vscode.postMessage({ type: "openTftpSettings" });
+      });
+      bindClick("open-dhcp-settings-btn", function() {
+        vscode.postMessage({ type: "openDhcpSettings" });
       });
       bindClick("open-all-settings-btn", function() {
         vscode.postMessage({ type: "openAllSettings" });

@@ -282,6 +282,21 @@ function buildFormDom(definition: FormDefinition): FormDom {
       continue;
     }
 
+    // A section is a heading, not a control: `renderField` emits a bare
+    // `.form-section` div with no `.form-group` wrapper and registers nothing,
+    // because the descriptor carries only a label — no `key`, `value` or
+    // `required`. Handled here so the switch below never sees it.
+    if (field.type === "section") {
+      const heading = form.append(new StubElement("DIV", ["form-section"]));
+      heading.textContent = field.label;
+      if (field.visibleWhen) {
+        heading.dataset.visibleWhen = JSON.stringify(
+          Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen]
+        );
+      }
+      continue;
+    }
+
     const group = form.append(new StubElement("DIV", ["form-group"]));
     if (field.visibleWhen) {
       group.dataset.visibleWhen = JSON.stringify(Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen]);

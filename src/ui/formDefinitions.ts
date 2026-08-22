@@ -1,5 +1,9 @@
 import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
 import { authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
+import type { NetworkServerKind } from "../models/networkServer";
+import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
+import { DEFAULTS as DHCP_DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
+import { computePoolSize } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -1799,4 +1803,273 @@ export function inventorySourceFormDefinition(
       )
     ]
   };
+}
+
+/**
+ * Editor for the two fixed network services (TFTP + DHCP).
+ *
+ * Unlike every other form here there is no record to build: each field maps 1:1
+ * onto a `nexus.networkServers.<kind>.*` settings key, and the submit handler
+ * writes them back through `WorkspaceConfiguration.update`. Seeds therefore
+ * come from the manager's own settings readers, so the form opens showing
+ * exactly what a start would use — blanks included, which is how VS Code spells
+ * "fall back to the adapter default".
+ */
+export interface NetworkServerFormOptions {
+  /**
+   * The machine's bindable IPv4 addresses, enumerated at open time by
+   * `networkInterfaceBindOptions()`. Omitted (tests, defensive callers) leaves
+   * the picker offering the all-interfaces choice plus whatever the setting
+   * already holds, so no configured address is ever silently dropped.
+   */
+  interfaceOptions?: Array<{ label: string; value: string }>;
+}
+
+const ALL_INTERFACES_OPTION = { label: "All interfaces (0.0.0.0)", value: "" };
+
+/**
+ * The bind-address picker, shared by both services.
+ *
+ * `0.0.0.0` and blank are the same instruction, so both land on the
+ * all-interfaces option; saving it clears the setting rather than writing the
+ * literal address back. An address the setting holds but this machine no longer
+ * has — a NIC that has gone away, or a value typed into the native Settings UI
+ * — is appended and flagged, because a select silently renders its first option
+ * for an unknown value, and Save would then rebind the service to every
+ * interface without the user asking for it.
+ */
+function bindInterfaceField(
+  configured: string | undefined,
+  options: NetworkServerFormOptions | undefined,
+  hint: string
+): FormFieldDescriptor {
+  const trimmed = (configured ?? "").trim();
+  const value = trimmed === "0.0.0.0" ? "" : trimmed;
+  const known = [ALL_INTERFACES_OPTION, ...(options?.interfaceOptions ?? []).filter((option) => option.value !== "")];
+  return {
+    type: "select",
+    key: "interface",
+    label: "Interface",
+    options: known.some((option) => option.value === value)
+      ? known
+      : [...known, { label: `${value} — not currently available`, value }],
+    value,
+    hint
+  };
+}
+
+function tftpServerFields(current: TftpAdapterConfig, options?: NetworkServerFormOptions): FormFieldDescriptor[] {
+  return [
+    { type: "section", label: "Network" },
+    {
+      type: "text",
+      key: "root",
+      label: "Root Directory",
+      placeholder: "~/Nexus/tftp-root (default)",
+      value: current.root,
+      hint: "Every file beneath this directory is readable by any host that can reach the port. Point it at a staging directory, not a source tree."
+    },
+    bindInterfaceField(
+      current.interface,
+      options,
+      "Which NIC serves TFTP. Pick the lab-facing address on a multi-homed machine; all interfaces also exposes the root over the corporate LAN or VPN."
+    ),
+    {
+      type: "number",
+      key: "port",
+      label: "Port",
+      min: 1,
+      max: 65535,
+      placeholder: "69",
+      value: current.port,
+      hint: "UDP 69 is privileged; if binding is denied the service falls back to 1069 and logs a warning."
+    },
+    { type: "section", label: "Access" },
+    {
+      type: "checkbox",
+      key: "allowWrite",
+      label: "Allow write requests (WRQ)",
+      value: current.allowWrite ?? false,
+      hint: "TFTP has no authentication — anything that can reach the port could overwrite files."
+    }
+  ];
+}
+
+/**
+ * The DHCP form's seed.
+ *
+ * `autoLinkTftp` is not part of the adapter config — it is a host-side rule
+ * that is already resolved away by the time the adapter sees a `nextServer` —
+ * so the editor carries it alongside rather than inside.
+ */
+export interface DhcpServerFormSeed extends DhcpAdapterConfig {
+  readonly autoLinkTftp?: boolean;
+}
+
+/** The pool's current size, or nothing at all when neither end of it is configured. */
+function dhcpPoolCountSeed(current: DhcpServerFormSeed): number | undefined {
+  if (current.rangeStart === undefined && current.rangeEnd === undefined) return undefined;
+  return (
+    computePoolSize(
+      current.rangeStart ?? DHCP_DEFAULTS.rangeStart,
+      current.rangeEnd ?? DHCP_DEFAULTS.rangeEnd
+    ) || undefined
+  );
+}
+
+function dhcpServerFields(current: DhcpServerFormSeed, options?: NetworkServerFormOptions): FormFieldDescriptor[] {
+  const staticTextarea = current.static
+    ? Object.entries(current.static)
+        .map(([mac, ip]) => `${mac}=${ip}`)
+        .join("\n")
+    : undefined;
+  const vendorOptionsTextarea = current.vendorSpecificOptions
+    ? current.vendorSpecificOptions.map((entry) => `${entry.subOption}=${entry.value}`).join("\n")
+    : undefined;
+  return [
+    { type: "section", label: "Network" },
+    bindInterfaceField(
+      current.bindAddress,
+      options,
+      "Which NIC serves DHCP. This is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The port is always UDP 67."
+    ),
+    { type: "section", label: "Address Pool" },
+    {
+      type: "text",
+      key: "rangeStart",
+      label: "Pool Start",
+      placeholder: "192.168.2.10 (default)",
+      value: current.rangeStart
+    },
+    {
+      type: "number",
+      key: "poolCount",
+      label: "Pool Count",
+      min: 1,
+      placeholder: "190 (default)",
+      // Presentation only: the saved setting stays `rangeEnd`, computed on
+      // submit, so settings.json keeps the start/end pair it always had. An
+      // untouched pool stays blank rather than seeding 190, so saving the form
+      // does not write the packaged default out as an explicit setting.
+      value: dhcpPoolCountSeed(current),
+      hint: "How many addresses the pool hands out, counting from Pool Start. Saved as the pool's end address."
+    },
+    {
+      type: "text",
+      key: "subnet",
+      label: "Subnet Mask",
+      placeholder: "255.255.255.0 (default)",
+      value: current.subnet,
+      hint: "Handed to clients as option 1."
+    },
+    {
+      type: "text",
+      key: "gateway",
+      label: "Gateway",
+      placeholder: "192.168.2.1 (default)",
+      value: current.gateway,
+      hint: "Handed to clients as option 3."
+    },
+    {
+      type: "text",
+      key: "dns",
+      label: "DNS Servers",
+      placeholder: "8.8.8.8, 8.8.4.4",
+      value: current.dns?.join(", "),
+      hint: "Comma-separated, in preference order (option 6)."
+    },
+    {
+      type: "number",
+      key: "leaseTimeSec",
+      label: "Lease Time (seconds)",
+      min: 60,
+      max: 604_800,
+      placeholder: "86400",
+      value: current.leaseTimeSec,
+      hint: "Enter a whole number from 60 seconds to 7 days (option 51). The form rejects invalid values; invalid saved settings fall back to the 24-hour default."
+    },
+    {
+      type: "text",
+      key: "serverId",
+      label: "Server Identifier",
+      placeholder: "192.168.2.1 (default)",
+      value: current.serverId,
+      hint: "The address clients see this machine on (option 54) — renewals are sent here."
+    },
+    {
+      type: "text",
+      key: "broadcast",
+      label: "Broadcast Address",
+      placeholder: "192.168.2.255 (default)",
+      value: current.broadcast,
+      hint: "Optional. Handed to clients as option 28."
+    },
+    { type: "section", label: "Boot / ZTP" },
+    {
+      type: "text",
+      key: "bootFileName",
+      label: "Boot File Name",
+      placeholder: "ios-image.bin",
+      value: current.bootFileName,
+      hint: "Option 67 — the file a PXE/ZTP client fetches from the boot server."
+    },
+    {
+      type: "text",
+      key: "nextServer",
+      label: "Boot Server (TFTP)",
+      placeholder: "192.168.2.1",
+      value: current.nextServer,
+      hint: "Option 66. Leave empty to inherit the TFTP service's interface when Auto-link TFTP is on."
+    },
+    {
+      type: "text",
+      key: "tftpServerAddresses",
+      label: "TFTP Server Addresses (Cisco)",
+      placeholder: "192.168.2.1, 192.168.2.2",
+      value: current.tftpServerAddresses?.join(", "),
+      hint: "Option 150 — comma-separated IPv4 addresses. Cisco phones and IOS ZTP ask for this instead of option 66."
+    },
+    {
+      type: "checkbox",
+      key: "autoLinkTftp",
+      label: "Auto-link TFTP service",
+      value: current.autoLinkTftp ?? true,
+      hint: "Fill options 66 and 150 from the TFTP service's interface when both are left empty. Ignored when TFTP binds all interfaces."
+    },
+    {
+      type: "text",
+      key: "vendorClassId",
+      label: "Vendor Class Filter",
+      placeholder: "(all clients)",
+      value: current.vendorClassId,
+      hint: "Option 60. When set, boot options go only to clients sending this exact identifier — the observed value is logged on every DISCOVER."
+    },
+    {
+      type: "textarea",
+      key: "vendorSpecificOptions",
+      label: "Vendor-Specific Options",
+      placeholder: "1=192.168.2.5\n241=0x0A0B0C",
+      value: vendorOptionsTextarea,
+      hint: "Option 43, one sub-option per line as CODE=VALUE. A 0x-prefixed value is sent as raw bytes, anything else as text."
+    },
+    { type: "section", label: "Reservations" },
+    {
+      type: "textarea",
+      key: "static",
+      label: "Static Leases",
+      placeholder: "aa:bb:cc:dd:ee:ff=192.168.2.50\n11:22:33:44:55:66=192.168.2.51",
+      value: staticTextarea,
+      hint: "One MAC=IP reservation per line. Reserved addresses are handed to the matching client regardless of the dynamic pool."
+    }
+  ];
+}
+
+export function networkServerFormDefinition(
+  kind: NetworkServerKind,
+  current: TftpAdapterConfig | DhcpServerFormSeed,
+  options?: NetworkServerFormOptions
+): FormDefinition {
+  return kind === "tftp"
+    ? { title: "TFTP Service Settings", fields: tftpServerFields(current as TftpAdapterConfig, options) }
+    : { title: "DHCP Service Settings", fields: dhcpServerFields(current as DhcpServerFormSeed, options) };
 }

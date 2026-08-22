@@ -7,6 +7,7 @@ import {
   tunnelFormDefinition,
   unifiedProfileFormDefinition,
   unifiedProfileFormId,
+  networkServerFormDefinition,
   SAVED_FILTER_SELECT_KEY,
   SAVED_FILTER_SAVE_CURRENT_SENTINEL
 } from "../../src/ui/formDefinitions";
@@ -41,6 +42,18 @@ function keyPathVisibleWhen(definition: ReturnType<typeof serverFormDefinition>)
   expect(keyPathField).toBeDefined();
   return keyPathField!.visibleWhen;
 }
+
+describe("networkServerFormDefinition — DHCP lease duration", () => {
+  // ⊘ Restoring the former clamping claim misstates the form contract: invalid
+  // submissions are rejected and invalid persisted settings default to 24h.
+  it("states the rejected form bounds and persisted-settings fallback", () => {
+    const field = keyedField(networkServerFormDefinition("dhcp", {}), "leaseTimeSec");
+
+    expect(field.hint).toBe(
+      "Enter a whole number from 60 seconds to 7 days (option 51). The form rejects invalid values; invalid saved settings fall back to the 24-hour default."
+    );
+  });
+});
 
 describe("serverFormDefinition — addressless (P2-a)", () => {
   // A synced placeholder has no console address, so the Edit form must not mark

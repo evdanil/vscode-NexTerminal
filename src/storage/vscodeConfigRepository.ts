@@ -3,9 +3,12 @@ import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, Tunne
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
+import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { ConfigRepository } from "../core/contracts";
 import {
   validateServerConfig,
+  validateTftpConfigProfile,
+  validateDhcpConfigProfile,
   validateTunnelProfile,
   validateSerialProfile,
   validateAuthProfile,
@@ -102,6 +105,8 @@ const AUTH_PROFILES_KEY = "nexus.authProfiles";
 const INVENTORY_SOURCES_KEY = "nexus.inventorySources";
 const DEVICE_TEMPLATES_KEY = "nexus.deviceTemplates";
 const SAVED_FILTERS_KEY = "nexus.savedFilters";
+const TFTP_PROFILES_KEY = "nexus.networkServers.tftpProfiles";
+const DHCP_PROFILES_KEY = "nexus.networkServers.dhcpProfiles";
 
 export class VscodeConfigRepository implements ConfigRepository {
   /**
@@ -378,6 +383,36 @@ export class VscodeConfigRepository implements ConfigRepository {
 
   public async saveLocalShellProfiles(profiles: LocalShellProfile[]): Promise<void> {
     await this.guardedUpdate(LOCAL_SHELL_PROFILES_KEY, "local shell profiles", profiles);
+  }
+
+  public async getTftpProfiles(): Promise<TftpConfigProfile[]> {
+    const raw = asArray<TftpConfigProfile>(this.readRaw(TFTP_PROFILES_KEY));
+    return raw.filter((item) => {
+      if (validateTftpConfigProfile(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid TFTP profile entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveTftpProfiles(profiles: TftpConfigProfile[]): Promise<void> {
+    await this.guardedUpdate(TFTP_PROFILES_KEY, "TFTP profiles", profiles);
+  }
+
+  public async getDhcpProfiles(): Promise<DhcpConfigProfile[]> {
+    const raw = asArray<DhcpConfigProfile>(this.readRaw(DHCP_PROFILES_KEY));
+    return raw.filter((item) => {
+      if (validateDhcpConfigProfile(item)) {
+        return true;
+      }
+      console.warn("[Nexus] Skipping invalid DHCP profile entry:", JSON.stringify(item));
+      return false;
+    });
+  }
+
+  public async saveDhcpProfiles(profiles: DhcpConfigProfile[]): Promise<void> {
+    await this.guardedUpdate(DHCP_PROFILES_KEY, "DHCP profiles", profiles);
   }
 
   public async getGroups(): Promise<string[]> {
