@@ -111,8 +111,12 @@ class DaemonClient {
 
   private constructor(public readonly child: ChildProcess) {}
 
-  public static async launch(script: string): Promise<DaemonClient> {
-    const child = spawn(process.execPath, [script], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  public static async launch(script: string, environment?: NodeJS.ProcessEnv): Promise<DaemonClient> {
+    const child = spawn(process.execPath, [script], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      env: environment,
+    });
     const client = new DaemonClient(child);
     client.rl = createInterface({ input: child.stdout! });
     client.rl.on("line", (line) => client.handleLine(line));
@@ -312,6 +316,36 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     client.child.stdin!.write("this is not json\n");
     await expect(client.call("list")).resolves.toBeDefined();
     expect(client.exited).toBeUndefined();
+  });
+
+  it("rejects malformed configure, start, and restart DTOs before applying or creating an adapter", async () => {
+    const malformedDhcp = await client.send("configure", { configs: { dhcp: { dns: ["not-an-ip"] } } });
+    expect(malformedDhcp.error?.code).toBe("INTERNAL_ERROR");
+    expect(malformedDhcp.error?.message).toContain("dhcp.dns[0]");
+
+    const malformedStart = await client.send("start", { id: "tftp", config: { port: -1 } });
+    expect(malformedStart.error?.code).toBe("INTERNAL_ERROR");
+    expect(malformedStart.error?.message).toContain("tftp.port");
+    expect((await client.call<{ status: string }>("getStatus", { id: "tftp" })).status).toBe("stopped");
+
+    const malformedRestart = await client.send("restart", { id: "tftp", config: { interface: "not-an-ip" } });
+    expect(malformedRestart.error?.code).toBe("INTERNAL_ERROR");
+    expect(malformedRestart.error?.message).toContain("tftp.interface");
+    expect((await client.call<{ status: string }>("getStatus", { id: "tftp" })).status).toBe("stopped");
+  });
+
+  it("rejects an invalid environment seed before the daemon announces readiness", async () => {
+    const seeded = await DaemonClient.launch(daemonScript, {
+      ...process.env,
+      NEXUS_NETWORK_SERVERS_CONFIG: JSON.stringify({ dhcp: { static: { "bad-mac": "10.0.0.50" } } }),
+    });
+    try {
+      const warning = seeded.events.find((event) => event.event === "log" && JSON.stringify(event.data).includes("NEXUS_NETWORK_SERVERS_CONFIG"));
+      expect(warning).toBeDefined();
+      await expect(seeded.call("list")).resolves.toBeDefined();
+    } finally {
+      seeded.teardown();
+    }
   });
 
   it("`start` binds a real UDP socket that serves a file end to end through the daemon", async () => {

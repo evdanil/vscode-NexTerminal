@@ -126,14 +126,20 @@ describe("DHCP submit validation — accepted input", () => {
     expect(byKey("broadcast")).toBe("192.168.2.255");
   });
 
+  it("validates the form's start-plus-count pool rather than pairing the start with an unrelated default end", async () => {
+    await expect(
+      submitDhcp({ rangeStart: "10.0.0.10", poolCount: "10", subnet: "255.255.255.0" })
+    ).resolves.toBeUndefined();
+  });
+
   it("accepts a start equal to the end (a one-address pool)", async () => {
     await expect(submitDhcp({ rangeStart: "10.0.0.50", rangeEnd: "10.0.0.50" })).resolves.toBeUndefined();
   });
 
-  it("accepts the boundary octets 0 and 255", async () => {
+  it("rejects boundary octets when they describe a pool above the allocator cap", async () => {
     await expect(
       submitDhcp({ rangeStart: "0.0.0.0", rangeEnd: "255.255.255.255", subnet: "255.255.255.255" })
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow("DHCP pool size must not exceed 65,536 addresses.");
   });
 
   it.each(["255.0.0.0", "255.255.128.0", "255.255.255.252", "0.0.0.0"])(
@@ -154,8 +160,10 @@ describe("DHCP submit validation — blanks are not invalid", () => {
     }
   });
 
-  it("does not compare a blank pool end against a present start", async () => {
-    await expect(submitDhcp({ rangeStart: "192.168.2.200", rangeEnd: "" })).resolves.toBeUndefined();
+  it("rejects a lone endpoint when it becomes inverted against the packaged default", async () => {
+    await expect(submitDhcp({ rangeStart: "192.168.2.200", rangeEnd: "" })).rejects.toThrow(
+      "Pool Start (192.168.2.200) must not be higher than Pool End (192.168.2.199)."
+    );
   });
 
   it("does not run the netmask check on a blank subnet", async () => {
@@ -220,6 +228,20 @@ describe("DHCP submit validation — rejected input", () => {
 
   it("writes no setting at all when validation fails", async () => {
     await expect(submitDhcp({ ...VALID, subnet: "255.255.0.15" })).rejects.toThrow(/contiguous/);
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("rejects malformed DNS before writing any form settings through the shared parser", async () => {
+    await expect(submitDhcp({ ...VALID, dns: "1.1.1.1, not-an-ip" })).rejects.toThrow(
+      'DNS server must be a dotted-quad IPv4 address (got "not-an-ip").'
+    );
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("rejects malformed static reservations before writing any form settings", async () => {
+    await expect(submitDhcp({ ...VALID, static: "AA-BB-CC-DD-EE-FF=10.0.0.50\nbad-mac=10.0.0.51" })).rejects.toThrow(
+      /Static reservation MAC addresses/
+    );
     expect(configUpdates).toEqual([]);
   });
 

@@ -4151,7 +4151,7 @@
           "type": "string",
           "default": "",
           "order": 50,
-          "markdownDescription": "**DHCP — Boot / ZTP. Option 66** (tftp-server-name) — the boot server clients fetch `#nexus.networkServers.dhcp.bootFileName#` from, as a dotted-quad address (e.g. `192.168.2.1`) or a hostname. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills it in from the embedded TFTP service's own interface. Note that the BOOTP `siaddr` header field is **not** configurable — it always carries `#nexus.networkServers.dhcp.serverId#` — so devices that read `siaddr` instead of option 66 follow that address."
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 66** (tftp-server-name) — the boot-server IPv4 address clients fetch `#nexus.networkServers.dhcp.bootFileName#` from, as a dotted-quad address (e.g. `192.168.2.1`). Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills it in from the embedded TFTP service's own interface. Note that the BOOTP `siaddr` header field is **not** configurable — it always carries `#nexus.networkServers.dhcp.serverId#` — so devices that read `siaddr` instead of option 66 follow that address."
         },
         "nexus.networkServers.dhcp.tftpServerAddresses": {
           "type": "array",

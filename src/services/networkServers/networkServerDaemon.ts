@@ -62,6 +62,7 @@ import { env, stdin, stdout } from 'node:process';
 import { DhcpAdapter, type DhcpLeaseInfo } from './dhcp/DhcpAdapter';
 import { TftpAdapter, type TftpTransferView } from './tftp/TftpAdapter';
 import { createRuntimeUpdateThrottle } from './runtimeUpdateThrottle';
+import { parseNetworkServerConfigs } from './networkServerConfigValidation';
 import {
   ServerManager,
   ServerStatus,
@@ -174,6 +175,14 @@ type JsonRpcEvent =
  * Each instance is serialized as **a single JSON line** followed by `\n`.
  */
 type JsonLine = JsonRpcResult | JsonRpcError | JsonRpcEvent;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasOwn(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
 
 /**
  * Serializes a {@link JsonLine} object and writes it as **one line**
@@ -292,15 +301,17 @@ async function run(): Promise<void> {
    */
   const applyConfigs = async (configs: NetworkServerConfigs): Promise<string[]> => {
     const changed: string[] = [];
-    for (const id of ['tftp', 'dhcp'] as const) {
-      const incoming = configs[id];
-      if (incoming === undefined) continue;
-      if (JSON.stringify(configStore[id] ?? null) === JSON.stringify(incoming)) continue;
-      // Both branches assign the same union member the key was read from; TS
-      // cannot follow that through the indexed access, hence the narrow cast.
-      (configStore as Record<string, unknown>)[id] = incoming;
-      changed.push(id);
-      await evictIfIdle(id);
+    const tftp = configs.tftp;
+    if (tftp !== undefined && JSON.stringify(configStore.tftp ?? null) !== JSON.stringify(tftp)) {
+      configStore.tftp = tftp;
+      changed.push('tftp');
+      await evictIfIdle('tftp');
+    }
+    const dhcp = configs.dhcp;
+    if (dhcp !== undefined && JSON.stringify(configStore.dhcp ?? null) !== JSON.stringify(dhcp)) {
+      configStore.dhcp = dhcp;
+      changed.push('dhcp');
+      await evictIfIdle('dhcp');
     }
     return changed;
   };
@@ -314,12 +325,14 @@ async function run(): Promise<void> {
     const raw = env[CONFIG_ENV_VAR];
     if (!raw) return;
     try {
-      const parsed = JSON.parse(raw) as NetworkServerConfigs;
-      if (parsed && typeof parsed === 'object') {
-        await applyConfigs(parsed);
+      const parsed = parseNetworkServerConfigs(JSON.parse(raw));
+      if (!parsed.ok) {
+        logDaemon('warn', `Rejected malformed ${CONFIG_ENV_VAR}: ${parsed.errors.join('; ')}`);
+        return;
       }
+      await applyConfigs(parsed.value);
     } catch (err) {
-      logDaemon('warn', `Ignored malformed ${CONFIG_ENV_VAR}: ${err instanceof Error ? err.message : String(err)}`);
+      logDaemon('warn', `Rejected malformed ${CONFIG_ENV_VAR}: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
@@ -395,11 +408,16 @@ async function run(): Promise<void> {
    * @param id - Service id the request targets (`tftp` / `dhcp`).
    * @param params - Raw RPC params; `params.config` is used when present.
    */
-  const applyRequestConfig = async (id: string, params?: Record<string, unknown>): Promise<void> => {
-    const config = params?.['config'];
-    if (!config || typeof config !== 'object') return;
-    if (id !== 'tftp' && id !== 'dhcp') return;
-    await applyConfigs({ [id]: config } as NetworkServerConfigs);
+  const parseRequestConfig = (id: string, params: unknown): NetworkServerConfigs | undefined => {
+    if (id !== 'tftp' && id !== 'dhcp') return undefined;
+    if (!isRecord(params) || !hasOwn(params, 'config')) return undefined;
+    const config = params.config;
+    const candidate: Record<string, unknown> = id === 'tftp' ? { tftp: config } : { dhcp: config };
+    const parsed = parseNetworkServerConfigs(candidate);
+    if (!parsed.ok) {
+      throw new Error(`Invalid network-server configuration: ${parsed.errors.join('; ')}`);
+    }
+    return parsed.value;
   };
 
   const handleRequest = async (req: JsonRpcRequest): Promise<JsonRpcResult | JsonRpcError> => {
@@ -421,13 +439,19 @@ async function run(): Promise<void> {
           return { id: req.id, result: found };
         }
         case 'configure': {
-          const configs = (req.params?.['configs'] ?? {}) as NetworkServerConfigs;
-          const changed = await applyConfigs(configs);
+          const params = isRecord(req.params) ? req.params : undefined;
+          const rawConfigs = params && hasOwn(params, 'configs') ? params.configs : {};
+          const parsed = parseNetworkServerConfigs(rawConfigs);
+          if (!parsed.ok) {
+            throw new Error(`Invalid network-server configuration: ${parsed.errors.join('; ')}`);
+          }
+          const changed = await applyConfigs(parsed.value);
           return { id: req.id, result: { ok: true, changed } };
         }
         case 'start': {
           const id = String(req.params?.['id'] ?? '');
-          await applyRequestConfig(id, req.params);
+          const configs = parseRequestConfig(id, req.params);
+          if (configs) await applyConfigs(configs);
           if (staleConfigIds.has(id)) await evictIfIdle(id);
           await manager.start(id);
           return { id: req.id, result: { ok: true, id } };
@@ -439,11 +463,12 @@ async function run(): Promise<void> {
         }
         case 'restart': {
           const id = String(req.params?.['id'] ?? '');
+          const configs = parseRequestConfig(id, req.params);
           // Stop first, THEN apply: applyConfigs deliberately refuses to evict
           // a running instance, so configuring before stopping would leave the
           // old instance in place and restart it with stale settings.
           await manager.stop(id);
-          await applyRequestConfig(id, req.params);
+          if (configs) await applyConfigs(configs);
           // Picks up a `configure` that landed while the service was running:
           // the eviction it could not do back then happens now that it is idle.
           if (staleConfigIds.has(id)) await evictIfIdle(id);

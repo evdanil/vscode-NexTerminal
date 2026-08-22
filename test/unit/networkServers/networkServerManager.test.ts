@@ -216,11 +216,11 @@ describe("NetworkServerManager — settings resolution", () => {
     });
   });
 
-  it("clamps leaseTimeSec into the [60s, 7d] band", () => {
+  it("defaults invalid leaseTimeSec values instead of clamping them", () => {
     mockConfig.set("nexus.networkServers.dhcp.leaseTimeSec", 5);
-    expect(readDhcpConfig().leaseTimeSec).toBe(60);
+    expect(readDhcpConfig().leaseTimeSec).toBe(86_400);
     mockConfig.set("nexus.networkServers.dhcp.leaseTimeSec", 99_999_999);
-    expect(readDhcpConfig().leaseTimeSec).toBe(604_800);
+    expect(readDhcpConfig().leaseTimeSec).toBe(86_400);
   });
 
   it("maps the dhcp `interface` setting onto the engine's bindAddress field", () => {
@@ -293,6 +293,7 @@ describe("NetworkServerManager — settings resolution", () => {
   it("readNetworkServerConfigs() bundles both services for the spawn seed", () => {
     mockConfig.set("nexus.networkServers.tftp.port", 6900);
     mockConfig.set("nexus.networkServers.dhcp.rangeStart", "172.28.1.10");
+    mockConfig.set("nexus.networkServers.dhcp.rangeEnd", "172.28.1.200");
     const configs = readNetworkServerConfigs();
     expect(configs.tftp?.port).toBe(6900);
     expect(configs.dhcp?.rangeStart).toBe("172.28.1.10");
@@ -406,6 +407,7 @@ describe("NetworkServerManager — lifecycle happy paths", () => {
   it("readConfig() returns the TFTP shape for tftp and the DHCP shape for dhcp", () => {
     mockConfig.set("nexus.networkServers.tftp.root", "/srv/tftp");
     mockConfig.set("nexus.networkServers.dhcp.rangeStart", "172.28.1.10");
+    mockConfig.set("nexus.networkServers.dhcp.rangeEnd", "172.28.1.200");
     const manager = fakeManager();
     expect(manager.readConfig("tftp")).toMatchObject({ root: "/srv/tftp" });
     expect(manager.readConfig("dhcp")).toMatchObject({ rangeStart: "172.28.1.10" });

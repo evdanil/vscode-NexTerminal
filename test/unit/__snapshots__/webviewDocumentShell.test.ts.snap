@@ -9940,7 +9940,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
 </div>
   <div class="form-group">
   <label for="setting-nexus-networkServers-dhcp-nextServer">Boot Server (TFTP)</label>
-  <div class="setting-desc">Option 66 (tftp-server-name) — the boot server clients fetch the boot file from, as a dotted-quad address or a hostname. Leave empty and Auto-Link TFTP fills it in from the embedded TFTP service&#39;s own interface. The BOOTP siaddr header field is not configurable — it always carries the server identifier — so devices that read siaddr instead of option 66 follow that address.</div>
+  <div class="setting-desc">Option 66 (tftp-server-name) — the boot server IPv4 address clients fetch the boot file from, as a dotted-quad address. Leave empty and Auto-Link TFTP fills it in from the embedded TFTP service&#39;s own interface. The BOOTP siaddr header field is not configurable — it always carries the server identifier — so devices that read siaddr instead of option 66 follow that address.</div>
   <input type="text" id="setting-nexus-networkServers-dhcp-nextServer" data-section="nexus.networkServers" data-key="dhcp.nextServer" value="" />
   <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.dhcp.nextServer"></span>
 </div>

@@ -20,6 +20,7 @@ import {
   isValidIpv4
 } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
+import { MAX_DHCP_POOL_SIZE, validateDhcpFormInput } from "../services/networkServers/networkServerConfigValidation";
 import type { DhcpVendorSpecificEntry } from "../services/networkServers/core/index";
 import type { NetworkServerKind } from "../models/networkServer";
 import type { NetworkServerConfigProfile } from "../models/networkServerProfile";
@@ -113,6 +114,9 @@ export function dhcpPoolProblem(
   if (count === undefined) return undefined;
   if (!Number.isInteger(count) || count < 1) {
     return `Pool Count must be a whole number of at least 1 (got "${String(count)}").`;
+  }
+  if (count > MAX_DHCP_POOL_SIZE) {
+    return `Pool Count must not exceed ${MAX_DHCP_POOL_SIZE.toLocaleString("en-US")} addresses.`;
   }
   const start = rangeStart ?? DEFAULTS.rangeStart;
   if (!isValidIpv4(start)) return undefined;
@@ -270,25 +274,9 @@ export function networkServerProfileSettingUpdates(
  * use the packaged default", which is always valid.
  */
 export function validateDhcpValues(values: FormValues): string | undefined {
+  const parserProblem = validateDhcpFormInput(values);
+  if (parserProblem) return parserProblem;
   const rangeStart = readSettingString(values.rangeStart);
-  const rangeEnd = readSettingString(values.rangeEnd);
   const subnet = readSettingString(values.subnet);
-  for (const [label, value] of [
-    ["Pool Start", rangeStart],
-    ["Pool End", rangeEnd],
-    ["Subnet Mask", subnet],
-    ["Gateway", readSettingString(values.gateway)],
-    ["Server Identifier", readSettingString(values.serverId)],
-    ["Broadcast Address", readSettingString(values.broadcast)]
-  ] as const) {
-    if (value && !isValidIpv4(value)) {
-      return `${label} must be a dotted-quad IPv4 address (got "${value}").`;
-    }
-  }
-  if (subnet && !isContiguousMask(subnet)) {
-    return `Subnet Mask "${subnet}" is not a valid netmask — its set bits must be contiguous (e.g. 255.255.255.0).`;
-  }
-  const inverted = dhcpRangeOrderProblem(rangeStart, rangeEnd);
-  if (inverted) return inverted;
   return dhcpPoolProblem(rangeStart, readSettingNumber(values.poolCount), subnet);
 }

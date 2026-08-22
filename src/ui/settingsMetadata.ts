@@ -701,7 +701,7 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "dhcpServer",
     subgroup: "Boot / ZTP",
     description:
-      "Option 66 (tftp-server-name) — the boot server clients fetch the boot file from, as a dotted-quad address or a hostname. Leave empty and Auto-Link TFTP fills it in from the embedded TFTP service's own interface. The BOOTP siaddr header field is not configurable — it always carries the server identifier — so devices that read siaddr instead of option 66 follow that address."
+      "Option 66 (tftp-server-name) — the boot server IPv4 address clients fetch the boot file from, as a dotted-quad address. Leave empty and Auto-Link TFTP fills it in from the embedded TFTP service's own interface. The BOOTP siaddr header field is not configurable — it always carries the server identifier — so devices that read siaddr instead of option 66 follow that address."
   },
   {
     key: "dhcp.autoLinkTftp",

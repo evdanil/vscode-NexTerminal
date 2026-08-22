@@ -33,16 +33,13 @@ import {
   type NetworkServerTransferHistoryEntry,
   type NetworkServerTransferSummary
 } from "../../models/networkServer";
-import { readBoundedNumber } from "../../utils/boundedConfig";
 import type {
   DhcpAdapterConfig,
-  DhcpVendorSpecificEntry,
   NetworkServerConfigs,
   ServerConnectionEvent,
   TftpAdapterConfig
 } from "./core/index";
-import { isValidSubOptionCode } from "./dhcp/engine/dhcpBootOptions";
-import { compareIpv4, isContiguousMask, isValidIpv4 } from "./dhcp/engine/dhcpNetworkUtils";
+import { sanitizeDhcpConfig, sanitizeTftpConfig } from "./networkServerConfigValidation";
 import {
   NetworkServerDaemonHost,
   type DhcpRuntimeSnapshot,
@@ -137,93 +134,42 @@ export function resolveNetworkServerDaemonPath(extensionPath: string): string {
  * default with an empty root path or an empty bind address, so it has to
  * collapse to `undefined` instead.
  */
-function readOptionalString(section: string, key: string): string | undefined {
-  const raw = vscode.workspace.getConfiguration(section).get<string>(key);
-  if (typeof raw !== "string") return undefined;
+function readOptionalSettingValue(section: string, key: string): unknown {
+  const raw = vscode.workspace.getConfiguration(section).get<unknown>(key);
+  if (typeof raw !== "string") return raw;
   const trimmed = raw.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-/** Reads a string-array setting, dropping blanks; `undefined` when empty. */
-function readOptionalStringArray(section: string, key: string): string[] | undefined {
-  const raw = vscode.workspace.getConfiguration(section).get<unknown>(key);
-  if (!Array.isArray(raw)) return undefined;
-  const values = raw.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).map((entry) => entry.trim());
-  return values.length > 0 ? values : undefined;
+function readOptionalArrayValue(section: string, key: string): unknown {
+  const raw = readOptionalSettingValue(section, key);
+  if (!Array.isArray(raw)) return raw;
+  if (raw.length === 0) return undefined;
+  return raw.map((entry) => (typeof entry === "string" ? entry.trim() : entry));
+}
+
+function readOptionalObjectValue(section: string, key: string): unknown {
+  const raw = readOptionalSettingValue(section, key);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  return Object.keys(raw).length > 0 ? raw : undefined;
 }
 
 /**
- * Reads the MAC→IP reservation map, keeping only well-formed string pairs.
+ * Normalizes editable static-lease map whitespace before strict validation.
  *
- * Hand-edited `settings.json` is the normal authoring path for this setting,
- * so a nested object or a numeric value is a realistic input — and one bad
- * entry must not discard the whole map.
+ * VS Code settings can retain hand-edited padding around object keys and
+ * values. Trimming it here preserves the previous tolerant settings-read
+ * behavior while the shared validator remains the authority for canonical MAC
+ * and IPv4 syntax.
  */
-function readStaticLeaseMap(section: string, key: string): Record<string, string> | undefined {
-  const raw = vscode.workspace.getConfiguration(section).get<unknown>(key);
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const entries: Record<string, string> = {};
-  for (const [mac, ip] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof ip !== "string") continue;
-    const trimmedMac = mac.trim();
-    const trimmedIp = ip.trim();
-    if (!trimmedMac || !trimmedIp) continue;
-    entries[trimmedMac] = trimmedIp;
+function readStaticSettingValue(section: string, key: string): unknown {
+  const raw = readOptionalObjectValue(section, key);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const normalized: Record<string, unknown> = {};
+  for (const [entryKey, entryValue] of Object.entries(raw)) {
+    normalized[entryKey.trim()] = typeof entryValue === "string" ? entryValue.trim() : entryValue;
   }
-  return Object.keys(entries).length > 0 ? entries : undefined;
-}
-
-/**
- * Reads the option 43 sub-option list, dropping entries that could not be put
- * on the wire.
- *
- * Same tolerance as {@link readStaticLeaseMap}: this array is authored by hand
- * in `settings.json` as often as through the form, and one malformed entry must
- * not discard the rest. Value syntax (`0x…` hex vs plain text) is validated at
- * encode time, not here — this filter only rejects entries that are not
- * `{ subOption, value }` pairs with a legal sub-option code.
- */
-function readVendorSpecificOptions(section: string, key: string): DhcpVendorSpecificEntry[] | undefined {
-  const raw = vscode.workspace.getConfiguration(section).get<unknown>(key);
-  if (!Array.isArray(raw)) return undefined;
-  const entries: DhcpVendorSpecificEntry[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-    const { subOption, value } = item as { subOption?: unknown; value?: unknown };
-    if (typeof subOption !== "number" || !isValidSubOptionCode(subOption)) continue;
-    if (typeof value !== "string" || value.length === 0) continue;
-    entries.push({ subOption, value });
-  }
-  return entries.length > 0 ? entries : undefined;
-}
-
-/**
- * Reads a dotted-quad IPv4 setting, discarding a value that is not one.
- *
- * The editors refuse a malformed address before it is ever written
- * (`validateDhcpValues`), but `settings.json` is a text file: a user — or a
- * Settings Sync conflict, or a profile hand-edited outside the extension — can
- * put `192.168.2.` or `not-an-ip` under any of these keys without going near a
- * form. Forwarding that verbatim hands the daemon a pool it cannot allocate
- * from and paints the bad value into the sidebar as if it were in effect.
- *
- * Degrading to `undefined` rather than throwing is the same contract every
- * other reader in this file already has: an unset key means "use the packaged
- * default", and a value the daemon could not have used is, in practice, unset.
- *
- * @param problems Collector; a rejected value appends its reason here so the
- *   caller can report every fault in one line rather than one line per key.
- */
-function readOptionalIpv4(
-  section: string,
-  key: string,
-  label: string,
-  problems: string[]
-): string | undefined {
-  const value = readOptionalString(section, key);
-  if (value === undefined || isValidIpv4(value)) return value;
-  problems.push(`${label} ("${value}") is not a dotted-quad IPv4 address`);
-  return undefined;
+  return normalized;
 }
 
 /**
@@ -237,6 +183,7 @@ function readOptionalIpv4(
  * user fixed it, is still reported.
  */
 let lastReportedDhcpConfigProblems = "";
+let lastReportedTftpConfigProblems = "";
 
 /** Reports malformed DHCP settings once per distinct set of faults. */
 function reportDhcpConfigProblems(problems: readonly string[]): void {
@@ -246,6 +193,17 @@ function reportDhcpConfigProblems(problems: readonly string[]): void {
   if (problems.length === 0) return;
   console.warn(
     `[Nexus Network Servers] Ignoring malformed nexus.networkServers.dhcp settings — the packaged defaults apply instead: ${summary}.`
+  );
+}
+
+/** Reports malformed TFTP settings once per distinct set of faults. */
+function reportTftpConfigProblems(problems: readonly string[]): void {
+  const summary = problems.join("; ");
+  if (summary === lastReportedTftpConfigProblems) return;
+  lastReportedTftpConfigProblems = summary;
+  if (problems.length === 0) return;
+  console.warn(
+    `[Nexus Network Servers] Ignoring malformed nexus.networkServers.tftp settings — the packaged defaults apply instead: ${summary}.`
   );
 }
 
@@ -264,11 +222,17 @@ function resolveTftpLinkAddress(): string | undefined {
 /** Resolves current `nexus.networkServers.tftp.*` settings. */
 export function readTftpConfig(): TftpAdapterConfig {
   const section = "nexus.networkServers.tftp";
+  const result = sanitizeTftpConfig({
+    root: readOptionalSettingValue(section, "root"),
+    port: readOptionalSettingValue(section, "port"),
+    allowWrite: readOptionalSettingValue(section, "allowWrite"),
+    interface: readOptionalSettingValue(section, "interface")
+  });
+  reportTftpConfigProblems(result.warnings);
   return {
-    root: readOptionalString(section, "root"),
-    port: readBoundedNumber(section, "port", 69, 1, 65535),
-    allowWrite: vscode.workspace.getConfiguration(section).get<boolean>("allowWrite", false) === true,
-    interface: readOptionalString(section, "interface")
+    ...result.value,
+    port: result.value.port ?? 69,
+    allowWrite: result.value.allowWrite ?? false
   };
 }
 
@@ -295,31 +259,26 @@ export function readTftpConfig(): TftpAdapterConfig {
  */
 export function readDhcpConfig(globalStoragePath?: string): DhcpAdapterConfig {
   const section = "nexus.networkServers.dhcp";
-  const problems: string[] = [];
-  let rangeStart = readOptionalIpv4(section, "rangeStart", "Pool Start", problems);
-  let rangeEnd = readOptionalIpv4(section, "rangeEnd", "Pool End", problems);
-  let subnet = readOptionalIpv4(section, "subnet", "Subnet Mask", problems);
-  if (subnet !== undefined && !isContiguousMask(subnet)) {
-    problems.push(`Subnet Mask ("${subnet}") is not a netmask — its set bits must be contiguous`);
-    subnet = undefined;
-  }
-  // Both ends go back to the defaults together. Dropping only one of an
-  // inverted pair leaves the survivor paired with a default from another
-  // subnet entirely, which can be inverted all over again — and the pair, not
-  // either address on its own, is what is wrong.
-  if (rangeStart !== undefined && rangeEnd !== undefined && compareIpv4(rangeStart, rangeEnd) > 0) {
-    problems.push(
-      `Pool Start (${rangeStart}) is above Pool End (${rangeEnd}), which describes an empty pool`
-    );
-    rangeStart = undefined;
-    rangeEnd = undefined;
-  }
-  const gateway = readOptionalIpv4(section, "gateway", "Gateway", problems);
-  const serverId = readOptionalIpv4(section, "serverId", "Server Identifier", problems);
-  const broadcast = readOptionalIpv4(section, "broadcast", "Broadcast Address", problems);
-  reportDhcpConfigProblems(problems);
-  const nextServer = readOptionalString(section, "nextServer");
-  const tftpServerAddresses = readOptionalStringArray(section, "tftpServerAddresses");
+  const result = sanitizeDhcpConfig({
+    rangeStart: readOptionalSettingValue(section, "rangeStart"),
+    rangeEnd: readOptionalSettingValue(section, "rangeEnd"),
+    subnet: readOptionalSettingValue(section, "subnet"),
+    gateway: readOptionalSettingValue(section, "gateway"),
+    dns: readOptionalArrayValue(section, "dns"),
+    leaseTimeSec: readOptionalSettingValue(section, "leaseTimeSec"),
+    serverId: readOptionalSettingValue(section, "serverId"),
+    broadcast: readOptionalSettingValue(section, "broadcast"),
+    static: readStaticSettingValue(section, "static"),
+    bindAddress: readOptionalSettingValue(section, "interface"),
+    bootFileName: readOptionalSettingValue(section, "bootFileName"),
+    nextServer: readOptionalSettingValue(section, "nextServer"),
+    tftpServerAddresses: readOptionalArrayValue(section, "tftpServerAddresses"),
+    vendorClassId: readOptionalSettingValue(section, "vendorClassId"),
+    vendorSpecificOptions: readOptionalArrayValue(section, "vendorSpecificOptions")
+  });
+  reportDhcpConfigProblems(result.warnings);
+  const nextServer = result.value.nextServer;
+  const tftpServerAddresses = result.value.tftpServerAddresses;
   // All-or-nothing on purpose: an explicit address in *either* key means the
   // user has already picked a boot server, and quietly advertising a second,
   // different one under the other option number is how a device ends up
@@ -331,24 +290,11 @@ export function readDhcpConfig(globalStoragePath?: string): DhcpAdapterConfig {
       ? resolveTftpLinkAddress()
       : undefined;
   return {
-    rangeStart,
-    rangeEnd,
-    subnet,
-    gateway,
-    dns: readOptionalStringArray(section, "dns"),
-    // 60s floor: shorter leases make clients renew faster than the server can
-    // meaningfully track. 7-day ceiling matches common DHCP practice.
-    leaseTimeSec: readBoundedNumber(section, "leaseTimeSec", 86_400, 60, 604_800),
-    serverId,
-    broadcast,
-    static: readStaticLeaseMap(section, "static"),
-    bindAddress: readOptionalString(section, "interface"),
+    ...result.value,
+    leaseTimeSec: result.value.leaseTimeSec ?? 86_400,
     leaseStorePath: globalStoragePath ? resolveDhcpLeaseStorePath(globalStoragePath) : undefined,
-    bootFileName: readOptionalString(section, "bootFileName"),
     nextServer: nextServer ?? autoLinked,
-    tftpServerAddresses: tftpServerAddresses ?? (autoLinked ? [autoLinked] : undefined),
-    vendorClassId: readOptionalString(section, "vendorClassId"),
-    vendorSpecificOptions: readVendorSpecificOptions(section, "vendorSpecificOptions")
+    tftpServerAddresses: tftpServerAddresses ?? (autoLinked ? [autoLinked] : undefined)
   };
 }
 

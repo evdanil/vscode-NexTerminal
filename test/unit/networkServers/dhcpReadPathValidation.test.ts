@@ -51,7 +51,7 @@ vi.mock("../../../src/services/networkServers/daemonHost", () => ({
   }
 }));
 
-import { readDhcpConfig } from "../../../src/services/networkServers/networkServerManager";
+import { readDhcpConfig, readTftpConfig } from "../../../src/services/networkServers/networkServerManager";
 
 /** Silences (and captures) the one-per-distinct-fault console report. */
 function captureWarnings(): { calls: () => string[]; restore: () => void } {
@@ -156,13 +156,15 @@ describe("readDhcpConfig — pool ordering", () => {
     expect(config.rangeEnd).toBe("10.0.0.50");
   });
 
-  it("does not report an inversion when one end is blank", () => {
+  it("falls back a lone endpoint that becomes inverted against the adapter default", () => {
     const warnings = captureWarnings();
     set("rangeStart", "192.168.9.240");
     const config = readDhcpConfig();
-    expect(config.rangeStart).toBe("192.168.9.240");
+    expect(config.rangeStart).toBeUndefined();
     expect(config.rangeEnd).toBeUndefined();
-    expect(warnings.calls()).toHaveLength(0);
+    expect(warnings.calls()).toHaveLength(1);
+    expect(warnings.calls()[0]).toContain("dhcp.rangeStart");
+    expect(warnings.calls()[0]).toContain("empty pool");
     warnings.restore();
   });
 });
@@ -196,6 +198,65 @@ describe("readDhcpConfig — reporting", () => {
     set("gateway", "10.0.0.1");
     readDhcpConfig();
     expect(warnings.calls()).toHaveLength(0);
+    warnings.restore();
+  });
+});
+
+describe("readDhcpConfig — shared parser coverage", () => {
+  it("keeps valid DNS and option-150 siblings while defaulting malformed values", () => {
+    const warnings = captureWarnings();
+    set("dns", ["1.1.1.1", "not-an-ip", "8.8.8.8"]);
+    set("tftpServerAddresses", ["10.0.0.2", "bad-address"]);
+
+    const config = readDhcpConfig();
+
+    expect(config.dns).toEqual(["1.1.1.1", "8.8.8.8"]);
+    expect(config.tftpServerAddresses).toEqual(["10.0.0.2"]);
+    expect(warnings.calls()).toHaveLength(1);
+    expect(warnings.calls()[0]).toContain("dhcp.dns[1]");
+    expect(warnings.calls()[0]).toContain("dhcp.tftpServerAddresses[1]");
+    warnings.restore();
+  });
+
+  it("canonicalizes valid reservations while keeping malformed static siblings out", () => {
+    const warnings = captureWarnings();
+    set("static", {
+      "AA-BB-CC-DD-EE-FF": "10.0.0.50",
+      "bad-mac": "10.0.0.51",
+      "11:22:33:44:55:66": "not-an-ip"
+    });
+
+    expect(readDhcpConfig().static).toEqual({ "aa:bb:cc:dd:ee:ff": "10.0.0.50" });
+    expect(warnings.calls()).toHaveLength(1);
+    expect(warnings.calls()[0]).toContain("dhcp.static");
+    warnings.restore();
+  });
+
+  it("drops an over-cap pool back to its adapter defaults and reports it once", () => {
+    const warnings = captureWarnings();
+    set("rangeStart", "10.0.0.0");
+    set("rangeEnd", "10.1.0.0");
+
+    const config = readDhcpConfig();
+    expect(config.rangeStart).toBeUndefined();
+    expect(config.rangeEnd).toBeUndefined();
+    expect(warnings.calls()).toHaveLength(1);
+    expect(warnings.calls()[0]).toContain("65,536");
+    readDhcpConfig();
+    expect(warnings.calls()).toHaveLength(1);
+    warnings.restore();
+  });
+});
+
+describe("readTftpConfig — shared parser coverage", () => {
+  it("defaults an invalid interface while warning once", () => {
+    const warnings = captureWarnings();
+    mockConfig.set("nexus.networkServers.tftp.interface", "not-an-ip");
+
+    expect(readTftpConfig().interface).toBeUndefined();
+    expect(readTftpConfig().port).toBe(69);
+    expect(warnings.calls()).toHaveLength(1);
+    expect(warnings.calls()[0]).toContain("tftp.interface");
     warnings.restore();
   });
 });

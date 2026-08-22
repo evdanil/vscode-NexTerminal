@@ -258,7 +258,7 @@ describe("registerNetworkServerCommands — edit", () => {
     ]);
   });
 
-  it("parses the DHCP comma list and MAC=IP reservation textarea, skipping malformed lines", async () => {
+  it("parses the DHCP comma list and well-formed MAC=IP reservation textarea", async () => {
     const manager = fakeManager();
     const cmd = register(fakeContext(manager));
     await cmd("nexus.networkServer.edit")("dhcp");
@@ -267,7 +267,7 @@ describe("registerNetworkServerCommands — edit", () => {
       rangeEnd: "172.28.1.20",
       dns: "1.1.1.1, 8.8.8.8 ,",
       leaseTimeSec: "3600",
-      static: ["aa:bb:cc:dd:ee:ff=172.28.1.50", "# a comment", "no-equals-sign", "=172.28.1.51", "11:22:33:44:55:66 = 172.28.1.52"].join("\n")
+      static: ["aa:bb:cc:dd:ee:ff=172.28.1.50", "# a comment", "11:22:33:44:55:66 = 172.28.1.52"].join("\n")
     });
 
     const byKey = (key: string) => configUpdates.find((entry) => entry.key === key)?.value;
@@ -313,7 +313,7 @@ describe("registerNetworkServerCommands — edit", () => {
     ctx.core.getNetworkServerSession = vi.fn(() => ({ kind: "dhcp", status: "running" }));
     const cmd = register(ctx);
     await cmd("nexus.networkServer.edit")("dhcp");
-    await formPanelOpens[0].handlers.onSubmit({ rangeStart: "172.28.1.10" });
+    await formPanelOpens[0].handlers.onSubmit({ rangeStart: "172.28.1.10", poolCount: "190" });
     expect(manager.restart).not.toHaveBeenCalled();
   });
 

@@ -797,7 +797,7 @@ The *Boot / ZTP* row appears only when at least one boot option is set; most lab
 
 | Option | Setting | Purpose |
 |--------|---------|---------|
-| 66 | `dhcp.nextServer` | TFTP server name/address. The BOOTP `siaddr` header field is filled from `serverId` and is not separately configurable. |
+| 66 | `dhcp.nextServer` | TFTP server IPv4 address. The BOOTP `siaddr` header field is filled from `serverId` and is not separately configurable. |
 | 67 | `dhcp.bootFileName` | Boot file to fetch. |
 | 150 | `dhcp.tftpServerAddresses` | Cisco TFTP server list. |
 | 60 | `dhcp.vendorClassId` | Vendor-class filter — when set, options 66/67/150/43 are sent only to clients whose class matches. |
