@@ -3,7 +3,19 @@ export interface SettingMeta {
   section: string;
   label: string;
   type: "boolean" | "number" | "string" | "enum" | "directory" | "multi-checkbox";
-  category: "logging" | "ssh" | "securityData" | "tunnels" | "terminal" | "ui" | "sftp" | "serial" | "scripts";
+  category:
+    | "logging"
+    | "ssh"
+    | "securityData"
+    | "tunnels"
+    | "terminal"
+    | "ui"
+    | "sftp"
+    | "serial"
+    | "scripts"
+    | "networkServers"
+    | "tftpServer"
+    | "dhcpServer";
   description?: string;
   badge?: string;
   badgeClass?: string;
@@ -529,6 +541,212 @@ export const SETTINGS_META: SettingMeta[] = [
     description:
       "Automatically restore terminal.integrated.commandsToSkipShell when an external program strips it. Forensic logging stays active even when disabled.",
     default: true
+  },
+  // --- Network Servers (shared by TFTP and DHCP) ---
+  {
+    key: "verboseMode",
+    section: "nexus.networkServers",
+    label: "Verbose Mode",
+    type: "boolean",
+    category: "networkServers",
+    subgroup: "Notifications",
+    description:
+      "Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the Nexus Network Servers output channel records everything either way.",
+    default: false
+  },
+  {
+    key: "engine",
+    section: "nexus.networkServers",
+    label: "Server Engine",
+    type: "enum",
+    category: "networkServers",
+    subgroup: "Advanced",
+    description:
+      "Which implementation backs the embedded TFTP and DHCP services. Node runs the bundled JavaScript daemon and works on every supported platform. Rust runs a native binary speaking the identical stdio JSON-RPC protocol; if no binary ships for the current platform the JavaScript daemon is used instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Takes effect the next time the daemon starts.",
+    default: "node",
+    enumOptions: [
+      {
+        label: "Node",
+        value: "node",
+        description: "Bundled JavaScript daemon — available on every platform",
+        recommended: true
+      },
+      {
+        label: "Rust",
+        value: "rust",
+        description: "Native binary — used only where a prebuilt artifact ships for this platform"
+      }
+    ]
+  },
+  // --- TFTP Server ---
+  {
+    key: "tftp.root",
+    section: "nexus.networkServers",
+    label: "TFTP Root Directory",
+    type: "directory",
+    category: "tftpServer",
+    subgroup: "Network",
+    description:
+      "Directory served by the embedded TFTP service. Leave empty to use ~/Nexus/tftp-root, which is created on first start (falling back to the system temp directory if it cannot be created). Every file beneath this directory is readable by any host that can reach the bound port — point it at a staging directory, not at a source tree or a home directory."
+  },
+  {
+    key: "tftp.interface",
+    section: "nexus.networkServers",
+    label: "TFTP Bind Interface",
+    type: "string",
+    category: "tftpServer",
+    subgroup: "Network",
+    description:
+      "Local IPv4 address to bind the TFTP socket to, i.e. which network interface serves TFTP. Leave empty for 0.0.0.0 (all interfaces). On a multi-homed machine, set this to the lab-facing NIC so the service is not also reachable over the corporate LAN or VPN. This address is also what Auto-Link TFTP advertises to DHCP clients, so binding all interfaces leaves the DHCP boot options unset."
+  },
+  {
+    key: "tftp.port",
+    section: "nexus.networkServers",
+    label: "TFTP Port",
+    type: "number",
+    category: "tftpServer",
+    subgroup: "Network",
+    description:
+      "UDP port for the embedded TFTP service. The IANA port 69 is privileged: if binding it is denied (no root/Administrator), the service automatically falls back to 1069 and logs a warning instead of failing. Clients must then be pointed at the fallback port — the port actually in use is shown next to the service.",
+    min: 1,
+    max: 65535,
+    default: 69
+  },
+  {
+    key: "tftp.allowWrite",
+    section: "nexus.networkServers",
+    label: "Allow TFTP Uploads",
+    type: "boolean",
+    category: "tftpServer",
+    subgroup: "Access",
+    description:
+      "Accept TFTP write requests (WRQ), letting remote clients upload files into the TFTP root. TFTP has no authentication whatsoever, so anything that can reach the port can overwrite files. Leave disabled unless a device genuinely needs to push configs or crash dumps back.",
+    default: false
+  },
+  // --- DHCP Server ---
+  {
+    key: "dhcp.interface",
+    section: "nexus.networkServers",
+    label: "DHCP Bind Interface",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Network",
+    description:
+      "Local IPv4 address to bind the DHCP socket to, i.e. which network interface serves DHCP. Leave empty for 0.0.0.0 (all interfaces) — on a multi-homed machine this is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The service always uses the IANA port 67; if binding it is denied, it falls back to 1067 and logs a warning, which normal DHCP clients will not reach."
+  },
+  {
+    key: "dhcp.rangeStart",
+    section: "nexus.networkServers",
+    label: "Pool Start Address",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
+    description:
+      "First address of the dynamic pool. Leave empty for 192.168.2.10. Must not be higher than the pool end address; static reservations are handed out regardless of this range."
+  },
+  {
+    key: "dhcp.rangeEnd",
+    section: "nexus.networkServers",
+    label: "Pool End Address",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
+    description:
+      "Last address of the dynamic pool. Leave empty for 192.168.2.199. The pool size this implies drives the utilization figure shown beside the running service."
+  },
+  {
+    key: "dhcp.subnet",
+    section: "nexus.networkServers",
+    label: "Subnet Mask",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
+    description:
+      "Subnet mask handed to clients (option 1). Leave empty for 255.255.255.0. Its set bits must be contiguous (255.255.254.0 is a mask, 255.0.255.0 is not); together with the gateway it also derives the broadcast address when that is left empty."
+  },
+  {
+    key: "dhcp.gateway",
+    section: "nexus.networkServers",
+    label: "Default Gateway",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
+    description: "Default gateway handed to clients (option 3). Leave empty for 192.168.2.1."
+  },
+  {
+    key: "dhcp.leaseTimeSec",
+    section: "nexus.networkServers",
+    label: "Lease Time",
+    type: "number",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
+    description:
+      "Lease duration handed to clients (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum.",
+    min: 60,
+    max: 604800,
+    unit: "seconds",
+    default: 86400
+  },
+  {
+    key: "dhcp.serverId",
+    section: "nexus.networkServers",
+    label: "Server Identifier",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
+    description:
+      "Server identifier advertised to clients (option 54). Leave empty for 192.168.2.1. This should be the address clients see this machine on, otherwise renewals are sent to the wrong host. It is also the value carried in the BOOTP siaddr header field, which devices that ignore option 66 boot from."
+  },
+  {
+    key: "dhcp.broadcast",
+    section: "nexus.networkServers",
+    label: "Broadcast Address",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Address Pool",
+    description:
+      "Broadcast address handed to clients (option 28). Leave empty to derive it from the gateway and the subnet mask."
+  },
+  {
+    key: "dhcp.bootFileName",
+    section: "nexus.networkServers",
+    label: "Boot File Name",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
+    description:
+      "Option 67 (bootfile-name) — the file a PXE or ZTP client fetches from the boot server once it has an address, for example ios-image.bin, pxelinux.0 or ztp.py. Leave empty to send no bootfile, in which case a device gets an address and nothing to boot from."
+  },
+  {
+    key: "dhcp.nextServer",
+    section: "nexus.networkServers",
+    label: "Boot Server (TFTP)",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
+    description:
+      "Option 66 (tftp-server-name) — the boot server clients fetch the boot file from, as a dotted-quad address or a hostname. Leave empty and Auto-Link TFTP fills it in from the embedded TFTP service's own interface. The BOOTP siaddr header field is not configurable — it always carries the server identifier — so devices that read siaddr instead of option 66 follow that address."
+  },
+  {
+    key: "dhcp.autoLinkTftp",
+    section: "nexus.networkServers",
+    label: "Auto-Link TFTP",
+    type: "boolean",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
+    description:
+      "Point DHCP clients at this machine's own TFTP service. When the boot server and the option 150 address list are both empty, options 66 and 150 are filled in from the TFTP bind interface so ZTP works without typing the same address twice. Setting either one by hand turns the link off for both — quietly advertising a second, different boot server under the other option number is how a device boots from the wrong host. If TFTP is bound to all interfaces there is no single address to advertise, and both options are left unset rather than guessed.",
+    default: true
+  },
+  {
+    key: "dhcp.vendorClassId",
+    section: "nexus.networkServers",
+    label: "Vendor Class Identifier Filter",
+    type: "string",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
+    description:
+      "Option 60 (vendor class identifier) to match on. When set, the boot options (66, 67, 150 and 43) are served only to clients whose DISCOVER carries this exact identifier — everyone else still gets an address from the pool, just no boot information. The match is case-insensitive but otherwise exact, so Cisco will not match Cisco Systems, Inc.; the value each client actually sends is logged in the Nexus Network Servers channel at debug level. Leave empty to serve the boot options to every client."
   }
 ];
 
@@ -541,7 +759,20 @@ export const SETTINGS_META: SettingMeta[] = [
 // whether anything carries that category, so an emptied category is a row that
 // opens onto nothing.
 
-export const CATEGORY_ORDER = ["logging", "ssh", "securityData", "tunnels", "terminal", "ui", "sftp", "serial", "scripts"] as const;
+export const CATEGORY_ORDER = [
+  "logging",
+  "ssh",
+  "securityData",
+  "tunnels",
+  "terminal",
+  "ui",
+  "sftp",
+  "serial",
+  "scripts",
+  "networkServers",
+  "tftpServer",
+  "dhcpServer"
+] as const;
 
 export const CATEGORY_LABELS: Record<string, string> = {
   logging: "Logging",
@@ -552,7 +783,10 @@ export const CATEGORY_LABELS: Record<string, string> = {
   ui: "Interface",
   sftp: "SFTP / File Explorer",
   serial: "Serial",
-  scripts: "Scripts"
+  scripts: "Scripts",
+  networkServers: "Network Servers",
+  tftpServer: "TFTP Server",
+  dhcpServer: "DHCP Server"
 };
 
 export const CATEGORY_ICONS: Record<string, string> = {
@@ -564,7 +798,10 @@ export const CATEGORY_ICONS: Record<string, string> = {
   ui: "layout",
   sftp: "folder-opened",
   serial: "circuit-board",
-  scripts: "play"
+  scripts: "play",
+  networkServers: "bell",
+  tftpServer: "radio-tower",
+  dhcpServer: "broadcast"
 };
 
 export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
@@ -576,7 +813,13 @@ export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   ui: "Adjust how Nexus connection details are shown in the VS Code views.",
   sftp: "Configure remote file browsing, caching, watching, transfer timeouts, and delete safety limits.",
   serial: "Set serial command timeout behavior.",
-  scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs."
+  scripts: "Configure script storage, wait timing, runtime limits, and macro behavior during runs.",
+  networkServers:
+    "Behaviour shared by both embedded network services — how much of what TFTP and DHCP are doing is surfaced as notifications.",
+  tftpServer:
+    "Configure the embedded TFTP service — served directory, bind interface, port, and upload access.",
+  dhcpServer:
+    "Configure the embedded DHCP service — bind interface, address pool, lease timing, and boot/ZTP options."
 };
 
 export function formatSettingValueForTree(meta: SettingMeta, rawValue: unknown): string {

@@ -71,6 +71,7 @@
     "onStartupFinished",
     "onView:nexusCommandCenter",
     "onView:nexusTunnels",
+    "onView:nexusNetworkServers",
     "onCommand:nexus.server.add",
     "onCommand:nexus.server.connect",
     "onCommand:nexus.serial.add",
@@ -78,6 +79,7 @@
     "onCommand:nexus.localShell.add",
     "onCommand:nexus.localShell.connect",
     "onCommand:nexus.localShell.runWithScript",
+    "onCommand:nexus.networkServer.start",
     "onCommand:nexus.profile.add",
     "onFileSystem:nexterm",
     "onUri"
@@ -101,6 +103,11 @@
         {
           "id": "nexusTunnels",
           "name": "Port Forwarding"
+        },
+        {
+          "id": "nexusNetworkServers",
+          "name": "Network Servers",
+          "visibility": "collapsed"
         },
         {
           "id": "nexusFileExplorer",
@@ -450,6 +457,84 @@
         "command": "nexus.localShell.rename",
         "title": "Rename",
         "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.networkServer.start",
+        "title": "Start Service",
+        "category": "Nexus",
+        "icon": "$(play)"
+      },
+      {
+        "command": "nexus.networkServer.stop",
+        "title": "Stop Service",
+        "category": "Nexus",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "nexus.networkServer.restart",
+        "title": "Restart Service",
+        "category": "Nexus",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "nexus.networkServer.quickAdjust",
+        "title": "Quick Settings",
+        "category": "Nexus",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "nexus.networkServer.edit",
+        "title": "Open Full Settings",
+        "category": "Nexus",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "nexus.networkServer.inspectLogs",
+        "title": "Inspect Logs",
+        "category": "Nexus",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "nexus.networkServer.tftp.cancelTransfer",
+        "title": "Cancel Transfer",
+        "category": "Nexus",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "nexus.networkServer.tftp.clearHistory",
+        "title": "Clear Transfer History",
+        "category": "Nexus",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "nexus.networkServer.profile.saveCurrent",
+        "title": "Save Current Settings as Profile",
+        "category": "Nexus",
+        "icon": "$(save)"
+      },
+      {
+        "command": "nexus.networkServer.profile.apply",
+        "title": "Load Profile",
+        "category": "Nexus",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "nexus.networkServer.profile.rename",
+        "title": "Rename Profile",
+        "category": "Nexus",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.networkServer.profile.duplicate",
+        "title": "Duplicate Profile",
+        "category": "Nexus",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "nexus.networkServer.profile.remove",
+        "title": "Remove Profile",
+        "category": "Nexus",
+        "icon": "$(trash)"
       },
       {
         "command": "nexus.group.connect",
@@ -975,6 +1060,11 @@
           "group": "1_manage@4"
         },
         {
+          "command": "nexus.networkServer.edit",
+          "when": "view == nexusNetworkServers",
+          "group": "navigation@1"
+        },
+        {
           "command": "nexus.tunnel.add",
           "when": "view == nexusTunnels",
           "group": "navigation@1"
@@ -1462,6 +1552,76 @@
           "group": "3_destructive"
         },
         {
+          "command": "nexus.networkServer.start",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(stopped|error)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.stop",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(running|starting)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.restart",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServer.running",
+          "group": "inline@2"
+        },
+        {
+          "command": "nexus.networkServer.quickAdjust",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "inline@3"
+        },
+        {
+          "command": "nexus.networkServer.start",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(stopped|error)$/",
+          "group": "0_connect@1"
+        },
+        {
+          "command": "nexus.networkServer.stop",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\.(running|starting)$/",
+          "group": "0_connect@2"
+        },
+        {
+          "command": "nexus.networkServer.restart",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServer.running",
+          "group": "0_connect@3"
+        },
+        {
+          "command": "nexus.networkServer.inspectLogs",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "1_terminal@1"
+        },
+        {
+          "command": "nexus.networkServer.quickAdjust",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "nexus.networkServer.edit",
+          "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
+          "group": "1_manage@2"
+        },
+        {
+          "command": "nexus.networkServer.tftp.cancelTransfer",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerTransfer.active",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.tftp.cancelTransfer",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerTransfer.active",
+          "group": "0_connect@1"
+        },
+        {
+          "command": "nexus.networkServer.tftp.clearHistory",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerHistory.group",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.networkServer.tftp.clearHistory",
+          "when": "view == nexusNetworkServers && viewItem == nexus.networkServerHistory.group",
+          "group": "0_connect@1"
+        },
+        {
           "command": "nexus.tunnel.start",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "inline"
@@ -1923,6 +2083,58 @@
         },
         {
           "command": "nexus.localShell.rename",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.start",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.stop",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.restart",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.quickAdjust",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.edit",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.inspectLogs",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.tftp.cancelTransfer",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.tftp.clearHistory",
+          "when": "workspace.isTrusted"
+        },
+        {
+          "command": "nexus.networkServer.profile.saveCurrent",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.apply",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.rename",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.duplicate",
+          "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.profile.remove",
           "when": "true"
         },
         {
@@ -3843,6 +4055,179 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Automatically restore `terminal.integrated.commandsToSkipShell` entries when an external program (e.g. a corporate DLP/endpoint agent) strips them from `settings.json`. Restores are rate-limited and every restore shows an Undo notification. Forensic logging (see *Nexus: Show Settings Guard Report*) stays active even when this is disabled."
+        },
+        "nexus.networkServers.tftp.root": {
+          "type": "string",
+          "default": "",
+          "order": 36,
+          "markdownDescription": "**TFTP — Network.** Directory served by the embedded TFTP service. Leave empty to use `~/Nexus/tftp-root`, which is created on first start (falling back to the system temp directory if it cannot be created). **Every file beneath this directory is readable by any host that can reach the bound port** — point it at a staging directory, not at a source tree or a home directory."
+        },
+        "nexus.networkServers.tftp.interface": {
+          "type": "string",
+          "default": "",
+          "order": 37,
+          "markdownDescription": "**TFTP — Network.** Local IPv4 address to bind the TFTP socket to, i.e. which network interface serves TFTP. Leave empty for `0.0.0.0` (all interfaces). On a multi-homed machine, set this to the lab-facing NIC (e.g. `192.168.2.1`) so the service is not also reachable over the corporate LAN or VPN. This address is also what `#nexus.networkServers.dhcp.autoLinkTftp#` advertises to DHCP clients, so binding all interfaces leaves the DHCP boot options unset. *Edit Settings on the TFTP service offers this machine's addresses as a list.*"
+        },
+        "nexus.networkServers.tftp.port": {
+          "type": "number",
+          "default": 69,
+          "minimum": 1,
+          "maximum": 65535,
+          "order": 38,
+          "markdownDescription": "**TFTP — Network.** UDP port for the embedded TFTP service. The IANA port 69 is privileged: if binding it is denied (no root/Administrator), the service automatically falls back to **1069** and logs a warning instead of failing. Clients must then be pointed at the fallback port — the port actually in use is shown next to the service."
+        },
+        "nexus.networkServers.tftp.allowWrite": {
+          "type": "boolean",
+          "default": false,
+          "order": 39,
+          "markdownDescription": "**TFTP — Access.** Accept TFTP write requests (`WRQ`), letting remote clients upload files into `#nexus.networkServers.tftp.root#`. TFTP has no authentication whatsoever, so anything that can reach the port can overwrite files. Leave disabled unless a device genuinely needs to push configs or crash dumps back."
+        },
+        "nexus.networkServers.dhcp.interface": {
+          "type": "string",
+          "default": "",
+          "order": 40,
+          "markdownDescription": "**DHCP — Network.** Local IPv4 address to bind the DHCP socket to, i.e. which network interface serves DHCP. Leave empty for `0.0.0.0` (all interfaces) — on a multi-homed machine this is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The service always uses the IANA port 67; if binding it is denied (no root/Administrator), it automatically falls back to **1067** and logs a warning, which normal DHCP clients will not reach. *Edit Settings on the DHCP service offers this machine's addresses as a list.*"
+        },
+        "nexus.networkServers.dhcp.rangeStart": {
+          "type": "string",
+          "default": "",
+          "order": 41,
+          "markdownDescription": "**DHCP — Address Pool.** First address of the dynamic pool. Leave empty for `192.168.2.10`. Must not be higher than `#nexus.networkServers.dhcp.rangeEnd#`; addresses reserved in `#nexus.networkServers.dhcp.static#` are handed out regardless of this range."
+        },
+        "nexus.networkServers.dhcp.rangeEnd": {
+          "type": "string",
+          "default": "",
+          "order": 42,
+          "markdownDescription": "**DHCP — Address Pool.** Last address of the dynamic pool. Leave empty for `192.168.2.199`. The pool size this implies drives the utilization figure shown beside the running service."
+        },
+        "nexus.networkServers.dhcp.subnet": {
+          "type": "string",
+          "default": "",
+          "order": 43,
+          "markdownDescription": "**DHCP — Address Pool.** Subnet mask handed to clients (option 1). Leave empty for `255.255.255.0`. Its set bits must be contiguous (`255.255.254.0` is a mask, `255.0.255.0` is not); together with `#nexus.networkServers.dhcp.gateway#` it also derives `#nexus.networkServers.dhcp.broadcast#` when that is left empty."
+        },
+        "nexus.networkServers.dhcp.gateway": {
+          "type": "string",
+          "default": "",
+          "order": 44,
+          "markdownDescription": "**DHCP — Address Pool.** Default gateway handed to clients (option 3). Leave empty for `192.168.2.1`."
+        },
+        "nexus.networkServers.dhcp.dns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "order": 45,
+          "markdownDescription": "**DHCP — Address Pool.** DNS servers handed to clients (option 6), in preference order. Leave empty for `8.8.8.8` and `8.8.4.4`."
+        },
+        "nexus.networkServers.dhcp.leaseTimeSec": {
+          "type": "number",
+          "default": 86400,
+          "minimum": 60,
+          "maximum": 604800,
+          "order": 46,
+          "markdownDescription": "**DHCP — Address Pool.** Lease duration in seconds (option 51). Clamped to 60 seconds minimum — shorter leases make clients renew faster than the server can meaningfully track — and 7 days maximum."
+        },
+        "nexus.networkServers.dhcp.serverId": {
+          "type": "string",
+          "default": "",
+          "order": 47,
+          "markdownDescription": "**DHCP — Address Pool.** Server identifier advertised to clients (option 54). Leave empty for `192.168.2.1`. This should be the address clients see this machine on, otherwise renewals are sent to the wrong host. It is also the value carried in the BOOTP `siaddr` header field, which devices that ignore option 66 boot from."
+        },
+        "nexus.networkServers.dhcp.broadcast": {
+          "type": "string",
+          "default": "",
+          "order": 48,
+          "markdownDescription": "**DHCP — Address Pool.** Broadcast address handed to clients (option 28). Leave empty to derive it from `#nexus.networkServers.dhcp.gateway#` and `#nexus.networkServers.dhcp.subnet#`."
+        },
+        "nexus.networkServers.dhcp.bootFileName": {
+          "type": "string",
+          "default": "",
+          "order": 49,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 67** (bootfile-name) — the file a PXE or ZTP client fetches from the boot server once it has an address, for example `ios-image.bin`, `pxelinux.0` or `ztp.py`. The boot server itself is `#nexus.networkServers.dhcp.nextServer#`. Leave empty to send no bootfile, in which case a device gets an address and nothing to boot from."
+        },
+        "nexus.networkServers.dhcp.nextServer": {
+          "type": "string",
+          "default": "",
+          "order": 50,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 66** (tftp-server-name) — the boot server clients fetch `#nexus.networkServers.dhcp.bootFileName#` from, as a dotted-quad address (e.g. `192.168.2.1`) or a hostname. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills it in from the embedded TFTP service's own interface. Note that the BOOTP `siaddr` header field is **not** configurable — it always carries `#nexus.networkServers.dhcp.serverId#` — so devices that read `siaddr` instead of option 66 follow that address."
+        },
+        "nexus.networkServers.dhcp.tftpServerAddresses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "order": 51,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 150** (Cisco TFTP server address list) — one or more IPv4 addresses, in preference order. Cisco IP phones and IOS ZTP request option 150 rather than `#nexus.networkServers.dhcp.nextServer#` (option 66); hardware from other vendors generally ignores it, so setting both is normal. Leave empty and `#nexus.networkServers.dhcp.autoLinkTftp#` fills in the embedded TFTP service's own interface."
+        },
+        "nexus.networkServers.dhcp.autoLinkTftp": {
+          "type": "boolean",
+          "default": true,
+          "order": 52,
+          "markdownDescription": "**DHCP — Boot / ZTP.** Point DHCP clients at this machine's own TFTP service. When `#nexus.networkServers.dhcp.nextServer#` and `#nexus.networkServers.dhcp.tftpServerAddresses#` are both empty, options 66 and 150 are filled in from `#nexus.networkServers.tftp.interface#` so ZTP works without typing the same address twice. Setting either one by hand turns the link off for both — quietly advertising a second, different boot server under the other option number is how a device boots from the wrong host. If the TFTP service is bound to `0.0.0.0` (all interfaces) there is no single address to advertise, and both options are left unset rather than guessed."
+        },
+        "nexus.networkServers.dhcp.vendorClassId": {
+          "type": "string",
+          "default": "",
+          "order": 53,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 60** (vendor class identifier) to match on. When set, the boot options (66, 67, 150 and 43) are served **only** to clients whose DISCOVER carries this exact identifier — everyone else still gets an address from the pool, just no boot information. Aruba, FortiGate and Huawei gear all key their provisioning off option 60. The match is case-insensitive but otherwise exact, so `Cisco` will not match `Cisco Systems, Inc.`; the value each client actually sends is logged (`vendor-class=\"…\"`) in the *Nexus Network Servers* channel at debug level. Leave empty to serve the boot options to every client."
+        },
+        "nexus.networkServers.dhcp.vendorSpecificOptions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "subOption",
+              "value"
+            ],
+            "properties": {
+              "subOption": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 254,
+                "description": "Sub-option code (1-254). 0 is PAD and 255 is END, so neither can carry a value."
+              },
+              "value": {
+                "type": "string",
+                "description": "Plain text, or a 0x-prefixed hex literal (e.g. 0x0A0B0C) for raw bytes."
+              }
+            },
+            "additionalProperties": false
+          },
+          "default": [],
+          "order": 54,
+          "markdownDescription": "**DHCP — Boot / ZTP. Option 43** (vendor-specific information) as a list of sub-options, TLV-encoded onto the wire as `[code][length][value]` per RFC 2132 §8.4. Each vendor defines its own sub-option layout — Aruba APs read the controller address from sub-option 43/1, Cisco APs from 241, and so on — so the codes come from the vendor's documentation. A `value` starting with `0x` is written as raw bytes (`:` `-` `_` separators are ignored), anything else is written as text. Like the other boot options this is gated by `#nexus.networkServers.dhcp.vendorClassId#` when that is set. The whole option is capped at 255 bytes; an entry that cannot be encoded is logged and skipped rather than blocking the service."
+        },
+        "nexus.networkServers.dhcp.static": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "order": 55,
+          "markdownDescription": "**DHCP — Reservations.** Static reservations as a **MAC address → IP address** map, for example `{ \"aa:bb:cc:dd:ee:ff\": \"192.168.2.50\" }`. Reserved addresses are handed to the matching client regardless of the dynamic pool, so they may sit inside or outside `#nexus.networkServers.dhcp.rangeStart#`…`#nexus.networkServers.dhcp.rangeEnd#`. Entries whose value is not a string are ignored, so one malformed line does not discard the rest of the map."
+        },
+        "nexus.networkServers.verboseMode": {
+          "type": "boolean",
+          "default": false,
+          "order": 56,
+          "markdownDescription": "**Network Servers — Notifications.** Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the *Nexus Network Servers* output channel records everything either way."
+        },
+        "nexus.networkServers.engine": {
+          "type": "string",
+          "enum": [
+            "node",
+            "rust"
+          ],
+          "enumDescriptions": [
+            "Bundled JavaScript daemon. Runs on every platform the extension supports.",
+            "Native Rust daemon. Only available where a prebuilt binary ships for your platform; otherwise the JavaScript daemon is used and a warning is logged."
+          ],
+          "default": "node",
+          "order": 57,
+          "markdownDescription": "**Network Servers — Engine.** Which implementation backs the embedded TFTP and DHCP services. `node` (default) runs the bundled JavaScript daemon. `rust` runs a native binary that speaks the identical stdio JSON-RPC protocol. If `rust` is selected but no binary ships for the current platform, the JavaScript daemon is used instead and the reason is logged to the *Nexus Network Servers* output channel — the services always start. Takes effect the next time the daemon starts."
         }
       }
     }
@@ -3858,21 +4243,24 @@
   "scripts": {
     "clean": "rimraf dist coverage",
     "compile": "tsc -p tsconfig.json --noEmit",
-    "build": "npm run clean && npm run compile && node esbuild.mjs && npm run prepare:local-pty",
-    "build:production": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty",
+    "build": "npm run clean && npm run compile && node esbuild.mjs && npm run prepare:local-pty && npm run prepare:network-server-daemon",
+    "build:production": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty && npm run prepare:network-server-daemon",
     "smoke:bundle": "node scripts/smokeBundle.mjs",
     "prepare:local-pty": "node scripts/installLocalPtyArtifacts.mjs",
     "prepare:local-pty:required": "node scripts/installLocalPtyArtifacts.mjs --require-all",
+    "prepare:network-server-daemon": "node scripts/installNetworkServerDaemonArtifacts.mjs",
+    "prepare:network-server-daemon:required": "node scripts/installNetworkServerDaemonArtifacts.mjs --require-all",
     "watch": "tsc -p tsconfig.json --watch --noEmit",
     "test": "vitest run --coverage",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty:required && vsce package",
+    "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty:required && npm run prepare:network-server-daemon && vsce package",
     "package:ovsx": "npm run package:vsix",
     "publish:ovsx": "ovsx publish \"vscode-nexterminal-${npm_package_version}.vsix\" --pat \"$OVSX_PAT\" --skip-duplicate",
     "generate:keybindings": "node scripts/generateKeybindings.mjs"
   },
   "dependencies": {
+    "dhcp": "0.2.20",
     "fast-xml-parser": "^5.10.1",
     "jsonc-parser": "^3.3.1",
     "serialport": "^13.0.0",

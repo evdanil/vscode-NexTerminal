@@ -89,7 +89,16 @@ export type FormFieldDescriptor =
   | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
   | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)
   /** Raw HTML injected without escaping. `content` must only contain trusted, developer-authored markup — never user-controlled data. */
-  | ({ type: "html"; content: string } & FormFieldCommon);
+  | ({ type: "html"; content: string } & FormFieldCommon)
+  /**
+   * A group heading. Carries no `key`, so it submits nothing and never appears
+   * in `FormValues` — the fields that follow it, up to the next `section`, are
+   * the group. Distinct from `html`, which is styled as a bordered illustration
+   * card and widens the whole form (`body:has(.form-illustration)`); this is a
+   * plain rule-and-label, so every form's groups read alike and the label is
+   * escaped rather than trusted as markup.
+   */
+  | ({ type: "section"; label: string } & FormFieldCommon);
 
 export interface FormDefinition {
   title: string;

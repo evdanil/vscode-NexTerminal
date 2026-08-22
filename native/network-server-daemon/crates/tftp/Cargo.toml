@@ -1,0 +1,11 @@
+[package]
+name = "nexus-tftp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "TFTP protocol codec, filesystem sandbox and transfer engine for the Nexus network-server daemon"
+
+[dependencies]
+
+[dev-dependencies]

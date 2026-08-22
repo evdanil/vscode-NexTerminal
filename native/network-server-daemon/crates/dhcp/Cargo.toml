@@ -1,0 +1,17 @@
+[package]
+name = "nexus-dhcp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "DHCP packet codec, lease store and DORA engine for the Nexus network-server daemon"
+
+# serde is here and not in `nexus-tftp` for one reason: the lease store is a
+# JSON file shared with the TypeScript implementation, and hand-rolling that
+# codec would buy nothing — unlike the wire protocol, where hand-rolling is the
+# entire point (see the module header of `protocol`).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
