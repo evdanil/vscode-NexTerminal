@@ -118,7 +118,9 @@ interface ChildIoOwnership {
 interface StartupAttempt {
   child?: ChildProcess;
   generation?: number;
-  promise?: Promise<void>;
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
 }
 
 /** `getServiceRuntime` reply for the TFTP service. */
@@ -350,10 +352,17 @@ export class NetworkServerDaemonHost {
     }
     const existingAttempt = this.startAttempt;
     if (
-      existingAttempt?.promise
-      && existingAttempt.child
-      && existingAttempt.generation !== undefined
-      && this.isCurrentChild(existingAttempt.child, existingAttempt.generation)
+      existingAttempt
+      && (
+        // The deferred authority must be usable while the resolver and config
+        // serializer synchronously reenter before a child exists.
+        (!existingAttempt.child && existingAttempt.generation === undefined && !this.child)
+        || (
+          existingAttempt.child
+          && existingAttempt.generation !== undefined
+          && this.isCurrentChild(existingAttempt.child, existingAttempt.generation)
+        )
+      )
     ) {
       return existingAttempt.promise;
     }
@@ -361,16 +370,26 @@ export class NetworkServerDaemonHost {
     // promise to a listener that synchronously starts a replacement.
     if (existingAttempt) this.startAttempt = undefined;
 
-    const attempt: StartupAttempt = {};
-    this.startAttempt = attempt;
-    const promise = this.launch(attempt).finally(() => {
+    let resolveAttempt!: () => void;
+    let rejectAttempt!: (error: unknown) => void;
+    const deferred = new Promise<void>((resolve, reject) => {
+      resolveAttempt = resolve;
+      rejectAttempt = reject;
+    });
+    let attempt!: StartupAttempt;
+    const promise = deferred.finally(() => {
       // A retired attempt's reaction runs after user callbacks. Only its own
       // cache entry may be cleared; a replacement attempt belongs to another
       // child generation.
       if (this.startAttempt === attempt) this.startAttempt = undefined;
     });
-    attempt.promise = promise;
-    return promise;
+    attempt = { promise, resolve: resolveAttempt, reject: rejectAttempt };
+    this.startAttempt = attempt;
+    // Publish the fully usable deferred attempt before `launch()` can invoke
+    // user-owned config resolution or serialization. Its handlers settle only
+    // this attempt, so an old launch cannot touch a reentrant replacement.
+    void this.launch(attempt).then(attempt.resolve, attempt.reject);
+    return attempt.promise;
   }
 
   /**
@@ -382,12 +401,18 @@ export class NetworkServerDaemonHost {
     if (this.disposed) return;
     this.disposed = true;
     this.readyFlag = false;
+    const error = new Error("Network servers daemon host disposed");
+    const preSpawnAttempt = this.startAttempt;
+    if (preSpawnAttempt && !preSpawnAttempt.child && preSpawnAttempt.generation === undefined) {
+      this.startAttempt = undefined;
+      preSpawnAttempt.reject(error);
+    }
 
     const child = this.child;
     if (child) this.terminateChild(child);
 
-    this.rejectAllPending(new Error("Network servers daemon host disposed"));
-    this.rejectAllReadyWaiters(new Error("Network servers daemon host disposed"));
+    this.rejectAllPending(error);
+    this.rejectAllReadyWaiters(error);
     this.statusChangeListeners.clear();
     this.runtimeUpdateListeners.clear();
     this.connectionListeners.clear();
@@ -438,6 +463,15 @@ export class NetworkServerDaemonHost {
     }
 
     const seed = this.options.resolveSpawnConfig?.();
+    const serializedSeed = seed ? JSON.stringify(seed) : undefined;
+    // The resolver and JSON serialization may synchronously reenter or
+    // dispose the host. Never spawn after this exact attempt was retired, and
+    // never overwrite a child that another owner already made current.
+    if (this.disposed || this.startAttempt !== attempt || this.child) {
+      throw new Error(this.disposed
+        ? "Network servers daemon host is disposed"
+        : "Network servers daemon startup attempt was retired before spawn");
+    }
     const child = spawn(process.execPath, [this.daemonScriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: this.options.extensionRoot,
@@ -445,7 +479,7 @@ export class NetworkServerDaemonHost {
       env: {
         ...process.env,
         ELECTRON_RUN_AS_NODE: "1",
-        ...(seed ? { [CONFIG_ENV_VAR]: JSON.stringify(seed) } : {})
+        ...(serializedSeed ? { [CONFIG_ENV_VAR]: serializedSeed } : {})
       }
     });
     const generation = this.nextGeneration++;
@@ -470,7 +504,12 @@ export class NetworkServerDaemonHost {
 
     child.on("error", (error) => {
       if (!this.isCurrentChild(child, generation)) return;
-      this.rejectAllReadyWaiters(error);
+      const wasReady = this.readyFlag;
+      const terminalError = new Error(`Network servers daemon process error: ${error.message}`);
+      this.terminateChild(child);
+      this.rejectAllPending(terminalError);
+      this.rejectAllReadyWaiters(terminalError);
+      if (wasReady) this.emitExit(null, null);
       this.emitLog("daemon", "error", `Daemon process error: ${error.message}`);
     });
 

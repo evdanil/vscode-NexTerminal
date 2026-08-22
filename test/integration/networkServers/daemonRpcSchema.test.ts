@@ -6,7 +6,8 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
-import { NetworkServerDaemonHost } from "../../../src/services/networkServers/daemonHost";
+import { NetworkServerDaemonHost, type NetworkServerDaemonHostOptions } from "../../../src/services/networkServers/daemonHost";
+import type { NetworkServerConfigs } from "../../../src/services/networkServers/core";
 import { MAX_DAEMON_RPC_IN_FLIGHT } from "../../../src/services/networkServers/networkServerRpcProtocol";
 import { sleep } from "../../helpers/networkServerTestHelpers";
 
@@ -131,9 +132,9 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     delete process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE;
   });
 
-  function create(mode: string): NetworkServerDaemonHost {
+  function create(mode: string, options: NetworkServerDaemonHostOptions = {}): NetworkServerDaemonHost {
     process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = mode;
-    const host = new NetworkServerDaemonHost(FIXTURE, { rpcTimeoutMs: 2_000, readyTimeoutMs: 1_000 });
+    const host = new NetworkServerDaemonHost(FIXTURE, { rpcTimeoutMs: 2_000, readyTimeoutMs: 1_000, ...options });
     hosts.push(host);
     return host;
   }
@@ -551,6 +552,219 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     host.dispose();
     expect(await waitForExit(pid!)).toBe(true);
     await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }, 30_000);
+
+  async function expectResolverReentrantCoalescing(
+    reenter: (host: NetworkServerDaemonHost) => Promise<unknown>,
+    assertReentrantResult: (result: unknown) => void,
+  ): Promise<void> {
+    let host!: NetworkServerDaemonHost;
+    let reentrant: Promise<unknown> | undefined;
+    let callbackPid: number | undefined;
+    let resolverCalls = 0;
+    host = create("clean", {
+      resolveSpawnConfig: () => {
+        resolverCalls += 1;
+        if (resolverCalls === 1) {
+          reentrant = reenter(host);
+          void reentrant.catch(() => undefined);
+          callbackPid = childPid(host);
+          if (callbackPid !== undefined) pids.add(callbackPid);
+        }
+        return {};
+      },
+    });
+    const internals = host as unknown as HostOwnershipInternals;
+    const startup = host.ensureStarted();
+    const pid = childPid(host);
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+
+    try {
+      await expect(startup).resolves.toBeUndefined();
+      expect(reentrant).toBeDefined();
+      // A usable deferred attempt lets synchronous resolver reentry coalesce
+      // before there is a child to observe or replace.
+      expect(callbackPid).toBeUndefined();
+      expect(resolverCalls).toBe(1);
+      expect(internals.nextGeneration).toBe(2);
+      if (!reentrant) throw new Error("resolver reentry did not receive the published startup attempt");
+      assertReentrantResult(await reentrant);
+      expect(childPid(host)).toBe(pid);
+      expect(host.isReady).toBe(true);
+      await expect(host.listServers()).resolves.toHaveLength(2);
+    } finally {
+      const currentPid = childPid(host);
+      if (currentPid !== undefined) pids.add(currentPid);
+      host.dispose();
+    }
+
+    expect(await waitForExit(pid!)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }
+
+  it("publishes a coalescible attempt before a resolver reentrantly ensures startup", async () => {
+    await expectResolverReentrantCoalescing(
+      (host) => host.ensureStarted(),
+      (result) => expect(result).toBeUndefined(),
+    );
+  }, 30_000);
+
+  it("publishes a coalescible attempt before a resolver reentrantly lists services", async () => {
+    await expectResolverReentrantCoalescing(
+      (host) => host.listServers(),
+      (result) => expect(result).toHaveLength(2),
+    );
+  }, 30_000);
+
+  it("keeps the attempt coalescible while serializing a resolver-provided config getter", async () => {
+    let host!: NetworkServerDaemonHost;
+    let reentrant: Promise<unknown> | undefined;
+    let getterPid: number | undefined;
+    let serializationCalls = 0;
+    const seed = {} as NetworkServerConfigs;
+    Object.defineProperty(seed, "tftp", {
+      enumerable: true,
+      get: () => {
+        serializationCalls += 1;
+        if (serializationCalls === 1) {
+          reentrant = host.listServers();
+          void reentrant.catch(() => undefined);
+          getterPid = childPid(host);
+          if (getterPid !== undefined) pids.add(getterPid);
+        }
+        return undefined;
+      },
+    });
+    host = create("clean", { resolveSpawnConfig: () => seed });
+    const internals = host as unknown as HostOwnershipInternals;
+    const startup = host.ensureStarted();
+    const pid = childPid(host);
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+
+    try {
+      await expect(startup).resolves.toBeUndefined();
+      expect(reentrant).toBeDefined();
+      expect(getterPid).toBeUndefined();
+      expect(serializationCalls).toBe(1);
+      expect(internals.nextGeneration).toBe(2);
+      if (!reentrant) throw new Error("config serialization did not receive the published startup attempt");
+      await expect(reentrant).resolves.toHaveLength(2);
+      expect(childPid(host)).toBe(pid);
+      expect(host.isReady).toBe(true);
+    } finally {
+      const currentPid = childPid(host);
+      if (currentPid !== undefined) pids.add(currentPid);
+      host.dispose();
+    }
+
+    expect(await waitForExit(pid!)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }, 30_000);
+
+  it("rejects a pre-spawn attempt and creates no child when its resolver disposes the host", async () => {
+    let host!: NetworkServerDaemonHost;
+    let resolverCalls = 0;
+    host = create("clean", {
+      resolveSpawnConfig: () => {
+        resolverCalls += 1;
+        host.dispose();
+        return {};
+      },
+    });
+    const internals = host as unknown as HostOwnershipInternals;
+    const startup = host.ensureStarted();
+
+    try {
+      await expect(startup).rejects.toThrow(/disposed/i);
+      expect(resolverCalls).toBe(1);
+      expect(childPid(host)).toBeUndefined();
+      expect(host.isRunning).toBe(false);
+      expect(internals.nextGeneration).toBe(1);
+    } finally {
+      const pid = childPid(host);
+      if (pid !== undefined) pids.add(pid);
+      host.dispose();
+    }
+
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }, 30_000);
+
+  async function expectChildErrorLogReentrantReplacement(
+    phase: "pre-ready" | "ready",
+    reenter: (host: NetworkServerDaemonHost) => Promise<unknown>,
+    assertReentrantResult: (result: unknown) => void,
+  ): Promise<void> {
+    const host = create(phase === "pre-ready" ? "delayed-ready-hold-all" : "hold-all-list");
+    const internals = host as unknown as HostOwnershipInternals;
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    const logs: Array<{ id: string; level: string; message: string }> = [];
+    let exitsAtLog: Array<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
+    let reentrant: Promise<unknown> | undefined;
+    let replacementPid: number | undefined;
+    host.onDidExit((code, signal) => exits.push({ code, signal }));
+    host.onDidLog((id, level, message) => {
+      logs.push({ id, level, message });
+      if (!/forced .* child error/i.test(message)) return;
+      exitsAtLog = [...exits];
+      process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
+      reentrant = reenter(host);
+      void reentrant.catch(() => undefined);
+      replacementPid = childPid(host);
+      if (replacementPid !== undefined) pids.add(replacementPid);
+    });
+
+    const startup = host.ensureStarted();
+    if (phase === "ready") await expect(startup).resolves.toBeUndefined();
+    const failedPid = childPid(host);
+    const failedChild = internals.child;
+    expect(failedPid).toBeTypeOf("number");
+    expect(failedChild).toBeDefined();
+    pids.add(failedPid!);
+
+    const original = phase === "pre-ready" ? startup : host.listServers();
+    void original.catch(() => undefined);
+    if (phase === "ready") {
+      await expect(waitFor(() => internals.pending?.size === 1 ? true : undefined)).resolves.toBe(true);
+    }
+    failedChild!.emit("error", new Error(`forced ${phase} child error`));
+
+    try {
+      expect(reentrant).toBeDefined();
+      expect(replacementPid).toBeTypeOf("number");
+      expect(replacementPid).not.toBe(failedPid);
+      expect(exitsAtLog).toEqual(phase === "ready" ? [{ code: null, signal: null }] : []);
+      if (!reentrant || replacementPid === undefined) {
+        throw new Error("child error log listener did not start a replacement generation");
+      }
+
+      await expect(original).rejects.toThrow(/forced .* child error/i);
+      assertReentrantResult(await reentrant);
+      expect(logs).toContainEqual(expect.objectContaining({ id: "daemon", level: "error" }));
+      expect(host.isReady).toBe(true);
+      await expect(host.listServers()).resolves.toHaveLength(2);
+      expect(await waitForExit(failedPid!)).toBe(true);
+      expect(host.isReady).toBe(true);
+      await expect(host.listServers()).resolves.toHaveLength(2);
+      expect(exits).toEqual(phase === "ready" ? [{ code: null, signal: null }] : []);
+    } finally {
+      const currentPid = childPid(host);
+      if (currentPid !== undefined) pids.add(currentPid);
+      host.dispose();
+    }
+
+    expect(await waitForExit(replacementPid!)).toBe(true);
+    await expect(waitFor(() => allDaemonOwnershipIsReleased(internals) ? true : undefined)).resolves.toBe(true);
+  }
+
+  it.each([
+    ["pre-ready", "ensure", (host: NetworkServerDaemonHost) => host.ensureStarted(), (result: unknown) => expect(result).toBeUndefined()],
+    ["pre-ready", "list", (host: NetworkServerDaemonHost) => host.listServers(), (result: unknown) => expect(result).toHaveLength(2)],
+    ["ready", "ensure", (host: NetworkServerDaemonHost) => host.ensureStarted(), (result: unknown) => expect(result).toBeUndefined()],
+    ["ready", "list", (host: NetworkServerDaemonHost) => host.listServers(), (result: unknown) => expect(result).toHaveLength(2)],
+  ] as const)("retires a %s child before a log listener reentrantly %s", async (phase, _operation, reenter, assertReentrantResult) => {
+    await expectChildErrorLogReentrantReplacement(phase, reenter, assertReentrantResult);
   }, 30_000);
 
   it("keeps a replacement startup attempt cached when an old attempt finalizes", async () => {
