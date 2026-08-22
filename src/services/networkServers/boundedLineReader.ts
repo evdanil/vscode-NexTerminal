@@ -7,6 +7,10 @@ export interface BoundedLineReaderOptions {
   readonly maxBytes?: number;
 }
 
+type PendingEvent =
+  | { readonly type: "data"; readonly value: Buffer | string; readonly queuedBytes: number }
+  | { readonly type: "end" };
+
 /**
  * Attaches a byte-bounded JSON-line reader to a stream.
  *
@@ -24,8 +28,10 @@ export function attachBoundedLineReader(
   let active = true;
   let bufferedBytes = 0;
   let fragments: Buffer[] = [];
-  let pendingEvents: ({ readonly type: "data"; readonly value: Buffer | string } | { readonly type: "end" })[] = [];
+  let pendingEvents: PendingEvent[] = [];
+  let queuedBytes = 0;
   let processing = false;
+  let endQueued = false;
 
   const clear = (): void => {
     bufferedBytes = 0;
@@ -37,6 +43,7 @@ export function attachBoundedLineReader(
     active = false;
     clear();
     pendingEvents = [];
+    queuedBytes = 0;
     stream.removeListener("data", onData);
     stream.removeListener("end", onEnd);
   };
@@ -56,6 +63,15 @@ export function attachBoundedLineReader(
     if (!active) return;
     detach();
     onError(new Error(`RPC line exceeds ${maxBytes} bytes.`));
+  };
+
+  const byteLength = (value: Buffer | string): number => Buffer.isBuffer(value) ? value.length : Buffer.byteLength(value, "utf8");
+
+  const snapshotQueuedInput = (value: Buffer | string, length: number): Buffer => {
+    const snapshot = Buffer.allocUnsafeSlow(length);
+    if (Buffer.isBuffer(value)) value.copy(snapshot);
+    else snapshot.write(value, 0, length, "utf8");
+    return snapshot;
   };
 
   const processData = (value: Buffer | string): void => {
@@ -101,23 +117,40 @@ export function attachBoundedLineReader(
     try {
       while (active && index < pendingEvents.length) {
         const event = pendingEvents[index++]!;
-        if (event.type === "data") processData(event.value);
+        if (event.type === "data") {
+          queuedBytes -= event.queuedBytes;
+          processData(event.value);
+        }
         else processEnd();
       }
     } finally {
       pendingEvents = [];
+      queuedBytes = 0;
       processing = false;
     }
   };
 
   const onData = (value: Buffer | string): void => {
-    if (!active) return;
-    pendingEvents.push({ type: "data", value });
+    if (!active || endQueued) return;
+    const length = byteLength(value);
+    if (length === 0) return;
+    if (!processing) {
+      pendingEvents.push({ type: "data", value, queuedBytes: 0 });
+      drain();
+      return;
+    }
+    if (queuedBytes + length > maxBytes) {
+      rejectOversize();
+      return;
+    }
+    pendingEvents.push({ type: "data", value: snapshotQueuedInput(value, length), queuedBytes: length });
+    queuedBytes += length;
     drain();
   };
 
   const onEnd = (): void => {
-    if (!active) return;
+    if (!active || endQueued) return;
+    endQueued = true;
     pendingEvents.push({ type: "end" });
     drain();
   };

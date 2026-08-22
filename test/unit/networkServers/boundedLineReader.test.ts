@@ -117,6 +117,55 @@ describe("bounded RPC line reader", () => {
     dispose();
   });
 
+  it("owns a queued one-byte view before its callback mutates the large source buffer", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const backing = Buffer.alloc(8 * 1024 * 1024, 0x78);
+    const residualOffset = backing.length - 1;
+    backing[residualOffset] = 0x61;
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => {
+        lines.push(line);
+        if (line !== "start") return;
+        stream.emit("data", backing.subarray(residualOffset));
+        backing[residualOffset] = 0x7a;
+        stream.emit("data", Buffer.from("\n"));
+      },
+      onError: (error) => errors.push(error),
+    });
+
+    stream.write(Buffer.from("start\n"));
+
+    expect(lines).toEqual(["start", "a"]);
+    expect(errors).toEqual([]);
+    dispose();
+  });
+
+  it("terminates once and drops queued data when reentrant input exceeds its byte budget", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      maxBytes: 6,
+      onLine: (line) => {
+        lines.push(line);
+        if (line !== "t") return;
+        for (const chunk of ["a\n", "b\n", "c\n", "d\n"]) stream.emit("data", Buffer.from(chunk));
+      },
+      onError: (error) => errors.push(error),
+    });
+
+    stream.write(Buffer.from("t\n"));
+    stream.emit("data", Buffer.from("late\n"));
+    stream.emit("end");
+
+    expect(lines).toEqual(["t"]);
+    expect(errors).toHaveLength(1);
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+    dispose();
+  });
+
   it("reports once and detaches after byte 1,048,577 before a newline", () => {
     const stream = new PassThrough();
     const lines: string[] = [];
