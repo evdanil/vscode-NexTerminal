@@ -50,6 +50,17 @@ describe("TFTP TransferSession (no network)", () => {
     }
   });
 
+  function makeOptionedRrqSession(): TransferSession {
+    return new TransferSession({
+      peer: mkPeer(),
+      opcode: Opcode.RRQ,
+      filename: "r.bin",
+      absFilePath: path.join(root, "r.bin"),
+      mode: "octet",
+      rawOptions: { blksize: "1400" }
+    });
+  }
+
   describe("constructor + invariants", () => {
     it("creates basic RRQ TransferSession: Idle, blksize=512, window=1", () => {
       const t = new TransferSession({
@@ -186,7 +197,7 @@ describe("TFTP TransferSession (no network)", () => {
       expect(r.send.length).toBe(0);
     });
 
-    it("WRQ with options: after OACK sent handleACK(0) → phase Receiving + produceMore=false (does NOT produce data!)", () => {
+    it("WRQ compatibility: handleACK(0) after OACK moves to Receiving without producing data", () => {
       const t = new TransferSession({
         peer: mkPeer(),
         opcode: Opcode.WRQ,
@@ -201,6 +212,17 @@ describe("TFTP TransferSession (no network)", () => {
       expect(t.phase, "WRQ SendOACK→ACK(0) must go to Receiving (awaits DATA(1))").toBe(TransferPhase.Receiving);
       expect(r.produceMore).toBe(false);
       expect(r.done).toBe(false);
+    });
+
+    it("ACK(0) removes OACK before DATA retransmission tracking", () => {
+      const t = makeOptionedRrqSession();
+      const oack = t.initForRRQ(true, 1024);
+      t.recordOutbound(oack);
+      expect(t.handleACK(0).produceMore).toBe(true);
+      expect(t.consumeRetransmission()).toBeNull();
+      t.recordOutbound([encodeDATA(1, Buffer.alloc(512))]);
+      t.handleACK(1);
+      expect(t.consumeRetransmission()).toBeNull();
     });
   });
 
@@ -248,6 +270,22 @@ describe("TFTP TransferSession (no network)", () => {
   });
 
   describe("handleDATA WRQ flow", () => {
+    it("optioned WRQ accepts DATA(1) immediately after OACK", () => {
+      const t = new TransferSession({
+        peer: mkPeer(), opcode: Opcode.WRQ, filename: "w.bin",
+        absFilePath: path.join(root, "w.bin"), mode: "octet",
+        rawOptions: { blksize: "1400" }
+      });
+      const initial = t.initForWRQ(true);
+      t.recordOutbound(initial);
+      const result = t.handleDATA(1, Buffer.from("final"));
+      expect(result.write?.equals(Buffer.from("final"))).toBe(true);
+      expect(result.send[0]?.readUInt16BE(2)).toBe(1);
+      expect(result.done).toBe(true);
+      expect(t.phase).toBe(TransferPhase.Done);
+      expect(t.consumeRetransmission()).toBeNull();
+    });
+
     it("WRQ blksize=512, 2*512+100 B: progressive handleDATA(1..3), last returns done=true + ACK + write", () => {
       const t = new TransferSession({
         peer: mkPeer(),

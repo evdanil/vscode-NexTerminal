@@ -10,7 +10,8 @@
  *
  * FSM phases:
  *   - Idle            : newly-created session, not yet initialized
- *   - SendOACK        : server negotiated options and sent OACK, waiting for ACK(0)
+ *   - SendOACK        : server negotiated options and sent OACK, waiting for
+ *                       ACK(0) for RRQ or DATA(1) for WRQ
  *   - Sending         : RRQ in progress, sending DATA blocks
  *   - SentLast        : last DATA sent (<blksize), waiting for final ACK
  *   - RecvInitialACK  : WRQ without OACK, ACK(0) sent, waiting for DATA(1)
@@ -388,7 +389,6 @@ export class TransferSession {
    * @sideeffect `this.outboundQueue` is truncated; `retxBackoffMs` reset.
    */
   public clearOutboundUpToAck(ackBlockNum: number): void {
-    if (ackBlockNum === 0) return;
     let i = 0;
     while (i < this.outboundQueue.length) {
       const p = this.outboundQueue[i];
@@ -396,7 +396,9 @@ export class TransferSession {
       // holding 65534, 65535, 1, 2 confirmed by ACK(2) drains nothing, and the
       // session then retransmits blocks the peer already has until the queue
       // cap silently drops them.
-      if (p.blockNum !== null && blockAtOrAfter(p.blockNum, ackBlockNum)) {
+      if (p.blockNum === null) {
+        i++;
+      } else if (ackBlockNum !== 0 && blockAtOrAfter(p.blockNum, ackBlockNum)) {
         i++;
       } else {
         break;
@@ -466,9 +468,9 @@ export class TransferSession {
    *
    * P0 BUG FIXED (originally `tsizeAtStart` was not captured here):
    * now stores `this.opts.tsize` at the start, for metrics and validation.
-   * Another P0 BUG: the phase after OACK is now `Receiving` (previously it
-   * incorrectly stayed in `RecvInitialACK`), which prevented the first DATA
-   * from reaching the FSM.
+   * RFC 2347 starts an optioned WRQ with DATA(1) after the OACK, so
+   * `handleDATA` moves SendOACK into Receiving for that packet. handleACK(0)
+   * remains accepted for compatibility with older clients.
    *
    * @param hasOptions `true` if WRQ carried options (responds OACK, else ACK(0)).
    * @returns Initial packet(s): OACK or ACK(0).
@@ -568,6 +570,14 @@ export class TransferSession {
     this.retries = 0;
     if (this.phase === TransferPhase.RecvInitialACK) {
       this.phase = TransferPhase.Receiving;
+    }
+    if (
+      this.phase === TransferPhase.SendOACK &&
+      this.opcode === Opcode.WRQ &&
+      blockNum === 1
+    ) {
+      this.phase = TransferPhase.Receiving;
+      this.clearOutboundUpToAck(0);
     }
     if (this.phase !== TransferPhase.Receiving) {
       return { send: [], write: null, done: false };

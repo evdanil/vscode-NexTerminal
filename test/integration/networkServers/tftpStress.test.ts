@@ -136,11 +136,24 @@ async function doWRQ(port: number, filename: string, payload: Buffer, opts: Reco
   const c = await createUdpClient();
   try {
     const blksize = opts.blksize ? Number(opts.blksize) : 512;
+    const windowsize = opts.windowsize ? Number(opts.windowsize) : 1;
     c.sendTo(encodeWRQ(filename, "octet", opts), port);
     const totalBlocks = Math.max(1, Math.ceil(payload.length / blksize));
     let sent = 0;
+    let lastAcked = 0;
     let finished = false;
     let safety = 0;
+    const sendNextBlock = () => {
+      if (sent >= totalBlocks) return;
+      const blockNum = sent + 1;
+      const offset = (blockNum - 1) * blksize;
+      const chunk = payload.subarray(offset, offset + blksize);
+      c.sendTo(encodeDATA(blockNum, chunk), port);
+      sent++;
+    };
+    const sendWindow = () => {
+      while (sent < totalBlocks && sent - lastAcked < windowsize) sendNextBlock();
+    };
     while (!finished && safety++ < 10_000) {
       const { message } = await c.nextMsg(20_000);
       const op = getOpcode(message);
@@ -151,7 +164,7 @@ async function doWRQ(port: number, filename: string, payload: Buffer, opts: Reco
         throw new Error(`WRQ server ERROR code=${code} ${msg}`);
       }
       if (op === 6) {
-        c.sendTo(encodeACK(0), port);
+        sendWindow();
         continue;
       }
       if (op === 4) {
@@ -160,11 +173,12 @@ async function doWRQ(port: number, filename: string, payload: Buffer, opts: Reco
           finished = true;
           break;
         }
-        const nextBlock = acked + 1;
-        const offset = (nextBlock - 1) * blksize;
-        const chunk = payload.subarray(offset, offset + blksize);
-        c.sendTo(encodeDATA(nextBlock, chunk), port);
-        sent++;
+        if (acked === 0 && sent === 0) {
+          sendWindow();
+        } else if (acked > lastAcked) {
+          lastAcked = acked;
+          sendWindow();
+        }
       }
     }
     expect(finished, `WRQ did not finish, sent=${sent} blocks`).toBe(true);
@@ -273,6 +287,15 @@ describe("TFTP E2E — Stress 30+ Concurrent Devices", () => {
     },
     180_000
   );
+
+  it("optioned WRQ writes the byte-identical payload", async () => {
+    const payload = randomPayload(128 * 6 + 37);
+    await withEngine(root, true, {}, async (_engine, port) => {
+      await doWRQ(port, "optioned.bin", payload, { blksize: "128", windowsize: "4" });
+      const onDisk = fs.readFileSync(path.join(root, "optioned.bin"));
+      expect(onDisk.equals(payload)).toBe(true);
+    });
+  });
 });
 
 describe("TFTP E2E — Real Progress Bar + Speed + ETA", () => {
