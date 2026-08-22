@@ -230,6 +230,7 @@ function parseStaticReservations(value: unknown, path: string, errors: string[])
     return undefined;
   }
   const parsed: Record<string, string> = {};
+  const addressOwners = new Map<string, string>();
   for (const [rawMac, rawIp] of entries) {
     const mac = canonicalMac(rawMac);
     if (!mac) {
@@ -241,7 +242,14 @@ function parseStaticReservations(value: unknown, path: string, errors: string[])
       continue;
     }
     const ip = parseIpv4(rawIp, `${path}.${mac}`, "Static reservation address", errors);
-    if (ip) parsed[mac] = ip.value;
+    if (!ip) continue;
+    const owner = addressOwners.get(ip.value);
+    if (owner !== undefined) {
+      errors.push(`${path}.${mac}: Static reservation address ${ip.value} is already reserved by ${owner}.`);
+      continue;
+    }
+    parsed[mac] = ip.value;
+    addressOwners.set(ip.value, mac);
   }
   return parsed;
 }

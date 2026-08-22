@@ -92,4 +92,49 @@ describe("ServiceWorkflowQueue", () => {
     expect(socketOwned).toBe(false);
     expect(disposed).toBe(true);
   });
+
+  it("recovers after a rejected workflow and removes its settled service tail (catches a rejected-map-entry retention mutation)", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const rejection = new Error("synthetic workflow rejection");
+
+    await expect(queue.enqueue("dhcp", async () => {
+      throw rejection;
+    })).rejects.toBe(rejection);
+
+    await expect(queue.enqueue("dhcp", async () => "recovered")).resolves.toBe("recovered");
+    await queue.drain();
+    await Promise.resolve();
+
+    expect((queue as unknown as { queues: Map<string, Promise<void>> }).queues.size).toBe(0);
+  });
+
+  it("runs a different service while one service workflow remains gated (catches a shared global-tail mutation)", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const tftpEntered = deferred();
+    const releaseTftp = deferred();
+    let tftpFinished = false;
+
+    const tftp = queue.enqueue("tftp", async () => {
+      tftpEntered.resolve();
+      await releaseTftp.promise;
+      tftpFinished = true;
+      return "tftp";
+    });
+    await tftpEntered.promise;
+
+    let dhcpFinished = false;
+    const dhcp = queue.enqueue("dhcp", async () => {
+      dhcpFinished = true;
+      return "dhcp";
+    });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(dhcpFinished).toBe(true);
+      expect(tftpFinished).toBe(false);
+    } finally {
+      releaseTftp.resolve();
+      await expect(tftp).resolves.toBe("tftp");
+      await expect(dhcp).resolves.toBe("dhcp");
+    }
+  });
 });

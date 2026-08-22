@@ -300,16 +300,18 @@ export class DhcpAdapter extends BaseNexusServer {
    */
   private async releaseEngine(engine: DhcpEngine): Promise<Error | null> {
     try {
-      engine.removeAllListeners();
-    } catch {
-      // Listener cleanup must not prevent the resource-owning stop attempt.
-    }
-    try {
       await engine.stop();
     } catch (err) {
       const cleanupError = err instanceof Error ? err : new Error(String(err));
       this.log('warn', `cleanup issue: ${cleanupError.message}`);
       return cleanupError;
+    }
+    try {
+      // The engine's error/log observers must remain attached through its
+      // dependency close callback, then can be released with the owner.
+      engine.removeAllListeners();
+    } catch {
+      // Resource cleanup succeeded; listener cleanup must not resurrect it.
     }
     if (this.engine === engine) this.engine = null;
     return null;

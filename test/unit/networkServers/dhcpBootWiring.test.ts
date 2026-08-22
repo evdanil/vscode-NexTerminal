@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as dhcp from "dhcp";
 import { DhcpEngine } from "../../../src/services/networkServers/dhcp/engine/DhcpEngine";
 import type { DhcpEngineConfig } from "../../../src/services/networkServers/dhcp/engine/DhcpEngine";
+import { sanitizeDhcpConfig } from "../../../src/services/networkServers/networkServerConfigValidation";
 
 const BASE: DhcpEngineConfig = {
   rangeStart: "172.28.1.10",
@@ -103,6 +104,30 @@ describe("DHCP boot options — wiring into the `dhcp` library", () => {
       1, 1, 1, 1,
       8, 8, 8, 8,
     ]);
+  });
+
+  it("formats default non-empty option 6 bytes when a direct engine caller supplies dns: [] (catches removal of the empty-DNS normalization)", () => {
+    expect([...formattedOfferOption({ ...BASE, dns: [] }, 6) ?? []]).toEqual([
+      8, 8, 8, 8,
+      8, 8, 4, 4,
+    ]);
+  });
+
+  it("passes one retained static-reservation owner to the dependency, so distinct clients cannot resolve the same reserved address (catches reservation-address conflict retention)", () => {
+    const sanitized = sanitizeDhcpConfig({
+      rangeStart: "172.28.1.10",
+      rangeEnd: "172.28.1.10",
+      static: {
+        "AA-BB-CC-DD-EE-01": "172.28.1.50",
+        "aa:bb:cc:dd:ee:02": "172.28.1.50",
+      },
+    });
+    const engine = new DhcpEngine({ ...BASE, ...sanitized.value }, () => undefined);
+    const server: any = dhcp.createServer((engine as any).buildServerConfig());
+    openSockets.push(server._sock);
+
+    expect(server._selectAddress("AA-BB-CC-DD-EE-01", { options: {} })).toBe("172.28.1.50");
+    expect(server._selectAddress("AA-BB-CC-DD-EE-02", { options: {} })).toBe("172.28.1.10");
   });
 
   it("sends 66/67/150/43 unsolicited, without the client requesting them", () => {

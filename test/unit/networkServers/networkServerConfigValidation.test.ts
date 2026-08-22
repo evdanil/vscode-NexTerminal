@@ -100,6 +100,28 @@ describe("network-server configuration validation", () => {
     );
   });
 
+  it("rejects a second MAC that reserves an address already owned by the first MAC (catches a missing reservation-address uniqueness check)", () => {
+    const reservations = {
+      "AA-BB-CC-DD-EE-01": "10.0.0.50",
+      "aa:bb:cc:dd:ee:02": "10.0.0.50",
+    };
+
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, static: reservations }), "dhcp.static");
+    expectInvalid(parseNetworkServerConfigs({ dhcp: { ...VALID_DHCP, static: reservations } }), "dhcp.static");
+  });
+
+  it("keeps the first static-reservation address owner and warns while dropping a later conflicting settings entry (catches a missing tolerant reservation-address uniqueness check)", () => {
+    const sanitized = sanitizeDhcpConfig({
+      static: {
+        "AA-BB-CC-DD-EE-01": "10.0.0.50",
+        "aa:bb:cc:dd:ee:02": "10.0.0.50",
+      },
+    });
+
+    expect(sanitized.value.static).toEqual({ "aa:bb:cc:dd:ee:01": "10.0.0.50" });
+    expect(sanitized.warnings.join(" ")).toContain("aa:bb:cc:dd:ee:02");
+  });
+
   it("rejects inverted ranges and caps the effective DHCP pool at the allocator limit", () => {
     expectInvalid(parseDhcpConfig({ ...VALID_DHCP, rangeStart: "10.0.0.20", rangeEnd: "10.0.0.10" }), "dhcp.rangeStart");
     expectValid(parseDhcpConfig({ ...VALID_DHCP, rangeStart: "10.0.0.0", rangeEnd: "10.0.255.255" }));

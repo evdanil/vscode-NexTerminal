@@ -327,6 +327,19 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     expect(emptyDns.error?.code).toBe("INTERNAL_ERROR");
     expect(emptyDns.error?.message).toContain("dhcp.dns");
 
+    const duplicateReservationAddress = await client.send("configure", {
+      configs: {
+        dhcp: {
+          static: {
+            "AA-BB-CC-DD-EE-01": "172.28.1.50",
+            "aa:bb:cc:dd:ee:02": "172.28.1.50",
+          },
+        },
+      },
+    });
+    expect(duplicateReservationAddress.error?.code).toBe("INTERNAL_ERROR");
+    expect(duplicateReservationAddress.error?.message).toContain("dhcp.static");
+
     const blankVendorFilter = await client.send("configure", { configs: { dhcp: { vendorClassId: "  \t " } } });
     expect(blankVendorFilter.error?.code).toBe("INTERNAL_ERROR");
     expect(blankVendorFilter.error?.message).toContain("dhcp.vendorClassId");

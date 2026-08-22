@@ -232,6 +232,19 @@ describe("readDhcpConfig — shared parser coverage", () => {
     warnings.restore();
   });
 
+  it("retains the first settings reservation owner and warns while dropping a later MAC with the same address (catches duplicate-reservation-address forwarding)", () => {
+    const warnings = captureWarnings();
+    set("static", {
+      "AA-BB-CC-DD-EE-01": "10.0.0.50",
+      "aa:bb:cc:dd:ee:02": "10.0.0.50",
+    });
+
+    expect(readDhcpConfig().static).toEqual({ "aa:bb:cc:dd:ee:01": "10.0.0.50" });
+    expect(warnings.calls()).toHaveLength(1);
+    expect(warnings.calls()[0]).toContain("aa:bb:cc:dd:ee:02");
+    warnings.restore();
+  });
+
   it("drops an over-cap pool back to its adapter defaults and reports it once", () => {
     const warnings = captureWarnings();
     set("rangeStart", "10.0.0.0");

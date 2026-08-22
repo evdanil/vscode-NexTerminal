@@ -545,22 +545,33 @@ export class DhcpEngine extends EventEmitter {
     this._server = null;
     this._boundPort = null;
     if (!server) return;
+    let closeError: Error | undefined;
+    const observeCloseError = (error: unknown): void => {
+      const normalized = toError(error);
+      // A runtime socket error may already have closed the dependency socket
+      // before its owner reaches stop(). That close has completed; treating
+      // Node's follow-up "not running" exception as a retryable cleanup
+      // failure would retain an engine with no resource left to release.
+      if ((normalized as NodeJS.ErrnoException).code === 'ERR_SOCKET_DGRAM_NOT_RUNNING') return;
+      closeError ??= normalized;
+    };
+    // Keep the dependency's normal error path and this shutdown observer alive
+    // until its close callback confirms socket ownership has ended.
+    server.on('error', observeCloseError);
     try {
-      server.removeAllListeners();
       await new Promise<void>((resolve) => {
         try {
           server.close(() => resolve());
-        } catch {
+        } catch (error) {
+          observeCloseError(error);
           resolve();
         }
       });
-      this.emit('close');
-    } catch (err) {
-      this._log(
-        'warn',
-        `Engine: cleanup after stop had a warning (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-      );
+    } finally {
+      server.removeAllListeners();
     }
+    this.emit('close');
+    if (closeError) throw closeError;
     // Reset counters at the end (we keep last state available until next start
     // so UI does not see empty in the middle of stop; but not critical).
   }

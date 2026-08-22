@@ -63,10 +63,10 @@ import { DhcpAdapter, type DhcpLeaseInfo } from './dhcp/DhcpAdapter';
 import { TftpAdapter, type TftpTransferView } from './tftp/TftpAdapter';
 import { createRuntimeUpdateThrottle } from './runtimeUpdateThrottle';
 import { parseNetworkServerConfigs } from './networkServerConfigValidation';
+import { NetworkServerConfigController, type NetworkServerConfigStore } from './networkServerConfigController';
 import { ServiceWorkflowQueue } from './networkServerWorkflowQueue';
 import {
   ServerManager,
-  ServerStatus,
   createDefaultRegistry,
   type DhcpAdapterConfig,
   type NetworkServerConfigs,
@@ -245,47 +245,14 @@ async function run(): Promise<void> {
    * to `createDefaultRegistry` below), so a rebuilt adapter always picks up
    * whatever configuration is current at that moment.
    */
-  const configStore: { tftp?: TftpAdapterConfig; dhcp?: DhcpAdapterConfig } = {};
+  const configStore: NetworkServerConfigStore = {};
 
   const manager = new ServerManager(
     createDefaultRegistry(() => ({ tftp: configStore.tftp, dhcp: configStore.dhcp })),
   );
+  const configController = new NetworkServerConfigController(manager, configStore);
   const serviceWorkflows = new ServiceWorkflowQueue();
   let shuttingDown = false;
-
-  /**
-   * Ids whose stored configuration changed while the service was still running,
-   * so the cached adapter could not be evicted at that moment.
-   *
-   * `ServerManager.stop()` deliberately keeps the instance cached, and the
-   * value-equality check in {@link applyConfigs} short-circuits on any later
-   * re-send of the same values — so without remembering the miss here, that
-   * adapter would keep being restarted from the configuration it was originally
-   * built with, and the user's edit would never take effect.
-   */
-  const staleConfigIds = new Set<string>();
-
-  /**
-   * Drops the cached adapter for `id` when it is idle, so the next `start()`
-   * rebuilds it from current configuration.
-   *
-   * A live service is left alone — silently rebuilding it would drop active
-   * TFTP transfers and DHCP leases without the user asking — and is recorded as
-   * stale so the eviction happens as soon as it stops.
-   */
-  const evictIfIdle = async (id: string): Promise<void> => {
-    const instance = manager.getInstance(id);
-    if (!instance) {
-      staleConfigIds.delete(id);
-      return;
-    }
-    if (instance.status === ServerStatus.RUNNING || instance.status === ServerStatus.STARTING) {
-      staleConfigIds.add(id);
-      return;
-    }
-    await manager.dropInstance(id);
-    staleConfigIds.delete(id);
-  };
 
   /**
    * Merges incoming configuration into {@link configStore} and evicts any
@@ -305,17 +272,7 @@ async function run(): Promise<void> {
   const applyConfig = async (
     id: 'tftp' | 'dhcp',
     config: TftpAdapterConfig | DhcpAdapterConfig,
-  ): Promise<boolean> => {
-    if (id === 'tftp') {
-      if (JSON.stringify(configStore.tftp ?? null) === JSON.stringify(config)) return false;
-      configStore.tftp = config as TftpAdapterConfig;
-    } else {
-      if (JSON.stringify(configStore.dhcp ?? null) === JSON.stringify(config)) return false;
-      configStore.dhcp = config as DhcpAdapterConfig;
-    }
-    await evictIfIdle(id);
-    return true;
-  };
+  ): Promise<boolean> => configController.apply(id, config);
 
   const applyConfigs = async (configs: NetworkServerConfigs): Promise<string[]> => {
     const changed: string[] = [];
@@ -486,7 +443,7 @@ async function run(): Promise<void> {
             await serviceWorkflows.enqueue(id, async () => {
               const config = id === 'tftp' ? configs?.tftp : configs?.dhcp;
               if (config !== undefined) await applyConfig(id, config);
-              if (staleConfigIds.has(id)) await evictIfIdle(id);
+              if (configController.requiresEviction(id)) await configController.evictIfIdle(id);
               await manager.start(id);
             });
           }
@@ -513,7 +470,7 @@ async function run(): Promise<void> {
               if (config !== undefined) await applyConfig(id, config);
               // Picks up a configure that landed while the service was running:
               // the eviction it could not do back then happens now that it is idle.
-              if (staleConfigIds.has(id)) await evictIfIdle(id);
+              if (configController.requiresEviction(id)) await configController.evictIfIdle(id);
               await manager.start(id);
             });
           }
