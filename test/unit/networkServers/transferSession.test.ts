@@ -224,6 +224,20 @@ describe("TFTP TransferSession (no network)", () => {
       t.handleACK(1);
       expect(t.consumeRetransmission()).toBeNull();
     });
+
+    it("invalid ACK(1) leaves OACK retransmittable", () => {
+      const t = makeOptionedRrqSession();
+      const oack = t.initForRRQ(true, 1024);
+      t.recordOutbound(oack);
+
+      const result = t.handleACK(1);
+
+      expect(t.phase).toBe(TransferPhase.SendOACK);
+      expect(result.produceMore).toBe(false);
+      const retransmission = t.consumeRetransmission();
+      expect(retransmission).toHaveLength(1);
+      expect(retransmission?.[0]?.equals(oack[0]!)).toBe(true);
+    });
   });
 
   describe("RRQ end-to-end (with produceNextSendPackets I/O reading a file)", () => {

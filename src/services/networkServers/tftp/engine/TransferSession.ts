@@ -507,7 +507,7 @@ export class TransferSession {
   } {
     this.touch();
     this.retries = 0;
-    if (this.phase === TransferPhase.SendOACK || this.phase === TransferPhase.SentLast) {
+    if (this.phase === TransferPhase.SentLast) {
       this.clearOutboundUpToAck(blockNum);
     }
     if (this.phase === TransferPhase.Sending) {
@@ -521,6 +521,7 @@ export class TransferSession {
     }
     if (this.phase === TransferPhase.SendOACK) {
       if (blockNum === 0) {
+        this.clearOutboundUpToAck(blockNum);
         if (this.opcode === Opcode.RRQ) {
           this.phase = TransferPhase.Sending;
           return { send: [], produceMore: true, done: false };
