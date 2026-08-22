@@ -52,7 +52,32 @@ import { createUdpClient, mkdtemp, sleep } from "../../helpers/networkServerTest
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 
+/**
+ * Which implementation is put behind the protocol.
+ *
+ * Every assertion in this file is about the *wire contract* — request/reply
+ * shapes, event pushes, socket binding, shutdown — and none of it about which
+ * language implements it. So pointing the spawn at the native daemon runs this
+ * identical suite against the other engine, which is exactly the parity
+ * evidence the Rust port needs. Unset (the default) it builds and runs the Node
+ * bundle, unchanged.
+ */
+const USE_NATIVE_DAEMON =
+  (process.env.NEXUS_NETWORK_SERVERS_ENGINE ?? "").trim().toLowerCase() === "rust";
+const NATIVE_DAEMON_BIN = process.env.NEXUS_NETWORK_SERVER_DAEMON_BIN?.trim();
+
 let daemonScript: string;
+
+/** Spawns whichever daemon this run is exercising. */
+function spawnDaemon(script: string): ChildProcess {
+  const options: Parameters<typeof spawn>[2] = {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true
+  };
+  return USE_NATIVE_DAEMON
+    ? spawn(NATIVE_DAEMON_BIN!, [], options)
+    : spawn(process.execPath, [script], options);
+}
 
 /** Builds the daemon entry point exactly as `esbuild.mjs` does, into a temp dir. */
 async function buildDaemonBundle(): Promise<string> {
@@ -112,7 +137,7 @@ class DaemonClient {
   private constructor(public readonly child: ChildProcess) {}
 
   public static async launch(script: string): Promise<DaemonClient> {
-    const child = spawn(process.execPath, [script], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const child = spawnDaemon(script);
     const client = new DaemonClient(child);
     client.rl = createInterface({ input: child.stdout! });
     client.rl.on("line", (line) => client.handleLine(line));
@@ -267,6 +292,21 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
   let client: DaemonClient;
 
   beforeAll(async () => {
+    if (USE_NATIVE_DAEMON) {
+      // Fail loudly rather than silently falling back to the Node bundle: a
+      // parity run that quietly exercised the wrong binary would "pass" while
+      // proving nothing.
+      if (!NATIVE_DAEMON_BIN) {
+        throw new Error(
+          "NEXUS_NETWORK_SERVERS_ENGINE=rust requires NEXUS_NETWORK_SERVER_DAEMON_BIN to name the native daemon"
+        );
+      }
+      if (!fs.existsSync(NATIVE_DAEMON_BIN)) {
+        throw new Error(`Native daemon binary not found: ${NATIVE_DAEMON_BIN}`);
+      }
+      daemonScript = NATIVE_DAEMON_BIN;
+      return;
+    }
     daemonScript = await buildDaemonBundle();
   }, 60_000);
 

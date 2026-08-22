@@ -77,7 +77,12 @@ vi.mock("../../../src/services/networkServers/daemonHost", () => ({
     public dispose = vi.fn(() => {
       hostState.disposeCalls += 1;
     });
-  }
+  },
+  // The manager resolves the native artifact path at construction and hands it
+  // to the host. Mocking the module wholesale means this export has to be
+  // restated here or every construction throws.
+  resolveNativeDaemonBinaryPath: (extensionPath: string) =>
+    `${extensionPath}/dist/native/network-server-daemon/win32-x64/nexus-network-server-daemon.exe`
 }));
 
 import {

@@ -4214,6 +4214,20 @@
           "default": false,
           "order": 56,
           "markdownDescription": "**Network Servers — Notifications.** Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the *Nexus Network Servers* output channel records everything either way."
+        },
+        "nexus.networkServers.engine": {
+          "type": "string",
+          "enum": [
+            "node",
+            "rust"
+          ],
+          "enumDescriptions": [
+            "Bundled JavaScript daemon. Runs on every platform the extension supports.",
+            "Native Rust daemon. Only available where a prebuilt binary ships for your platform; otherwise the JavaScript daemon is used and a warning is logged."
+          ],
+          "default": "node",
+          "order": 57,
+          "markdownDescription": "**Network Servers — Engine.** Which implementation backs the embedded TFTP and DHCP services. `node` (default) runs the bundled JavaScript daemon. `rust` runs a native binary that speaks the identical stdio JSON-RPC protocol. If `rust` is selected but no binary ships for the current platform, the JavaScript daemon is used instead and the reason is logged to the *Nexus Network Servers* output channel — the services always start. Takes effect the next time the daemon starts."
         }
       }
     }
@@ -4229,16 +4243,18 @@
   "scripts": {
     "clean": "rimraf dist coverage",
     "compile": "tsc -p tsconfig.json --noEmit",
-    "build": "npm run clean && npm run compile && node esbuild.mjs && npm run prepare:local-pty",
-    "build:production": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty",
+    "build": "npm run clean && npm run compile && node esbuild.mjs && npm run prepare:local-pty && npm run prepare:network-server-daemon",
+    "build:production": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty && npm run prepare:network-server-daemon",
     "smoke:bundle": "node scripts/smokeBundle.mjs",
     "prepare:local-pty": "node scripts/installLocalPtyArtifacts.mjs",
     "prepare:local-pty:required": "node scripts/installLocalPtyArtifacts.mjs --require-all",
+    "prepare:network-server-daemon": "node scripts/installNetworkServerDaemonArtifacts.mjs",
+    "prepare:network-server-daemon:required": "node scripts/installNetworkServerDaemonArtifacts.mjs --require-all",
     "watch": "tsc -p tsconfig.json --watch --noEmit",
     "test": "vitest run --coverage",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty:required && vsce package",
+    "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty:required && npm run prepare:network-server-daemon && vsce package",
     "package:ovsx": "npm run package:vsix",
     "publish:ovsx": "ovsx publish \"vscode-nexterminal-${npm_package_version}.vsix\" --pat \"$OVSX_PAT\" --skip-duplicate",
     "generate:keybindings": "node scripts/generateKeybindings.mjs"

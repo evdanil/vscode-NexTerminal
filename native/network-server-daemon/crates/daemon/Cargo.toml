@@ -1,0 +1,22 @@
+[package]
+name = "nexus-network-server-daemon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Out-of-process supervisor for the Nexus embedded TFTP and DHCP services"
+
+[lib]
+name = "nexus_network_server_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexus-network-server-daemon"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+nexus-rpc = { workspace = true }
+nexus-tftp = { workspace = true }
+nexus-dhcp = { workspace = true }

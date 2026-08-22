@@ -45,8 +45,10 @@ import { isValidSubOptionCode } from "./dhcp/engine/dhcpBootOptions";
 import { compareIpv4, isContiguousMask, isValidIpv4 } from "./dhcp/engine/dhcpNetworkUtils";
 import {
   NetworkServerDaemonHost,
+  resolveNativeDaemonBinaryPath,
   type DhcpRuntimeSnapshot,
   type NetworkServerAdapterConfig,
+  type NetworkServerEngine,
   type NetworkServerRuntimeSnapshot,
   type TftpRuntimeSnapshot
 } from "./daemonHost";
@@ -127,6 +129,23 @@ export function resolveDhcpLeaseStorePath(globalStoragePath: string): string {
  */
 export function resolveNetworkServerDaemonPath(extensionPath: string): string {
   return path.join(extensionPath, "dist", "services", "networkServers", "networkServerDaemon.js");
+}
+
+/** Environment override for the engine, honoured ahead of the setting. */
+const ENGINE_ENV_VAR = "NEXUS_NETWORK_SERVERS_ENGINE";
+
+/**
+ * Which daemon implementation to spawn.
+ *
+ * The environment variable wins over the setting so the parity suites — which
+ * run outside VS Code and have no settings store to write to — can drive the
+ * real production code path against either engine.
+ */
+export function readNetworkServerEngine(): NetworkServerEngine {
+  const fromEnv = process.env[ENGINE_ENV_VAR]?.trim().toLowerCase();
+  if (fromEnv === "rust" || fromEnv === "node") return fromEnv;
+  const fromSetting = vscode.workspace.getConfiguration("nexus.networkServers").get<string>("engine");
+  return fromSetting === "rust" ? "rust" : "node";
 }
 
 /**
@@ -383,6 +402,8 @@ export class NetworkServerManager implements vscode.Disposable {
     this.outputChannel = options.outputChannel ?? vscode.window.createOutputChannel("Nexus Network Servers");
     this.host = new NetworkServerDaemonHost(resolveNetworkServerDaemonPath(options.extensionPath), {
       extensionRoot: options.extensionPath,
+      engine: readNetworkServerEngine(),
+      nativeBinaryPath: resolveNativeDaemonBinaryPath(options.extensionPath),
       resolveSpawnConfig: () => readNetworkServerConfigs(options.globalStoragePath)
     });
 
