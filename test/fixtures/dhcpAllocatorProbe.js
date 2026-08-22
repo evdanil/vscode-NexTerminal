@@ -8,9 +8,12 @@ const OCCUPIED_MAC = "AA-BB-CC-00-00-01";
 const REQUESTING_MAC = "AA-BB-CC-00-00-02";
 const OCCUPIED_ADDRESS = "192.0.2.10";
 const mode = process.env.DHCP_ALLOCATOR_PROBE_MODE || "select-exhausted";
+const range = mode === "select-oversized"
+  ? ["0.0.0.0", "255.255.255.255"]
+  : [OCCUPIED_ADDRESS, OCCUPIED_ADDRESS];
 
 const server = dhcp.createServer({
-  range: [OCCUPIED_ADDRESS, OCCUPIED_ADDRESS],
+  range,
   randomIP: true,
   static: {},
   server: "192.0.2.1",
@@ -30,8 +33,17 @@ const request = {
   options: {}
 };
 
+// This process is disposable. Making every candidate look occupied turns a
+// missing oversized-range guard into a deadline-bounded scan, so the parent
+// can prove both the early return and the unconditional SIGKILL/reap path.
+if (mode === "select-oversized") {
+  Set.prototype.has = () => true;
+}
+
 let value;
 if (mode === "select-exhausted") {
+  value = server._selectAddress(REQUESTING_MAC, request);
+} else if (mode === "select-oversized") {
   value = server._selectAddress(REQUESTING_MAC, request);
 } else if (mode === "discover-exhausted") {
   let offers = 0;
@@ -44,6 +56,20 @@ if (mode === "select-exhausted") {
   server.handleDiscover(request);
   value = {
     offers,
+    exhausted,
+    stateHasClient: Object.prototype.hasOwnProperty.call(server._state, REQUESTING_MAC)
+  };
+} else if (mode === "request-exhausted") {
+  let acks = 0;
+  const exhausted = [];
+  server.sendAck = () => {
+    acks++;
+  };
+  server.on("poolExhausted", (req) => exhausted.push(req.chaddr));
+
+  server.handleRequest(request);
+  value = {
+    acks,
     exhausted,
     stateHasClient: Object.prototype.hasOwnProperty.call(server._state, REQUESTING_MAC)
   };

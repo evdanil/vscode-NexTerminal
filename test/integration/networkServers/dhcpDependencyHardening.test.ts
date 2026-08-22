@@ -5,6 +5,9 @@ import * as path from "node:path";
 import * as dhcp from "dhcp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { toRestoredLeaseState } from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
+import type { DhcpLeaseInfo } from "../../../src/services/networkServers/dhcp/engine/dhcpLeaseUtils";
+
 const FIXTURE = path.resolve(__dirname, "..", "..", "fixtures", "dhcpAllocatorProbe.js");
 const PROBE_DEADLINE_MS = 500;
 const REAP_DEADLINE_MS = 2_000;
@@ -170,6 +173,10 @@ describe("dhcp@0.2.20 dependency hardening", () => {
     await expect(runAllocatorProbe()).resolves.toEqual({ type: "result", value: null });
   });
 
+  it("rejects a full-width IPv4 pool before attempting an operationally unbounded scan", async () => {
+    await expect(runAllocatorProbe("select-oversized")).resolves.toEqual({ type: "result", value: null });
+  });
+
   it("can select the inclusive last address from a randomized range", () => {
     const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"], true);
     vi.spyOn(Math, "random").mockReturnValue(0.999);
@@ -182,6 +189,17 @@ describe("dhcp@0.2.20 dependency hardening", () => {
       type: "result",
       value: {
         offers: 0,
+        exhausted: ["AA-BB-CC-00-00-02"],
+        stateHasClient: false
+      }
+    });
+  });
+
+  it("does not retain BOUND state or send an ACK when a direct REQUEST exhausts the pool", async () => {
+    await expect(runAllocatorProbe("request-exhausted")).resolves.toEqual({
+      type: "result",
+      value: {
+        acks: 0,
         exhausted: ["AA-BB-CC-00-00-02"],
         stateHasClient: false
       }
@@ -231,6 +249,42 @@ describe("dhcp@0.2.20 dependency hardening", () => {
     expect(server._state["AA-BB-CC-00-00-01"].address).toBe("192.0.2.10");
   });
 
+  it("expires a stale static OFFER while keeping its address reserved from dynamic allocation", () => {
+    const staticMac = "AA-BB-CC-00-00-01";
+    const server = createAllocatorServer(
+      ["192.0.2.10", "192.0.2.11"],
+      false,
+      { "aa:bb:cc:00:00:01": "192.0.2.10" }
+    );
+    server._state[staticMac] = {
+      address: "192.0.2.10",
+      offerTime: Date.now() - 60_001,
+      leasePeriod: 3600,
+      state: "OFFERED"
+    };
+
+    expect(server._selectAddress(REQUEST.chaddr, REQUEST)).toBe("192.0.2.11");
+    expect(server._state).not.toHaveProperty(staticMac);
+  });
+
+  it("compares allocator bounds unsigned across the signed IPv4 midpoint", () => {
+    const server = createAllocatorServer(["127.255.255.255", "128.0.0.0"]);
+    server._state["AA-BB-CC-00-00-01"] = {
+      address: "127.255.255.255",
+      bindTime: new Date(),
+      leasePeriod: 3600,
+      state: "BOUND"
+    };
+
+    expect(server._selectAddress(REQUEST.chaddr, REQUEST)).toBe("128.0.0.0");
+  });
+
+  it("allocates the single unsigned maximum IPv4 address", () => {
+    const server = createAllocatorServer(["255.255.255.255", "255.255.255.255"]);
+
+    expect(server._selectAddress(REQUEST.chaddr, REQUEST)).toBe("255.255.255.255");
+  });
+
   it("timestamps a successful OFFER with a numeric provisional start time", () => {
     const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
     server.sendOffer = () => undefined;
@@ -276,5 +330,93 @@ describe("dhcp@0.2.20 dependency hardening", () => {
 
     expect(server._state[mac].address).toBe("192.0.2.10");
     expect(released).toEqual([]);
+  });
+
+  it("preserves a lease when RELEASE carries a different hardware address", () => {
+    const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+    const mac = "AA-BB-CC-00-00-01";
+    server._state[mac] = {
+      address: "192.0.2.10",
+      clientId: "client-a",
+      leasePeriod: 3600,
+      state: "BOUND"
+    };
+    const released: Array<[string, string]> = [];
+    server.on("released", (releasedMac: string, address: string) => released.push([releasedMac, address]));
+
+    server._sock.emit("message", buildRelease("AA-BB-CC-00-00-09", "192.0.2.10", "client-a"));
+
+    expect(server._state[mac].address).toBe("192.0.2.10");
+    expect(released).toEqual([]);
+  });
+
+  it("preserves a lease when RELEASE carries the wrong client address", () => {
+    const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+    const mac = "AA-BB-CC-00-00-01";
+    server._state[mac] = {
+      address: "192.0.2.10",
+      clientId: "client-a",
+      leasePeriod: 3600,
+      state: "BOUND"
+    };
+    const released: Array<[string, string]> = [];
+    server.on("released", (releasedMac: string, address: string) => released.push([releasedMac, address]));
+
+    server._sock.emit("message", buildRelease(mac, "192.0.2.11", "client-a"));
+
+    expect(server._state[mac].address).toBe("192.0.2.10");
+    expect(released).toEqual([]);
+  });
+
+  it("preserves static reservation ownership when a matching RELEASE targets its placeholder", () => {
+    const server = createAllocatorServer(
+      ["192.0.2.10", "192.0.2.11"],
+      false,
+      { "aa:bb:cc:00:00:01": "192.0.2.10" }
+    );
+    const mac = "AA-BB-CC-00-00-01";
+    server._state[mac] = {
+      address: "192.0.2.10",
+      clientId: null,
+      leasePeriod: 3600,
+      state: "RESERVED"
+    };
+    const released: Array<[string, string]> = [];
+    server.on("released", (releasedMac: string, address: string) => released.push([releasedMac, address]));
+
+    server._sock.emit("message", buildRelease(mac, "192.0.2.10"));
+
+    expect(server._state[mac].address).toBe("192.0.2.10");
+    expect(released).toEqual([]);
+    expect(server._selectAddress(REQUEST.chaddr, REQUEST)).toBe("192.0.2.11");
+  });
+
+  it("accepts a matching RELEASE after a persisted client identifier is restored", () => {
+    const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+    const mac = "AA-BB-CC-00-00-01";
+    const persisted: DhcpLeaseInfo = {
+      mac,
+      ip: "192.0.2.10",
+      boundAt: Date.now() - 1_000,
+      leaseSec: 3600,
+      expiresAt: Date.now() + 3_599_000,
+      remainingSec: 3599,
+      hostname: null,
+      leaseType: "dynamic",
+      clientId: "client-a"
+    };
+    server._state[mac] = toRestoredLeaseState(persisted, "192.0.2.1");
+    const released: Array<[string, string]> = [];
+    server.on("released", (releasedMac: string, address: string) => released.push([releasedMac, address]));
+
+    server._sock.emit("message", buildRelease(mac, "192.0.2.10", "client-b"));
+
+    expect(server._state[mac].address).toBe("192.0.2.10");
+    expect(released).toEqual([]);
+
+    server._sock.emit("message", buildRelease(mac, "192.0.2.10", "client-a"));
+
+    expect(server._state).not.toHaveProperty(mac);
+    expect(released).toEqual([[mac, "192.0.2.10"]]);
   });
 });

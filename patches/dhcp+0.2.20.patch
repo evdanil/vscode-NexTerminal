@@ -1,5 +1,5 @@
 diff --git a/node_modules/dhcp/lib/dhcp.js b/node_modules/dhcp/lib/dhcp.js
-index e009e81..94db481 100644
+index e009e81..61f4166 100644
 --- a/node_modules/dhcp/lib/dhcp.js
 +++ b/node_modules/dhcp/lib/dhcp.js
 @@ -6,6 +6,8 @@
@@ -11,15 +11,18 @@ index e009e81..94db481 100644
  const util = require('util');
  const dgram = require('dgram');
  const os = require('os');
-@@ -27,6 +29,7 @@ const DHCPINFORM = 8;
+@@ -27,6 +29,10 @@ const DHCPINFORM = 8;
  
  const SERVER_PORT = 67;
  const CLIENT_PORT = 68;
 +const OFFER_TTL_MS = 60 * 1000;
++// A /16 is already larger than an ordinary DHCP broadcast domain and keeps a
++// worst-case synchronous allocation scan operationally finite.
++const MAX_POOL_SIZE = 65_536;
  
  const INADDR_ANY = '0.0.0.0';
  const INADDR_BROADCAST = '255.255.255.255';
-@@ -36,6 +39,14 @@ const BOOTREPLY = 2;
+@@ -36,6 +42,14 @@ const BOOTREPLY = 2;
  
  
  
@@ -34,7 +37,7 @@ index e009e81..94db481 100644
  function Lease() {
  
  }
-@@ -95,6 +106,9 @@ function Server(config, listenOnly) {
+@@ -95,6 +109,9 @@ function Server(config, listenOnly) {
          case DHCPREQUEST: // 3.
            self.handleRequest(req);
            break;
@@ -44,7 +47,7 @@ index e009e81..94db481 100644
          default:
            console.error("Not implemented method", req.options[53]);
        }
-@@ -257,19 +271,50 @@ Server.prototype = {
+@@ -257,19 +274,49 @@ Server.prototype = {
       *
       * 1. Is there a wish for static binding?
       *
@@ -90,7 +93,6 @@ index e009e81..94db481 100644
 +      ) {
 +        delete this._state[mac];
 +      } else if (
-+        !isStatic &&
 +        lease.state === 'OFFERED' &&
 +        Number.isFinite(lease.offerTime) &&
 +        lease.offerTime + OFFER_TTL_MS <= now
@@ -102,7 +104,7 @@ index e009e81..94db481 100644
  
      // If existing lease for a mac address is present, re-use the IP
      if (this._state[clientMAC] && this._state[clientMAC].address) {
-@@ -279,89 +324,62 @@ Server.prototype = {
+@@ -279,89 +326,66 @@ Server.prototype = {
  
  
      // Is there a static binding?
@@ -122,20 +124,19 @@ index e009e81..94db481 100644
      const _tmp = this.config('range');
 -    const firstIP = Tools.parseIp(_tmp[0]);
 -    const lastIP = Tools.parseIp(_tmp[1]);
+-
+-
 +    const firstIP = Tools.parseIp(_tmp[0]) >>> 0;
 +    const lastIP = Tools.parseIp(_tmp[1]) >>> 0;
- 
- 
++    const poolSize = lastIP - firstIP + 1;
  
 -    // Add all known addresses and save the oldest lease
 -    const ips = [this.config('server')]; // Exclude our own server IP from pool
 -    let oldestMac = null;
 -    let oldestTime = Infinity;
 -    let leases = 0;
-+    // Add all known addresses.
-+    const ips = new Set([this.config('server'), ...staticAddresses]); // Exclude server/static IPs from pool
-     for (let mac in this._state) {
-       if (this._state[mac].address)
+-    for (let mac in this._state) {
+-      if (this._state[mac].address)
 -        ips.push(this._state[mac].address);
 -
 -      if (this._state[mac].leaseTime < oldestTime) {
@@ -143,17 +144,13 @@ index e009e81..94db481 100644
 -        oldestMac = mac;
 -      }
 -      leases++;
-+        ips.add(this._state[mac].address);
++    if (!Number.isSafeInteger(poolSize) || poolSize < 1 || poolSize > MAX_POOL_SIZE) {
++      return null;
      }
  
  
  
-+    const poolSize = lastIP - firstIP + 1;
-+    const startOffset = randIP ? Math.floor(Math.random() * poolSize) : 0;
-+    for (let attempt = 0; attempt < poolSize; attempt++) {
-+      const offset = (startOffset + attempt) % poolSize;
-+      const ip = Tools.formatIp((firstIP + offset) >>> 0);
- 
+-
 -    // Check if all IP's are used and delete the oldest
 -    if (oldestMac !== null && lastIP - firstIP === leases) {
 -      const ip = this._state[oldestMac].address;
@@ -178,13 +175,22 @@ index e009e81..94db481 100644
 -          return ip;
 -        }
 -      }
--    }
--
--
--
++    // Add all known addresses.
++    const ips = new Set([this.config('server'), ...staticAddresses]); // Exclude server/static IPs from pool
++    for (let mac in this._state) {
++      if (this._state[mac].address)
++        ips.add(this._state[mac].address);
+     }
+ 
+ 
+ 
 -    // Choose first free IP in subnet
 -    for (let i = firstIP; i <= lastIP; i++) {
--
++    const startOffset = randIP ? Math.floor(Math.random() * poolSize) : 0;
++    for (let attempt = 0; attempt < poolSize; attempt++) {
++      const offset = (startOffset + attempt) % poolSize;
++      const ip = Tools.formatIp((firstIP + offset) >>> 0);
+ 
 -      const ip = Tools.formatIp(i);
 -
 -      if (ips.indexOf(ip) === -1) {
@@ -217,7 +223,23 @@ index e009e81..94db481 100644
  
      this.sendOffer(req);
    },
-@@ -407,6 +425,9 @@ Server.prototype = {
+@@ -401,12 +425,24 @@ Server.prototype = {
+   handleRequest: function(req) {
+     //console.log('Handle Request', req);
+ 
++    const address = this._selectAddress(req.chaddr, req);
++    if (address === null) {
++      if (this._state[req.chaddr] && !this._state[req.chaddr].address) {
++        delete this._state[req.chaddr];
++      }
++      this.emit('poolExhausted', req);
++      return;
++    }
++
+     const lease = this._state[req.chaddr] = this._state[req.chaddr] || new Lease;
+-    lease.address = this._selectAddress(req.chaddr);
++    lease.address = address;
+     lease.leasePeriod = this.config('leaseTime');
      lease.server = this.config('server');
      lease.state = 'BOUND';
      lease.bindTime = new Date;
@@ -227,7 +249,7 @@ index e009e81..94db481 100644
  
      this.sendAck(req);
    },
-@@ -470,8 +491,23 @@ Server.prototype = {
+@@ -470,8 +506,23 @@ Server.prototype = {
      this._send(this.config('broadcast'), ans);
    },
  

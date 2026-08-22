@@ -31,6 +31,8 @@ export interface DhcpLeaseInfo {
   readonly hostname: string | null;
   /** Lease type: dynamic by default, static if from fixed MAC mapping, renewed, inform (DHCPINFORM). */
   readonly leaseType: DhcpLeaseType;
+  /** Opaque DHCP option-61 identity; absent for lease files written before this field existed. */
+  readonly clientId?: string | null;
 }
 
 /**
@@ -121,6 +123,7 @@ export function buildLeaseInfo(
   const hostname: string | null = entry.options?.hostname ? String(entry.options.hostname) : null;
   const leaseType: DhcpLeaseType =
     typeOverride ?? (isStaticLease(mac, entry.address, staticMap) ? 'static' : 'dynamic');
+  const identity = entry.clientId === undefined ? {} : { clientId: entry.clientId };
 
-  return { mac, ip: entry.address, boundAt, leaseSec, expiresAt, remainingSec, hostname, leaseType };
+  return { mac, ip: entry.address, boundAt, leaseSec, expiresAt, remainingSec, hostname, leaseType, ...identity };
 }

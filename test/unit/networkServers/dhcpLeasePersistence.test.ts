@@ -36,7 +36,10 @@ import {
   saveLeases,
   toRestoredLeaseState
 } from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
-import type { DhcpLeaseInfo } from "../../../src/services/networkServers/dhcp/engine/dhcpLeaseUtils";
+import {
+  buildLeaseInfo,
+  type DhcpLeaseInfo
+} from "../../../src/services/networkServers/dhcp/engine/dhcpLeaseUtils";
 
 const NOW = 1_770_000_000_000;
 
@@ -91,6 +94,56 @@ describe("dhcpLeasePersistence — save/load round trip", () => {
     await saveLeases(storePath, leases);
 
     expect(loadLeases(storePath)).toEqual(leases);
+  });
+
+  it("captures option-61 identity in a lease snapshot and restores it after a disk round trip", async () => {
+    const snapshot = buildLeaseInfo(
+      "AA-BB-CC-DD-EE-01",
+      {
+        address: "192.168.2.50",
+        bindTime: new Date(NOW - 60_000),
+        leasePeriod: 3600,
+        renewPeriod: 1800,
+        rebindPeriod: 3600,
+        state: "BOUND",
+        server: "192.168.2.1",
+        options: {},
+        tries: 0,
+        xid: 1,
+        clientId: "client-a"
+      },
+      {},
+      NOW,
+      3600
+    );
+
+    expect(snapshot).toMatchObject({ clientId: "client-a" });
+    await saveLeases(storePath, [snapshot!]);
+    const [reloaded] = loadLeases(storePath);
+
+    expect(reloaded).toMatchObject({ clientId: "client-a" });
+    expect(toRestoredLeaseState(reloaded, "192.168.2.1")).toMatchObject({ clientId: "client-a" });
+  });
+
+  it("keeps legacy identity-less leases compatible and validates optional clientId values", () => {
+    const legacy = lease();
+    const withNullIdentity = { ...lease({ mac: "aa:bb:cc:dd:ee:02" }), clientId: null };
+    const malformedIdentity = { ...lease({ mac: "aa:bb:cc:dd:ee:03" }), clientId: 61 };
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(
+      storePath,
+      JSON.stringify({
+        version: LEASE_STORE_VERSION,
+        savedAt: NOW,
+        leases: [legacy, withNullIdentity, malformedIdentity]
+      }),
+      "utf8"
+    );
+
+    const reloaded = loadLeases(storePath);
+    expect(reloaded).toEqual([legacy, withNullIdentity]);
+    expect(toRestoredLeaseState(reloaded[0], "192.168.2.1").clientId).toBeUndefined();
+    expect(toRestoredLeaseState(reloaded[1], "192.168.2.1").clientId).toBeNull();
   });
 
   it("creates the storage directory on demand", async () => {

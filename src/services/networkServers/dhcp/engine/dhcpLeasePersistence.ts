@@ -108,7 +108,8 @@ function isLeaseRecord(value: unknown): value is DhcpLeaseInfo {
     typeof lease.leaseSec === 'number' && Number.isFinite(lease.leaseSec) &&
     typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt) &&
     (lease.hostname === null || typeof lease.hostname === 'string') &&
-    typeof lease.leaseType === 'string' && LEASE_TYPES.includes(lease.leaseType as DhcpLeaseType)
+    typeof lease.leaseType === 'string' && LEASE_TYPES.includes(lease.leaseType as DhcpLeaseType) &&
+    (lease.clientId === undefined || lease.clientId === null || typeof lease.clientId === 'string')
   );
 }
 
@@ -257,6 +258,7 @@ export function toRestoredLeaseState(lease: DhcpLeaseInfo, serverId: string): Le
     server: serverId,
     address: lease.ip,
     options: lease.hostname ? { hostname: lease.hostname } : {},
+    clientId: lease.clientId,
     tries: 0,
     xid: 1,
   };
