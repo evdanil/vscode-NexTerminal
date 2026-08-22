@@ -24,13 +24,15 @@
  * 2. **Each message = 1 line = 1 JSON-RPC style object**: the protocol
  *    is self-delimited by `\n`, so there is no need to implement
  *    manual framing (e.g.: length-prefix) nor handle partially
- *    received messages. Node's `readline` module handles all
- *    buffering and line parsing.
+ *    received messages. The shared bounded reader owns buffering and line
+ *    framing before the closed request parser sees a value.
  *
  * 3. **Trivial debugging**: we can run the daemon manually in a
  *    terminal, paste JSON and see responses immediately. All
  *    traffic is human-readable; unlike binary sockets or
- *    Electron IPC.
+ *    Electron IPC. A bounded line reader enforces the wire-size limit
+ *    before JSON parsing, so a malformed peer cannot make stdin buffering
+ *    unbounded.
  *
  * 4. **VS Code ↔ daemon Bridge**: the main extension process
  *    (`extension.ts`) does `spawn()` of this daemon as a child process and
@@ -53,26 +55,36 @@
  *
  * Emitted events: `ready`, `statusChange`, `log`, `runtimeUpdate`, `connection`.
  *
- * @see {@link JsonRpcRequest}   format of requests received by the daemon
- * @see {@link JsonLine}         format of lines written to stdout
+ * @see {@link RpcRequest}       format of requests received by the daemon
+ * @see {@link RpcEnvelope}      format of response lines written to stdout
  */
 
-import { createInterface } from 'node:readline';
 import { env, stdin, stdout } from 'node:process';
+import { attachBoundedLineReader } from './boundedLineReader';
 import { DhcpAdapter, type DhcpLeaseInfo } from './dhcp/DhcpAdapter';
 import { TftpAdapter, type TftpTransferView } from './tftp/TftpAdapter';
 import { createRuntimeUpdateThrottle } from './runtimeUpdateThrottle';
 import { parseNetworkServerConfigs } from './networkServerConfigValidation';
 import { NetworkServerConfigController, type NetworkServerConfigStore } from './networkServerConfigController';
+import { createNetworkServerDaemonShutdown } from './networkServerDaemonShutdown';
+import {
+  parseRpcEnvelope,
+  parseRpcEvent,
+  parseRpcRequest,
+  rpcResultParsers,
+  MAX_RPC_TEXT_BYTES,
+  type RpcEnvelope,
+  type RpcEvent,
+  type RpcLogLevel,
+  type RpcMethod,
+  type RpcRequest,
+} from './networkServerRpcProtocol';
 import { ServiceWorkflowQueue } from './networkServerWorkflowQueue';
 import {
   ServerManager,
   createDefaultRegistry,
   type DhcpAdapterConfig,
   type NetworkServerConfigs,
-  type ServerConnectionEvent,
-  type ServerSnapshot,
-  type ServerStatusChangeEvent,
   type TftpAdapterConfig,
 } from './core/index';
 
@@ -104,89 +116,7 @@ import {
 const CONFIG_ENV_VAR = 'NEXUS_NETWORK_SERVERS_CONFIG';
 
 /**
- * Request received via stdin in simplified JSON-RPC format.
- *
- * @property id     — unique request identifier (integer number).
- *                    The response will have the same `id` for matching.
- * @property method — name of the RPC method to invoke on {@link ServerManager}.
- * @property params — optional parameters (key/value object).
- */
-type JsonRpcRequest = {
-  readonly id: number;
-  readonly method:
-    | 'list'
-    | 'start'
-    | 'stop'
-    | 'restart'
-    | 'getStatus'
-    | 'getServiceRuntime'
-    | 'configure'
-    | 'cancelTransfer';
-  readonly params?: Record<string, unknown>;
-};
-
-/**
- * Success response to a {@link JsonRpcRequest}.
- *
- * @property id     — same `id` as the corresponding request.
- * @property result — result payload (variable type depending on method).
- */
-type JsonRpcResult = {
-  readonly id: number;
-  readonly result: unknown;
-};
-
-/**
- * Error response to a {@link JsonRpcRequest}.
- *
- * @property id    — same `id` as the corresponding request.
- * @property error — descriptive error object with code and message.
- */
-type JsonRpcError = {
-  readonly id: number;
-  readonly error: { readonly code: string; readonly message: string };
-};
-
-/**
- * Asynchronous event sent by the daemon without matching a request.
- *
- * Variants:
- * - `statusChange` — a server changed state (running ↔ stopped ↔ error).
- * - `log`          — log line emitted by a server or by the daemon itself.
- * - `ready`        — daemon initialized and ready to receive requests.
- * - `runtimeUpdate`— mutable runtime changed (TFTP transfers / DHCP leases).
- *                    Coalesced per id before it reaches stdout — see
- *                    {@link createRuntimeUpdateThrottle}.
- * - `connection`   — a client connection lifecycle edge (TFTP transfer
- *                    opened/finished/failed, DHCP lease granted/declined).
- *                    Deliberately **not** coalesced: unlike `runtimeUpdate`,
- *                    these already fire only at edges, and folding two of them
- *                    together would drop an event the host is expected to
- *                    surface one-for-one.
- */
-type JsonRpcEvent =
-  | { readonly event: 'statusChange'; readonly data: ServerStatusChangeEvent }
-  | { readonly event: 'log'; readonly data: { readonly id: string; readonly level: string; readonly message: string } }
-  | { readonly event: 'ready'; readonly data: null }
-  | { readonly event: 'runtimeUpdate'; readonly data: { readonly id: string } }
-  | { readonly event: 'connection'; readonly data: { readonly id: string; readonly connection: ServerConnectionEvent } };
-
-/**
- * Union of all message types the daemon writes to stdout.
- * Each instance is serialized as **a single JSON line** followed by `\n`.
- */
-type JsonLine = JsonRpcResult | JsonRpcError | JsonRpcEvent;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function hasOwn(record: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(record, key);
-}
-
-/**
- * Serializes a {@link JsonLine} object and writes it as **one line**
+ * Serializes a closed protocol envelope/event and writes it as **one line**
  * to the process `stdout`.
  *
  * Silently ignores write failures — if stdout is already closed
@@ -194,9 +124,13 @@ function hasOwn(record: Record<string, unknown>, key: string): boolean {
  *
  * @param obj — message to send to the parent process (VS Code UI).
  */
-function writeLine(obj: JsonLine): void {
+function writeLine(obj: RpcEnvelope | RpcEvent): void {
   try {
-    stdout.write(JSON.stringify(obj) + '\n');
+    const serialized = JSON.stringify(obj);
+    const wireValue: unknown = JSON.parse(serialized);
+    const parsed = 'id' in obj ? parseRpcEnvelope(wireValue) : parseRpcEvent(wireValue);
+    if (!parsed.ok) return;
+    stdout.write(serialized + '\n');
   } catch {
     // stdout unavailable; nothing we can do
   }
@@ -212,11 +146,49 @@ function writeLine(obj: JsonLine): void {
  * @param message — descriptive text of the event. Automatically prefixed
  *                  with `[daemon]` to facilitate filtering in the UI.
  */
-function logDaemon(level: string, message: string): void {
+function logDaemon(level: RpcLogLevel, message: string): void {
   writeLine({
     event: 'log',
     data: { id: 'daemon', level, message: `[daemon] ${message}` },
   });
+}
+
+/** The fallback response id is never assigned by the host. */
+function responseIdFor(value: unknown): number {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return 0;
+  if (!Object.prototype.hasOwnProperty.call(value, 'id')) return 0;
+  const id = (value as { readonly id?: unknown }).id;
+  return typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 ? id : 0;
+}
+
+function invalidRequest(id: number, message: string): RpcEnvelope {
+  return { id, error: { code: 'INVALID_REQUEST', message } };
+}
+
+function internalError(id: number, error: unknown): RpcEnvelope {
+  const message = error instanceof Error ? error.message : String(error);
+  let bounded = '';
+  let bytes = 0;
+  for (const character of message) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > MAX_RPC_TEXT_BYTES) break;
+    bounded += character;
+    bytes += characterBytes;
+  }
+  return { id, error: { code: 'INTERNAL_ERROR', message: bounded || 'Daemon operation failed.' } };
+}
+
+function resultEnvelope(id: number, method: RpcMethod, result: unknown): RpcEnvelope {
+  let wireResult: unknown;
+  try {
+    wireResult = JSON.parse(JSON.stringify(result));
+  } catch {
+    return { id, error: { code: 'INTERNAL_ERROR', message: 'Daemon produced an invalid RPC result.' } };
+  }
+  const parsed = (rpcResultParsers[method] as (value: unknown) => { readonly ok: boolean; readonly value?: unknown })(wireResult);
+  return parsed.ok
+    ? { id, result: parsed.value as never }
+    : { id, error: { code: 'INTERNAL_ERROR', message: 'Daemon produced an invalid RPC result.' } };
 }
 
 /**
@@ -227,8 +199,8 @@ function logDaemon(level: string, message: string): void {
  * 2. Binds Manager's `statusChange` and `log` events to stdout (bridge).
  * 3. Installs `SIGINT` / `SIGTERM` and `stdin close` handlers for
  *    graceful shutdown (releases all server ports).
- * 4. Creates a `readline` interface over `stdin` to receive JSON lines
- *    and dispatch them to {@link handleRequest}.
+ * 4. Attaches a bounded line reader over `stdin`, validates each JSON value
+ *    through the closed RPC parser, and dispatches only accepted requests.
  * 5. Sends the `ready` event to signal to VS Code that it is operational.
  *
  * The function returns a Promise that only resolves on shutdown; however
@@ -252,7 +224,6 @@ async function run(): Promise<void> {
   );
   const configController = new NetworkServerConfigController(manager, configStore);
   const serviceWorkflows = new ServiceWorkflowQueue();
-  let shuttingDown = false;
 
   /**
    * Merges incoming configuration into {@link configStore} and evicts any
@@ -295,28 +266,32 @@ async function run(): Promise<void> {
         logDaemon('warn', `Rejected malformed ${CONFIG_ENV_VAR}: ${parsed.errors.join('; ')}`);
         return;
       }
-      await applyConfigs(parsed.value);
+      await serviceWorkflows.enqueueMany(['tftp', 'dhcp'], () => applyConfigs(parsed.value));
     } catch (err) {
       logDaemon('warn', `Rejected malformed ${CONFIG_ENV_VAR}: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
   manager.on('statusChange', (evt) => {
-    writeLine({ event: 'statusChange', data: evt });
+    if (evt.id !== 'tftp' && evt.id !== 'dhcp') return;
+    writeLine(evt.error === undefined
+      ? { event: 'statusChange', data: { id: evt.id, status: evt.status } }
+      : { event: 'statusChange', data: { id: evt.id, status: evt.status, error: evt.error } });
   });
   manager.on('log', (id, level, message) => {
-    writeLine({ event: 'log', data: { id, level, message } });
+    if ((id !== 'tftp' && id !== 'dhcp') || !['trace', 'debug', 'info', 'warn', 'error'].includes(level)) return;
+    writeLine({ event: 'log', data: { id, level: level as RpcLogLevel, message } });
   });
   const runtimeUpdates = createRuntimeUpdateThrottle((id) => {
-    writeLine({ event: 'runtimeUpdate', data: { id } });
+    if (id === 'tftp' || id === 'dhcp') writeLine({ event: 'runtimeUpdate', data: { id } });
   });
 
   manager.on('runtimeUpdate', (id: string, final?: boolean) => {
     runtimeUpdates.push(id, final);
   });
 
-  manager.on('connection', (id: string, connection: ServerConnectionEvent) => {
-    writeLine({ event: 'connection', data: { id, connection } });
+  manager.on('connection', (id: string, connection) => {
+    if (id === 'tftp' || id === 'dhcp') writeLine({ event: 'connection', data: { id, connection } });
   });
 
   /**
@@ -329,174 +304,101 @@ async function run(): Promise<void> {
    * @param reason — text identifying the shutdown source
    *                 (`SIGINT`, `SIGTERM`, `stdin closed`).
    */
-  let shutdownPromise: Promise<void> | undefined;
-  const shutdown = (reason: string): Promise<void> => {
-    if (shutdownPromise) return shutdownPromise;
-    shuttingDown = true;
-    shutdownPromise = (async () => {
-      logDaemon('info', `Shutting down (${reason})...`);
-      runtimeUpdates.flush();
-      try {
-        await serviceWorkflows.drain();
-        await manager.disposeAll();
-      } catch {
-        // ignore
-      }
-      process.exit(0);
-    })();
-    return shutdownPromise;
-  };
-
-  process.on('SIGINT', () => void shutdown('SIGINT').catch((err) => process.stderr.write('shutdown error: ' + (err instanceof Error ? err.message : String(err)) + '\n')));
-  process.on('SIGTERM', () => void shutdown('SIGTERM').catch((err) => process.stderr.write('shutdown error: ' + (err instanceof Error ? err.message : String(err)) + '\n')));
-
-  /**
-   * Dispatches a {@link JsonRpcRequest} to the corresponding operation
-   * on {@link ServerManager} and returns the response (success or error).
-   *
-   * Supported methods:
-   * - `list`      — returns `ServerSnapshot[]` with all registered servers.
-   * - `getStatus` — returns `ServerSnapshot` of a specific server (`params.id`).
-   * - `start`     — starts a server by ID.
-   * - `stop`      — stops a server by ID.
-   * - `restart`   — stops and restarts a server by ID.
-   *
-   * All errors (both "not found" and unexpected exceptions) are
-   * converted to {@link JsonRpcError} with a string `code` and `message`.
-   *
-   * @param req — already validated JSON-RPC request (`id` and `method` fields exist).
-   * @returns Promise with the response (formatted result or error).
-   */
-  /**
-   * Applies the optional `config` payload that rides along with a `start` /
-   * `restart` request, scoped to that request's service id.
-   *
-   * This is what makes "start reads the *current* settings" true: the host
-   * resolves `nexus.networkServers.<kind>.*` immediately before issuing the
-   * call, so the adapter that gets built is always in sync with what the user
-   * sees in the settings UI — no daemon restart required, and no stale
-   * configuration surviving from a previous run.
-   *
-   * @param id - Service id the request targets (`tftp` / `dhcp`).
-   * @param params - Raw RPC params; `params.config` is used when present.
-   */
-  const parseRequestConfig = (id: string, params: unknown): NetworkServerConfigs | undefined => {
-    if (id !== 'tftp' && id !== 'dhcp') return undefined;
-    if (!isRecord(params) || !hasOwn(params, 'config')) return undefined;
-    const config = params.config;
-    const candidate: Record<string, unknown> = id === 'tftp' ? { tftp: config } : { dhcp: config };
-    const parsed = parseNetworkServerConfigs(candidate);
-    if (!parsed.ok) {
-      throw new Error(`Invalid network-server configuration: ${parsed.errors.join('; ')}`);
-    }
-    return parsed.value;
-  };
-
-  const handleRequest = async (req: JsonRpcRequest): Promise<JsonRpcResult | JsonRpcError> => {
+  let detachInput: (() => void) | undefined;
+  let onStdinEnd: () => void = () => undefined;
+  const writeShutdownError = (err: unknown): void => {
     try {
-      if (shuttingDown) throw new Error('Network servers daemon is shutting down.');
+      process.stderr.write('shutdown error: ' + (err instanceof Error ? err.message : String(err)) + '\n');
+    } catch {
+      // stderr is unavailable during process teardown.
+    }
+  };
+  const daemonShutdown = createNetworkServerDaemonShutdown({
+    stopAccepting: () => {
+      detachInput?.();
+      stdin.removeListener('end', onStdinEnd);
+      serviceWorkflows.close();
+    },
+    drain: () => serviceWorkflows.drain(),
+    flushRuntimeUpdates: () => runtimeUpdates.flush(),
+    dispose: () => manager.disposeAll(),
+    exit: () => process.exit(0),
+  });
+  const shutdown = (reason: string): Promise<void> => {
+    const alreadyShuttingDown = daemonShutdown.isShuttingDown();
+    const promise = daemonShutdown.begin(reason);
+    if (!alreadyShuttingDown) logDaemon('info', `Shutting down (${reason})...`);
+    return promise;
+  };
+  onStdinEnd = (): void => { void shutdown('stdin closed').catch(writeShutdownError); };
+
+  process.on('SIGINT', () => void shutdown('SIGINT').catch(writeShutdownError));
+  process.on('SIGTERM', () => void shutdown('SIGTERM').catch(writeShutdownError));
+
+  const handleRequest = async (req: RpcRequest): Promise<RpcEnvelope> => {
+    try {
+      if (daemonShutdown.isShuttingDown()) {
+        return { id: req.id, error: { code: 'SHUTTING_DOWN', message: 'Network servers daemon is shutting down.' } };
+      }
       switch (req.method) {
         case 'list': {
-          const list: readonly ServerSnapshot[] = manager.list();
-          return { id: req.id, result: list };
+          const list = await serviceWorkflows.readMany(['tftp', 'dhcp'], async () => manager.list());
+          return resultEnvelope(req.id, req.method, list);
         }
         case 'getStatus': {
-          const id = String(req.params?.['id'] ?? '');
-          const found = manager.list().find((s) => s.id === id);
-          if (!found) {
-            return {
-              id: req.id,
-              error: { code: 'NOT_FOUND', message: `Server '${id}' not found.` },
-            };
-          }
-          return { id: req.id, result: found };
+          const snapshot = await serviceWorkflows.read(req.params.id, async () => manager.getSnapshot(req.params.id));
+          return resultEnvelope(req.id, req.method, snapshot);
         }
         case 'configure': {
-          const params = isRecord(req.params) ? req.params : undefined;
-          const rawConfigs = params && hasOwn(params, 'configs') ? params.configs : {};
-          const parsed = parseNetworkServerConfigs(rawConfigs);
-          if (!parsed.ok) {
-            throw new Error(`Invalid network-server configuration: ${parsed.errors.join('; ')}`);
-          }
-          const operations: Array<Promise<{ readonly id: 'tftp' | 'dhcp'; readonly changed: boolean }>> = [];
-          if (parsed.value.tftp !== undefined) {
-            operations.push(serviceWorkflows.enqueue('tftp', async () => ({
-              id: 'tftp',
-              changed: await applyConfig('tftp', parsed.value.tftp!),
-            })));
-          }
-          if (parsed.value.dhcp !== undefined) {
-            operations.push(serviceWorkflows.enqueue('dhcp', async () => ({
-              id: 'dhcp',
-              changed: await applyConfig('dhcp', parsed.value.dhcp!),
-            })));
-          }
-          const changed = (await Promise.all(operations)).filter((result) => result.changed).map((result) => result.id);
-          return { id: req.id, result: { ok: true, changed } };
+          const configIds = [
+            ...(req.params.configs.tftp === undefined ? [] : ['tftp']),
+            ...(req.params.configs.dhcp === undefined ? [] : ['dhcp']),
+          ];
+          const changed = await serviceWorkflows.enqueueMany(configIds, async () => applyConfigs(req.params.configs));
+          return resultEnvelope(req.id, req.method, { ok: true, changed });
         }
         case 'start': {
-          const id = String(req.params?.['id'] ?? '');
-          const configs = parseRequestConfig(id, req.params);
-          if (id !== 'tftp' && id !== 'dhcp') {
+          const { id, config } = req.params;
+          await serviceWorkflows.enqueue(id, async () => {
+            if (config !== undefined) await applyConfig(id, config);
+            if (configController.requiresEviction(id)) await configController.evictIfIdle(id);
             await manager.start(id);
-          } else {
-            await serviceWorkflows.enqueue(id, async () => {
-              const config = id === 'tftp' ? configs?.tftp : configs?.dhcp;
-              if (config !== undefined) await applyConfig(id, config);
-              if (configController.requiresEviction(id)) await configController.evictIfIdle(id);
-              await manager.start(id);
-            });
-          }
-          return { id: req.id, result: { ok: true, id } };
+          });
+          return resultEnvelope(req.id, req.method, { ok: true, id });
         }
         case 'stop': {
-          const id = String(req.params?.['id'] ?? '');
-          if (id === 'tftp' || id === 'dhcp') await serviceWorkflows.enqueue(id, () => manager.stop(id));
-          else await manager.stop(id);
-          return { id: req.id, result: { ok: true, id } };
+          const { id } = req.params;
+          await serviceWorkflows.enqueue(id, () => manager.stop(id));
+          return resultEnvelope(req.id, req.method, { ok: true, id });
         }
         case 'restart': {
-          const id = String(req.params?.['id'] ?? '');
-          const configs = parseRequestConfig(id, req.params);
+          const { id, config } = req.params;
           // Stop first, THEN apply: applyConfigs deliberately refuses to evict
           // a running instance, so configuring before stopping would leave the
           // old instance in place and restart it with stale settings.
-          if (id !== 'tftp' && id !== 'dhcp') {
-            await manager.restart(id);
-          } else {
-            await serviceWorkflows.enqueue(id, async () => {
-              await manager.stop(id);
-              const config = id === 'tftp' ? configs?.tftp : configs?.dhcp;
-              if (config !== undefined) await applyConfig(id, config);
-              // Picks up a configure that landed while the service was running:
-              // the eviction it could not do back then happens now that it is idle.
-              if (configController.requiresEviction(id)) await configController.evictIfIdle(id);
-              await manager.start(id);
-            });
-          }
-          return { id: req.id, result: { ok: true, id } };
+          await serviceWorkflows.enqueue(id, async () => {
+            await manager.stop(id);
+            if (config !== undefined) await applyConfig(id, config);
+            // Picks up a configure that landed while the service was running:
+            // the eviction it could not do back then happens now that it is idle.
+            if (configController.requiresEviction(id)) await configController.evictIfIdle(id);
+            await manager.start(id);
+          });
+          return resultEnvelope(req.id, req.method, { ok: true, id });
         }
         case 'cancelTransfer': {
-          const id = String(req.params?.['id'] ?? '');
-          const transferId = String(req.params?.['transferId'] ?? '');
-          if (id !== 'tftp') {
-            return {
-              id: req.id,
-              error: { code: 'NOT_FOUND', message: `Service '${id}' has no cancellable transfers.` },
-            };
-          }
-          // Deliberately `getInstance`, not `ensureInstance`: cancelling on a
-          // service that was never started must not bring one into existence.
-          const instance = manager.getInstance(id);
-          if (!(instance instanceof TftpAdapter)) {
-            return { id: req.id, result: { ok: false, id, transferId } };
-          }
-          const cancelled = await instance.cancelTransfer(transferId);
-          return { id: req.id, result: { ok: cancelled, id, transferId } };
+          const { id, transferId } = req.params;
+          const cancelled = await serviceWorkflows.enqueue(id, async () => {
+            // Deliberately `getInstance`, not `ensureInstance`: cancelling on a
+            // service that was never started must not bring one into existence.
+            const instance = manager.getInstance(id);
+            return instance instanceof TftpAdapter ? instance.cancelTransfer(transferId) : false;
+          });
+          return resultEnvelope(req.id, req.method, { ok: cancelled, id, transferId });
         }
         case 'getServiceRuntime': {
-          const id = String(req.params?.['id'] ?? '');
-          try {
+          const { id } = req.params;
+          const runtime = await serviceWorkflows.read(id, async () => {
             const instance = manager.ensureInstance(id);
             const snapshot = manager.getSnapshot(id);
 
@@ -506,72 +408,49 @@ async function run(): Promise<void> {
               const packetCounters = dhcp.packetCounters;
               const poolInfo = dhcp.poolInfo;
               const boundPort = dhcp.boundPort;
-              return { id: req.id, result: { snapshot, leases, packetCounters, poolInfo, boundPort } };
+              return { snapshot, leases, packetCounters, poolInfo, boundPort };
             }
-            if (id === 'tftp') {
-              const tftp = instance as TftpAdapter;
-              const transfers: readonly TftpTransferView[] = tftp.activeTransfers();
-              const root = tftp.root;
-              const allowWrite = tftp.allowWrite;
-              const boundPort = tftp.boundPort ?? tftp.port;
-              return { id: req.id, result: { snapshot, transfers, root, allowWrite, boundPort } };
-            }
-
-            return {
-              id: req.id,
-              error: { code: 'NOT_FOUND', message: `Service '${id}' does not support runtime info.` },
-            };
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            if (/Unknown server id|not registered/i.test(message)) {
-              return {
-                id: req.id,
-                error: { code: 'NOT_FOUND', message: `Server '${id}' not found.` },
-              };
-            }
-            throw err;
-          }
-        }
-        default: {
-          return {
-            id: req.id,
-            error: { code: 'METHOD_NOT_FOUND', message: `Unknown method: ${String(req.method)}` },
-          };
+            const tftp = instance as TftpAdapter;
+            const transfers: readonly TftpTransferView[] = tftp.activeTransfers();
+            const root = tftp.root;
+            const allowWrite = tftp.allowWrite;
+            const boundPort = tftp.boundPort ?? tftp.port;
+            return { snapshot, transfers, root, allowWrite, boundPort };
+          });
+          return resultEnvelope(req.id, req.method, runtime);
         }
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { id: req.id, error: { code: 'INTERNAL_ERROR', message } };
+      return internalError(req.id, err);
     }
   };
 
-  const rl = createInterface({ input: stdin, output: undefined });
-
-  rl.on('line', async (raw) => {
+  const handleLine = (line: string): void => {
+    let payload: unknown;
     try {
-      const line = raw.trim();
-      if (!line) return;
-      let req: JsonRpcRequest;
-      try {
-        req = JSON.parse(line) as JsonRpcRequest;
-      } catch {
-        logDaemon('warn', `Ignored invalid JSON line: ${line.slice(0, 160)}`);
-        return;
-      }
-      if (typeof req.id !== 'number' || typeof req.method !== 'string') {
-        logDaemon('warn', `Ignored malformed request: missing id/method.`);
-        return;
-      }
-      const response = await handleRequest(req);
-      writeLine(response);
-    } catch (err) {
-      try {
-        process.stderr.write('line handler error: ' + (err instanceof Error ? err.message : String(err)) + '\n');
-      } catch {}
+      payload = JSON.parse(line);
+    } catch {
+      writeLine(invalidRequest(0, 'Malformed RPC request.'));
+      return;
     }
-  });
+    const parsed = parseRpcRequest(payload);
+    if (!parsed.ok) {
+      writeLine(invalidRequest(responseIdFor(payload), parsed.error));
+      return;
+    }
+    void handleRequest(parsed.value).then(writeLine, (err) => {
+      writeLine(internalError(parsed.value.id, err));
+    });
+  };
 
-  rl.on('close', () => void shutdown('stdin closed').catch((err) => process.stderr.write('shutdown error: ' + (err instanceof Error ? err.message : String(err)) + '\n')));
+  detachInput = attachBoundedLineReader(stdin, {
+    onLine: handleLine,
+    onError: () => {
+      writeLine(invalidRequest(0, 'RPC input exceeded the maximum line length.'));
+      void shutdown('stdin framing error').catch(writeShutdownError);
+    },
+  });
+  stdin.once('end', onStdinEnd);
 
   // Seed BEFORE announcing readiness: the host may fire `list` the instant it
   // sees `ready`, and that snapshot must already reflect configured ports.

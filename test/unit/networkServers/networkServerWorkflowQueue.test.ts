@@ -137,4 +137,90 @@ describe("ServiceWorkflowQueue", () => {
       await expect(dhcp).resolves.toBe("dhcp");
     }
   });
+
+  it("acquires tftp then dhcp atomically, without letting either single-service workflow interleave", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const tftpEntered = deferred();
+    const releaseTftp = deferred();
+    const configureEntered = deferred();
+    const releaseConfigure = deferred();
+    const lifecycle: string[] = [];
+
+    const tftp = queue.enqueue("tftp", async () => {
+      lifecycle.push("tftp:before");
+      tftpEntered.resolve();
+      await releaseTftp.promise;
+      lifecycle.push("tftp:after");
+    });
+    await tftpEntered.promise;
+
+    const configure = queue.enqueueMany(["dhcp", "tftp"], async () => {
+      lifecycle.push("configure");
+      configureEntered.resolve();
+      await releaseConfigure.promise;
+    });
+    const dhcp = queue.enqueue("dhcp", async () => {
+      lifecycle.push("dhcp:after-configure");
+    });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(lifecycle).toEqual(["tftp:before"]);
+
+    releaseTftp.resolve();
+    await configureEntered.promise;
+    expect(lifecycle).toEqual(["tftp:before", "tftp:after", "configure"]);
+
+    releaseConfigure.resolve();
+    await Promise.all([tftp, configure, dhcp]);
+    expect(lifecycle).toEqual(["tftp:before", "tftp:after", "configure", "dhcp:after-configure"]);
+  });
+
+  it("keeps a queued coherent read ahead of a later mutation for the same service", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const stopEntered = deferred();
+    const releaseStop = deferred();
+    const observed: string[] = [];
+
+    const stop = queue.enqueue("tftp", async () => {
+      stopEntered.resolve();
+      await releaseStop.promise;
+      observed.push("stopped");
+    });
+    await stopEntered.promise;
+    const read = queue.read("tftp", async () => {
+      observed.push("read:stopped");
+    });
+    const restart = queue.enqueue("tftp", async () => {
+      observed.push("restarted");
+    });
+
+    releaseStop.resolve();
+    await Promise.all([stop, read, restart]);
+    expect(observed).toEqual(["stopped", "read:stopped", "restarted"]);
+  });
+
+  it("refuses new work after close while retaining already accepted tails for shutdown drain", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const entered = deferred();
+    const release = deferred();
+    const accepted = queue.enqueue("dhcp", async () => {
+      entered.resolve();
+      await release.promise;
+      return "accepted";
+    });
+    await entered.promise;
+
+    queue.close();
+    await expect(queue.enqueue("dhcp", async () => "late")).rejects.toThrow(/shutting down/i);
+
+    let drained = false;
+    const draining = queue.drain().then(() => { drained = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
+
+    release.resolve();
+    await expect(accepted).resolves.toBe("accepted");
+    await draining;
+    expect(drained).toBe(true);
+  });
 });

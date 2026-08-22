@@ -49,6 +49,7 @@ import { createInterface, type Interface } from "node:readline";
 import { encodeRRQ, encodeACK, getOpcode } from "../../../src/services/networkServers/tftp/engine/protocol";
 import { RUNTIME_UPDATE_THROTTLE_MS } from "../../../src/services/networkServers/runtimeUpdateThrottle";
 import { createUdpClient, mkdtemp, sleep } from "../../helpers/networkServerTestHelpers";
+import { MAX_RPC_LINE_BYTES } from "../../../src/services/networkServers/boundedLineReader";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 
@@ -153,6 +154,27 @@ class DaemonClient {
 
   public send(method: string, params?: Record<string, unknown>, timeoutMs = 15_000): Promise<RpcReply> {
     const id = this.nextId++;
+    return this.sendLine(`${JSON.stringify({ id, method, params })}\n`, id, timeoutMs);
+  }
+
+  /** Sends an untrusted JSON value and waits for its safe id or the daemon's reserved fallback id 0. */
+  public sendRaw(payload: unknown, timeoutMs = 15_000): Promise<RpcReply> {
+    const id = payload !== null
+      && typeof payload === "object"
+      && Object.prototype.hasOwnProperty.call(payload, "id")
+      && Number.isSafeInteger((payload as { id?: unknown }).id)
+      && (payload as { id: number }).id >= 0
+      ? (payload as { id: number }).id
+      : 0;
+    return this.sendLine(`${JSON.stringify(payload)}\n`, id, timeoutMs);
+  }
+
+  /** Sends raw JSON-line text, for parser failures which cannot be represented by JSON.stringify. */
+  public sendRawLine(line: string, responseId = 0, timeoutMs = 15_000): Promise<RpcReply> {
+    return this.sendLine(`${line}\n`, responseId, timeoutMs);
+  }
+
+  private sendLine(line: string, id: number, timeoutMs: number): Promise<RpcReply> {
     return new Promise<RpcReply>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -162,7 +184,7 @@ class DaemonClient {
         clearTimeout(timer);
         resolve(reply);
       });
-      this.child.stdin!.write(`${JSON.stringify({ id, method, params })}\n`);
+      this.child.stdin!.write(line);
     });
   }
 
@@ -295,37 +317,57 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     expect(list.every((s) => s.status === "stopped")).toBe(true);
   });
 
-  it("answers `getStatus` for a known id and NOT_FOUND for an unknown one", async () => {
+  it("answers `getStatus` for a known id and rejects an unknown service through the closed request boundary", async () => {
     const snapshot = await client.call<{ id: string; status: string }>("getStatus", { id: "dhcp" });
     expect(snapshot.id).toBe("dhcp");
     expect(snapshot.status).toBe("stopped");
 
     const missing = await client.send("getStatus", { id: "ftp" });
-    expect(missing.error?.code).toBe("NOT_FOUND");
-    expect(missing.error?.message).toMatch(/not found/i);
+    expect(missing.error?.code).toBe("INVALID_REQUEST");
   });
 
-  it("rejects an unknown method with METHOD_NOT_FOUND rather than dying", async () => {
+  it("returns closed INVALID_REQUEST envelopes for invalid ids, methods, params, configs, and JSON without reaching a manager operation", async () => {
+    const cases: readonly [string, unknown, number][] = [
+      ["unsafe id", { id: -1, method: "list" }, 0],
+      ["unknown method", { id: 41, method: "selfDestruct" }, 41],
+      ["extra request key", { id: 42, method: "list", extra: true }, 42],
+      ["unexpected list params", { id: 43, method: "list", params: {} }, 43],
+      ["wrong service params", { id: 44, method: "stop", params: { id: "ftp" } }, 44],
+      ["extra service params", { id: 45, method: "stop", params: { id: "tftp", force: true } }, 45],
+      ["wrong service config", { id: 46, method: "start", params: { id: "tftp", config: { rangeStart: "10.0.0.2" } } }, 46],
+      ["extra config field", { id: 47, method: "configure", params: { configs: { tftp: { unknown: true } } } }, 47],
+    ];
+
+    for (const [name, payload, id] of cases) {
+      const reply = await client.sendRaw(payload);
+      expect(reply.id, name).toBe(id);
+      expect(reply.error?.code, name).toBe("INVALID_REQUEST");
+      expect(reply.result, name).toBeUndefined();
+    }
+
+    const invalidJson = await client.sendRawLine("this is not json");
+    expect(invalidJson.id).toBe(0);
+    expect(invalidJson.error?.code).toBe("INVALID_REQUEST");
+
+    // No rejected mutation may have started a TFTP adapter or changed its status.
+    const status = await client.call<{ status: string }>("getStatus", { id: "tftp" });
+    expect(status.status).toBe("stopped");
+    expect(client.exited).toBeUndefined();
+  });
+
+  it("rejects an unknown method with INVALID_REQUEST rather than dying", async () => {
     const reply = await client.send("selfDestruct");
-    expect(reply.error?.code).toBe("METHOD_NOT_FOUND");
+    expect(reply.error?.code).toBe("INVALID_REQUEST");
     // Still alive and serving afterwards.
     await expect(client.call("list")).resolves.toBeDefined();
   });
 
-  it("ignores a malformed line instead of crashing the process", async () => {
-    client.child.stdin!.write("this is not json\n");
-    await expect(client.call("list")).resolves.toBeDefined();
-    expect(client.exited).toBeUndefined();
-  });
-
-  it("rejects malformed configure, start, and restart DTOs before applying or creating an adapter", async () => {
+  it("rejects malformed configure, start, and restart DTOs as INVALID_REQUEST before applying or creating an adapter", async () => {
     const malformedDhcp = await client.send("configure", { configs: { dhcp: { dns: ["not-an-ip"] } } });
-    expect(malformedDhcp.error?.code).toBe("INTERNAL_ERROR");
-    expect(malformedDhcp.error?.message).toContain("dhcp.dns[0]");
+    expect(malformedDhcp.error?.code).toBe("INVALID_REQUEST");
 
     const emptyDns = await client.send("configure", { configs: { dhcp: { dns: [] } } });
-    expect(emptyDns.error?.code).toBe("INTERNAL_ERROR");
-    expect(emptyDns.error?.message).toContain("dhcp.dns");
+    expect(emptyDns.error?.code).toBe("INVALID_REQUEST");
 
     const duplicateReservationAddress = await client.send("configure", {
       configs: {
@@ -337,22 +379,25 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
         },
       },
     });
-    expect(duplicateReservationAddress.error?.code).toBe("INTERNAL_ERROR");
-    expect(duplicateReservationAddress.error?.message).toContain("dhcp.static");
+    expect(duplicateReservationAddress.error?.code).toBe("INVALID_REQUEST");
 
     const blankVendorFilter = await client.send("configure", { configs: { dhcp: { vendorClassId: "  \t " } } });
-    expect(blankVendorFilter.error?.code).toBe("INTERNAL_ERROR");
-    expect(blankVendorFilter.error?.message).toContain("dhcp.vendorClassId");
+    expect(blankVendorFilter.error?.code).toBe("INVALID_REQUEST");
 
     const malformedStart = await client.send("start", { id: "tftp", config: { port: -1 } });
-    expect(malformedStart.error?.code).toBe("INTERNAL_ERROR");
-    expect(malformedStart.error?.message).toContain("tftp.port");
+    expect(malformedStart.error?.code).toBe("INVALID_REQUEST");
     expect((await client.call<{ status: string }>("getStatus", { id: "tftp" })).status).toBe("stopped");
 
     const malformedRestart = await client.send("restart", { id: "tftp", config: { interface: "not-an-ip" } });
-    expect(malformedRestart.error?.code).toBe("INTERNAL_ERROR");
-    expect(malformedRestart.error?.message).toContain("tftp.interface");
+    expect(malformedRestart.error?.code).toBe("INVALID_REQUEST");
     expect((await client.call<{ status: string }>("getStatus", { id: "tftp" })).status).toBe("stopped");
+  });
+
+  it("bounds an oversized stdin frame, reports the reserved fallback id, and terminates deterministically", async () => {
+    const reply = await client.sendRawLine("x".repeat(MAX_RPC_LINE_BYTES + 1));
+    expect(reply.id).toBe(0);
+    expect(reply.error?.code).toBe("INVALID_REQUEST");
+    await expect(client.waitForExit(15_000)).resolves.toEqual({ code: 0, signal: null });
   });
 
   it("rejects an invalid environment seed before the daemon announces readiness", async () => {
@@ -544,13 +589,14 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     120_000
   );
 
-  it("closing stdin shuts the daemon down cleanly and releases the UDP port", async () => {
+  it("closing stdin and delivering SIGTERM together run one clean shutdown and release the UDP port", async () => {
     const port = await allocateFreeUdpPort();
     await client.call("start", { id: "tftp", config: { root, port, allowWrite: false } });
     await client.waitForEvent("statusChange", 10_000, (d) => d?.id === "tftp" && d?.status === "running");
     expect(await isUdpPortFree(port), "port should be held while the service runs").toBe(false);
 
     client.closeStdin();
+    client.kill("SIGTERM");
     const exit = await client.waitForExit(15_000);
     expect(exit.code).toBe(0);
     expect(await isUdpPortFree(port), "daemon exit must release the UDP port").toBe(true);
