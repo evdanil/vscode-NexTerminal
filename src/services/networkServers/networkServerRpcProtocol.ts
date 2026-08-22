@@ -7,12 +7,11 @@
  */
 
 import { MAX_DHCP_POOL_SIZE, MAX_STATIC_RESERVATIONS, parseNetworkServerConfigs } from "./networkServerConfigValidation";
+import { MAX_RPC_LINE_BYTES } from "./boundedLineReader";
 import type { NetworkServerConfigs } from "./core/index";
 import type { DhcpAdapterConfig } from "./dhcp/DhcpAdapter";
 import type { TftpAdapterConfig } from "./tftp/TftpAdapter";
 
-/** Planned Task 2 framing ceiling, repeated locally so this pure contract has no transport dependency. */
-const MAX_RPC_LINE_BYTES = 1_048_576;
 /** More than the current log envelope's 67 serialized bytes, leaving room for protocol metadata. */
 const MAX_RPC_TEXT_FIELD_HEADROOM_BYTES = 1024;
 /** Text-field limit leaves envelope/newline headroom inside the planned JSON-line transport ceiling. */

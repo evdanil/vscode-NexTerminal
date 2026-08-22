@@ -1,0 +1,159 @@
+import { PassThrough } from "node:stream";
+import { describe, expect, it } from "vitest";
+import { MAX_RPC_LINE_BYTES, attachBoundedLineReader } from "../../../src/services/networkServers/boundedLineReader";
+
+type FramingCase = {
+  readonly name: string;
+  readonly chunks: readonly Buffer[];
+  readonly lines: readonly string[];
+};
+
+const FRAMING_CASES: readonly FramingCase[] = [
+  {
+    name: "multiple complete lines and a residual line across chunks",
+    chunks: [Buffer.from("first\nsecond\nres"), Buffer.from("idual\nthird\n")],
+    lines: ["first", "second", "residual", "third"],
+  },
+  {
+    name: "a UTF-8 code point split across chunks",
+    chunks: [Buffer.from([0x65, 0x75, 0x72, 0x6f, 0x3a, 0xe2]), Buffer.from([0x82, 0xac, 0x0a])],
+    lines: ["euro:€"],
+  },
+  {
+    name: "empty lines",
+    chunks: [Buffer.from("\n\n")],
+    lines: ["", ""],
+  },
+  {
+    name: "a CRLF line",
+    chunks: [Buffer.from("windows\r\none\r\r\n")],
+    lines: ["windows", "one\r"],
+  },
+];
+
+function listenerCounts(stream: PassThrough): { readonly data: number; readonly end: number } {
+  return { data: stream.listenerCount("data"), end: stream.listenerCount("end") };
+}
+
+function ended(stream: PassThrough): Promise<void> {
+  return new Promise((resolve) => stream.once("end", resolve));
+}
+
+describe("bounded RPC line reader", () => {
+  it.each(FRAMING_CASES)("delivers $name", ({ chunks, lines: expectedLines }) => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    for (const chunk of chunks) stream.write(chunk);
+
+    expect(lines).toEqual(expectedLines);
+    expect(errors).toEqual([]);
+    dispose();
+  });
+
+  it("accepts exactly the byte limit before a newline without counting the delimiter", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    stream.write(Buffer.alloc(MAX_RPC_LINE_BYTES, 0x61));
+    expect(lines).toEqual([]);
+    expect(errors).toEqual([]);
+    stream.write(Buffer.from("\n"));
+
+    expect(lines).toHaveLength(1);
+    expect(Buffer.byteLength(lines[0]!, "utf8")).toBe(MAX_RPC_LINE_BYTES);
+    expect(errors).toEqual([]);
+    dispose();
+  });
+
+  it("reports once and detaches after byte 1,048,577 before a newline", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    stream.write(Buffer.alloc(MAX_RPC_LINE_BYTES + 1, 0x61));
+    stream.write(Buffer.alloc(MAX_RPC_LINE_BYTES + 1, 0x62));
+    stream.write(Buffer.from("late\n"));
+    stream.emit("end");
+
+    expect(lines).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(Error);
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+    dispose();
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+  });
+
+  it("delivers a bounded unterminated final line at EOF and preserves a bare CR", async () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    const streamEnded = ended(stream);
+    stream.end(Buffer.from("bare\r"));
+    await streamEnded;
+
+    expect(lines).toEqual(["bare\r"]);
+    expect(errors).toEqual([]);
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+    dispose();
+  });
+
+  it("does not deliver a line when EOF has no buffered bytes", async () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    const streamEnded = ended(stream);
+    stream.end();
+    await streamEnded;
+
+    expect(lines).toEqual([]);
+    expect(errors).toEqual([]);
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+    dispose();
+  });
+
+  it("removes its listeners idempotently without delivering buffered data", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+
+    expect(listenerCounts(stream)).toEqual({ data: 1, end: 1 });
+    stream.write(Buffer.from("buffered"));
+    dispose();
+    dispose();
+    stream.write(Buffer.from("-ignored\n"));
+    stream.emit("end");
+
+    expect(lines).toEqual([]);
+    expect(errors).toEqual([]);
+    expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
+  });
+});

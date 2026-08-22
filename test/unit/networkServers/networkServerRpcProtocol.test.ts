@@ -8,10 +8,10 @@ import {
   parseRpcRequest,
   rpcResultParsers,
 } from "../../../src/services/networkServers/networkServerRpcProtocol";
+import { MAX_RPC_LINE_BYTES } from "../../../src/services/networkServers/boundedLineReader";
 import { validateOptions } from "../../../src/services/networkServers/tftp/engine/protocol";
 
 const DHCP_RUNTIME_LEASE_MAX = 65_536 + 1_024;
-const PLANNED_LINE_BYTE_LIMIT = 1_048_576;
 const TEXT_FIELD_BYTE_LIMIT = 1_047_552;
 
 const TFTP_SNAPSHOT = {
@@ -324,7 +324,7 @@ describe("network-server RPC protocol", () => {
       const eventAtLimit = { event: "log", data: { id: "daemon", level: "info", message: messageAtLimit } } as const;
       expect(Buffer.byteLength(messageAtLimit, "utf8")).toBe(TEXT_FIELD_BYTE_LIMIT);
       expectAccepted(parseRpcEvent(eventAtLimit));
-      expect(Buffer.byteLength(`${JSON.stringify(eventAtLimit)}\n`, "utf8")).toBeLessThanOrEqual(PLANNED_LINE_BYTE_LIMIT);
+      expect(Buffer.byteLength(`${JSON.stringify(eventAtLimit)}\n`, "utf8")).toBeLessThanOrEqual(MAX_RPC_LINE_BYTES);
 
       const messageOneByteOver = `${messageAtLimit}a`;
       expect(Buffer.byteLength(messageOneByteOver, "utf8")).toBe(TEXT_FIELD_BYTE_LIMIT + 1);
