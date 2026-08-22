@@ -182,7 +182,8 @@ export interface DhcpEngineConfig {
   readonly tftpServerAddresses?: readonly string[];
   /**
    * Option 60 of the *incoming* request to match before the boot options
-   * above are served. Empty means serve them to every client.
+   * above are served. Omission serves every client; a direct caller's
+   * explicit blank value is retained as a fail-closed marker.
    */
   readonly vendorClassId?: string;
   /** Option 43 — vendor-specific sub-options, TLV-encoded onto the wire. */
@@ -367,10 +368,10 @@ export class DhcpEngine extends EventEmitter {
       bootFileName: cfg.bootFileName,
       nextServer: cfg.nextServer,
       tftpServerAddresses: cfg.tftpServerAddresses ? [...cfg.tftpServerAddresses] : undefined,
-      // Configuration ingress rejects blank filters. Trim direct callers too:
-      // option 60 matching treats whitespace as insignificant, so retaining a
-      // blank string here would silently turn a supposed restriction off.
-      vendorClassId: cfg.vendorClassId?.trim() || undefined,
+      // Configuration ingress rejects blank filters. Direct callers retain an
+      // explicit blank as the fail-closed marker, so it cannot widen to the
+      // intentionally unrestricted omitted configuration.
+      vendorClassId: cfg.vendorClassId === undefined ? undefined : cfg.vendorClassId.trim(),
       vendorSpecificOptions: cfg.vendorSpecificOptions ? [...cfg.vendorSpecificOptions] : undefined,
     };
     this._log = logger;
@@ -779,10 +780,12 @@ export class DhcpEngine extends EventEmitter {
     }
 
     if (forced.length === 0) return {};
-    this._log(
-      'info',
-      `Engine: serving boot options [${forced.join(', ')}]${this._cfg.vendorClassId ? ` to clients whose option 60 is "${this._cfg.vendorClassId}"` : ' to every client'}.`,
-    );
+    const vendorClassScope = this._cfg.vendorClassId === undefined
+      ? ' to every client'
+      : this._cfg.vendorClassId.length === 0
+        ? ' to no clients (explicit blank vendor filter)'
+        : ` to clients whose option 60 is "${this._cfg.vendorClassId}"`;
+    this._log('info', `Engine: serving boot options [${forced.join(', ')}]${vendorClassScope}.`);
     return { ...boot, forceOptions: forced };
   }
 
@@ -796,8 +799,9 @@ export class DhcpEngine extends EventEmitter {
    * would be encoded as a real, empty option.
    */
   private gateOnVendorClass<T>(value: T): DhcpConfigValue<T> {
-    const vendorClassId = this._cfg.vendorClassId?.trim();
-    if (!vendorClassId) return value;
+    const vendorClassId = this._cfg.vendorClassId;
+    if (vendorClassId === undefined) return value;
+    if (vendorClassId.length === 0) return () => null;
     return (requestOptions) =>
       matchesVendorClass(vendorClassId, requestOptions[VENDOR_CLASS_REQUEST_ATTR]) ? value : null;
   }

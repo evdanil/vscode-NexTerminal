@@ -161,6 +161,24 @@ describe("DHCP boot options — wiring into the `dhcp` library", () => {
     expect(silent[66]).toBeNull();
   });
 
+  it("fails closed for an explicit blank vendor filter supplied to the engine directly", () => {
+    const offered = resolveOfferedOptions({
+      ...BASE,
+      // Strict daemon/RPC ingress rejects this. Direct construction must not
+      // erase it into the unrestricted `undefined` configuration.
+      vendorClassId: " \t ",
+      nextServer: "172.28.1.1",
+      bootFileName: "restricted.cfg",
+      tftpServerAddresses: ["172.28.1.1"],
+      vendorSpecificOptions: [{ subOption: 1, value: "172.28.1.1" }]
+    }, "PXEClient");
+
+    expect(offered[66]).toBeNull();
+    expect(offered[67]).toBeNull();
+    expect(offered[150]).toBeNull();
+    expect(offered[43]).toBeNull();
+  });
+
   it("drops an unencodable option 43 without disturbing the other boot options", () => {
     const offered = resolveOfferedOptions({
       ...BASE,

@@ -85,6 +85,35 @@ describe("DHCP Adapter (DhcpAdapter)", () => {
       expect(new DhcpAdapter().bindAddress).toBe("0.0.0.0");
       expect(new DhcpAdapter({ bindAddress: "127.0.0.1" }).bindAddress).toBe("127.0.0.1");
     });
+
+    it("keeps a direct blank vendor filter fail-closed after the adapter starts", async () => {
+      const port = await freeLoopbackPort();
+      const adapter = new DhcpAdapter({
+        rangeStart: "172.28.1.10",
+        rangeEnd: "172.28.1.20",
+        subnet: "255.255.255.0",
+        gateway: "172.28.1.1",
+        serverId: "172.28.1.1",
+        broadcast: "127.0.0.1",
+        bindAddress: "127.0.0.1",
+        vendorClassId: " \t ",
+        nextServer: "172.28.1.1",
+        bootFileName: "restricted.cfg"
+      });
+      (adapter as any).port = port;
+
+      try {
+        await adapter.start();
+        const server: any = (adapter as any).engine._server;
+        server._req = { options: { 60: "PXEClient" } };
+        const offered = server._getOptions({}, [], undefined);
+
+        expect(offered[66]).toBeNull();
+        expect(offered[67]).toBeNull();
+      } finally {
+        await adapter.stop();
+      }
+    });
   });
 
   describe("smoke start/close (UDP bind real)", () => {

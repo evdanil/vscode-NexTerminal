@@ -123,7 +123,9 @@ export class DhcpAdapter extends BaseNexusServer {
       bootFileName: config.bootFileName,
       nextServer: config.nextServer,
       tftpServerAddresses: config.tftpServerAddresses ? [...config.tftpServerAddresses] : undefined,
-      vendorClassId: config.vendorClassId?.trim() || undefined,
+      // Preserve an explicitly blank direct-construction filter as the
+      // engine's fail-closed marker; only omission is unrestricted.
+      vendorClassId: config.vendorClassId === undefined ? undefined : config.vendorClassId.trim(),
       vendorSpecificOptions: config.vendorSpecificOptions ? [...config.vendorSpecificOptions] : undefined,
     };
   }
