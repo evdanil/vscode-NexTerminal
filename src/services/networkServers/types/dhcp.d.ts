@@ -79,8 +79,8 @@ declare module 'dhcp' {
     listening: [sock: Socket];
     close: [];
     error: [err: Error, data?: any];
-    /** A malformed/request-level packet was rejected; the UDP socket remains owned and running. */
-    packetError: [err: Error, req?: any];
+    /** Correlates a packet rejection with whether the request entered the `message` event pipeline. */
+    packetError: [err: Error, req?: any, metadata?: { readonly messageEmitted: boolean }];
     message: [req: any];
     bound: [state: Record<string, LeaseState>];
     poolExhausted: [req: any];

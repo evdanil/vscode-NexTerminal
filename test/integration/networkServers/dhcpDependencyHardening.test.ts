@@ -15,6 +15,7 @@ import {
   toRestoredLeaseState
 } from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
 import type { DhcpLeaseInfo } from "../../../src/services/networkServers/dhcp/engine/dhcpLeaseUtils";
+import { DhcpEngine } from "../../../src/services/networkServers/dhcp/engine/DhcpEngine";
 
 const FIXTURE = path.resolve(__dirname, "..", "..", "fixtures", "dhcpAllocatorProbe.js");
 const PROBE_DEADLINE_MS = 500;
@@ -138,6 +139,18 @@ async function sendLoopbackPacket(packet: Buffer, port: number): Promise<void> {
   }
 }
 
+/** Keeps the real DHCP OFFER send path free of ICMP-port-unreachable noise. */
+function createReplySink(): Promise<() => Promise<void>> {
+  const sink = dgram.createSocket({ type: "udp4", reuseAddr: true });
+  return new Promise((resolve) => {
+    const close = async (): Promise<void> => {
+      await new Promise<void>((done) => sink.close(() => done()));
+    };
+    sink.once("error", () => resolve(async () => undefined));
+    sink.bind(68, "127.0.0.1", () => resolve(close));
+  });
+}
+
 async function freeLoopbackPort(): Promise<number> {
   const probe = dgram.createSocket("udp4");
   try {
@@ -182,12 +195,12 @@ async function createPacketServer(): Promise<{ server: any; port: number; close:
   };
 }
 
-function oncePacketError(server: any): Promise<[Error, unknown?]> {
+function oncePacketError(server: any): Promise<[Error, unknown?, { messageEmitted?: boolean }?]> {
   return new Promise((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout>;
-    const onPacketError = (error: Error, req?: unknown): void => {
+    const onPacketError = (error: Error, req?: unknown, metadata?: { messageEmitted?: boolean }): void => {
       clearTimeout(timer);
-      resolve([error, req]);
+      resolve([error, req, metadata]);
     };
     timer = setTimeout(() => {
       server.off("packetError", onPacketError);
@@ -200,6 +213,23 @@ function oncePacketError(server: any): Promise<[Error, unknown?]> {
 function onceMessage(server: any): Promise<unknown> {
   return new Promise((resolve) => {
     server.once("message", resolve);
+  });
+}
+
+/** A deadline is diagnostic only: the test otherwise waits on the real completion callback. */
+function within<T>(promise: Promise<T>, description: string, timeoutMs = 750): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${description} was not observed within ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
 }
 
@@ -293,6 +323,7 @@ async function runAllocatorProbe(mode = "select-exhausted"): Promise<ProbeReply>
 describe("dhcp@0.2.20 dependency hardening", () => {
   it("contains malformed datagrams as packetError and remains responsive on the same loopback port", async () => {
     const { server, port, close } = await createPacketServer();
+    const closeReplySink = await createReplySink();
     const fatalErrors: unknown[] = [];
     server.on("error", (error: unknown) => fatalErrors.push(error));
 
@@ -311,11 +342,30 @@ describe("dhcp@0.2.20 dependency hardening", () => {
       }
 
       expect(fatalErrors).toEqual([]);
+      const originalSend = server._sock.send.bind(server._sock);
+      let completeOfferSend: (() => void) | undefined;
+      let failOfferSend: ((error: Error) => void) | undefined;
+      const offerSent = new Promise<void>((resolve, reject) => {
+        completeOfferSend = resolve;
+        failOfferSend = reject;
+      });
+      server._sock.send = (...args: unknown[]): unknown => {
+        const callback = args.at(-1);
+        if (typeof callback !== "function") throw new Error("expected dgram send callback");
+        args[args.length - 1] = (error: Error | null): void => {
+          callback(error);
+          if (error) failOfferSend?.(error);
+          else completeOfferSend?.();
+        };
+        return originalSend(...args);
+      };
       const message = onceMessage(server);
       await sendLoopbackPacket(buildPacket(1), port);
       await expect(message).resolves.toMatchObject({ options: { 53: 1 } });
+      await expect(within(offerSent, "OFFER send completion")).resolves.toBeUndefined();
       expect(fatalErrors).toEqual([]);
     } finally {
+      await closeReplySink();
       await close();
     }
 
@@ -327,6 +377,133 @@ describe("dhcp@0.2.20 dependency hardening", () => {
       });
     } finally {
       await new Promise<void>((resolve) => rebound.close(() => resolve()));
+    }
+  });
+
+  it("observes every allowed client type actively and every known type passively", () => {
+    const active = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+    const activeMessages: number[] = [];
+    const activePacketErrors: Error[] = [];
+    active.handleDiscover = () => undefined;
+    active.handleRequest = () => undefined;
+    active.handleRelease = () => undefined;
+    active.on("message", (req: { options?: Record<number, number> }) => activeMessages.push(req.options?.[53] ?? -1));
+    active.on("packetError", (error: Error) => activePacketErrors.push(error));
+
+    for (const type of [1, 3, 4, 7, 8]) {
+      active._sock.emit("message", buildPacket(type));
+    }
+
+    expect(activeMessages).toEqual([1, 3, 4, 7, 8]);
+    expect(activePacketErrors).toEqual([]);
+
+    for (const type of [2, 5, 6, 0, 9]) {
+      active._sock.emit("message", buildPacket(type));
+    }
+    expect(activePacketErrors).toHaveLength(5);
+
+    const passive: any = dhcp.createBroadcastHandler();
+    openSockets.push(passive._sock);
+    const passiveMessages: number[] = [];
+    const passivePacketErrors: Error[] = [];
+    passive.on("message", (req: { options?: Record<number, number> }) => passiveMessages.push(req.options?.[53] ?? -1));
+    passive.on("packetError", (error: Error) => passivePacketErrors.push(error));
+
+    for (let type = 1; type <= 8; type += 1) {
+      passive._sock.emit("message", buildPacket(type));
+    }
+
+    expect(passiveMessages).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(passivePacketErrors).toEqual([]);
+  });
+
+  it("rejects a parser-produced non-integer DHCP message type", () => {
+    const server = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+    const protocol = require("dhcp/lib/protocol.js") as { parse: (packet: Buffer) => unknown };
+    vi.spyOn(protocol, "parse").mockReturnValue({ op: 1, options: { 53: 1.5 } });
+    const packetErrors: Error[] = [];
+    server.on("packetError", (error: Error) => packetErrors.push(error));
+
+    server._sock.emit("message", Buffer.alloc(0));
+
+    expect(packetErrors).toHaveLength(1);
+    expect(packetErrors[0]).toBeInstanceOf(Error);
+  });
+
+  it("normalizes downstream non-Error, synchronous-send, and asynchronous-send failures", async () => {
+    const { server, port, close } = await createPacketServer();
+    const fatalErrors: unknown[] = [];
+    server.on("error", (error: unknown) => fatalErrors.push(error));
+
+    try {
+      const nonErrorThrower = (): void => {
+        throw "downstream non-Error failure";
+      };
+      server.once("message", nonErrorThrower);
+      const downstream = oncePacketError(server);
+      await sendLoopbackPacket(buildPacket(1), port);
+      await expect(downstream).resolves.toMatchObject([expect.any(Error), expect.anything(), { messageEmitted: true }]);
+
+      const originalSend = server._sock.send.bind(server._sock);
+      server._sock.send = (): never => {
+        throw "synchronous send failure";
+      };
+      const synchronous = oncePacketError(server);
+      await sendLoopbackPacket(buildPacket(1), port);
+      await expect(synchronous).resolves.toMatchObject([expect.any(Error), expect.anything(), { messageEmitted: true }]);
+
+      server._sock.send = (...args: unknown[]): unknown => {
+        const callback = args.at(-1);
+        if (typeof callback !== "function") throw new Error("expected dgram send callback");
+        queueMicrotask(() => callback("asynchronous send failure"));
+        return undefined;
+      };
+      const asynchronous = oncePacketError(server);
+      await sendLoopbackPacket(buildPacket(1), port);
+      await expect(asynchronous).resolves.toMatchObject([expect.any(Error), expect.anything(), { messageEmitted: true }]);
+      server._sock.send = originalSend;
+
+      expect(fatalErrors).toEqual([]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("counts each rejected datagram exactly once across the message boundary", async () => {
+    const port = await freeLoopbackPort();
+    const warnings: string[] = [];
+    const engine = new DhcpEngine(
+      {
+        rangeStart: "192.0.2.10",
+        rangeEnd: "192.0.2.11",
+        subnet: "255.255.255.0",
+        gateway: "192.0.2.1",
+        serverId: "192.0.2.1",
+        broadcast: "127.0.0.1",
+        bindAddress: "127.0.0.1"
+      },
+      () => undefined
+    );
+    engine.on("log", (level, message) => {
+      if (level === "warn") warnings.push(message);
+    });
+
+    try {
+      await engine.start(port);
+
+      await sendLoopbackPacket(Buffer.from([1, 1, 6]), port);
+      await vi.waitFor(() => expect(warnings).toHaveLength(1));
+      expect(engine.packetCounters.packetsReceived).toBe(1);
+
+      const server: any = (engine as any)._server;
+      server.once("message", () => {
+        throw new Error("post-message observer failure");
+      });
+      await sendLoopbackPacket(buildPacket(1), port);
+      await vi.waitFor(() => expect(warnings).toHaveLength(2));
+      expect(engine.packetCounters.packetsReceived).toBe(2);
+    } finally {
+      await engine.stop();
     }
   });
 

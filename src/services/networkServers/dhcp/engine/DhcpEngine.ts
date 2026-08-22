@@ -97,6 +97,13 @@ function describePacketClient(value: unknown): string {
   return typeof mac === 'string' && mac.length > 0 ? `MAC ${mac}` : 'unknown client';
 }
 
+/** A dependency release identity is usable only if it becomes an exact `_state` key. */
+function canonicalReleasedMac(value: unknown): string | null {
+  if (typeof value !== 'string' || value.trim().length === 0) return null;
+  const mac = toLibraryMacKey(value);
+  return /^(?:[0-9A-F]{2}-){5}[0-9A-F]{2}$/.test(mac) ? mac : null;
+}
+
 /**
  * Teaches the `dhcp` library about option 150, which it does not ship.
  *
@@ -893,26 +900,51 @@ export class DhcpEngine extends EventEmitter {
       }
     }
 
-    // Emit events.
-    for (const l of boundMsgs) this.emit('lease:bound', l);
-    for (const l of renewedMsgs) this.emit('lease:renewed', l);
-    for (const l of releasedMsgs) this.emit('lease:released', l);
-
     if (boundMsgs.length > 0 || renewedMsgs.length > 0 || releasedMsgs.length > 0) {
       this._leaseStore?.schedule();
     }
 
-    // Save state for next diff.
-    this._prevLeaseKeys = currKeys;
+    // Establish the next baseline before public observers run. A synchronous
+    // observer is allowed to stop/throw, but it must not leave a stale lease
+    // diff or discard the persistence schedule that was just queued.
+    this._refreshLeaseBaseline();
+
+    // Emit events only after durable work and internal reconciliation.
+    for (const l of boundMsgs) this.emit('lease:bound', l);
+    for (const l of renewedMsgs) this.emit('lease:renewed', l);
+    for (const l of releasedMsgs) this.emit('lease:released', l);
+  }
+
+  /** Rebuilds the active-lease diff baseline from the current dependency state. */
+  private _refreshLeaseBaseline(): void {
+    if (!this._server) {
+      this._prevLeaseKeys.clear();
+      this._prevBindTimes.clear();
+      return;
+    }
+    const state = this._server._state as Record<string, LeaseState>;
+    const currKeys = new Set<string>(
+      Object.keys(state).filter((mac) => state[mac]?.state !== RESERVED_LEASE_STATE),
+    );
+    const now = Date.now();
     const nextBindTimes = new Map<string, number>();
     for (const mac of currKeys) {
       const entry = state[mac];
       if (entry) {
-        const bt = entry.bindTime instanceof Date ? entry.bindTime.getTime() : now;
-        nextBindTimes.set(mac, bt);
+        const bindTime = entry.bindTime instanceof Date ? entry.bindTime.getTime() : now;
+        nextBindTimes.set(mac, bindTime);
       }
     }
+    this._prevLeaseKeys = currKeys;
     this._prevBindTimes = nextBindTimes;
+  }
+
+  /** Returns a current static reservation only when it belongs to this canonical key. */
+  private _staticAddressForMac(mac: string): string | undefined {
+    for (const [configuredMac, address] of Object.entries(this._cfg.static ?? {})) {
+      if (toLibraryMacKey(configuredMac) === mac) return address;
+    }
+    return undefined;
   }
 
   /** Best effort to recover the released IP (querying old entry if still available in cache; if not, returns null). */
@@ -991,9 +1023,11 @@ export class DhcpEngine extends EventEmitter {
       this.emit('error', err);
       this.emit('log', 'error', msg);
     });
-    server.on('packetError', (error, req) => {
+    server.on('packetError', (error, req, metadata) => {
       const err = toError(error);
-      this._counters.packetsReceived += 1;
+      // `message` already increments this counter. The package gives us an
+      // explicit correlation bit instead of inferring ordering from callbacks.
+      if (metadata?.messageEmitted !== true) this._counters.packetsReceived += 1;
       const msg = `Engine: dropped malformed DHCP packet from ${describePacketClient(req)}: ${err.message}`;
       this._log('warn', msg);
       this.emit('log', 'warn', msg);
@@ -1020,17 +1054,32 @@ export class DhcpEngine extends EventEmitter {
       }
     });
     server.on('released', (rawMac, rawAddress) => {
-      const mac = typeof rawMac === 'string' && rawMac.length > 0 ? rawMac : '??:??:??:??:??:??';
+      const mac = canonicalReleasedMac(rawMac);
+      if (!mac) {
+        const msg = 'Engine: dropped dependency release with an invalid client identity.';
+        this._log('warn', msg);
+        this.emit('log', 'warn', msg);
+        this._refreshLeaseBaseline();
+        return;
+      }
       const ip = typeof rawAddress === 'string' && rawAddress.length > 0 ? rawAddress : null;
 
       // The dependency emits `message` before RELEASE deletes `_state`, so the
-      // message-time diff still sees this lease. Reconcile the post-delete
-      // state here to preserve the former address and avoid a duplicate on the
-      // next packet.
-      this._prevLeaseKeys.delete(mac);
-      this._prevBindTimes.delete(mac);
-      this.emit('lease:released', { mac, ip });
+      // message-time diff still sees this lease. Accept only a release of an
+      // active baseline entry, restore an in-pool static placeholder when it
+      // was a real static BOUND lease, then establish the new baseline before
+      // public observers can re-enter the lifecycle.
+      if (!this._prevLeaseKeys.has(mac)) {
+        this._refreshLeaseBaseline();
+        return;
+      }
+      const staticAddress = this._staticAddressForMac(mac);
+      if (ip !== null && staticAddress === ip && isIpInPool(ip, this.rangeStart, this.rangeEnd)) {
+        (server._state as Record<string, LeaseState>)[mac] = toReservedLeaseState(ip, this.serverId, this.leaseTimeSec);
+      }
+      this._refreshLeaseBaseline();
       this._leaseStore?.schedule();
+      this.emit('lease:released', { mac, ip });
     });
   }
 }

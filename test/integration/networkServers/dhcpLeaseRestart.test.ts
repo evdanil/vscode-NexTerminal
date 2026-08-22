@@ -32,7 +32,6 @@ import * as path from "node:path";
 
 import { DhcpEngine } from "../../../src/services/networkServers/dhcp/engine/DhcpEngine";
 import {
-  LEASE_PERSIST_DEBOUNCE_MS,
   loadLeases
 } from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
 
@@ -70,7 +69,7 @@ afterEach(async () => {
 });
 
 /** Assembles a BOOTREQUEST the `dhcp` library's parser accepts (RFC 2131 layout). */
-function buildRequest(messageType: 1 | 3, mac: string, xid: number): Buffer {
+function buildRequest(messageType: number, mac: string, xid: number): Buffer {
   const packet = Buffer.alloc(300);
   let offset = 0;
   packet.writeUInt8(1, offset++); // op: BOOTREQUEST
@@ -155,7 +154,7 @@ function createReplySink(): Promise<() => Promise<void>> {
   });
 }
 
-function startEngine(port: number, leaseStorePath: string): DhcpEngine {
+function startEngine(port: number, leaseStorePath: string, staticLeases: Record<string, string> = {}): DhcpEngine {
   const engine = new DhcpEngine(
     {
       rangeStart: RANGE_START,
@@ -168,7 +167,8 @@ function startEngine(port: number, leaseStorePath: string): DhcpEngine {
       broadcast: "127.0.0.1",
       bindAddress: "127.0.0.1",
       leaseTimeSec: 3600,
-      leaseStorePath
+      leaseStorePath,
+      static: staticLeases
     },
     () => undefined
   );
@@ -238,8 +238,9 @@ describe("DHCP lease persistence across a restart", () => {
     await engine.start(port);
 
     await expect(acquireLease(engine, port, CLIENT_A)).resolves.toBe(RANGE_START);
-    await new Promise((resolve) => setTimeout(resolve, LEASE_PERSIST_DEBOUNCE_MS + 50));
-    expect(loadLeases(storePath)).toMatchObject([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+    await vi.waitFor(() => {
+      expect(loadLeases(storePath)).toMatchObject([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+    });
 
     const released: Array<{ mac: string; ip: string | null }> = [];
     engine.on("lease:released", (lease) => released.push(lease));
@@ -250,12 +251,95 @@ describe("DHCP lease persistence across a restart", () => {
       expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
     });
 
-    await new Promise((resolve) => setTimeout(resolve, LEASE_PERSIST_DEBOUNCE_MS + 50));
-    expect(loadLeases(storePath)).toEqual([]);
+    await vi.waitFor(() => expect(loadLeases(storePath)).toEqual([]));
 
     scriptAddressPicks(PICK_FIRST);
     await expect(offeredAddress(engine, port, CLIENT_B)).resolves.toBe(RANGE_START);
     expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+  }, 30_000);
+
+  it("canonicalizes an immediate dependency release and drops invalid identities without duplicates", async () => {
+    const storePath = makeStore("nexus-dhcp-canonical-release-");
+    cleanups.push(await createReplySink());
+    scriptAddressPicks(PICK_FIRST, PICK_SECOND);
+    const port = await freePort();
+    const engine = startEngine(port, storePath);
+    cleanups.push(() => engine.stop());
+    const released: Array<{ mac: string; ip: string | null }> = [];
+    const warnings: string[] = [];
+    engine.on("lease:released", (lease) => released.push(lease));
+    engine.on("log", (level, message) => {
+      if (level === "warn") warnings.push(message);
+    });
+    await engine.start(port);
+    await expect(acquireLease(engine, port, CLIENT_A)).resolves.toBe(RANGE_START);
+
+    const server: any = (engine as any)._server;
+    delete server._state[stateKey(CLIENT_A)];
+    server.emit("released", CLIENT_A, RANGE_START);
+
+    expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+    expect((engine as any)._prevLeaseKeys).not.toContain(stateKey(CLIENT_A));
+
+    server.emit("released", null, RANGE_START);
+    server.emit("released", "not-a-mac", RANGE_START);
+    expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+    expect(warnings).toHaveLength(2);
+
+    server._sock.emit("message", buildRequest(4, CLIENT_B, 0x9876));
+    expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+  }, 30_000);
+
+  it("restores an invisible static reservation as soon as its BOUND lease is released", async () => {
+    const storePath = makeStore("nexus-dhcp-static-release-");
+    cleanups.push(await createReplySink());
+    scriptAddressPicks(PICK_FIRST);
+    const port = await freePort();
+    const engine = startEngine(port, storePath, { [CLIENT_A]: RANGE_START });
+    cleanups.push(() => engine.stop());
+    await engine.start(port);
+    await expect(acquireLease(engine, port, CLIENT_A)).resolves.toBe(RANGE_START);
+
+    const released: Array<{ mac: string; ip: string | null }> = [];
+    engine.on("lease:released", (lease) => released.push(lease));
+    await sendPacket(newClient(), buildRelease(CLIENT_A, RANGE_START, 0x8765), port);
+
+    await vi.waitFor(() => {
+      const server: any = (engine as any)._server;
+      expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+      expect(server._state[stateKey(CLIENT_A)]).toMatchObject({ address: RANGE_START, state: "RESERVED" });
+      expect(engine.activeLeases()).toEqual([]);
+      expect(loadLeases(storePath)).toEqual([]);
+    });
+
+    await expect(offeredAddress(engine, port, CLIENT_B)).resolves.toBe("10.0.0.11");
+  }, 30_000);
+
+  it("schedules the release snapshot before a synchronous observer can stop and throw", async () => {
+    const storePath = makeStore("nexus-dhcp-reentrant-release-");
+    cleanups.push(await createReplySink());
+    scriptAddressPicks(PICK_FIRST);
+    const port = await freePort();
+    const engine = startEngine(port, storePath);
+    cleanups.push(() => engine.stop());
+    await engine.start(port);
+    await expect(acquireLease(engine, port, CLIENT_A)).resolves.toBe(RANGE_START);
+    await vi.waitFor(() => {
+      expect(loadLeases(storePath)).toMatchObject([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+    });
+
+    let stopPromise: Promise<void> | undefined;
+    engine.on("lease:released", () => {
+      stopPromise = engine.stop();
+      throw new Error("reentrant release observer failed");
+    });
+    const server: any = (engine as any)._server;
+    delete server._state[stateKey(CLIENT_A)];
+
+    expect(() => server.emit("released", stateKey(CLIENT_A), RANGE_START)).toThrow("reentrant release observer failed");
+    await expect(stopPromise).resolves.toBeUndefined();
+    expect((engine as any)._prevLeaseKeys).not.toContain(stateKey(CLIENT_A));
+    await vi.waitFor(() => expect(loadLeases(storePath)).toEqual([]));
   }, 30_000);
 
   it("recovers a bound lease and keeps its address reserved for the original device", async () => {

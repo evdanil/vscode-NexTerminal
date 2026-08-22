@@ -1,5 +1,5 @@
 diff --git a/node_modules/dhcp/lib/dhcp.js b/node_modules/dhcp/lib/dhcp.js
-index e009e81..79829f6 100644
+index e009e81..3b1593e 100644
 --- a/node_modules/dhcp/lib/dhcp.js
 +++ b/node_modules/dhcp/lib/dhcp.js
 @@ -6,6 +6,8 @@
@@ -41,7 +41,11 @@ index e009e81..79829f6 100644
  function Lease() {
  
  }
-@@ -67,37 +85,45 @@ function Server(config, listenOnly) {
+@@ -64,40 +82,64 @@ function Server(config, listenOnly) {
+   sock.on('message', function(buf) {
+ 
+     let req;
++    let messageEmitted = false;
  
      try {
        req = Protocol.parse(buf);
@@ -60,21 +64,29 @@ index e009e81..79829f6 100644
 -      self.emit('error', new Error('Malformed packet'), req);
 -      return;
 -    }
--
--    if (!req.options[53]) {
--      self.emit('error', new Error('Got message, without valid message type'), req);
--      return;
--    }
 +      if (req.op !== BOOTREQUEST) {
 +        throw new Error('Malformed packet');
 +      }
  
--    self.emit('message', req);
+-    if (!req.options[53]) {
+-      self.emit('error', new Error('Got message, without valid message type'), req);
+-      return;
+-    }
 +      const messageType = req.options[53];
-+      if (
++      if (!Number.isInteger(messageType) || messageType < DHCPDISCOVER || messageType > DHCPINFORM) {
++        throw new Error('Got message, without valid message type');
++      }
+ 
+-    self.emit('message', req);
++      // Passive broadcast listeners observe every DHCP type. An active server
++      // only accepts client-originated types; DECLINE/INFORM are intentionally
++      // no-ops after observation because this dependency has no response path.
++      if (!listenOnly &&
 +        messageType !== DHCPDISCOVER &&
 +        messageType !== DHCPREQUEST &&
-+        messageType !== DHCPRELEASE
++        messageType !== DHCPDECLINE &&
++        messageType !== DHCPRELEASE &&
++        messageType !== DHCPINFORM
 +      ) {
 +        throw new Error('Got message, without valid message type');
 +      }
@@ -90,6 +102,9 @@ index e009e81..79829f6 100644
 -          break;
 -        default:
 -          console.error("Not implemented method", req.options[53]);
++      // The engine receives this metadata on a later packetError so it can
++      // count one datagram once even if a message observer/handler then fails.
++      messageEmitted = true;
 +      self.emit('message', req);
 +
 +      if (!listenOnly) {
@@ -104,16 +119,19 @@ index e009e81..79829f6 100644
 +          case DHCPRELEASE: // 7.
 +            self.handleRelease(req);
 +            break;
++          case DHCPDECLINE: // 4.
++          case DHCPINFORM: // 8.
++            break;
 +          default:
 +            throw new Error('Unsupported DHCP message type ' + messageType);
 +        }
        }
 +    } catch (error) {
-+      self.emit('packetError', asPacketError(error), req);
++      self.emit('packetError', asPacketError(error), req, {messageEmitted: messageEmitted});
      }
    });
  
-@@ -199,7 +225,7 @@ Server.prototype = {
+@@ -199,7 +241,7 @@ Server.prototype = {
          }
  
        } else {
@@ -122,7 +140,7 @@ index e009e81..79829f6 100644
        }
      }
  
-@@ -221,7 +247,7 @@ Server.prototype = {
+@@ -221,7 +263,7 @@ Server.prototype = {
            }
  
          } else {
@@ -131,7 +149,7 @@ index e009e81..79829f6 100644
          }
        }
      }
-@@ -257,19 +283,49 @@ Server.prototype = {
+@@ -257,19 +299,49 @@ Server.prototype = {
       *
       * 1. Is there a wish for static binding?
       *
@@ -188,7 +206,7 @@ index e009e81..79829f6 100644
  
      // If existing lease for a mac address is present, re-use the IP
      if (this._state[clientMAC] && this._state[clientMAC].address) {
-@@ -279,89 +335,66 @@ Server.prototype = {
+@@ -279,89 +351,66 @@ Server.prototype = {
  
  
      // Is there a static binding?
@@ -307,7 +325,7 @@ index e009e81..79829f6 100644
  
      this.sendOffer(req);
    },
-@@ -401,12 +434,24 @@ Server.prototype = {
+@@ -401,12 +450,24 @@ Server.prototype = {
    handleRequest: function(req) {
      //console.log('Handle Request', req);
  
@@ -333,7 +351,7 @@ index e009e81..79829f6 100644
  
      this.sendAck(req);
    },
-@@ -470,8 +515,25 @@ Server.prototype = {
+@@ -470,8 +531,25 @@ Server.prototype = {
      this._send(this.config('broadcast'), ans);
    },
  
@@ -360,7 +378,7 @@ index e009e81..79829f6 100644
    },
  
    handleRenew: function() {
-@@ -497,10 +559,12 @@ Server.prototype = {
+@@ -497,10 +575,12 @@ Server.prototype = {
    _send: function(host, data) {
  
      const sb = Protocol.format(data);
@@ -370,7 +388,7 @@ index e009e81..79829f6 100644
      this._sock.send(sb._data, 0, sb._w, CLIENT_PORT, host, function(err, bytes) {
        if (err) {
 -        console.log(err);
-+        self.emit('packetError', asPacketError(err), req);
++        self.emit('packetError', asPacketError(err), req, {messageEmitted: true});
        } else {
          //console.log('Sent ', bytes, 'bytes');
        }
