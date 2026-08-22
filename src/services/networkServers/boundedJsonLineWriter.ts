@@ -47,6 +47,8 @@ export class BoundedJsonLineWriter {
   private writing = false;
   private waitingForDrain = false;
   private writeCallbackDone = false;
+  /** Invalidates post-return work from a synchronously terminal write call. */
+  private writeEpoch = 0;
   private readonly queued: PendingLine[] = [];
   private queuedBytes = 0;
   private readonly onDrain = (): void => {
@@ -122,11 +124,13 @@ export class BoundedJsonLineWriter {
 
   private startWrite(line: PendingLine): void {
     if (!this.active) return;
+    const epoch = ++this.writeEpoch;
     this.writing = true;
     this.waitingForDrain = false;
     this.writeCallbackDone = false;
     try {
       const accepted = this.stream.write(line.line, (error?: Error | null) => {
+        if (!this.isCurrentWrite(epoch)) return;
         if (error) {
           this.terminal(error);
           return;
@@ -134,7 +138,10 @@ export class BoundedJsonLineWriter {
         this.writeCallbackDone = true;
         this.finishWriteIfReady();
       });
-      if (!accepted) {
+      // A Writable may synchronously invoke the callback, emit error/close,
+      // or reenter another write before returning false. Only this still-live
+      // write epoch is allowed to claim drain ownership after the return.
+      if (!accepted && this.isCurrentWrite(epoch)) {
         this.waitingForDrain = true;
         this.stream.once("drain", this.onDrain);
       }
@@ -151,6 +158,10 @@ export class BoundedJsonLineWriter {
     if (next) this.startWrite(next);
   }
 
+  private isCurrentWrite(epoch: number): boolean {
+    return this.active && this.writing && this.writeEpoch === epoch;
+  }
+
   private readonly onStreamError = (error: Error): void => this.terminal(error);
 
   private readonly onStreamClose = (): void => {
@@ -160,6 +171,10 @@ export class BoundedJsonLineWriter {
   private terminal(error: Error): void {
     if (!this.active) return;
     this.active = false;
+    this.writeEpoch += 1;
+    this.writing = false;
+    this.waitingForDrain = false;
+    this.writeCallbackDone = false;
     this.queued.length = 0;
     this.queuedBytes = 0;
     this.stream.removeListener("drain", this.onDrain);
@@ -191,6 +206,8 @@ export class BoundedDaemonDiagnosticWriter {
   private inFlight = false;
   private waitingForDrain = false;
   private writeCallbackDone = false;
+  /** Invalidates post-return work from a synchronously terminal write call. */
+  private writeEpoch = 0;
 
   private readonly onDrain = (): void => {
     this.waitingForDrain = false;
@@ -210,11 +227,13 @@ export class BoundedDaemonDiagnosticWriter {
   public write(message: string): void {
     if (!this.active || this.inFlight) return;
     const line = `${this.truncate(message, MAX_DAEMON_DIAGNOSTIC_BYTES - 1)}\n`;
+    const epoch = ++this.writeEpoch;
     this.inFlight = true;
     this.waitingForDrain = false;
     this.writeCallbackDone = false;
     try {
       const accepted = this.stream.write(line, (error?: Error | null) => {
+        if (!this.isCurrentWrite(epoch)) return;
         if (error) {
           this.terminal();
           return;
@@ -222,7 +241,9 @@ export class BoundedDaemonDiagnosticWriter {
         this.writeCallbackDone = true;
         this.finishWriteIfReady();
       });
-      if (!accepted) {
+      // See BoundedJsonLineWriter: the return value arrives after permitted
+      // synchronous callback/error/close reentrancy, so terminal state wins.
+      if (!accepted && this.isCurrentWrite(epoch)) {
         this.waitingForDrain = true;
         this.stream.once("drain", this.onDrain);
       }
@@ -236,11 +257,17 @@ export class BoundedDaemonDiagnosticWriter {
     this.inFlight = false;
   }
 
+  private isCurrentWrite(epoch: number): boolean {
+    return this.active && this.inFlight && this.writeEpoch === epoch;
+  }
+
   private terminal(): void {
     if (!this.active) return;
     this.active = false;
+    this.writeEpoch += 1;
     this.inFlight = false;
     this.waitingForDrain = false;
+    this.writeCallbackDone = false;
     this.stream.removeListener("drain", this.onDrain);
   }
 

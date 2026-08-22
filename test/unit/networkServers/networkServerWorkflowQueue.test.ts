@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { ServiceWorkflowQueue } from "../../../src/services/networkServers/networkServerWorkflowQueue";
-
-const MAX_SERVICE_WORKFLOW_OPERATIONS = 32;
+import {
+  MAX_SERVICE_WORKFLOW_OPERATIONS,
+  ServiceWorkflowQueue,
+} from "../../../src/services/networkServers/networkServerWorkflowQueue";
 
 function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
   let resolve!: () => void;

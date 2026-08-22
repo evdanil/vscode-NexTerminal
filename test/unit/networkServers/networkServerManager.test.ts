@@ -31,7 +31,8 @@ const hostState = vi.hoisted(() => ({
   getServiceRuntime: undefined as any,
   isRunning: true,
   disposeCalls: 0,
-  spawnConfigResolver: undefined as (() => unknown) | undefined
+  spawnConfigResolver: undefined as (() => unknown) | undefined,
+  exitListener: undefined as ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined,
 }));
 
 vi.mock("vscode", () => ({
@@ -68,7 +69,10 @@ vi.mock("../../../src/services/networkServers/daemonHost", () => ({
     public onDidUpdateRuntime = vi.fn(() => vi.fn());
     public onDidConnection = vi.fn(() => vi.fn());
     public onDidLog = vi.fn(() => vi.fn());
-    public onDidExit = vi.fn(() => vi.fn());
+    public onDidExit = vi.fn((listener: (code: number | null, signal: NodeJS.Signals | null) => void) => {
+      hostState.exitListener = listener;
+      return vi.fn();
+    });
     public startServer = (...args: unknown[]) => hostState.startServer(...args);
     public stopServer = (...args: unknown[]) => hostState.stopServer(...args);
     public restartServer = (...args: unknown[]) => hostState.restartServer(...args);
@@ -126,6 +130,7 @@ beforeEach(() => {
   mockConfig.clear();
   hostState.isRunning = true;
   hostState.disposeCalls = 0;
+  hostState.exitListener = undefined;
   hostState.startServer = vi.fn(async () => undefined);
   hostState.stopServer = vi.fn(async () => undefined);
   hostState.restartServer = vi.fn(async () => undefined);
@@ -164,6 +169,22 @@ describe("NetworkServerManager — workspace trust gating", () => {
     const manager = fakeManager();
     await expect(manager.start("tftp")).resolves.toBeUndefined();
     expect(hostState.startServer).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("NetworkServerManager — daemon lifecycle", () => {
+  it("marks each registered running session stopped once when the host reports a synthetic failure exit", async () => {
+    const core = fakeCore();
+    const manager = fakeManager(core);
+    await manager.start("tftp");
+    await manager.start("dhcp");
+    core.updateNetworkServerSessionStatus.mockClear();
+
+    hostState.exitListener?.(null, null);
+
+    expect(core.updateNetworkServerSessionStatus).toHaveBeenCalledTimes(2);
+    expect(core.updateNetworkServerSessionStatus).toHaveBeenCalledWith("tftp", "stopped", { boundPort: null });
+    expect(core.updateNetworkServerSessionStatus).toHaveBeenCalledWith("dhcp", "stopped", { boundPort: null });
   });
 });
 

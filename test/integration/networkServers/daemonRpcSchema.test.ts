@@ -7,12 +7,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
 import { NetworkServerDaemonHost } from "../../../src/services/networkServers/daemonHost";
+import { MAX_DAEMON_RPC_IN_FLIGHT } from "../../../src/services/networkServers/networkServerRpcProtocol";
 import { sleep } from "../../helpers/networkServerTestHelpers";
 
 const FIXTURES = path.resolve(__dirname, "..", "..", "fixtures");
 const FIXTURE = path.join(FIXTURES, "mockNetworkServerDaemonMalformed.js");
-const MAX_DAEMON_RPC_IN_FLIGHT = 16;
-
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -55,8 +54,36 @@ type HostInternals = {
   };
   activeGeneration?: number;
   pending?: Map<number, unknown>;
+  admissions?: Set<unknown>;
   handleMessage(child: HostInternals["child"] & object, generation: number, raw: string): void;
 };
+
+type WritableWithCallback = NodeJS.WritableStream & {
+  write(chunk: string, callback?: (error?: Error | null) => void): boolean;
+};
+
+function retainFalseWrites(child: NonNullable<HostInternals["child"]>): {
+  readonly retained: Set<(error?: Error | null) => void>;
+  readonly restore: () => void;
+} {
+  const stdin = child.stdin as WritableWithCallback | undefined;
+  if (!stdin) throw new Error("expected mock daemon stdin");
+  const original = stdin.write.bind(stdin);
+  const retained = new Set<(error?: Error | null) => void>();
+  stdin.write = ((_: string, callback?: (error?: Error | null) => void): boolean => {
+    if (callback) retained.add(callback);
+    return false;
+  }) as typeof stdin.write;
+
+  // The real writable stream drops its retained callbacks when the exact
+  // child reaches close. Model that ownership in the test harness so a second
+  // child generation cannot inherit the first generation's held frames.
+  (child as unknown as { once(event: string, listener: () => void): void }).once("close", () => retained.clear());
+  return {
+    retained,
+    restore: () => { stdin.write = original as typeof stdin.write; },
+  };
+}
 
 function blockHostEventLoop(durationMs: number): void {
   const deadline = Date.now() + durationMs;
@@ -248,6 +275,9 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
 
   it("owns an idle ready-pipe error before a request can use the stale generation", async () => {
     const host = create("clean");
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    host.onDidExit(() => { throw new Error("exit listener exploded"); });
+    host.onDidExit((code, signal) => exits.push({ code, signal }));
     await host.ensureStarted();
     const failedPid = childPid(host);
     expect(failedPid).toBeTypeOf("number");
@@ -256,6 +286,7 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     expect(stdin).toBeDefined();
     stdin!.emit("error", new Error("forced idle ready-pipe failure"));
 
+    await expect(waitFor(() => exits[0], 500)).resolves.toEqual({ code: null, signal: null });
     await expect(waitFor(() => host.isReady ? undefined : true, 3_000)).resolves.toBe(true);
     expect(await waitForExit(failedPid!)).toBe(true);
     process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
@@ -264,6 +295,63 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     expect(cleanPid).toBeTypeOf("number");
     expect(cleanPid).not.toBe(failedPid);
     pids.add(cleanPid!);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    await sleep(50);
+    expect(exits).toEqual([{ code: null, signal: null }]);
+  }, 30_000);
+
+  it("emits one isolated unknown lifecycle exit for a ready protocol failure and preserves a replacement", async () => {
+    const host = create("invalid-json");
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null; ready: boolean }> = [];
+    host.onDidExit(() => { throw new Error("exit listener exploded"); });
+    host.onDidExit((code, signal) => exits.push({ code, signal, ready: host.isReady }));
+
+    await host.ensureStarted();
+    const failedPid = childPid(host);
+    expect(failedPid).toBeTypeOf("number");
+    pids.add(failedPid!);
+    await expect(host.listServers()).rejects.toThrow(/Daemon protocol error/);
+
+    await expect(waitFor(() => exits[0], 500)).resolves.toEqual({ code: null, signal: null, ready: false });
+    expect(await waitForExit(failedPid!)).toBe(true);
+
+    process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
+    await host.ensureStarted();
+    const replacementPid = childPid(host);
+    expect(replacementPid).toBeTypeOf("number");
+    expect(replacementPid).not.toBe(failedPid);
+    pids.add(replacementPid!);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    await sleep(50);
+    expect(exits).toEqual([{ code: null, signal: null, ready: false }]);
+  }, 30_000);
+
+  it("does not let a late physical exit from a retired generation reset a ready replacement", async () => {
+    const host = create("late-stdio");
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    host.onDidExit((code, signal) => exits.push({ code, signal }));
+    await host.ensureStarted();
+    const stalePid = childPid(host);
+    expect(stalePid).toBeTypeOf("number");
+    pids.add(stalePid!);
+    const stdin = (host as unknown as { child?: { stdin?: NodeJS.WritableStream } }).child?.stdin;
+    expect(stdin).toBeDefined();
+
+    stdin!.emit("error", new Error("retire this generation"));
+    await expect(waitFor(() => exits[0], 500)).resolves.toEqual({ code: null, signal: null });
+
+    process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "clean";
+    await host.ensureStarted();
+    const replacementPid = childPid(host);
+    expect(replacementPid).toBeTypeOf("number");
+    expect(replacementPid).not.toBe(stalePid);
+    pids.add(replacementPid!);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+
+    await expect(waitForExit(stalePid!, 5_000)).resolves.toBe(true);
+    expect(host.isReady).toBe(true);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(exits).toEqual([{ code: null, signal: null }]);
   }, 30_000);
 
   it.each([
@@ -359,6 +447,123 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     } finally {
       host.dispose();
       await Promise.all(accepted);
+    }
+  }, 30_000);
+
+  it("acquires the finite host admission before a cold-start flood waits for readiness", async () => {
+    const host = create("delayed-ready-hold-all");
+    const internals = host as unknown as HostInternals;
+    const calls = Array.from({ length: 1_000 }, () => host.listServers());
+    for (const call of calls.slice(0, MAX_DAEMON_RPC_IN_FLIGHT)) void call.catch(() => undefined);
+    const rejected = await Promise.race([
+      Promise.all(calls.slice(MAX_DAEMON_RPC_IN_FLIGHT).map(async (call) => {
+        const error = await call.then(
+          () => undefined,
+          (reason: unknown) => reason,
+        );
+        return error instanceof Error ? error.name : undefined;
+      })),
+      sleep(250).then(() => undefined),
+    ]);
+
+    expect(rejected).toHaveLength(1_000 - MAX_DAEMON_RPC_IN_FLIGHT);
+    expect(rejected).toEqual(Array.from(
+      { length: 1_000 - MAX_DAEMON_RPC_IN_FLIGHT },
+      () => "SERVER_BUSY",
+    ));
+    expect(internals.admissions?.size).toBe(MAX_DAEMON_RPC_IN_FLIGHT);
+
+    host.dispose();
+    await Promise.all(calls.map((call) => call.catch(() => undefined)));
+  }, 30_000);
+
+  it("reaps timed-out false-return writes before another generation can retain another admission batch", async () => {
+    const host = create("clean");
+    const internals = host as unknown as HostInternals;
+    const retainedByGeneration: Array<Set<(error?: Error | null) => void>> = [];
+
+    for (let generation = 0; generation < 3; generation += 1) {
+      await host.ensureStarted();
+      const child = internals.child;
+      const pid = child?.pid;
+      expect(child).toBeDefined();
+      expect(pid).toBeTypeOf("number");
+      pids.add(pid!);
+      const retainedWrite = retainFalseWrites(child!);
+      retainedByGeneration.push(retainedWrite.retained);
+      try {
+        const requests = Array.from({ length: MAX_DAEMON_RPC_IN_FLIGHT }, () => host.listServers());
+        await expect(waitFor(() => internals.pending?.size === MAX_DAEMON_RPC_IN_FLIGHT ? true : undefined)).resolves.toBe(true);
+        expect((child!.stdin as NodeJS.EventEmitter).listenerCount("drain")).toBe(1);
+        await Promise.all(requests.map((request) => expect(request).rejects.toThrow(/timed out|transport error/i)));
+        expect(await waitForExit(pid!, 5_000)).toBe(true);
+        expect(retainedWrite.retained.size).toBe(0);
+        expect(internals.admissions?.size).toBe(0);
+      } finally {
+        retainedWrite.restore();
+      }
+    }
+
+    expect(retainedByGeneration.map((retained) => retained.size)).toEqual([0, 0, 0]);
+    await host.ensureStarted();
+    const replacementPid = childPid(host);
+    expect(replacementPid).toBeTypeOf("number");
+    pids.add(replacementPid!);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+  }, 45_000);
+
+  it("keeps a false-return write admitted until its one child-owned drain and callback both settle", async () => {
+    const host = create("clean");
+    const internals = host as unknown as HostInternals;
+    await host.ensureStarted();
+    const child = internals.child;
+    const stdin = child?.stdin as WritableWithCallback | undefined;
+    const pid = child?.pid;
+    expect(stdin).toBeDefined();
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+
+    const original = stdin!.write.bind(stdin);
+    stdin!.write = ((chunk: string, callback?: (error?: Error | null) => void): boolean => {
+      original(chunk, callback);
+      queueMicrotask(() => (stdin as unknown as { emit(event: string): void }).emit("drain"));
+      return false;
+    }) as WritableWithCallback["write"];
+    try {
+      await expect(host.listServers()).resolves.toHaveLength(2);
+      await expect(waitFor(() => internals.admissions?.size === 0 ? true : undefined)).resolves.toBe(true);
+      expect(stdin!.listenerCount("drain")).toBe(0);
+      expect(host.isReady).toBe(true);
+    } finally {
+      stdin!.write = original as WritableWithCallback["write"];
+    }
+  }, 30_000);
+
+  it("does not add a post-terminal drain listener when a false-return write fails synchronously", async () => {
+    const host = create("clean");
+    const internals = host as unknown as HostInternals;
+    await host.ensureStarted();
+    const child = internals.child;
+    const stdin = child?.stdin as WritableWithCallback | undefined;
+    const pid = child?.pid;
+    expect(stdin).toBeDefined();
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+
+    const original = stdin!.write.bind(stdin);
+    stdin!.write = ((_chunk: string, callback?: (error?: Error | null) => void): boolean => {
+      callback?.(new Error("synchronous write callback failure"));
+      return false;
+    }) as WritableWithCallback["write"];
+    try {
+      const request = host.listServers();
+      expect(stdin!.listenerCount("drain")).toBe(0);
+      await expect(request).rejects.toThrow(/transport error/i);
+      expect(await waitForExit(pid!)).toBe(true);
+      expect(internals.admissions?.size).toBe(0);
+      expect(stdin!.listenerCount("drain")).toBe(0);
+    } finally {
+      stdin!.write = original as WritableWithCallback["write"];
     }
   }, 30_000);
 

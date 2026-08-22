@@ -69,9 +69,37 @@ type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void
 interface PendingRequest {
   readonly method: RpcMethod;
   readonly parseResult: (value: unknown) => RpcParseResult<unknown>;
+  readonly admission: RequestAdmission;
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * One finite host admission, acquired before a caller can wait for startup.
+ *
+ * A reply may settle before Node has released the corresponding stdin frame,
+ * so response and write ownership remain intentionally independent. The final
+ * release happens only once both have settled, or when this exact child's
+ * close proves the frame cannot remain retained by its writable stream.
+ */
+interface RequestAdmission {
+  responseSettled: boolean;
+  writeSettled: boolean;
+  released: boolean;
+  child?: ChildProcess;
+  generation?: number;
+}
+
+/** One child owns one drain listener for all of its backpressured frames. */
+interface ChildWriteAuthority {
+  readonly child: ChildProcess;
+  readonly generation: number;
+  readonly stdin: NodeJS.WritableStream;
+  readonly admissions: Set<RequestAdmission>;
+  waitingForDrain: boolean;
+  closed: boolean;
+  readonly onDrain: () => void;
 }
 
 /** The EOF grace resources owned by one exact child generation. */
@@ -151,6 +179,9 @@ export class NetworkServerDaemonHost {
   private child?: ChildProcess;
   private nextId = 1;
   private readonly pending = new Map<number, PendingRequest>();
+  /** Includes cold-start callers and retained stdin writes, not just replies. */
+  private readonly admissions = new Set<RequestAdmission>();
+  private readonly childWrites = new Map<ChildProcess, ChildWriteAuthority>();
   private readonly statusChangeListeners = new Set<StatusChangeListener>();
   private readonly runtimeUpdateListeners = new Set<RuntimeUpdateListener>();
   private readonly connectionListeners = new Set<ConnectionListener>();
@@ -357,8 +388,9 @@ export class NetworkServerDaemonHost {
    * cleared when `child` really is the current one. Detaching a child that has
    * already been replaced must not close the live one's pipes.
    */
-  private terminateChild(child: ChildProcess): void {
+  private terminateChild(child: ChildProcess, reportUnexpectedReadyExit = false): void {
     if (this.child !== child) return;
+    const notifyUnexpectedReadyExit = reportUnexpectedReadyExit && this.readyFlag;
     this.clearChildStdoutEofDeadline(child);
     this.child = undefined;
     this.activeGeneration = undefined;
@@ -368,6 +400,11 @@ export class NetworkServerDaemonHost {
     // Stream error guards stay attached through this child's later `close`:
     // Node can deliver a buffered EPIPE after exit/termination.
     this.detachChildProtocolIo(child);
+    // A ready generation that failed protocol/transport validation has already
+    // lost all host ownership, but its process has not necessarily exited yet.
+    // Notify consumers once with honest unknown metadata now; its later
+    // physical exit is identity-gated and cannot reset a replacement.
+    if (notifyUnexpectedReadyExit) this.emitExit(null, null);
     try { child.stdin?.end(); } catch { /* pipe already gone */ }
     try { child.kill("SIGTERM"); } catch { /* already dead */ }
     this.scheduleChildEscalation(child);
@@ -392,6 +429,7 @@ export class NetworkServerDaemonHost {
     const generation = this.nextGeneration++;
     this.child = child;
     this.activeGeneration = generation;
+    if (child.stdin) this.installChildWriteAuthority(child, generation, child.stdin);
 
     // This observation deliberately survives bridge teardown. `terminateChild`
     // clears current-host state before signalling, so the guarded lifecycle
@@ -403,6 +441,7 @@ export class NetworkServerDaemonHost {
     };
     child.once("exit", clearChildTimers);
     child.once("close", clearChildTimers);
+    child.once("close", () => this.releaseChildWriteAdmissions(child));
     child.once("close", () => this.releaseChildTerminalGuards(child));
 
     child.on("error", (error) => {
@@ -421,9 +460,7 @@ export class NetworkServerDaemonHost {
       const error = new Error(`Network servers daemon exited (code=${String(code ?? "null")})`);
       this.rejectAllPending(error);
       this.rejectAllReadyWaiters(error);
-      for (const listener of this.exitListeners) {
-        this.invokeUserListener(() => listener(code, signal));
-      }
+      this.emitExit(code, signal);
     });
 
     const protocolDetachers: Array<() => void> = [];
@@ -523,56 +560,81 @@ export class NetworkServerDaemonHost {
   }
 
   private async request<M extends RpcMethod>(method: M, params?: RpcParams<M>): Promise<RpcResult<M>> {
-    await this.ensureStarted();
-    const child = this.child;
-    const generation = this.activeGeneration;
-    if (!child || !child.stdin || !child.stdin.writable) {
-      throw new Error("Network servers daemon stdin is not writable");
-    }
-    if (generation === undefined) {
-      throw new Error("Network servers daemon generation is unavailable");
-    }
-    if (this.pending.size >= MAX_DAEMON_RPC_IN_FLIGHT) {
-      const error = new Error("Network servers daemon RPC admission is full");
-      error.name = "SERVER_BUSY";
-      throw error;
-    }
-    // Capture the narrowed stream before entering deferred callbacks; the
-    // ChildProcess property itself is nullable in Node's declarations.
-    const stdin = child.stdin;
-
-    const id = this.allocateRequestId();
-    const responsePromise = new Promise<unknown>((resolve, reject) => {
-      const deferred: PendingRequest = {
-        method,
-        parseResult: (value) => parseRpcResultForRequest(method, params, value),
-        resolve,
-        reject,
-      };
-      deferred.timer = setTimeout(() => {
-        this.settlePending(id, deferred, (entry) => entry.reject(
-          new Error(`Network servers daemon RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`)
-        ));
-      }, this.rpcTimeoutMs);
-      this.pending.set(id, deferred);
-
-      try {
-        const request = params === undefined ? { id, method } : { id, method, params };
-        // A false return means Node buffered this frame. Its callback and the
-        // per-request timeout remain armed until a response or write failure,
-        // which is the only correct behaviour under pipe backpressure.
-        stdin.write(`${JSON.stringify(request)}\n`, (error?: Error | null) => {
-          if (!error || !this.isCurrentChild(child, generation)) return;
-          this.failChildTransport(child, generation, `daemon stdin write failed: ${error.message}`);
-        });
-      } catch (error) {
-        if (!this.isCurrentChild(child, generation)) return;
-        const message = error instanceof Error ? error.message : String(error);
-        this.failChildTransport(child, generation, `daemon stdin write failed: ${message}`);
+    const admission = this.acquireAdmission();
+    try {
+      await this.ensureStarted();
+      const child = this.child;
+      const generation = this.activeGeneration;
+      if (!child || !child.stdin || !child.stdin.writable) {
+        throw new Error("Network servers daemon stdin is not writable");
       }
-    });
+      if (generation === undefined) {
+        throw new Error("Network servers daemon generation is unavailable");
+      }
+      // Capture the narrowed stream before entering deferred callbacks; the
+      // ChildProcess property itself is nullable in Node's declarations.
+      const stdin = child.stdin;
+      const authority = this.childWrites.get(child);
+      if (!authority || authority.generation !== generation || authority.stdin !== stdin || authority.closed) {
+        throw new Error("Network servers daemon stdin ownership is unavailable");
+      }
 
-    return responsePromise as Promise<RpcResult<M>>;
+      const id = this.allocateRequestId();
+      const responsePromise = new Promise<unknown>((resolve, reject) => {
+        const deferred: PendingRequest = {
+          method,
+          parseResult: (value) => parseRpcResultForRequest(method, params, value),
+          admission,
+          resolve,
+          reject,
+        };
+        deferred.timer = setTimeout(() => {
+          const writeStillRetained = !admission.writeSettled;
+          this.settlePending(id, deferred, (entry) => entry.reject(
+            new Error(`Network servers daemon RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`)
+          ));
+          // A timeout only frees its response ownership. A false-return frame
+          // can still be retained by this exact stdin stream, so retire the
+          // generation rather than recycling the admission into another write.
+          if (writeStillRetained && this.isCurrentChild(child, generation)) {
+            this.failChildTransport(child, generation, `daemon stdin write remained undrained after RPC timeout (method=${method})`);
+          }
+        }, this.rpcTimeoutMs);
+        this.pending.set(id, deferred);
+
+        this.beginAdmissionWrite(admission, authority);
+        try {
+          const request = params === undefined ? { id, method } : { id, method, params };
+          const accepted = stdin.write(`${JSON.stringify(request)}\n`, (error?: Error | null) => {
+            // Node has invoked this callback, so it no longer retains this
+            // exact frame even if the child was already retired meanwhile.
+            this.settleAdmissionWrite(admission);
+            if (error && this.isCurrentChild(child, generation)) {
+              this.failChildTransport(child, generation, `daemon stdin write failed: ${error.message}`);
+            }
+          });
+          // `write()` is allowed to synchronously invoke its callback/error
+          // path before returning false. Recheck both the exact admission and
+          // current generation so a terminal callback cannot add a stale drain
+          // listener after it has torn down the transport.
+          if (!accepted && !admission.writeSettled && this.isCurrentChild(child, generation)) {
+            this.waitForChildDrain(authority);
+          }
+        } catch (error) {
+          this.settleAdmissionWrite(admission);
+          if (this.isCurrentChild(child, generation)) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.failChildTransport(child, generation, `daemon stdin write failed: ${message}`);
+          }
+        }
+      });
+
+      return await responsePromise as RpcResult<M>;
+    } finally {
+      // Startup/write failures have no response envelope to settle. A normal
+      // reply or teardown has already done this and is harmlessly idempotent.
+      this.settleAdmissionResponse(admission);
+    }
   }
 
   private handleMessage(child: ChildProcess, generation: number, raw: string): void {
@@ -677,8 +739,95 @@ export class NetworkServerDaemonHost {
     }
   }
 
+  /** Emits one lifecycle edge while isolating each extension-host listener. */
+  private emitExit(code: number | null, signal: NodeJS.Signals | null): void {
+    for (const listener of this.exitListeners) {
+      this.invokeUserListener(() => listener(code, signal));
+    }
+  }
+
   private isCurrentChild(child: ChildProcess, generation: number): boolean {
     return this.child === child && this.activeGeneration === generation;
+  }
+
+  /** Reserves one finite host slot before startup, allocation, or serialization. */
+  private acquireAdmission(): RequestAdmission {
+    if (this.admissions.size >= MAX_DAEMON_RPC_IN_FLIGHT) {
+      const error = new Error("Network servers daemon RPC admission is full");
+      error.name = "SERVER_BUSY";
+      throw error;
+    }
+    const admission: RequestAdmission = {
+      responseSettled: false,
+      // Until a write begins there is no stream-retained frame to own.
+      writeSettled: true,
+      released: false,
+    };
+    this.admissions.add(admission);
+    return admission;
+  }
+
+  private beginAdmissionWrite(admission: RequestAdmission, authority: ChildWriteAuthority): void {
+    if (admission.released) return;
+    admission.writeSettled = false;
+    admission.child = authority.child;
+    admission.generation = authority.generation;
+    authority.admissions.add(admission);
+  }
+
+  private settleAdmissionResponse(admission: RequestAdmission): void {
+    if (admission.responseSettled) return;
+    admission.responseSettled = true;
+    this.releaseAdmissionIfComplete(admission);
+  }
+
+  private settleAdmissionWrite(admission: RequestAdmission): void {
+    if (admission.writeSettled) return;
+    admission.writeSettled = true;
+    if (admission.child) this.childWrites.get(admission.child)?.admissions.delete(admission);
+    this.releaseAdmissionIfComplete(admission);
+  }
+
+  private releaseAdmissionIfComplete(admission: RequestAdmission): void {
+    if (admission.released || !admission.responseSettled || !admission.writeSettled) return;
+    admission.released = true;
+    this.admissions.delete(admission);
+  }
+
+  private installChildWriteAuthority(child: ChildProcess, generation: number, stdin: NodeJS.WritableStream): void {
+    const authority: ChildWriteAuthority = {
+      child,
+      generation,
+      stdin,
+      admissions: new Set<RequestAdmission>(),
+      waitingForDrain: false,
+      closed: false,
+      onDrain: () => {
+        authority.waitingForDrain = false;
+      },
+    };
+    this.childWrites.set(child, authority);
+  }
+
+  /** One child, rather than one request, owns the writable stream's drain listener. */
+  private waitForChildDrain(authority: ChildWriteAuthority): void {
+    if (authority.closed || authority.waitingForDrain) return;
+    authority.waitingForDrain = true;
+    authority.stdin.once("drain", authority.onDrain);
+  }
+
+  /** Child close is the final proof that its writable stream cannot retain a frame. */
+  private releaseChildWriteAdmissions(child: ChildProcess): void {
+    const authority = this.childWrites.get(child);
+    if (!authority) return;
+    authority.closed = true;
+    if (authority.waitingForDrain) authority.stdin.removeListener("drain", authority.onDrain);
+    authority.waitingForDrain = false;
+    this.childWrites.delete(child);
+    for (const admission of [...authority.admissions]) {
+      this.settleAdmissionWrite(admission);
+    }
+    authority.admissions.clear();
   }
 
   /** Settles exactly the request which installed this callback, once. */
@@ -686,6 +835,7 @@ export class NetworkServerDaemonHost {
     if (this.pending.get(id) !== expected) return false;
     this.pending.delete(id);
     if (expected.timer) clearTimeout(expected.timer);
+    this.settleAdmissionResponse(expected.admission);
     settle(expected);
     return true;
   }
@@ -694,7 +844,7 @@ export class NetworkServerDaemonHost {
   private failChildProtocol(child: ChildProcess, generation: number, reason: string): void {
     if (!this.isCurrentChild(child, generation)) return;
     const error = new Error(`Daemon protocol error: ${reason}`);
-    this.terminateChild(child);
+    this.terminateChild(child, true);
     this.rejectAllPending(error);
     this.rejectAllReadyWaiters(error);
   }
@@ -703,7 +853,7 @@ export class NetworkServerDaemonHost {
   private failChildTransport(child: ChildProcess, generation: number, reason: string): void {
     if (!this.isCurrentChild(child, generation)) return;
     const error = new Error(`Network servers daemon transport error: ${reason}`);
-    this.terminateChild(child);
+    this.terminateChild(child, true);
     this.rejectAllPending(error);
     this.rejectAllReadyWaiters(error);
   }

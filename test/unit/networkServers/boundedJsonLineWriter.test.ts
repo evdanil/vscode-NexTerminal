@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { MAX_RPC_LINE_BYTES } from "../../../src/services/networkServers/boundedLineReader";
@@ -21,6 +22,43 @@ class ControlledWritable extends Writable {
     this.callbacks.push(callback);
   }
 }
+
+type SynchronousWriteMode = "callback" | "error" | "close" | "callback-then-error";
+
+/** Models Writable's permitted synchronous terminal/callback reentrancy. */
+class SynchronousWritable extends EventEmitter {
+  public readonly chunks: string[] = [];
+
+  public constructor(private readonly mode: SynchronousWriteMode) {
+    super();
+  }
+
+  public write(chunk: string, callback?: (error?: Error | null) => void): boolean {
+    this.chunks.push(chunk);
+    switch (this.mode) {
+      case "callback":
+        callback?.();
+        break;
+      case "error":
+        this.emit("error", new Error("synchronous stream error"));
+        break;
+      case "close":
+        this.emit("close");
+        break;
+      case "callback-then-error":
+        callback?.();
+        this.emit("error", new Error("reentrant stream error"));
+        break;
+    }
+    return false;
+  }
+}
+
+type WriterInternals = {
+  readonly active: boolean;
+  readonly writing?: boolean;
+  readonly inFlight?: boolean;
+};
 
 async function turn(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -198,5 +236,80 @@ describe("bounded daemon JSON-line writer", () => {
     }).not.toThrow();
     expect(stream.chunks).toHaveLength(1);
     write.mockRestore();
+  });
+
+  it.each(["error", "close"] as const)("does not attach a drain listener after synchronous stdout %s with false return", (mode) => {
+    const stream = new SynchronousWritable(mode);
+    const terminal: Error[] = [];
+    const writer = new BoundedJsonLineWriter(stream as unknown as Writable, {
+      onTerminal: (error) => terminal.push(error),
+    });
+
+    writer.write({ id: 1, result: null });
+
+    expect(terminal).toHaveLength(1);
+    expect(stream.listenerCount("drain")).toBe(0);
+    expect((writer as unknown as WriterInternals).active).toBe(false);
+    expect((writer as unknown as WriterInternals).writing).toBe(false);
+    expect(() => stream.emit("drain")).not.toThrow();
+  });
+
+  it("does not strand stdout state when a false-return write invokes its callback synchronously", () => {
+    const stream = new SynchronousWritable("callback");
+    const writer = new BoundedJsonLineWriter(stream as unknown as Writable, { onTerminal: () => undefined });
+
+    writer.write({ id: 1, result: null });
+    writer.write({ id: 2, result: null });
+
+    expect(stream.chunks).toEqual(["{\"id\":1,\"result\":null}\n", "{\"id\":2,\"result\":null}\n"]);
+    expect(stream.listenerCount("drain")).toBe(0);
+    expect((writer as unknown as WriterInternals)).toMatchObject({ active: true, writing: false });
+  });
+
+  it("does not re-add stdout drain ownership after a synchronous callback terminalizes reentrantly", () => {
+    const stream = new SynchronousWritable("callback-then-error");
+    const terminal: Error[] = [];
+    const writer = new BoundedJsonLineWriter(stream as unknown as Writable, {
+      onTerminal: (error) => terminal.push(error),
+    });
+
+    writer.write({ id: 1, result: null });
+
+    expect(terminal).toHaveLength(1);
+    expect(stream.listenerCount("drain")).toBe(0);
+    expect((writer as unknown as WriterInternals)).toMatchObject({ active: false, writing: false });
+  });
+
+  it.each(["error", "close"] as const)("does not attach a drain listener after synchronous stderr %s with false return", (mode) => {
+    const stream = new SynchronousWritable(mode);
+    const writer = new BoundedDaemonDiagnosticWriter(stream as unknown as Writable);
+
+    writer.write("diagnostic");
+
+    expect(stream.listenerCount("drain")).toBe(0);
+    expect((writer as unknown as WriterInternals)).toMatchObject({ active: false, inFlight: false });
+    expect(() => stream.emit("drain")).not.toThrow();
+  });
+
+  it("does not strand stderr state when a false-return write invokes its callback synchronously", () => {
+    const stream = new SynchronousWritable("callback");
+    const writer = new BoundedDaemonDiagnosticWriter(stream as unknown as Writable);
+
+    writer.write("first");
+    writer.write("second");
+
+    expect(stream.chunks).toEqual(["first\n", "second\n"]);
+    expect(stream.listenerCount("drain")).toBe(0);
+    expect((writer as unknown as WriterInternals)).toMatchObject({ active: true, inFlight: false });
+  });
+
+  it("does not re-add stderr drain ownership after a synchronous callback terminalizes reentrantly", () => {
+    const stream = new SynchronousWritable("callback-then-error");
+    const writer = new BoundedDaemonDiagnosticWriter(stream as unknown as Writable);
+
+    writer.write("diagnostic");
+
+    expect(stream.listenerCount("drain")).toBe(0);
+    expect((writer as unknown as WriterInternals)).toMatchObject({ active: false, inFlight: false });
   });
 });

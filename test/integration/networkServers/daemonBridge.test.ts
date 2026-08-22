@@ -50,9 +50,9 @@ import { encodeRRQ, encodeACK, getOpcode } from "../../../src/services/networkSe
 import { RUNTIME_UPDATE_THROTTLE_MS } from "../../../src/services/networkServers/runtimeUpdateThrottle";
 import { createUdpClient, mkdtemp, sleep } from "../../helpers/networkServerTestHelpers";
 import { MAX_RPC_LINE_BYTES } from "../../../src/services/networkServers/boundedLineReader";
+import { MAX_DAEMON_RPC_IN_FLIGHT } from "../../../src/services/networkServers/networkServerRpcProtocol";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
-const MAX_DAEMON_RPC_IN_FLIGHT = 16;
 
 let daemonScript: string;
 let daemonBundleDir: string | undefined;

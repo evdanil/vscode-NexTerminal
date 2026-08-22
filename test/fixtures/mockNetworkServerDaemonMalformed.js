@@ -77,6 +77,8 @@ function sendInvalidThenValid(id, invalid, request) {
 if (mode === "malformed-ready") {
   send({ event: "ready", data: {} });
   setTimeout(() => send({ event: "ready", data: null }), 20);
+} else if (mode === "delayed-ready-hold-all") {
+  setTimeout(() => send({ event: "ready", data: null }), 500);
 } else {
   send({ event: "ready", data: null });
 }
@@ -169,6 +171,7 @@ process.stdin.on("data", (chunk) => {
         if (requestCount > 1) sendValidReply(id, request);
         break;
       case "hold-all-list":
+      case "delayed-ready-hold-all":
         break;
       case "late-stdio":
         // Hold a real host write pending until the test has torn its
