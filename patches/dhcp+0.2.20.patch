@@ -1,5 +1,5 @@
 diff --git a/node_modules/dhcp/lib/dhcp.js b/node_modules/dhcp/lib/dhcp.js
-index e009e81..3d953cc 100644
+index e009e81..94db481 100644
 --- a/node_modules/dhcp/lib/dhcp.js
 +++ b/node_modules/dhcp/lib/dhcp.js
 @@ -6,6 +6,8 @@
@@ -11,3 +11,244 @@ index e009e81..3d953cc 100644
  const util = require('util');
  const dgram = require('dgram');
  const os = require('os');
+@@ -27,6 +29,7 @@ const DHCPINFORM = 8;
+ 
+ const SERVER_PORT = 67;
+ const CLIENT_PORT = 68;
++const OFFER_TTL_MS = 60 * 1000;
+ 
+ const INADDR_ANY = '0.0.0.0';
+ const INADDR_BROADCAST = '255.255.255.255';
+@@ -36,6 +39,14 @@ const BOOTREPLY = 2;
+ 
+ 
+ 
++function normalizeMac(mac) {
++  const value = String(mac);
++  const hex = value.replace(/[^0-9a-f]/gi, '').toUpperCase();
++  return hex.length === 12 ? hex.match(/../g).join('-') : value.trim().toUpperCase();
++}
++
++
++
+ function Lease() {
+ 
+ }
+@@ -95,6 +106,9 @@ function Server(config, listenOnly) {
+         case DHCPREQUEST: // 3.
+           self.handleRequest(req);
+           break;
++        case DHCPRELEASE: // 7.
++          self.handleRelease(req);
++          break;
+         default:
+           console.error("Not implemented method", req.options[53]);
+       }
+@@ -257,19 +271,50 @@ Server.prototype = {
+      *
+      * 1. Is there a wish for static binding?
+      *
+-     * 2. Are all available IP's occupied?
+-     *    - Send release to oldest lease and reuse
+-     *
+-     * 3. is config randomIP?
+-     *    - Select random IP of range, until no occupied slot is found
+-     *
+-     * 4. Take first unmapped IP of range
++     * 2. Select an address from the configured inclusive range, visiting each
++     *    candidate at most once.
+      *
+      * TODO:
+      * - Incorporate user preference, sent to us
+      * - Check APR if IP exists on net
+      */
+ 
++    const _static = this.config('static');
++    const staticByMac = Object.create(null);
++    const staticAddresses = new Set;
++    if (_static && typeof _static === 'object') {
++      for (let mac in _static) {
++        const address = _static[mac];
++        staticByMac[normalizeMac(mac)] = address;
++        if (address) {
++          staticAddresses.add(address);
++        }
++      }
++    }
++
++    const now = Date.now();
++    for (let mac in this._state) {
++      const lease = this._state[mac];
++      const bindTime = lease.bindTime instanceof Date ? lease.bindTime.getTime() : NaN;
++      const isStatic = staticByMac[normalizeMac(mac)] === lease.address;
++      if (
++        !isStatic &&
++        lease.state === 'BOUND' &&
++        Number.isFinite(bindTime) &&
++        Number.isFinite(lease.leasePeriod) &&
++        bindTime + lease.leasePeriod * 1000 <= now
++      ) {
++        delete this._state[mac];
++      } else if (
++        !isStatic &&
++        lease.state === 'OFFERED' &&
++        Number.isFinite(lease.offerTime) &&
++        lease.offerTime + OFFER_TTL_MS <= now
++      ) {
++        delete this._state[mac];
++      }
++    }
++
+ 
+     // If existing lease for a mac address is present, re-use the IP
+     if (this._state[clientMAC] && this._state[clientMAC].address) {
+@@ -279,89 +324,62 @@ Server.prototype = {
+ 
+ 
+     // Is there a static binding?
+-    const _static = this.config('static');
+     if (typeof _static === "function") {
+       const staticResult = _static(clientMAC, req);
+       if (staticResult)
+         return staticResult;
+-    } else if (_static[clientMAC]) {
+-      return _static[clientMAC];
++    } else if (staticByMac[normalizeMac(clientMAC)]) {
++      return staticByMac[normalizeMac(clientMAC)];
+     }
+ 
+ 
+     const randIP = this.config('randomIP');
+     const _tmp = this.config('range');
+-    const firstIP = Tools.parseIp(_tmp[0]);
+-    const lastIP = Tools.parseIp(_tmp[1]);
++    const firstIP = Tools.parseIp(_tmp[0]) >>> 0;
++    const lastIP = Tools.parseIp(_tmp[1]) >>> 0;
+ 
+ 
+ 
+-    // Add all known addresses and save the oldest lease
+-    const ips = [this.config('server')]; // Exclude our own server IP from pool
+-    let oldestMac = null;
+-    let oldestTime = Infinity;
+-    let leases = 0;
++    // Add all known addresses.
++    const ips = new Set([this.config('server'), ...staticAddresses]); // Exclude server/static IPs from pool
+     for (let mac in this._state) {
+       if (this._state[mac].address)
+-        ips.push(this._state[mac].address);
+-
+-      if (this._state[mac].leaseTime < oldestTime) {
+-        oldestTime = this._state[mac].leaseTime;
+-        oldestMac = mac;
+-      }
+-      leases++;
++        ips.add(this._state[mac].address);
+     }
+ 
+ 
+ 
++    const poolSize = lastIP - firstIP + 1;
++    const startOffset = randIP ? Math.floor(Math.random() * poolSize) : 0;
++    for (let attempt = 0; attempt < poolSize; attempt++) {
++      const offset = (startOffset + attempt) % poolSize;
++      const ip = Tools.formatIp((firstIP + offset) >>> 0);
+ 
+-    // Check if all IP's are used and delete the oldest
+-    if (oldestMac !== null && lastIP - firstIP === leases) {
+-      const ip = this._state[oldestMac].address;
+-
+-      // TODO: Notify deleted client
+-      delete this._state[oldestMac];
+-
+-      return ip;
+-    }
+-
+-
+-
+-
+-    // Select a random IP, maybe not the best algorithm for quick selection if lots of ip's are given: TODO
+-    if (randIP) {
+-
+-      while (1) {
+-
+-        const ip = Tools.formatIp(firstIP + Math.random() * (lastIP - firstIP) | 0);
+-
+-        if (ips.indexOf(ip) === -1) {
+-          return ip;
+-        }
+-      }
+-    }
+-
+-
+-
+-    // Choose first free IP in subnet
+-    for (let i = firstIP; i <= lastIP; i++) {
+-
+-      const ip = Tools.formatIp(i);
+-
+-      if (ips.indexOf(ip) === -1) {
++      if (!ips.has(ip)) {
+         return ip;
+       }
+     }
++    return null;
+   },
+ 
+   handleDiscover: function(req) {
+     //console.log('Handle Discover', req);
+ 
++    const address = this._selectAddress(req.chaddr, req);
++    if (address === null) {
++      this.emit('poolExhausted', req);
++      return;
++    }
++
+     const lease = this._state[req.chaddr] = this._state[req.chaddr] || new Lease;
+-    lease.address = this._selectAddress(req.chaddr, req);
++    lease.address = address;
+     lease.leasePeriod = this.config('leaseTime');
+     lease.server = this.config('server');
+     lease.state = 'OFFERED';
++    lease.offerTime = Date.now();
++    if (lease.clientId === undefined) {
++      lease.clientId = req.options[61] === undefined ? null : req.options[61];
++    }
+ 
+     this.sendOffer(req);
+   },
+@@ -407,6 +425,9 @@ Server.prototype = {
+     lease.server = this.config('server');
+     lease.state = 'BOUND';
+     lease.bindTime = new Date;
++    if (lease.clientId === undefined) {
++      lease.clientId = req.options[61] === undefined ? null : req.options[61];
++    }
+ 
+     this.sendAck(req);
+   },
+@@ -470,8 +491,23 @@ Server.prototype = {
+     this._send(this.config('broadcast'), ans);
+   },
+ 
+-  handleRelease: function() {
++  handleRelease: function(req) {
++    const lease = this._state[req.chaddr];
++    const clientId = req.options[61] === undefined ? null : req.options[61];
++    const leaseClientId = lease && lease.clientId === undefined ? null : lease && lease.clientId;
++
++    if (
++      !lease ||
++      lease.state !== 'BOUND' ||
++      lease.address !== req.ciaddr ||
++      leaseClientId !== clientId
++    ) {
++      return;
++    }
+ 
++    const address = lease.address;
++    delete this._state[req.chaddr];
++    this.emit('released', req.chaddr, address);
+   },
+ 
+   handleRenew: function() {

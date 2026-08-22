@@ -69,6 +69,10 @@ declare module 'dhcp' {
     readonly tries: number;
     readonly xid: number;
     readonly leaseTime?: number;
+    /** Epoch milliseconds when a provisional OFFER was created. */
+    readonly offerTime?: number;
+    /** Opaque option-61 identity; `null` means the client used `chaddr`. */
+    readonly clientId?: string | null;
   }
 
   export interface ServerEvents {
@@ -77,6 +81,8 @@ declare module 'dhcp' {
     error: [err: Error, data?: any];
     message: [req: any];
     bound: [state: Record<string, LeaseState>];
+    poolExhausted: [req: any];
+    released: [mac: string, address: string];
   }
 
   export interface ClientEvents {
@@ -107,6 +113,7 @@ declare module 'dhcp' {
     public readonly _sock: Socket;
     public readonly _conf: ServerConfig | null;
     public readonly _state: Record<string, LeaseState>;
+    public _selectAddress(clientMAC: string, req?: any): string | null;
   }
 
   export class Client extends EventEmitter {
