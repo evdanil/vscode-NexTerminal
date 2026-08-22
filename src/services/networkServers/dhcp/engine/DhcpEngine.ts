@@ -354,7 +354,10 @@ export class DhcpEngine extends EventEmitter {
       rangeEnd: cfg.rangeEnd,
       subnet: cfg.subnet,
       gateway: cfg.gateway,
-      dns: cfg.dns ? [...cfg.dns] : undefined,
+      // Strict daemon/RPC validation rejects `dns: []`; direct engine users
+      // still normalize it to the documented defaults rather than formatting
+      // an invalid zero-length option 6.
+      dns: cfg.dns && cfg.dns.length > 0 ? [...cfg.dns] : undefined,
       leaseTimeSec: cfg.leaseTimeSec,
       serverId: cfg.serverId,
       broadcast: cfg.broadcast,
@@ -364,7 +367,10 @@ export class DhcpEngine extends EventEmitter {
       bootFileName: cfg.bootFileName,
       nextServer: cfg.nextServer,
       tftpServerAddresses: cfg.tftpServerAddresses ? [...cfg.tftpServerAddresses] : undefined,
-      vendorClassId: cfg.vendorClassId,
+      // Configuration ingress rejects blank filters. Trim direct callers too:
+      // option 60 matching treats whitespace as insignificant, so retaining a
+      // blank string here would silently turn a supposed restriction off.
+      vendorClassId: cfg.vendorClassId?.trim() || undefined,
       vendorSpecificOptions: cfg.vendorSpecificOptions ? [...cfg.vendorSpecificOptions] : undefined,
     };
     this._log = logger;

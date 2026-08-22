@@ -210,6 +210,21 @@ function oncePacketError(server: any): Promise<[Error, unknown?, { messageEmitte
   });
 }
 
+/** Resolves only when the dependency reports an owned socket failure. */
+function onceFatalSocketError(server: any): Promise<Error> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      server.off("error", onError);
+      reject(new Error("fatal socket error was not emitted within 750ms"));
+    }, 750);
+    const onError = (error: Error): void => {
+      clearTimeout(timer);
+      resolve(error);
+    };
+    server.once("error", onError);
+  });
+}
+
 function onceMessage(server: any): Promise<unknown> {
   return new Promise((resolve) => {
     server.once("message", resolve);
@@ -450,10 +465,12 @@ describe("dhcp@0.2.20 dependency hardening", () => {
     expect(packetErrors[0]).toBeInstanceOf(Error);
   });
 
-  it("normalizes downstream non-Error, synchronous-send, and asynchronous-send failures", async () => {
+  it("keeps packet-local throws on packetError but makes reply-socket failures fatal", async () => {
     const { server, port, close } = await createPacketServer();
     const fatalErrors: unknown[] = [];
+    const packetErrors: unknown[] = [];
     server.on("error", (error: unknown) => fatalErrors.push(error));
+    server.on("packetError", (error: unknown) => packetErrors.push(error));
 
     try {
       const nonErrorThrower = (): void => {
@@ -468,9 +485,9 @@ describe("dhcp@0.2.20 dependency hardening", () => {
       server._sock.send = (): never => {
         throw "synchronous send failure";
       };
-      const synchronous = oncePacketError(server);
+      const synchronous = onceFatalSocketError(server);
       await sendLoopbackPacket(buildPacket(1), port);
-      await expect(synchronous).resolves.toMatchObject([expect.any(Error), expect.anything(), { messageEmitted: true }]);
+      await expect(synchronous).resolves.toBeInstanceOf(Error);
 
       server._sock.send = (...args: unknown[]): unknown => {
         const callback = args.at(-1);
@@ -478,12 +495,13 @@ describe("dhcp@0.2.20 dependency hardening", () => {
         queueMicrotask(() => callback("asynchronous send failure"));
         return undefined;
       };
-      const asynchronous = oncePacketError(server);
+      const asynchronous = onceFatalSocketError(server);
       await sendLoopbackPacket(buildPacket(1), port);
-      await expect(asynchronous).resolves.toMatchObject([expect.any(Error), expect.anything(), { messageEmitted: true }]);
+      await expect(asynchronous).resolves.toBeInstanceOf(Error);
       server._sock.send = originalSend;
 
-      expect(fatalErrors).toEqual([]);
+      expect(packetErrors, "only the message-listener throw is packet-local").toHaveLength(1);
+      expect(fatalErrors).toHaveLength(2);
     } finally {
       await close();
     }

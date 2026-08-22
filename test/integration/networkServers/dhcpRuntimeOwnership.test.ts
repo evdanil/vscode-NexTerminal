@@ -181,6 +181,42 @@ describe("DHCP runtime ownership", () => {
     }
   });
 
+  it("treats a real closed dependency reply socket as ERROR, then releases its owned engine", async () => {
+    const port = await freeLoopbackPort();
+    const adapter = createAdapter(port);
+    const manager = new ServerManager().register("dhcp", () => adapter);
+
+    try {
+      await manager.start("dhcp");
+      const engine = engineOf(adapter)!;
+      const dependencyServer = (engine as unknown as { _server: any })._server;
+      await new Promise<void>((resolve) => dependencyServer._sock.close(() => resolve()));
+
+      // This is the dependency's real OFFER formatter and its now-closed UDP
+      // socket, not a synthetic engine error. A broken reply channel is fatal
+      // even though the adapter still owns the engine long enough to stop it.
+      expect(() => dependencyServer.sendOffer({
+        xid: 0x12345678,
+        flags: 0,
+        ciaddr: "0.0.0.0",
+        giaddr: "0.0.0.0",
+        chaddr: "AA-BB-CC-DD-EE-FF",
+        options: {},
+      })).not.toThrow();
+      expect(adapter.status).toBe(ServerStatus.ERROR);
+      expect(adapter.boundPort).toBe(port);
+
+      await expect(manager.dropInstance("dhcp")).resolves.toBe(true);
+      expect(manager.getInstance("dhcp")).toBeUndefined();
+      expect(adapter.boundPort).toBeNull();
+
+      const release = await holdLoopbackPort(port);
+      await release();
+    } finally {
+      await adapter.stop().catch(() => undefined);
+    }
+  });
+
   it("reaps an ERROR-owned engine before replacing it", async () => {
     const port = await freeLoopbackPort();
     const adapter = createAdapter(port);

@@ -113,7 +113,7 @@ export class DhcpAdapter extends BaseNexusServer {
       rangeEnd: config.rangeEnd,
       subnet: config.subnet,
       gateway: config.gateway,
-      dns: config.dns ? [...config.dns] : undefined,
+      dns: config.dns && config.dns.length > 0 ? [...config.dns] : undefined,
       leaseTimeSec: config.leaseTimeSec,
       serverId: config.serverId,
       broadcast: config.broadcast,
@@ -123,7 +123,7 @@ export class DhcpAdapter extends BaseNexusServer {
       bootFileName: config.bootFileName,
       nextServer: config.nextServer,
       tftpServerAddresses: config.tftpServerAddresses ? [...config.tftpServerAddresses] : undefined,
-      vendorClassId: config.vendorClassId,
+      vendorClassId: config.vendorClassId?.trim() || undefined,
       vendorSpecificOptions: config.vendorSpecificOptions ? [...config.vendorSpecificOptions] : undefined,
     };
   }

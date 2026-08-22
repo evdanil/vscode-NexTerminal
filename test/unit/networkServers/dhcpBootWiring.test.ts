@@ -61,7 +61,50 @@ function resolveOfferedOptions(
   return server._getOptions({}, [], requestedParameters);
 }
 
+/**
+ * Runs the dependency's real OFFER formatter and extracts one raw TLV option.
+ * A change that reintroduces `dns: []` makes option 6's length byte zero.
+ */
+function formattedOfferOption(cfg: DhcpEngineConfig, optionCode: number): Buffer | undefined {
+  const engine = new DhcpEngine(cfg, () => undefined);
+  const serverConfig = (engine as any).buildServerConfig();
+  const server: any = dhcp.createServer(serverConfig);
+  openSockets.push(server._sock);
+  let packet: Buffer | undefined;
+  server._sock.send = (data: Buffer, offset: number, length: number, _port: number, _host: string, callback: (error: Error | null, bytes: number) => void) => {
+    packet = Buffer.from(data.subarray(offset, offset + length));
+    callback(null, length);
+  };
+  server.sendOffer({
+    xid: 0x12345678,
+    flags: 0,
+    ciaddr: "0.0.0.0",
+    giaddr: "0.0.0.0",
+    chaddr: "AA-BB-CC-DD-EE-FF",
+    options: {},
+  });
+  if (!packet) throw new Error("DHCP dependency did not format an OFFER");
+
+  for (let offset = 240; offset < packet.length;) {
+    const code = packet[offset++];
+    if (code === 255) return undefined;
+    if (code === 0) continue;
+    const length = packet[offset++];
+    const value = packet.subarray(offset, offset + length);
+    if (code === optionCode) return value;
+    offset += length;
+  }
+  return undefined;
+}
+
 describe("DHCP boot options — wiring into the `dhcp` library", () => {
+  it("formats a non-empty option 6 DNS payload into a real OFFER", () => {
+    expect([...formattedOfferOption({ ...BASE, dns: ["1.1.1.1", "8.8.8.8"] }, 6) ?? []]).toEqual([
+      1, 1, 1, 1,
+      8, 8, 8, 8,
+    ]);
+  });
+
   it("sends 66/67/150/43 unsolicited, without the client requesting them", () => {
     const offered = resolveOfferedOptions({
       ...BASE,

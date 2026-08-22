@@ -323,6 +323,14 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     expect(malformedDhcp.error?.code).toBe("INTERNAL_ERROR");
     expect(malformedDhcp.error?.message).toContain("dhcp.dns[0]");
 
+    const emptyDns = await client.send("configure", { configs: { dhcp: { dns: [] } } });
+    expect(emptyDns.error?.code).toBe("INTERNAL_ERROR");
+    expect(emptyDns.error?.message).toContain("dhcp.dns");
+
+    const blankVendorFilter = await client.send("configure", { configs: { dhcp: { vendorClassId: "  \t " } } });
+    expect(blankVendorFilter.error?.code).toBe("INTERNAL_ERROR");
+    expect(blankVendorFilter.error?.message).toContain("dhcp.vendorClassId");
+
     const malformedStart = await client.send("start", { id: "tftp", config: { port: -1 } });
     expect(malformedStart.error?.code).toBe("INTERNAL_ERROR");
     expect(malformedStart.error?.message).toContain("tftp.port");
@@ -341,6 +349,20 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     });
     try {
       const warning = seeded.events.find((event) => event.event === "log" && JSON.stringify(event.data).includes("NEXUS_NETWORK_SERVERS_CONFIG"));
+      expect(warning).toBeDefined();
+      await expect(seeded.call("list")).resolves.toBeDefined();
+    } finally {
+      seeded.teardown();
+    }
+  });
+
+  it("rejects a whitespace-only vendor filter in the environment seed before readiness", async () => {
+    const seeded = await DaemonClient.launch(daemonScript, {
+      ...process.env,
+      NEXUS_NETWORK_SERVERS_CONFIG: JSON.stringify({ dhcp: { vendorClassId: "  \t " } }),
+    });
+    try {
+      const warning = seeded.events.find((event) => event.event === "log" && JSON.stringify(event.data).includes("dhcp.vendorClassId"));
       expect(warning).toBeDefined();
       await expect(seeded.call("list")).resolves.toBeDefined();
     } finally {
@@ -438,6 +460,29 @@ describe("Network servers daemon — stdio JSON-RPC bridge", () => {
     } finally {
       udp.close();
     }
+  });
+
+  it("serializes same-service restart, configure, and start workflows in input order", async () => {
+    await client.call("start", { id: "tftp", config: { root, port: 0, allowWrite: false } });
+    const restartPort = await allocateFreeUdpPort();
+    const configuredPort = await allocateFreeUdpPort();
+
+    const restarted = client.send("restart", { id: "tftp", config: { root, port: restartPort, allowWrite: false } });
+    const configured = client.send("configure", { configs: { tftp: { root, port: configuredPort, allowWrite: false } } });
+    const started = client.send("start", { id: "tftp" });
+
+    for (const reply of await Promise.all([restarted, configured, started])) {
+      expect(reply.error, "each accepted workflow must receive its own success reply").toBeUndefined();
+    }
+
+    // The later configure is deliberately deferred while the restarted socket
+    // runs. A later restart must therefore use its port, not let the earlier
+    // restart overwrite the saved config after the fact.
+    await client.call("restart", { id: "tftp" });
+    const runtime = await client.call<TftpRuntimeReply>("getServiceRuntime", { id: "tftp" });
+    expect(runtime.boundPort).toBe(configuredPort);
+    expect(await isUdpPortFree(restartPort), "the superseded socket must be released before the final start").toBe(true);
+    expect(await isUdpPortFree(configuredPort), "the final configured socket must be owned exactly once").toBe(false);
   });
 
   it(

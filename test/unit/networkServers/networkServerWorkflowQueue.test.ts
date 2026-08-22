@@ -1,0 +1,95 @@
+import { describe, expect, it } from "vitest";
+import { ServiceWorkflowQueue } from "../../../src/services/networkServers/networkServerWorkflowQueue";
+
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe("ServiceWorkflowQueue", () => {
+  it("keeps a gated restart, later configure, and start in input order for one service", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const restartEntered = deferred();
+    const releaseRestart = deferred();
+    const lifecycle: string[] = [];
+    const sockets = new Set<string>(["old"]);
+    let savedConfig = "old";
+    let instance = { identity: "old", socket: "old" };
+
+    const restart = queue.enqueue("tftp", async () => {
+      lifecycle.push("restart:stop");
+      restartEntered.resolve();
+      await releaseRestart.promise;
+      sockets.delete(instance.socket);
+      savedConfig = "restart";
+      instance = { identity: "restart", socket: "restart" };
+      sockets.add(instance.socket);
+      lifecycle.push("restart:start");
+      return { id: 1, ok: true };
+    });
+    await restartEntered.promise;
+
+    const configure = queue.enqueue("tftp", async () => {
+      savedConfig = "configured";
+      lifecycle.push("configure");
+      return { id: 2, ok: true };
+    });
+    const start = queue.enqueue("tftp", async () => {
+      lifecycle.push("start:no-op-running");
+      return { id: 3, ok: true };
+    });
+
+    releaseRestart.resolve();
+    await expect(Promise.all([restart, configure, start])).resolves.toEqual([
+      { id: 1, ok: true },
+      { id: 2, ok: true },
+      { id: 3, ok: true },
+    ]);
+
+    expect(lifecycle).toEqual(["restart:stop", "restart:start", "configure", "start:no-op-running"]);
+    expect(savedConfig).toBe("configured");
+    expect(instance).toEqual({ identity: "restart", socket: "restart" });
+    expect([...sockets]).toEqual(["restart"]);
+
+    const finalRestart = await queue.enqueue("tftp", async () => {
+      sockets.delete(instance.socket);
+      instance = { identity: "configured", socket: savedConfig };
+      sockets.add(instance.socket);
+      return { id: 4, ok: true };
+    });
+    expect(finalRestart).toEqual({ id: 4, ok: true });
+    expect(instance).toEqual({ identity: "configured", socket: "configured" });
+    expect([...sockets]).toEqual(["configured"]);
+  });
+
+  it("drains a gated workflow before shutdown disposes its socket owner", async () => {
+    const queue = new ServiceWorkflowQueue();
+    const workflowEntered = deferred();
+    const releaseWorkflow = deferred();
+    let socketOwned = true;
+    let disposed = false;
+
+    const stopping = queue.enqueue("dhcp", async () => {
+      workflowEntered.resolve();
+      await releaseWorkflow.promise;
+      socketOwned = false;
+    });
+    await workflowEntered.promise;
+
+    const shutdown = (async (): Promise<void> => {
+      await queue.drain();
+      disposed = true;
+    })();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(disposed, "shutdown must not dispose around an unfinished service workflow").toBe(false);
+    expect(socketOwned).toBe(true);
+
+    releaseWorkflow.resolve();
+    await Promise.all([stopping, shutdown]);
+    expect(socketOwned).toBe(false);
+    expect(disposed).toBe(true);
+  });
+});

@@ -137,6 +137,31 @@ function parseBoundedString(
   return value;
 }
 
+/** Parses a bounded string whose surrounding whitespace has no meaning. */
+function parseTrimmedNonBlankString(
+  value: unknown,
+  path: string,
+  label: string,
+  maximumBytes: number,
+  errors: string[],
+): string | undefined {
+  if (typeof value !== "string") {
+    errors.push(`${path}: ${label} must be a string.`);
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    errors.push(`${path}: ${label} must not be blank; omit it to serve boot options to every client.`);
+    return undefined;
+  }
+  const bytes = utf8Bytes(trimmed);
+  if (bytes > maximumBytes) {
+    errors.push(`${path}: ${label} is ${bytes} bytes; the maximum is ${maximumBytes}.`);
+    return undefined;
+  }
+  return trimmed;
+}
+
 function parsePort(value: unknown, path: string, errors: string[]): number | undefined {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < MIN_PORT || value > MAX_PORT) {
     errors.push(`${path}: Port must be a safe whole number between ${MIN_PORT} and ${MAX_PORT}.`);
@@ -167,13 +192,23 @@ function canonicalMac(value: string): string | undefined {
   return [match[1], match[3], match[4], match[5], match[6], match[7]].join(":").toLowerCase();
 }
 
-function parseIpv4Array(value: unknown, path: string, label: string, errors: string[]): string[] | undefined {
+function parseIpv4Array(
+  value: unknown,
+  path: string,
+  label: string,
+  errors: string[],
+  minimumEntries = 0,
+): string[] | undefined {
   if (!Array.isArray(value)) {
     errors.push(`${path}: ${label} must be an array of IPv4 addresses.`);
     return undefined;
   }
   if (value.length > MAX_DHCP_ARRAY_ENTRIES) {
     errors.push(`${path}: ${label} has ${value.length} entries; the maximum is ${MAX_DHCP_ARRAY_ENTRIES}.`);
+    return undefined;
+  }
+  if (value.length < minimumEntries) {
+    errors.push(`${path}: ${label} must contain at least ${minimumEntries} IPv4 address${minimumEntries === 1 ? "" : "es"}.`);
     return undefined;
   }
   const parsed: string[] = [];
@@ -336,7 +371,7 @@ function parseDhcpConfigAt(value: unknown, path: string): ValidationResult<DhcpA
     }
   }
   if (hasOwn(value, "dns")) {
-    const dns = parseIpv4Array(value.dns, `${path}.dns`, "DNS servers", errors);
+    const dns = parseIpv4Array(value.dns, `${path}.dns`, "DNS servers", errors, 1);
     if (dns !== undefined) parsed.dns = dns;
   }
   if (hasOwn(value, "tftpServerAddresses")) {
@@ -364,7 +399,7 @@ function parseDhcpConfigAt(value: unknown, path: string): ValidationResult<DhcpA
     if (address) parsed.nextServer = address.value;
   }
   if (hasOwn(value, "vendorClassId")) {
-    const text = parseBoundedString(value.vendorClassId, `${path}.vendorClassId`, "Vendor Class Identifier", MAX_DHCP_STRING_BYTES, errors);
+    const text = parseTrimmedNonBlankString(value.vendorClassId, `${path}.vendorClassId`, "Vendor Class Identifier", MAX_DHCP_STRING_BYTES, errors);
     if (text !== undefined) parsed.vendorClassId = text;
   }
   if (hasOwn(value, "vendorSpecificOptions")) {
@@ -475,7 +510,7 @@ export function sanitizeDhcpConfig(value: unknown): { readonly value: DhcpAdapte
     }
   }
   if (hasConfiguredValue(value, "dns")) {
-    const dns = parseIpv4Array(value.dns, "dhcp.dns", "DNS servers", warnings);
+    const dns = parseIpv4Array(value.dns, "dhcp.dns", "DNS servers", warnings, 1);
     if (dns && dns.length > 0) parsed.dns = dns;
   }
   if (hasConfiguredValue(value, "tftpServerAddresses")) {
@@ -503,7 +538,7 @@ export function sanitizeDhcpConfig(value: unknown): { readonly value: DhcpAdapte
     if (address) parsed.nextServer = address.value;
   }
   if (hasConfiguredValue(value, "vendorClassId")) {
-    const text = parseBoundedString(value.vendorClassId, "dhcp.vendorClassId", "Vendor Class Identifier", MAX_DHCP_STRING_BYTES, warnings);
+    const text = parseTrimmedNonBlankString(value.vendorClassId, "dhcp.vendorClassId", "Vendor Class Identifier", MAX_DHCP_STRING_BYTES, warnings);
     if (text !== undefined) parsed.vendorClassId = text;
   }
   if (hasConfiguredValue(value, "vendorSpecificOptions")) {

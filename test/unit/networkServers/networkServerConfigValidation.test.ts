@@ -116,6 +116,13 @@ describe("network-server configuration validation", () => {
     expectInvalid(parseDhcpConfig({ ...VALID_DHCP, leaseTimeSec: 3.5 }), "dhcp.leaseTimeSec");
   });
 
+  it("rejects explicit empty DNS and whitespace-only vendor filters at strict ingress", () => {
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, dns: [] }), "dhcp.dns");
+    expectInvalid(parseNetworkServerConfigs({ dhcp: { ...VALID_DHCP, dns: [] } }), "dhcp.dns");
+    expectInvalid(parseDhcpConfig({ ...VALID_DHCP, vendorClassId: " \t " }), "dhcp.vendorClassId");
+    expectInvalid(parseNetworkServerConfigs({ dhcp: { ...VALID_DHCP, vendorClassId: " \t " } }), "dhcp.vendorClassId");
+  });
+
   it("bounds DHCP strings, address arrays, and option-43 TLV bytes before adapter creation", () => {
     expectInvalid(parseDhcpConfig({ ...VALID_DHCP, bootFileName: "x".repeat(256) }), "dhcp.bootFileName");
     expectInvalid(parseDhcpConfig({ ...VALID_DHCP, dns: Array.from({ length: 17 }, () => "1.1.1.1") }), "dhcp.dns");
@@ -140,7 +147,6 @@ describe("network-server configuration validation", () => {
     expectValid(parseNetworkServerConfigs({ tftp: { root: "x".repeat(4_096), port: 65_535 } }));
     expectValid(parseDhcpConfig({
       ...VALID_DHCP,
-      dns: [],
       tftpServerAddresses: [],
       static: {},
       vendorSpecificOptions: [],

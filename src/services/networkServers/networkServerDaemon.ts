@@ -63,6 +63,7 @@ import { DhcpAdapter, type DhcpLeaseInfo } from './dhcp/DhcpAdapter';
 import { TftpAdapter, type TftpTransferView } from './tftp/TftpAdapter';
 import { createRuntimeUpdateThrottle } from './runtimeUpdateThrottle';
 import { parseNetworkServerConfigs } from './networkServerConfigValidation';
+import { ServiceWorkflowQueue } from './networkServerWorkflowQueue';
 import {
   ServerManager,
   ServerStatus,
@@ -249,6 +250,8 @@ async function run(): Promise<void> {
   const manager = new ServerManager(
     createDefaultRegistry(() => ({ tftp: configStore.tftp, dhcp: configStore.dhcp })),
   );
+  const serviceWorkflows = new ServiceWorkflowQueue();
+  let shuttingDown = false;
 
   /**
    * Ids whose stored configuration changed while the service was still running,
@@ -299,20 +302,25 @@ async function run(): Promise<void> {
    *   `start` carrying only `tftp` config cannot clobber the DHCP settings.
    * @returns The ids whose stored configuration actually changed.
    */
+  const applyConfig = async (
+    id: 'tftp' | 'dhcp',
+    config: TftpAdapterConfig | DhcpAdapterConfig,
+  ): Promise<boolean> => {
+    if (id === 'tftp') {
+      if (JSON.stringify(configStore.tftp ?? null) === JSON.stringify(config)) return false;
+      configStore.tftp = config as TftpAdapterConfig;
+    } else {
+      if (JSON.stringify(configStore.dhcp ?? null) === JSON.stringify(config)) return false;
+      configStore.dhcp = config as DhcpAdapterConfig;
+    }
+    await evictIfIdle(id);
+    return true;
+  };
+
   const applyConfigs = async (configs: NetworkServerConfigs): Promise<string[]> => {
     const changed: string[] = [];
-    const tftp = configs.tftp;
-    if (tftp !== undefined && JSON.stringify(configStore.tftp ?? null) !== JSON.stringify(tftp)) {
-      configStore.tftp = tftp;
-      changed.push('tftp');
-      await evictIfIdle('tftp');
-    }
-    const dhcp = configs.dhcp;
-    if (dhcp !== undefined && JSON.stringify(configStore.dhcp ?? null) !== JSON.stringify(dhcp)) {
-      configStore.dhcp = dhcp;
-      changed.push('dhcp');
-      await evictIfIdle('dhcp');
-    }
+    if (configs.tftp !== undefined && await applyConfig('tftp', configs.tftp)) changed.push('tftp');
+    if (configs.dhcp !== undefined && await applyConfig('dhcp', configs.dhcp)) changed.push('dhcp');
     return changed;
   };
 
@@ -364,15 +372,22 @@ async function run(): Promise<void> {
    * @param reason — text identifying the shutdown source
    *                 (`SIGINT`, `SIGTERM`, `stdin closed`).
    */
-  const shutdown = async (reason: string): Promise<void> => {
-    logDaemon('info', `Shutting down (${reason})...`);
-    runtimeUpdates.flush();
-    try {
-      await manager.disposeAll();
-    } catch {
-      // ignore
-    }
-    process.exit(0);
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (reason: string): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    shuttingDown = true;
+    shutdownPromise = (async () => {
+      logDaemon('info', `Shutting down (${reason})...`);
+      runtimeUpdates.flush();
+      try {
+        await serviceWorkflows.drain();
+        await manager.disposeAll();
+      } catch {
+        // ignore
+      }
+      process.exit(0);
+    })();
+    return shutdownPromise;
   };
 
   process.on('SIGINT', () => void shutdown('SIGINT').catch((err) => process.stderr.write('shutdown error: ' + (err instanceof Error ? err.message : String(err)) + '\n')));
@@ -422,6 +437,7 @@ async function run(): Promise<void> {
 
   const handleRequest = async (req: JsonRpcRequest): Promise<JsonRpcResult | JsonRpcError> => {
     try {
+      if (shuttingDown) throw new Error('Network servers daemon is shutting down.');
       switch (req.method) {
         case 'list': {
           const list: readonly ServerSnapshot[] = manager.list();
@@ -445,20 +461,41 @@ async function run(): Promise<void> {
           if (!parsed.ok) {
             throw new Error(`Invalid network-server configuration: ${parsed.errors.join('; ')}`);
           }
-          const changed = await applyConfigs(parsed.value);
+          const operations: Array<Promise<{ readonly id: 'tftp' | 'dhcp'; readonly changed: boolean }>> = [];
+          if (parsed.value.tftp !== undefined) {
+            operations.push(serviceWorkflows.enqueue('tftp', async () => ({
+              id: 'tftp',
+              changed: await applyConfig('tftp', parsed.value.tftp!),
+            })));
+          }
+          if (parsed.value.dhcp !== undefined) {
+            operations.push(serviceWorkflows.enqueue('dhcp', async () => ({
+              id: 'dhcp',
+              changed: await applyConfig('dhcp', parsed.value.dhcp!),
+            })));
+          }
+          const changed = (await Promise.all(operations)).filter((result) => result.changed).map((result) => result.id);
           return { id: req.id, result: { ok: true, changed } };
         }
         case 'start': {
           const id = String(req.params?.['id'] ?? '');
           const configs = parseRequestConfig(id, req.params);
-          if (configs) await applyConfigs(configs);
-          if (staleConfigIds.has(id)) await evictIfIdle(id);
-          await manager.start(id);
+          if (id !== 'tftp' && id !== 'dhcp') {
+            await manager.start(id);
+          } else {
+            await serviceWorkflows.enqueue(id, async () => {
+              const config = id === 'tftp' ? configs?.tftp : configs?.dhcp;
+              if (config !== undefined) await applyConfig(id, config);
+              if (staleConfigIds.has(id)) await evictIfIdle(id);
+              await manager.start(id);
+            });
+          }
           return { id: req.id, result: { ok: true, id } };
         }
         case 'stop': {
           const id = String(req.params?.['id'] ?? '');
-          await manager.stop(id);
+          if (id === 'tftp' || id === 'dhcp') await serviceWorkflows.enqueue(id, () => manager.stop(id));
+          else await manager.stop(id);
           return { id: req.id, result: { ok: true, id } };
         }
         case 'restart': {
@@ -467,12 +504,19 @@ async function run(): Promise<void> {
           // Stop first, THEN apply: applyConfigs deliberately refuses to evict
           // a running instance, so configuring before stopping would leave the
           // old instance in place and restart it with stale settings.
-          await manager.stop(id);
-          if (configs) await applyConfigs(configs);
-          // Picks up a `configure` that landed while the service was running:
-          // the eviction it could not do back then happens now that it is idle.
-          if (staleConfigIds.has(id)) await evictIfIdle(id);
-          await manager.start(id);
+          if (id !== 'tftp' && id !== 'dhcp') {
+            await manager.restart(id);
+          } else {
+            await serviceWorkflows.enqueue(id, async () => {
+              await manager.stop(id);
+              const config = id === 'tftp' ? configs?.tftp : configs?.dhcp;
+              if (config !== undefined) await applyConfig(id, config);
+              // Picks up a configure that landed while the service was running:
+              // the eviction it could not do back then happens now that it is idle.
+              if (staleConfigIds.has(id)) await evictIfIdle(id);
+              await manager.start(id);
+            });
+          }
           return { id: req.id, result: { ok: true, id } };
         }
         case 'cancelTransfer': {
