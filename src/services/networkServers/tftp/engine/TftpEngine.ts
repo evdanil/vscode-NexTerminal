@@ -198,6 +198,8 @@ export class TftpEngine extends EventEmitter {
   private readonly pendingAdmissionKeys = new Set<string>();
   /** Admission work owned by this engine lifecycle and awaited by {@link stop}. */
   private readonly admissionTasks = new Set<Promise<void>>();
+  /** Per-peer packet tails, so a WRQ's position-relative writes stay ordered. */
+  private readonly peerPacketTasks = new Map<string, Promise<void>>();
   /** Invalidates admissions captured by an earlier start/stop lifecycle. */
   private lifecycleGeneration = 0;
   /** Whether new RRQ/WRQ admissions may be created in the current lifecycle. */
@@ -300,7 +302,8 @@ export class TftpEngine extends EventEmitter {
     // Before the socket, not after: a root that does not exist is a
     // configuration failure the operator has to see, and a bound socket that
     // can serve nothing is the worst possible way to tell them.
-    this.guard = new PathGuard(this.opts.root);
+    const guard = new PathGuard(this.opts.root);
+    this.guard = guard;
     const generation = ++this.lifecycleGeneration;
     this.acceptingRequests = false;
     const socket = dgram.createSocket('udp4');
@@ -349,7 +352,21 @@ export class TftpEngine extends EventEmitter {
     });
 
     socket.bind(this.opts.port, this.opts.address);
-    await listeningPromise;
+    try {
+      await listeningPromise;
+    } catch (err) {
+      socket.removeAllListeners();
+      await new Promise<void>((resolve) => {
+        try {
+          socket.close(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+      if (this.socket === socket) this.socket = null;
+      if (this.guard === guard) this.guard = null;
+      throw err;
+    }
     if (this.lifecycleGeneration !== generation || this.socket !== socket) return;
     this.acceptingRequests = true;
 
@@ -391,6 +408,7 @@ export class TftpEngine extends EventEmitter {
       });
     }
     await Promise.allSettled(admissions);
+    await Promise.allSettled(Array.from(this.peerPacketTasks.values()));
     for (const t of this.transfers.values()) {
       try {
         await t.closeFile();
@@ -410,6 +428,7 @@ export class TftpEngine extends EventEmitter {
     this.writeHandles.clear();
     this.pendingAdmissionKeys.clear();
     this.admissionTasks.clear();
+    this.peerPacketTasks.clear();
     this.guard = null;
     this.log('info', 'stopped.');
   }
@@ -540,7 +559,7 @@ export class TftpEngine extends EventEmitter {
     const key = `${rinfo.address}:${rinfo.port}`;
     const existing = this.transfers.get(key);
     if (existing) {
-      await this.routeExisting(existing, msg, rinfo);
+      await this.enqueueExistingPacket(key, existing, msg, rinfo);
       return;
     }
     if (opcode !== Opcode.RRQ && opcode !== Opcode.WRQ) {
@@ -548,6 +567,32 @@ export class TftpEngine extends EventEmitter {
       return;
     }
     await this.handleNewRequest(msg, rinfo);
+  }
+
+  /**
+   * Serializes packets for one existing peer while leaving unrelated peers
+   * independent. In particular, WRQ DATA handling advances the FSM before its
+   * position-relative file write completes, so the next DATA packet must not
+   * enter that path until the previous one has settled.
+   */
+  private async enqueueExistingPacket(
+    key: string,
+    transfer: TransferSession,
+    msg: Buffer,
+    rinfo: dgram.RemoteInfo,
+  ): Promise<void> {
+    const previous = this.peerPacketTasks.get(key) ?? Promise.resolve();
+    const operation = previous.catch(() => {}).then(async () => {
+      if (this.transfers.get(key) !== transfer) return;
+      await this.routeExisting(transfer, msg, rinfo);
+    });
+    const tracked = operation.finally(() => {
+      if (this.peerPacketTasks.get(key) === tracked) {
+        this.peerPacketTasks.delete(key);
+      }
+    });
+    this.peerPacketTasks.set(key, tracked);
+    await tracked;
   }
 
   /**

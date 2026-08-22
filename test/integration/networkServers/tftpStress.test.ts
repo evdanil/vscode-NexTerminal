@@ -138,7 +138,9 @@ async function doWRQ(port: number, filename: string, payload: Buffer, opts: Reco
     const blksize = opts.blksize ? Number(opts.blksize) : 512;
     const windowsize = opts.windowsize ? Number(opts.windowsize) : 1;
     c.sendTo(encodeWRQ(filename, "octet", opts), port);
-    const totalBlocks = Math.max(1, Math.ceil(payload.length / blksize));
+    // RFC 1350 terminates a transfer with a short DATA packet. An exact
+    // multiple therefore needs one additional zero-length block.
+    const totalBlocks = Math.floor(payload.length / blksize) + 1;
     let sent = 0;
     let lastAcked = 0;
     let finished = false;
@@ -294,6 +296,23 @@ describe("TFTP E2E — Stress 30+ Concurrent Devices", () => {
       await doWRQ(port, "optioned.bin", payload, { blksize: "128", windowsize: "4" });
       const onDisk = fs.readFileSync(path.join(root, "optioned.bin"));
       expect(onDisk.equals(payload)).toBe(true);
+    });
+  });
+
+  it("exact-multiple WRQ sends the final empty DATA block and completes", async () => {
+    const payload = randomPayload(128 * 4);
+    await withEngine(root, true, {}, async (engine, port) => {
+      let completes = 0;
+      engine.on("transfer:complete", () => completes++);
+
+      await doWRQ(port, "exact-multiple.bin", payload, {
+        blksize: "128",
+        windowsize: "4"
+      });
+
+      expect(fs.readFileSync(path.join(root, "exact-multiple.bin"))).toEqual(payload);
+      expect(completes, "the zero-length terminator must complete the server session").toBe(1);
+      expect(engine.activeTransfers()).toHaveLength(0);
     });
   });
 });

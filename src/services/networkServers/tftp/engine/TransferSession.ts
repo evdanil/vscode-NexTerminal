@@ -506,6 +506,20 @@ export class TransferSession {
     produceMore: boolean;
     done: boolean;
   } {
+    if (this.phase === TransferPhase.SendOACK) {
+      if (blockNum !== 0) {
+        return { send: [], produceMore: false, done: false };
+      }
+      this.touch();
+      this.retries = 0;
+      this.clearOutboundUpToAck(blockNum);
+      if (this.opcode === Opcode.RRQ) {
+        this.phase = TransferPhase.Sending;
+        return { send: [], produceMore: true, done: false };
+      }
+      this.phase = TransferPhase.Receiving;
+      return { send: [], produceMore: false, done: false };
+    }
     this.touch();
     this.retries = 0;
     if (this.phase === TransferPhase.SentLast) {
@@ -518,18 +532,6 @@ export class TransferSession {
       if (blockNum === this.blockNum || blockNum === 0) {
         this.phase = TransferPhase.Done;
         return { send: [], produceMore: false, done: true };
-      }
-    }
-    if (this.phase === TransferPhase.SendOACK) {
-      if (blockNum === 0) {
-        this.clearOutboundUpToAck(blockNum);
-        if (this.opcode === Opcode.RRQ) {
-          this.phase = TransferPhase.Sending;
-          return { send: [], produceMore: true, done: false };
-        } else {
-          this.phase = TransferPhase.Receiving;
-          return { send: [], produceMore: false, done: false };
-        }
       }
     }
     if (this.phase === TransferPhase.Sending) {

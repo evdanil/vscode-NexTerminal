@@ -121,6 +121,13 @@ export class TftpAdapter extends BaseNexusServer {
   private readonly hostnames = new ReverseDnsCache();
   /** Effective configuration (with defaults applied in the constructor). */
   private config: TftpAdapterConfig;
+  /** Serializes adapter start/stop transitions in caller order. */
+  private lifecycleQueue: Promise<void> = Promise.resolve();
+  /** Coalesces adjacent duplicate lifecycle requests. */
+  private lastLifecycleOperation: {
+    readonly kind: 'start' | 'stop';
+    readonly promise: Promise<void>;
+  } | null = null;
 
   /**
    * Creates (but does not start) a TFTP adapter.
@@ -233,8 +240,19 @@ export class TftpAdapter extends BaseNexusServer {
    *
    * @sideeffect Creates {@link TftpEngine}, binds listeners, emits logs, changes status.
    */
-  public override async start(): Promise<void> {
-    if (this.status === ServerStatus.STARTING || this.status === ServerStatus.RUNNING) return;
+  public override start(): Promise<void> {
+    return this.enqueueLifecycle('start', () => this.startOwned());
+  }
+
+  /** Performs one serialized start transition. */
+  private async startOwned(): Promise<void> {
+    if (this.engine && this.status === ServerStatus.RUNNING) return;
+    if (this.engine) {
+      const cleanupError = await this.releaseEngine(this.engine);
+      if (cleanupError) {
+        throw this.failStart(`Cannot replace the previous TFTP engine: ${cleanupError.message}`);
+      }
+    }
     this.setStatus(ServerStatus.STARTING);
 
     const root = this.root;
@@ -251,13 +269,11 @@ export class TftpAdapter extends BaseNexusServer {
       address,
     };
 
-    let firstEngine: TftpEngine | null = null;
-
     const tryStart = async (port: number): Promise<TftpEngine> => {
       const engine = new TftpEngine({ ...engineOpts, port });
-      if (port === this.port) {
-        firstEngine = engine;
-      }
+      // Publish ownership before bind: stop/dispose must be able to find an
+      // engine while its asynchronous start is still pending.
+      this.engine = engine;
       this.bindEngineLogging(engine);
       this.bindEngineEvents(engine);
       await engine.start();
@@ -272,21 +288,12 @@ export class TftpAdapter extends BaseNexusServer {
       }
       this.setStatus(ServerStatus.RUNNING);
     } catch (err) {
-      const failedEngine = firstEngine as TftpEngine | null;
-      if (failedEngine) {
-        try {
-          failedEngine.removeAllListeners();
-        } catch {
-          // swallow
-        }
-        try {
-          void failedEngine.stop().catch(() => {});
-        } catch {
-          // swallow
-        }
-        firstEngine = null;
-      }
       const message = err instanceof Error ? err.message : String(err);
+      const failedEngine = this.engine;
+      const cleanupError = failedEngine ? await this.releaseEngine(failedEngine) : null;
+      if (cleanupError) {
+        throw this.failStart(`Failed to start: ${message}; cleanup issue: ${cleanupError.message}`);
+      }
       const isEACCES = /EACCES|Access/i.test(message) || /permission/i.test(message);
       const isInUse = /EADDRINUSE|address already in use/i.test(message);
       if (isEACCES && this.port === DEFAULT_PORT) {
@@ -305,8 +312,15 @@ export class TftpAdapter extends BaseNexusServer {
           return;
         } catch (altErr) {
           const altMsg = altErr instanceof Error ? altErr.message : String(altErr);
+          const failedFallback = this.engine;
+          const fallbackCleanupError = failedFallback
+            ? await this.releaseEngine(failedFallback)
+            : null;
+          const cleanupDetail = fallbackCleanupError
+            ? `; cleanup issue: ${fallbackCleanupError.message}`
+            : '';
           throw this.failStart(
-            `Failed to start (port ${DEFAULT_PORT} denied, fallback ${FALLBACK_ALT_PORT} failed: ${altMsg})`,
+            `Failed to start (port ${DEFAULT_PORT} denied, fallback ${FALLBACK_ALT_PORT} failed: ${altMsg}${cleanupDetail})`,
           );
         }
       }
@@ -345,25 +359,82 @@ export class TftpAdapter extends BaseNexusServer {
    *
    * @sideeffect Stops the engine, removes listeners, closes socket, changes status to STOPPED.
    */
-  public override async stop(): Promise<void> {
-    if (this.status === ServerStatus.STOPPING || this.status === ServerStatus.STOPPED) return;
+  public override stop(): Promise<void> {
+    return this.enqueueLifecycle('stop', () => this.stopOwned());
+  }
+
+  /** Performs one serialized, resource-based stop transition. */
+  private async stopOwned(): Promise<void> {
+    if (!this.engine && this.status === ServerStatus.STOPPED) return;
     this.setStatus(ServerStatus.STOPPING);
     this.log('info', 'Stopping...');
     const engine = this.engine;
-    this.engine = null;
     // Names are only meaningful while the bench they describe is being served;
     // a restart should re-observe the network rather than trust stale PTRs.
     this.hostnames.clear();
     if (engine) {
-      try {
-        engine.removeAllListeners();
-        await engine.stop();
-      } catch (err) {
-        this.log('warn', `cleanup issue: ${err instanceof Error ? err.message : String(err)}`);
+      const cleanupError = await this.releaseEngine(engine);
+      if (cleanupError) {
+        this.setStatus(ServerStatus.ERROR, `cleanup issue: ${cleanupError.message}`);
+        return;
       }
     }
     this.setStatus(ServerStatus.STOPPED);
     this.log('info', 'Service stopped.');
+  }
+
+  /**
+   * Stops one captured engine and clears ownership only after cleanup succeeds.
+   * A failed cleanup leaves the engine reachable so a later stop can retry it.
+   */
+  private async releaseEngine(engine: TftpEngine): Promise<Error | null> {
+    try {
+      engine.removeAllListeners();
+    } catch {
+      // Continue to the resource-owning stop even if listener cleanup failed.
+    }
+    try {
+      await engine.stop();
+    } catch (err) {
+      const cleanupError = err instanceof Error ? err : new Error(String(err));
+      this.log('warn', `cleanup issue: ${cleanupError.message}`);
+      return cleanupError;
+    }
+    if (this.engine === engine) this.engine = null;
+    return null;
+  }
+
+  /** Queues one lifecycle transition and keeps the queue usable after errors. */
+  private enqueueLifecycle(
+    kind: 'start' | 'stop',
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const pending = this.lastLifecycleOperation;
+    if (pending?.kind === kind) return pending.promise;
+
+    const promise = this.lifecycleQueue.then(operation);
+    this.lifecycleQueue = promise.catch(() => {});
+    const request = { kind, promise };
+    this.lastLifecycleOperation = request;
+    void promise.then(
+      () => {
+        if (this.lastLifecycleOperation === request) this.lastLifecycleOperation = null;
+      },
+      () => {
+        if (this.lastLifecycleOperation === request) this.lastLifecycleOperation = null;
+      },
+    );
+    return promise;
+  }
+
+  /** Resource-aware disposal; ERROR is not proof that the engine is gone. */
+  public override async dispose(): Promise<void> {
+    try {
+      await this.stop();
+    } catch {
+      // Disposal is terminal and must not reject.
+    }
+    this.removeAllListeners();
   }
 
   /**

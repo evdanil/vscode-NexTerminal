@@ -16,13 +16,22 @@
  * asserted in `daemonBridge.test.ts`, which drives a real daemon child process.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import dgram from "node:dgram";
 import fs from "node:fs";
 import { TftpAdapter } from "../../../src/services/networkServers/tftp/TftpAdapter";
+import { TftpEngine } from "../../../src/services/networkServers/tftp/engine/TftpEngine";
 import { DhcpAdapter } from "../../../src/services/networkServers/dhcp/DhcpAdapter";
 import { ServerStatus } from "../../../src/services/networkServers/core/ServerStatus";
 import { mkdtemp } from "../../helpers/networkServerTestHelpers";
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 /** Binds a UDP port and keeps it, so the next binder gets EADDRINUSE. */
 function holdUdpPort(): Promise<{ port: number; release: () => Promise<void> }> {
@@ -46,6 +55,7 @@ describe("network server adapters — a start that fails must reject", () => {
     for (const cleanup of cleanups.splice(0)) {
       await cleanup().catch(() => undefined);
     }
+    vi.restoreAllMocks();
   });
 
   it("TFTP: a port already in use rejects start() and records ERROR", async () => {
@@ -63,6 +73,116 @@ describe("network server adapters — a start that fails must reject", () => {
     ).rejects.toThrow(/already in use/i);
     expect(adapter.status).toBe(ServerStatus.ERROR);
     expect(adapter.boundPort, "nothing was bound, so nothing may be reported as bound").toBeNull();
+  });
+
+  it("TFTP: stop waits for a provisional engine start and then releases it", async () => {
+    const root = mkdtemp("nexus-adapter-start-stop-");
+    cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+    const startEntered = deferred();
+    const releaseStart = deferred();
+    const originalStart = TftpEngine.prototype.start;
+    vi.spyOn(TftpEngine.prototype, "start").mockImplementation(async function (this: TftpEngine) {
+      startEntered.resolve();
+      await releaseStart.promise;
+      await originalStart.call(this);
+    });
+    const adapter = new TftpAdapter({ root, port: 0, interface: "127.0.0.1" });
+    cleanups.push(() => adapter.stop());
+    let startPromise: Promise<void> | undefined;
+    let stopPromise: Promise<void> | undefined;
+
+    try {
+      startPromise = adapter.start();
+      await startEntered.promise;
+      let stopSettled = false;
+      stopPromise = adapter.stop().then(() => {
+        stopSettled = true;
+      });
+      await Promise.resolve();
+      expect(stopSettled, "stop must queue behind the provisional engine's start").toBe(false);
+
+      releaseStart.resolve();
+      await Promise.all([startPromise, stopPromise]);
+      expect(adapter.status).toBe(ServerStatus.STOPPED);
+      expect(adapter.boundPort).toBeNull();
+    } finally {
+      releaseStart.resolve();
+      await Promise.allSettled(
+        [startPromise, stopPromise].filter((p): p is Promise<void> => p !== undefined)
+      );
+    }
+  });
+
+  it("TFTP: failed start does not reject until its provisional engine is cleaned", async () => {
+    const held = await holdUdpPort();
+    cleanups.push(held.release);
+    const root = mkdtemp("nexus-adapter-failed-cleanup-");
+    cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+    const stopEntered = deferred();
+    const releaseStop = deferred();
+    const originalStop = TftpEngine.prototype.stop;
+    vi.spyOn(TftpEngine.prototype, "stop").mockImplementation(async function (this: TftpEngine) {
+      stopEntered.resolve();
+      await releaseStop.promise;
+      await originalStop.call(this);
+    });
+    const adapter = new TftpAdapter({ root, port: held.port, interface: "127.0.0.1" });
+    cleanups.push(() => adapter.stop());
+    let startSettled = false;
+    const starting = adapter.start().then(
+      () => {
+        startSettled = true;
+        return null;
+      },
+      (err: unknown) => {
+        startSettled = true;
+        return err;
+      }
+    );
+
+    try {
+      const firstOutcome = await Promise.race([
+        stopEntered.promise.then(() => "cleanup-entered" as const),
+        starting.then(() => "start-settled" as const)
+      ]);
+      expect(firstOutcome, "failed start must enter provisional cleanup before settling").toBe(
+        "cleanup-entered"
+      );
+      await Promise.resolve();
+      expect(startSettled, "the adapter must retain ownership until failed-start cleanup settles").toBe(false);
+
+      releaseStop.resolve();
+      const startError = await starting;
+      expect(startError).toBeInstanceOf(Error);
+      expect((startError as Error).message).toMatch(/already in use/i);
+      expect(adapter.status).toBe(ServerStatus.ERROR);
+      expect(adapter.boundPort).toBeNull();
+    } finally {
+      releaseStop.resolve();
+      await starting;
+    }
+  });
+
+  it("TFTP: dispose stops a live engine even after a runtime ERROR", async () => {
+    const root = mkdtemp("nexus-adapter-error-dispose-");
+    cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+    const adapter = new TftpAdapter({ root, port: 0, interface: "127.0.0.1" });
+    const state = adapter as unknown as { engine: TftpEngine | null };
+
+    await adapter.start();
+    const engine = state.engine!;
+    try {
+      expect(engine.boundPort).not.toBeNull();
+      engine.emit("error", new Error("synthetic runtime socket failure"));
+      expect(adapter.status).toBe(ServerStatus.ERROR);
+
+      await adapter.dispose();
+
+      expect(adapter.boundPort, "dispose must release resources regardless of ERROR status").toBeNull();
+      expect(engine.boundPort).toBeNull();
+    } finally {
+      await engine.stop();
+    }
   });
 
   it("DHCP: an unbindable address rejects start() and records ERROR", async () => {

@@ -33,6 +33,7 @@ import {
   encodeRRQ,
   encodeWRQ,
   encodeACK,
+  encodeDATA,
   getOpcode
 } from "../../../src/services/networkServers/tftp/engine/protocol";
 import { PathGuard } from "../../../src/services/networkServers/tftp/engine/PathGuard";
@@ -44,6 +45,21 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+/** Binds a UDP port until released, forcing a deterministic EADDRINUSE. */
+function holdUdpPort(): Promise<{ port: number; release: () => Promise<void> }> {
+  return new Promise((resolve, reject) => {
+    const socket = dgram.createSocket({ type: "udp4", reuseAddr: false });
+    socket.once("error", reject);
+    socket.bind(0, "127.0.0.1", () => {
+      const { port } = socket.address() as { port: number };
+      resolve({
+        port,
+        release: () => new Promise<void>((done) => socket.close(() => done()))
+      });
+    });
+  });
 }
 
 async function withEngine<T>(
@@ -332,6 +348,48 @@ describe("TFTP E2E — Critical Paths", () => {
   });
 
   describe("lifecycle ownership", () => {
+    it("failed bind releases its socket and guard before the same engine retries", async () => {
+      const held = await holdUdpPort();
+      const engine = new TftpEngine({ root, port: held.port, address: "127.0.0.1" });
+      const state = engine as unknown as { socket: dgram.Socket | null; guard: PathGuard | null };
+      engine.on("error", () => {});
+      let released = false;
+
+      try {
+        await expect(engine.start()).rejects.toMatchObject({ code: "EADDRINUSE" });
+        expect(state.socket, "the rejected start must release its captured socket").toBeNull();
+        expect(state.guard, "the rejected start must release its captured root guard").toBeNull();
+
+        await held.release();
+        released = true;
+        await engine.start();
+        expect(engine.boundPort).toBe(held.port);
+      } finally {
+        if (!released) await held.release();
+        await engine.stop();
+      }
+    });
+
+    it("stop after a failed bind sees no stale attempt-owned resources", async () => {
+      const held = await holdUdpPort();
+      const engine = new TftpEngine({ root, port: held.port, address: "127.0.0.1" });
+      const state = engine as unknown as { socket: dgram.Socket | null; guard: PathGuard | null };
+      engine.on("error", () => {});
+
+      try {
+        await expect(engine.start()).rejects.toMatchObject({ code: "EADDRINUSE" });
+        expect(state.socket).toBeNull();
+        expect(state.guard).toBeNull();
+        await engine.stop();
+        expect(engine.boundPort).toBeNull();
+        expect(state.socket).toBeNull();
+        expect(state.guard).toBeNull();
+      } finally {
+        await held.release();
+        await engine.stop();
+      }
+    });
+
     it("stop during bind settles start and leaves the engine stopped", async () => {
       const engine = new TftpEngine({ root, port: 0, address: "127.0.0.1" });
       engine.on("error", () => {});
@@ -464,6 +522,88 @@ describe("TFTP E2E — Critical Paths", () => {
       } finally {
         releaseRrqClose.resolve();
         releaseWrqClose.resolve();
+        openSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("existing-session packet ownership", () => {
+    it("serializes windowed WRQ writes and stop waits for the queued peer work", async () => {
+      const firstWriteEntered = deferred();
+      const releaseFirstWrite = deferred();
+      const originalOpen = fs.promises.open.bind(fs.promises);
+      const writes: string[] = [];
+      const completedWrites: string[] = [];
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args: any[]) => {
+        const handle = await (originalOpen as any)(...args);
+        if (args[1] === "wx") {
+          const realWrite = handle.write.bind(handle);
+          vi.spyOn(handle, "write").mockImplementation(async (data: any, ...writeArgs: any[]) => {
+            const label = Buffer.from(data).toString("ascii");
+            writes.push(label);
+            if (writes.length === 1) {
+              firstWriteEntered.resolve();
+              await releaseFirstWrite.promise;
+            }
+            const result = await (realWrite as any)(data, ...writeArgs);
+            completedWrites.push(label);
+            return result;
+          });
+        }
+        return handle;
+      });
+      const engine = new TftpEngine({
+        root,
+        allowWrite: true,
+        port: 0,
+        address: "127.0.0.1"
+      });
+      let firstPacket: Promise<void> | undefined;
+      let secondPacket: Promise<void> | undefined;
+      let stopping: Promise<void> | undefined;
+
+      try {
+        await engine.start();
+        const entry = engine as unknown as MessageEntryPoint;
+        const wrq = encodeWRQ("serialized-window.bin", "octet", {
+          blksize: "8",
+          windowsize: "2"
+        });
+        const rinfo = rinfoFor(42307, wrq.length);
+        await entry.handleMessage(wrq, rinfo);
+
+        firstPacket = entry.handleMessage(encodeDATA(1, Buffer.from("block001")), rinfo);
+        await firstWriteEntered.promise;
+        secondPacket = entry.handleMessage(encodeDATA(2, Buffer.from("tail")), rinfo);
+
+        expect(
+          writes,
+          "DATA(2) must stay queued until DATA(1)'s position-relative write completes"
+        ).toEqual(["block001"]);
+
+        const socketClosed = deferred();
+        engine.once("close", socketClosed.resolve);
+        let stopSettled = false;
+        stopping = engine.stop().then(() => {
+          stopSettled = true;
+        });
+        await socketClosed.promise;
+        expect(stopSettled, "stop must await the peer's queued packet work").toBe(false);
+
+        releaseFirstWrite.resolve();
+        await Promise.all([firstPacket, secondPacket, stopping]);
+
+        expect(writes).toEqual(["block001", "tail"]);
+        expect(completedWrites).toEqual(["block001", "tail"]);
+        expect(fs.readFileSync(path.join(root, "serialized-window.bin"))).toEqual(
+          Buffer.from("block001tail")
+        );
+      } finally {
+        releaseFirstWrite.resolve();
+        await Promise.allSettled(
+          [firstPacket, secondPacket, stopping].filter((p): p is Promise<void> => p !== undefined)
+        );
+        await engine.stop();
         openSpy.mockRestore();
       }
     });

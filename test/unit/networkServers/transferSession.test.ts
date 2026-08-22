@@ -20,7 +20,7 @@
  * Ported from the standalone add-on's `tests/unit/transfersession.test.ts`.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -242,6 +242,34 @@ describe("TFTP TransferSession (no network)", () => {
       const retransmission = t.consumeRetransmission();
       expect(retransmission).toHaveLength(1);
       expect(retransmission?.[0]?.equals(oack[0]!)).toBe(true);
+    });
+
+    it("invalid ACKs cannot prevent OACK retransmission exhaustion", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-08-22T00:00:00.000Z"));
+      try {
+        const t = makeOptionedRrqSession();
+        const oack = t.initForRRQ(true, 1024);
+        t.recordOutbound(oack);
+
+        for (let attempt = 1; attempt <= DEFAULT_MAX_RETRIES; attempt++) {
+          t.handleACK(1);
+          vi.advanceTimersByTime(60_000);
+          expect(t.timeForRetransmission()).toBe(true);
+          const retransmission = t.consumeRetransmission();
+          expect(retransmission, `attempt ${attempt} must retain the outstanding OACK`).toHaveLength(1);
+          expect(retransmission?.[0]?.equals(oack[0]!)).toBe(true);
+        }
+
+        t.handleACK(1);
+        vi.advanceTimersByTime(60_000);
+        expect(t.timeForRetransmission()).toBe(true);
+        expect(t.consumeRetransmission()).toBeNull();
+        expect(t.phase).toBe(TransferPhase.Error);
+        expect(t.errorMessage).toMatch(/max retries exceeded/i);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -511,6 +539,7 @@ describe("TFTP TransferSession (no network)", () => {
           return parsed.opcode === Opcode.DATA ? parsed.blockNum : -1;
         })
       ).toEqual(Array.from({ length: 256 }, (_, index) => index + 1));
+      await t.closeFile();
     });
 
     it("OACK reports the CLAMPED windowsize, so client and server agree on the window", async () => {
@@ -557,6 +586,7 @@ describe("TFTP TransferSession (no network)", () => {
       expect(t.phase, "the file is longer than the window, so the transfer is not finished").toBe(
         TransferPhase.Sending
       );
+      await t.closeFile();
     });
   });
 
@@ -618,6 +648,7 @@ describe("TFTP TransferSession (no network)", () => {
       const after = await t.produceNextSendPackets();
       expect(after.length, "the transfer must keep flowing past the wrap").toBe(1);
       expect(after[0]!.readUInt16BE(2)).toBe(2);
+      await t.closeFile();
     });
 
     it("WRQ: a retransmitted pre-wrap block is re-ACKed, not treated as a protocol violation", () => {
