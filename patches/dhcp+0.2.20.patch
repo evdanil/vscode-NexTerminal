@@ -1,0 +1,13 @@
+diff --git a/node_modules/dhcp/lib/dhcp.js b/node_modules/dhcp/lib/dhcp.js
+index e009e81..3d953cc 100644
+--- a/node_modules/dhcp/lib/dhcp.js
++++ b/node_modules/dhcp/lib/dhcp.js
+@@ -6,6 +6,8 @@
+  * Dual licensed under the MIT or GPL Version 2 licenses.
+  **/
+ 
++// Nexus applies bounded allocator/dispatch corrections to dhcp@0.2.20.
++
+ const util = require('util');
+ const dgram = require('dgram');
+ const os = require('os');
