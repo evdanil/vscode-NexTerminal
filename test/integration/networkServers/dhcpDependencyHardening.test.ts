@@ -1,6 +1,7 @@
 /** @author kanekitakitos */
 
 import { fork, type ChildProcess } from "node:child_process";
+import * as dgram from "node:dgram";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -86,6 +87,120 @@ function buildRelease(mac: string, address: string, clientId?: string): Buffer {
   }
   packet.writeUInt8(255, offset++);
   return packet.subarray(0, Math.max(offset, 240));
+}
+
+/** Builds a minimal BOOTREQUEST for packet-boundary tests. */
+function buildPacket(messageType?: number, requestedOption?: number): Buffer {
+  const packet = Buffer.alloc(300);
+  let offset = 0;
+  packet.writeUInt8(1, offset++); // BOOTREQUEST
+  packet.writeUInt8(1, offset++); // Ethernet
+  packet.writeUInt8(6, offset++); // chaddr length
+  packet.writeUInt8(0, offset++); // hops
+  packet.writeUInt32BE(0x12345678, offset);
+  offset += 4;
+  offset += 2; // secs
+  offset += 2; // flags
+  offset += 16; // ciaddr / yiaddr / siaddr / giaddr
+  for (const octet of "AA:BB:CC:00:00:02".split(":")) packet.writeUInt8(parseInt(octet, 16), offset++);
+  offset += 10; // chaddr tail
+  offset += 64; // sname
+  offset += 128; // file
+  packet.writeUInt32BE(0x63825363, offset); // DHCP magic cookie
+  offset += 4;
+  if (messageType !== undefined) {
+    packet.writeUInt8(53, offset++);
+    packet.writeUInt8(1, offset++);
+    packet.writeUInt8(messageType, offset++);
+  }
+  if (requestedOption !== undefined) {
+    packet.writeUInt8(55, offset++);
+    packet.writeUInt8(1, offset++);
+    packet.writeUInt8(requestedOption, offset++);
+  }
+  packet.writeUInt8(255, offset++);
+  return packet.subarray(0, Math.max(offset, 240));
+}
+
+function malformedOptionLengthPacket(): Buffer {
+  const packet = buildPacket();
+  return Buffer.concat([packet.subarray(0, packet.length - 1), Buffer.from([55, 4, 1])]);
+}
+
+async function sendLoopbackPacket(packet: Buffer, port: number): Promise<void> {
+  const client = dgram.createSocket("udp4");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      client.send(packet, port, "127.0.0.1", (error) => (error ? reject(error) : resolve()));
+    });
+  } finally {
+    await new Promise<void>((resolve) => client.close(() => resolve()));
+  }
+}
+
+async function freeLoopbackPort(): Promise<number> {
+  const probe = dgram.createSocket("udp4");
+  try {
+    const port = await new Promise<number>((resolve, reject) => {
+      probe.once("error", reject);
+      probe.bind(0, "127.0.0.1", () => resolve(probe.address().port));
+    });
+    return port;
+  } finally {
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+  }
+}
+
+async function createPacketServer(): Promise<{ server: any; port: number; close: () => Promise<void> }> {
+  const server = dhcp.createServer({
+    range: ["192.0.2.10", "192.0.2.11"],
+    randomIP: false,
+    static: {},
+    server: "192.0.2.1",
+    broadcast: "127.0.0.1",
+    leaseTime: 3600
+  });
+  openSockets.push(server._sock);
+  const port = await freeLoopbackPort();
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  });
+  return {
+    server,
+    port,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve()))
+  };
+}
+
+function oncePacketError(server: any): Promise<[Error, unknown?]> {
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const onPacketError = (error: Error, req?: unknown): void => {
+      clearTimeout(timer);
+      resolve([error, req]);
+    };
+    timer = setTimeout(() => {
+      server.off("packetError", onPacketError);
+      reject(new Error("packetError was not emitted within 750ms"));
+    }, 750);
+    server.once("packetError", onPacketError);
+  });
+}
+
+function onceMessage(server: any): Promise<unknown> {
+  return new Promise((resolve) => {
+    server.once("message", resolve);
+  });
 }
 
 interface ProbeReply {
@@ -176,6 +291,45 @@ async function runAllocatorProbe(mode = "select-exhausted"): Promise<ProbeReply>
 }
 
 describe("dhcp@0.2.20 dependency hardening", () => {
+  it("contains malformed datagrams as packetError and remains responsive on the same loopback port", async () => {
+    const { server, port, close } = await createPacketServer();
+    const fatalErrors: unknown[] = [];
+    server.on("error", (error: unknown) => fatalErrors.push(error));
+
+    try {
+      for (const packet of [
+        Buffer.from([1, 1, 6]),
+        malformedOptionLengthPacket(),
+        buildPacket(),
+        buildPacket(2),
+        buildPacket(1, 254)
+      ]) {
+        const rejected = oncePacketError(server);
+        await sendLoopbackPacket(packet, port);
+        const [error] = await rejected;
+        expect(error).toBeInstanceOf(Error);
+      }
+
+      expect(fatalErrors).toEqual([]);
+      const message = onceMessage(server);
+      await sendLoopbackPacket(buildPacket(1), port);
+      await expect(message).resolves.toMatchObject({ options: { 53: 1 } });
+      expect(fatalErrors).toEqual([]);
+    } finally {
+      await close();
+    }
+
+    const rebound = dgram.createSocket("udp4");
+    try {
+      await new Promise<void>((resolve, reject) => {
+        rebound.once("error", reject);
+        rebound.bind(port, "127.0.0.1", () => resolve());
+      });
+    } finally {
+      await new Promise<void>((resolve) => rebound.close(() => resolve()));
+    }
+  });
+
   it("returns a controlled no-address result for an exhausted pool", async () => {
     await expect(runAllocatorProbe()).resolves.toEqual({ type: "result", value: null });
   });

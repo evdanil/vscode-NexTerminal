@@ -87,6 +87,16 @@ const VENDOR_CLASS_REQUEST_ATTR = 'vendorClassId';
 
 let ciscoTftpOptionRegistered = false;
 
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function describePacketClient(value: unknown): string {
+  if (!value || typeof value !== 'object') return 'unknown client';
+  const mac = (value as { chaddr?: unknown }).chaddr;
+  return typeof mac === 'string' && mac.length > 0 ? `MAC ${mac}` : 'unknown client';
+}
+
 /**
  * Teaches the `dhcp` library about option 150, which it does not ship.
  *
@@ -974,11 +984,24 @@ export class DhcpEngine extends EventEmitter {
     server.on('close', () => {
       this._log('info', 'Engine: DHCP socket closed.');
     });
-    server.on('error', (err) => {
+    server.on('error', (error) => {
+      const err = toError(error);
       const msg = `Engine: error emitted by DHCP server during RUNNING: ${err.message}`;
       this._log('error', msg);
       this.emit('error', err);
       this.emit('log', 'error', msg);
+    });
+    server.on('packetError', (error, req) => {
+      const err = toError(error);
+      this._counters.packetsReceived += 1;
+      const msg = `Engine: dropped malformed DHCP packet from ${describePacketClient(req)}: ${err.message}`;
+      this._log('warn', msg);
+      this.emit('log', 'warn', msg);
+    });
+    server.on('poolExhausted', (req) => {
+      const msg = `Engine: dropped DHCP request from ${describePacketClient(req)}: no address is available.`;
+      this._log('warn', msg);
+      this.emit('log', 'warn', msg);
     });
     server.on('message', (req) => {
       this._processMessage(req);
@@ -995,6 +1018,19 @@ export class DhcpEngine extends EventEmitter {
           `Engine: Lease BOUND MAC ${latest.mac} → IP ${latest.ip} (lease ${latest.leaseSec}s, remaining ${latest.remainingSec}s, type=${latest.leaseType}${latest.hostname ? `, hostname=${latest.hostname}` : ''})`,
         );
       }
+    });
+    server.on('released', (rawMac, rawAddress) => {
+      const mac = typeof rawMac === 'string' && rawMac.length > 0 ? rawMac : '??:??:??:??:??:??';
+      const ip = typeof rawAddress === 'string' && rawAddress.length > 0 ? rawAddress : null;
+
+      // The dependency emits `message` before RELEASE deletes `_state`, so the
+      // message-time diff still sees this lease. Reconcile the post-delete
+      // state here to preserve the former address and avoid a duplicate on the
+      // next packet.
+      this._prevLeaseKeys.delete(mac);
+      this._prevBindTimes.delete(mac);
+      this.emit('lease:released', { mac, ip });
+      this._leaseStore?.schedule();
     });
   }
 }

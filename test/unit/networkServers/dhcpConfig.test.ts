@@ -19,6 +19,7 @@
  * Ported from the standalone add-on's `tests/unit/dhcp-config.test.ts`.
  */
 
+import * as dgram from "node:dgram";
 import { describe, expect, it } from "vitest";
 import { DhcpAdapter } from "../../../src/services/networkServers/dhcp/DhcpAdapter";
 import { ServerStatus } from "../../../src/services/networkServers/core/ServerStatus";
@@ -76,6 +77,20 @@ describe("DHCP Adapter (DhcpAdapter)", () => {
         await runningPromise;
         expect(gotRunning, "status must transition to RUNNING").toBeTruthy();
         expect(adapter.status).toBe(ServerStatus.RUNNING);
+
+        const malformedClient = dgram.createSocket("udp4");
+        try {
+          await new Promise<void>((resolve, reject) => {
+            malformedClient.send(Buffer.from([1, 1, 6]), adapter.boundPort!, "127.0.0.1", (error) =>
+              error ? reject(error) : resolve()
+            );
+          });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(adapter.status, "a rejected packet must not make the adapter fatal").toBe(ServerStatus.RUNNING);
+          expect(adapter.boundPort, "the adapter must retain its running socket after a packet rejection").not.toBeNull();
+        } finally {
+          await new Promise<void>((resolve) => malformedClient.close(() => resolve()));
+        }
 
         await new Promise((res) => setTimeout(res, 1000));
 

@@ -31,7 +31,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { DhcpEngine } from "../../../src/services/networkServers/dhcp/engine/DhcpEngine";
-import { loadLeases } from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
+import {
+  LEASE_PERSIST_DEBOUNCE_MS,
+  loadLeases
+} from "../../../src/services/networkServers/dhcp/engine/dhcpLeasePersistence";
 
 const CLIENT_A = "aa:bb:cc:00:00:0a";
 const CLIENT_B = "aa:bb:cc:00:00:0b";
@@ -88,6 +91,32 @@ function buildRequest(messageType: 1 | 3, mac: string, xid: number): Buffer {
   packet.writeUInt8(53, offset++); // option 53: DHCP message type
   packet.writeUInt8(1, offset++);
   packet.writeUInt8(messageType, offset++);
+  packet.writeUInt8(255, offset++); // end
+  return packet.subarray(0, Math.max(offset, 240));
+}
+
+function buildRelease(mac: string, address: string, xid: number): Buffer {
+  const packet = Buffer.alloc(300);
+  let offset = 0;
+  packet.writeUInt8(1, offset++); // op: BOOTREQUEST
+  packet.writeUInt8(1, offset++); // htype: ethernet
+  packet.writeUInt8(6, offset++); // hlen
+  packet.writeUInt8(0, offset++); // hops
+  packet.writeUInt32BE(xid, offset);
+  offset += 4;
+  offset += 2; // secs
+  offset += 2; // flags
+  for (const octet of address.split(".")) packet.writeUInt8(Number(octet), offset++); // ciaddr
+  offset += 12; // yiaddr / siaddr / giaddr
+  for (const octet of mac.split(":")) packet.writeUInt8(parseInt(octet, 16), offset++);
+  offset += 10; // chaddr tail
+  offset += 64; // sname
+  offset += 128; // file
+  packet.writeUInt32BE(0x63825363, offset); // DHCP magic cookie
+  offset += 4;
+  packet.writeUInt8(53, offset++); // DHCP message type
+  packet.writeUInt8(1, offset++);
+  packet.writeUInt8(7, offset++); // DHCPRELEASE
   packet.writeUInt8(255, offset++); // end
   return packet.subarray(0, Math.max(offset, 240));
 }
@@ -199,6 +228,36 @@ function makeStore(prefix: string): string {
 }
 
 describe("DHCP lease persistence across a restart", () => {
+  it("reconciles a matching RELEASE immediately with its former address and persists the removal", async () => {
+    const storePath = makeStore("nexus-dhcp-release-");
+    cleanups.push(await createReplySink());
+    scriptAddressPicks(PICK_FIRST, PICK_SECOND);
+    const port = await freePort();
+    const engine = startEngine(port, storePath);
+    cleanups.push(() => engine.stop());
+    await engine.start(port);
+
+    await expect(acquireLease(engine, port, CLIENT_A)).resolves.toBe(RANGE_START);
+    await new Promise((resolve) => setTimeout(resolve, LEASE_PERSIST_DEBOUNCE_MS + 50));
+    expect(loadLeases(storePath)).toMatchObject([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+
+    const released: Array<{ mac: string; ip: string | null }> = [];
+    engine.on("lease:released", (lease) => released.push(lease));
+    await sendPacket(newClient(), buildRelease(CLIENT_A, RANGE_START, 0x8765), port);
+
+    await vi.waitFor(() => {
+      expect(engine.activeLeases()).toEqual([]);
+      expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, LEASE_PERSIST_DEBOUNCE_MS + 50));
+    expect(loadLeases(storePath)).toEqual([]);
+
+    scriptAddressPicks(PICK_FIRST);
+    await expect(offeredAddress(engine, port, CLIENT_B)).resolves.toBe(RANGE_START);
+    expect(released).toEqual([{ mac: stateKey(CLIENT_A), ip: RANGE_START }]);
+  }, 30_000);
+
   it("recovers a bound lease and keeps its address reserved for the original device", async () => {
     const storePath = makeStore("nexus-dhcp-restart-");
     cleanups.push(await createReplySink());
