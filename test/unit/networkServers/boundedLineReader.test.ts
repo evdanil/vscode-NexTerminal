@@ -76,6 +76,47 @@ describe("bounded RPC line reader", () => {
     dispose();
   });
 
+  it("owns a tiny residual instead of retaining its large mutable backing buffer", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => lines.push(line),
+      onError: (error) => errors.push(error),
+    });
+    const backing = Buffer.alloc(8 * 1024 * 1024, 0x78);
+    const residualOffset = backing.length - 1;
+    backing[residualOffset] = 0x61;
+
+    stream.write(backing.subarray(residualOffset));
+    backing[residualOffset] = 0x7a;
+    stream.write(Buffer.from("\n"));
+
+    expect(lines).toEqual(["a"]);
+    expect(errors).toEqual([]);
+    dispose();
+  });
+
+  it("finishes an original chunk before a reentrant stream write", () => {
+    const stream = new PassThrough();
+    const lines: string[] = [];
+    const errors: Error[] = [];
+    const dispose = attachBoundedLineReader(stream, {
+      onLine: (line) => {
+        lines.push(line);
+        if (line === "a") stream.emit("data", Buffer.from("X"));
+      },
+      onError: (error) => errors.push(error),
+    });
+
+    stream.write(Buffer.from("a\nb\n"));
+    stream.write(Buffer.from("\n"));
+
+    expect(lines).toEqual(["a", "b", "X"]);
+    expect(errors).toEqual([]);
+    dispose();
+  });
+
   it("reports once and detaches after byte 1,048,577 before a newline", () => {
     const stream = new PassThrough();
     const lines: string[] = [];

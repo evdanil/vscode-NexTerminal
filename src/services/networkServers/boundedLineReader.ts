@@ -24,6 +24,8 @@ export function attachBoundedLineReader(
   let active = true;
   let bufferedBytes = 0;
   let fragments: Buffer[] = [];
+  let pendingEvents: ({ readonly type: "data"; readonly value: Buffer | string } | { readonly type: "end" })[] = [];
+  let processing = false;
 
   const clear = (): void => {
     bufferedBytes = 0;
@@ -34,6 +36,7 @@ export function attachBoundedLineReader(
     if (!active) return;
     active = false;
     clear();
+    pendingEvents = [];
     stream.removeListener("data", onData);
     stream.removeListener("end", onEnd);
   };
@@ -55,7 +58,7 @@ export function attachBoundedLineReader(
     onError(new Error(`RPC line exceeds ${maxBytes} bytes.`));
   };
 
-  const onData = (value: Buffer | string): void => {
+  const processData = (value: Buffer | string): void => {
     if (!active) return;
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
     let offset = 0;
@@ -70,7 +73,9 @@ export function attachBoundedLineReader(
       }
 
       if (length > 0) {
-        fragments.push(chunk.subarray(offset, end));
+        const fragment = Buffer.allocUnsafeSlow(length);
+        chunk.copy(fragment, 0, offset, end);
+        fragments.push(fragment);
         bufferedBytes += length;
       }
 
@@ -82,11 +87,39 @@ export function attachBoundedLineReader(
     }
   };
 
-  const onEnd = (): void => {
+  const processEnd = (): void => {
     if (!active) return;
     const finalLine = bufferedBytes === 0 ? undefined : takeLine(false);
     detach();
     if (finalLine !== undefined) onLine(finalLine);
+  };
+
+  const drain = (): void => {
+    if (processing || !active) return;
+    processing = true;
+    let index = 0;
+    try {
+      while (active && index < pendingEvents.length) {
+        const event = pendingEvents[index++]!;
+        if (event.type === "data") processData(event.value);
+        else processEnd();
+      }
+    } finally {
+      pendingEvents = [];
+      processing = false;
+    }
+  };
+
+  const onData = (value: Buffer | string): void => {
+    if (!active) return;
+    pendingEvents.push({ type: "data", value });
+    drain();
+  };
+
+  const onEnd = (): void => {
+    if (!active) return;
+    pendingEvents.push({ type: "end" });
+    drain();
   };
 
   stream.on("data", onData);
