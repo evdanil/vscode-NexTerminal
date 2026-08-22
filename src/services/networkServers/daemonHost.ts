@@ -31,6 +31,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import { normalizeBoundedNumber } from "../../utils/helpers";
 import { attachBoundedLineReader } from "./boundedLineReader";
@@ -164,10 +165,59 @@ export interface NetworkServerDaemonHostOptions {
    * default ports for services the user has reconfigured.
    */
   resolveSpawnConfig?: () => NetworkServerConfigs;
+  /**
+   * Which daemon implementation to spawn. `rust` is a preference: if no native
+   * binary is available for this platform, the host falls back to Node.
+   */
+  engine?: NetworkServerEngine;
+  /** Absolute path to the native daemon binary, when one ships for this platform. */
+  nativeBinaryPath?: string;
 }
 
 /** Environment variable carrying the spawn-time configuration seed. */
 const CONFIG_ENV_VAR = "NEXUS_NETWORK_SERVERS_CONFIG";
+
+/** Which implementation backs the daemon child process. */
+export type NetworkServerEngine = "node" | "rust";
+
+/**
+ * Environment override for running a locally-built native daemon without a
+ * packaged artifact.
+ */
+export const DAEMON_BINARY_ENV_VAR = "NEXUS_NETWORK_SERVER_DAEMON_BIN";
+
+interface LaunchTarget {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly native: boolean;
+}
+
+function toNativeDaemonPlatformKey(platform: NodeJS.Platform, arch: string): string | undefined {
+  if (arch !== "x64" && arch !== "arm64") return undefined;
+  switch (platform) {
+    case "darwin":
+    case "linux":
+    case "win32":
+      return `${platform}-${arch}`;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Absolute path of the native daemon binary for the running platform, or
+ * `undefined` when the platform/architecture is unsupported.
+ */
+export function resolveNativeDaemonBinaryPath(
+  extensionPath: string,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string | undefined {
+  const platformKey = toNativeDaemonPlatformKey(platform, arch);
+  if (!platformKey) return undefined;
+  const binaryName = platform === "win32" ? "nexus-network-server-daemon.exe" : "nexus-network-server-daemon";
+  return path.join(extensionPath, "dist", "native", "network-server-daemon", platformKey, binaryName);
+}
 
 function normalizeRpcTimeoutMs(timeoutMs: number): number {
   return normalizeBoundedNumber(timeoutMs, 15_000, 2_000, 60_000);
@@ -457,8 +507,47 @@ export class NetworkServerDaemonHost {
     this.scheduleChildEscalation(child);
   }
 
+  /**
+   * Picks the child process to spawn.
+   *
+   * `engine: "rust"` is a preference, never a hard requirement. A user who
+   * opts in on a platform without a packaged binary must still get working
+   * TFTP/DHCP, so missing native artifacts degrade to the bundled Node daemon
+   * with a visible warning.
+   */
+  private resolveLaunchTarget(): LaunchTarget {
+    const nodeTarget: LaunchTarget = { command: process.execPath, args: [this.daemonScriptPath], native: false };
+    if (this.options.engine !== "rust") return nodeTarget;
+
+    const override = process.env[DAEMON_BINARY_ENV_VAR]?.trim();
+    const binary = override && override.length > 0 ? override : this.options.nativeBinaryPath;
+    if (!binary) {
+      this.emitLog(
+        "daemon",
+        "warn",
+        `Engine 'rust' requested but no native daemon ships for ${process.platform}-${process.arch}; using the bundled Node daemon instead.`
+      );
+      return nodeTarget;
+    }
+    if (!existsSync(binary)) {
+      this.emitLog(
+        "daemon",
+        "warn",
+        `Engine 'rust' requested but the native daemon binary is missing at ${binary}; using the bundled Node daemon instead.`
+      );
+      return nodeTarget;
+    }
+    return { command: binary, args: [], native: true };
+  }
+
   private async launch(attempt: StartupAttempt): Promise<void> {
-    if (!existsSync(this.daemonScriptPath)) {
+    const target = this.resolveLaunchTarget();
+    if (this.disposed || this.startAttempt !== attempt || this.child) {
+      throw new Error(this.disposed
+        ? "Network servers daemon host is disposed"
+        : "Network servers daemon startup attempt was retired before spawn");
+    }
+    if (!target.native && !existsSync(this.daemonScriptPath)) {
       throw new Error(`Network servers daemon script not found: ${this.daemonScriptPath}`);
     }
 
@@ -472,15 +561,21 @@ export class NetworkServerDaemonHost {
         ? "Network servers daemon host is disposed"
         : "Network servers daemon startup attempt was retired before spawn");
     }
-    const child = spawn(process.execPath, [this.daemonScriptPath], {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(serializedSeed ? { [CONFIG_ENV_VAR]: serializedSeed } : {})
+    };
+    if (target.native) {
+      // The native daemon is a plain executable, not a Node/Electron script.
+      delete env.ELECTRON_RUN_AS_NODE;
+    } else {
+      env.ELECTRON_RUN_AS_NODE = "1";
+    }
+    const child = spawn(target.command, [...target.args], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: this.options.extensionRoot,
       windowsHide: true,
-      env: {
-        ...process.env,
-        ELECTRON_RUN_AS_NODE: "1",
-        ...(serializedSeed ? { [CONFIG_ENV_VAR]: serializedSeed } : {})
-      }
+      env
     });
     const generation = this.nextGeneration++;
     this.child = child;

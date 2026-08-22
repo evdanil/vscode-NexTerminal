@@ -31,6 +31,7 @@ const hostState = vi.hoisted(() => ({
   getServiceRuntime: undefined as any,
   isRunning: true,
   disposeCalls: 0,
+  options: undefined as any,
   spawnConfigResolver: undefined as (() => unknown) | undefined,
   exitListener: undefined as ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined,
 }));
@@ -54,12 +55,16 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../../../src/services/networkServers/daemonHost", () => ({
+  resolveNativeDaemonBinaryPath: vi.fn((extensionPath: string) =>
+    `${extensionPath}/dist/native/network-server-daemon/linux-x64/nexus-network-server-daemon`
+  ),
   NetworkServerDaemonHost: class {
     public constructor(
       public readonly scriptPath: string,
-      public readonly options: { resolveSpawnConfig?: () => unknown }
+      public readonly options: { resolveSpawnConfig?: () => unknown; engine?: string; nativeBinaryPath?: string }
     ) {
       hostState.instance = this;
+      hostState.options = options;
       hostState.spawnConfigResolver = options.resolveSpawnConfig;
     }
     public get isRunning(): boolean {
@@ -130,12 +135,34 @@ beforeEach(() => {
   mockConfig.clear();
   hostState.isRunning = true;
   hostState.disposeCalls = 0;
+  hostState.options = undefined;
   hostState.exitListener = undefined;
+  delete process.env.NEXUS_NETWORK_SERVERS_ENGINE;
   hostState.startServer = vi.fn(async () => undefined);
   hostState.stopServer = vi.fn(async () => undefined);
   hostState.restartServer = vi.fn(async () => undefined);
   hostState.configure = vi.fn(async () => []);
   hostState.getServiceRuntime = vi.fn(async () => tftpRuntime());
+});
+
+describe("NetworkServerManager — daemon engine selection", () => {
+  it("passes the configured rust engine and resolved native binary path to the daemon host", () => {
+    mockConfig.set("nexus.networkServers.engine", "rust");
+    fakeManager();
+
+    expect(hostState.options).toMatchObject({
+      engine: "rust",
+      nativeBinaryPath: "/tmp/nexus-ext/dist/native/network-server-daemon/linux-x64/nexus-network-server-daemon"
+    });
+  });
+
+  it("lets NEXUS_NETWORK_SERVERS_ENGINE override the workspace setting", () => {
+    mockConfig.set("nexus.networkServers.engine", "node");
+    process.env.NEXUS_NETWORK_SERVERS_ENGINE = "rust";
+    fakeManager();
+
+    expect(hostState.options).toMatchObject({ engine: "rust" });
+  });
 });
 
 describe("NetworkServerManager — workspace trust gating", () => {
