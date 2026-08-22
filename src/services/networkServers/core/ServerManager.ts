@@ -48,6 +48,13 @@ export interface ServerManagerEvents {
   connection: [id: string, event: ServerConnectionEvent];
 }
 
+type ManagedLifecycleOperation = 'start' | 'stop' | 'restart' | 'drop';
+
+interface QueuedLifecycleOperation {
+  readonly kind: ManagedLifecycleOperation;
+  readonly promise: Promise<unknown>;
+}
+
 /**
  * Central **Facade** for orchestrating multiple `NexusServer` servers.
  *
@@ -76,6 +83,10 @@ export interface ServerManagerEvents {
 export class ServerManager extends EventEmitter {
   private readonly registry: ServerRegistry;
   private readonly instances: Map<string, NexusServer> = new Map();
+  /** Serializes lifecycle transitions independently for every server id. */
+  private readonly lifecycleQueues: Map<string, Promise<void>> = new Map();
+  /** Coalesces adjacent duplicate lifecycle requests for one server id. */
+  private readonly lastLifecycleOperations: Map<string, QueuedLifecycleOperation> = new Map();
   /** In-flight evictions, coalesced so one instance is never disposed twice. */
   private readonly dropOperations: Map<string, Promise<boolean>> = new Map();
 
@@ -148,8 +159,8 @@ export class ServerManager extends EventEmitter {
    * ### How does the snapshot work for servers not yet created?
    * The Manager uses a clean (but optimal for KISS) trick: it creates a temporary
    * instance to read `id`, `name`, `port`, immediately calls `dispose()`
-   * and discards it. Since creation is lazy and `dispose()` on a
-   * `STOPPED` server is a no-op, this has no noticeable overhead.
+   * and discards it. Since creation is lazy and a freshly-created server
+   * owns no runtime resource, this has no noticeable overhead.
    *
    * @returns Readonly array of `ServerSnapshot`, sorted by the order of
    *   id discovery (union between registered and instantiated).
@@ -172,8 +183,10 @@ export class ServerManager extends EventEmitter {
    *
    * - If the server does not yet have an instance, `ensureInstance` creates one
    *   automatically from the registered factory.
-   * - Idempotent: if already `RUNNING` or `STARTING`, returns immediately
-   *   without doing anything (no warnings, no errors).
+   * - Per-id lifecycle requests are serialized. A concurrent `start()`
+   *   shares the active start transition, including its eventual failure;
+   *   a start after a queued stop waits for that stop first.
+   * - Once its transition begins, an already `RUNNING` server is a no-op.
    *
    * @param id - Identifier of the server to start.
    * @returns Promise that resolves when the server is `RUNNING`.
@@ -182,9 +195,17 @@ export class ServerManager extends EventEmitter {
    *   1. `ServerRegistry.create()` — if the `id` is not registered.
    *   2. `NexusServer.start()` — if the server startup fails.
    */
-  public async start(id: string): Promise<void> {
+  public start(id: string): Promise<void> {
+    // Publish an instance synchronously so a same-tick stop/drop has an owner
+    // to queue behind rather than incorrectly treating the service as absent.
+    this.ensureInstance(id);
+    return this.enqueueLifecycle(id, 'start', () => this.startOwned(id));
+  }
+
+  /** Performs one serialized start transition. */
+  private async startOwned(id: string): Promise<void> {
     const server = this.ensureInstance(id);
-    if (server.status === ServerStatus.RUNNING || server.status === ServerStatus.STARTING) return;
+    if (server.status === ServerStatus.RUNNING) return;
     await server.start();
   }
 
@@ -192,8 +213,9 @@ export class ServerManager extends EventEmitter {
    * Stops (graceful shutdown) a server by its `id`.
    *
    * - If the server does not even have a created instance (never started),
-   *   returns silently — nothing to do.
-   * - Idempotent: if already `STOPPED` or `STOPPING`, returns immediately.
+   *   resolves silently — nothing to do.
+   * - Per-id lifecycle requests are serialized; the call is delegated to the
+   *   server rather than trusting a status value that may lag queued work.
    *
    * @param id - Identifier of the server to stop.
    * @returns Promise that resolves when the server reaches `STOPPED`.
@@ -201,10 +223,14 @@ export class ServerManager extends EventEmitter {
    * @throws {Error} Propagates the error from `NexusServer.stop()` if stopping
    *   fails.
    */
-  public async stop(id: string): Promise<void> {
+  public stop(id: string): Promise<void> {
+    return this.enqueueLifecycle(id, 'stop', () => this.stopOwned(id));
+  }
+
+  /** Performs one serialized stop transition without trusting a stale status. */
+  private async stopOwned(id: string): Promise<void> {
     const server = this.instances.get(id);
     if (!server) return;
-    if (server.status === ServerStatus.STOPPED || server.status === ServerStatus.STOPPING) return;
     await server.stop();
   }
 
@@ -223,9 +249,12 @@ export class ServerManager extends EventEmitter {
    *
    * @throws {Error} Errors propagated from `stop()` or `start()`.
    */
-  public async restart(id: string): Promise<void> {
-    await this.stop(id);
-    await this.start(id);
+  public restart(id: string): Promise<void> {
+    this.ensureInstance(id);
+    return this.enqueueLifecycle(id, 'restart', async () => {
+      await this.stopOwned(id);
+      await this.startOwned(id);
+    });
   }
 
   /**
@@ -251,10 +280,11 @@ export class ServerManager extends EventEmitter {
   public dropInstance(id: string): Promise<boolean> {
     const pending = this.dropOperations.get(id);
     if (pending) return pending;
-    const instance = this.instances.get(id);
-    if (!instance) return Promise.resolve(false);
 
-    const operation = this.disposeAndDrop(id, instance);
+    // `enqueueLifecycle` defers the user-owned stop/dispose callbacks behind
+    // a promise. Store the operation before that microtask runs so a callback
+    // that re-enters `dropInstance` shares this exact operation.
+    const operation = this.enqueueLifecycle(id, 'drop', () => this.stopDisposeAndDrop(id));
     this.dropOperations.set(id, operation);
     void operation.then(
       () => {
@@ -267,8 +297,19 @@ export class ServerManager extends EventEmitter {
     return operation;
   }
 
-  /** Disposes one captured instance before evicting the matching map entry. */
-  private async disposeAndDrop(id: string, instance: NexusServer): Promise<boolean> {
+  /**
+   * Drives the rejecting lifecycle boundary before no-throw disposal, then
+   * evicts only after both settled successfully.
+   */
+  private async stopDisposeAndDrop(id: string): Promise<boolean> {
+    const instance = this.instances.get(id);
+    if (!instance) return false;
+    try {
+      await instance.stop();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to stop server '${id}': ${message}`, { cause: err });
+    }
     try {
       await instance.dispose();
     } catch (err) {
@@ -279,6 +320,34 @@ export class ServerManager extends EventEmitter {
     return true;
   }
 
+  /** Queues one per-server lifecycle transition and keeps that queue reusable after errors. */
+  private enqueueLifecycle<T>(
+    id: string,
+    kind: ManagedLifecycleOperation,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const pending = this.lastLifecycleOperations.get(id);
+    if (pending?.kind === kind) return pending.promise as Promise<T>;
+
+    const previous = this.lifecycleQueues.get(id) ?? Promise.resolve();
+    const promise = previous.then(operation);
+    const settledQueue = promise.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.lifecycleQueues.set(id, settledQueue);
+    const request: QueuedLifecycleOperation = { kind, promise };
+    this.lastLifecycleOperations.set(id, request);
+    const clear = () => {
+      if (this.lastLifecycleOperations.get(id) === request) {
+        this.lastLifecycleOperations.delete(id);
+        if (this.lifecycleQueues.get(id) === settledQueue) this.lifecycleQueues.delete(id);
+      }
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
   /**
    * **Global shutdown operation.** Dispose of **all** managed server
    * instances and clean up the Manager's internal state.
@@ -287,17 +356,19 @@ export class ServerManager extends EventEmitter {
    * socket remains open and no listener hangs (memory leaks).
    *
    * ### Important guarantees:
-   * 1. **Never throws.** Any individual `dispose()` error is swallowed —
-   *    the goal is to clean everything up, even if something fails midway.
+   * 1. **Never throws.** A failed rejecting cleanup is swallowed here, but
+   *    its instance remains mapped for a later retry. Independent instances
+   *    still receive their own cleanup attempt.
    * 2. **Removes all listeners** from the Manager itself. After
    *    `disposeAll()`, new `on('statusChange', ...)` calls on the Manager will
    *    not work — it is a terminal operation.
-   * 3. Clears the instance `Map`, but does **not** touch the `ServerRegistry`
-   *    (there may be other Managers using the same registry).
+   * 3. Evicts only instances whose stop and disposal both succeed; it does
+   *    not touch the `ServerRegistry` (there may be other Managers using the
+   *    same registry).
    *
    * **Side effects:**
-   * - Calls `dispose()` on each live instance.
-   * - Clears `this.instances`.
+   * - Routes each instance through `dropInstance()`, including already
+   *   pending drops.
    * - `this.removeAllListeners()` — erases all Manager subs.
    *
    * @returns Promise that **always** resolves.
@@ -306,15 +377,12 @@ export class ServerManager extends EventEmitter {
     const ids = Array.from(this.instances.keys());
     for (const id of ids) {
       try {
-        const instance = this.instances.get(id);
-        if (instance) {
-          await instance.dispose();
-        }
+        await this.dropInstance(id);
       } catch {
-        // swallow; we're shutting down
+        // Best effort continues with independent instances; failed ownership
+        // remains mapped so a later explicit drop can retry it.
       }
     }
-    this.instances.clear();
     this.removeAllListeners();
   }
 

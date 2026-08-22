@@ -9,11 +9,15 @@
 
 import { describe, expect, it, vi } from "vitest";
 import dgram from "node:dgram";
+import fs from "node:fs";
 import { BaseNexusServer } from "../../../src/services/networkServers/core/BaseNexusServer";
 import { ServerManager } from "../../../src/services/networkServers/core/ServerManager";
 import { ServerStatus } from "../../../src/services/networkServers/core/ServerStatus";
 import { DhcpAdapter } from "../../../src/services/networkServers/dhcp/DhcpAdapter";
 import { DhcpEngine } from "../../../src/services/networkServers/dhcp/engine/DhcpEngine";
+import { TftpAdapter } from "../../../src/services/networkServers/tftp/TftpAdapter";
+import { TftpEngine } from "../../../src/services/networkServers/tftp/engine/TftpEngine";
+import { mkdtemp } from "../../helpers/networkServerTestHelpers";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
@@ -65,6 +69,10 @@ function engineOf(adapter: DhcpAdapter): DhcpEngine | null {
   return (adapter as unknown as { engine: DhcpEngine | null }).engine;
 }
 
+function tftpEngineOf(adapter: TftpAdapter): TftpEngine | null {
+  return (adapter as unknown as { engine: TftpEngine | null }).engine;
+}
+
 function send(socket: dgram.Socket, message: Buffer, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
     socket.send(message, port, "127.0.0.1", (error) => (error ? reject(error) : resolve()));
@@ -74,10 +82,12 @@ function send(socket: dgram.Socket, message: Buffer, port: number): Promise<void
 class ControlledDisposableServer extends BaseNexusServer {
   public disposeCalls = 0;
   public disposed = false;
+  public stopCalls = 0;
 
   public constructor(
     id: string,
     private disposeAction: () => Promise<void>,
+    private stopAction: () => Promise<void> = async () => undefined,
   ) {
     super(id, "Controlled server", 0);
   }
@@ -87,6 +97,8 @@ class ControlledDisposableServer extends BaseNexusServer {
   }
 
   public override async stop(): Promise<void> {
+    this.stopCalls += 1;
+    await this.stopAction();
     this.setStatus(ServerStatus.STOPPED);
   }
 
@@ -96,6 +108,30 @@ class ControlledDisposableServer extends BaseNexusServer {
     this.disposed = true;
   }
 
+}
+
+class GatedFailingStartServer extends BaseNexusServer {
+  public starts = 0;
+
+  public constructor(
+    private readonly entered: { resolve: () => void },
+    private readonly release: Promise<void>,
+  ) {
+    super("failing", "Gated failing server", 0);
+  }
+
+  public override async start(): Promise<void> {
+    this.starts += 1;
+    this.setStatus(ServerStatus.STARTING);
+    this.entered.resolve();
+    await this.release;
+    this.setStatus(ServerStatus.ERROR, "synthetic bind failure");
+    throw new Error("synthetic bind failure");
+  }
+
+  public override async stop(): Promise<void> {
+    this.setStatus(ServerStatus.STOPPED);
+  }
 }
 
 describe("DHCP runtime ownership", () => {
@@ -265,9 +301,126 @@ describe("DHCP runtime ownership", () => {
       await adapter.stop().catch(() => undefined);
     }
   });
+
+  it("queues same-tick DHCP start and Base disposal until the socket is stopped", async () => {
+    const port = await freeLoopbackPort();
+    const adapter = createAdapter(port);
+    const starting = adapter.start();
+    const disposing = adapter.dispose();
+
+    try {
+      await Promise.all([starting, disposing]);
+      expect(adapter.status).toBe(ServerStatus.STOPPED);
+      expect(adapter.boundPort).toBeNull();
+
+      const release = await holdLoopbackPort(port);
+      await release();
+    } finally {
+      await adapter.stop().catch(() => undefined);
+    }
+  });
 });
 
 describe("ServerManager disposal ownership", () => {
+  it.each(["dhcp", "tftp"] as const)(
+    "keeps a real %s adapter mapped when rejecting cleanup must be retried",
+    async (kind) => {
+      const root = kind === "tftp" ? mkdtemp("nexus-manager-drop-retry-") : undefined;
+      const port = kind === "dhcp" ? await freeLoopbackPort() : 0;
+      const adapter = kind === "dhcp"
+        ? createAdapter(port)
+        : new TftpAdapter({ root, port, interface: "127.0.0.1" });
+      const manager = new ServerManager().register(kind, () => adapter);
+
+      try {
+        await manager.start(kind);
+        const engine = kind === "dhcp" ? engineOf(adapter as DhcpAdapter)! : tftpEngineOf(adapter as TftpAdapter)!;
+        const originalStop = engine.stop.bind(engine);
+        let attempts = 0;
+        const stopSpy = vi.spyOn(engine, "stop").mockImplementation(async () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error("synthetic manager cleanup failure");
+          await originalStop();
+        });
+
+        try {
+          await expect(manager.dropInstance(kind)).rejects.toThrow(
+            new RegExp(`Failed to stop server '${kind}': synthetic manager cleanup failure`),
+          );
+          expect(manager.getInstance(kind)).toBe(adapter);
+          expect(kind === "dhcp" ? (adapter as DhcpAdapter).boundPort : (adapter as TftpAdapter).boundPort).not.toBeNull();
+
+          await expect(manager.dropInstance(kind)).resolves.toBe(true);
+          expect(attempts).toBe(2);
+          expect(manager.getInstance(kind)).toBeUndefined();
+          expect(kind === "dhcp" ? (adapter as DhcpAdapter).boundPort : (adapter as TftpAdapter).boundPort).toBeNull();
+        } finally {
+          stopSpy.mockRestore();
+          await originalStop();
+        }
+      } finally {
+        await adapter.stop().catch(() => undefined);
+        if (root) fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("serializes same-tick manager start and stop for a real DHCP socket", async () => {
+    const port = await freeLoopbackPort();
+    const adapter = createAdapter(port);
+    const manager = new ServerManager().register("dhcp", () => adapter);
+    const starting = manager.start("dhcp");
+    const stopping = manager.stop("dhcp");
+
+    try {
+      await Promise.all([starting, stopping]);
+      expect(adapter.status).toBe(ServerStatus.STOPPED);
+      expect(adapter.boundPort).toBeNull();
+    } finally {
+      await adapter.stop().catch(() => undefined);
+    }
+  });
+
+  it("serializes same-tick manager start and drop before deleting a real DHCP owner", async () => {
+    const port = await freeLoopbackPort();
+    const adapter = createAdapter(port);
+    const manager = new ServerManager().register("dhcp", () => adapter);
+    const starting = manager.start("dhcp");
+    const dropping = manager.dropInstance("dhcp");
+
+    try {
+      await Promise.all([starting, dropping]);
+      expect(manager.getInstance("dhcp")).toBeUndefined();
+      expect(adapter.boundPort).toBeNull();
+
+      const release = await holdLoopbackPort(port);
+      await release();
+    } finally {
+      await adapter.stop().catch(() => undefined);
+    }
+  });
+
+  it("shares a concurrent manager start failure instead of resolving from STARTING", async () => {
+    const startEntered = deferred();
+    const releaseStart = deferred();
+    const server = new GatedFailingStartServer(startEntered, releaseStart.promise);
+    const manager = new ServerManager().register("failing", () => server);
+    const first = manager.start("failing");
+
+    try {
+      await startEntered.promise;
+      const second = manager.start("failing");
+      releaseStart.resolve();
+
+      await expect(first).rejects.toThrow(/synthetic bind failure/);
+      await expect(second).rejects.toThrow(/synthetic bind failure/);
+      expect(server.starts).toBe(1);
+    } finally {
+      releaseStart.resolve();
+      await Promise.allSettled([first]);
+    }
+  });
+
   it("retains the mapped instance until delayed disposal finishes before creating a replacement", async () => {
     const disposalEntered = deferred();
     const releaseDisposal = deferred();
@@ -320,5 +473,116 @@ describe("ServerManager disposal ownership", () => {
     failDisposal = false;
     await expect(manager.dropInstance("retry")).resolves.toBe(true);
     expect(manager.getInstance("retry")).toBeUndefined();
+  });
+
+  it("publishes a reentrant drop before disposal can invoke it again", async () => {
+    const disposalEntered = deferred();
+    const releaseDisposal = deferred();
+    let reentrant: Promise<boolean> | undefined;
+    let firstDisposal = true;
+    const manager = new ServerManager();
+    const server = new ControlledDisposableServer(
+      "reentrant",
+      async () => {
+        disposalEntered.resolve();
+        await releaseDisposal.promise;
+      },
+      async () => {
+        if (firstDisposal) {
+          firstDisposal = false;
+          reentrant = manager.dropInstance("reentrant");
+        }
+      },
+    );
+    manager.register("reentrant", () => server);
+    manager.ensureInstance("reentrant");
+    const dropping = manager.dropInstance("reentrant");
+
+    try {
+      await disposalEntered.promise;
+      expect(reentrant).toBe(dropping);
+      expect(server.disposeCalls).toBe(1);
+
+      releaseDisposal.resolve();
+      await expect(dropping).resolves.toBe(true);
+      await expect(reentrant).resolves.toBe(true);
+    } finally {
+      releaseDisposal.resolve();
+      await Promise.allSettled([dropping, reentrant].filter((promise): promise is Promise<boolean> => promise !== undefined));
+    }
+  });
+
+  it("shares ordinary concurrent drops before their disposal gate resolves", async () => {
+    const disposalEntered = deferred();
+    const releaseDisposal = deferred();
+    const server = new ControlledDisposableServer("concurrent", async () => {
+      disposalEntered.resolve();
+      await releaseDisposal.promise;
+    });
+    const manager = new ServerManager().register("concurrent", () => server);
+    manager.ensureInstance("concurrent");
+    const first = manager.dropInstance("concurrent");
+    const second = manager.dropInstance("concurrent");
+
+    try {
+      expect(second).toBe(first);
+      await disposalEntered.promise;
+      expect(server.disposeCalls).toBe(1);
+
+      releaseDisposal.resolve();
+      await expect(first).resolves.toBe(true);
+      await expect(second).resolves.toBe(true);
+    } finally {
+      releaseDisposal.resolve();
+      await Promise.allSettled([first, second]);
+    }
+  });
+
+  it("waits for a pending drop instead of double-disposing during disposeAll", async () => {
+    const disposalEntered = deferred();
+    const releaseDisposal = deferred();
+    const server = new ControlledDisposableServer("shutdown", async () => {
+      disposalEntered.resolve();
+      await releaseDisposal.promise;
+    });
+    const manager = new ServerManager().register("shutdown", () => server);
+    manager.ensureInstance("shutdown");
+    const dropping = manager.dropInstance("shutdown");
+
+    try {
+      await disposalEntered.promise;
+      const disposingAll = manager.disposeAll();
+      await Promise.resolve();
+      expect(server.disposeCalls).toBe(1);
+
+      releaseDisposal.resolve();
+      await Promise.all([dropping, disposingAll]);
+      expect(manager.getInstance("shutdown")).toBeUndefined();
+    } finally {
+      releaseDisposal.resolve();
+      await dropping.catch(() => undefined);
+    }
+  });
+
+  it("retains failed shutdown cleanup while still attempting independent instances", async () => {
+    const failing = new ControlledDisposableServer(
+      "failed-shutdown",
+      async () => undefined,
+      async () => {
+        throw new Error("synthetic shutdown cleanup failure");
+      },
+    );
+    const independent = new ControlledDisposableServer("independent", async () => undefined);
+    const manager = new ServerManager()
+      .register("failed-shutdown", () => failing)
+      .register("independent", () => independent);
+    manager.ensureInstance("failed-shutdown");
+    manager.ensureInstance("independent");
+
+    await expect(manager.disposeAll()).resolves.toBeUndefined();
+    expect(failing.stopCalls).toBe(1);
+    expect(manager.getInstance("failed-shutdown")).toBe(failing);
+    expect(independent.disposeCalls).toBe(1);
+    expect(manager.getInstance("independent")).toBeUndefined();
   });
 });
