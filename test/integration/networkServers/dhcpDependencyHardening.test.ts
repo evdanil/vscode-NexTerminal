@@ -90,11 +90,11 @@ function buildRelease(mac: string, address: string, clientId?: string): Buffer {
   return packet.subarray(0, Math.max(offset, 240));
 }
 
-/** Builds a minimal BOOTREQUEST for packet-boundary tests. */
-function buildPacket(messageType?: number, requestedOption?: number): Buffer {
+/** Builds a minimal BOOTP frame for packet-boundary tests. */
+function buildPacket(messageType?: number, requestedOption?: number, opcode = 1): Buffer {
   const packet = Buffer.alloc(300);
   let offset = 0;
-  packet.writeUInt8(1, offset++); // BOOTREQUEST
+  packet.writeUInt8(opcode, offset++); // BOOTREQUEST or BOOTREPLY
   packet.writeUInt8(1, offset++); // Ethernet
   packet.writeUInt8(6, offset++); // chaddr length
   packet.writeUInt8(0, offset++); // hops
@@ -410,11 +410,31 @@ describe("dhcp@0.2.20 dependency hardening", () => {
     passive.on("packetError", (error: Error) => passivePacketErrors.push(error));
 
     for (let type = 1; type <= 8; type += 1) {
-      passive._sock.emit("message", buildPacket(type));
+      const opcode = type === 2 || type === 5 || type === 6 ? 2 : 1;
+      passive._sock.emit("message", buildPacket(type, undefined, opcode));
     }
 
     expect(passiveMessages).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(passivePacketErrors).toEqual([]);
+  });
+
+  it("keeps BOOTREPLY and invalid BOOTP opcodes out of active server dispatch", () => {
+    const active = createAllocatorServer(["192.0.2.10", "192.0.2.11"]);
+    const messages: number[] = [];
+    const packetErrors: Error[] = [];
+    active.on("message", (req: { options?: Record<number, number> }) => messages.push(req.options?.[53] ?? -1));
+    active.on("packetError", (error: Error) => packetErrors.push(error));
+
+    for (const packet of [
+      buildPacket(2, undefined, 2),
+      buildPacket(1, undefined, 0),
+      buildPacket(1, undefined, 3)
+    ]) {
+      active._sock.emit("message", packet);
+    }
+
+    expect(messages).toEqual([]);
+    expect(packetErrors).toHaveLength(3);
   });
 
   it("rejects a parser-produced non-integer DHCP message type", () => {
