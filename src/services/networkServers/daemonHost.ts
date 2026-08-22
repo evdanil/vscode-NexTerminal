@@ -33,45 +33,30 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createInterface, type Interface } from "node:readline";
 import { normalizeBoundedNumber } from "../../utils/helpers";
+import { attachBoundedLineReader } from "./boundedLineReader";
 import type {
   DhcpAdapterConfig,
   NetworkServerConfigs,
   ServerConnectionEvent,
   ServerSnapshot,
+  ServerStatus,
   ServerStatusChangeEvent,
   TftpAdapterConfig
 } from "./core/index";
 import type { DhcpLeaseInfo } from "./dhcp/DhcpAdapter";
 import type { DhcpPacketCounters, DhcpPoolInfo } from "./dhcp/engine/DhcpEngine";
+import {
+  parseRpcEnvelope,
+  parseRpcEvent,
+  rpcResultParsers,
+  type RpcEnvelope,
+  type RpcEvent,
+  type RpcMethod,
+  type RpcParams,
+  type RpcParseResult,
+  type RpcResult,
+} from "./networkServerRpcProtocol";
 import type { TftpTransferView } from "./tftp/TftpAdapter";
-
-/** Successful JSON-RPC response (id + result). */
-type JsonRpcResult = { readonly id: number; readonly result: unknown };
-/** Error JSON-RPC response (id + error.code + error.message). */
-type JsonRpcError = { readonly id: number; readonly error: { readonly code: string; readonly message: string } };
-/** Union of all possible daemon responses. */
-type JsonRpcResponse = JsonRpcResult | JsonRpcError;
-
-/**
- * Unsolicited pushes from the daemon (not replies to any request).
- * - `ready`: initialization finished; RPCs are now accepted.
- * - `statusChange`: a service moved between stopped/starting/running/error.
- * - `log`: a log line to surface in the output channel.
- * - `runtimeUpdate`: mutable runtime changed (TFTP transfers / DHCP leases).
- * - `connection`: a client connection lifecycle edge — a TFTP transfer opened,
- *   finished or failed, a DHCP lease was granted or declined. One push per
- *   edge, never per progress tick, so a consumer may surface each one directly
- *   to the user without any throttling of its own.
- */
-type JsonRpcEvent =
-  | { readonly event: "ready"; readonly data: null }
-  | { readonly event: "statusChange"; readonly data: ServerStatusChangeEvent }
-  | { readonly event: "log"; readonly data: { readonly id: string; readonly level: string; readonly message: string } }
-  | { readonly event: "runtimeUpdate"; readonly data: { readonly id: string } }
-  | {
-      readonly event: "connection";
-      readonly data: { readonly id: string; readonly connection: ServerConnectionEvent };
-    };
 
 type StatusChangeListener = (event: ServerStatusChangeEvent) => void;
 type RuntimeUpdateListener = (id: string) => void;
@@ -81,9 +66,12 @@ type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void
 
 /** In-flight JSON-RPC call awaiting its response. */
 interface PendingRequest {
+  readonly method: RpcMethod;
+  readonly parseResult: (value: unknown) => RpcParseResult<unknown>;
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
+  detachWriteError?: () => void;
 }
 
 /** `getServiceRuntime` reply for the TFTP service. */
@@ -161,8 +149,9 @@ export class NetworkServerDaemonHost {
   private readyFlag = false;
   private disposed = false;
   private startPromise?: Promise<void>;
-  private rlStdout?: Interface;
-  private rlStderr?: Interface;
+  private nextGeneration = 1;
+  private activeGeneration?: number;
+  private detachChildIo?: () => void;
   private killTimer?: ReturnType<typeof setTimeout>;
   private readonly rpcTimeoutMs: number;
   private readonly readyTimeoutMs: number;
@@ -223,12 +212,12 @@ export class NetworkServerDaemonHost {
   /** Lists every registered service with its current snapshot. */
   public async listServers(): Promise<readonly ServerSnapshot[]> {
     const result = await this.request("list");
-    return (result as ServerSnapshot[]) ?? [];
+    return result as readonly ServerSnapshot[];
   }
 
   /** Snapshot of a single service. */
   public async getStatus(id: string): Promise<ServerSnapshot> {
-    return (await this.request("getStatus", { id })) as ServerSnapshot;
+    return (await this.request("getStatus", { id } as RpcParams<"getStatus">)) as ServerSnapshot;
   }
 
   /**
@@ -239,8 +228,8 @@ export class NetworkServerDaemonHost {
    * keep serving under their current configuration until restarted.
    */
   public async configure(configs: NetworkServerConfigs): Promise<readonly string[]> {
-    const result = await this.request("configure", { configs });
-    return ((result as { changed?: string[] })?.changed ?? []) as readonly string[];
+    const result = await this.request("configure", { configs } as RpcParams<"configure">);
+    return result.changed;
   }
 
   /**
@@ -251,17 +240,17 @@ export class NetworkServerDaemonHost {
    * transition.
    */
   public async startServer(id: string, config?: NetworkServerAdapterConfig): Promise<void> {
-    await this.request("start", config ? { id, config } : { id });
+    await this.request("start", (config ? { id, config } : { id }) as RpcParams<"start">);
   }
 
   /** Gracefully stops a service. */
   public async stopServer(id: string): Promise<void> {
-    await this.request("stop", { id });
+    await this.request("stop", { id } as RpcParams<"stop">);
   }
 
   /** Stops then starts a service, optionally applying new configuration between the two. */
   public async restartServer(id: string, config?: NetworkServerAdapterConfig): Promise<void> {
-    await this.request("restart", config ? { id, config } : { id });
+    await this.request("restart", (config ? { id, config } : { id }) as RpcParams<"restart">);
   }
 
   /**
@@ -274,8 +263,8 @@ export class NetworkServerDaemonHost {
    *          "already finished", not as an error).
    */
   public async cancelTransfer(id: string, transferId: string): Promise<boolean> {
-    const result = await this.request("cancelTransfer", { id, transferId });
-    return (result as { ok?: boolean } | undefined)?.ok === true;
+    const result = await this.request("cancelTransfer", { id, transferId } as RpcParams<"cancelTransfer">);
+    return result.ok;
   }
 
   /**
@@ -286,7 +275,7 @@ export class NetworkServerDaemonHost {
    * `{snapshot, leases, packetCounters, poolInfo, boundPort}` for DHCP.
    */
   public async getServiceRuntime(id: string): Promise<NetworkServerRuntimeSnapshot> {
-    return (await this.request("getServiceRuntime", { id })) as NetworkServerRuntimeSnapshot;
+    return (await this.request("getServiceRuntime", { id } as RpcParams<"getServiceRuntime">)) as NetworkServerRuntimeSnapshot;
   }
 
   // ---------------------------------------------------------------------------
@@ -354,14 +343,13 @@ export class NetworkServerDaemonHost {
    * already been replaced must not close the live one's pipes.
    */
   private terminateChild(child: ChildProcess): void {
-    if (this.child === child) {
-      this.child = undefined;
-      this.readyFlag = false;
-      // These interfaces are attached to THIS child's stdout/stderr. Leaving
-      // them open is what lets a late `ready` line from a daemon nobody is
-      // waiting on any more resolve waiters that belong to its replacement.
-      this.closeReadlineInterfaces();
-    }
+    if (this.child !== child) return;
+    this.child = undefined;
+    this.activeGeneration = undefined;
+    this.readyFlag = false;
+    // These readers are attached to THIS child's stdout/stderr. Leaving them
+    // attached lets a late line from a dead generation mutate its replacement.
+    this.closeChildIo();
     if (this.killTimer) {
       clearTimeout(this.killTimer);
       this.killTimer = undefined;
@@ -394,17 +382,22 @@ export class NetworkServerDaemonHost {
         ...(seed ? { [CONFIG_ENV_VAR]: JSON.stringify(seed) } : {})
       }
     });
+    const generation = this.nextGeneration++;
     this.child = child;
+    this.activeGeneration = generation;
 
     child.on("error", (error) => {
+      if (!this.isCurrentChild(child, generation)) return;
       this.rejectAllReadyWaiters(error);
       this.emitLog("daemon", "error", `Daemon process error: ${error.message}`);
     });
 
     child.on("exit", (code, signal) => {
+      if (!this.isCurrentChild(child, generation)) return;
       this.readyFlag = false;
-      this.closeReadlineInterfaces();
+      this.closeChildIo();
       this.child = undefined;
+      this.activeGeneration = undefined;
       const error = new Error(`Network servers daemon exited (code=${String(code ?? "null")})`);
       this.rejectAllPending(error);
       this.rejectAllReadyWaiters(error);
@@ -414,14 +407,67 @@ export class NetworkServerDaemonHost {
     });
 
     if (child.stdout) {
-      const rl = createInterface({ input: child.stdout });
-      rl.on("line", (line) => this.handleMessage(line));
-      this.rlStdout = rl;
+      const stdout = child.stdout;
+      const detachReader = attachBoundedLineReader(stdout, {
+        onLine: (line) => {
+          if (!this.isCurrentChild(child, generation)) return;
+          this.handleMessage(child, generation, line);
+        },
+        onError: (error) => this.failChildProtocol(child, generation, error.message),
+      });
+      const onStdoutEnd = () => {
+        // Node can deliver a pipe EOF several event-loop turns before its
+        // ChildProcess `exit` event. Give ordinary process teardown a short
+        // grace period; a live child that merely closed stdout remains a
+        // protocol failure once that period expires.
+        setTimeout(() => {
+          if (!this.isCurrentChild(child, generation)) return;
+          if (child.exitCode === null && child.signalCode === null) {
+            this.failChildProtocol(child, generation, "daemon stdout closed before the process exited");
+          }
+        }, 25);
+      };
+      const onStdoutError = (error: Error) => {
+        if (!this.isCurrentChild(child, generation)) return;
+        this.failChildProtocol(child, generation, `daemon stdout stream error: ${error.message}`);
+      };
+      stdout.once("end", onStdoutEnd);
+      stdout.once("error", onStdoutError);
+      this.detachChildIo = () => {
+        detachReader();
+        stdout.removeListener("end", onStdoutEnd);
+        stdout.removeListener("error", onStdoutError);
+      };
     }
     if (child.stderr) {
+      const previousCleanup = this.detachChildIo;
       const rl = createInterface({ input: child.stderr });
-      rl.on("line", (line) => this.emitLog("daemon", "warn", `[stderr] ${line}`));
-      this.rlStderr = rl;
+      rl.on("line", (line) => {
+        if (!this.isCurrentChild(child, generation)) return;
+        this.emitLog("daemon", "warn", `[stderr] ${line}`);
+      });
+      const onStderrError = (error: Error) => {
+        if (!this.isCurrentChild(child, generation)) return;
+        this.emitLog("daemon", "warn", `Daemon stderr stream error: ${error.message}`);
+      };
+      child.stderr.on("error", onStderrError);
+      this.detachChildIo = () => {
+        previousCleanup?.();
+        try { rl.close(); } catch { /* already closed */ }
+        child.stderr?.removeListener("error", onStderrError);
+      };
+    }
+    if (child.stdin) {
+      const previousCleanup = this.detachChildIo;
+      const onStdinError = (error: Error) => {
+        if (!this.isCurrentChild(child, generation)) return;
+        this.emitLog("daemon", "warn", `Daemon stdin stream error: ${error.message}`);
+      };
+      child.stdin.on("error", onStdinError);
+      this.detachChildIo = () => {
+        previousCleanup?.();
+        child.stdin?.removeListener("error", onStdinError);
+      };
     }
 
     try {
@@ -457,69 +503,119 @@ export class NetworkServerDaemonHost {
     }
   }
 
-  private async request(method: string, params?: Record<string, unknown>): Promise<unknown> {
+  private async request<M extends RpcMethod>(method: M, params?: RpcParams<M>): Promise<RpcResult<M>> {
     await this.ensureStarted();
     const child = this.child;
+    const generation = this.activeGeneration;
     if (!child || !child.stdin || !child.stdin.writable) {
       throw new Error("Network servers daemon stdin is not writable");
     }
+    if (generation === undefined) {
+      throw new Error("Network servers daemon generation is unavailable");
+    }
+    // Capture the narrowed stream before entering deferred callbacks; the
+    // ChildProcess property itself is nullable in Node's declarations.
+    const stdin = child.stdin;
 
     const id = this.nextId++;
     const responsePromise = new Promise<unknown>((resolve, reject) => {
-      const deferred: PendingRequest = { resolve, reject };
+      const deferred: PendingRequest = {
+        method,
+        parseResult: (value) => rpcResultParsers[method](value),
+        resolve,
+        reject,
+      };
       deferred.timer = setTimeout(() => {
-        const entry = this.pending.get(id);
-        if (!entry) return;
-        this.pending.delete(id);
-        entry.reject(
+        this.settlePending(id, deferred, (entry) => entry.reject(
           new Error(`Network servers daemon RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`)
-        );
+        ));
       }, this.rpcTimeoutMs);
       this.pending.set(id, deferred);
+
+      const rejectWrite = (error: Error) => {
+        if (!this.isCurrentChild(child, generation)) return;
+        this.settlePending(id, deferred, (entry) => entry.reject(
+          new Error(`Network servers daemon stdin write failed: ${error.message}`)
+        ));
+      };
+      stdin.once("error", rejectWrite);
+      deferred.detachWriteError = () => stdin.removeListener("error", rejectWrite);
+
+      try {
+        const request = params === undefined ? { id, method } : { id, method, params };
+        // A false return means Node buffered this frame. Its callback and the
+        // per-request timeout remain armed until a response or write failure,
+        // which is the only correct behaviour under pipe backpressure.
+        stdin.write(`${JSON.stringify(request)}\n`, (error?: Error | null) => {
+          if (!error || !this.isCurrentChild(child, generation)) return;
+          this.settlePending(id, deferred, (entry) => entry.reject(
+            new Error(`Network servers daemon stdin write failed: ${error.message}`)
+          ));
+        });
+      } catch (error) {
+        if (!this.isCurrentChild(child, generation)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        this.settlePending(id, deferred, (entry) => entry.reject(
+          new Error(`Network servers daemon stdin write failed: ${message}`)
+        ));
+      }
     });
 
-    child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
-    return responsePromise;
+    return responsePromise as Promise<RpcResult<M>>;
   }
 
-  private handleMessage(raw: string): void {
-    const line = raw.trim();
-    if (!line) return;
-
+  private handleMessage(child: ChildProcess, generation: number, raw: string): void {
+    if (!this.isCurrentChild(child, generation)) return;
     let payload: unknown;
     try {
-      payload = JSON.parse(line);
+      payload = JSON.parse(raw);
     } catch {
-      this.emitLog("daemon", "warn", `Invalid JSON from daemon: ${line.slice(0, 200)}`);
+      this.failChildProtocol(child, generation, "invalid JSON from daemon");
       return;
     }
 
-    if (this.isResponse(payload)) {
-      const deferred = this.pending.get(payload.id);
-      if (!deferred) return;
-      this.pending.delete(payload.id);
-      if (deferred.timer) {
-        clearTimeout(deferred.timer);
-      }
-      if ("error" in payload) {
-        const error = new Error(payload.error.message);
-        error.name = payload.error.code;
-        deferred.reject(error);
-        return;
-      }
-      deferred.resolve(payload.result);
+    const envelope = parseRpcEnvelope(payload);
+    if (envelope.ok) {
+      this.handleEnvelope(child, generation, envelope.value);
       return;
     }
 
-    if (this.isEvent(payload)) {
-      this.handleNotification(payload);
+    const event = parseRpcEvent(payload);
+    if (event.ok) {
+      this.handleNotification(child, generation, event.value);
       return;
     }
 
-    this.emitLog("daemon", "warn", `Unknown JSON shape from daemon: ${line.slice(0, 160)}`);
+    this.failChildProtocol(child, generation, `${envelope.error} ${event.error}`);
   }
 
-  private handleNotification(notification: JsonRpcEvent): void {
+  private handleEnvelope(child: ChildProcess, generation: number, envelope: RpcEnvelope): void {
+    if (!this.isCurrentChild(child, generation)) return;
+    const deferred = this.pending.get(envelope.id);
+    if (!deferred) {
+      this.emitLog("daemon", "warn", `Ignoring daemon response for unknown request id ${envelope.id}`);
+      return;
+    }
+
+    if ("error" in envelope) {
+      this.settlePending(envelope.id, deferred, (entry) => {
+        const error = new Error(envelope.error.message);
+        error.name = envelope.error.code;
+        entry.reject(error);
+      });
+      return;
+    }
+
+    const result = deferred.parseResult(envelope.result);
+    if (!result.ok) {
+      this.failChildProtocol(child, generation, `malformed ${deferred.method} result: ${result.error}`);
+      return;
+    }
+    this.settlePending(envelope.id, deferred, (entry) => entry.resolve(result.value));
+  }
+
+  private handleNotification(child: ChildProcess, generation: number, notification: RpcEvent): void {
+    if (!this.isCurrentChild(child, generation)) return;
     switch (notification.event) {
       case "ready": {
         this.readyFlag = true;
@@ -530,19 +626,29 @@ export class NetworkServerDaemonHost {
         return;
       }
       case "statusChange": {
+        // JSON transports enum values as their closed string representation;
+        // `parseRpcEvent` has already established the exact shared domain.
+        const statusEvent: ServerStatusChangeEvent = {
+          id: notification.data.id,
+          status: notification.data.status as ServerStatus,
+          ...(notification.data.error === undefined ? {} : { error: notification.data.error }),
+        };
         for (const listener of this.statusChangeListeners) {
-          listener(notification.data);
+          if (!this.isCurrentChild(child, generation)) return;
+          listener(statusEvent);
         }
         return;
       }
       case "runtimeUpdate": {
         for (const listener of this.runtimeUpdateListeners) {
+          if (!this.isCurrentChild(child, generation)) return;
           listener(notification.data.id);
         }
         return;
       }
       case "connection": {
         for (const listener of this.connectionListeners) {
+          if (!this.isCurrentChild(child, generation)) return;
           listener(notification.data.id, notification.data.connection);
         }
         return;
@@ -560,14 +666,34 @@ export class NetworkServerDaemonHost {
     }
   }
 
+  private isCurrentChild(child: ChildProcess, generation: number): boolean {
+    return this.child === child && this.activeGeneration === generation;
+  }
+
+  /** Settles exactly the request which installed this callback, once. */
+  private settlePending(id: number, expected: PendingRequest, settle: (entry: PendingRequest) => void): boolean {
+    if (this.pending.get(id) !== expected) return false;
+    this.pending.delete(id);
+    if (expected.timer) clearTimeout(expected.timer);
+    expected.detachWriteError?.();
+    expected.detachWriteError = undefined;
+    settle(expected);
+    return true;
+  }
+
+  /** Rejects this generation and reaps only its process after an untrusted stdout violation. */
+  private failChildProtocol(child: ChildProcess, generation: number, reason: string): void {
+    if (!this.isCurrentChild(child, generation)) return;
+    const error = new Error(`Daemon protocol error: ${reason}`);
+    this.terminateChild(child);
+    this.rejectAllPending(error);
+    this.rejectAllReadyWaiters(error);
+  }
+
   private rejectAllPending(error: Error): void {
-    for (const [, deferred] of this.pending) {
-      if (deferred.timer) {
-        clearTimeout(deferred.timer);
-      }
-      deferred.reject(error);
+    for (const [id, deferred] of [...this.pending]) {
+      this.settlePending(id, deferred, (entry) => entry.reject(error));
     }
-    this.pending.clear();
   }
 
   private rejectAllReadyWaiters(error: Error): void {
@@ -577,32 +703,8 @@ export class NetworkServerDaemonHost {
     this.readyWaiters.clear();
   }
 
-  private closeReadlineInterfaces(): void {
-    if (this.rlStdout) {
-      try { this.rlStdout.close(); } catch { /* already closed */ }
-      this.rlStdout = undefined;
-    }
-    if (this.rlStderr) {
-      try { this.rlStderr.close(); } catch { /* already closed */ }
-      this.rlStderr = undefined;
-    }
-  }
-
-  private isResponse(value: unknown): value is JsonRpcResponse {
-    if (!value || typeof value !== "object") return false;
-    const obj = value as Record<string, unknown>;
-    if (typeof obj.id !== "number") return false;
-    if ("result" in obj) return true;
-    return (
-      typeof obj.error === "object" &&
-      obj.error !== null &&
-      typeof (obj.error as Record<string, unknown>).message === "string"
-    );
-  }
-
-  private isEvent(value: unknown): value is JsonRpcEvent {
-    if (!value || typeof value !== "object") return false;
-    const obj = value as Record<string, unknown>;
-    return typeof obj.event === "string" && "data" in obj;
+  private closeChildIo(): void {
+    this.detachChildIo?.();
+    this.detachChildIo = undefined;
   }
 }
