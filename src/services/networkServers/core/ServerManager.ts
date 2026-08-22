@@ -87,8 +87,6 @@ export class ServerManager extends EventEmitter {
   private readonly lifecycleQueues: Map<string, Promise<void>> = new Map();
   /** Coalesces adjacent duplicate lifecycle requests for one server id. */
   private readonly lastLifecycleOperations: Map<string, QueuedLifecycleOperation> = new Map();
-  /** In-flight evictions, coalesced so one instance is never disposed twice. */
-  private readonly dropOperations: Map<string, Promise<boolean>> = new Map();
 
   /**
    * Creates a new `ServerManager`.
@@ -189,16 +187,17 @@ export class ServerManager extends EventEmitter {
    * - Once its transition begins, an already `RUNNING` server is a no-op.
    *
    * @param id - Identifier of the server to start.
-   * @returns Promise that resolves when the server is `RUNNING`.
-   *
-   * @throws {Error} Propagated from two sources:
-   *   1. `ServerRegistry.create()` — if the `id` is not registered.
-   *   2. `NexusServer.start()` — if the server startup fails.
+   * @returns Promise that resolves when the server is `RUNNING`, or rejects
+   *   with an error from `ServerRegistry.create()` or `NexusServer.start()`.
    */
   public start(id: string): Promise<void> {
     // Publish an instance synchronously so a same-tick stop/drop has an owner
     // to queue behind rather than incorrectly treating the service as absent.
-    this.ensureInstance(id);
+    try {
+      this.ensureInstance(id);
+    } catch (err) {
+      return Promise.reject(err);
+    }
     return this.enqueueLifecycle(id, 'start', () => this.startOwned(id));
   }
 
@@ -245,12 +244,15 @@ export class ServerManager extends EventEmitter {
    * if stop fails, use `try/catch` in the caller.
    *
    * @param id - Identifier of the server to restart.
-   * @returns Promise that resolves when the server is back to `RUNNING`.
-   *
-   * @throws {Error} Errors propagated from `stop()` or `start()`.
+   * @returns Promise that resolves when the server is back to `RUNNING`, or
+   *   rejects with an error from factory creation, `stop()`, or `start()`.
    */
   public restart(id: string): Promise<void> {
-    this.ensureInstance(id);
+    try {
+      this.ensureInstance(id);
+    } catch (err) {
+      return Promise.reject(err);
+    }
     return this.enqueueLifecycle(id, 'restart', async () => {
       await this.stopOwned(id);
       await this.startOwned(id);
@@ -278,23 +280,10 @@ export class ServerManager extends EventEmitter {
    * @throws {Error} When disposal fails; the mapped instance is retained.
    */
   public dropInstance(id: string): Promise<boolean> {
-    const pending = this.dropOperations.get(id);
-    if (pending) return pending;
-
-    // `enqueueLifecycle` defers the user-owned stop/dispose callbacks behind
-    // a promise. Store the operation before that microtask runs so a callback
-    // that re-enters `dropInstance` shares this exact operation.
-    const operation = this.enqueueLifecycle(id, 'drop', () => this.stopDisposeAndDrop(id));
-    this.dropOperations.set(id, operation);
-    void operation.then(
-      () => {
-        if (this.dropOperations.get(id) === operation) this.dropOperations.delete(id);
-      },
-      () => {
-        if (this.dropOperations.get(id) === operation) this.dropOperations.delete(id);
-      },
-    );
-    return operation;
+    // `enqueueLifecycle` records this operation before user-owned lifecycle
+    // callbacks run. Adjacent/reentrant drops share it, while a drop after an
+    // intervening start/stop/restart is deliberately queued as new work.
+    return this.enqueueLifecycle(id, 'drop', () => this.stopDisposeAndDrop(id));
   }
 
   /**

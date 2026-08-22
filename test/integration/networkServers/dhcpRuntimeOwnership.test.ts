@@ -400,6 +400,125 @@ describe("ServerManager disposal ownership", () => {
     }
   });
 
+  it("queues a new drop after an intervening real DHCP start", async () => {
+    const port = await freeLoopbackPort();
+    const adapters: DhcpAdapter[] = [];
+    const manager = new ServerManager().register("dhcp", () => {
+      const adapter = createAdapter(port);
+      adapters.push(adapter);
+      return adapter;
+    });
+    const dropEntered = deferred();
+    const releaseFirstDrop = deferred();
+    let stopSpy: { mockRestore(): void } | undefined;
+    let firstDrop: Promise<boolean> | undefined;
+    let restarting: Promise<void> | undefined;
+    let finalDrop: Promise<boolean> | undefined;
+
+    try {
+      await manager.start("dhcp");
+      const firstEngine = engineOf(adapters[0])!;
+      const originalStop = firstEngine.stop.bind(firstEngine);
+      stopSpy = vi.spyOn(firstEngine, "stop").mockImplementation(async () => {
+        dropEntered.resolve();
+        await releaseFirstDrop.promise;
+        await originalStop();
+      });
+
+      firstDrop = manager.dropInstance("dhcp");
+      restarting = manager.start("dhcp");
+      finalDrop = manager.dropInstance("dhcp");
+
+      expect(finalDrop).not.toBe(firstDrop);
+      await dropEntered.promise;
+      releaseFirstDrop.resolve();
+      await Promise.all([firstDrop, restarting, finalDrop]);
+
+      expect(adapters).toHaveLength(2);
+      expect(manager.getInstance("dhcp")).toBeUndefined();
+      expect(adapters[1].boundPort).toBeNull();
+      const releasePort = await holdLoopbackPort(port);
+      await releasePort();
+    } finally {
+      releaseFirstDrop.resolve();
+      stopSpy?.mockRestore();
+      await Promise.allSettled(
+        [firstDrop, restarting, finalDrop].filter((operation): operation is Promise<unknown> => operation !== undefined),
+      );
+      await Promise.allSettled(adapters.map((adapter) => adapter.stop()));
+    }
+  });
+
+  it("queues a post-start drop when disposeAll follows a pending real DHCP drop", async () => {
+    const port = await freeLoopbackPort();
+    const adapters: DhcpAdapter[] = [];
+    const manager = new ServerManager().register("dhcp", () => {
+      const adapter = createAdapter(port);
+      adapters.push(adapter);
+      return adapter;
+    });
+    const dropEntered = deferred();
+    const releaseFirstDrop = deferred();
+    let stopSpy: { mockRestore(): void } | undefined;
+    let firstDrop: Promise<boolean> | undefined;
+    let restarting: Promise<void> | undefined;
+    let disposingAll: Promise<void> | undefined;
+
+    try {
+      await manager.start("dhcp");
+      const firstEngine = engineOf(adapters[0])!;
+      const originalStop = firstEngine.stop.bind(firstEngine);
+      stopSpy = vi.spyOn(firstEngine, "stop").mockImplementation(async () => {
+        dropEntered.resolve();
+        await releaseFirstDrop.promise;
+        await originalStop();
+      });
+
+      firstDrop = manager.dropInstance("dhcp");
+      restarting = manager.start("dhcp");
+      disposingAll = manager.disposeAll();
+
+      await dropEntered.promise;
+      releaseFirstDrop.resolve();
+      await Promise.all([firstDrop, restarting, disposingAll]);
+
+      expect(adapters).toHaveLength(2);
+      expect(manager.getInstance("dhcp")).toBeUndefined();
+      expect(adapters[1].boundPort).toBeNull();
+      const releasePort = await holdLoopbackPort(port);
+      await releasePort();
+    } finally {
+      releaseFirstDrop.resolve();
+      stopSpy?.mockRestore();
+      await Promise.allSettled(
+        [firstDrop, restarting, disposingAll].filter((operation): operation is Promise<unknown> => operation !== undefined),
+      );
+      await Promise.allSettled(adapters.map((adapter) => adapter.stop()));
+    }
+  });
+
+  it("returns a missing-registry start error as a rejected promise", async () => {
+    const manager = new ServerManager();
+    let starting: Promise<void> | undefined;
+
+    expect(() => {
+      starting = manager.start("missing");
+    }).not.toThrow();
+    await expect(starting).rejects.toThrow(/Server 'missing' not found in registry/);
+  });
+
+  it("returns a factory configuration error from restart as a rejected promise", async () => {
+    const manager = new ServerManager().register("invalid-config", () => {
+      throw new Error("synthetic invalid DHCP configuration");
+    });
+    let restarting: Promise<void> | undefined;
+
+    expect(() => {
+      restarting = manager.restart("invalid-config");
+    }).not.toThrow();
+    await expect(restarting).rejects.toThrow(/synthetic invalid DHCP configuration/);
+  });
+
   it("shares a concurrent manager start failure instead of resolving from STARTING", async () => {
     const startEntered = deferred();
     const releaseStart = deferred();
