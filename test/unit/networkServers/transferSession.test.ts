@@ -23,7 +23,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { Opcode, ErrorCode, MAX_IN_FLIGHT_BYTES } from "../../../src/services/networkServers/tftp/engine/types";
+import {
+  Opcode,
+  ErrorCode,
+  MAX_IN_FLIGHT_BYTES,
+  MAX_RETRANSMISSION_PACKETS
+} from "../../../src/services/networkServers/tftp/engine/types";
 import {
   TransferSession,
   TransferPhase,
@@ -479,6 +484,35 @@ describe("TFTP TransferSession (no network)", () => {
   });
 
   describe("Negotiated window is bounded (remote allocation DoS)", () => {
+    it("retains one clamped window for retransmission", async () => {
+      const p = path.join(root, "retransmission-window.bin");
+      fs.writeFileSync(p, randomPayload(8 * MAX_RETRANSMISSION_PACKETS));
+      const t = new TransferSession({
+        peer: mkPeer(),
+        opcode: Opcode.RRQ,
+        filename: "retransmission-window.bin",
+        absFilePath: p,
+        mode: "octet",
+        rawOptions: { blksize: "8", windowsize: "257" }
+      });
+      t.initForRRQ(false, fs.statSync(p).size);
+
+      expect(t.opts.windowsize).toBe(256);
+      const packets = await t.produceNextSendPackets();
+      expect(packets).toHaveLength(256);
+      t.recordOutbound(packets);
+
+      const retransmission = t.consumeRetransmission()!;
+      expect(retransmission).toHaveLength(256);
+      expect(
+        retransmission.map((packet) => {
+          const parsed = parsePacket(packet)!;
+          expect(parsed.opcode).toBe(Opcode.DATA);
+          return parsed.opcode === Opcode.DATA ? parsed.blockNum : -1;
+        })
+      ).toEqual(Array.from({ length: 256 }, (_, index) => index + 1));
+    });
+
     it("OACK reports the CLAMPED windowsize, so client and server agree on the window", async () => {
       // A disagreement here is worse than the clamp itself: the client would
       // send/expect a 65535-block window while the server serves 16.

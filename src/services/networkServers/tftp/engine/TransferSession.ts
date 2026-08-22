@@ -29,6 +29,7 @@ import {
   ErrorCode,
   DEFAULT_BLOCK_SIZE,
   DEFAULT_WINDOW_SIZE,
+  MAX_RETRANSMISSION_PACKETS,
   type ValidatedOptions,
   type RawOptions,
 } from './types';
@@ -374,8 +375,8 @@ export class TransferSession {
       this.outboundQueue.push({ blockNum, buffer: pkt });
     }
     this.outboundSentLast = Date.now();
-    if (this.outboundQueue.length > 256) {
-      const drop = this.outboundQueue.length - 256;
+    if (this.outboundQueue.length > MAX_RETRANSMISSION_PACKETS) {
+      const drop = this.outboundQueue.length - MAX_RETRANSMISSION_PACKETS;
       this.outboundQueue.splice(0, drop);
     }
   }

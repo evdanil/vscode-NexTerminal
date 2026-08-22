@@ -31,6 +31,7 @@ import {
   DEFAULT_WINDOW_SIZE,
   OPTION_LIMITS,
   MAX_IN_FLIGHT_BYTES,
+  MAX_RETRANSMISSION_PACKETS,
   DATA_HEADER_LEN,
   type RawOptions,
   type ValidatedOptions,
@@ -439,7 +440,10 @@ export function validateOptions(
   // before anything can read them — including `validatedToRaw`, which is what
   // the OACK is built from. Clamping later (say, in the engine) would answer
   // the client with the value it asked for and then use a different one.
-  const maxWindow = Math.max(1, Math.floor(MAX_IN_FLIGHT_BYTES / out.blksize));
+  const maxWindow = Math.max(
+    1,
+    Math.min(MAX_RETRANSMISSION_PACKETS, Math.floor(MAX_IN_FLIGHT_BYTES / out.blksize)),
+  );
   if (out.windowsize > maxWindow) out.windowsize = maxWindow;
   return out;
 }

@@ -90,6 +90,12 @@ export const OPTION_LIMITS = {
  */
 export const MAX_IN_FLIGHT_BYTES = 1024 * 1024;
 
+/**
+ * Maximum number of sent packets retained for retransmission. This stays
+ * below the 32,768-packet ambiguous half-range of the 16-bit block space.
+ */
+export const MAX_RETRANSMISSION_PACKETS = 256;
+
 /** Names of options recognized by the engine. */
 export type OptionName = 'blksize' | 'timeout' | 'tsize' | 'windowsize';
 

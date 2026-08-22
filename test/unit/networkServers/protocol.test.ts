@@ -35,7 +35,8 @@ import {
   ErrorCode,
   DEFAULT_BLOCK_SIZE,
   DEFAULT_WINDOW_SIZE,
-  MAX_IN_FLIGHT_BYTES
+  MAX_IN_FLIGHT_BYTES,
+  MAX_RETRANSMISSION_PACKETS
 } from "../../../src/services/networkServers/tftp/engine/types";
 
 describe("TFTP Protocol (protocol.ts)", () => {
@@ -233,6 +234,16 @@ describe("TFTP Protocol (protocol.ts)", () => {
 
     it("windowsize < 1 → ProtocolError", () => {
       expect(() => validateOptions({ windowsize: "0" })).toThrow(ProtocolError);
+    });
+
+    it("clamps a tiny-block window to retransmission capacity", () => {
+      const v = validateOptions({ blksize: "8", windowsize: "65535" });
+      expect(v.windowsize).toBe(MAX_RETRANSMISSION_PACKETS);
+    });
+
+    it("does not clamp the retransmission boundary itself", () => {
+      expect(validateOptions({ blksize: "8", windowsize: "256" }).windowsize).toBe(256);
+      expect(validateOptions({ blksize: "8", windowsize: "257" }).windowsize).toBe(256);
     });
 
     it("negative tsize → ProtocolError", () => {
