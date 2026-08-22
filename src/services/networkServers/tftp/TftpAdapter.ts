@@ -376,7 +376,7 @@ export class TftpAdapter extends BaseNexusServer {
       const cleanupError = await this.releaseEngine(engine);
       if (cleanupError) {
         this.setStatus(ServerStatus.ERROR, `cleanup issue: ${cleanupError.message}`);
-        return;
+        throw cleanupError;
       }
     }
     this.setStatus(ServerStatus.STOPPED);

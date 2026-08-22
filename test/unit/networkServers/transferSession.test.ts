@@ -333,6 +333,45 @@ describe("TFTP TransferSession (no network)", () => {
       expect(t.consumeRetransmission()).toBeNull();
     });
 
+    it("invalid DATA(2) cannot prevent optioned WRQ OACK retransmission exhaustion", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-08-22T00:00:00.000Z"));
+      try {
+        const t = new TransferSession({
+          peer: mkPeer(), opcode: Opcode.WRQ, filename: "w.bin",
+          absFilePath: path.join(root, "w.bin"), mode: "octet",
+          rawOptions: { blksize: "8" }
+        });
+        const oack = t.initForWRQ(true);
+        t.recordOutbound(oack);
+
+        for (let attempt = 1; attempt <= DEFAULT_MAX_RETRIES; attempt++) {
+          const invalid = t.handleDATA(2, Buffer.alloc(8));
+          expect(invalid).toEqual({ send: [], write: null, done: false });
+          expect(t.phase, "invalid DATA must not advance the OACK handshake").toBe(
+            TransferPhase.SendOACK
+          );
+          vi.advanceTimersByTime(60_000);
+          expect(t.timeForRetransmission()).toBe(true);
+          const retransmission = t.consumeRetransmission();
+          expect(retransmission, `attempt ${attempt} must retain the outstanding OACK`).toHaveLength(1);
+          expect(retransmission?.[0]?.equals(oack[0]!)).toBe(true);
+          expect(t.retries).toBe(attempt);
+        }
+
+        const invalid = t.handleDATA(2, Buffer.alloc(8));
+        expect(invalid).toEqual({ send: [], write: null, done: false });
+        expect(t.phase).toBe(TransferPhase.SendOACK);
+        vi.advanceTimersByTime(60_000);
+        expect(t.timeForRetransmission()).toBe(true);
+        expect(t.consumeRetransmission()).toBeNull();
+        expect(t.phase).toBe(TransferPhase.Error);
+        expect(t.errorMessage).toMatch(/max retries exceeded/i);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("WRQ blksize=512, 2*512+100 B: progressive handleDATA(1..3), last returns done=true + ACK + write", () => {
       const t = new TransferSession({
         peer: mkPeer(),

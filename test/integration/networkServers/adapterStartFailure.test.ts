@@ -185,6 +185,90 @@ describe("network server adapters — a start that fails must reject", () => {
     }
   });
 
+  it.each(["stop", "dispose"] as const)(
+    "TFTP: failed cleanup rejects stop, then %s retries and releases ownership",
+    async (retryWith) => {
+      const root = mkdtemp(`nexus-adapter-cleanup-retry-${retryWith}-`);
+      cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+      const adapter = new TftpAdapter({ root, port: 0, interface: "127.0.0.1" });
+      const state = adapter as unknown as { engine: TftpEngine | null };
+      await adapter.start();
+      const engine = state.engine!;
+      const originalStop = engine.stop.bind(engine);
+      let stopAttempts = 0;
+      const stopSpy = vi.spyOn(engine, "stop").mockImplementation(async () => {
+        stopAttempts++;
+        if (stopAttempts === 1) throw new Error("synthetic engine cleanup failure");
+        await originalStop();
+      });
+
+      try {
+        await expect(adapter.stop()).rejects.toThrow(/synthetic engine cleanup failure/i);
+        expect(adapter.status).toBe(ServerStatus.ERROR);
+        expect(adapter.lastError).toMatch(/cleanup issue: synthetic engine cleanup failure/i);
+        expect(state.engine, "failed cleanup must retain the captured engine").toBe(engine);
+        expect(engine.boundPort, "the retained engine still owns its UDP port").not.toBeNull();
+
+        if (retryWith === "stop") await adapter.stop();
+        else await adapter.dispose();
+
+        expect(stopAttempts, `${retryWith} must retry the retained engine`).toBe(2);
+        expect(adapter.status).toBe(ServerStatus.STOPPED);
+        expect(state.engine).toBeNull();
+        expect(engine.boundPort).toBeNull();
+      } finally {
+        stopSpy.mockRestore();
+        await originalStop();
+      }
+    }
+  );
+
+  it("TFTP: repeated dispose cleanup failure is awaited and swallowed with ownership retained", async () => {
+    const root = mkdtemp("nexus-adapter-dispose-failure-");
+    cleanups.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+    const adapter = new TftpAdapter({ root, port: 0, interface: "127.0.0.1" });
+    const state = adapter as unknown as { engine: TftpEngine | null };
+    await adapter.start();
+    const engine = state.engine!;
+    const originalStop = engine.stop.bind(engine);
+    const disposeCleanupEntered = deferred();
+    const releaseDisposeCleanup = deferred();
+    let stopAttempts = 0;
+    const stopSpy = vi.spyOn(engine, "stop").mockImplementation(async () => {
+      stopAttempts++;
+      if (stopAttempts === 1) throw new Error("first synthetic cleanup failure");
+      disposeCleanupEntered.resolve();
+      await releaseDisposeCleanup.promise;
+      throw new Error("repeated synthetic cleanup failure");
+    });
+    let disposing: Promise<void> | undefined;
+
+    try {
+      await expect(adapter.stop()).rejects.toThrow(/first synthetic cleanup failure/i);
+      disposing = adapter.dispose();
+      await disposeCleanupEntered.promise;
+      let disposeSettled = false;
+      const observedDispose = disposing.then(() => {
+        disposeSettled = true;
+      });
+      await Promise.resolve();
+      expect(disposeSettled, "dispose must await the retrying engine cleanup").toBe(false);
+
+      releaseDisposeCleanup.resolve();
+      await expect(observedDispose).resolves.toBeUndefined();
+      expect(stopAttempts).toBe(2);
+      expect(adapter.status).toBe(ServerStatus.ERROR);
+      expect(adapter.lastError).toMatch(/cleanup issue: repeated synthetic cleanup failure/i);
+      expect(state.engine, "a failed disposal retry must keep ownership available").toBe(engine);
+      expect(engine.boundPort).not.toBeNull();
+    } finally {
+      releaseDisposeCleanup.resolve();
+      await Promise.allSettled([disposing].filter((p): p is Promise<void> => p !== undefined));
+      stopSpy.mockRestore();
+      await originalStop();
+    }
+  });
+
   it("DHCP: an unbindable address rejects start() and records ERROR", async () => {
     // TEST-NET-3 (RFC 5737). Not assigned to any interface anywhere, so the
     // bind fails with EADDRNOTAVAIL rather than depending on who owns port 67

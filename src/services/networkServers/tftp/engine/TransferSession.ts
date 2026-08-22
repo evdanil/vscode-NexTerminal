@@ -570,18 +570,14 @@ export class TransferSession {
     write: Buffer | null;
     done: boolean;
   } {
-    this.touch();
-    this.retries = 0;
-    if (this.phase === TransferPhase.RecvInitialACK) {
-      this.phase = TransferPhase.Receiving;
-    }
-    if (
-      this.phase === TransferPhase.SendOACK &&
-      this.opcode === Opcode.WRQ &&
-      blockNum === 1
-    ) {
+    if (this.phase === TransferPhase.SendOACK) {
+      if (this.opcode !== Opcode.WRQ || blockNum !== 1) {
+        return { send: [], write: null, done: false };
+      }
       this.phase = TransferPhase.Receiving;
       this.clearOutboundUpToAck(0);
+    } else if (this.phase === TransferPhase.RecvInitialACK) {
+      this.phase = TransferPhase.Receiving;
     }
     if (this.phase !== TransferPhase.Receiving) {
       return { send: [], write: null, done: false };
@@ -594,6 +590,8 @@ export class TransferSession {
     // transfer that was merely recovering from a lost ACK.
     const previousBlock = this.blockNum <= 1 ? 65535 : this.blockNum - 1;
     if (blockNum === previousBlock) {
+      this.touch();
+      this.retries = 0;
       return { send: [encodeACK(previousBlock)], write: null, done: false };
     }
     if (blockNum !== this.blockNum) {
@@ -604,6 +602,8 @@ export class TransferSession {
       this.setError(ErrorCode.IllegalOperation, 'DATA exceeds blksize');
       return { send: [this.makeErrorPacket()], write: null, done: true };
     }
+    this.touch();
+    this.retries = 0;
     const isLast = data.length < this.opts.blksize;
     const currentBlock = this.blockNum;
     this.bytesTransferred += data.length;
