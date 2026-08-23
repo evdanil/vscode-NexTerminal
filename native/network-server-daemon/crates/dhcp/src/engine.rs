@@ -588,6 +588,28 @@ impl<S: Datagram> DhcpCore<S> {
                 Some(request.ciaddr)
             }
         });
+        // RFC 2131 Table 5: a REQUEST carries option 50 in SELECTING and
+        // INIT-REBOOT, and ciaddr in RENEWING and REBINDING — so one with
+        // neither names no address in any state the protocol defines. Allocating
+        // for it regardless turns a malformed packet into a bound, persisted
+        // lease, and a scanner cycling spoofed MACs could take the whole pool
+        // without ever completing DISCOVER/OFFER.
+        //
+        // The discard is limited to requests that would consume a *fresh*
+        // address: a client the server has already bound is asking about
+        // something it holds, not making a claim on the pool, so a sloppy
+        // renewal is still answered rather than cut off mid-lease.
+        if requested.is_none() && self.table.existing_address(mac, now).is_none() {
+            self.counters.malformed_count += 1;
+            // Not answered, for the same reason an unparseable packet is not:
+            // a reply is the one thing that confirms to a scanner that it found
+            // a server.
+            self.wire.log(
+                LogLevel::Debug,
+                format!("REQUEST from {mac} names no address in any valid state; discarded"),
+            );
+            return;
+        }
         let selected = self.table.select_address(mac, requested, now);
 
         // A NAK is the honest answer to "you cannot have that address": it tells
@@ -1225,6 +1247,51 @@ mod tests {
     }
 
     // -- DORA ----------------------------------------------------------------
+
+    #[test]
+    fn a_request_naming_no_address_never_allocates_a_new_one() {
+        // RFC 2131 Table 5: a DHCPREQUEST carries option 50 in SELECTING and
+        // INIT-REBOOT, and ciaddr in RENEWING and REBINDING. One with neither
+        // names no address in any valid state. Allocating for it anyway lets a
+        // scanner bind the whole pool from spoofed MACs without ever completing
+        // DISCOVER/OFFER — and unlike an unclaimed offer, those binds persist.
+        let mut h = Harness::new();
+        h.feed(&request(&MAC_A, None, None));
+
+        assert!(
+            h.core.active_leases().is_empty(),
+            "an addressless REQUEST from an unknown client must not bind anything"
+        );
+        assert!(
+            h.sent.borrow().is_empty(),
+            "and it is not worth an answer: replying only tells a scanner it found a server"
+        );
+        assert_eq!(
+            h.core.counters().malformed_count,
+            1,
+            "the drop must be counted, or it is invisible to whoever is diagnosing it"
+        );
+    }
+
+    #[test]
+    fn a_request_naming_no_address_still_renews_a_client_that_already_has_one() {
+        // The discard is deliberately narrow. A client the server has already
+        // bound is not a pool-exhaustion vector — it is asking about an address
+        // it already holds — so a sloppy renewal that omits both fields keeps
+        // working rather than being cut off mid-lease.
+        let mut h = Harness::new();
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+        assert_eq!(h.core.active_leases().len(), 1);
+
+        h.feed(&request(&MAC_A, None, None));
+
+        let reply = h.last_reply();
+        assert_eq!(reply.options.message_type(), Some(MessageType::Ack));
+        assert_eq!(reply.yiaddr, ip("10.0.0.10"));
+        assert_eq!(h.core.active_leases().len(), 1, "and it is still one lease");
+    }
+
 
     #[test]
     fn a_discover_is_answered_with_an_offer_from_the_bottom_of_the_pool() {

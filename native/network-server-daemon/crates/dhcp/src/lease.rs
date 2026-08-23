@@ -340,15 +340,8 @@ impl LeaseTable {
         requested: Option<Ipv4Addr>,
         now_ms: u64,
     ) -> Option<Ipv4Addr> {
-        if let Some(reserved) = self.statics.get(mac) {
-            if !self.is_quarantined(*reserved, now_ms) {
-                return Some(*reserved);
-            }
-        }
-        if let Some(entry) = self.entries.get(mac) {
-            if entry.is_live(now_ms) {
-                return Some(entry.address);
-            }
+        if let Some(existing) = self.existing_address(mac, now_ms) {
+            return Some(existing);
         }
         if let Some(wanted) = requested {
             if is_ip_in_pool(wanted, self.range_start, self.range_end)
@@ -359,6 +352,27 @@ impl LeaseTable {
         }
         self.lowest_free_address(mac, now_ms)
     }
+
+    /// The address this client already holds, without allocating a new one.
+    ///
+    /// The prefix of [`Self::select_address`] that never reaches the free pool:
+    /// a static reservation, or a live lease. Separated so a caller can tell
+    /// "this client is asking about an address it already has" from "answering
+    /// this would consume a fresh one" — the distinction between a renewal and
+    /// a claim on the pool.
+    #[must_use]
+    pub fn existing_address(&self, mac: &MacKey, now_ms: u64) -> Option<Ipv4Addr> {
+        if let Some(reserved) = self.statics.get(mac) {
+            if !self.is_quarantined(*reserved, now_ms) {
+                return Some(*reserved);
+            }
+        }
+        self.entries
+            .get(mac)
+            .filter(|entry| entry.is_live(now_ms))
+            .map(|entry| entry.address)
+    }
+
 
     /// Whether some MAC other than `mac` has a live claim on `address`.
     #[must_use]
