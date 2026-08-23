@@ -321,6 +321,13 @@ pub struct DhcpCore<S: Datagram> {
     lease_store_path: Option<PathBuf>,
     persist_debounce: Duration,
     dirty_since: Option<Instant>,
+    /// True while the last lease write failed and has not yet succeeded again.
+    ///
+    /// Retries run on the debounce interval, which is sub-second, so a store
+    /// that never recovers would otherwise report itself several times a second
+    /// for as long as the daemon runs. Reporting on the transitions instead
+    /// keeps the retry silent without keeping it secret.
+    persist_failed: bool,
     counters: PacketCounters,
 }
 
@@ -351,6 +358,7 @@ impl<S: Datagram> DhcpCore<S> {
             lease_store_path: options.lease_store_path.clone(),
             persist_debounce: options.persist_debounce,
             dirty_since: None,
+            persist_failed: false,
             counters: PacketCounters::default(),
         };
         core.restore_persisted(options);
@@ -855,14 +863,23 @@ impl<S: Datagram> DhcpCore<S> {
             self.dirty_since = Some(Instant::now());
             // Logged, never fatal: a lease server that stops serving because it
             // cannot write a cache file is strictly worse than one that serves
-            // and warns.
+            // and warns. Logged once per outage rather than once per retry.
+            if !self.persist_failed {
+                self.persist_failed = true;
+                self.wire.log(
+                    LogLevel::Warn,
+                    format!(
+                        "could not persist the lease table to {} — leases will not survive a \
+                         restart, and this will be retried quietly: {error}",
+                        path.display()
+                    ),
+                );
+            }
+        } else if self.persist_failed {
+            self.persist_failed = false;
             self.wire.log(
-                LogLevel::Warn,
-                format!(
-                    "could not persist the lease table to {} — leases will not survive a \
-                     restart: {error}",
-                    path.display()
-                ),
+                LogLevel::Info,
+                format!("lease table persisted again to {}", path.display()),
             );
         }
     }
@@ -1830,6 +1847,69 @@ mod tests {
             1,
             "a failed write must leave the table dirty so a later tick retries it"
         );
+    }
+
+    #[test]
+    fn a_persistently_unwritable_store_warns_once_not_on_every_tick() {
+        // Retrying a failed write is right, but the debounce is 500ms, so a path
+        // that never becomes writable would otherwise put two warnings a second
+        // into the operator's log forever — burying whatever else is in it.
+        // Retry quietly; say something again only when the situation changes.
+        let dir = TempDir::new("dhcp-engine-persist-noise");
+        let blocker = dir.path().join("store");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let mut o = options();
+        o.lease_store_path = Some(blocker.join("dhcp-leases.json"));
+        o.persist_debounce = Duration::ZERO;
+
+        let mut h = Harness::with(&o);
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+        for _ in 0..20 {
+            h.core.tick();
+        }
+
+        let warnings = h
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|line| line.contains("could not persist the lease table"))
+            .count();
+        assert_eq!(
+            warnings, 1,
+            "a stuck lease store must be reported once, not on every retry"
+        );
+    }
+
+    #[test]
+    fn a_recovered_lease_store_says_so_after_it_has_failed() {
+        // The counterpart to reporting once: having gone quiet, the engine still
+        // has to tell the operator when the problem is over, or a warning with
+        // no resolution is all they ever see.
+        let dir = TempDir::new("dhcp-engine-persist-recovery");
+        let blocker = dir.path().join("store");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("dhcp-leases.json");
+        let mut o = options();
+        o.lease_store_path = Some(path.clone());
+        o.persist_debounce = Duration::ZERO;
+
+        let mut h = Harness::with(&o);
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+        h.core.tick();
+        std::fs::remove_file(&blocker).unwrap();
+        h.core.tick();
+
+        assert_eq!(persistence::load_leases(&path).len(), 1);
+        let recovered = h
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|line| line.contains("lease table persisted again"));
+        assert!(recovered, "recovery from a reported failure must be reported too");
     }
 
     #[test]
