@@ -22,8 +22,9 @@ including real-UDP e2e) passes, and the extension-side parity suite
 existing Node/TypeScript daemon. Prebuilt artifacts for all six supported platforms are built and packaged by
 `.github/workflows/release.yml` at release time — see
 `native/network-server-daemon-artifacts/README.md` for how that works.
-**Not yet done:** flipping the `nexus.networkServers.engine` default away from
-`"node"`, which waits on field evidence rather than on packaging.
+The `nexus.networkServers.engine` default became `"rust"` in 2.8.205. The Node
+daemon stays in the tree and stays the automatic fallback for any platform
+without a packaged binary, so it is not dead code and its tests still run.
 
 ## Layout
 

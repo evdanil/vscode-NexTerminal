@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.8.205] — 2026-08-23
+
+### Changed
+
+- **The native engine now backs the embedded TFTP and DHCP servers by default.** `nexus.networkServers.engine` defaults to `rust` instead of `node`. Nothing about using the servers changes — same sidebar, same Quick Settings, same settings, same isolated child process — and the JavaScript daemon that shipped until now stays in place as the automatic fallback for any platform without a packaged binary, with the reason logged. The services start either way, which is the property the fallback exists to guarantee. Set the engine back to `node` if you would rather stay on the previous implementation; it takes effect the next time the daemon starts.
+
+  Why the native one: it parses the DHCP wire format under this project's own tests rather than through `dhcp@0.2.20`, which has been unmaintained since around 2017, so a defect there is a defect nobody upstream is going to fix. It forbids unsafe code in every crate, and it aborts on arithmetic overflow rather than continuing with a wrapped value — on a service that parses packets from anyone on the network, failing loudly and being restarted is better than carrying on with a number that is quietly wrong. The credit for the argument, and for the implementation that proved it, belongs to Brandon Mejia (@kanekitakitos).
+
+  The honest counterweight, since a default is a decision made on other people's behalf: the two implementations have been compared by a test suite and a parity harness, not by time in the field. The Rust one is new. If it misbehaves for you, one setting puts you back, and a report would be genuinely useful.
+
+- **One behavioural difference comes with the switch: DHCP requests naming a relay agent are no longer answered by default.** This is the hardening added in 2.8.204, which the Rust engine honours and the JavaScript engine does not — so it applied to almost nobody until now, and applies to almost everybody from this release. If your DHCP server genuinely sits behind a relay, switch **Serve Relayed Requests** (`nexus.networkServers.dhcp.allowRelayAgents`) on. If it does not — a bench, a lab, a switch on the desk — there is nothing to change, and refusing those requests is what stops an unauthenticated peer from having a full network configuration sent to an address of its choosing.
+
 ## [2.8.204] — 2026-08-23
 
 ### Security

@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox and EVE-NG inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.204",
+  "version": "2.8.205",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -4228,12 +4228,12 @@
             "rust"
           ],
           "enumDescriptions": [
-            "Bundled JavaScript daemon. Runs on every platform the extension supports.",
-            "Native Rust daemon. Uses a packaged binary when one is installed, or NEXUS_NETWORK_SERVER_DAEMON_BIN for development; otherwise the JavaScript daemon is used and a warning is logged."
+            "Bundled JavaScript daemon. Runs on every platform the extension supports, and is the fallback whenever no native binary is available.",
+            "Native Rust daemon, packaged for all six supported platforms. Falls back to the JavaScript daemon, with the reason logged, if no binary is available here."
           ],
-          "default": "node",
+          "default": "rust",
           "order": 57,
-          "markdownDescription": "**Network Servers — Engine.** Which implementation backs the embedded TFTP and DHCP services. `node` (default) runs the bundled JavaScript daemon. `rust` runs a native binary that speaks the identical stdio JSON-RPC protocol, using a packaged binary when one is installed or `NEXUS_NETWORK_SERVER_DAEMON_BIN` for development. If `rust` is selected but no native binary is available, the JavaScript daemon is used instead and the reason is logged to the *Nexus Network Servers* output channel — the services always start. Takes effect the next time the daemon starts."
+          "markdownDescription": "**Network Servers — Engine.** Which implementation backs the embedded TFTP and DHCP services. `rust` (default since 2.8.205) runs a native binary packaged for all six supported platforms: it parses the wire protocol under this project's own tests rather than an unmaintained dependency, forbids unsafe code, and aborts on arithmetic overflow rather than continuing with a wrong value. `node` runs the bundled JavaScript daemon, which is what shipped before 2.8.205 and remains the fallback — if no native binary is available for this platform, or `NEXUS_NETWORK_SERVER_DAEMON_BIN` points at nothing, the JavaScript daemon starts instead and the reason is logged to the *Nexus Network Servers* output channel. The services always start either way. Note that `#nexus.networkServers.dhcp.allowRelayAgents#` is honoured by the Rust engine only. Takes effect the next time the daemon starts."
         }
       }
     }
