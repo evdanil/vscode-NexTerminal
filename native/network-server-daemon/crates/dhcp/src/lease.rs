@@ -36,6 +36,26 @@ use crate::net::{is_ip_in_pool, pool_size, MacKey};
 /// implementation does.
 pub const DEFAULT_OFFER_SECS: u32 = 120;
 
+/// The share of the pool that unclaimed offers may hold, as a divisor.
+///
+/// A DISCOVER costs a peer one packet and reserves an address for
+/// [`DEFAULT_OFFER_SECS`], so fabricated MACs can hold an entire pool without
+/// ever completing DORA — LAN presence, no credentials. Capping what offers may
+/// occupy keeps capacity for clients that will actually bind.
+///
+/// A count alone cannot tell a flood from a genuine rush of devices, and this
+/// does not try to: a client refused an offer re-sends DISCOVER, so a real burst
+/// larger than the cap is served as earlier offers convert to leases, while a
+/// flood that never converts stays bounded at half the pool.
+const PENDING_OFFER_POOL_DIVISOR: u32 = 2;
+
+/// Floor for that cap, so a small pool is not throttled into uselessness.
+///
+/// Half of a ten-address bench pool is five, and five simultaneous boots is an
+/// ordinary morning. A pool this size cannot be protected from exhaustion by
+/// arithmetic anyway — the defence is worth having where there is room for it.
+const MIN_PENDING_OFFERS: usize = 8;
+
 /// How long a declined address is held out of the pool.
 ///
 /// RFC 2131 §4.3.3: a DHCPDECLINE means the client probed the offered address
@@ -361,6 +381,23 @@ impl LeaseTable {
             }
         }
         self.lowest_free_address(mac, now_ms)
+    }
+
+    /// True when unclaimed offers already hold the share of the pool they may.
+    ///
+    /// Asked only of clients making a *fresh* claim: a device that already holds
+    /// an address is asking about the one it has, and refusing it would turn a
+    /// defence against fabricated MACs into an outage for real ones.
+    #[must_use]
+    pub fn offer_capacity_reached(&self, now_ms: u64) -> bool {
+        let pool = pool_size(self.range_start, self.range_end);
+        let cap = ((pool / PENDING_OFFER_POOL_DIVISOR) as usize).max(MIN_PENDING_OFFERS);
+        let pending = self
+            .entries
+            .values()
+            .filter(|entry| entry.state == LeaseState::Offered && entry.is_live(now_ms))
+            .count();
+        pending >= cap
     }
 
     /// The address this client already holds, without allocating a new one.

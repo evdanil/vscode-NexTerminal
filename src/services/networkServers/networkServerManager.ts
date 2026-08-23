@@ -308,6 +308,11 @@ export function readDhcpConfig(globalStoragePath?: string): DhcpAdapterConfig {
       : undefined;
   return {
     ...result.value,
+    // Read straight from configuration rather than through the sanitizer: it is
+    // a plain boolean with no cross-field meaning, and the daemon defaults it
+    // off if the key never arrives.
+    allowRelayAgents:
+      vscode.workspace.getConfiguration(section).get<boolean>("allowRelayAgents", false) === true,
     leaseTimeSec: result.value.leaseTimeSec ?? 86_400,
     leaseStorePath: globalStoragePath ? resolveDhcpLeaseStorePath(globalStoragePath) : undefined,
     nextServer: nextServer ?? autoLinked,
