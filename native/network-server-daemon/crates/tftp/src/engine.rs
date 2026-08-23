@@ -346,6 +346,9 @@ struct CompletedWrite {
     window_start: u16,
     final_block: u16,
     ack: Vec<u8>,
+    /// How long each answered retry buys. Retained because the deadline is
+    /// restarted on every one, not set once at completion.
+    dally: Duration,
     expires_at: Instant,
 }
 
@@ -537,10 +540,11 @@ impl<S: Datagram> TftpCore<S> {
     // -- request handling ---------------------------------------------------
 
     fn reack_completed_write(&mut self, msg: &[u8], peer: SocketAddr) -> bool {
-        let Some(completed) = self.completed_writes.get(&peer) else {
+        let now = Instant::now();
+        let Some(completed) = self.completed_writes.get_mut(&peer) else {
             return false;
         };
-        if completed.expires_at <= Instant::now() {
+        if completed.expires_at <= now {
             self.completed_writes.remove(&peer);
             return false;
         }
@@ -550,6 +554,11 @@ impl<S: Datagram> TftpCore<S> {
         if !completed.covers(block) {
             return false;
         }
+        // Every answered retry restarts the clock. The client waits a full
+        // timeout before retrying again, so a deadline fixed at completion has
+        // already lapsed by the time a lost *answer* brings the client back —
+        // and the record would be gone exactly when it is still needed.
+        completed.expires_at = now + completed.dally;
         let ack = completed.ack.clone();
         self.wire.send_raw(peer, &[ack]);
         true
@@ -867,6 +876,7 @@ impl<S: Datagram> TftpCore<S> {
                 window_start: session.acked_window_start,
                 final_block: session.last_acked,
                 ack: crate::protocol::encode_ack(session.last_acked),
+                dally: session.retry_interval(),
                 expires_at: Instant::now() + session.retry_interval(),
             })
         });
@@ -1476,6 +1486,42 @@ mod tests {
             error_code(&sent.last().unwrap().1),
             ErrorCode::UnknownTransferId.to_wire(),
             "a block from before the completed window is not a final-window retry"
+        );
+    }
+
+    #[test]
+    fn answering_a_completed_write_retry_restarts_the_dally() {
+        // A client whose retry is answered but whose *answer* is also lost waits
+        // one more negotiated timeout before trying again. A deadline fixed at
+        // completion has expired by then, so the second retry — just as valid as
+        // the first — draws UnknownTransferId and the client reports a failure
+        // for an upload the server already has.
+        let temp = TempDir::new("engine-write-dally-renewal");
+        let (mut core, _rec) = core_for(&temp, true, 8);
+        let writer = peer(43216);
+        let options = RawOptions {
+            timeout: Some("30".to_owned()),
+            ..RawOptions::default()
+        };
+
+        core.handle_message(&encode_wrq("up.bin", "octet", &options), writer);
+        core.handle_message(&encode_data(1, b"done"), writer);
+        let first = core
+            .completed_writes
+            .get(&writer)
+            .expect("completed WRQ keeps final ACK state")
+            .expires_at;
+
+        core.handle_message(&encode_data(1, b"done"), writer);
+        let renewed = core
+            .completed_writes
+            .get(&writer)
+            .expect("answering a retry must not drop the state")
+            .expires_at;
+
+        assert!(
+            renewed > first,
+            "each answered retry must restart the dally clock"
         );
     }
 
