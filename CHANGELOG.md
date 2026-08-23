@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.8.202] — 2026-08-23
+
+### Added
+
+- **A second implementation of the embedded TFTP and DHCP servers, and the setting that chooses between them.** `nexus.networkServers.engine` picks which one backs those services: `node`, the default, is the bundled JavaScript daemon that has always run them; `rust` is a native binary speaking the identical stdio JSON-RPC protocol. Both sit behind the same isolated child process, the same Quick Settings, and the same sidebar, so nothing about *using* the servers changes — this is the engine underneath, not the feature on top.
+
+  **The native binary ships for all six supported platforms** — Windows, macOS and Linux, on x64 and arm64 — built for each from its own native runner as part of the release, started once on that platform to prove it runs before it is packaged, and checked for afterwards inside the VSIX. A platform that fails to build fails the release rather than shipping quietly without it.
+
+  **The default is still `node`, and deliberately so.** Packaging a thing is not evidence that it behaves in the field, and the two engines have only ever been compared by a test suite. Switching is a per-machine decision you can make and reverse, taking effect the next time the daemon starts. If you select `rust` and no binary is available for your platform — an unpackaged development build, say — the JavaScript daemon starts instead and the reason is written to the *Nexus Network Servers* output channel. Whichever engine you name, the services start; that is the one property the fallback exists to guarantee. Developers can point at a local build with `NEXUS_NETWORK_SERVER_DAEMON_BIN`.
+
+  The contract between host and daemon is written to be implementation-independent — either side could be rebuilt from [docs/network-server-daemon-protocol.md](docs/network-server-daemon-protocol.md) alone — and a parity suite drives the real RPC client against both engines and compares the results, which is what makes "identical protocol" a claim rather than an intention.
+
+### Changed
+
+- **A DHCP runtime response may now list fewer leases than the pool reports as active.** The sidebar's lease list is a view bounded by what one RPC line can carry; `activeCount` and utilisation keep reporting the true figures. A pool may hold 65,536 addresses, and serialising every lease of a well-populated one runs to several megabytes against a 1 MiB per-line limit — past which the response is replaced wholesale rather than trimmed, so the sidebar showed nothing at all rather than showing less. The host previously required the list length and the active count to match exactly, which made a deliberately shortened list indistinguishable from a corrupt one; it now rejects only a response claiming *more* leases than are active. This affects the JavaScript engine too, since both speak the same protocol.
+
+### Fixed
+
+- **The embedded servers were hardened against a hostile network before the native engine ships.** Roughly thirty defects were found and fixed during review of the new daemon, the great majority in code that has never shipped. They are not itemised here, because a changelog records what changed for you and this changed nothing you could have observed. The classes are worth naming, though, since they say what the review was looking for: unauthenticated peers able to pin transfer slots or exhaust the address pool with spoofed identities; peer-supplied text reaching logs and notifications without bounds or sanitisation; lease-file contents able to take the service down on every restart; and protocol state-machine errors that aborted healthy transfers on a single lost datagram.
+
+  One of them reaches the JavaScript engine as well and is described under **Changed** above.
+
 ## [2.8.201] — 2026-08-21
 
 ### Fixed
