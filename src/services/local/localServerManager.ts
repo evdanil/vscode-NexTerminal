@@ -46,6 +46,53 @@ export const LOCAL_SERVER_STABLE_RUN_MS = 10_000;
 export const LOCAL_SERVER_INITIAL_BACKOFF_MS = 500;
 export const LOCAL_SERVER_MAX_BACKOFF_MS = 30_000;
 export const LOCAL_SERVER_DEFAULT_MAX_RESTARTS = 5;
+
+/**
+ * Hard ceiling on consecutive auto-restarts, whatever configuration asks for.
+ *
+ * Backoff doubles from half a second to a thirty-second ceiling, so five
+ * consecutive failures already span most of a minute — and a process that has
+ * died five times in a row without once surviving the stable window is not
+ * having a bad moment, it is broken. Past that point another attempt is worth
+ * less than a `failed` row telling somebody so.
+ *
+ * The default is the same number, which makes the setting a way to ask for
+ * *fewer* restarts rather than more.
+ */
+export const LOCAL_SERVER_RESTART_CEILING = 5;
+
+/** The tunable half of the restart policy, read fresh at each point of use. */
+interface LocalServerTuning {
+  defaultMaxAutoRestarts: number;
+  stableRuntimeMs: number;
+  initialBackoffMs: number;
+  maxBackoffMs: number;
+}
+
+/**
+ * Reads the restart policy from configuration.
+ *
+ * Read at the point of use rather than cached at construction, so an edit
+ * applies to the next restart instead of the next window reload. Every value is
+ * clamped here rather than trusted: `package.json` bounds them, but a settings
+ * file is hand-editable and a negative backoff or a hundred restarts would both
+ * be honoured by the arithmetic below.
+ */
+function readTuning(): LocalServerTuning {
+  const cfg = vscode.workspace.getConfiguration("nexus.localServers");
+  const initial = Math.max(50, cfg.get<number>("initialBackoffMs", LOCAL_SERVER_INITIAL_BACKOFF_MS));
+  return {
+    defaultMaxAutoRestarts: Math.min(
+      LOCAL_SERVER_RESTART_CEILING,
+      Math.max(0, cfg.get<number>("defaultMaxAutoRestarts", LOCAL_SERVER_DEFAULT_MAX_RESTARTS))
+    ),
+    stableRuntimeMs: Math.max(1_000, cfg.get<number>("stableRuntimeMs", LOCAL_SERVER_STABLE_RUN_MS)),
+    initialBackoffMs: initial,
+    // Never below the initial delay, or the ceiling would shorten the first
+    // wait instead of bounding the last one.
+    maxBackoffMs: Math.max(initial, cfg.get<number>("maxBackoffMs", LOCAL_SERVER_MAX_BACKOFF_MS))
+  };
+}
 /**
  * Bound on how long stop() waits for the pty to report a real exit code
  * (via the onDidClose/onDidTerminateEarly listeners wired in start()) before
@@ -381,7 +428,7 @@ export class LocalServerManager implements vscode.Disposable {
           // stops restarting for no reason a user could see.
           this.restartAttempts.delete(config.id);
         }
-      }, LOCAL_SERVER_STABLE_RUN_MS);
+      }, readTuning().stableRuntimeMs);
     });
 
     pty.onDidTerminateEarly((evt: LocalShellEarlyTerminationEvent) => {
@@ -471,11 +518,20 @@ export class LocalServerManager implements vscode.Disposable {
     this.clearTimers(entry);
     this.options.core.setLocalServerLastExitCode(sessionId, exitCode);
 
-    const stopping = !config.autoRestart || entry.userInitiatedStop;
-    const maxRestarts =
-      typeof config.maxAutoRestarts === "number" && config.maxAutoRestarts > 0
+    const tuning = readTuning();
+    // A profile that names a number gets it; one that does not follows the
+    // setting. Either way the ceiling applies — configuration can ask for
+    // fewer restarts than the default, never more.
+    const configured =
+      typeof config.maxAutoRestarts === "number"
         ? config.maxAutoRestarts
-        : LOCAL_SERVER_DEFAULT_MAX_RESTARTS;
+        : tuning.defaultMaxAutoRestarts;
+    const maxRestarts = Math.min(LOCAL_SERVER_RESTART_CEILING, Math.max(0, configured));
+    // Zero means no automatic restarts, which is indistinguishable from having
+    // switched auto-restart off — so it takes the same path, and the server
+    // stops cleanly rather than being reported as failed for obeying its
+    // configuration.
+    const stopping = !config.autoRestart || entry.userInitiatedStop || maxRestarts === 0;
     // Counted here rather than on the session, and keyed by config rather than
     // by session id. Each restart registers a *new* session with its own id and
     // `restartAttempts: 0`, so a per-session counter cannot accumulate across
@@ -511,8 +567,8 @@ export class LocalServerManager implements vscode.Disposable {
     const nextAttempts = attempts + 1;
     this.restartAttempts.set(config.id, nextAttempts);
     const backoff = Math.min(
-      LOCAL_SERVER_INITIAL_BACKOFF_MS * Math.pow(2, nextAttempts - 1),
-      LOCAL_SERVER_MAX_BACKOFF_MS
+      tuning.initialBackoffMs * Math.pow(2, nextAttempts - 1),
+      tuning.maxBackoffMs
     );
     this.restartTimers.set(
       config.id,

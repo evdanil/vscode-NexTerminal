@@ -193,15 +193,22 @@ describe("formValuesToLocalServer", () => {
     expect(viaOff!.autoRestart).toBeUndefined();
   });
 
-  it("coerces maxAutoRestarts from string and number; treats 0 / garbage as unset", () => {
+  it("coerces maxAutoRestarts from string and number; keeps a deliberate 0, drops garbage", () => {
+    // 0 now means "no automatic restarts" rather than "unset", so it has to
+    // survive the form. Unparseable text must not: mapping it to 0 would turn a
+    // typo into a silent disabling of auto-restart, which is the one outcome
+    // nobody asks for. A value above the ceiling is stored as typed and clamped
+    // where it is used, so the profile keeps saying what its owner wrote.
     const viaStr = formValuesToLocalServer({ ...baseValues(), maxAutoRestarts: "12" });
     const viaNum = formValuesToLocalServer({ ...baseValues(), maxAutoRestarts: 7 });
     const viaZero = formValuesToLocalServer({ ...baseValues(), maxAutoRestarts: "0" });
     const viaGarbage = formValuesToLocalServer({ ...baseValues(), maxAutoRestarts: "abc" });
+    const viaNegative = formValuesToLocalServer({ ...baseValues(), maxAutoRestarts: "-3" });
     expect(viaStr!.maxAutoRestarts).toBe(12);
     expect(viaNum!.maxAutoRestarts).toBe(7);
-    expect(viaZero!.maxAutoRestarts).toBeUndefined();
+    expect(viaZero!.maxAutoRestarts).toBe(0);
     expect(viaGarbage!.maxAutoRestarts).toBeUndefined();
+    expect(viaNegative!.maxAutoRestarts).toBeUndefined();
   });
 
   it("normalizes group folder path and preserves leading / trailing group semantics", () => {

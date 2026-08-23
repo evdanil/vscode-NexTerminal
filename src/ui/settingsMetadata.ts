@@ -769,9 +769,9 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "localServers",
     subgroup: "Auto-Restart",
     description:
-      "Maximum automatic restarts per local server when auto-restart is enabled and the profile sets no explicit limit of its own. 0 disables auto-restart globally. Restarts use exponential backoff and stop counting attempts once the server has run for the stable-runtime threshold.",
+      "How many times in a row a local server may be restarted automatically when it exits on its own, for profiles that set no limit of their own. 0 means no automatic restarts. The count is consecutive: a server that runs for the stable-runtime threshold without dying clears it, so this bounds a crash loop rather than restarts over the profile's life. Five is also the hard ceiling — a process that has died five times in a row without once running stably is broken, and the failed state is more use than another attempt.",
     min: 0,
-    max: 100,
+    max: 5,
     default: 5
   },
   {
@@ -808,24 +808,11 @@ export const SETTINGS_META: SettingMeta[] = [
     type: "number",
     category: "localServers",
     subgroup: "Auto-Restart",
-    description: "Ceiling for the exponential backoff delay between auto-restart attempts.",
+    description: "Ceiling on the wait between automatic restarts, however far the doubling has gone. Never less than the initial backoff.",
     min: 100,
     max: 600000,
     unit: "ms",
     default: 30000
-  },
-  {
-    key: "restrictToWorkspaceRoots",
-    section: "nexus.localServers",
-    label: "Restrict Working Directories to Workspace",
-    type: "boolean",
-    category: "localServers",
-    subgroup: "Security",
-    description:
-      "Refuse to start a local server whose working directory resolves outside the currently-open workspace roots. Disabling this allows any absolute path, including system directories — turn it off only if you trust every profile in storage.",
-    default: true,
-    badge: "Safety limit",
-    badgeClass: "setting-badge-safety"
   }
 ];
 

@@ -83,9 +83,15 @@ export interface LocalServerConfig {
    */
   autoRestart?: boolean;
   /**
-   * Upper bound for consecutive auto-restart attempts. Once reached the
-   * manager transitions to `failed` and requires a manual `restart` to
-   * re-arm. 0 disables the cap (not recommended).
+   * Upper bound for *consecutive* auto-restart attempts — a run that survives
+   * `nexus.localServers.stableRuntimeMs` clears the count, so this bounds a
+   * crash loop rather than restarts over the profile's life. Once reached the
+   * manager transitions to `failed` and requires a manual `restart` to re-arm.
+   *
+   * 0 means no automatic restarts, the same as leaving `autoRestart` off.
+   * Values above `LOCAL_SERVER_RESTART_CEILING` are clamped to it: a process
+   * that has died that many times in a row without once running stably is
+   * broken, and another attempt is worth less than saying so.
    */
   maxAutoRestarts?: number;
   /**
