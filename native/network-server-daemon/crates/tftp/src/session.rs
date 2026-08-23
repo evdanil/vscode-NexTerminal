@@ -441,8 +441,38 @@ impl TransferSession {
         }
     }
 
+    /// True when `ack` names a block this session has actually put on the wire.
+    ///
+    /// [`Self::block`] is the highest block emitted and [`Self::last_acked`] the
+    /// highest already confirmed, so anything outside `[last_acked, block]` is
+    /// either a stale duplicate or an invention. Both comparisons are wrap-safe
+    /// for the reason given on [`block_at_or_after`].
+    fn ack_is_for_sent_data(&self, ack: u16) -> bool {
+        match self.phase {
+            // The OACK is the only thing outstanding, and RFC 2347 has the peer
+            // confirm it with ACK(0).
+            Phase::SendOack => ack == 0,
+            Phase::Sending | Phase::SentLast => {
+                block_at_or_after(self.last_acked, ack) && block_at_or_after(ack, self.block)
+            }
+            // Nothing of ours is outstanding in any other phase — a WRQ peer
+            // sends DATA, not ACKs — so an ACK there is noise, and noise must
+            // not be able to keep a session alive.
+            _ => false,
+        }
+    }
+
     /// Feeds an ACK received from the peer to the machine.
     pub fn handle_ack(&mut self, ack: u16) -> AckOutcome {
+        // An ACK for a block that was never sent proves nothing, so it may not
+        // reach any of the state below. Acted on, it cleared the retransmission
+        // queue, advanced the window past data the peer has not seen, and — via
+        // the activity touch and retry reset — let a peer hold a stalled
+        // transfer open indefinitely by repeating it, occupying one of a
+        // bounded number of slots without ever moving a byte.
+        if !self.ack_is_for_sent_data(ack) {
+            return AckOutcome::default();
+        }
         self.touch();
         self.retries = 0;
         if matches!(
@@ -993,6 +1023,37 @@ mod tests {
     }
 
     #[test]
+    fn an_ack_for_a_block_that_was_never_sent_changes_nothing() {
+        // An ACK inside the forward half of the sequence space was taken on
+        // trust. ACK(1000) after a single DATA(1) cleared the retransmission
+        // queue, dragged `last_acked` up to 1000, and — because every ACK
+        // refreshed the activity clock and reset the retry counter — let a peer
+        // hold a stalled transfer open for as long as it kept sending, occupying
+        // one of a bounded number of slots without ever moving a byte.
+        let temp = TempDir::new("session-phantom-ack");
+        let path = temp.path().join("payload.bin");
+        std::fs::write(&path, vec![1u8; 512 * 20]).unwrap();
+        let mut s = session_for_file(&path, raw(&[("blksize", "512"), ("windowsize", "1")]));
+        s.init_for_read(512 * 20);
+        s.handle_ack(0);
+        let sent = s.produce_next_send_packets().unwrap();
+        assert_eq!(sent.len(), 1, "one block outstanding");
+        assert_eq!(s.block, 1, "and it is block 1");
+        s.record_outbound(&sent); // what the engine's send path does
+        s.retries = 2;
+
+        let outcome = s.handle_ack(1000);
+
+        assert!(!outcome.produce_more, "a phantom ACK must not open the window");
+        assert_eq!(s.last_acked, 0, "nor advance past data the peer never saw");
+        assert_eq!(s.retries, 2, "nor reset the retry budget that ends a dead transfer");
+        assert!(
+            !s.outbound.is_empty(),
+            "nor discard the block still awaiting a real acknowledgement"
+        );
+    }
+
+    #[test]
     fn a_clamped_window_bounds_production_at_the_clamped_value_not_the_requested_one() {
         // The allocation bound is only real if the producer honours it. With the
         // clamp reverted this loop builds 65535 packets — about 33 MB for this
@@ -1101,6 +1162,10 @@ mod tests {
         s.record_outbound(&initial);
         s.handle_ack(0);
         s.record_outbound(&[encode_data(1, &[0; 4])]);
+        // `produce_next_send_packets` is what advances `block` alongside the
+        // packets it hands to the send path; recording a DATA by hand has to say
+        // so too, or the session claims to have emitted nothing.
+        s.block = 1;
         s.handle_ack(1);
         assert!(
             s.outbound.is_empty(),
