@@ -13,7 +13,7 @@ use nexus_dhcp::boot::{BootOptions, VendorEntry};
 use nexus_dhcp::constants::{MAX_OPTION_VALUE_BYTES, MAX_STATIC_RESERVATIONS};
 use nexus_dhcp::engine::EngineOptions as DhcpEngineOptions;
 use nexus_dhcp::net::{broadcast_address, MacKey};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -43,18 +43,34 @@ const MAX_PATH_BYTES: usize = 4_096;
 const MIN_DHCP_LEASE_SECONDS: u32 = 60;
 const MAX_DHCP_LEASE_SECONDS: u32 = 604_800;
 
+/// Deserializes an optional field that, when present, may not be `null`.
+///
+/// `Option<T>` maps an absent field and an explicit `null` to the same `None`,
+/// so `{"port": null}` deserialized cleanly and the service quietly used its
+/// default — while the DTO declares an integer and the host-side ingress
+/// rejects null outright. Paired with `#[serde(default)]`, which supplies
+/// `None` when the key is absent, this runs only when the key *is* present, so
+/// a null there fails as the type error it is.
+fn present_but_not_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// TFTP settings, as the host sends them. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TftpConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub root: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub port: Option<u16>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub allow_write: Option<bool>,
     /// Which local address serves TFTP. Omitted means every interface.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub interface: Option<String>,
 }
 
@@ -165,42 +181,42 @@ pub struct VendorOptionConfig {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DhcpConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub port: Option<u16>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub range_start: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub range_end: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub subnet: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub gateway: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub dns: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub lease_time_sec: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub server_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub broadcast: Option<String>,
     /// MAC → IP reservations, keyed as the operator typed them.
-    #[serde(default, rename = "static")]
+    #[serde(default, rename = "static", deserialize_with = "present_but_not_null")]
     pub statics: Option<BTreeMap<String, String>>,
     /// Which local address serves DHCP. Omitted means every interface.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub bind_address: Option<String>,
     /// Where the lease table is mirrored. Omitted keeps leases in memory only.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub lease_store_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub boot_file_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub next_server: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub tftp_server_addresses: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub vendor_class_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_but_not_null")]
     pub vendor_specific_options: Option<Vec<VendorOptionConfig>>,
 }
 
@@ -602,6 +618,32 @@ mod tests {
             store.tftp().bind_address().unwrap().to_string(),
             "192.168.2.1"
         );
+    }
+
+    #[test]
+    fn an_explicit_null_is_refused_rather_than_read_as_absent() {
+        // serde maps both an absent field and an explicit `null` to `None`, so
+        // {"port": null} deserialized cleanly, `configure` reported success, and
+        // the service quietly ran on the default port — while the DTO declares
+        // an integer and the host-side ingress rejects null outright. A setting
+        // that is silently ignored is worse than one that is refused.
+        for (service, payload) in [
+            ("tftp", json!({"tftp": {"port": null}})),
+            ("tftp", json!({"tftp": {"root": null}})),
+            ("dhcp", json!({"dhcp": {"leaseTimeSec": null}})),
+            ("dhcp", json!({"dhcp": {"dns": null}})),
+            ("dhcp", json!({"dhcp": {"static": null}})),
+        ] {
+            let mut store = ConfigStore::default();
+            let Err(err) = store.apply(&configs(&payload)) else {
+                panic!("{payload} must be refused");
+            };
+            assert!(
+                err.0.contains(service),
+                "the error should name the section it came from: {}",
+                err.0
+            );
+        }
     }
 
     #[test]
