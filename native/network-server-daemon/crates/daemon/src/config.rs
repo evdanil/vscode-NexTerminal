@@ -39,6 +39,9 @@ pub const DHCP_FALLBACK_PORT: u16 = 1067;
 const IPV4_BYTES_PER_DHCP_OPTION_ENTRY: usize = 4;
 const MAX_IPV4_ADDRESSES_PER_DHCP_OPTION: usize =
     MAX_OPTION_VALUE_BYTES / IPV4_BYTES_PER_DHCP_OPTION_ENTRY;
+const MIN_DHCP_LEASE_SECONDS: u32 = 60;
+const MAX_DHCP_LEASE_SECONDS: u32 = 604_800;
+const MAX_STATIC_RESERVATIONS: usize = 1_024;
 
 /// TFTP settings, as the host sends them. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -248,35 +251,16 @@ impl DhcpConfig {
             options.dns = parse_ipv4_list(list, "DNS server")?;
         }
         if let Some(seconds) = self.lease_time_sec {
-            if seconds == 0 {
-                return Err("Lease time must be at least one second.".to_owned());
+            if !(MIN_DHCP_LEASE_SECONDS..=MAX_DHCP_LEASE_SECONDS).contains(&seconds) {
+                return Err(format!(
+                    "Lease time must be between {MIN_DHCP_LEASE_SECONDS} and \
+                     {MAX_DHCP_LEASE_SECONDS} seconds."
+                ));
             }
             options.lease_secs = seconds;
         }
         if let Some(map) = &self.statics {
-            let mut statics = BTreeMap::new();
-            let mut address_owners: BTreeMap<Ipv4Addr, MacKey> = BTreeMap::new();
-            for (mac, address) in map {
-                let parsed = address.trim().parse::<Ipv4Addr>().map_err(|_| {
-                    format!("Static reservation for '{mac}' is not a valid IPv4 address: '{address}'.")
-                })?;
-                let parsed_mac = MacKey::parse_lossy(mac);
-                if statics.contains_key(&parsed_mac) {
-                    return Err(format!(
-                        "Static reservation for '{mac}' duplicates a reservation this MAC already has."
-                    ));
-                }
-                if let Some(owner) = address_owners.insert(parsed, parsed_mac.clone()) {
-                    return Err(format!(
-                        "Static reservation address '{parsed}' is already reserved by {owner}."
-                    ));
-                }
-                // Canonicalised here, once. The reference implementation kept
-                // the operator's spelling and looked it up by the wire spelling,
-                // so a reservation typed with colons was never matched.
-                statics.insert(parsed_mac, parsed);
-            }
-            options.statics = statics;
+            options.statics = parse_static_reservations(map)?;
         }
         options.lease_store_path = self
             .lease_store_path
@@ -346,6 +330,44 @@ fn parse_ipv4_list(values: &[String], label: &str) -> Result<Vec<Ipv4Addr>, Stri
         ));
     }
     Ok(parsed)
+}
+
+fn parse_static_reservations(
+    map: &BTreeMap<String, String>,
+) -> Result<BTreeMap<MacKey, Ipv4Addr>, String> {
+    if map.len() > MAX_STATIC_RESERVATIONS {
+        return Err(format!(
+            "Static reservations has {} entries; the maximum is {MAX_STATIC_RESERVATIONS}.",
+            map.len()
+        ));
+    }
+    let mut statics = BTreeMap::new();
+    let mut address_owners: BTreeMap<Ipv4Addr, MacKey> = BTreeMap::new();
+    for (mac, address) in map {
+        let parsed = address.trim().parse::<Ipv4Addr>().map_err(|_| {
+            format!("Static reservation for '{mac}' is not a valid IPv4 address: '{address}'.")
+        })?;
+        let parsed_mac = MacKey::parse(mac).ok_or_else(|| {
+            format!(
+                "Static reservation MAC address '{mac}' is not a canonicalizable six-octet address."
+            )
+        })?;
+        if statics.contains_key(&parsed_mac) {
+            return Err(format!(
+                "Static reservation for '{mac}' duplicates a reservation this MAC already has."
+            ));
+        }
+        if let Some(owner) = address_owners.insert(parsed, parsed_mac.clone()) {
+            return Err(format!(
+                "Static reservation address '{parsed}' is already reserved by {owner}."
+            ));
+        }
+        // Canonicalised here, once. The reference implementation kept the
+        // operator's spelling and looked it up by the wire spelling, so a
+        // reservation typed with colons was never matched.
+        statics.insert(parsed_mac, parsed);
+    }
+    Ok(statics)
 }
 
 /// The stored configuration for both services.
@@ -669,6 +691,18 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_dhcp_lease_intervals_are_refused_before_startup() {
+        for seconds in [1, 7, 59, 604_801] {
+            let mut store = ConfigStore::default();
+            let err = store
+                .apply(&configs(&json!({"dhcp": {"leaseTimeSec": seconds}})))
+                .unwrap_err();
+            assert!(err.0.contains("Lease time"), "got {}", err.0);
+            assert!(store.dhcp().lease_time_sec.is_none(), "the rejected lease time must not be stored");
+        }
+    }
+
+    #[test]
     fn a_dhcp_payload_of_the_wrong_shape_is_refused_rather_than_defaulted() {
         // Distinct from a semantically bad value: these fail to deserialise at
         // all. Falling back to defaults here would silently discard everything
@@ -726,6 +760,35 @@ mod tests {
             }})))
             .unwrap_err();
         assert!(err.0.contains("Static reservation"), "got {}", err.0);
+    }
+
+    #[test]
+    fn malformed_static_reservation_mac_keys_are_refused() {
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(&json!({"dhcp": {
+                "static": {"not-a-mac": "172.28.1.50"}
+            }})))
+            .unwrap_err();
+        assert!(err.0.contains("MAC"), "got {}", err.0);
+        assert!(store.dhcp().statics.is_none(), "the rejected reservations must not be stored");
+    }
+
+    #[test]
+    fn oversized_static_reservation_maps_are_refused() {
+        let mut reservations = Map::new();
+        for i in 0..=1024u16 {
+            reservations.insert(
+                format!("02:00:00:00:{:02x}:{:02x}", i / 256, i % 256),
+                json!(format!("10.{}.{}.1", i / 256, i % 256)),
+            );
+        }
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(&json!({"dhcp": {"static": reservations}})))
+            .unwrap_err();
+        assert!(err.0.contains("1,024") || err.0.contains("1024"), "got {}", err.0);
+        assert!(store.dhcp().statics.is_none(), "the rejected reservations must not be stored");
     }
 
     #[test]

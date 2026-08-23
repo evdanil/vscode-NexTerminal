@@ -64,9 +64,16 @@ impl MacKey {
     /// silently rewritten into a valid-looking address nobody configured.
     #[must_use]
     pub fn parse_lossy(raw: &str) -> Self {
+        Self::parse(raw).unwrap_or_else(|| Self(raw.trim().to_uppercase()))
+    }
+
+    /// Canonicalises a configured MAC address, rejecting values that cannot map
+    /// to the six octets carried on the wire.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
         let hex: String = raw.chars().filter(char::is_ascii_hexdigit).collect();
         if hex.len() != 12 {
-            return Self(raw.trim().to_uppercase());
+            return None;
         }
         let upper = hex.to_uppercase();
         let pairs: Vec<String> = upper
@@ -74,7 +81,7 @@ impl MacKey {
             .chunks(2)
             .map(|pair| String::from_utf8_lossy(pair).into_owned())
             .collect();
-        Self(pairs.join("-"))
+        Some(Self(pairs.join("-")))
     }
 
     #[must_use]

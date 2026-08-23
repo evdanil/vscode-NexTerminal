@@ -554,10 +554,8 @@ impl LeaseTable {
             return None;
         }
         let address = self.entries.remove(mac)?.address;
-        if is_ip_in_pool(address, self.range_start, self.range_end) {
-            self.quarantine
-                .insert(address, now_ms + u64::from(self.quarantine_secs) * 1000);
-        }
+        self.quarantine
+            .insert(address, now_ms + u64::from(self.quarantine_secs) * 1000);
         Some(address)
     }
 
@@ -1058,6 +1056,23 @@ mod tests {
             t.select_address(&reserved, None, NOW),
             Some(ip("10.0.0.10")),
             "the quarantined reservation must not be offered straight back"
+        );
+    }
+
+    #[test]
+    fn an_out_of_pool_declined_static_reservation_is_not_immediately_reoffered() {
+        let mut t = table_with_statics(&[("aa:00:00:00:00:09", "192.168.50.5")]);
+        let reserved = mac("aa:00:00:00:00:09");
+        t.bind(&reserved, ip("192.168.50.5"), None, NOW);
+        t.decline(&reserved, ip("192.168.50.5"), NOW);
+        assert!(
+            t.is_quarantined(ip("192.168.50.5"), NOW),
+            "declined static reservations outside the pool still need quarantine"
+        );
+        assert_eq!(
+            t.select_address(&reserved, None, NOW),
+            Some(ip("10.0.0.10")),
+            "the quarantined out-of-pool reservation must not be offered straight back"
         );
     }
 
