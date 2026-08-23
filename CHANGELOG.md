@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.203] — 2026-08-23
+
+### Fixed
+
+- **2.8.202 reached Open VSX without the native daemon binaries it promised. This release supplies them, on both registries.** The 2.8.202 notes say the native binary ships for all six platforms. That was true of the build the release pipeline makes, and untrue of the one Open VSX received: publishing to the two registries runs from two separate workflows, each with its own cross-compilation matrix, and only one of them was taught to build the daemon. Open VSX therefore published a package with none, while the Marketplace publish never ran at all — the release build failed first, on two unrelated timing-sensitive tests, so 2.8.202 exists on one registry and not the other. **If you installed 2.8.202 from Open VSX, `nexus.networkServers.engine` had nothing to select and quietly stayed on the JavaScript daemon.** Nothing misbehaved; the fallback did exactly what it is for. Both workflows now build the daemon, both refuse to publish a package missing one, and both verify the packaged archive per platform before publishing.
+
+  The 2.8.202 entry below is left as published, because a changelog is a record rather than a draft. Read it as describing this release.
+
+- **Two tests that could fail a release on timing alone.** Each measured the wrong thing. One waited a fixed 25ms for a child process to appear and then asserted it had; it now polls for it. The other sampled the count of in-flight TFTP transfers every 50ms and asserted it had once seen two at once — which measures whether the sampler happened to look at the right moment, not whether the transfers overlapped, and thirty small files can begin and finish between two ticks. It now counts the engine's own start and finish events, so the peak it reports is the real one. A third, in the DHCP daemon's test suite, demanded that 320 of 325 UDP datagrams sent to a real socket arrive; the kernel drops some under load, and asserting a delivery guarantee UDP does not offer is not a test of anything. It now requires a large majority.
+
 ## [2.8.202] — 2026-08-23
 
 ### Added
