@@ -256,8 +256,10 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
   it("rejects malformed ready without setting ready and allows a clean generation", async () => {
     const host = create("malformed-ready");
     const readyAttempt = host.ensureStarted();
-    await sleep(25);
-    const failedPid = childPid(host);
+    // Deliberately not awaited — the ready is expected to fail — so the child
+    // has not necessarily spawned yet. Sleeping a fixed 25ms and hoping is what
+    // made this fail on a loaded runner: poll for the pid instead.
+    const failedPid = await waitFor(() => childPid(host));
     expect(failedPid).toBeTypeOf("number");
     pids.add(failedPid!);
 

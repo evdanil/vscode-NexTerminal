@@ -244,17 +244,36 @@ describe("TFTP E2E — Stress 30+ Concurrent Devices", () => {
       }
 
       await withEngine(root, true, { maxTransfers: 64 }, async (engine, port) => {
-        // During execution we will capture transfers count
+        // Counted from the engine's own lifecycle events rather than sampled.
+        // Sampling `activeTransfers()` on an interval measured whether the
+        // sampler happened to look while two transfers overlapped, not whether
+        // they overlapped: thirty small files can begin and finish between two
+        // ticks, and on a loaded runner they did — the assertion failed with a
+        // peak of 1 while the server had in fact run them all concurrently.
+        // Every start is observed here, so the peak is the real one.
+        let active = 0;
         let peakActive = 0;
-        const intId = setInterval(() => {
-          peakActive = Math.max(peakActive, engine.activeTransfers().length);
-        }, 50);
+        const onStart = (): void => {
+          active += 1;
+          peakActive = Math.max(peakActive, active);
+        };
+        const onEnd = (): void => {
+          active -= 1;
+        };
+        engine.on("transfer:start", onStart);
+        engine.on("transfer:complete", onEnd);
+        engine.on("transfer:error", onEnd);
 
         const tasks: Promise<any>[] = [];
         for (const f of rrqFiles) tasks.push(doRRQ(port, f.name, f.payload));
         for (const f of wrqFiles) tasks.push(doWRQ(port, f.name, f.payload));
-        await Promise.all(tasks);
-        clearInterval(intId);
+        try {
+          await Promise.all(tasks);
+        } finally {
+          engine.off("transfer:start", onStart);
+          engine.off("transfer:complete", onEnd);
+          engine.off("transfer:error", onEnd);
+        }
 
         expect(peakActive >= 2, "Expected more than 1 active transfer simultaneously").toBe(true);
 

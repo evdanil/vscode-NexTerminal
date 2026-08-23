@@ -341,7 +341,19 @@ fn a_flood_of_malformed_datagrams_leaves_the_service_answering() {
     assert_eq!(leases[0].ip, ip("10.0.0.10"));
 
     let counters = engine.runtime().expect("the loop is alive").counters;
-    assert!(counters.malformed_count >= 320, "got {}", counters.malformed_count);
+    // The point of this test is the assertion above: after the flood, a real
+    // client is still served. The counter is corroboration — that the garbage
+    // was processed and classified rather than crashing the loop — and it
+    // cannot be asserted exactly. These are 325 UDP datagrams to a real socket;
+    // the kernel drops some of them under load, and demanding all but five back
+    // made this fail roughly one run in five on nothing but timing. A large
+    // majority proves the same thing without asserting a delivery guarantee UDP
+    // does not offer.
+    assert!(
+        counters.malformed_count >= 200,
+        "the flood must be classified, not dropped on the floor; got {}",
+        counters.malformed_count
+    );
     assert_eq!(counters.discover_count, 1);
 }
 
