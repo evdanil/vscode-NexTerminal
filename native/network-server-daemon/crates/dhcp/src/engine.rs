@@ -595,11 +595,14 @@ impl<S: Datagram> DhcpCore<S> {
         // lease, and a scanner cycling spoofed MACs could take the whole pool
         // without ever completing DISCOVER/OFFER.
         //
-        // The discard is limited to requests that would consume a *fresh*
-        // address: a client the server has already bound is asking about
-        // something it holds, not making a claim on the pool, so a sloppy
-        // renewal is still answered rather than cut off mid-lease.
-        if requested.is_none() && self.table.existing_address(mac, now).is_none() {
+        // The discard is limited to requests from a client that has already
+        // been *granted* an address: it is asking about something it holds, not
+        // making a claim on the pool, so a sloppy renewal is still answered
+        // rather than cut off mid-lease. An outstanding offer is deliberately
+        // not enough — it is a promise, and claiming it is what naming the
+        // address does, or DISCOVER plus an addressless REQUEST would take a
+        // pool entry in two packets that never name one.
+        if requested.is_none() && self.table.granted_address(mac, now).is_none() {
             self.counters.malformed_count += 1;
             // Not answered, for the same reason an unparseable packet is not:
             // a reply is the one thing that confirms to a scanner that it found
@@ -1271,6 +1274,35 @@ mod tests {
             1,
             "the drop must be counted, or it is invisible to whoever is diagnosing it"
         );
+    }
+
+    #[test]
+    fn an_offer_does_not_license_an_addressless_request() {
+        // `is_live` is true for an Offered entry as well as a Bound one, so
+        // scoping the compatibility exception to "the table knows this MAC" left
+        // the pool-exhaustion path open one packet further along: DISCOVER to
+        // create the offer, then an addressless REQUEST to bind and persist it,
+        // without ever naming an address. An offer is a promise; claiming it is
+        // what a valid REQUEST does by naming the address.
+        let mut h = Harness::new();
+        h.feed(&discover(&MAC_A));
+        assert_eq!(h.last_reply().options.message_type(), Some(MessageType::Offer));
+        let acks = h.core.counters().ack_count;
+        let replies = h.sent.borrow().len();
+
+        h.feed(&request(&MAC_A, None, None));
+
+        assert_eq!(
+            h.core.counters().ack_count,
+            acks,
+            "an outstanding offer must not be claimable without naming it"
+        );
+        assert_eq!(
+            h.sent.borrow().len(),
+            replies,
+            "and the request is not worth answering at all"
+        );
+        assert_eq!(h.core.counters().malformed_count, 1, "the drop is counted");
     }
 
     #[test]

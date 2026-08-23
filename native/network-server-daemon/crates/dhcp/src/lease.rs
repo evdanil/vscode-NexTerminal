@@ -356,10 +356,12 @@ impl LeaseTable {
     /// The address this client already holds, without allocating a new one.
     ///
     /// The prefix of [`Self::select_address`] that never reaches the free pool:
-    /// a static reservation, or a live lease. Separated so a caller can tell
-    /// "this client is asking about an address it already has" from "answering
-    /// this would consume a fresh one" — the distinction between a renewal and
-    /// a claim on the pool.
+    /// a static reservation, or any live entry — an outstanding offer included,
+    /// since a client answering an OFFER must be given back the address it was
+    /// offered.
+    ///
+    /// This is *not* the right question to ask about whether a client is
+    /// entitled to an address it has not named: see [`Self::granted_address`].
     #[must_use]
     pub fn existing_address(&self, mac: &MacKey, now_ms: u64) -> Option<Ipv4Addr> {
         if let Some(reserved) = self.statics.get(mac) {
@@ -370,6 +372,31 @@ impl LeaseTable {
         self.entries
             .get(mac)
             .filter(|entry| entry.is_live(now_ms))
+            .map(|entry| entry.address)
+    }
+
+    /// The address this client has actually been *granted*, as against merely
+    /// offered.
+    ///
+    /// A configured reservation counts: it is a standing grant that exists
+    /// before the device ever speaks. An [`LeaseState::Offered`] entry does not
+    /// — an offer is a promise the client has yet to claim, and claiming it is
+    /// precisely what a valid REQUEST does by naming the address. Treating an
+    /// offer as a grant would let DISCOVER followed by an addressless REQUEST
+    /// take a pool address in two packets, neither of which ever names one.
+    #[must_use]
+    pub fn granted_address(&self, mac: &MacKey, now_ms: u64) -> Option<Ipv4Addr> {
+        if let Some(reserved) = self.statics.get(mac) {
+            if !self.is_quarantined(*reserved, now_ms) {
+                return Some(*reserved);
+            }
+        }
+        self.entries
+            .get(mac)
+            .filter(|entry| {
+                entry.is_live(now_ms)
+                    && matches!(entry.state, LeaseState::Bound | LeaseState::Reserved)
+            })
             .map(|entry| entry.address)
     }
 
