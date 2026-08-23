@@ -391,7 +391,16 @@ impl TransferSession {
             self.set_error(ErrorCode::NotDefined, "Max retries exceeded");
             return None;
         }
-        self.retx_backoff = (self.retx_backoff * 2).min(MAX_BACKOFF);
+        // RFC 2349 makes the timeout option an agreement, not an opening bid.
+        // Doubling it and capping the result at MAX_BACKOFF turned an agreed 255
+        // seconds into 60 on the first retry, so the server spent its whole
+        // retry budget inside one of the client's intervals and tore the session
+        // down while the client was still waiting. Where nothing was agreed
+        // there is nothing to honour, and backing off against a quiet peer is
+        // still right.
+        if self.opts.timeout.is_none() {
+            self.retx_backoff = (self.retx_backoff * 2).min(MAX_BACKOFF);
+        }
         let now = Instant::now();
         self.outbound_sent_last = now;
         self.last_activity = now;
@@ -897,6 +906,39 @@ mod tests {
         let s = session(Direction::Read, raw(&[("timeout", "3")]));
         assert_eq!(s.timeout, Duration::from_secs(3));
         assert_eq!(s.retx_backoff, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_negotiated_timeout_is_not_shortened_by_backoff() {
+        // RFC 2349: the timeout option is an agreement, not an opening bid.
+        // Doubling it and capping the result at MAX_BACKOFF turned an agreed 255
+        // seconds into 60 on the very first retry, so the server burned its
+        // whole retry budget inside a single one of the client's intervals and
+        // tore the session down while the client was still waiting to retry.
+        let mut s = session(Direction::Read, raw(&[("timeout", "255")]));
+        s.record_outbound(&[encode_data(1, &[0; 4])]);
+        assert_eq!(s.retx_backoff, Duration::from_secs(255));
+
+        s.consume_retransmission().expect("budget available");
+
+        assert_eq!(
+            s.retx_backoff,
+            Duration::from_secs(255),
+            "the negotiated interval must hold for the whole transfer"
+        );
+    }
+
+    #[test]
+    fn backoff_still_grows_when_no_timeout_was_negotiated() {
+        // Without an agreement there is nothing to honour, so backing off is
+        // still the right behaviour against a peer that has gone quiet.
+        let mut s = session(Direction::Read, RawOptions::default());
+        s.record_outbound(&[encode_data(1, &[0; 4])]);
+        assert_eq!(s.retx_backoff, DEFAULT_TIMEOUT);
+
+        s.consume_retransmission().expect("budget available");
+
+        assert_eq!(s.retx_backoff, DEFAULT_TIMEOUT * 2);
     }
 
     // --- initialisation transitions ------------------------------------------
