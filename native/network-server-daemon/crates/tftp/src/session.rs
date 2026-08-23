@@ -453,7 +453,14 @@ impl TransferSession {
             // confirm it with ACK(0).
             Phase::SendOack => ack == 0,
             Phase::Sending | Phase::SentLast => {
-                block_at_or_after(self.last_acked, ack) && block_at_or_after(ack, self.block)
+                // Strictly ahead of `last_acked`: an ACK equal to it confirms
+                // nothing that was not already confirmed, so it clears nothing
+                // and advances nothing — and must not refresh the session
+                // either, or repeating one stale ACK keeps a stalled transfer
+                // alive for as long as the peer cares to send it.
+                ack != self.last_acked
+                    && block_at_or_after(self.last_acked, ack)
+                    && block_at_or_after(ack, self.block)
             }
             // Nothing of ours is outstanding in any other phase — a WRQ peer
             // sends DATA, not ACKs — so an ACK there is noise, and noise must
@@ -569,6 +576,27 @@ impl TransferSession {
         // `Receiving`, so it is just another data block number.
         let previous = self.block.wrapping_sub(1);
         if block == previous {
+            return DataOutcome {
+                send: vec![encode_ack(previous)],
+                write: None,
+                done: false,
+            };
+        }
+        // A window that was only *partly* received: everything strictly between
+        // the last cumulative ACK and the block now expected is already on disk
+        // but not yet acknowledged. When one DATA of a window goes missing, the
+        // client retransmits from the first block it never saw acknowledged,
+        // which lands in exactly this range — and matched neither duplicate case
+        // below, so it fell through to the mismatch path, answered
+        // IllegalOperation and deleted a healthy partial upload. One lost
+        // datagram was enough to kill a windowed transfer.
+        //
+        // RFC 7440 §4: answer out-of-sequence DATA with the last block received
+        // in sequence, so the client resumes from the right place rather than
+        // guessing.
+        let received_through = block_distance(self.last_acked, previous);
+        let offset = block_distance(self.last_acked, block);
+        if self.bytes_transferred > 0 && offset >= 1 && offset <= received_through {
             return DataOutcome {
                 send: vec![encode_ack(previous)],
                 write: None,
@@ -1053,6 +1081,73 @@ mod tests {
         assert_eq!(
             s.last_activity, before,
             "nor hold the transfer open past its timeout"
+        );
+    }
+
+    #[test]
+    fn an_already_confirmed_ack_does_not_refresh_the_transfer() {
+        // The range check is inclusive at both ends, so ACK(last_acked) passed
+        // it — and then advanced nothing, cleared nothing, and still reached
+        // `touch()` and the retry reset. Repeating one stale ACK held a stalled
+        // RRQ open for as long as the peer cared to send it.
+        let temp = TempDir::new("session-stale-ack");
+        let path = temp.path().join("payload.bin");
+        std::fs::write(&path, vec![1u8; 512 * 8]).unwrap();
+        let mut s = session_for_file(&path, raw(&[("blksize", "512"), ("windowsize", "4")]));
+        s.init_for_read(512 * 8);
+        s.handle_ack(0);
+        let sent = s.produce_next_send_packets().unwrap();
+        s.record_outbound(&sent);
+        s.handle_ack(1);
+        assert_eq!(s.last_acked, 1, "a real ACK advances the window");
+
+        s.retries = 3;
+        let before = s.last_activity;
+        let outcome = s.handle_ack(1);
+
+        assert!(!outcome.produce_more, "a repeat confirms nothing new");
+        assert_eq!(s.last_acked, 1, "and moves nothing");
+        assert_eq!(s.retries, 3, "so it must not refill the retry budget");
+        assert_eq!(
+            s.last_activity, before,
+            "nor hold a stalled transfer past its timeout"
+        );
+    }
+
+    #[test]
+    fn a_partly_received_write_window_recovers_from_a_lost_block() {
+        // windowsize=4: DATA(1..3) arrive and are written, DATA(4) is lost. The
+        // server now expects block 4 while `last_acked` is still 0, so the
+        // client's retransmission of its unacknowledged window — which starts at
+        // block 1, the first it never saw acknowledged — matched neither
+        // duplicate case. It fell through to the mismatch path, which answered
+        // IllegalOperation and deleted a healthy partial upload. One lost
+        // datagram killed the transfer.
+        let mut s = session(Direction::Write, raw(&[("windowsize", "4"), ("blksize", "512")]));
+        s.init_for_write();
+        for block in 1..=3u16 {
+            let outcome = s.handle_data(block, &vec![block as u8; 512]);
+            assert!(outcome.send.is_empty(), "block {block} is inside the window");
+            assert!(outcome.write.is_some());
+        }
+        assert_eq!(s.block, 4, "block 4 is expected next");
+        assert_eq!(s.last_acked, 0, "and nothing has been acknowledged yet");
+
+        let outcome = s.handle_data(1, &vec![1u8; 512]);
+
+        assert_eq!(
+            s.phase,
+            Phase::Receiving,
+            "a lost block must not abort an upload that is going fine"
+        );
+        assert!(
+            outcome.write.is_none(),
+            "and block 1 must not be appended a second time"
+        );
+        assert_eq!(
+            ack_block(&outcome.send[0]),
+            3,
+            "RFC 7440 §4: answer with the last block received in sequence"
         );
     }
 
