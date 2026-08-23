@@ -522,7 +522,7 @@ export class NetworkServerDaemonHost {
    * with a visible warning.
    */
   private resolveLaunchTarget(): LaunchTarget {
-    const nodeTarget: LaunchTarget = { command: process.execPath, args: [this.daemonScriptPath], native: false };
+    const nodeTarget = this.nodeLaunchTarget();
     const engine = this.options.resolveEngine?.() ?? this.options.engine ?? "node";
     if (engine !== "rust") return nodeTarget;
 
@@ -547,8 +547,41 @@ export class NetworkServerDaemonHost {
     return { command: binary, args: [], native: true };
   }
 
+  private nodeLaunchTarget(): LaunchTarget {
+    return { command: process.execPath, args: [this.daemonScriptPath], native: false };
+  }
+
   private async launch(attempt: StartupAttempt): Promise<void> {
     const target = this.resolveLaunchTarget();
+    if (target.native) {
+      try {
+        await this.launchTarget(attempt, target);
+        return;
+      } catch (error) {
+        if (!this.canRetryStartupAttempt(attempt)) throw error;
+        attempt.child = undefined;
+        attempt.generation = undefined;
+        this.startAttempt = attempt;
+        this.emitLog(
+          "daemon",
+          "warn",
+          `Native network servers daemon failed before reporting ready (${error instanceof Error ? error.message : String(error)}); using the bundled Node daemon instead.`
+        );
+        await this.launchTarget(attempt, this.nodeLaunchTarget());
+        return;
+      }
+    }
+    await this.launchTarget(attempt, target);
+  }
+
+  private canRetryStartupAttempt(attempt: StartupAttempt): boolean {
+    return !this.disposed
+      && !this.readyFlag
+      && !this.child
+      && (this.startAttempt === attempt || this.startAttempt === undefined);
+  }
+
+  private async launchTarget(attempt: StartupAttempt, target: LaunchTarget): Promise<void> {
     if (this.disposed || this.startAttempt !== attempt || this.child) {
       throw new Error(this.disposed
         ? "Network servers daemon host is disposed"

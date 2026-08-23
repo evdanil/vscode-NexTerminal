@@ -175,6 +175,28 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     }));
   });
 
+  it("falls back to the bundled Node daemon when the native binary cannot start before ready", async () => {
+    const host = create("clean", {
+      engine: "rust",
+      // Exists, but it is a directory, not an executable daemon. That models an
+      // installed native artifact that spawn can see but cannot execute.
+      nativeBinaryPath: FIXTURES
+    });
+    const logs: Array<{ id: string; level: string; message: string }> = [];
+    host.onDidLog((id, level, message) => logs.push({ id, level, message }));
+
+    await host.ensureStarted();
+    const pid = childPid(host);
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(logs).toContainEqual(expect.objectContaining({
+      id: "daemon",
+      level: "warn",
+      message: expect.stringContaining("using the bundled Node daemon")
+    }));
+  });
+
   async function expectProtocolFailureThenCleanRestart(
     mode: string,
     request: (host: NetworkServerDaemonHost) => Promise<unknown> = (host) => host.listServers(),

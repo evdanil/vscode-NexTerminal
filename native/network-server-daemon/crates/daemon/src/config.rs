@@ -251,14 +251,21 @@ impl DhcpConfig {
         }
         if let Some(map) = &self.statics {
             let mut statics = BTreeMap::new();
+            let mut address_owners: BTreeMap<Ipv4Addr, MacKey> = BTreeMap::new();
             for (mac, address) in map {
                 let parsed = address.trim().parse::<Ipv4Addr>().map_err(|_| {
                     format!("Static reservation for '{mac}' is not a valid IPv4 address: '{address}'.")
                 })?;
+                let parsed_mac = MacKey::parse_lossy(mac);
+                if let Some(owner) = address_owners.insert(parsed, parsed_mac.clone()) {
+                    return Err(format!(
+                        "Static reservation address '{parsed}' is already reserved by {owner}."
+                    ));
+                }
                 // Canonicalised here, once. The reference implementation kept
                 // the operator's spelling and looked it up by the wire spelling,
                 // so a reservation typed with colons was never matched.
-                statics.insert(MacKey::parse_lossy(mac), parsed);
+                statics.insert(parsed_mac, parsed);
             }
             options.statics = statics;
         }
@@ -621,6 +628,21 @@ mod tests {
             }})))
             .unwrap_err();
         assert!(err.0.contains("Static reservation"), "got {}", err.0);
+    }
+
+    #[test]
+    fn duplicate_static_reservation_addresses_are_refused() {
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(&json!({"dhcp": {
+                "static": {
+                    "aa:bb:cc:dd:ee:01": "172.28.1.50",
+                    "aa:bb:cc:dd:ee:02": "172.28.1.50"
+                }
+            }})))
+            .unwrap_err();
+        assert!(err.0.contains("already reserved"), "got {}", err.0);
+        assert!(store.dhcp().statics.is_none(), "the rejected reservations must not be stored");
     }
 
     #[test]
