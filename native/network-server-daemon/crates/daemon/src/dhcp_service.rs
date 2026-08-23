@@ -20,6 +20,48 @@ use crate::events::{ConnectionEvent, ConnectionPhase, Emitter, ServerStatus, Sta
 pub const SERVICE_ID: &str = "dhcp";
 const SERVICE_NAME: &str = "DHCP Server";
 
+/// The host reads one JSON line at a time under a 1 MiB ceiling —
+/// `MAX_RPC_LINE_BYTES` in `boundedLineReader.ts`. A response over it is not
+/// truncated but *replaced*, by a `RESPONSE_TOO_LARGE` error, so the sidebar
+/// keeps showing whatever it had last and no lease is displayed at all.
+const MAX_RPC_LINE_BYTES: usize = 1_048_576;
+
+/// Room reserved for everything in a runtime response that is not the lease
+/// array: the snapshot, packet counters, pool figures and the JSON-RPC envelope
+/// around them. Generous on purpose — the cost of over-reserving is a few
+/// fewer leases listed, and the cost of under-reserving is the whole response.
+const RUNTIME_ENVELOPE_HEADROOM_BYTES: usize = 64 * 1024;
+
+/// Serialises as many leases as the transport can carry.
+///
+/// A pool may hold 65,536 addresses, and a lease is a few hundred bytes of
+/// JSON, so a well-populated pool produces several megabytes — many times what
+/// one RPC line allows. Measuring the encoded size rather than counting records
+/// is what makes this exact: a lease carries a client-supplied hostname, so
+/// records vary by an order of magnitude and any fixed count would be either
+/// wasteful or wrong.
+///
+/// The count is deliberately *not* reconciled with `poolInfo.activeCount`,
+/// which keeps reporting the true figure. The array is a view; the counters are
+/// the truth, and shrinking them to match would trade a display limit for a
+/// wrong utilisation reading.
+fn bounded_lease_array(leases: &[LeaseInfo]) -> Vec<Value> {
+    let mut budget = MAX_RPC_LINE_BYTES.saturating_sub(RUNTIME_ENVELOPE_HEADROOM_BYTES);
+    let mut out = Vec::new();
+    for lease in leases {
+        let encoded = lease_to_json(lease);
+        // `to_string` here is the same encoder the response goes out through,
+        // so the measurement cannot drift from the thing being measured.
+        let size = encoded.to_string().len() + 1; // the separating comma
+        if size > budget {
+            break;
+        }
+        budget -= size;
+        out.push(encoded);
+    }
+    out
+}
+
 pub struct DhcpService {
     emitter: Emitter,
     status: StatusHandle,
@@ -175,7 +217,7 @@ impl DhcpService {
         };
         json!({
             "snapshot": self.snapshot(),
-            "leases": leases.iter().map(lease_to_json).collect::<Vec<_>>(),
+            "leases": bounded_lease_array(&leases),
             "packetCounters": counters_to_json(&counters),
             "poolInfo": pool.as_ref().map_or_else(
                 || self.stopped_pool_info(),
@@ -468,6 +510,71 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_full_pool_still_produces_a_runtime_line_the_host_can_read() {
+        // A pool may hold 65,536 addresses and a lease is a few hundred bytes of
+        // JSON, so serialising them all produces several megabytes against a
+        // 1 MiB line ceiling. The host does not truncate an over-long line, it
+        // replaces the whole response with RESPONSE_TOO_LARGE — so the sidebar
+        // shows no leases at all, and keeps whatever it had last.
+        let leases: Vec<LeaseInfo> = (0..65_536u32)
+            .map(|i| LeaseInfo {
+                mac: MacKey::from_hardware(&[
+                    0xAA,
+                    0xBB,
+                    (i >> 24) as u8,
+                    (i >> 16) as u8,
+                    (i >> 8) as u8,
+                    i as u8,
+                ]),
+                ip: Ipv4Addr::from(0x0A00_0000 + i),
+                bound_at: 1_700_000_000_000,
+                lease_sec: 86_400,
+                expires_at: 1_700_086_400_000,
+                remaining_sec: 86_400,
+                // Client-supplied, so worst-case length is what has to fit.
+                hostname: Some("h".repeat(255)),
+                lease_type: LeaseType::Dynamic,
+            })
+            .collect();
+
+        let array = bounded_lease_array(&leases);
+        let encoded = Value::Array(array.clone()).to_string().len();
+
+        assert!(
+            encoded <= MAX_RPC_LINE_BYTES - RUNTIME_ENVELOPE_HEADROOM_BYTES,
+            "the lease array must fit one RPC line; {encoded} bytes"
+        );
+        assert!(
+            !array.is_empty(),
+            "and it must still carry as many leases as it can"
+        );
+        assert!(
+            array.len() < leases.len(),
+            "this fixture is only meaningful if the bound actually bites"
+        );
+    }
+
+    #[test]
+    fn a_small_pool_is_reported_in_full() {
+        // The bound must not cost anything in the ordinary case, which is every
+        // deployment that is not enormous.
+        let leases: Vec<LeaseInfo> = (0..64u32)
+            .map(|i| LeaseInfo {
+                mac: MacKey::from_hardware(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, i as u8]),
+                ip: Ipv4Addr::from(0x0A00_0000 + i),
+                bound_at: 1_700_000_000_000,
+                lease_sec: 86_400,
+                expires_at: 1_700_086_400_000,
+                remaining_sec: 86_400,
+                hostname: Some("bench-switch".to_owned()),
+                lease_type: LeaseType::Dynamic,
+            })
+            .collect();
+
+        assert_eq!(bounded_lease_array(&leases).len(), 64);
     }
 
     fn service() -> (DhcpService, crate::throttle::ThrottleWorker) {
