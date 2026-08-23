@@ -362,6 +362,77 @@ describe("LocalServerManager integration (lifecycle + core hub + trust gating)",
     manager.dispose();
   });
 
+  it("honours the configured restart limit instead of the built-in default", async () => {
+    // The five nexus.localServers.* settings shipped inert: nothing read them,
+    // and the manager used hard-coded constants that happened to match their
+    // defaults. A setting that cannot change anything is worse than no setting.
+    vi.useFakeTimers();
+    mockConfig.set("defaultMaxAutoRestarts", 1);
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const cfg = baseConfig({ autoRestart: true });   // no per-profile limit
+    await core.addOrUpdateLocalServerConfig(cfg);
+    const manager = makeManager(core);
+
+    await manager.start(cfg);
+    for (let round = 0; round < 10; round += 1) {
+      const pty = spawnedPtys[spawnedPtys.length - 1];
+      if (!pty || pty.closed) break;
+      pty.fire("term", { code: 1, stable: false } as LocalShellEarlyTerminationEvent);
+      await vi.advanceTimersByTimeAsync(120_000);
+    }
+    vi.useRealTimers();
+
+    // One start plus the single restart the setting allows.
+    expect(spawnedPtys.length).toBe(2);
+    manager.dispose();
+  });
+
+  it("treats maxAutoRestarts: 0 as no automatic restarts", async () => {
+    // Zero meant three different things across package.json, the model doc and
+    // the code, and the form erased it entirely with `|| undefined` — so a user
+    // asking for no restarts got the default of five.
+    vi.useFakeTimers();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const cfg = baseConfig({ autoRestart: true, maxAutoRestarts: 0 });
+    await core.addOrUpdateLocalServerConfig(cfg);
+    const manager = makeManager(core);
+
+    await manager.start(cfg);
+    spawnedPtys[0].fire("term", { code: 1, stable: false } as LocalShellEarlyTerminationEvent);
+    await vi.advanceTimersByTimeAsync(120_000);
+    vi.useRealTimers();
+
+    expect(spawnedPtys.length).toBe(1);
+    manager.dispose();
+  });
+
+  it("clamps a profile asking for more restarts than the ceiling allows", async () => {
+    vi.useFakeTimers();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const cfg = baseConfig({ autoRestart: true, maxAutoRestarts: 99 });
+    await core.addOrUpdateLocalServerConfig(cfg);
+    const manager = makeManager(core);
+
+    await manager.start(cfg);
+    for (let round = 0; round < 30; round += 1) {
+      const pty = spawnedPtys[spawnedPtys.length - 1];
+      if (!pty || pty.closed) break;
+      pty.fire("term", { code: 1, stable: false } as LocalShellEarlyTerminationEvent);
+      await vi.advanceTimersByTimeAsync(120_000);
+    }
+    vi.useRealTimers();
+
+    // One start plus at most LOCAL_SERVER_RESTART_CEILING (5) restarts.
+    expect(spawnedPtys.length).toBeLessThanOrEqual(6);
+    manager.dispose();
+  });
+
   it("workspace trust gating: manager refuses AND never mutates core", async () => {
     const core = makeCoreSpy();
     mockConfig.set("isTrusted", false);

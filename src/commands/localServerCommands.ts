@@ -105,9 +105,17 @@ export function formValuesToLocalServer(values: FormValues, existing?: Partial<L
     : typeof values.maxAutoRestarts === "number"
       ? String(values.maxAutoRestarts)
       : "";
-  const maxAutoRestarts = maxAutoRestartsRaw
-    ? Math.max(0, parseInt(maxAutoRestartsRaw, 10) || 0)
-    : undefined;
+  // `parseInt(...) || 0` mapped unparseable text to 0, which now *means*
+  // something — "never restart this" — so a typo would silently disable
+  // auto-restart. Garbage and an empty field both have to stay unset, and only
+  // a real number counts, including a deliberate 0.
+  const parsedMaxAutoRestarts = maxAutoRestartsRaw
+    ? Number.parseInt(maxAutoRestartsRaw, 10)
+    : Number.NaN;
+  const maxAutoRestarts =
+    Number.isFinite(parsedMaxAutoRestarts) && parsedMaxAutoRestarts >= 0
+      ? parsedMaxAutoRestarts
+      : undefined;
   return {
     id: existing?.id ?? randomUUID(),
     name,
@@ -116,7 +124,10 @@ export function formValuesToLocalServer(values: FormValues, existing?: Partial<L
     cwd: cwd || undefined,
     env: splitEnvFromTextarea(values.env),
     autoRestart: autoRestart || undefined,
-    maxAutoRestarts: maxAutoRestarts || undefined,
+    // `|| undefined` erased a deliberate 0 — the one value a user types to mean
+    // "do not restart this" — and an unset field then took the default of five,
+    // the exact opposite of the request.
+    maxAutoRestarts: maxAutoRestarts ?? undefined,
     description: description || undefined,
     group: normalizedGroup
   };

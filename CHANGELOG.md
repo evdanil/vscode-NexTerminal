@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.8.207] — 2026-08-23
+
+### Added
+
+- **Local Servers — run the local processes a bench needs alongside everything else.** A dev server, a proxy, a mock API, a build watcher: save a profile with an executable, arguments, working directory and environment, then start, stop and restart it from the Connectivity Hub. Output lands in an ordinary Nexus terminal, so highlighting, scrollback capture, Reset / Clear Scrollback / Copy All and session transcripts all work on it. A process that exits on its own can be restarted automatically, the delay doubling each attempt and the count clearing once it has run steadily.
+
+  Working directories are confined to the folders you have open — a profile pointing outside one is refused rather than started — and starting a server requires a trusted workspace. Profiles live in Nexus's own storage, not in workspace settings, so opening someone else's repository cannot introduce one.
+
+  It sits beside **Embedded Network Servers** in the sidebar and the two are easy to confuse: that one serves TFTP and DHCP to hardware on the wire, this one runs programs on your machine.
+
+  The feature is Brandon Mejia's (@kanekitakitos). It shipped with the documentation it should have had from the start — the README gained a feature entry, a walkthrough and its settings — and with one defect fixed before release: the auto-restart limit and its backoff did not work, so a crash-looping server respawned about four times a second, opened a terminal each time, and reported itself as stopped while doing it.
+
+### Changed
+
+- **The Local Servers auto-restart settings now do something.** Four of them were declared, shown in the settings UI with full descriptions, and read by nothing at all — the code used hard-coded values that happened to match their defaults, so changing any of them did precisely nothing. **Default Max Auto-Restarts**, **Stable Runtime Threshold**, **Initial Restart Backoff** and **Max Restart Backoff** are now read where they are used, so an edit applies to the next restart rather than the next window reload.
+
+- **A restart limit of `0` means no automatic restarts.** It previously meant three different things depending on where you read: the setting description said it disabled auto-restart, the code treated it as "unset" and used the default of five, and the profile form discarded it entirely — so typing `0` to stop a server restarting got you five restarts. It now means what the description always said, in the setting, the profile field and the code alike. Unparseable text in that field stays *unset* rather than becoming `0`, so a typo cannot quietly disable restarts either.
+
+- **Five consecutive restarts is now a hard ceiling**, not just the default. A process that has died five times in a row without once surviving the stable-runtime threshold is broken, and a sixth attempt is worth less than a failed row saying so. The setting can ask for fewer; it can no longer ask for more.
+
+### Removed
+
+- **The "Restrict Working Directories to Workspace" setting.** It never controlled anything: the restriction it described was always applied unconditionally, so switching it off changed nothing and left you with a `PathOutsideScope` error and no way forward. The restriction itself is unchanged and still enforced — only the toggle that pretended to govern it is gone. If an escape hatch from that sandbox is ever wanted it should be designed as one, rather than shipped as a setting that already reads as though it exists.
+
 ## [2.8.205] — 2026-08-23
 
 ### Changed

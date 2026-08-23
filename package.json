@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox and EVE-NG inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.206",
+  "version": "2.8.207",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -4456,9 +4456,9 @@
           "type": "number",
           "default": 5,
           "minimum": 0,
-          "maximum": 100,
+          "maximum": 5,
           "order": 31,
-          "markdownDescription": "Default maximum number of automatic restarts per local server when `autoRestart` is enabled and no explicit `maxAutoRestarts` is set on the profile. 0 disables auto-restart globally. Auto-restart uses exponential backoff and stops counting attempts after 10 seconds of stable runtime."
+          "markdownDescription": "**Local Servers — Auto-Restart.** How many times in a row a local server may be restarted automatically when it exits on its own, for profiles that do not set their own limit. `0` means no automatic restarts. The count is consecutive: a server that runs for `#nexus.localServers.stableRuntimeMs#` without dying clears it, so this bounds a crash loop rather than restarts over the profile's life. Five is also the hard ceiling — a process that has died five times in a row without once running stably is broken, and the failed state is more use than another attempt."
         },
         "nexus.localServers.stableRuntimeMs": {
           "type": "number",
@@ -4466,7 +4466,7 @@
           "minimum": 1000,
           "maximum": 600000,
           "order": 32,
-          "markdownDescription": "Milliseconds of continuous runtime after which a local server is considered 'stable' and its auto-restart attempt counter is reset. Must be long enough to distinguish a real crash from a graceful exit triggered just after startup."
+          "markdownDescription": "**Local Servers — Auto-Restart.** How long a local server must run without exiting before it counts as healthy and its consecutive-restart count is cleared. Long enough to tell a real crash from a process that exits cleanly moments after starting."
         },
         "nexus.localServers.initialBackoffMs": {
           "type": "number",
@@ -4474,7 +4474,7 @@
           "minimum": 50,
           "maximum": 60000,
           "order": 33,
-          "markdownDescription": "Initial exponential-backoff delay in milliseconds before the first auto-restart. Each subsequent attempt doubles this value up to `nexus.localServers.maxBackoffMs`."
+          "markdownDescription": "**Local Servers — Auto-Restart.** How long to wait before the first automatic restart. Each further attempt doubles the wait, up to `#nexus.localServers.maxBackoffMs#`."
         },
         "nexus.localServers.maxBackoffMs": {
           "type": "number",
@@ -4482,13 +4482,7 @@
           "minimum": 100,
           "maximum": 600000,
           "order": 34,
-          "markdownDescription": "Maximum backoff delay in milliseconds between auto-restart attempts (exponential backoff ceiling)."
-        },
-        "nexus.localServers.restrictToWorkspaceRoots": {
-          "type": "boolean",
-          "default": true,
-          "order": 35,
-          "markdownDescription": "Refuse to start a local server whose working directory resolves outside the currently-open workspace roots when a workspace is open. Disabling this allows any absolute path, including system directories, as cwd — enable only if you trust every profile in storage."
+          "markdownDescription": "**Local Servers — Auto-Restart.** Ceiling on the wait between automatic restarts, however far the doubling has gone. Never less than `#nexus.localServers.initialBackoffMs#`."
         }
       }
     }
