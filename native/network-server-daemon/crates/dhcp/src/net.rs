@@ -55,6 +55,34 @@ impl MacKey {
         Self(out)
     }
 
+    /// Accepts only a key [`Self::from_hardware`] could have produced.
+    ///
+    /// [`Self::parse_lossy`] keeps whatever it cannot canonicalise, which is
+    /// right for a value an operator typed — a reservation should not vanish
+    /// over punctuation — and wrong for one read back out of the lease cache.
+    /// No packet can produce `NOT-A-MAC`, so an entry filed under it belongs to
+    /// no client that will ever appear, yet it holds an address out of the pool
+    /// until it expires, and gets written back on the next save.
+    ///
+    /// The length is bounded by `hlen` rather than fixed at six: `chaddr`
+    /// carries 1..=16 bytes, so a client whose hardware address is not
+    /// Ethernet-shaped still has a key this must accept.
+    #[must_use]
+    pub fn from_wire_key(raw: &str) -> Option<Self> {
+        let mut octets = 0usize;
+        for pair in raw.split('-') {
+            let bytes = pair.as_bytes();
+            let hex = |b: &u8| b.is_ascii_digit() || (b'A'..=b'F').contains(b);
+            if bytes.len() != 2 || !bytes.iter().all(hex) {
+                return None;
+            }
+            octets += 1;
+        }
+        (1..=crate::protocol::MAX_HARDWARE_LEN)
+            .contains(&octets)
+            .then(|| Self(raw.to_owned()))
+    }
+
     /// Canonicalises a MAC as an operator may have typed it.
     ///
     /// Accepts `aa:bb:cc:dd:ee:ff`, `AA-BB-…`, `aabb.ccdd.eeff` and bare

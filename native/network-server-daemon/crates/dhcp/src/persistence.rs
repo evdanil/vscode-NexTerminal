@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::constants::{MAX_DHCP_FIELD_BYTES, MAX_DHCP_POOL_SIZE, MAX_STATIC_RESERVATIONS};
+use crate::constants::{MAX_DHCP_POOL_SIZE, MAX_STATIC_RESERVATIONS};
 use crate::lease::{LeaseInfo, LeaseType};
 use crate::net::{is_ip_in_pool, MacKey};
 
@@ -143,25 +143,42 @@ pub struct ReconcileContext<'a> {
 ///
 /// Junk is filtered *per record*, so one malformed entry does not discard the
 /// rest of a file that is otherwise fine.
+/// Everything the lease file holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeaseStore {
+    pub leases: Vec<LeaseInfo>,
+    /// Address → epoch-millisecond deadline. Written so a DECLINE keeps holding
+    /// its contested address back across a restart.
+    pub quarantine: Vec<(Ipv4Addr, u64)>,
+}
+
+/// Reads the leases only. The quarantine is dropped, so callers that maintain
+/// the table use [`load_store`].
 #[must_use]
 pub fn load_leases(path: &Path) -> Vec<LeaseInfo> {
+    load_store(path).leases
+}
+
+/// Reads the persisted lease table and its quarantine deadlines.
+#[must_use]
+pub fn load_store(path: &Path) -> LeaseStore {
     let Ok(metadata) = fs::metadata(path) else {
-        return Vec::new();
+        return LeaseStore::default();
     };
     if metadata.len() > MAX_LEASE_FILE_BYTES {
-        return Vec::new();
+        return LeaseStore::default();
     }
     let Ok(raw) = fs::read_to_string(path) else {
-        return Vec::new();
+        return LeaseStore::default();
     };
     let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
+        return LeaseStore::default();
     };
     if parsed.get("version").and_then(Value::as_u64) != Some(LEASE_STORE_VERSION) {
-        return Vec::new();
+        return LeaseStore::default();
     }
     let Some(entries) = parsed.get("leases").and_then(Value::as_array) else {
-        return Vec::new();
+        return LeaseStore::default();
     };
     // Bounded as well as filtered. A file holding more live records than the
     // writer could have produced — corruption, a hand edit, a file from a
@@ -172,24 +189,47 @@ pub fn load_leases(path: &Path) -> Vec<LeaseInfo> {
     // retiring the daemon. Truncating keeps the server running on as much of
     // its cache as the protocol can actually carry, which is the same
     // degrade-rather-than-fail choice the rest of this function makes.
-    entries
-        .iter()
-        .filter_map(lease_from_json)
-        .take(MAX_PERSISTED_LEASES as usize)
-        .collect()
+    LeaseStore {
+        leases: entries
+            .iter()
+            .filter_map(lease_from_json)
+            .take(MAX_PERSISTED_LEASES as usize)
+            .collect(),
+        quarantine: parsed
+            .get("quarantine")
+            .and_then(Value::as_array)
+            .map(|held| {
+                held.iter()
+                    .filter_map(quarantine_from_json)
+                    .take(MAX_PERSISTED_LEASES as usize)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// One quarantine deadline, held to the same bounds as a lease timestamp.
+fn quarantine_from_json(value: &Value) -> Option<(Ipv4Addr, u64)> {
+    let address: Ipv4Addr = value.get("ip")?.as_str()?.parse().ok()?;
+    let until = finite_ms(value.get("until")?)?;
+    Some((address, until))
 }
 
 /// Rejects anything that is not a complete, well-typed lease record.
 fn lease_from_json(value: &Value) -> Option<LeaseInfo> {
-    // `MacKey::parse_lossy` keeps whatever it cannot parse, so an oversized
-    // `mac` here would survive into the lease and be echoed straight back out
-    // by `lease_to_json` — past the host's per-field ceiling, which costs the
-    // whole response and the daemon with it. From a file, that recurs on every
-    // start until somebody edits it.
-    let mac = value
-        .get("mac")?
-        .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= MAX_DHCP_FIELD_BYTES)?;
+    // The key has to name a client that could actually appear. `parse_lossy`
+    // keeps whatever it cannot canonicalise — right for a reservation an
+    // operator typed, wrong here — so a cache saying "not-a-mac" filed an entry
+    // no packet can ever match, whose address the allocator still counted as
+    // taken. Malformed records therefore shrank the pool, and were written back
+    // out on the next save, so the file kept them alive.
+    //
+    // Two accepted forms: one an operator may have typed for a six-octet
+    // address, and one this daemon writes for any hardware length `chaddr`
+    // carries. Both are far shorter than the host's per-field ceiling, so that
+    // separate bound is subsumed rather than dropped.
+    let raw_mac = value.get("mac")?.as_str().filter(|s| !s.is_empty())?;
+    let mac = MacKey::parse(raw_mac).or_else(|| MacKey::from_wire_key(raw_mac))?;
     let ip: Ipv4Addr = value.get("ip")?.as_str()?.parse().ok()?;
     let bound_at = finite_ms(value.get("boundAt")?)?;
     let lease_sec = value.get("leaseSec").and_then(Value::as_f64)?;
@@ -208,7 +248,7 @@ fn lease_from_json(value: &Value) -> Option<LeaseInfo> {
     #[allow(clippy::cast_sign_loss, reason = "the value is checked non-negative above")]
     let lease_sec = lease_sec as u32;
     Some(LeaseInfo {
-        mac: MacKey::parse_lossy(mac),
+        mac,
         ip,
         bound_at,
         lease_sec,
@@ -240,7 +280,11 @@ fn finite_ms(value: &Value) -> Option<u64> {
 ///
 /// The parent directory is created on demand — on a fresh install the
 /// extension's global storage folder may not exist yet.
-pub fn save_leases(path: &Path, leases: &[LeaseInfo]) -> io::Result<()> {
+pub fn save_leases(
+    path: &Path,
+    leases: &[LeaseInfo],
+    quarantine: &[(Ipv4Addr, u64)],
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -250,6 +294,12 @@ pub fn save_leases(path: &Path, leases: &[LeaseInfo]) -> io::Result<()> {
         "version": LEASE_STORE_VERSION,
         "savedAt": now_epoch_ms(),
         "leases": leases.iter().map(lease_to_json).collect::<Vec<_>>(),
+        // Additive: a reader that predates this key simply finds no quarantine,
+        // which is the behaviour it had anyway, so the schema version stands.
+        "quarantine": quarantine
+            .iter()
+            .map(|(address, until)| json!({"ip": address.to_string(), "until": until}))
+            .collect::<Vec<_>>(),
     });
     let text = serde_json::to_string_pretty(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -429,7 +479,7 @@ mod tests {
         let dir = TempDir::new("dhcp-persist");
         let path = dir.path().join("nested").join("dhcp-leases.json");
         let leases = vec![lease("aa:bb:cc:dd:ee:ff", "10.0.0.10", NOW + 3_600_000)];
-        save_leases(&path, &leases).expect("the parent directory is created on demand");
+        save_leases(&path, &leases, &[]).expect("the parent directory is created on demand");
 
         let loaded = load_leases(&path);
         assert_eq!(loaded.len(), 1);
@@ -446,7 +496,7 @@ mod tests {
         // silently costs every device its address on the next swap.
         let dir = TempDir::new("dhcp-format");
         let path = dir.path().join("dhcp-leases.json");
-        save_leases(&path, &[lease("aa:bb:cc:dd:ee:ff", "10.0.0.10", NOW + 1000)]).unwrap();
+        save_leases(&path, &[lease("aa:bb:cc:dd:ee:ff", "10.0.0.10", NOW + 1000)], &[]).unwrap();
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["version"], json!(1));
         assert!(value["savedAt"].is_number());
@@ -474,7 +524,7 @@ mod tests {
         let dir = TempDir::new("dhcp-atomic");
         let path = dir.path().join("dhcp-leases.json");
         for round in 0..5u64 {
-            save_leases(&path, &[lease("aa:bb:cc:dd:ee:ff", "10.0.0.10", NOW + round + 1)]).unwrap();
+            save_leases(&path, &[lease("aa:bb:cc:dd:ee:ff", "10.0.0.10", NOW + round + 1)], &[]).unwrap();
         }
         let strays: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
@@ -498,11 +548,11 @@ mod tests {
         // what, and that is worse than having no file at all.
         let dir = TempDir::new("dhcp-interrupted");
         let path = dir.path().join("dhcp-leases.json");
-        save_leases(&path, &[lease("aa:00:00:00:00:01", "10.0.0.10", NOW + 3_600_000)]).unwrap();
+        save_leases(&path, &[lease("aa:00:00:00:00:01", "10.0.0.10", NOW + 3_600_000)], &[]).unwrap();
 
         // Occupy the temp path with a directory, which cannot be opened as a file.
         fs::create_dir(temp_path(&path)).unwrap();
-        let result = save_leases(&path, &[lease("bb:00:00:00:00:02", "10.0.0.11", NOW + 3_600_000)]);
+        let result = save_leases(&path, &[lease("bb:00:00:00:00:02", "10.0.0.11", NOW + 3_600_000)], &[]);
         assert!(result.is_err(), "the staged write could not have succeeded");
 
         let survivors = load_leases(&path);
@@ -532,8 +582,8 @@ mod tests {
     fn an_overwrite_replaces_the_previous_content_rather_than_appending() {
         let dir = TempDir::new("dhcp-overwrite");
         let path = dir.path().join("dhcp-leases.json");
-        save_leases(&path, &[lease("aa:00:00:00:00:01", "10.0.0.10", NOW + 1000)]).unwrap();
-        save_leases(&path, &[lease("aa:00:00:00:00:02", "10.0.0.11", NOW + 1000)]).unwrap();
+        save_leases(&path, &[lease("aa:00:00:00:00:01", "10.0.0.10", NOW + 1000)], &[]).unwrap();
+        save_leases(&path, &[lease("aa:00:00:00:00:02", "10.0.0.11", NOW + 1000)], &[]).unwrap();
         let loaded = load_leases(&path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].ip, ip("10.0.0.11"));
@@ -712,6 +762,82 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_deadlines_round_trip_and_expired_ones_do_not() {
+        // The file format half of the restart fix. A deadline already in the
+        // past is dropped on read rather than restored and swept later, so a
+        // stale file cannot hold an address back for a window it has served.
+        let dir = TempDir::new("dhcp-quarantine-roundtrip");
+        let path = dir.path().join("dhcp-leases.json");
+        let live = (ip("10.0.0.10"), NOW + 600_000);
+        let stale = (ip("10.0.0.11"), NOW - 1);
+        save_leases(&path, &[], &[live, stale]).unwrap();
+
+        let store = load_store(&path);
+
+        assert!(store.leases.is_empty(), "a file may hold quarantine and no leases");
+        assert!(store.quarantine.contains(&live), "the live deadline survives");
+        assert!(store.quarantine.contains(&stale), "the reader keeps what it read");
+
+        let mut table = crate::lease::LeaseTable::new(ip("10.0.0.10"), ip("10.0.0.20"), 3600, BTreeMap::new());
+        table.restore_quarantine(&store.quarantine, NOW);
+        assert!(table.is_quarantined(ip("10.0.0.10"), NOW), "still held back");
+        assert!(
+            !table.is_quarantined(ip("10.0.0.11"), NOW),
+            "a deadline that has already passed must not be reinstated"
+        );
+    }
+
+    #[test]
+    fn a_mac_no_packet_could_produce_is_not_restored() {
+        // `parse_lossy` keeps anything it cannot canonicalise, so a cache saying
+        // "not-a-mac" filed an entry under a key no client will ever present.
+        // The allocator still counts its address as taken, so malformed records
+        // shrink the pool — and get written back out on the next save, so the
+        // file heals itself into keeping them.
+        let dir = TempDir::new("dhcp-bogus-mac");
+        let path = dir.path().join("dhcp-leases.json");
+        let payload = json!({
+            "version": 1, "savedAt": NOW,
+            "leases": [
+                {"mac": "not-a-mac", "ip": "10.0.0.10", "boundAt": NOW,
+                 "leaseSec": 3600, "expiresAt": NOW + 3_600_000, "remainingSec": 3600,
+                 "hostname": null, "leaseType": "dynamic"},
+                {"mac": "aa:00:00:00:00:02", "ip": "10.0.0.11", "boundAt": NOW,
+                 "leaseSec": 3600, "expiresAt": NOW + 3_600_000, "remainingSec": 3600,
+                 "hostname": null, "leaseType": "dynamic"}
+            ]
+        });
+        fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+
+        let loaded = load_leases(&path);
+
+        assert_eq!(loaded.len(), 1, "only the record naming a real client survives");
+        assert_eq!(loaded[0].ip, ip("10.0.0.11"));
+        assert_eq!(loaded[0].mac, MacKey::parse_lossy("aa:00:00:00:00:02"));
+    }
+
+    #[test]
+    fn a_restored_key_may_be_any_hardware_length_the_wire_allows() {
+        // `chaddr` carries 1..=16 bytes, so the check cannot simply demand six:
+        // a client whose hardware address is not Ethernet-shaped writes a longer
+        // key, and refusing it would drop a lease that is entirely legitimate.
+        let dir = TempDir::new("dhcp-wide-mac");
+        let path = dir.path().join("dhcp-leases.json");
+        let wide = MacKey::from_hardware(&[0x11; 16]);
+        let payload = json!({
+            "version": 1, "savedAt": NOW,
+            "leases": [
+                {"mac": wide.as_str(), "ip": "10.0.0.10", "boundAt": NOW,
+                 "leaseSec": 3600, "expiresAt": NOW + 3_600_000, "remainingSec": 3600,
+                 "hostname": null, "leaseType": "dynamic"}
+            ]
+        });
+        fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+
+        assert_eq!(load_leases(&path).len(), 1, "a 16-byte hardware address is valid");
+    }
+
+    #[test]
     fn a_persisted_mac_too_long_for_the_runtime_protocol_is_dropped() {
         // `MacKey::parse_lossy` keeps whatever it cannot parse, so an oversized
         // `mac` in the file survives into the lease and is echoed straight back
@@ -765,8 +891,8 @@ mod tests {
 
         let one_path = dir.path().join("one.json");
         let many_path = dir.path().join("many.json");
-        save_leases(&one_path, std::slice::from_ref(&worst)).unwrap();
-        save_leases(&many_path, &vec![worst; 257]).unwrap();
+        save_leases(&one_path, std::slice::from_ref(&worst), &[]).unwrap();
+        save_leases(&many_path, &vec![worst; 257], &[]).unwrap();
         let one = fs::metadata(&one_path).unwrap().len();
         let many = fs::metadata(&many_path).unwrap().len();
 
