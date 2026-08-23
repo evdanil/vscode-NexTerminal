@@ -341,7 +341,9 @@ impl LeaseTable {
         now_ms: u64,
     ) -> Option<Ipv4Addr> {
         if let Some(reserved) = self.statics.get(mac) {
-            return Some(*reserved);
+            if !self.is_quarantined(*reserved, now_ms) {
+                return Some(*reserved);
+            }
         }
         if let Some(entry) = self.entries.get(mac) {
             if entry.is_live(now_ms) {
@@ -1043,6 +1045,19 @@ mod tests {
         assert_eq!(
             t.select_address(&mac("bb:00:00:00:00:02"), Some(ip("10.0.0.10")), NOW),
             Some(ip("10.0.0.11"))
+        );
+    }
+
+    #[test]
+    fn a_declined_static_reservation_is_not_immediately_reoffered() {
+        let mut t = table_with_statics(&[("aa:00:00:00:00:09", "10.0.0.12")]);
+        let reserved = mac("aa:00:00:00:00:09");
+        t.bind(&reserved, ip("10.0.0.12"), None, NOW);
+        t.decline(&reserved, ip("10.0.0.12"), NOW);
+        assert_eq!(
+            t.select_address(&reserved, None, NOW),
+            Some(ip("10.0.0.10")),
+            "the quarantined reservation must not be offered straight back"
         );
     }
 

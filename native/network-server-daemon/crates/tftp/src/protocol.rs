@@ -13,8 +13,8 @@
 
 use crate::types::{
     ErrorCode, Opcode, Packet, RawOptions, Request, TransferMode, ValidatedOptions, BLKSIZE_MAX,
-    BLKSIZE_MIN, DATA_HEADER_LEN, DEFAULT_BLOCK_SIZE, DEFAULT_WINDOW_SIZE, MAX_IN_FLIGHT_BYTES,
-    TIMEOUT_MAX, TIMEOUT_MIN, WINDOWSIZE_MAX, WINDOWSIZE_MIN,
+    BLKSIZE_MIN, BLOCK_SPACE, DATA_HEADER_LEN, DEFAULT_BLOCK_SIZE, DEFAULT_WINDOW_SIZE,
+    MAX_IN_FLIGHT_BYTES, TIMEOUT_MAX, TIMEOUT_MIN, WINDOWSIZE_MAX, WINDOWSIZE_MIN,
 };
 use std::fmt;
 
@@ -349,7 +349,7 @@ pub fn validate_options(raw: &RawOptions, defaults: ValidatedOptions) -> Result<
     // answer the client with the value it asked for and then use a different
     // one, and the two ends would disagree about the window for the whole
     // transfer.
-    let max_window = (MAX_IN_FLIGHT_BYTES / out.blksize).max(1);
+    let max_window = (MAX_IN_FLIGHT_BYTES / out.blksize).clamp(1, (BLOCK_SPACE / 2) - 1);
     if out.windowsize > max_window {
         out.windowsize = max_window;
     }
@@ -619,6 +619,19 @@ mod tests {
         .unwrap();
         assert_eq!(v.windowsize, MAX_IN_FLIGHT_BYTES / 1400);
         assert!(v.blksize * v.windowsize <= MAX_IN_FLIGHT_BYTES);
+    }
+
+    #[test]
+    fn windowsize_is_clamped_below_the_ambiguous_half_block_space() {
+        let v = validate_options(
+            &opts(&[("blksize", "32"), ("windowsize", "32768")]),
+            ValidatedOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            v.windowsize < BLOCK_SPACE / 2,
+            "block ordering treats exactly half the sequence space as ambiguous"
+        );
     }
 
     #[test]
