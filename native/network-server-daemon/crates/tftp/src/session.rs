@@ -34,19 +34,16 @@ const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Forward distance from `from` to `to` in the 16-bit block-number space.
 ///
-/// Block numbers are 16 bits on the wire and this implementation wraps
-/// 65535 → 1, so plain `<` / `>=` comparisons are wrong the moment a transfer
+/// Block numbers are 16 bits on the wire and wrap 65535 → 0, so plain `<` /
+/// `>=` comparisons are wrong the moment a transfer
 /// passes 65535 blocks — 32 MB at the default block size, which is one PXE
 /// image at any realistic size. Past the wrap the sender's numbers restart while
 /// `last_acked` is still up at 65535: every subsequent ACK reads as "older than
 /// what we already have", the window never advances, no more DATA is produced,
 /// and the transfer stalls with no error on either side.
 ///
-/// The distance is computed modulo 65536 rather than modulo the 65535-value
-/// space the wrap-to-1 actually walks. That costs one block of window width for
-/// the single round after each wrap — never a stall, never an over-fill — and
-/// keeps this the standard sequence-space arithmetic a reader already knows
-/// instead of a bespoke variant that has to be re-derived to be trusted.
+/// The distance is computed modulo 65536, directly matching the wire
+/// representation.
 #[must_use]
 pub fn block_distance(from: u16, to: u16) -> u32 {
     u32::from(to.wrapping_sub(from))
@@ -63,17 +60,10 @@ pub fn block_at_or_after(earlier: u16, later: u16) -> bool {
     block_distance(earlier, later) < BLOCK_SPACE / 2
 }
 
-/// The block after `block`, wrapping 65535 → 1.
-///
-/// Zero is skipped on purpose: block 0 is reserved for the initial ACK of an
-/// OACK or a WRQ, so reusing it mid-transfer would be ambiguous.
+/// The block after `block`, wrapping 65535 → 0.
 #[must_use]
 pub fn next_block(block: u16) -> u16 {
-    if block == u16::MAX {
-        1
-    } else {
-        block + 1
-    }
+    block.wrapping_add(1)
 }
 
 /// Which way the bytes flow, named from the client's point of view — the one an
@@ -343,7 +333,7 @@ impl TransferSession {
     /// Two things here are easy to get wrong and both were:
     ///
     /// * The comparison must be wrap-safe. `block <= ack` stops dead at the
-    ///   wrap: a queue holding 65534, 65535, 1, 2 confirmed by ACK(2) drains
+    ///   wrap: a queue holding 65534, 65535, 0, 1 confirmed by ACK(1) drains
     ///   nothing, and the session then retransmits blocks the peer already has
     ///   until the cap silently discards them.
     /// * An unnumbered packet — the OACK — must be *droppable*. Treating it as
@@ -485,14 +475,8 @@ impl TransferSession {
                 }
             }
             Phase::Sending => {
-                if ack == 0 && self.block == 0 {
-                    return AckOutcome {
-                        produce_more: true,
-                        done: false,
-                    };
-                }
                 // Wrap-safe form of `ack < last_acked`. Past block 65535 the
-                // peer's ACKs restart at 1 while `last_acked` is still 65535,
+                // peer's ACKs restart at 0 while `last_acked` is still 65535,
                 // and a numeric compare discards every one of them: the window
                 // never advances, no more DATA is produced, and the transfer
                 // stalls silently.
@@ -530,13 +514,11 @@ impl TransferSession {
             return DataOutcome::default();
         }
 
-        // The block before the expected one, in the space this implementation
-        // actually walks: 65535 is followed by 1, not by 0. Computing it as
-        // `self.block - 1` yields 0 right after a wrap, so an ordinary
-        // retransmission of block 65535 would match nothing, fall through to the
-        // mismatch branch below, and kill a transfer that was merely recovering
-        // from a lost ACK.
-        let previous = if self.block <= 1 { u16::MAX } else { self.block - 1 };
+        // The block before the expected one in the same 16-bit sequence space
+        // used by the wire format. A duplicate DATA(0) after the wrap is
+        // distinct from negotiation ACK(0): at this point the phase is
+        // `Receiving`, so it is just another data block number.
+        let previous = self.block.wrapping_sub(1);
         if block == previous {
             return DataOutcome {
                 send: vec![encode_ack(previous)],
@@ -572,7 +554,7 @@ impl TransferSession {
             self.block = next_block(self.block);
         }
         // Same wrap hazard as the send side: `current >= last_acked + windowsize`
-        // is never true again once the client's numbering restarts at 1, so the
+        // is never true again once the client's numbering restarts at 0, so the
         // server stops acknowledging entirely and the upload dies on the
         // client's retries.
         let should_ack =
@@ -601,7 +583,7 @@ impl TransferSession {
     /// The loop bound is wrap-safe for the reason spelled out on
     /// [`block_distance`]: `self.block < self.last_acked + windowsize` stops
     /// bounding anything once the sender wraps past 65535, because the sum stays
-    /// up near 65536 while `self.block` restarts at 1 — the loop would then run
+    /// up near 65536 while `self.block` restarts at 0 — the loop would then run
     /// to EOF and push the entire remaining file into memory in one call.
     pub fn produce_next_send_packets(&mut self) -> std::io::Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
@@ -1100,28 +1082,30 @@ mod tests {
 
     #[test]
     fn distance_and_ordering_are_computed_in_the_sequence_space() {
+        assert_eq!(block_distance(65535, 0), 1);
         assert_eq!(block_distance(65535, 1), 2);
         assert_eq!(block_distance(65534, 2), 4);
-        assert!(block_at_or_after(65535, 1), "1 follows 65535");
+        assert!(block_at_or_after(65535, 0), "0 follows 65535");
+        assert!(block_at_or_after(65535, 1), "1 follows 0");
         assert!(!block_at_or_after(1, 65535), "65535 precedes 1");
-        assert_eq!(next_block(65535), 1, "block 0 is reserved, so 65535 wraps to 1");
+        assert_eq!(next_block(65535), 0, "the 16-bit wire field wraps through 0");
     }
 
     #[test]
-    fn a_write_expects_block_one_after_block_65535() {
+    fn a_write_expects_block_zero_after_block_65535() {
         let mut s = session(Direction::Write, RawOptions::default());
         s.init_for_write();
         s.block = 65535;
         s.last_acked = 65534;
         let outcome = s.handle_data(65535, &vec![1u8; 512]);
         assert_eq!(ack_block(&outcome.send[0]), 65535);
-        assert_eq!(s.block, 1, "65536 does not exist on a 16-bit wire field");
+        assert_eq!(s.block, 0, "the 16-bit wire field wraps through block 0");
 
-        // The very next block is 1, and it must be accepted as the expected one
+        // The very next block is 0, and it must be accepted as the expected one
         // rather than rejected as an out-of-order duplicate.
-        let outcome = s.handle_data(1, &vec![2u8; 512]);
+        let outcome = s.handle_data(0, &vec![2u8; 512]);
         assert_eq!(s.phase, Phase::Receiving, "a wrap is not a protocol violation");
-        assert_eq!(ack_block(&outcome.send[0]), 1);
+        assert_eq!(ack_block(&outcome.send[0]), 0);
         assert!(outcome.write.is_some());
     }
 
@@ -1140,23 +1124,23 @@ mod tests {
         let packets = s.produce_next_send_packets().unwrap();
         assert_eq!(
             packets.iter().map(|p| data_block(p)).collect::<Vec<_>>(),
-            vec![1],
+            vec![0],
             "distance(65534, 65535) is already 1 of a 2-block window"
         );
 
-        // ACK(1) is numerically far *below* last_acked (65534). A plain compare
+        // ACK(0) is numerically far *below* last_acked (65534). A plain compare
         // discards it, the window never advances, and the transfer stalls with
         // no error on either side.
-        let outcome = s.handle_ack(1);
+        let outcome = s.handle_ack(0);
         assert!(
             outcome.produce_more,
             "an ACK for a wrapped block must advance the window"
         );
-        assert_eq!(s.last_acked, 1);
+        assert_eq!(s.last_acked, 0);
         let packets = s.produce_next_send_packets().unwrap();
         assert_eq!(
             packets.iter().map(|p| data_block(p)).collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![1, 2]
         );
     }
 
@@ -1167,7 +1151,7 @@ mod tests {
         // that was only recovering from a lost ACK.
         let mut s = session(Direction::Write, RawOptions::default());
         s.init_for_write();
-        s.block = 1;
+        s.block = 0;
         s.last_acked = 65535;
         let outcome = s.handle_data(65535, &vec![5u8; 512]);
         assert_eq!(s.phase, Phase::Receiving, "must not error");
@@ -1182,10 +1166,10 @@ mod tests {
         s.record_outbound(&[
             encode_data(65534, &[0; 4]),
             encode_data(65535, &[0; 4]),
+            encode_data(0, &[0; 4]),
             encode_data(1, &[0; 4]),
-            encode_data(2, &[0; 4]),
         ]);
-        s.clear_outbound_up_to(2);
+        s.clear_outbound_up_to(1);
         assert!(
             s.outbound.is_empty(),
             "a numeric compare drains nothing here and the session then \
@@ -1203,9 +1187,9 @@ mod tests {
         // distance(65531, 65535) == 4 == windowsize, so this block is acked.
         let outcome = s.handle_data(65535, &vec![1u8; 512]);
         assert_eq!(ack_block(&outcome.send[0]), 65535);
-        assert_eq!(s.block, 1);
-        // Three blocks past the wrap: distance(65535, 3) == 4, ack again.
-        for block in [1u16, 2] {
+        assert_eq!(s.block, 0);
+        // Four blocks past the wrap: distance(65535, 3) == 4, ack again.
+        for block in [0u16, 1, 2] {
             let outcome = s.handle_data(block, &vec![1u8; 512]);
             assert!(outcome.send.is_empty(), "block {block} is inside the window");
         }

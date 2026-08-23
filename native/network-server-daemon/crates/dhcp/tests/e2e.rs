@@ -23,7 +23,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use nexus_dhcp::constants::{CLIENT_PORT, OPTION_REQUESTED_IP, OPTION_SERVER_ID};
-use nexus_dhcp::engine::{Engine, EngineOptions};
+use nexus_dhcp::engine::{Engine, EngineOptions, RuntimeSnapshot};
 use nexus_dhcp::lease::LeaseInfo;
 use nexus_dhcp::persistence;
 use nexus_dhcp::protocol::{Message, MessageType};
@@ -136,23 +136,32 @@ fn request_with(mac: &[u8], xid: u32, wanted: Ipv4Addr, server: Ipv4Addr) -> Vec
 }
 
 /// Waits until the engine's lease table satisfies `predicate`.
+fn await_runtime(
+    engine: &Engine,
+    what: &str,
+    predicate: impl Fn(&RuntimeSnapshot) -> bool,
+) -> RuntimeSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = None;
+    while Instant::now() < deadline {
+        if let Some(runtime) = engine.runtime() {
+            if predicate(&runtime) {
+                return runtime;
+            }
+            last = Some(runtime);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {what}; last seen: {last:?}");
+}
+
+/// Waits until the engine's lease table satisfies `predicate`.
 fn await_leases(
     engine: &Engine,
     what: &str,
     predicate: impl Fn(&[LeaseInfo]) -> bool,
 ) -> Vec<LeaseInfo> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last = Vec::new();
-    while Instant::now() < deadline {
-        if let Some(runtime) = engine.runtime() {
-            if predicate(&runtime.leases) {
-                return runtime.leases;
-            }
-            last = runtime.leases;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("timed out waiting for {what}; last seen: {last:?}");
+    await_runtime(engine, what, |runtime| predicate(&runtime.leases)).leases
 }
 
 #[test]
@@ -236,8 +245,12 @@ fn a_lease_survives_a_restart_and_stays_out_of_the_pool() {
         send(&client, &discover(&MAC_A), port);
         let offered = await_leases(&engine, "an offer", |l| !l.is_empty())[0].ip;
         send(&client, &request(&MAC_A, offered, ip("10.0.0.1")), port);
-        await_leases(&engine, "the bind", |l| {
-            l.iter().any(|lease| lease.bound_at > 0 && lease.ip == offered)
+        await_runtime(&engine, "the bind", |runtime| {
+            runtime.counters.request_count >= 1
+                && runtime.counters.ack_count >= 1
+                && runtime.leases.iter().any(|lease| {
+                    lease.ip == offered && lease.mac.as_str() == "AA-00-00-00-00-0A"
+                })
         });
         engine.stop();
         offered

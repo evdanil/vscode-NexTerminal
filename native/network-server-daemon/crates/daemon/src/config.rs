@@ -371,31 +371,46 @@ impl ConfigStore {
                 return Err(ConfigError(format!("unknown service configuration: {key}")));
             }
         }
-        let mut changed = Vec::new();
-        if let Some(incoming) = configs.get("tftp") {
-            if self.tftp_raw.as_ref() != Some(incoming) {
+        let tftp_update = if let Some(incoming) = configs.get("tftp") {
+            if self.tftp_raw.as_ref() == Some(incoming) {
+                None
+            } else {
                 let parsed: TftpConfig = serde_json::from_value(incoming.clone())
                     .map_err(|e| ConfigError(format!("invalid tftp configuration: {e}")))?;
                 // Validated here rather than at start, so a bad interface is
                 // reported against the edit that introduced it.
                 parsed.bind_address().map_err(ConfigError)?;
-                self.tftp = parsed;
-                self.tftp_raw = Some(incoming.clone());
-                changed.push("tftp".to_owned());
+                Some((parsed, incoming.clone()))
             }
-        }
-        if let Some(incoming) = configs.get("dhcp") {
-            if self.dhcp_raw.as_ref() != Some(incoming) {
+        } else {
+            None
+        };
+        let dhcp_update = if let Some(incoming) = configs.get("dhcp") {
+            if self.dhcp_raw.as_ref() == Some(incoming) {
+                None
+            } else {
                 let parsed: DhcpConfig = serde_json::from_value(incoming.clone())
                     .map_err(|e| ConfigError(format!("invalid dhcp configuration: {e}")))?;
                 // Validated here rather than at start, so a bad pool or a
                 // mistyped reservation is reported against the edit that
                 // introduced it — and so a rejected value is never stored.
                 parsed.resolve().map_err(ConfigError)?;
-                self.dhcp = parsed;
-                self.dhcp_raw = Some(incoming.clone());
-                changed.push("dhcp".to_owned());
+                Some((parsed, incoming.clone()))
             }
+        } else {
+            None
+        };
+
+        let mut changed = Vec::new();
+        if let Some((parsed, raw)) = tftp_update {
+            self.tftp = parsed;
+            self.tftp_raw = Some(raw);
+            changed.push("tftp".to_owned());
+        }
+        if let Some((parsed, raw)) = dhcp_update {
+            self.dhcp = parsed;
+            self.dhcp_raw = Some(raw);
+            changed.push("dhcp".to_owned());
         }
         Ok(changed)
     }
@@ -454,6 +469,24 @@ mod tests {
             .unwrap();
         assert_eq!(store.dhcp_port(), 6700, "a tftp-only apply must not clobber dhcp");
         assert_eq!(store.tftp().port(), 6900);
+    }
+
+    #[test]
+    fn a_combined_apply_is_atomic_when_one_service_config_is_invalid() {
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(&json!({
+                "tftp": {"port": 6900},
+                "dhcp": {"dns": ["not-an-ip"]}
+            })))
+            .unwrap_err();
+        assert!(err.0.contains("DNS server"), "got {}", err.0);
+        assert_eq!(
+            store.tftp().port(),
+            TFTP_DEFAULT_PORT,
+            "a rejected combined payload must not partially store the valid tftp half"
+        );
+        assert!(store.tftp_raw.is_none(), "raw tftp config must remain unchanged");
     }
 
     #[test]
