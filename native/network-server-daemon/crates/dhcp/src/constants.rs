@@ -25,6 +25,14 @@ pub const MAX_DHCP_POOL_SIZE: u32 = 65_536;
 /// reservation outside the dynamic range adds a lease the pool size does not
 /// account for, so both bounds are needed to size the lease file.
 pub const MAX_STATIC_RESERVATIONS: u32 = 1_024;
+/// Byte ceiling the extension host puts on every DHCP lease string field,
+/// mirroring `MAX_DHCP_FIELD_BYTES` in `networkServerRpcProtocol.ts`.
+///
+/// The host rejects the entire runtime response when one field exceeds it, and
+/// treats that as a protocol failure — which terminates a running daemon. So
+/// this is not a display preference: nothing above it may be allowed to reach a
+/// lease, whether it came off the wire or out of the lease file.
+pub const MAX_DHCP_FIELD_BYTES: usize = 255;
 
 // -- Option codes (RFC 2132) ------------------------------------------------
 

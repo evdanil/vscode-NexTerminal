@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::constants::{MAX_DHCP_POOL_SIZE, MAX_STATIC_RESERVATIONS};
+use crate::constants::{MAX_DHCP_FIELD_BYTES, MAX_DHCP_POOL_SIZE, MAX_STATIC_RESERVATIONS};
 use crate::lease::{LeaseInfo, LeaseType};
 use crate::net::{is_ip_in_pool, MacKey};
 
@@ -150,12 +150,33 @@ pub fn load_leases(path: &Path) -> Vec<LeaseInfo> {
     let Some(entries) = parsed.get("leases").and_then(Value::as_array) else {
         return Vec::new();
     };
-    entries.iter().filter_map(lease_from_json).collect()
+    // Bounded as well as filtered. A file holding more live records than the
+    // writer could have produced — corruption, a hand edit, a file from a
+    // differently configured pool — otherwise restores them all, and
+    // `reconcile` does not collapse records that share an address. The surplus
+    // reaches the runtime snapshot, where the host bounds the lease array at
+    // the same figure and reads anything longer as a malformed response,
+    // retiring the daemon. Truncating keeps the server running on as much of
+    // its cache as the protocol can actually carry, which is the same
+    // degrade-rather-than-fail choice the rest of this function makes.
+    entries
+        .iter()
+        .filter_map(lease_from_json)
+        .take(MAX_PERSISTED_LEASES as usize)
+        .collect()
 }
 
 /// Rejects anything that is not a complete, well-typed lease record.
 fn lease_from_json(value: &Value) -> Option<LeaseInfo> {
-    let mac = value.get("mac")?.as_str().filter(|s| !s.is_empty())?;
+    // `MacKey::parse_lossy` keeps whatever it cannot parse, so an oversized
+    // `mac` here would survive into the lease and be echoed straight back out
+    // by `lease_to_json` — past the host's per-field ceiling, which costs the
+    // whole response and the daemon with it. From a file, that recurs on every
+    // start until somebody edits it.
+    let mac = value
+        .get("mac")?
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= MAX_DHCP_FIELD_BYTES)?;
     let ip: Ipv4Addr = value.get("ip")?.as_str()?.parse().ok()?;
     let bound_at = finite_ms(value.get("boundAt")?)?;
     let lease_sec = value.get("leaseSec").and_then(Value::as_f64)?;
@@ -532,6 +553,77 @@ mod tests {
         assert_eq!(loaded.len(), 2, "only the two well-formed records survive");
         assert_eq!(loaded[0].ip, ip("10.0.0.10"));
         assert_eq!(loaded[1].ip, ip("10.0.0.15"));
+    }
+
+    #[test]
+    fn more_records_than_the_runtime_protocol_carries_are_not_all_restored() {
+        use std::fmt::Write as _;
+        // A cache holding more live records than the writer could ever have
+        // produced — corruption, a hand edit, a file from a differently
+        // configured pool — was restored whole. `reconcile` does not collapse
+        // records sharing an IP, so the surplus survives into the runtime
+        // snapshot, where the host bounds the lease array at
+        // MAX_DHCP_RUNTIME_LEASES and treats anything longer as a malformed
+        // response, terminating the daemon.
+        let dir = TempDir::new("dhcp-too-many");
+        let path = dir.path().join("dhcp-leases.json");
+        let surplus = MAX_PERSISTED_LEASES as usize + 16;
+        let mut records = String::from("[");
+        for i in 0..surplus {
+            if i > 0 {
+                records.push(',');
+            }
+            // Distinct MACs so nothing dedupes them away for the wrong reason.
+            let mac = format!("AA-BB-CC-{:02X}-{:02X}-{:02X}", (i >> 16) & 0xFF, (i >> 8) & 0xFF, i & 0xFF);
+            write!(
+                records,
+                r#"{{"mac":"{mac}","ip":"10.0.0.1","boundAt":{NOW},"leaseSec":3600,"expiresAt":{},"remainingSec":3600,"hostname":null,"leaseType":"dynamic"}}"#,
+                NOW + 3_600_000
+            )
+            .unwrap();
+        }
+        records.push(']');
+        fs::write(&path, format!(r#"{{"version":1,"savedAt":{NOW},"leases":{records}}}"#)).unwrap();
+
+        let loaded = load_leases(&path);
+
+        assert!(
+            loaded.len() as u64 <= MAX_PERSISTED_LEASES,
+            "restored {} records; the runtime protocol carries at most {MAX_PERSISTED_LEASES}",
+            loaded.len()
+        );
+    }
+
+    #[test]
+    fn a_persisted_mac_too_long_for_the_runtime_protocol_is_dropped() {
+        // `MacKey::parse_lossy` keeps whatever it cannot parse, so an oversized
+        // `mac` in the file survives into the lease and is echoed straight back
+        // out by `lease_to_json`. The host bounds every DHCP lease field at 255
+        // bytes and rejects the whole response above it, taking the daemon down
+        // with it — from a file, so it recurs on every start.
+        let dir = TempDir::new("dhcp-long-mac");
+        let path = dir.path().join("dhcp-leases.json");
+        let payload = json!({
+            "version": 1, "savedAt": NOW,
+            "leases": [
+                {"mac": "Z".repeat(300), "ip": "10.0.0.10", "boundAt": NOW,
+                 "leaseSec": 3600, "expiresAt": NOW + 3_600_000, "remainingSec": 3600,
+                 "hostname": null, "leaseType": "dynamic"},
+                {"mac": "AA-00-00-00-00-01", "ip": "10.0.0.11", "boundAt": NOW,
+                 "leaseSec": 3600, "expiresAt": NOW + 3_600_000, "remainingSec": 3600,
+                 "hostname": null, "leaseType": "dynamic"}
+            ]
+        });
+        fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+
+        let loaded = load_leases(&path);
+
+        assert_eq!(loaded.len(), 1, "the oversized record must not be restored");
+        assert_eq!(
+            loaded[0].ip,
+            ip("10.0.0.11"),
+            "and the sound record beside it still is"
+        );
     }
 
     #[test]

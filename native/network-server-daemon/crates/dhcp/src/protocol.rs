@@ -91,7 +91,7 @@ pub const MAX_ECHOED_TEXT: usize = 200;
 /// unauthenticated option 12 of invalid bytes stops the DHCP service. 255 is
 /// that host bound, and every text this module echoes goes through the same
 /// gate, so no field can drift past it.
-pub const MAX_ECHOED_TEXT_BYTES: usize = 255;
+pub const MAX_ECHOED_TEXT_BYTES: usize = crate::constants::MAX_DHCP_FIELD_BYTES;
 
 // ---------------------------------------------------------------------------
 // Errors
