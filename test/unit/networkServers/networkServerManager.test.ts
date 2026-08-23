@@ -161,6 +161,24 @@ describe("NetworkServerManager — daemon engine selection", () => {
     expect(hostState.options.resolveEngine?.()).toBe("rust");
   });
 
+  it("defaults to the native engine when nothing is configured", () => {
+    // Pins the declared default in package.json. Flipping it is a decision made
+    // on every user's behalf, so it should not be possible to change one of the
+    // two places it lives without the other noticing.
+    fakeManager();
+
+    expect(hostState.options.resolveEngine?.()).toBe("rust");
+  });
+
+  it("treats an unrecognised engine as unset rather than as the other engine", () => {
+    // A typo should give what an empty setting gives, not silently select the
+    // implementation the operator did not ask for.
+    mockConfig.set("nexus.networkServers.engine", "rusty");
+    fakeManager();
+
+    expect(hostState.options.resolveEngine?.()).toBe("rust");
+  });
+
   it("lets NEXUS_NETWORK_SERVERS_ENGINE override the workspace setting", () => {
     mockConfig.set("nexus.networkServers.engine", "node");
     process.env.NEXUS_NETWORK_SERVERS_ENGINE = "rust";

@@ -562,8 +562,8 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "networkServers",
     subgroup: "Advanced",
     description:
-      "Which implementation backs the embedded TFTP and DHCP services. Node runs the bundled JavaScript daemon and works on every supported platform. Rust runs a native binary speaking the identical stdio JSON-RPC protocol, using a packaged binary when one is installed or NEXUS_NETWORK_SERVER_DAEMON_BIN for development; if no native binary is available the JavaScript daemon is used instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Takes effect the next time the daemon starts.",
-    default: "node",
+      "Which implementation backs the embedded TFTP and DHCP services. Rust, the default, runs a native binary packaged for all six supported platforms; it parses the wire protocol under this project's own tests rather than an unmaintained dependency, forbids unsafe code, and aborts on arithmetic overflow instead of continuing with a wrong value. Node runs the bundled JavaScript daemon, which is what shipped before 2.8.205 and remains the fallback: if no native binary is available for this platform, or NEXUS_NETWORK_SERVER_DAEMON_BIN points at nothing, the JavaScript daemon starts instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Note that DHCP relay requests are answered only by the Node engine unless Serve Relayed Requests is switched on. Takes effect the next time the daemon starts.",
+    default: "rust",
     enumOptions: [
       {
         label: "Node",

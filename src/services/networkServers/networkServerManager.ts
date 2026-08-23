@@ -140,7 +140,11 @@ export function readNetworkServerEngine(): NetworkServerEngine {
   const fromEnv = normalizeNetworkServerEngine(process.env[ENGINE_ENV_VAR]);
   if (fromEnv) return fromEnv;
   const fromSetting = vscode.workspace.getConfiguration("nexus.networkServers").get<unknown>("engine");
-  return normalizeNetworkServerEngine(fromSetting) ?? "node";
+  // Matches the declared default in package.json. A value that is neither
+  // engine is treated as unset rather than as a reason to pick the other one:
+  // an operator who typed something wrong should get what an operator who typed
+  // nothing gets, not a different implementation.
+  return normalizeNetworkServerEngine(fromSetting) ?? "rust";
 }
 
 /**
