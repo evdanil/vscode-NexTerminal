@@ -264,6 +264,12 @@ impl TransferSession {
         self.error.as_ref().map(|(c, m)| (*c, m.as_str()))
     }
 
+    /// The peer's negotiated retry interval.
+    #[must_use]
+    pub fn retry_interval(&self) -> Duration {
+        self.timeout
+    }
+
     /// Moves the session to a terminal failure the caller will serialise.
     pub fn set_error(&mut self, code: ErrorCode, message: impl Into<String>) {
         self.phase = Phase::Error;

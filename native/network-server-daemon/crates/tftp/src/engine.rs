@@ -62,13 +62,6 @@ const RECV_BUFFER: usize = 65_536;
 /// report it.
 const MAX_CONSECUTIVE_SOCKET_ERRORS: u32 = 100;
 
-/// How long a completed WRQ keeps enough state to answer duplicate final DATA.
-///
-/// The full transfer is already closed and reported complete. This tiny dally
-/// record exists only for the RFC 1350 final-ACK-loss case: the client repeats
-/// the last DATA block and needs the same ACK again.
-const COMPLETED_WRITE_DALLY: Duration = Duration::from_secs(10);
-
 /// Cap on operator-facing text lifted from a peer.
 ///
 /// A client controls its own ERROR message and its own filename, and both are
@@ -848,7 +841,7 @@ impl<S: Datagram> TftpCore<S> {
             (session.direction == Direction::Write).then(|| CompletedWrite {
                 final_block: session.last_acked,
                 ack: crate::protocol::encode_ack(session.last_acked),
-                expires_at: Instant::now() + COMPLETED_WRITE_DALLY,
+                expires_at: Instant::now() + session.retry_interval(),
             })
         });
         let Some((info, _write_path)) = self.take(peer) else {
@@ -1386,6 +1379,31 @@ mod tests {
             std::fs::read(&destination).unwrap(),
             b"done",
             "the duplicate final DATA must not be appended a second time"
+        );
+    }
+
+    #[test]
+    fn a_completed_write_dallies_for_the_negotiated_timeout() {
+        let temp = TempDir::new("engine-write-final-retry-timeout");
+        let (mut core, _rec) = core_for(&temp, true, 8);
+        let writer = peer(43213);
+        let options = RawOptions {
+            timeout: Some("30".to_owned()),
+            ..RawOptions::default()
+        };
+
+        core.handle_message(&encode_wrq("up.bin", "octet", &options), writer);
+        core.handle_message(&encode_data(1, b"done"), writer);
+
+        let retained_for = core
+            .completed_writes
+            .get(&writer)
+            .expect("completed WRQ keeps final ACK state")
+            .expires_at
+            .saturating_duration_since(Instant::now());
+        assert!(
+            retained_for >= Duration::from_secs(29),
+            "dally should follow the negotiated timeout; retained for {retained_for:?}"
         );
     }
 
