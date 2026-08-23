@@ -10,7 +10,7 @@
 //! configuration regardless of how it arrived.
 
 use nexus_dhcp::boot::{BootOptions, VendorEntry};
-use nexus_dhcp::constants::MAX_OPTION_VALUE_BYTES;
+use nexus_dhcp::constants::{MAX_OPTION_VALUE_BYTES, MAX_STATIC_RESERVATIONS};
 use nexus_dhcp::engine::EngineOptions as DhcpEngineOptions;
 use nexus_dhcp::net::{broadcast_address, MacKey};
 use serde::Deserialize;
@@ -42,7 +42,6 @@ const MAX_IPV4_ADDRESSES_PER_DHCP_OPTION: usize =
 const MAX_PATH_BYTES: usize = 4_096;
 const MIN_DHCP_LEASE_SECONDS: u32 = 60;
 const MAX_DHCP_LEASE_SECONDS: u32 = 604_800;
-const MAX_STATIC_RESERVATIONS: usize = 1_024;
 
 /// TFTP settings, as the host sends them. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -275,12 +274,26 @@ impl DhcpConfig {
         if let Some(map) = &self.statics {
             options.statics = parse_static_reservations(map)?;
         }
-        options.lease_store_path = self
+        let lease_store_path = self
             .lease_store_path
             .as_ref()
             .map(|p| p.trim().to_owned())
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from);
+            .filter(|p| !p.is_empty());
+        // Bounded for the same reason the TFTP root is, and against the same
+        // limit the host-side parser applies. An unusable path is not inert
+        // here: DHCP keeps ACKing leases while every write fails, so the
+        // acknowledged leases are absent after a restart and their addresses go
+        // out again to different clients. Refusing the configuration is the last
+        // point at which that is visible to whoever set it.
+        if let Some(path) = &lease_store_path {
+            let bytes = path.len();
+            if bytes > MAX_PATH_BYTES {
+                return Err(format!(
+                    "Lease store path is {bytes} bytes; the maximum is {MAX_PATH_BYTES}."
+                ));
+            }
+        }
+        options.lease_store_path = lease_store_path.map(PathBuf::from);
 
         let tftp_servers = match &self.tftp_server_addresses {
             Some(list) => parse_ipv4_list(list, "TFTP server address")?,
@@ -348,7 +361,7 @@ fn parse_ipv4_list(values: &[String], label: &str) -> Result<Vec<Ipv4Addr>, Stri
 fn parse_static_reservations(
     map: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<MacKey, Ipv4Addr>, String> {
-    if map.len() > MAX_STATIC_RESERVATIONS {
+    if map.len() > MAX_STATIC_RESERVATIONS as usize {
         return Err(format!(
             "Static reservations has {} entries; the maximum is {MAX_STATIC_RESERVATIONS}.",
             map.len()
@@ -604,6 +617,27 @@ mod tests {
             "the rejected TFTP root must not be stored for a later runtime snapshot"
         );
         assert!(store.tftp_raw.is_none(), "raw tftp config must remain unchanged");
+    }
+
+    #[test]
+    fn an_oversized_lease_store_path_is_refused_before_startup() {
+        // The TFTP root is bounded here; the lease store was not. A path the
+        // platform cannot use is accepted and reported as configured, DHCP goes
+        // on ACKing leases, and every persistence attempt fails — so the leases
+        // are gone after a restart and their addresses can be handed to somebody
+        // else. Rejecting the configuration is the only point at which that is
+        // still visible to whoever set it.
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(&json!({"dhcp": {"leaseStorePath": "x".repeat(4097)}})))
+            .unwrap_err();
+        assert!(err.0.contains("Lease store path"), "got {}", err.0);
+        assert!(err.0.contains("4096") || err.0.contains("4,096"), "got {}", err.0);
+        assert!(
+            store.dhcp().lease_store_path.is_none(),
+            "the rejected path must not be stored for a later start"
+        );
+        assert!(store.dhcp_raw.is_none(), "raw dhcp config must remain unchanged");
     }
 
     #[test]
