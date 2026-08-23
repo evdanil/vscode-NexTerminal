@@ -31,6 +31,8 @@ import type { LocalServerConfig } from "../../src/models/localServer";
 import { LocalServerError } from "../../src/models/localServer";
 import type { LocalShellEarlyTerminationEvent } from "../../src/services/local/localShellPty";
 import { LocalServerManager, wireLocalServerTerminalCloseListener } from "../../src/services/local/localServerManager";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
 function norm(p: string): string {
   return p.replace(/\//g, "\\").toLowerCase();
@@ -173,7 +175,9 @@ function makeCoreSpy() {
     incrementLocalServerRestartAttempts: vi.fn((_id: string) => 1),
     resetLocalServerRestartAttempts: vi.fn(),
     getActiveSessionById: vi.fn(() => undefined),
-    getLocalServer: vi.fn()
+    // Must answer, or every scheduled restart aborts: retryStart now refuses to
+    // respawn a profile that has been deleted mid-backoff.
+    getLocalServer: vi.fn((id: string) => ({ id, name: "spy", executable: "node" }))
   } as any;
 }
 
@@ -258,6 +262,11 @@ describe("LocalServerManager integration (lifecycle + core hub + trust gating)",
     expect(pty.closed).toBe(true);
   });
 
+  // NOTE: this exercises the spy, which fabricates the increment the real core
+  // declines to perform on an unregistered session — so it cannot observe the
+  // cap failing. "stops restarting a crash-looping server at the configured
+  // cap" below covers the same ground against the real NexusCore, and is the
+  // one that fails if the cap regresses.
   it("early crash triggers auto-restart with backoff, respecting max attempts", async () => {
     vi.useFakeTimers();
     const core = makeCoreSpy();
@@ -276,17 +285,79 @@ describe("LocalServerManager integration (lifecycle + core hub + trust gating)",
     const first = spawnedPtys[0];
     first.fire("term", { code: 1, stable: false } as LocalShellEarlyTerminationEvent);
 
-    // Backoff is scheduled; advance timers to fire restart attempts
-    for (let i = 0; i < 6; i++) {
-      vi.advanceTimersByTime(50);
-      await Promise.resolve();
-    }
+    // Backoff is 500ms on the first retry and doubles from there, so the
+    // window has to be generous. The original 6 x 50ms encoded the broken
+    // schedule: attempts never incremented, so the delay was a constant
+    // 500 * 2^-1 = 250ms and 300ms was enough to catch one.
+    await vi.advanceTimersByTimeAsync(60_000);
     vi.useRealTimers();
 
     // Total spawns: initial + 2 restarts (maxAutoRestarts=2) = 3
     expect(spawnedPtys.length).toBeGreaterThanOrEqual(2);
     expect(spawnedPtys.length).toBeLessThanOrEqual(3);
-    expect(core.incrementLocalServerRestartAttempts).toHaveBeenCalled();
+    // The count lives on the manager now, keyed by config: a per-session
+    // counter restarts at zero with each new session and can never reach a cap.
+    expect(core.updateLocalServerSessionStatus).toHaveBeenCalledWith(expect.any(String), "restarting");
+
+    manager.dispose();
+  });
+
+  it("stops restarting a crash-looping server at the configured cap", async () => {
+    // Against the REAL core, not a spy. The spy fabricates the increment that
+    // the real core declines to perform on an unregistered session, which is
+    // precisely the bug — so a mocked core cannot see this and the existing
+    // cap test passes only because its fake ptys never crash twice.
+    vi.useFakeTimers();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const cfg = baseConfig({ autoRestart: true, maxAutoRestarts: 2 });
+    await core.addOrUpdateLocalServerConfig(cfg);
+    const manager = makeManager(core);
+
+    await manager.start(cfg);
+
+    // Crash every process the manager spawns, as a broken executable would.
+    for (let round = 0; round < 20; round += 1) {
+      const pty = spawnedPtys[spawnedPtys.length - 1];
+      if (!pty || pty.closed) break;
+      pty.fire("term", { code: 1, stable: false } as LocalShellEarlyTerminationEvent);
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    vi.useRealTimers();
+
+    // One initial start plus at most `maxAutoRestarts` retries.
+    expect(spawnedPtys.length).toBeLessThanOrEqual(3);
+
+    manager.dispose();
+  });
+
+  it("keeps a crash-looping server visible as failed rather than silently stopped", async () => {
+    // The status writes ran after the session had been unregistered, so they
+    // were no-ops: the tree showed "stopped" while the loop ran, and the
+    // `failed` state the provider draws could never be reached.
+    vi.useFakeTimers();
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const cfg = baseConfig({ autoRestart: true, maxAutoRestarts: 1 });
+    await core.addOrUpdateLocalServerConfig(cfg);
+    const manager = makeManager(core);
+    const statuses: string[] = [];
+    core.onDidChange(() => {
+      for (const s of core.getSnapshot().activeLocalServerSessions) statuses.push(s.status);
+    });
+
+    await manager.start(cfg);
+    for (let round = 0; round < 4; round += 1) {
+      const pty = spawnedPtys[spawnedPtys.length - 1];
+      if (!pty || pty.closed) break;
+      pty.fire("term", { code: 1, stable: false } as LocalShellEarlyTerminationEvent);
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    vi.useRealTimers();
+
+    expect(statuses).toContain("failed");
 
     manager.dispose();
   });
