@@ -1156,6 +1156,7 @@ mod tests {
 
     const MAC_A: [u8; 6] = [0xAA, 0x00, 0x00, 0x00, 0x00, 0x01];
     const MAC_B: [u8; 6] = [0xBB, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const MAC_STATIC: [u8; 6] = [0xAA, 0x00, 0x00, 0x00, 0x00, 0x0A];
 
     fn ip(text: &str) -> Ipv4Addr {
         text.parse().expect("test address parses")
@@ -1910,6 +1911,43 @@ mod tests {
             restarted.last_reply().yiaddr,
             ip("10.0.0.11"),
             "the contested address must still be held back after a restart"
+        );
+    }
+
+    #[test]
+    fn a_quarantined_reservation_is_not_handed_back_by_its_placeholder() {
+        // Persisting the quarantine only helps if the reservation placeholder
+        // respects it. `seed_static_reservations` files a live `Reserved` entry
+        // unconditionally, and the address lookups check `is_quarantined` on the
+        // static map but not on the entry they fall through to — so the
+        // placeholder handed the contested address straight back. `expire` seeds
+        // too, so the same bypass appears without a restart.
+        let dir = TempDir::new("dhcp-engine-quarantined-reservation");
+        let path = dir.path().join("dhcp-leases.json");
+        let mut o = options();
+        o.lease_store_path = Some(path.clone());
+        o.statics = crate::net::normalize_static_map([("aa:00:00:00:00:0a", ip("10.0.0.10"))]);
+
+        {
+            let mut h = Harness::with(&o);
+            h.feed(&discover(&MAC_STATIC));
+            h.feed(&request(&MAC_STATIC, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+            let decline = PacketBuilder::new(&MAC_STATIC)
+                .message_type(4)
+                .option(OPTION_REQUESTED_IP, &ip("10.0.0.10").octets())
+                .option(OPTION_SERVER_ID, &ip("10.0.0.1").octets())
+                .build();
+            h.feed(&decline);
+            h.core.shutdown();
+        }
+
+        let mut restarted = Harness::with(&o);
+        restarted.feed(&discover(&MAC_STATIC));
+
+        assert_ne!(
+            restarted.last_reply().yiaddr,
+            ip("10.0.0.10"),
+            "a quarantined reservation must not be offered back through its placeholder"
         );
     }
 

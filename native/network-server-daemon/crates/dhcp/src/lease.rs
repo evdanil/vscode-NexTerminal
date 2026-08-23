@@ -286,6 +286,16 @@ impl LeaseTable {
             if self.entries.get(mac).is_some_and(|e| e.address == *address) {
                 continue;
             }
+            // A reservation whose address was just declined is held back like
+            // any other. Seeding a live placeholder for it would report an
+            // address as reserved while the quarantine says it is contested, and
+            // the address lookups would then answer from the placeholder. The
+            // address is not exposed to the pool meanwhile — `lowest_free_address`
+            // skips quarantined addresses — and `expire` seeds again once the
+            // hold lapses.
+            if self.is_quarantined(*address, now_ms) {
+                continue;
+            }
             self.entries.insert(
                 mac.clone(),
                 LeaseEntry {
@@ -372,6 +382,7 @@ impl LeaseTable {
         self.entries
             .get(mac)
             .filter(|entry| entry.is_live(now_ms))
+            .filter(|entry| !self.is_quarantined(entry.address, now_ms))
             .map(|entry| entry.address)
     }
 
@@ -397,6 +408,9 @@ impl LeaseTable {
                 entry.is_live(now_ms)
                     && matches!(entry.state, LeaseState::Bound | LeaseState::Reserved)
             })
+            // A quarantined address is held back from its own holder too: that
+            // holder is the client that just declined it.
+            .filter(|entry| !self.is_quarantined(entry.address, now_ms))
             .map(|entry| entry.address)
     }
 
