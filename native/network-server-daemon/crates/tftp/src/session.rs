@@ -500,6 +500,13 @@ impl TransferSession {
 
         match self.phase {
             Phase::SentLast => {
+                // Progress through the final window is recorded here as it is in
+                // `Sending`. Leaving `last_acked` frozen made every repeat of a
+                // partial ACK look new to the staleness test, so one packet per
+                // interval refreshed the session forever and pinned a slot —
+                // validated as in-window, so the ACK is real progress and
+                // belongs in `last_acked` regardless.
+                self.last_acked = ack;
                 // Only the final DATA block proves the client received the
                 // file. In an option-negotiated one-block RRQ, ACK(0) confirms
                 // only the OACK; accepting it here would complete the transfer
@@ -1123,6 +1130,43 @@ mod tests {
         assert_eq!(
             s.last_activity, before,
             "nor hold the transfer open past its timeout"
+        );
+    }
+
+    #[test]
+    fn a_repeated_partial_ack_in_the_final_window_cannot_pin_a_session() {
+        // `last_acked` advances in `Sending`, which is what makes the staleness
+        // test work — but the `SentLast` arm only checks for the final block and
+        // never records progress, so it stays frozen. An ACK inside the final
+        // window is therefore never stale: every repeat passes validation,
+        // refreshes the activity clock and zeroes the retry budget, so one
+        // packet per interval pins a session forever. Sixty-four source ports
+        // take the whole service, and RRQ needs no configuration to enable.
+        let temp = TempDir::new("session-sentlast-pin");
+        let path = temp.path().join("payload.bin");
+        // Two blocks, the second short, so the final window holds both.
+        std::fs::write(&path, vec![1u8; 512 + 8]).unwrap();
+        let mut s = session_for_file(&path, raw(&[("blksize", "512"), ("windowsize", "2")]));
+        s.init_for_read(512 + 8);
+        s.handle_ack(0);
+        let sent = s.produce_next_send_packets().unwrap();
+        s.record_outbound(&sent);
+        assert_eq!(s.phase, Phase::SentLast, "the short block ends the window");
+        assert_eq!(s.block, 2);
+
+        s.handle_ack(1);
+        s.retries = 3;
+        let before = s.last_activity;
+        let outcome = s.handle_ack(1);
+
+        assert!(!outcome.done, "a partial ACK does not finish the transfer");
+        assert_eq!(
+            s.retries, 3,
+            "a repeat of an ACK already given must not refill the retry budget"
+        );
+        assert_eq!(
+            s.last_activity, before,
+            "nor hold the session past its timeout"
         );
     }
 
