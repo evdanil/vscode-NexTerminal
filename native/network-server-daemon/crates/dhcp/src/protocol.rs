@@ -81,6 +81,18 @@ pub const MAX_HARDWARE_LEN: usize = 16;
 /// one hostile datagram from becoming an unbounded write to that pipe.
 pub const MAX_ECHOED_TEXT: usize = 200;
 
+/// Byte ceiling for the same text, which is the bound that actually matters.
+///
+/// [`MAX_ECHOED_TEXT`] counts `char`s, and a `char` is up to four bytes —
+/// `String::from_utf8_lossy` turns every invalid byte into U+FFFD, three bytes
+/// apiece, so a 200-`char` cap still admits 600 bytes. The extension host parses
+/// a lease `hostname` against a 255-byte bound and treats an over-long value as
+/// a malformed RPC result, which terminates the daemon; without a byte bound one
+/// unauthenticated option 12 of invalid bytes stops the DHCP service. 255 is
+/// that host bound, and every text this module echoes goes through the same
+/// gate, so no field can drift past it.
+pub const MAX_ECHOED_TEXT_BYTES: usize = 255;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -425,10 +437,18 @@ impl Options {
 /// Replaces control characters and truncates operator-facing text.
 #[must_use]
 pub fn sanitize_text(text: &str) -> String {
-    text.chars()
-        .take(MAX_ECHOED_TEXT)
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect()
+    let mut out = String::new();
+    for c in text.chars().take(MAX_ECHOED_TEXT) {
+        // Substituted before it is measured: U+FFFD is three bytes where the
+        // control character it replaces was one, so accounting for the original
+        // would under-count exactly the hostile case this bound exists for.
+        let c = if c.is_control() { '\u{fffd}' } else { c };
+        if out.len() + c.len_utf8() > MAX_ECHOED_TEXT_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Parses an option region.
@@ -1009,6 +1029,42 @@ mod tests {
         let text = message.options.text(OPTION_HOSTNAME).unwrap();
         assert!(!text.contains('\x1b'), "an escape sequence must not reach the log");
         assert!(text.chars().count() <= MAX_ECHOED_TEXT);
+    }
+
+    #[test]
+    fn sanitized_text_fits_the_byte_bound_the_host_parses_it_with() {
+        // `from_utf8_lossy` expands every invalid byte to U+FFFD, which is three
+        // bytes, so a cap counted in `char`s admits 200 of them — 600 bytes. The
+        // extension host parses a lease hostname with a 255-byte bound and treats
+        // anything longer as a malformed RPC result, which terminates the running
+        // daemon. A single option 12 of invalid bytes would therefore stop the
+        // DHCP service from off the LAN, unauthenticated.
+        let packet = PacketBuilder::new(&[1, 2, 3, 4, 5, 6])
+            .message_type(1)
+            .option(OPTION_HOSTNAME, &[0xffu8; 255])
+            .build();
+        let message = Message::decode(&packet).unwrap();
+        let text = message.options.text(OPTION_HOSTNAME).unwrap();
+        assert!(
+            text.len() <= MAX_ECHOED_TEXT_BYTES,
+            "sanitized text must fit the host's DHCP field bound; got {} bytes",
+            text.len()
+        );
+        assert!(!text.is_empty(), "a bounded hostname is still worth showing");
+    }
+
+    #[test]
+    fn a_byte_bounded_hostname_is_cut_on_a_character_boundary() {
+        // Bounding by bytes must not split a multi-byte character: a `String`
+        // cannot hold half of one, and truncating to a byte index inside a
+        // sequence would panic rather than shorten.
+        let wide = "\u{1f600}".repeat(120); // 4 bytes each, 480 bytes total
+        let text = sanitize_text(&wide);
+        assert!(text.len() <= MAX_ECHOED_TEXT_BYTES);
+        assert!(
+            text.chars().all(|c| c == '\u{1f600}'),
+            "every retained character must have survived whole"
+        );
     }
 
     // -- encoding ------------------------------------------------------------
