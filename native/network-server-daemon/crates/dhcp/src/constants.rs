@@ -20,6 +20,11 @@ pub const DEFAULT_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new
 pub const DEFAULT_LEASE_SECS: u32 = 86_400;
 /// Maximum dynamic pool size accepted by the extension host runtime parser.
 pub const MAX_DHCP_POOL_SIZE: u32 = 65_536;
+/// Maximum static reservations accepted by the same parser, mirroring
+/// `MAX_STATIC_RESERVATIONS` in `networkServerConfigValidation.ts`. A
+/// reservation outside the dynamic range adds a lease the pool size does not
+/// account for, so both bounds are needed to size the lease file.
+pub const MAX_STATIC_RESERVATIONS: u32 = 1_024;
 
 // -- Option codes (RFC 2132) ------------------------------------------------
 

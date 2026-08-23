@@ -39,6 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::constants::{MAX_DHCP_POOL_SIZE, MAX_STATIC_RESERVATIONS};
 use crate::lease::{LeaseInfo, LeaseType};
 use crate::net::{is_ip_in_pool, MacKey};
 
@@ -49,12 +50,33 @@ use crate::net::{is_ip_in_pool, MacKey};
 /// dropping it is far below the cost of mis-reading it.
 pub const LEASE_STORE_VERSION: u64 = 1;
 
+/// Upper bound on one pretty-printed lease record.
+///
+/// The measured worst case is 793 bytes: a 17-character MAC, a 15-character
+/// address, `u64::MAX` timestamps, and a hostname at the sanitizer's 255-byte
+/// ceiling made entirely of characters JSON escapes to two bytes each. Rounded
+/// up to leave room for a field being added without silently invalidating every
+/// file already on disk.
+const MAX_LEASE_RECORD_BYTES: u64 = 1024;
+
+/// Every lease the writer can be asked to persist at once.
+///
+/// One bound lease occupies one address, so the dynamic pool caps the count —
+/// except that a static reservation may sit outside the range and add to it.
+const MAX_PERSISTED_LEASES: u64 =
+    MAX_DHCP_POOL_SIZE as u64 + MAX_STATIC_RESERVATIONS as u64;
+
 /// Refuses to read a lease file larger than this.
 ///
-/// Nothing legitimate approaches it — a thousand leases is well under a
-/// megabyte. It exists so that a corrupt or hostile file cannot make start-up
-/// allocate without bound, on a path that runs before the socket is serving.
-pub const MAX_LEASE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// It exists so that a corrupt or hostile file cannot make start-up allocate
+/// without bound, on a path that runs before the socket is serving. It is
+/// *derived* rather than chosen: a limit below what `save_leases` can produce
+/// makes the daemon silently discard its own file, forget every still-valid
+/// lease, and hand out addresses that clients are still using — the failure is
+/// invisible because a rejected file is indistinguishable from no file at all.
+/// The previous fixed 8 MiB was roughly a sixth of what a fully-populated
+/// supported pool writes.
+pub const MAX_LEASE_FILE_BYTES: u64 = MAX_PERSISTED_LEASES * MAX_LEASE_RECORD_BYTES + 4096;
 
 /// Why a persisted lease was not restored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +532,47 @@ mod tests {
         assert_eq!(loaded.len(), 2, "only the two well-formed records survive");
         assert_eq!(loaded[0].ip, ip("10.0.0.10"));
         assert_eq!(loaded[1].ip, ip("10.0.0.15"));
+    }
+
+    #[test]
+    fn the_read_limit_admits_the_largest_file_the_writer_can_produce() {
+        // A read limit below what `save_leases` can write makes the daemon
+        // discard its own file on the next start. Nothing reports that: a
+        // rejected file is indistinguishable from no file, so the server simply
+        // forgets every still-valid lease and starts handing out addresses that
+        // clients are still using.
+        let dir = TempDir::new("dhcp-file-ceiling");
+        let worst = LeaseInfo {
+            mac: MacKey::from_hardware(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            ip: Ipv4Addr::BROADCAST,
+            bound_at: u64::MAX,
+            lease_sec: u32::MAX,
+            expires_at: u64::MAX,
+            remaining_sec: u64::MAX,
+            // The sanitizer's ceiling, of a character JSON escapes to two bytes.
+            hostname: Some("\"".repeat(crate::protocol::MAX_ECHOED_TEXT_BYTES)),
+            lease_type: LeaseType::Dynamic,
+        };
+
+        let one_path = dir.path().join("one.json");
+        let many_path = dir.path().join("many.json");
+        save_leases(&one_path, std::slice::from_ref(&worst)).unwrap();
+        save_leases(&many_path, &vec![worst; 257]).unwrap();
+        let one = fs::metadata(&one_path).unwrap().len();
+        let many = fs::metadata(&many_path).unwrap().len();
+
+        // The file is a fixed envelope plus a constant cost per record, and
+        // every record here is identical, so the difference over 256 of them is
+        // the per-record cost exactly rather than an estimate.
+        let per_record = (many - one) / 256;
+        let envelope = one - per_record;
+        let largest = envelope + per_record * MAX_PERSISTED_LEASES;
+
+        assert!(
+            largest <= MAX_LEASE_FILE_BYTES,
+            "the reader must not reject what the writer produces: {MAX_PERSISTED_LEASES} \
+             leases need {largest} bytes, the limit is {MAX_LEASE_FILE_BYTES}"
+        );
     }
 
     #[test]
