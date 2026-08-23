@@ -526,6 +526,21 @@ impl TransferSession {
                 done: false,
             };
         }
+        // If the cumulative ACK for a full WRQ window is lost, clients commonly
+        // retransmit the whole window. Those DATA blocks have already been
+        // written, so repeating the cumulative ACK is the only safe response:
+        // accepting them would duplicate file contents, and rejecting them would
+        // abort an otherwise healthy upload.
+        if self.bytes_transferred > 0
+            && self.block == next_block(self.last_acked)
+            && block_distance(block, self.last_acked) < self.opts.windowsize
+        {
+            return DataOutcome {
+                send: vec![encode_ack(self.last_acked)],
+                write: None,
+                done: false,
+            };
+        }
         if block != self.block {
             self.set_error(
                 ErrorCode::IllegalOperation,
@@ -1021,6 +1036,29 @@ mod tests {
         let outcome = s.handle_data(1, &vec![0u8; 513]);
         assert!(outcome.done);
         assert_eq!(s.error().unwrap().0, ErrorCode::IllegalOperation);
+    }
+
+    #[test]
+    fn a_windowed_write_reacks_retransmitted_blocks_from_a_completed_window() {
+        let mut s = session(Direction::Write, raw(&[("windowsize", "4")]));
+        s.init_for_write();
+        for block in 1..=3u16 {
+            let outcome = s.handle_data(block, &vec![block as u8; 512]);
+            assert!(outcome.send.is_empty(), "block {block} is inside the window");
+            assert!(outcome.write.is_some());
+        }
+        let outcome = s.handle_data(4, &vec![4u8; 512]);
+        assert_eq!(ack_block(&outcome.send[0]), 4);
+        assert_eq!(s.last_acked, 4);
+        assert_eq!(s.block, 5);
+
+        for block in 1..=4u16 {
+            let outcome = s.handle_data(block, &vec![block as u8; 512]);
+            assert_eq!(s.phase, Phase::Receiving, "block {block} must not abort the transfer");
+            assert_eq!(ack_block(&outcome.send[0]), 4, "block {block} should resend the cumulative ACK");
+            assert!(outcome.write.is_none(), "block {block} was already written");
+            assert!(!outcome.done);
+        }
     }
 
     // --- retransmission queue -------------------------------------------------

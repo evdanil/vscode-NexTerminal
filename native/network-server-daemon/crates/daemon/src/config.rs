@@ -10,6 +10,7 @@
 //! configuration regardless of how it arrived.
 
 use nexus_dhcp::boot::{BootOptions, VendorEntry};
+use nexus_dhcp::constants::MAX_OPTION_VALUE_BYTES;
 use nexus_dhcp::engine::EngineOptions as DhcpEngineOptions;
 use nexus_dhcp::net::{broadcast_address, MacKey};
 use serde::Deserialize;
@@ -35,6 +36,9 @@ pub const DHCP_DEFAULT_PORT: u16 = 67;
 /// to forward there. It exists so the operator sees a running service and a log
 /// line naming the real remedy, rather than a bind error with no path forward.
 pub const DHCP_FALLBACK_PORT: u16 = 1067;
+const IPV4_BYTES_PER_DHCP_OPTION_ENTRY: usize = 4;
+const MAX_IPV4_ADDRESSES_PER_DHCP_OPTION: usize =
+    MAX_OPTION_VALUE_BYTES / IPV4_BYTES_PER_DHCP_OPTION_ENTRY;
 
 /// TFTP settings, as the host sends them. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -206,12 +210,12 @@ impl DhcpConfig {
         options.address = match &self.bind_address {
             None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             Some(raw) if raw.trim().is_empty() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            Some(raw) => raw.trim().parse::<IpAddr>().map_err(|_| {
+            Some(raw) => IpAddr::V4(raw.trim().parse::<Ipv4Addr>().map_err(|_| {
                 format!(
-                    "'{raw}' is not a valid IP address for the DHCP interface setting. \
+                    "'{raw}' is not a valid IPv4 address for the DHCP interface setting. \
                      Leave it empty to serve on all interfaces."
                 )
-            })?,
+            })?),
         };
         if let Some(value) = parse_optional_ipv4(self.range_start.as_deref(), "Pool Start")? {
             options.range_start = value;
@@ -320,7 +324,7 @@ fn parse_optional_ipv4(raw: Option<&str>, label: &str) -> Result<Option<Ipv4Addr
 }
 
 fn parse_ipv4_list(values: &[String], label: &str) -> Result<Vec<Ipv4Addr>, String> {
-    values
+    let parsed = values
         .iter()
         .filter(|text| !text.trim().is_empty())
         .map(|text| {
@@ -328,7 +332,15 @@ fn parse_ipv4_list(values: &[String], label: &str) -> Result<Vec<Ipv4Addr>, Stri
                 .parse::<Ipv4Addr>()
                 .map_err(|_| format!("{label} ('{text}') is not a valid IPv4 address."))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.len() > MAX_IPV4_ADDRESSES_PER_DHCP_OPTION {
+        let count = parsed.len();
+        return Err(format!(
+            "{label} list has {count} address(es); DHCP options can carry at most \
+             {MAX_IPV4_ADDRESSES_PER_DHCP_OPTION}."
+        ));
+    }
+    Ok(parsed)
 }
 
 /// The stored configuration for both services.
@@ -585,6 +597,7 @@ mod tests {
             (json!({"subnet": "255.0.255.0"}), "contiguous"),
             (json!({"dns": ["8.8.8.8", "nope"]}), "DNS server"),
             (json!({"tftpServerAddresses": ["nope"]}), "TFTP server address"),
+            (json!({"bindAddress": "::1"}), "DHCP interface"),
         ];
         for (payload, expected) in cases {
             let mut store = ConfigStore::default();
@@ -601,6 +614,21 @@ mod tests {
                 err.0
             );
         }
+    }
+
+    #[test]
+    fn oversized_dhcp_address_lists_are_refused_before_startup() {
+        let dns: Vec<String> = (1..=64).map(|i| format!("10.0.0.{i}")).collect();
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(&json!({"dhcp": {"dns": dns}})))
+            .unwrap_err();
+        assert!(err.0.contains("DNS server"), "got {}", err.0);
+        assert!(err.0.contains("at most 63"), "got {}", err.0);
+        assert!(
+            store.dhcp().dns.is_none(),
+            "the rejected DNS list must not be stored for a later start"
+        );
     }
 
     #[test]
