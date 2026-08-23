@@ -28,10 +28,11 @@ use std::time::{Duration, Instant};
 use crate::boot::BootOptions;
 use crate::constants::{
     CLIENT_PORT, DEFAULT_BROADCAST, DEFAULT_GATEWAY, DEFAULT_LEASE_SECS, DEFAULT_PORT,
-    DEFAULT_RANGE_END, DEFAULT_RANGE_START, DEFAULT_SERVER_ID, DEFAULT_SUBNET, OPTION_BROADCAST,
-    OPTION_DNS, OPTION_HOSTNAME, OPTION_LEASE_TIME, OPTION_MESSAGE, OPTION_MESSAGE_TYPE,
-    OPTION_REBINDING_TIME, OPTION_RENEWAL_TIME, OPTION_REQUESTED_IP, OPTION_ROUTER,
-    OPTION_SERVER_ID, OPTION_SUBNET_MASK, OPTION_VENDOR_CLASS_ID, OP_BOOTREQUEST,
+    DEFAULT_RANGE_END, DEFAULT_RANGE_START, DEFAULT_SERVER_ID, DEFAULT_SUBNET,
+    MAX_DHCP_POOL_SIZE, OPTION_BROADCAST, OPTION_DNS, OPTION_HOSTNAME, OPTION_LEASE_TIME,
+    OPTION_MESSAGE, OPTION_MESSAGE_TYPE, OPTION_REBINDING_TIME, OPTION_RENEWAL_TIME,
+    OPTION_REQUESTED_IP, OPTION_ROUTER, OPTION_SERVER_ID, OPTION_SUBNET_MASK,
+    OPTION_VENDOR_CLASS_ID, OP_BOOTREQUEST,
 };
 use crate::lease::{BindOutcome, LeaseInfo, LeaseTable, PoolInfo};
 use crate::net::{pool_size, MacKey};
@@ -239,11 +240,17 @@ impl EngineOptions {
     /// that binds and then answers nothing reads as "DHCP is broken" with no
     /// diagnosis anywhere, which is the worst possible way to report a typo.
     pub fn validate(&self) -> Result<(), String> {
-        if pool_size(self.range_start, self.range_end) == 0 {
+        let size = pool_size(self.range_start, self.range_end);
+        if size == 0 {
             return Err(format!(
                 "The address pool {} → {} is empty: the end address is below the start. \
                  No client could be given an address.",
                 self.range_start, self.range_end
+            ));
+        }
+        if size > MAX_DHCP_POOL_SIZE {
+            return Err(format!(
+                "DHCP pool size is {size} addresses; it must not exceed 65,536."
             ));
         }
         Ok(())

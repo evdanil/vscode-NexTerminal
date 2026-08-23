@@ -585,6 +585,18 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_dhcp_pool_is_refused_at_configure_time() {
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(
+                &json!({"dhcp": {"rangeStart": "10.0.0.1", "rangeEnd": "10.1.0.1"}}),
+            ))
+            .unwrap_err();
+        assert!(err.0.contains("65,536"), "got {}", err.0);
+        assert!(store.dhcp().range_start.is_none(), "the rejected value must not be stored");
+    }
+
+    #[test]
     fn every_malformed_dhcp_address_is_refused_by_name() {
         // Falling back to a default would paint the bad value into the sidebar
         // as the configuration in force while the service served something else.
@@ -629,6 +641,26 @@ mod tests {
             store.dhcp().dns.is_none(),
             "the rejected DNS list must not be stored for a later start"
         );
+    }
+
+    #[test]
+    fn oversized_boot_option_strings_are_refused_before_startup() {
+        let too_long = "x".repeat(MAX_OPTION_VALUE_BYTES + 1);
+        for (payload, label) in [
+            (json!({"bootFileName": too_long.clone()}), "Boot File Name"),
+            (json!({"nextServer": too_long.clone()}), "Next Server"),
+        ] {
+            let mut store = ConfigStore::default();
+            let err = store
+                .apply(&configs(&json!({"dhcp": payload})))
+                .unwrap_err();
+            assert!(err.0.contains(label), "got {}", err.0);
+            assert!(err.0.contains("255"), "got {}", err.0);
+            assert!(
+                store.dhcp().boot_file_name.is_none() && store.dhcp().next_server.is_none(),
+                "the rejected boot option must not be stored for a later start"
+            );
+        }
     }
 
     #[test]

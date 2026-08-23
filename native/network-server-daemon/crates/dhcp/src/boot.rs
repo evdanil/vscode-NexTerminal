@@ -52,6 +52,8 @@ pub enum BootOptionError {
     SubOptionTooLong { sub_option: i64, len: usize },
     /// The concatenated payload cannot fit in a single DHCP option.
     PayloadTooLong(usize),
+    /// An option 66/67 text value is longer than its length byte can describe.
+    TextTooLong { label: &'static str, len: usize },
     /// The surrounding option itself could not be written.
     Encode(EncodeError),
 }
@@ -82,6 +84,10 @@ impl fmt::Display for BootOptionError {
                 "option 43 payload is {len} bytes; a single DHCP option carries at most \
                  {MAX_OPTION_VALUE_BYTES}. Remove or shorten sub-options."
             ),
+            Self::TextTooLong { label, len } => write!(
+                f,
+                "{label} is {len} bytes; a DHCP option carries at most {MAX_OPTION_VALUE_BYTES}"
+            ),
             Self::Encode(e) => write!(f, "{e}"),
         }
     }
@@ -93,6 +99,23 @@ impl From<EncodeError> for BootOptionError {
     fn from(value: EncodeError) -> Self {
         Self::Encode(value)
     }
+}
+
+fn normalize_option_text(
+    value: Option<String>,
+    label: &'static str,
+) -> Result<Option<String>, BootOptionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let len = value.len();
+    if len > MAX_OPTION_VALUE_BYTES {
+        return Err(BootOptionError::TextTooLong { label, len });
+    }
+    Ok(Some(value))
 }
 
 /// Sub-option codes 0 and 255 are reserved by the option encoding itself.
@@ -216,8 +239,8 @@ impl BootOptions {
         vendor_entries: &[VendorEntry],
     ) -> Result<Self, BootOptionError> {
         Ok(Self {
-            next_server: next_server.filter(|s| !s.trim().is_empty()),
-            boot_file_name: boot_file_name.filter(|s| !s.trim().is_empty()),
+            next_server: normalize_option_text(next_server, "Next Server")?,
+            boot_file_name: normalize_option_text(boot_file_name, "Boot File Name")?,
             tftp_server_addresses,
             vendor_class_id: vendor_class_id.filter(|s| !s.trim().is_empty()),
             vendor_specific: encode_vendor_specific_info(vendor_entries)?,

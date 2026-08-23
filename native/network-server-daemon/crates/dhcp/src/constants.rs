@@ -18,6 +18,8 @@ pub const DEFAULT_SERVER_ID: Ipv4Addr = Ipv4Addr::new(192, 168, 2, 1);
 pub const DEFAULT_BROADCAST: Ipv4Addr = Ipv4Addr::new(192, 168, 2, 255);
 pub const DEFAULT_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)];
 pub const DEFAULT_LEASE_SECS: u32 = 86_400;
+/// Maximum dynamic pool size accepted by the extension host runtime parser.
+pub const MAX_DHCP_POOL_SIZE: u32 = 65_536;
 
 // -- Option codes (RFC 2132) ------------------------------------------------
 
