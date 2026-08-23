@@ -140,7 +140,11 @@ export function readNetworkServerEngine(): NetworkServerEngine {
   const fromEnv = normalizeNetworkServerEngine(process.env[ENGINE_ENV_VAR]);
   if (fromEnv) return fromEnv;
   const fromSetting = vscode.workspace.getConfiguration("nexus.networkServers").get<unknown>("engine");
-  return normalizeNetworkServerEngine(fromSetting) ?? "node";
+  // Matches the declared default in package.json. A value that is neither
+  // engine is treated as unset rather than as a reason to pick the other one:
+  // an operator who typed something wrong should get what an operator who typed
+  // nothing gets, not a different implementation.
+  return normalizeNetworkServerEngine(fromSetting) ?? "rust";
 }
 
 /**
@@ -308,6 +312,11 @@ export function readDhcpConfig(globalStoragePath?: string): DhcpAdapterConfig {
       : undefined;
   return {
     ...result.value,
+    // Read straight from configuration rather than through the sanitizer: it is
+    // a plain boolean with no cross-field meaning, and the daemon defaults it
+    // off if the key never arrives.
+    allowRelayAgents:
+      vscode.workspace.getConfiguration(section).get<boolean>("allowRelayAgents", false) === true,
     leaseTimeSec: result.value.leaseTimeSec ?? 86_400,
     leaseStorePath: globalStoragePath ? resolveDhcpLeaseStorePath(globalStoragePath) : undefined,
     nextServer: nextServer ?? autoLinked,

@@ -188,6 +188,14 @@ export interface DhcpEngineConfig {
   readonly vendorClassId?: string;
   /** Option 43 — vendor-specific sub-options, TLV-encoded onto the wire. */
   readonly vendorSpecificOptions?: readonly DhcpVendorSpecificEntry[];
+  /**
+   * Serve requests naming a relay agent in `giaddr`. Off unless set.
+   *
+   * Honoured by the Rust engine. The JavaScript engine delegates reply routing
+   * to the `dhcp` package and cannot act on this, which is stated in the setting
+   * description rather than left for someone to discover.
+   */
+  readonly allowRelayAgents?: boolean;
 }
 
 /** Counters for DHCP messages processed since startup.

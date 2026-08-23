@@ -531,6 +531,11 @@ export class NetworkServerDaemonHost {
    */
   private resolveLaunchTarget(): LaunchTarget {
     const nodeTarget = this.nodeLaunchTarget();
+    // Deliberately still "node" where *nothing* was asked for, though the user
+    // -facing default is now "rust". This is the mechanism's default, not the
+    // product's: production always supplies `resolveEngine`, so this arm is
+    // reached only by a caller that expressed no preference at all, and the
+    // bundled daemon is the one that needs no packaged artifact to exist.
     const engine = this.options.resolveEngine?.() ?? this.options.engine ?? "node";
     if (engine !== "rust") return nodeTarget;
 

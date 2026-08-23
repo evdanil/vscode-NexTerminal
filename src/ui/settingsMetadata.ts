@@ -563,8 +563,8 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "networkServers",
     subgroup: "Advanced",
     description:
-      "Which implementation backs the embedded TFTP and DHCP services. Node runs the bundled JavaScript daemon and works on every supported platform. Rust runs a native binary speaking the identical stdio JSON-RPC protocol, using a packaged binary when one is installed or NEXUS_NETWORK_SERVER_DAEMON_BIN for development; if no native binary is available the JavaScript daemon is used instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Takes effect the next time the daemon starts.",
-    default: "node",
+      "Which implementation backs the embedded TFTP and DHCP services. Rust, the default, runs a native binary packaged for all six supported platforms; it parses the wire protocol under this project's own tests rather than an unmaintained dependency, forbids unsafe code, and aborts on arithmetic overflow instead of continuing with a wrong value. Node runs the bundled JavaScript daemon, which is what shipped before 2.8.205 and remains the fallback: if no native binary is available for this platform, or NEXUS_NETWORK_SERVER_DAEMON_BIN points at nothing, the JavaScript daemon starts instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Note that DHCP relay requests are answered only by the Node engine unless Serve Relayed Requests is switched on. Takes effect the next time the daemon starts.",
+    default: "rust",
     enumOptions: [
       {
         label: "Node",
@@ -738,6 +738,17 @@ export const SETTINGS_META: SettingMeta[] = [
     description:
       "Point DHCP clients at this machine's own TFTP service. When the boot server and the option 150 address list are both empty, options 66 and 150 are filled in from the TFTP bind interface so ZTP works without typing the same address twice. Setting either one by hand turns the link off for both — quietly advertising a second, different boot server under the other option number is how a device boots from the wrong host. If TFTP is bound to all interfaces there is no single address to advertise, and both options are left unset rather than guessed.",
     default: true
+  },
+  {
+    key: "dhcp.allowRelayAgents",
+    section: "nexus.networkServers",
+    label: "Serve Relayed Requests",
+    type: "boolean",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
+    description:
+      "Answer requests that name a relay agent in their giaddr field, per RFC 2131 §4.1. Off by default, and worth leaving off unless this server actually sits behind a DHCP relay: nothing in the protocol authenticates that field, so with it on, any device on the network can have a full configuration — subnet, gateway, DNS, boot options — sent to an address of its choosing. A bench or lab server has no relays in the picture and loses nothing by refusing them. Honoured by the Rust engine only; the JavaScript engine leaves reply routing to its DHCP library and always follows the RFC here.",
+    default: false
   },
   {
     key: "dhcp.vendorClassId",
