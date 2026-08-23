@@ -50,6 +50,15 @@ use crate::net::{is_ip_in_pool, MacKey};
 /// dropping it is far below the cost of mis-reading it.
 pub const LEASE_STORE_VERSION: u64 = 1;
 
+/// The largest integer the host can carry back out of a lease.
+///
+/// The runtime snapshot crosses a JSON boundary into JavaScript, where every
+/// number is a double and the host parses timestamps with `Number.isSafeInteger`
+/// — anything above 2^53 - 1 makes it read the whole response as malformed and
+/// retire the daemon. A value this large cannot be a real epoch millisecond in
+/// any case: it is roughly the year 287396.
+const MAX_SAFE_INTEGER_MS: u64 = 9_007_199_254_740_991;
+
 /// Upper bound on one pretty-printed lease record.
 ///
 /// The measured worst case is 793 bytes: a 17-character MAC, a 15-character
@@ -84,6 +93,9 @@ pub enum DropReason {
     Expired,
     StaticConflict,
     OutOfPool,
+    /// Another record already restored this address. `LeaseTable` keys entries
+    /// by MAC, so nothing downstream would notice two of them naming one IP.
+    DuplicateAddress,
 }
 
 impl DropReason {
@@ -93,6 +105,7 @@ impl DropReason {
             Self::Expired => "expired",
             Self::StaticConflict => "static-conflict",
             Self::OutOfPool => "out-of-pool",
+            Self::DuplicateAddress => "duplicate-address",
         }
     }
 }
@@ -214,7 +227,13 @@ fn finite_ms(value: &Value) -> Option<u64> {
     }
     #[allow(clippy::cast_sign_loss, reason = "the value is checked non-negative above")]
     let millis = number as u64;
-    Some(millis)
+    // Rejected rather than clamped. The cast above saturates, so a value like
+    // 1e30 arrives as u64::MAX and goes back out in the runtime snapshot far
+    // above what the host will parse — costing the whole response and the
+    // daemon with it, on every start, because the value is in a file. Clamping
+    // would keep the record while inventing a lease that effectively never
+    // expires; the record is corrupt, so it is dropped like any other.
+    (millis <= MAX_SAFE_INTEGER_MS).then_some(millis)
 }
 
 /// Writes the lease table atomically.
@@ -303,6 +322,11 @@ pub fn now_epoch_ms() -> u64 {
 #[must_use]
 pub fn reconcile(leases: &[LeaseInfo], context: &ReconcileContext<'_>) -> ReconcileResult {
     let mut result = ReconcileResult::default();
+    // `LeaseTable::restore` keys entries by MAC, so two records naming one
+    // address both survive it, and each client is later handed that address
+    // back as its own. Nothing downstream compares them, and the conflict
+    // returns on every start because the file is what says so.
+    let mut claimed: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
     for lease in leases {
         if lease.expires_at <= context.now_ms {
             result.dropped.push(DroppedLease { lease: lease.clone(), reason: DropReason::Expired });
@@ -312,7 +336,18 @@ pub fn reconcile(leases: &[LeaseInfo], context: &ReconcileContext<'_>) -> Reconc
         // with colons and a lease keyed off the wire must meet.
         if let Some(reserved) = context.statics.get(&lease.mac) {
             if *reserved == lease.ip {
-                result.restored.push(LeaseInfo { lease_type: LeaseType::Static, ..lease.clone() });
+                // Claimed here too: two reservations may name one address, and
+                // a restore that honoured both would seat two clients on it.
+                if claimed.insert(lease.ip) {
+                    result
+                        .restored
+                        .push(LeaseInfo { lease_type: LeaseType::Static, ..lease.clone() });
+                } else {
+                    result.dropped.push(DroppedLease {
+                        lease: lease.clone(),
+                        reason: DropReason::DuplicateAddress,
+                    });
+                }
             } else {
                 result.dropped.push(DroppedLease {
                     lease: lease.clone(),
@@ -332,6 +367,13 @@ pub fn reconcile(leases: &[LeaseInfo], context: &ReconcileContext<'_>) -> Reconc
             result
                 .dropped
                 .push(DroppedLease { lease: lease.clone(), reason: DropReason::OutOfPool });
+            continue;
+        }
+        if !claimed.insert(lease.ip) {
+            result.dropped.push(DroppedLease {
+                lease: lease.clone(),
+                reason: DropReason::DuplicateAddress,
+            });
             continue;
         }
         result.restored.push(LeaseInfo { lease_type: LeaseType::Dynamic, ..lease.clone() });
@@ -592,6 +634,81 @@ mod tests {
             "restored {} records; the runtime protocol carries at most {MAX_PERSISTED_LEASES}",
             loaded.len()
         );
+    }
+
+    #[test]
+    fn two_reservations_naming_one_address_seat_only_one_client() {
+        // The reserved path restores on its own terms, so the dedupe has to
+        // cover it as well: a configuration with two MACs pointing at one
+        // address would otherwise put both of them on it after a restart.
+        let map = statics(&[
+            ("AA-00-00-00-00-01", "10.0.0.10"),
+            ("AA-00-00-00-00-02", "10.0.0.10"),
+        ]);
+        let ctx = context(&map);
+        let leases = [
+            lease("AA-00-00-00-00-01", "10.0.0.10", NOW + 3_600_000),
+            lease("AA-00-00-00-00-02", "10.0.0.10", NOW + 3_600_000),
+        ];
+
+        let result = reconcile(&leases, &ctx);
+
+        assert_eq!(result.restored.len(), 1, "one address, one holder");
+        assert_eq!(result.dropped[0].reason, DropReason::DuplicateAddress);
+    }
+
+    #[test]
+    fn a_timestamp_beyond_the_safe_integer_range_is_dropped() {
+        // 1e30 is finite and non-negative, so it passed, and the cast to u64
+        // saturated it to u64::MAX. Re-emitted in the runtime snapshot that is
+        // far above Number.MAX_SAFE_INTEGER, which the host parses timestamps
+        // with — so the response is malformed, the daemon is retired, and
+        // because the value lives in a file it happens again on every start.
+        let dir = TempDir::new("dhcp-huge-timestamp");
+        let path = dir.path().join("dhcp-leases.json");
+        let payload = json!({
+            "version": 1, "savedAt": NOW,
+            "leases": [
+                {"mac": "AA-00-00-00-00-01", "ip": "10.0.0.10", "boundAt": NOW,
+                 "leaseSec": 3600, "expiresAt": 1e30, "remainingSec": 3600,
+                 "hostname": null, "leaseType": "dynamic"},
+                {"mac": "AA-00-00-00-00-02", "ip": "10.0.0.11", "boundAt": NOW,
+                 "leaseSec": 3600, "expiresAt": NOW + 3_600_000, "remainingSec": 3600,
+                 "hostname": null, "leaseType": "dynamic"}
+            ]
+        });
+        fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
+
+        let loaded = load_leases(&path);
+
+        assert_eq!(loaded.len(), 1, "the unrepresentable record must not be restored");
+        assert_eq!(loaded[0].ip, ip("10.0.0.11"));
+        for lease in &loaded {
+            assert!(lease.expires_at <= MAX_SAFE_INTEGER_MS);
+            assert!(lease.bound_at <= MAX_SAFE_INTEGER_MS);
+            assert!(lease.remaining_sec <= MAX_SAFE_INTEGER_MS);
+        }
+    }
+
+    #[test]
+    fn two_restored_leases_never_share_an_address() {
+        // LeaseTable::restore keys entries by MAC, so two records naming the
+        // same IP under different MACs both survive. Each client is then handed
+        // its own restored address back — the same address — and the conflict
+        // persists across restarts because it is what the file says.
+        let map = statics(&[]);
+        let ctx = context(&map);
+        let leases = [
+            lease("AA-00-00-00-00-01", "10.0.0.10", NOW + 3_600_000),
+            lease("AA-00-00-00-00-02", "10.0.0.10", NOW + 3_600_000),
+        ];
+
+        let result = reconcile(&leases, &ctx);
+
+        assert_eq!(result.restored.len(), 1, "one address, one holder");
+        assert_eq!(result.restored[0].mac, MacKey::parse_lossy("AA-00-00-00-00-01"));
+        assert_eq!(result.dropped.len(), 1);
+        assert_eq!(result.dropped[0].reason, DropReason::DuplicateAddress);
     }
 
     #[test]
