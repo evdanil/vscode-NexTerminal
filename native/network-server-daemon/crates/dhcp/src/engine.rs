@@ -56,6 +56,14 @@ pub const DEFAULT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Receive buffer: the largest payload a UDP datagram can carry.
 const RECV_BUFFER: usize = 65_536;
 
+/// How many dropped leases the restore line names individually.
+///
+/// The rest are counted. A lease file may hold tens of thousands of records and
+/// reconciliation can reject every one of them — after a pool is re-ranged, say
+/// — so the full list runs to megabytes, and the host reads log lines under the
+/// same 1 MiB ceiling as everything else.
+const MAX_LISTED_DROPPED_LEASES: usize = 20;
+
 /// Consecutive unexpected socket errors tolerated before the loop gives up.
 ///
 /// Without a bound, a socket wedged in a permanently-failing state spins a core
@@ -425,13 +433,24 @@ impl<S: Datagram> DhcpCore<S> {
             path.display()
         );
         if !result.dropped.is_empty() {
-            let detail = result
-                .dropped
+            // Listed, not enumerated. `dropped` is bounded only by the
+            // persisted-lease cap, so spelling all of them out runs to megabytes
+            // against the host's 1 MiB line — and an over-long line is not
+            // truncated by the reader, it fails the protocol and takes the
+            // daemon with it. This line is emitted before the socket binds and
+            // before any save, so the file would be unchanged and the next start
+            // would die the same way. The count is what an operator acts on; the
+            // examples are there to make the count intelligible.
+            let listed = result.dropped.len().min(MAX_LISTED_DROPPED_LEASES);
+            let detail = result.dropped[..listed]
                 .iter()
                 .map(|d| format!("{}→{} ({})", d.lease.mac, d.lease.ip, d.reason.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = write!(line, " · dropped {}: {detail}", result.dropped.len());
+            if result.dropped.len() > listed {
+                let _ = write!(line, ", and {} more", result.dropped.len() - listed);
+            }
         }
         self.wire.log(LogLevel::Info, line);
     }
@@ -1876,6 +1895,60 @@ mod tests {
             restarted.last_reply().yiaddr,
             ip("10.0.0.10"),
             "and the original device is handed its own address back"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_drops_many_leases_still_logs_one_readable_line() {
+        // The dropped-lease detail was interpolated in full, and `dropped` is
+        // bounded only by the persisted-lease cap of 66,560 — megabytes against
+        // the host's 1 MiB line ceiling. An over-long line is not truncated:
+        // `boundedLineReader` calls `onError`, which is `failChildProtocol`,
+        // which terminates the daemon. This line is emitted from `DhcpCore::new`
+        // before the socket binds and before any save, so the file is never
+        // rewritten and the daemon dies the same way on every subsequent start.
+        let dir = TempDir::new("dhcp-engine-restore-log");
+        let path = dir.path().join("dhcp-leases.json");
+        let now = persistence::now_epoch_ms();
+        // Every record sits outside the configured pool, so all are dropped.
+        let mut records = String::from("[");
+        for i in 0..2_000u32 {
+            if i > 0 {
+                records.push(',');
+            }
+            let mac = MacKey::from_hardware(&[0xAA, 0xBB, 0xCC, (i >> 8) as u8, i as u8, 0x01]);
+            let address = Ipv4Addr::from(0xC0A8_0000 + i);
+            let _ = write!(
+                records,
+                r#"{{"mac":"{}","ip":"{address}","boundAt":{now},"leaseSec":3600,"expiresAt":{},"remainingSec":3600,"hostname":null,"leaseType":"dynamic"}}"#,
+                mac.as_str(),
+                now + 3_600_000
+            );
+        }
+        records.push(']');
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":1,"savedAt":{now},"leases":{records}}}"#),
+        )
+        .unwrap();
+
+        let mut o = options();
+        o.lease_store_path = Some(path);
+        let h = Harness::with(&o);
+
+        let restore_line = h
+            .events()
+            .into_iter()
+            .find(|line| line.contains("dropped"))
+            .expect("the restore reports what it dropped");
+        assert!(
+            restore_line.len() < 8 * 1024,
+            "the restore line must stay well inside one RPC line; {} bytes",
+            restore_line.len()
+        );
+        assert!(
+            restore_line.contains("2000"),
+            "and must still say how many were dropped: {restore_line}"
         );
     }
 
