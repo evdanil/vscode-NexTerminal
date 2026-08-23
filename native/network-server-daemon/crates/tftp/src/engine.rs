@@ -99,6 +99,9 @@ pub struct TransferInfo {
     pub peer_address: String,
     pub peer_port: u16,
     pub direction: Direction,
+    /// Display-safe: control characters replaced and the length bounded when the
+    /// struct is built, because every consumer of this field emits it. The
+    /// unmodified name lives on the session, where the filesystem work is.
     pub filename: String,
     pub bytes: u64,
     pub total_bytes: Option<u64>,
@@ -891,7 +894,7 @@ impl<S: Datagram> TftpCore<S> {
             format!(
                 "{} complete {} ({} bytes)",
                 info.direction.as_str().to_uppercase(),
-                truncate_for_log(&info.filename),
+                info.filename,
                 info.bytes
             ),
         );
@@ -912,7 +915,7 @@ impl<S: Datagram> TftpCore<S> {
             format!(
                 "{} failed {}: {}",
                 info.direction.as_str().to_uppercase(),
-                truncate_for_log(&info.filename),
+                info.filename,
                 reason
             ),
         );
@@ -931,7 +934,16 @@ fn info_of(session: &mut TransferSession) -> TransferInfo {
         peer_address: session.peer.ip().to_string(),
         peer_port: session.peer.port(),
         direction: session.direction,
-        filename: session.filename.clone(),
+        // Sanitised here, at the one place a `TransferInfo` is built, rather
+        // than at each of the places one is emitted. The daemon turns this
+        // struct into newline-delimited JSON, output-channel lines and
+        // notification text; a raw control character in a peer-supplied name
+        // forges log lines and drives the reader's terminal. Cleaning it per
+        // emission site is what failed here — the engine cleaned some of its own
+        // log copies while the service-level events carried the raw value — and
+        // that list only grows. The unmodified name stays on the session, which
+        // is what every filesystem path already uses.
+        filename: truncate_for_log(&session.filename),
         bytes: session.bytes_transferred,
         total_bytes: session.total_bytes(),
         block_size: session.opts.blksize,
@@ -1387,6 +1399,35 @@ mod tests {
         assert!(
             !destination.exists(),
             "client-aborted uploads must not leave partial files behind"
+        );
+    }
+
+    #[test]
+    fn a_hostile_filename_is_sanitised_before_it_can_be_emitted() {
+        // A WRQ filename is attacker-controlled, and valid UTF-8 may carry
+        // newlines and escape sequences. `TransferInfo` is what the daemon turns
+        // into newline-delimited JSON, output-channel lines and notification
+        // text, so a raw control character here can forge a log line or drive
+        // the terminal of whoever is watching. Sanitising at the one place
+        // `TransferInfo` is built covers every emission site, including the ones
+        // not written yet — which is the failure mode: the engine cleaned some
+        // of its own log copies and the service-level events kept the raw value.
+        let mut session = TransferSession::new(TransferInit {
+            peer: peer(43300),
+            direction: Direction::Write,
+            filename: "up\n{\"event\":\"ready\"}\u{1b}[2J.bin".to_owned(),
+            abs_path: PathBuf::from("up.bin"),
+            raw_options: RawOptions::default(),
+        });
+
+        let info = info_of(&mut session);
+
+        assert!(!info.filename.contains('\n'), "got {:?}", info.filename);
+        assert!(!info.filename.contains('\u{1b}'), "got {:?}", info.filename);
+        assert!(
+            info.filename.starts_with("up"),
+            "and the name is still recognisable: {:?}",
+            info.filename
         );
     }
 
