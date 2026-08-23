@@ -600,6 +600,33 @@ impl LeaseTable {
         Some(address)
     }
 
+    /// The live quarantine deadlines, for persisting alongside the leases.
+    ///
+    /// `decline` drops the entry *and* holds the address back, and only the
+    /// first half of that survived a restart on its own — the entry is gone, so
+    /// nothing in the lease file records that the address is contested.
+    #[must_use]
+    pub fn quarantine_snapshot(&self, now_ms: u64) -> Vec<(Ipv4Addr, u64)> {
+        self.quarantine
+            .iter()
+            .filter(|(_, until)| **until > now_ms)
+            .map(|(address, until)| (*address, *until))
+            .collect()
+    }
+
+    /// Reinstates quarantine deadlines read back from the lease file.
+    ///
+    /// Deadlines that have already passed are skipped rather than inserted and
+    /// swept later, so a stale file cannot hold an address back for a window it
+    /// has already served.
+    pub fn restore_quarantine(&mut self, entries: &[(Ipv4Addr, u64)], now_ms: u64) {
+        for (address, until) in entries {
+            if *until > now_ms {
+                self.quarantine.insert(*address, *until);
+            }
+        }
+    }
+
     /// Removes every claim whose term has run out. Returns what was removed.
     pub fn expire(&mut self, now_ms: u64) -> Vec<(MacKey, Ipv4Addr)> {
         self.quarantine.retain(|_, until| *until > now_ms);

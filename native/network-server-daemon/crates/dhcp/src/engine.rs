@@ -399,7 +399,13 @@ impl<S: Datagram> DhcpCore<S> {
         let Some(path) = &options.lease_store_path else {
             return;
         };
-        let stored = persistence::load_leases(path);
+        let store = persistence::load_store(path);
+        let now_ms = persistence::now_epoch_ms();
+        // Restored before the early return: a file may legitimately hold a
+        // contested address and no leases at all, which is exactly the state a
+        // DECLINE on a fresh pool leaves behind.
+        self.table.restore_quarantine(&store.quarantine, now_ms);
+        let stored = store.leases;
         if stored.is_empty() {
             return;
         }
@@ -409,7 +415,7 @@ impl<S: Datagram> DhcpCore<S> {
                 statics: &options.statics,
                 range_start: options.range_start,
                 range_end: options.range_end,
-                now_ms: persistence::now_epoch_ms(),
+                now_ms,
             },
         );
         self.table.restore(&result.restored);
@@ -875,8 +881,13 @@ impl<S: Datagram> DhcpCore<S> {
         let Some(path) = self.lease_store_path.clone() else {
             return;
         };
-        let leases = self.table.persistable_leases(persistence::now_epoch_ms());
-        if let Err(error) = persistence::save_leases(&path, &leases) {
+        let now = persistence::now_epoch_ms();
+        let leases = self.table.persistable_leases(now);
+        // The quarantine rides along: `decline` drops the entry and holds the
+        // address back, and persisting only the first half loses the conflict on
+        // the next start.
+        let quarantine = self.table.quarantine_snapshot(now);
+        if let Err(error) = persistence::save_leases(&path, &leases, &quarantine) {
             // The table stays dirty, so the next tick tries again once the
             // debounce window has passed. Clearing the marker unconditionally
             // made a transient failure permanent: with no later lease mutation
@@ -1868,6 +1879,41 @@ mod tests {
     }
 
     #[test]
+    fn a_declined_address_stays_out_of_the_pool_across_a_restart() {
+        // `decline` drops the entry *and* quarantines the address, precisely so
+        // the next client to DISCOVER is not handed the same conflict. Only the
+        // dropped entry was persisted, so a restart inside the quarantine window
+        // lost the second half of that: the file says nothing about the
+        // contested address, and the allocator offers it again immediately.
+        let dir = TempDir::new("dhcp-engine-quarantine-restart");
+        let path = dir.path().join("dhcp-leases.json");
+        let mut o = options();
+        o.lease_store_path = Some(path.clone());
+
+        {
+            let mut h = Harness::with(&o);
+            h.feed(&discover(&MAC_A));
+            h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+            let decline = PacketBuilder::new(&MAC_A)
+                .message_type(4)
+                .option(OPTION_REQUESTED_IP, &ip("10.0.0.10").octets())
+                .option(OPTION_SERVER_ID, &ip("10.0.0.1").octets())
+                .build();
+            h.feed(&decline);
+            h.core.shutdown();
+        }
+
+        let mut restarted = Harness::with(&o);
+        restarted.feed(&discover(&MAC_B));
+
+        assert_eq!(
+            restarted.last_reply().yiaddr,
+            ip("10.0.0.11"),
+            "the contested address must still be held back after a restart"
+        );
+    }
+
+    #[test]
     fn an_expired_persisted_lease_is_not_a_claim_on_its_address() {
         let dir = TempDir::new("dhcp-engine-expired");
         let path = dir.path().join("dhcp-leases.json");
@@ -1881,7 +1927,7 @@ mod tests {
             hostname: None,
             lease_type: LeaseType::Dynamic,
         };
-        persistence::save_leases(&path, &[stale]).unwrap();
+        persistence::save_leases(&path, &[stale], &[]).unwrap();
 
         let mut o = options();
         o.lease_store_path = Some(path);
