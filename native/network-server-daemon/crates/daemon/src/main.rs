@@ -78,6 +78,20 @@ fn main() {
                         "warn",
                         &format!("Ignored malformed request: {detail}"),
                     ),
+                    Err(error @ RequestError::AnswerableMalformed { .. }) => {
+                        if let Some(id) = error.response_id() {
+                            emitter.respond(&Outgoing::error(
+                                id,
+                                nexus_rpc::ErrorCode::InvalidRequest,
+                                "Malformed RPC request.",
+                            ));
+                        }
+                        emitter.log(
+                            "daemon",
+                            "warn",
+                            &format!("Rejected malformed request: {error}"),
+                        );
+                    }
                 }
             }
             Ok(Line::Oversized(bytes)) => emitter.log(

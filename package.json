@@ -4223,11 +4223,11 @@
           ],
           "enumDescriptions": [
             "Bundled JavaScript daemon. Runs on every platform the extension supports.",
-            "Native Rust daemon. Only available where a prebuilt binary ships for your platform; otherwise the JavaScript daemon is used and a warning is logged."
+            "Native Rust daemon. Uses a packaged binary when one is installed, or NEXUS_NETWORK_SERVER_DAEMON_BIN for development; otherwise the JavaScript daemon is used and a warning is logged."
           ],
           "default": "node",
           "order": 57,
-          "markdownDescription": "**Network Servers — Engine.** Which implementation backs the embedded TFTP and DHCP services. `node` (default) runs the bundled JavaScript daemon. `rust` runs a native binary that speaks the identical stdio JSON-RPC protocol. If `rust` is selected but no binary ships for the current platform, the JavaScript daemon is used instead and the reason is logged to the *Nexus Network Servers* output channel — the services always start. Takes effect the next time the daemon starts."
+          "markdownDescription": "**Network Servers — Engine.** Which implementation backs the embedded TFTP and DHCP services. `node` (default) runs the bundled JavaScript daemon. `rust` runs a native binary that speaks the identical stdio JSON-RPC protocol, using a packaged binary when one is installed or `NEXUS_NETWORK_SERVER_DAEMON_BIN` for development. If `rust` is selected but no native binary is available, the JavaScript daemon is used instead and the reason is logged to the *Nexus Network Servers* output channel — the services always start. Takes effect the next time the daemon starts."
         }
       }
     }
@@ -4254,7 +4254,8 @@
     "test": "vitest run --coverage",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty:required && vsce package",
+    "test:network-server-daemon:rust": "node scripts/runNetworkServerDaemonRustParity.mjs",
+    "package:vsix": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty:required && npm run prepare:network-server-daemon && vsce package",
     "package:ovsx": "npm run package:vsix",
     "publish:ovsx": "ovsx publish \"vscode-nexterminal-${npm_package_version}.vsix\" --pat \"$OVSX_PAT\" --skip-duplicate",
     "generate:keybindings": "node scripts/generateKeybindings.mjs",

@@ -19,17 +19,15 @@
  * npx vitest run test/integration/networkServers/daemonEngineParity.test.ts
  *
  * # Rust
- * NEXUS_NETWORK_SERVERS_ENGINE=rust \
- * NEXUS_NETWORK_SERVER_DAEMON_BIN=/abs/path/to/nexus-network-server-daemon \
- * npx vitest run test/integration/networkServers/daemonEngineParity.test.ts
+ * npm run test:network-server-daemon:rust
  * ```
  *
  * ## Why it is a new file rather than a reuse of the existing suites
  *
  * Of the four suites nominated for this, only `daemonBridge.test.ts` actually
- * spawns a daemon — and it does so with a private client of its own, not with
- * `daemonHost.ts` (it is parameterized by the same two variables, so it runs
- * against either engine too). `tftpE2E`, `tftpStress` and `dhcpLeaseRestart`
+ * spawns a daemon, but it always uses the Node bundle and a private client of
+ * its own rather than the production `daemonHost.ts`. `tftpE2E`, `tftpStress`
+ * and `dhcpLeaseRestart`
  * construct `TftpEngine` / `DhcpEngine` in-process and call their methods
  * directly: there is no daemon, no RPC and no child process anywhere in their
  * path, so they cannot be aimed at a binary of any kind without being rewritten

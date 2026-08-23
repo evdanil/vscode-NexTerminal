@@ -137,6 +137,7 @@ of order relative to request arrival; the host correlates purely by `id`.
 | `NOT_FOUND` | Reserved for forward-compatible daemon builds where a known operation genuinely targets a missing resource outside the closed service-id set. Current services do not use it for invalid ids. |
 | `METHOD_NOT_FOUND` | Reserved legacy code for older daemon builds. Current daemons use `INVALID_REQUEST` for unknown methods. |
 | `INVALID_PARAMS` | Reserved legacy code for older daemon builds. Current daemons use `INVALID_REQUEST` for malformed params/config DTOs. |
+| `RESPONSE_TOO_LARGE` | A correlated response could not fit inside the one-line byte limit and was replaced with this bounded error envelope. |
 | `NOT_IMPLEMENTED` | The service exists but this build does not implement it. No service currently reports this; the code is retained so a host stays forward-compatible with a build that ships a service in name only. |
 | `INTERNAL_ERROR` | Anything else. `message` carries the underlying failure. |
 
@@ -305,8 +306,9 @@ is the authority.
 ```
 
 `data.id` is a service id, or the literal `"daemon"` for the daemon process
-itself. `data.level` is one of `trace`, `debug`, `info`, `warn`, `error`. An
-unrecognised level MUST be tolerated by the host (treated as `info`).
+itself. `data.level` is one of `trace`, `debug`, `info`, `warn`, `error`.
+Unknown log levels are malformed protocol output; the host rejects the current
+child rather than guessing a fallback severity.
 
 ### 4.4 `runtimeUpdate`
 
@@ -497,9 +499,10 @@ a lease with `leaseType: "static"` the moment its device completes an exchange.
 | `allowWrite` | boolean | `false` | Whether WRQ (upload) is accepted at all. |
 | `interface` | string | `0.0.0.0` | Local IPv4 to bind — which NIC serves TFTP. |
 
-**`DhcpConfig`** — every field optional. The daemon MUST also store the payload
-verbatim and round-trip it unchanged, so a field a newer host sends survives an
-older daemon.
+**`DhcpConfig`** — every field optional. This is a closed DTO: unknown fields
+MUST be rejected with `INVALID_REQUEST`, not stored or ignored. The daemon may
+keep the accepted payload verbatim for idempotence, but only after it has passed
+the exact-field validator.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -517,7 +520,7 @@ older daemon.
 | `nextServer` | string | unset | Option 66 — TFTP server name or address. |
 | `bootFileName` | string | unset | Option 67. |
 | `tftpServerAddresses` | string[] | unset | Option 150 (Cisco). |
-| `vendorClassId` | string | unset | Option 60 the *client* must send for the boot options above to be served. Empty serves every client. |
+| `vendorClassId` | string | unset | Option 60 the *client* must send for the boot options above to be served. Unset serves every client. |
 | `vendorSpecificOptions` | `{subOption, value}[]` | unset | Option 43 sub-options. `subOption` is 1–254; `value` is a `0x…` hex literal or plain text. |
 
 Malformed values MUST be refused at `configure` time with `INVALID_REQUEST` and
@@ -619,7 +622,7 @@ Leases persist to disk (atomic temp-file-plus-rename, so a crash mid-write
 leaves either the old file or the new one, never a partial one) and are
 restored on the next `start`.
 
-Static reservations (`DhcpConfig.reservations`, MAC → IP) are seeded into the
+Static reservations (`DhcpConfig.static`, MAC → IP) are seeded into the
 lease table at `start`, **after** the persisted-lease restore, so a reservation
 takes precedence over a stale persisted dynamic lease for the same address.
 Seeding is idempotent — a reservation whose address already holds the correct
@@ -633,10 +636,12 @@ boots.
 
 ### 6.6 ZTP boot options
 
-Options 66 (TFTP server name), 67 (bootfile name), 60 (vendor class, used as an
-allow-filter — an OFFER is made only to a DISCOVER whose option 60 matches, when
-configured), 150 (Cisco TFTP server addresses, one or more), and 43
-(vendor-specific, raw bytes or a hex string) are all supported. Option 43's
+Options 66 (TFTP server name), 67 (bootfile name), 60 (vendor class), 150 (Cisco
+TFTP server addresses, one or more), and 43 (vendor-specific, raw bytes or a
+hex string) are all supported. When `vendorClassId` is configured, option 60
+gates only the boot options (43/66/67/150): the server still participates in
+DORA, but clients with a nonmatching or absent vendor class receive ordinary
+address configuration without those boot options. Option 43's
 encoded value MUST NOT exceed 255 bytes — the field is a single length-prefixed
 byte in the DHCP option format, so a longer value cannot be represented on the
 wire and MUST be refused at `configure` time, not truncated silently.
@@ -732,13 +737,16 @@ This document's version is the **protocol** version, independent of the
 extension's release version.
 
 * **Patch** — clarification only; no wire change.
-* **Minor** — backwards-compatible additions: a new method, a new event, a new
-  optional field, a new error code. A reader MUST ignore unknown object members
-  and unknown event names rather than failing, so that a newer daemon can run
-  against an older host.
-* **Major** — a breaking change to an existing shape. Both sides ship together;
-  there is no negotiation step, because the daemon is bundled with the host that
-  spawns it.
+* **Minor** — coordinated additions that both bundled sides understand, such as
+  a new error code or method that is never emitted to an older reader.
+* **Major** — any change to an existing closed shape, including new object
+  fields, events, event names, log levels or config properties.
+
+Readers are intentionally exact. Unknown object members, unknown event names and
+unknown log levels are protocol violations, and the TypeScript host terminates
+the current child on malformed daemon output. Do not rely on additive
+daemon-to-host fields for compatibility; update both sides and this document
+together.
 
 The absence of a negotiation handshake is deliberate. Adding one would imply the
 two sides can be versioned apart, which for a bundled child process is a

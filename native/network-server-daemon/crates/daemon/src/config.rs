@@ -38,7 +38,7 @@ pub const DHCP_FALLBACK_PORT: u16 = 1067;
 
 /// TFTP settings, as the host sends them. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TftpConfig {
     #[serde(default)]
     pub root: Option<String>,
@@ -132,7 +132,7 @@ fn home_dir() -> PathBuf {
 /// failing here as an opaque deserialisation error against a field the operator
 /// would then have to guess at.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VendorOptionConfig {
     pub sub_option: i64,
     pub value: String,
@@ -144,7 +144,7 @@ pub struct VendorOptionConfig {
 /// always spelled this differently on the host side, and renaming one of them
 /// here would silently drop the operator's setting.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DhcpConfig {
     #[serde(default)]
     pub port: Option<u16>,
@@ -359,6 +359,11 @@ impl ConfigStore {
     /// Absent keys are left alone: a `start` carrying only TFTP configuration
     /// must not clobber the stored DHCP settings.
     pub fn apply(&mut self, configs: &Map<String, Value>) -> Result<Vec<String>, ConfigError> {
+        for key in configs.keys() {
+            if key != "tftp" && key != "dhcp" {
+                return Err(ConfigError(format!("unknown service configuration: {key}")));
+            }
+        }
         let mut changed = Vec::new();
         if let Some(incoming) = configs.get("tftp") {
             if self.tftp_raw.as_ref() != Some(incoming) {
@@ -503,10 +508,10 @@ mod tests {
 
     #[test]
     fn dhcp_configuration_round_trips_unchanged() {
-        // The raw payload is kept verbatim as well as parsed, so a field a newer
-        // host sends is echoed back rather than dropped by this build.
+        // The raw payload is kept verbatim as well as parsed, so idempotence is
+        // decided against the exact accepted DTO rather than a normalized copy.
         let mut store = ConfigStore::default();
-        let payload = json!({"dhcp": {"port": 67, "rangeStart": "192.168.2.10", "custom": [1, 2]}});
+        let payload = json!({"dhcp": {"port": 67, "rangeStart": "192.168.2.10"}});
         store.apply(&configs(&payload)).unwrap();
         assert_eq!(store.dhcp_raw.as_ref().unwrap(), &payload["dhcp"]);
         assert_eq!(store.dhcp().range_start.as_deref(), Some("192.168.2.10"));
@@ -700,13 +705,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_field_does_not_break_forward_compatibility() {
-        // A newer host may send a field this build has never heard of; refusing
-        // it would make the pair un-upgradeable one direction at a time.
+    fn an_unknown_field_is_refused_to_match_the_closed_host_contract() {
+        // The extension host uses exact DTO validation and treats unknown
+        // daemon output as a protocol failure. Rust must keep the same closed
+        // contract on input instead of accepting a shape TypeScript rejects.
         let mut store = ConfigStore::default();
-        store
+        let err = store
             .apply(&configs(&json!({"tftp": {"port": 6900, "somethingNew": true}})))
-            .unwrap();
-        assert_eq!(store.tftp().port(), 6900);
+            .unwrap_err();
+        assert!(
+            err.0.contains("unknown field"),
+            "unknown field should be refused by serde; got {}",
+            err.0
+        );
+        assert_eq!(store.tftp().port(), TFTP_DEFAULT_PORT);
     }
 }

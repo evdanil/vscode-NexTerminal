@@ -4,7 +4,7 @@
 //! implements: one UTF-8 JSON object per line, `\r` tolerated before the `\n`,
 //! blank lines ignored, and a bounded line length.
 
-use serde::Serialize;
+use crate::{ErrorCode, Outgoing};
 use std::io::{self, BufRead, Write};
 use std::sync::Mutex;
 
@@ -159,8 +159,26 @@ impl MessageWriter {
     /// A write failure is returned rather than swallowed, but callers on the
     /// event path generally have nowhere to report it: if the host has gone
     /// away, the next stdin read returns EOF and the daemon shuts down anyway.
-    pub fn write(&self, message: &impl Serialize) -> io::Result<()> {
+    pub fn write(&self, message: &Outgoing) -> io::Result<()> {
         let mut line = serde_json::to_vec(message).map_err(io::Error::other)?;
+        if line.len() > MAX_LINE_BYTES {
+            line = match message {
+                Outgoing::Result { id, .. } | Outgoing::Error { id, .. } => {
+                    serde_json::to_vec(&Outgoing::error(
+                        *id,
+                        ErrorCode::ResponseTooLarge,
+                        "Daemon response exceeds the RPC line limit.",
+                    ))
+                    .map_err(io::Error::other)?
+                }
+                Outgoing::Event { .. } => return Ok(()),
+            };
+        }
+        if line.len() > MAX_LINE_BYTES {
+            return Err(io::Error::other(
+                "RESPONSE_TOO_LARGE fallback exceeded the RPC line limit",
+            ));
+        }
         // Any newline inside a value is escaped by the serialiser, so this is
         // the only `\n` the payload can contain.
         debug_assert!(!line.contains(&b'\n'), "serialised message must be one line");
@@ -278,11 +296,57 @@ mod tests {
     fn each_message_is_written_as_exactly_one_line() {
         let sink = Sink::default();
         let writer = MessageWriter::new(Box::new(sink.clone()));
-        writer.write(&serde_json::json!({"id": 1, "result": null})).unwrap();
-        writer.write(&serde_json::json!({"event": "ready", "data": null})).unwrap();
+        writer.write(&Outgoing::result(1, serde_json::Value::Null)).unwrap();
+        writer.write(&Outgoing::event("ready", serde_json::Value::Null)).unwrap();
         let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         assert_eq!(out.lines().count(), 2);
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn an_oversized_response_is_replaced_with_a_correlated_error() {
+        let sink = Sink::default();
+        let writer = MessageWriter::new(Box::new(sink.clone()));
+        writer
+            .write(&Outgoing::result(
+                7,
+                serde_json::json!({ "payload": "x".repeat(MAX_LINE_BYTES) }),
+            ))
+            .unwrap();
+
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.trim_end().len() <= MAX_LINE_BYTES,
+            "fallback response must respect the line limit"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "id": 7,
+                "error": {
+                    "code": "RESPONSE_TOO_LARGE",
+                    "message": "Daemon response exceeds the RPC line limit."
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn an_oversized_event_is_dropped_instead_of_breaking_the_peer_reader() {
+        let sink = Sink::default();
+        let writer = MessageWriter::new(Box::new(sink.clone()));
+        writer
+            .write(&Outgoing::event(
+                "log",
+                serde_json::json!({
+                    "id": "dhcp",
+                    "level": "info",
+                    "message": "x".repeat(MAX_LINE_BYTES)
+                }),
+            ))
+            .unwrap();
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -292,10 +356,10 @@ mod tests {
         let sink = Sink::default();
         let writer = MessageWriter::new(Box::new(sink.clone()));
         writer
-            .write(&serde_json::json!({
-                "event": "log",
-                "data": { "id": "tftp", "level": "warn", "message": "a\nb\r\nc" }
-            }))
+            .write(&Outgoing::event(
+                "log",
+                serde_json::json!({ "id": "tftp", "level": "warn", "message": "a\nb\r\nc" }),
+            ))
             .unwrap();
         let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         assert_eq!(out.lines().count(), 1, "got {out:?}");
@@ -311,11 +375,14 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for seq in 0..50u32 {
                     writer
-                        .write(&serde_json::json!({
-                            "event": "log",
-                            "data": { "id": "tftp", "level": "info", "message": "x".repeat(500) ,
-                                      "worker": worker, "seq": seq }
-                        }))
+                        .write(&Outgoing::event(
+                            "log",
+                            serde_json::json!({
+                                "id": "tftp",
+                                "level": "info",
+                                "message": format!("{}-{worker}-{seq}", "x".repeat(500))
+                            }),
+                        ))
                         .unwrap();
                 }
             }));

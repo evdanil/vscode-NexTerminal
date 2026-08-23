@@ -346,7 +346,7 @@ export class NetworkServerManager implements vscode.Disposable {
     this.outputChannel = options.outputChannel ?? vscode.window.createOutputChannel("Nexus Network Servers");
     this.host = new NetworkServerDaemonHost(resolveNetworkServerDaemonPath(options.extensionPath), {
       extensionRoot: options.extensionPath,
-      engine: readNetworkServerEngine(),
+      resolveEngine: readNetworkServerEngine,
       nativeBinaryPath: resolveNativeDaemonBinaryPath(options.extensionPath),
       resolveSpawnConfig: () => readNetworkServerConfigs(options.globalStoragePath)
     });

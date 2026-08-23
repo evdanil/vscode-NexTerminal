@@ -562,7 +562,7 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "networkServers",
     subgroup: "Advanced",
     description:
-      "Which implementation backs the embedded TFTP and DHCP services. Node runs the bundled JavaScript daemon and works on every supported platform. Rust runs a native binary speaking the identical stdio JSON-RPC protocol; if no binary ships for the current platform the JavaScript daemon is used instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Takes effect the next time the daemon starts.",
+      "Which implementation backs the embedded TFTP and DHCP services. Node runs the bundled JavaScript daemon and works on every supported platform. Rust runs a native binary speaking the identical stdio JSON-RPC protocol, using a packaged binary when one is installed or NEXUS_NETWORK_SERVER_DAEMON_BIN for development; if no native binary is available the JavaScript daemon is used instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Takes effect the next time the daemon starts.",
     default: "node",
     enumOptions: [
       {
@@ -574,7 +574,7 @@ export const SETTINGS_META: SettingMeta[] = [
       {
         label: "Rust",
         value: "rust",
-        description: "Native binary — used only where a prebuilt artifact ships for this platform"
+        description: "Native binary — used when a packaged or development binary is available"
       }
     ]
   },

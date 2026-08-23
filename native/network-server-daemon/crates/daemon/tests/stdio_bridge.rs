@@ -101,7 +101,12 @@ impl Daemon {
     fn call(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
-        let line = json!({ "id": id, "method": method, "params": params }).to_string();
+        let envelope = if method == "list" {
+            json!({ "id": id, "method": method })
+        } else {
+            json!({ "id": id, "method": method, "params": params })
+        };
+        let line = envelope.to_string();
         let stdin = self.stdin.as_mut().expect("stdin still open");
         writeln!(stdin, "{line}").expect("write request");
         stdin.flush().expect("flush request");
@@ -117,6 +122,16 @@ impl Daemon {
         let stdin = self.stdin.as_mut().expect("stdin still open");
         stdin.write_all(line.as_bytes()).expect("write raw");
         stdin.flush().expect("flush raw");
+    }
+
+    fn call_raw_id(&mut self, id: i64, line: &str) -> Value {
+        self.write_raw(line);
+        loop {
+            let message = self.next();
+            if message["id"] == json!(id) {
+                return message;
+            }
+        }
     }
 
     /// Waits for an event matching `predicate`, from what has already been seen
@@ -418,6 +433,26 @@ fn garbage_on_stdin_is_survived_rather_than_fatal() {
     // Still serving.
     let response = daemon.call("list", json!({}));
     assert!(response["result"].is_array());
+    assert_eq!(daemon.shutdown(), 0);
+}
+
+#[test]
+fn malformed_requests_with_a_usable_id_receive_invalid_request() {
+    let mut daemon = Daemon::spawn(None);
+    daemon.await_ready();
+
+    for (id, line) in [
+        (40, r#"{"id":40,"method":"list","params":{}}"#),
+        (41, r#"{"id":41,"method":"configure","params":{}}"#),
+        (42, r#"{"id":42,"method":"getStatus","params":{"id":"tftp","unused":true}}"#),
+        (43, r#"{"id":43,"method":"list","extra":true}"#),
+    ] {
+        let response = daemon.call_raw_id(id, &format!("{line}\n"));
+        assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"), "{line}");
+    }
+
+    let response = daemon.call("list", json!({}));
+    assert!(response["result"].is_array(), "daemon must keep serving");
     assert_eq!(daemon.shutdown(), 0);
 }
 

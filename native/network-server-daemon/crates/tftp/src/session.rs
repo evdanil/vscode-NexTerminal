@@ -450,10 +450,11 @@ impl TransferSession {
 
         match self.phase {
             Phase::SentLast => {
-                // Block 0 is accepted as well: a client that lost the OACK
-                // exchange and restarts its acknowledgement from zero should end
-                // the transfer rather than hang.
-                if ack == self.block || ack == 0 {
+                // Only the final DATA block proves the client received the
+                // file. In an option-negotiated one-block RRQ, ACK(0) confirms
+                // only the OACK; accepting it here would complete the transfer
+                // even if DATA(1) was lost.
+                if ack == self.block {
                     self.phase = Phase::Done;
                     return AckOutcome {
                         produce_more: false,
@@ -838,6 +839,27 @@ mod tests {
         assert_eq!(peek_opcode(&initial[0]), Some(Opcode::Oack.to_wire()));
         assert_eq!(s.phase, Phase::SendOack);
         assert_eq!(s.opts.tsize, Some(4096), "tsize=0 asks the server to fill it in");
+    }
+
+    #[test]
+    fn duplicate_ack_zero_does_not_complete_a_negotiated_single_block_read() {
+        let temp = TempDir::new("session-ack-zero");
+        let path = temp.path().join("small.bin");
+        std::fs::write(&path, b"small").unwrap();
+        let mut s = session_for_file(&path, raw(&[("blksize", "1400"), ("tsize", "0")]));
+        s.init_for_read(5);
+        assert!(s.handle_ack(0).produce_more);
+        let packets = s.produce_next_send_packets().unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(data_block(&packets[0]), 1);
+        assert_eq!(s.phase, Phase::SentLast);
+
+        let outcome = s.handle_ack(0);
+        assert!(
+            !outcome.done,
+            "ACK(0) acknowledges only the OACK; it must not prove DATA(1) was delivered"
+        );
+        assert_eq!(s.phase, Phase::SentLast);
     }
 
     #[test]

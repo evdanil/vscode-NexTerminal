@@ -170,6 +170,12 @@ export interface NetworkServerDaemonHostOptions {
    * binary is available for this platform, the host falls back to Node.
    */
   engine?: NetworkServerEngine;
+  /**
+   * Resolves the implementation preference at launch time. Used by the VS Code
+   * manager so a settings change takes effect on the next daemon start without
+   * requiring an extension-host reload.
+   */
+  resolveEngine?: () => NetworkServerEngine;
   /** Absolute path to the native daemon binary, when one ships for this platform. */
   nativeBinaryPath?: string;
 }
@@ -517,7 +523,8 @@ export class NetworkServerDaemonHost {
    */
   private resolveLaunchTarget(): LaunchTarget {
     const nodeTarget: LaunchTarget = { command: process.execPath, args: [this.daemonScriptPath], native: false };
-    if (this.options.engine !== "rust") return nodeTarget;
+    const engine = this.options.resolveEngine?.() ?? this.options.engine ?? "node";
+    if (engine !== "rust") return nodeTarget;
 
     const override = process.env[DAEMON_BINARY_ENV_VAR]?.trim();
     const binary = override && override.length > 0 ? override : this.options.nativeBinaryPath;

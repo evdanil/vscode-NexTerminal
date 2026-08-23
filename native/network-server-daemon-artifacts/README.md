@@ -23,15 +23,15 @@ native/network-server-daemon-artifacts/
 
 ## Current state
 
-**Only `win32-x64` is populated.** It was built and verified on a Windows x64
-machine and passes the full daemon bridge suite against the real TypeScript
-JSON-RPC client.
+No prebuilt network-server daemon binaries are committed in this repository
+today. The `rust` engine can still be exercised by setting
+`NEXUS_NETWORK_SERVER_DAEMON_BIN` to a locally built daemon, and future packaging
+can populate the platform directories shown above.
 
-The other five directories are **deliberately absent, not forgotten**. Copying the
-Windows binary into them would ship something that cannot execute at all on those
-platforms, and the fallback below would never fire because the file *would* exist.
-An absent directory is the honest signal: users on those platforms transparently
-get the bundled Node daemon.
+An absent directory is deliberate: copying a binary into the wrong platform key
+would ship something that cannot execute there, and the fallback below would
+never fire because the file *would* exist. Until release automation supplies
+real artifacts, packaged extensions transparently use the bundled Node daemon.
 
 ## Graceful degradation (why a missing platform is safe)
 
@@ -45,10 +45,10 @@ Nothing breaks when a platform is missing:
   warning naming the reason, to the *Nexus Network Servers* output channel. TFTP
   and DHCP always start.
 
-So the setting is safe to expose on every platform today, and each new artifact
-added here simply starts being used.
+So the setting is safe to expose on every platform today. Each real artifact
+added here starts being used by packaged builds for its matching platform.
 
-## Producing the missing five
+## Producing artifacts
 
 Rust cannot realistically cross-compile to another *operating system* from one
 machine — each target needs that OS's linker, system libraries and SDK. Do not

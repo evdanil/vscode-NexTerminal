@@ -338,6 +338,7 @@ pub struct TftpCore<S: Datagram> {
     admission: Admission,
     transfers: HashMap<SocketAddr, TransferSession>,
     write_handles: HashMap<SocketAddr, File>,
+    write_paths: HashMap<SocketAddr, PathBuf>,
 }
 
 impl<S: Datagram> TftpCore<S> {
@@ -349,6 +350,7 @@ impl<S: Datagram> TftpCore<S> {
             admission: Admission::new(options.max_transfers),
             transfers: HashMap::new(),
             write_handles: HashMap::new(),
+            write_paths: HashMap::new(),
         }
     }
 
@@ -486,6 +488,9 @@ impl<S: Datagram> TftpCore<S> {
             session.close_file();
         }
         self.transfers.clear();
+        for (_, path) in self.write_paths.drain() {
+            let _ = std::fs::remove_file(path);
+        }
         self.write_handles.clear();
     }
 
@@ -684,6 +689,7 @@ impl<S: Datagram> TftpCore<S> {
             match OpenOptions::new().write(true).create_new(true).open(&abs_path) {
                 Ok(file) => {
                     self.write_handles.insert(peer, file);
+                    self.write_paths.insert(peer, abs_path.clone());
                 }
                 Err(e) => {
                     let (code, message) = wire_error_for_io(&e);
@@ -788,15 +794,16 @@ impl<S: Datagram> TftpCore<S> {
     /// because its teardown was asynchronous and the session stayed in the table
     /// across an await; doing the removal synchronously makes the set
     /// unnecessary and the invariant local.
-    fn take(&mut self, peer: SocketAddr) -> Option<TransferInfo> {
+    fn take(&mut self, peer: SocketAddr) -> Option<(TransferInfo, Option<PathBuf>)> {
         let mut session = self.transfers.remove(&peer)?;
         session.close_file();
         self.write_handles.remove(&peer);
-        Some(info_of(&mut session))
+        let write_path = self.write_paths.remove(&peer);
+        Some((info_of(&mut session), write_path))
     }
 
     fn finish_done(&mut self, peer: SocketAddr) {
-        let Some(info) = self.take(peer) else {
+        let Some((info, _write_path)) = self.take(peer) else {
             return;
         };
         self.wire.log(
@@ -812,9 +819,14 @@ impl<S: Datagram> TftpCore<S> {
     }
 
     fn finish_error(&mut self, peer: SocketAddr, reason: String, code: Option<String>) {
-        let Some(info) = self.take(peer) else {
+        let Some((info, write_path)) = self.take(peer) else {
             return;
         };
+        if info.direction == Direction::Write {
+            if let Some(path) = write_path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         self.wire.log(
             LogLevel::Warn,
             format!(
@@ -1252,6 +1264,43 @@ mod tests {
         );
         let sent = rec.sent.borrow();
         assert_eq!(error_code(&sent[0].1), ErrorCode::FileAlreadyExists.to_wire());
+    }
+
+    #[test]
+    fn a_cancelled_write_removes_the_incomplete_destination() {
+        let temp = TempDir::new("engine-cancel-write");
+        let destination = temp.path().join("up.bin");
+        let (mut core, _rec) = core_for(&temp, true, 8);
+        let writer = peer(43210);
+
+        core.handle_message(&encode_wrq("up.bin", "octet", &RawOptions::default()), writer);
+        assert!(destination.exists(), "WRQ creates the destination before DATA arrives");
+        assert!(core.cancel_transfer(&writer.to_string()));
+
+        assert!(
+            !destination.exists(),
+            "a failed upload must not permanently reserve the requested filename"
+        );
+    }
+
+    #[test]
+    fn a_client_error_during_write_removes_the_incomplete_destination() {
+        let temp = TempDir::new("engine-client-error-write");
+        let destination = temp.path().join("up.bin");
+        let (mut core, _rec) = core_for(&temp, true, 8);
+        let writer = peer(43211);
+
+        core.handle_message(&encode_wrq("up.bin", "octet", &RawOptions::default()), writer);
+        assert!(destination.exists(), "WRQ creates the destination before DATA arrives");
+        core.handle_message(
+            &encode_error(ErrorCode::NotDefined, Some("client aborted")),
+            writer,
+        );
+
+        assert!(
+            !destination.exists(),
+            "client-aborted uploads must not leave partial files behind"
+        );
     }
 
     #[test]

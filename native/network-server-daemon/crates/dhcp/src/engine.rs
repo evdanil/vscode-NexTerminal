@@ -554,7 +554,7 @@ impl<S: Datagram> DhcpCore<S> {
         // else and our offer must be freed rather than left holding an address.
         if let Some(chosen) = request.options.ipv4(OPTION_SERVER_ID) {
             if chosen != self.server_id {
-                if let Some(freed) = self.table.release(mac, now) {
+                if let Some(freed) = self.table.release_any(mac, now) {
                     self.mark_dirty();
                     self.wire.log(
                         LogLevel::Debug,
@@ -633,57 +633,54 @@ impl<S: Datagram> DhcpCore<S> {
 
     fn handle_release(&mut self, request: &Message, mac: &MacKey) {
         self.counters.release_count += 1;
-        if let Some(chosen) = request.options.ipv4(OPTION_SERVER_ID) {
-            if chosen != self.server_id {
-                return;
-            }
+        if request.options.ipv4(OPTION_SERVER_ID) != Some(self.server_id) {
+            return;
+        }
+        let address = request.ciaddr;
+        if address.is_unspecified() {
+            return;
         }
         let now = persistence::now_epoch_ms();
         // Unlike the reference — which had no access to the library's table and
         // so reported every release with a null address — the released address
         // is known here and is reported.
-        let released = self.table.release(mac, now);
-        if released.is_some() {
-            self.mark_dirty();
-        }
+        let Some(released) = self.table.release(mac, address, now) else {
+            return;
+        };
+        self.mark_dirty();
         self.wire.log(
             LogLevel::Info,
-            format!(
-                "RELEASE from {mac}{}",
-                released.map(|ip| format!(" (was {ip})")).unwrap_or_default()
-            ),
+            format!("RELEASE from {mac} (was {released})"),
         );
         self.wire.emit(EngineEvent::LeaseReleased {
             mac: mac.to_string(),
-            ip: released,
+            ip: Some(released),
             reason: ReleaseReason::Released,
         });
     }
 
     fn handle_decline(&mut self, request: &Message, mac: &MacKey) {
         self.counters.decline_count += 1;
-        let now = persistence::now_epoch_ms();
-        let named = request.options.ipv4(OPTION_REQUESTED_IP).or({
-            if request.ciaddr.is_unspecified() {
-                None
-            } else {
-                Some(request.ciaddr)
-            }
-        });
-        let declined = self.table.decline(mac, named, now);
-        if declined.is_some() {
-            self.mark_dirty();
+        if request.options.ipv4(OPTION_SERVER_ID) != Some(self.server_id) {
+            return;
         }
+        let Some(named) = request.options.ipv4(OPTION_REQUESTED_IP) else {
+            return;
+        };
+        let now = persistence::now_epoch_ms();
+        let Some(declined) = self.table.decline(mac, named, now) else {
+            return;
+        };
+        self.mark_dirty();
         self.wire.log(
             LogLevel::Warn,
             format!(
-                "DECLINE from {mac}{} — another host is already answering on that address; \
-                 it is held out of the pool for now",
-                declined.map(|ip| format!(" for {ip}")).unwrap_or_default()
+                "DECLINE from {mac} for {declined} — another host is already answering on that \
+                 address; it is held out of the pool for now"
             ),
         );
         self.wire
-            .emit(EngineEvent::LeaseDeclined { mac: mac.to_string(), ip: declined });
+            .emit(EngineEvent::LeaseDeclined { mac: mac.to_string(), ip: Some(declined) });
     }
 
     /// DHCPINFORM: the client already has an address and wants configuration.
@@ -1286,6 +1283,7 @@ mod tests {
         h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
         let release = PacketBuilder::new(&MAC_A)
             .message_type(7)
+            .ciaddr(ip("10.0.0.10"))
             .option(OPTION_SERVER_ID, &ip("10.0.0.1").octets())
             .build();
         h.feed(&release);
@@ -1297,6 +1295,36 @@ mod tests {
     }
 
     #[test]
+    fn a_release_without_this_server_and_bound_address_is_ignored() {
+        let mut h = Harness::new();
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+
+        for release in [
+            PacketBuilder::new(&MAC_A).message_type(7).ciaddr(ip("10.0.0.10")).build(),
+            PacketBuilder::new(&MAC_A)
+                .message_type(7)
+                .ciaddr(ip("10.0.0.77"))
+                .option(OPTION_SERVER_ID, &ip("10.0.0.1").octets())
+                .build(),
+            PacketBuilder::new(&MAC_A)
+                .message_type(7)
+                .ciaddr(ip("10.0.0.10"))
+                .option(OPTION_SERVER_ID, &ip("10.0.0.77").octets())
+                .build(),
+        ] {
+            h.feed(&release);
+            assert_eq!(h.core.active_leases().len(), 1, "release {release:?} must be ignored");
+        }
+        assert!(
+            h.lease_events()
+                .iter()
+                .all(|event| !event.starts_with("released ")),
+            "ignored release packets must not emit release events"
+        );
+    }
+
+    #[test]
     fn a_decline_holds_the_contested_address_out_of_the_pool() {
         let mut h = Harness::new();
         h.feed(&discover(&MAC_A));
@@ -1304,6 +1332,7 @@ mod tests {
         let decline = PacketBuilder::new(&MAC_A)
             .message_type(4)
             .option(OPTION_REQUESTED_IP, &ip("10.0.0.10").octets())
+            .option(OPTION_SERVER_ID, &ip("10.0.0.1").octets())
             .build();
         h.feed(&decline);
         h.feed(&discover(&MAC_B));
@@ -1313,6 +1342,52 @@ mod tests {
             "handing the contested address to the next client repeats the conflict"
         );
         assert_eq!(h.core.counters().decline_count, 1);
+    }
+
+    #[test]
+    fn a_decline_without_this_server_and_matching_offer_is_ignored() {
+        let mut h = Harness::new();
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+
+        for decline in [
+            PacketBuilder::new(&MAC_A)
+                .message_type(4)
+                .option(OPTION_REQUESTED_IP, &ip("10.0.0.10").octets())
+                .build(),
+            PacketBuilder::new(&MAC_A)
+                .message_type(4)
+                .option(OPTION_REQUESTED_IP, &ip("10.0.0.10").octets())
+                .option(OPTION_SERVER_ID, &ip("10.0.0.77").octets())
+                .build(),
+            PacketBuilder::new(&MAC_A)
+                .message_type(4)
+                .option(OPTION_REQUESTED_IP, &ip("10.0.0.11").octets())
+                .option(OPTION_SERVER_ID, &ip("10.0.0.1").octets())
+                .build(),
+        ] {
+            h.feed(&decline);
+            assert_eq!(h.core.active_leases().len(), 1, "decline {decline:?} must be ignored");
+        }
+
+        let stray = PacketBuilder::new(&MAC_B)
+            .message_type(4)
+            .option(OPTION_REQUESTED_IP, &ip("10.0.0.11").octets())
+            .option(OPTION_SERVER_ID, &ip("10.0.0.1").octets())
+            .build();
+        h.feed(&stray);
+        h.feed(&discover(&MAC_B));
+        assert_eq!(
+            h.last_reply().yiaddr,
+            ip("10.0.0.11"),
+            "a client with no offer must not quarantine the address it names"
+        );
+        assert!(
+            h.lease_events()
+                .iter()
+                .all(|event| !event.starts_with("declined ")),
+            "ignored decline packets must not emit decline events"
+        );
     }
 
     #[test]

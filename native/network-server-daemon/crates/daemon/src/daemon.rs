@@ -53,27 +53,45 @@ impl Daemon {
     pub fn handle(&mut self, request: &Request) -> Outgoing {
         let id = request.id;
         match request.method.as_str() {
-            "list" => Outgoing::result(
-                id,
-                json!([self.tftp.snapshot(), self.dhcp.snapshot()]),
-            ),
-            "getStatus" => match Self::service_id(request) {
-                Ok(tftp_service::SERVICE_ID) => Outgoing::result(id, self.tftp.snapshot()),
-                Ok(dhcp_service::SERVICE_ID) => Outgoing::result(id, self.dhcp.snapshot()),
-                Ok(unknown) => Self::invalid_service(id, unknown),
-                Err(response) => response,
-            },
+            "list" => {
+                if request.params_present {
+                    return Outgoing::error(id, ErrorCode::InvalidRequest, "Malformed RPC request.");
+                }
+                if let Err(response) = Self::exact_params(request, &[], &[]) {
+                    return response;
+                }
+                Outgoing::result(
+                    id,
+                    json!([self.tftp.snapshot(), self.dhcp.snapshot()]),
+                )
+            }
+            "getStatus" => {
+                if let Err(response) = Self::exact_params(request, &["id"], &["id"]) {
+                    return response;
+                }
+                match Self::service_id(request) {
+                    Ok(tftp_service::SERVICE_ID) => Outgoing::result(id, self.tftp.snapshot()),
+                    Ok(dhcp_service::SERVICE_ID) => Outgoing::result(id, self.dhcp.snapshot()),
+                    Ok(unknown) => Self::invalid_service(id, unknown),
+                    Err(response) => response,
+                }
+            }
             "configure" => self.handle_configure(request),
             "start" => self.handle_start(request),
             "stop" => self.handle_stop(request),
             "restart" => self.handle_restart(request),
             "cancelTransfer" => self.handle_cancel(request),
-            "getServiceRuntime" => match Self::service_id(request) {
-                Ok(tftp_service::SERVICE_ID) => Outgoing::result(id, self.tftp.runtime()),
-                Ok(dhcp_service::SERVICE_ID) => Outgoing::result(id, self.dhcp.runtime()),
-                Ok(unknown) => Self::invalid_service(id, unknown),
-                Err(response) => response,
-            },
+            "getServiceRuntime" => {
+                if let Err(response) = Self::exact_params(request, &["id"], &["id"]) {
+                    return response;
+                }
+                match Self::service_id(request) {
+                    Ok(tftp_service::SERVICE_ID) => Outgoing::result(id, self.tftp.runtime()),
+                    Ok(dhcp_service::SERVICE_ID) => Outgoing::result(id, self.dhcp.runtime()),
+                    Ok(unknown) => Self::invalid_service(id, unknown),
+                    Err(response) => response,
+                }
+            }
             other => Outgoing::error(id, ErrorCode::InvalidRequest, format!("Unknown RPC method: {other}")),
         }
     }
@@ -81,9 +99,11 @@ impl Daemon {
     // -- individual methods -------------------------------------------------
 
     fn handle_configure(&mut self, request: &Request) -> Outgoing {
+        if let Err(response) = Self::exact_params(request, &["configs"], &["configs"]) {
+            return response;
+        }
         let configs = match request.params.get("configs") {
             Some(Value::Object(map)) => map.clone(),
-            None | Some(Value::Null) => Map::new(),
             Some(_) => {
                 return Outgoing::error(
                     request.id,
@@ -91,6 +111,7 @@ impl Daemon {
                     "configs must be an object",
                 )
             }
+            None => unreachable!("exact_params required configs"),
         };
         match self.apply_configs(&configs) {
             Ok(changed) => Outgoing::result(request.id, json!({ "ok": true, "changed": changed })),
@@ -99,6 +120,9 @@ impl Daemon {
     }
 
     fn handle_start(&mut self, request: &Request) -> Outgoing {
+        if let Err(response) = Self::exact_params(request, &["id", "config"], &["id"]) {
+            return response;
+        }
         let service = match Self::service_id(request) {
             Ok(service) => service,
             Err(response) => return response,
@@ -120,6 +144,9 @@ impl Daemon {
     }
 
     fn handle_stop(&mut self, request: &Request) -> Outgoing {
+        if let Err(response) = Self::exact_params(request, &["id"], &["id"]) {
+            return response;
+        }
         match Self::service_id(request) {
             // Stopping something that was never started is success, not an
             // error: it is already in the state the caller asked for.
@@ -137,6 +164,9 @@ impl Daemon {
     }
 
     fn handle_restart(&mut self, request: &Request) -> Outgoing {
+        if let Err(response) = Self::exact_params(request, &["id", "config"], &["id"]) {
+            return response;
+        }
         let service = match Self::service_id(request) {
             Ok(service) => service,
             Err(response) => return response,
@@ -189,6 +219,9 @@ impl Daemon {
     }
 
     fn handle_cancel(&mut self, request: &Request) -> Outgoing {
+        if let Err(response) = Self::exact_params(request, &["id", "transferId"], &["id", "transferId"]) {
+            return response;
+        }
         let service = match Self::service_id(request) {
             Ok(service) => service,
             Err(response) => return response,
@@ -239,8 +272,17 @@ impl Daemon {
         request: &Request,
         service: &'static str,
     ) -> Result<(), Outgoing> {
-        let Some(config @ Value::Object(_)) = request.params.get("config") else {
-            return Ok(());
+        Self::exact_params(request, &["id", "config"], &["id"])?;
+        let config = match request.params.get("config") {
+            None => return Ok(()),
+            Some(config @ Value::Object(_)) => config,
+            Some(_) => {
+                return Err(Outgoing::error(
+                    request.id,
+                    ErrorCode::InvalidRequest,
+                    "config must be an object",
+                ))
+            }
         };
         // The set of changed ids is not interesting here — the caller is a
         // `start` or `restart`, whose own result says what happened.
@@ -276,6 +318,32 @@ impl Daemon {
         // The name is echoed, so bound it: it comes from the peer.
         let shown: String = service.chars().take(64).collect();
         Outgoing::error(id, ErrorCode::InvalidRequest, format!("Unknown service id: {shown}"))
+    }
+
+    fn exact_params(
+        request: &Request,
+        allowed: &[&str],
+        required: &[&str],
+    ) -> Result<(), Outgoing> {
+        for key in request.params.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Outgoing::error(
+                    request.id,
+                    ErrorCode::InvalidRequest,
+                    "Malformed RPC request.",
+                ));
+            }
+        }
+        for key in required {
+            if !request.params.contains_key(*key) {
+                return Err(Outgoing::error(
+                    request.id,
+                    ErrorCode::InvalidRequest,
+                    "Malformed RPC request.",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -322,8 +390,18 @@ mod tests {
         }
 
         fn call(&mut self, method: &str, params: &Value) -> Value {
-            let line = json!({ "id": 1, "method": method, "params": params }).to_string();
+            let envelope = if method == "list" {
+                json!({ "id": 1, "method": method })
+            } else {
+                json!({ "id": 1, "method": method, "params": params })
+            };
+            let line = envelope.to_string();
             let request = Request::parse(&line).unwrap();
+            serde_json::to_value(self.daemon.handle(&request)).unwrap()
+        }
+
+        fn call_envelope(&mut self, envelope: &Value) -> Value {
+            let request = Request::parse(&envelope.to_string()).unwrap();
             serde_json::to_value(self.daemon.handle(&request)).unwrap()
         }
 
@@ -525,6 +603,46 @@ mod tests {
             h.call("teleport", &json!({}))["error"]["code"],
             json!("INVALID_REQUEST")
         );
+    }
+
+    #[test]
+    fn list_refuses_params_like_the_typescript_daemon() {
+        let mut h = Harness::new();
+        let response = h.call_envelope(&json!({"id": 1, "method": "list", "params": {}}));
+        assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
+    }
+
+    #[test]
+    fn configure_requires_exact_configs_params() {
+        let mut h = Harness::new();
+        for params in [
+            json!({}),
+            json!({"configs": {}, "unused": true}),
+            json!({"configs": {"smtp": {}}}),
+            json!({"configs": {"tftp": {"port": 6900, "unused": true}}}),
+        ] {
+            let response = h.call("configure", &params);
+            assert_eq!(
+                response["error"]["code"],
+                json!("INVALID_REQUEST"),
+                "{params} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn service_methods_reject_extra_params() {
+        let mut h = Harness::new();
+        for method in ["getStatus", "stop", "getServiceRuntime"] {
+            let response = h.call(method, &json!({"id": "tftp", "unused": true}));
+            assert_eq!(
+                response["error"]["code"],
+                json!("INVALID_REQUEST"),
+                "{method} must reject unknown params"
+            );
+        }
+        let response = h.call("cancelTransfer", &json!({"id": "tftp", "transferId": "x", "unused": true}));
+        assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
     }
 
     #[test]

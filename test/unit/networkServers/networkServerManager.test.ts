@@ -61,7 +61,12 @@ vi.mock("../../../src/services/networkServers/daemonHost", () => ({
   NetworkServerDaemonHost: class {
     public constructor(
       public readonly scriptPath: string,
-      public readonly options: { resolveSpawnConfig?: () => unknown; engine?: string; nativeBinaryPath?: string }
+      public readonly options: {
+        resolveSpawnConfig?: () => unknown;
+        resolveEngine?: () => string;
+        engine?: string;
+        nativeBinaryPath?: string;
+      }
     ) {
       hostState.instance = this;
       hostState.options = options;
@@ -146,14 +151,14 @@ beforeEach(() => {
 });
 
 describe("NetworkServerManager — daemon engine selection", () => {
-  it("passes the configured rust engine and resolved native binary path to the daemon host", () => {
+  it("passes a launch-time engine resolver and resolved native binary path to the daemon host", () => {
     mockConfig.set("nexus.networkServers.engine", "rust");
     fakeManager();
 
     expect(hostState.options).toMatchObject({
-      engine: "rust",
       nativeBinaryPath: "/tmp/nexus-ext/dist/native/network-server-daemon/linux-x64/nexus-network-server-daemon"
     });
+    expect(hostState.options.resolveEngine?.()).toBe("rust");
   });
 
   it("lets NEXUS_NETWORK_SERVERS_ENGINE override the workspace setting", () => {
@@ -161,7 +166,16 @@ describe("NetworkServerManager — daemon engine selection", () => {
     process.env.NEXUS_NETWORK_SERVERS_ENGINE = "rust";
     fakeManager();
 
-    expect(hostState.options).toMatchObject({ engine: "rust" });
+    expect(hostState.options.resolveEngine?.()).toBe("rust");
+  });
+
+  it("reads the configured engine at daemon launch time, not only at manager construction", () => {
+    mockConfig.set("nexus.networkServers.engine", "node");
+    fakeManager();
+
+    expect(hostState.options.resolveEngine?.()).toBe("node");
+    mockConfig.set("nexus.networkServers.engine", "rust");
+    expect(hostState.options.resolveEngine?.()).toBe("rust");
   });
 });
 

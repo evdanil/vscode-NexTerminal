@@ -508,7 +508,19 @@ impl LeaseTable {
     /// A MAC that has a configured reservation drops back to the placeholder
     /// rather than out of the table: the reservation is configuration, and a
     /// client releasing its lease does not un-configure it.
-    pub fn release(&mut self, mac: &MacKey, now_ms: u64) -> Option<Ipv4Addr> {
+    pub fn release(&mut self, mac: &MacKey, address: Ipv4Addr, now_ms: u64) -> Option<Ipv4Addr> {
+        if self.entries.get(mac).map(|entry| entry.address) != Some(address) {
+            return None;
+        }
+        self.release_any(mac, now_ms)
+    }
+
+    /// Releases a provisional claim for this MAC without an address match.
+    ///
+    /// This is for the SELECTING case where a client explicitly chose another
+    /// server and we can free our own offer. DHCPRELEASE must use
+    /// [`Self::release`] so the packet names the lease being returned.
+    pub fn release_any(&mut self, mac: &MacKey, now_ms: u64) -> Option<Ipv4Addr> {
         let entry = self.entries.remove(mac)?;
         if let Some(reserved) = self.statics.get(mac).copied() {
             if is_ip_in_pool(reserved, self.range_start, self.range_end) {
@@ -534,8 +546,12 @@ impl LeaseTable {
     /// The entry is dropped *and* the address is quarantined. Dropping alone
     /// (what the reference does) returns the contested address to the top of the
     /// free list, so the next client to DISCOVER is handed the same conflict.
-    pub fn decline(&mut self, mac: &MacKey, declined: Option<Ipv4Addr>, now_ms: u64) -> Option<Ipv4Addr> {
-        let address = self.entries.remove(mac).map(|entry| entry.address).or(declined)?;
+    pub fn decline(&mut self, mac: &MacKey, declined: Ipv4Addr, now_ms: u64) -> Option<Ipv4Addr> {
+        let entry = self.entries.get(mac)?;
+        if entry.address != declined {
+            return None;
+        }
+        let address = self.entries.remove(mac)?.address;
         if is_ip_in_pool(address, self.range_start, self.range_end) {
             self.quarantine
                 .insert(address, now_ms + u64::from(self.quarantine_secs) * 1000);
@@ -957,11 +973,20 @@ mod tests {
         let mut t = table();
         let client = mac("aa:00:00:00:00:01");
         t.bind(&client, ip("10.0.0.10"), None, NOW);
-        assert_eq!(t.release(&client, NOW), Some(ip("10.0.0.10")));
+        assert_eq!(t.release(&client, ip("10.0.0.10"), NOW), Some(ip("10.0.0.10")));
         assert_eq!(
             t.select_address(&mac("aa:00:00:00:00:02"), None, NOW),
             Some(ip("10.0.0.10"))
         );
+    }
+
+    #[test]
+    fn a_release_naming_a_different_address_is_ignored() {
+        let mut t = table();
+        let client = mac("aa:00:00:00:00:01");
+        t.bind(&client, ip("10.0.0.10"), None, NOW);
+        assert_eq!(t.release(&client, ip("10.0.0.11"), NOW), None);
+        assert_eq!(t.entry(&client).unwrap().address, ip("10.0.0.10"));
     }
 
     #[test]
@@ -970,7 +995,7 @@ mod tests {
         let reserved = mac("aa:00:00:00:00:09");
         t.seed_static_reservations(NOW);
         t.bind(&reserved, ip("10.0.0.12"), None, NOW);
-        t.release(&reserved, NOW);
+        t.release(&reserved, ip("10.0.0.12"), NOW);
         assert_eq!(
             t.select_address(&mac("bb:00:00:00:00:01"), None, NOW),
             Some(ip("10.0.0.10")),
@@ -984,8 +1009,21 @@ mod tests {
         let mut t = table();
         let client = mac("aa:00:00:00:00:01");
         t.bind(&client, ip("10.0.0.10"), None, NOW);
-        assert_eq!(t.decline(&client, None, NOW), Some(ip("10.0.0.10")));
+        assert_eq!(t.decline(&client, ip("10.0.0.10"), NOW), Some(ip("10.0.0.10")));
         assert!(t.entry(&client).is_none());
+    }
+
+    #[test]
+    fn a_decline_naming_a_different_address_is_ignored() {
+        let mut t = table();
+        let client = mac("aa:00:00:00:00:01");
+        t.bind(&client, ip("10.0.0.10"), None, NOW);
+        assert_eq!(t.decline(&client, ip("10.0.0.11"), NOW), None);
+        assert_eq!(t.entry(&client).unwrap().address, ip("10.0.0.10"));
+        assert!(
+            !t.is_quarantined(ip("10.0.0.11"), NOW),
+            "an address the client was never offered must not be quarantined"
+        );
     }
 
     #[test]
@@ -995,7 +1033,7 @@ mod tests {
         // immediately, which is what the reference implementation does.
         let mut t = table();
         t.bind(&mac("aa:00:00:00:00:01"), ip("10.0.0.10"), None, NOW);
-        t.decline(&mac("aa:00:00:00:00:01"), None, NOW);
+        t.decline(&mac("aa:00:00:00:00:01"), ip("10.0.0.10"), NOW);
         assert_eq!(
             t.select_address(&mac("bb:00:00:00:00:02"), None, NOW),
             Some(ip("10.0.0.11")),
@@ -1012,7 +1050,7 @@ mod tests {
     fn a_quarantine_lapses_and_the_address_returns_to_the_pool() {
         let mut t = table();
         t.bind(&mac("aa:00:00:00:00:01"), ip("10.0.0.10"), None, NOW);
-        t.decline(&mac("aa:00:00:00:00:01"), None, NOW);
+        t.decline(&mac("aa:00:00:00:00:01"), ip("10.0.0.10"), NOW);
         let after = NOW + u64::from(DEFAULT_DECLINE_QUARANTINE_SECS) * 1000 + 1;
         assert!(!t.is_quarantined(ip("10.0.0.10"), after));
         assert_eq!(
@@ -1022,13 +1060,13 @@ mod tests {
     }
 
     #[test]
-    fn a_decline_from_a_client_with_no_entry_still_quarantines_what_it_names() {
+    fn a_decline_from_a_client_with_no_entry_is_ignored() {
         let mut t = table();
         assert_eq!(
-            t.decline(&mac("aa:00:00:00:00:01"), Some(ip("10.0.0.14")), NOW),
-            Some(ip("10.0.0.14"))
+            t.decline(&mac("aa:00:00:00:00:01"), ip("10.0.0.14"), NOW),
+            None
         );
-        assert!(t.is_quarantined(ip("10.0.0.14"), NOW));
+        assert!(!t.is_quarantined(ip("10.0.0.14"), NOW));
     }
 
     // -- views ---------------------------------------------------------------
