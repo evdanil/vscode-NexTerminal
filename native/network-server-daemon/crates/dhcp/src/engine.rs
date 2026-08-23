@@ -471,11 +471,12 @@ impl<S: Datagram> DhcpCore<S> {
             return;
         };
         let mac = message.hardware_key();
-        let vendor_class = message.options.text(OPTION_VENDOR_CLASS_ID);
+        let vendor_class = message.options.text_full(OPTION_VENDOR_CLASS_ID);
+        let vendor_class_log = message.options.text(OPTION_VENDOR_CLASS_ID);
         // The observed option 60 is echoed because the boot-option gate matches
         // exactly: this log line is where an operator copies the string their
         // gear actually sends.
-        let suffix = vendor_class
+        let suffix = vendor_class_log
             .as_deref()
             .map(|v| format!(" · vendor-class=\"{v}\""))
             .unwrap_or_default();
@@ -1672,6 +1673,31 @@ mod tests {
         let reply = h.last_reply();
         assert!(!reply.options.contains(crate::constants::OPTION_BOOTFILE_NAME));
         assert_eq!(reply.yiaddr, ip("10.0.0.11"), "but it still gets an address");
+    }
+
+    #[test]
+    fn vendor_class_matching_uses_the_full_option_value_not_the_log_echo() {
+        let vendor_class = "V".repeat(255);
+        let mut o = options();
+        o.boot = BootOptions::new(
+            None,
+            Some("ios-image.bin".to_owned()),
+            Vec::new(),
+            Some(vendor_class.clone()),
+            &[],
+        )
+        .unwrap();
+        let mut h = Harness::with(&o);
+
+        let matching = PacketBuilder::new(&MAC_A)
+            .message_type(1)
+            .option(OPTION_VENDOR_CLASS_ID, vendor_class.as_bytes())
+            .build();
+        h.feed(&matching);
+        assert!(
+            h.last_reply().options.contains(crate::constants::OPTION_BOOTFILE_NAME),
+            "a full-length accepted option 60 value must still pass the boot-option gate"
+        );
     }
 
     // -- persistence ---------------------------------------------------------

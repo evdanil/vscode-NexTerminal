@@ -39,6 +39,7 @@ pub const DHCP_FALLBACK_PORT: u16 = 1067;
 const IPV4_BYTES_PER_DHCP_OPTION_ENTRY: usize = 4;
 const MAX_IPV4_ADDRESSES_PER_DHCP_OPTION: usize =
     MAX_OPTION_VALUE_BYTES / IPV4_BYTES_PER_DHCP_OPTION_ENTRY;
+const MAX_PATH_BYTES: usize = 4_096;
 const MIN_DHCP_LEASE_SECONDS: u32 = 60;
 const MAX_DHCP_LEASE_SECONDS: u32 = 604_800;
 const MAX_STATIC_RESERVATIONS: usize = 1_024;
@@ -83,6 +84,18 @@ impl TftpConfig {
     #[must_use]
     pub fn root_path(&self) -> PathBuf {
         PathBuf::from(self.root_display())
+    }
+
+    fn validate_root(&self) -> Result<(), String> {
+        if let Some(root) = &self.root {
+            let bytes = root.len();
+            if bytes > MAX_PATH_BYTES {
+                return Err(format!(
+                    "Root is {bytes} bytes; the maximum is {MAX_PATH_BYTES}."
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Parses the configured interface into an address to bind.
@@ -419,6 +432,7 @@ impl ConfigStore {
                 // Validated here rather than at start, so a bad interface is
                 // reported against the edit that introduced it.
                 parsed.bind_address().map_err(ConfigError)?;
+                parsed.validate_root().map_err(ConfigError)?;
                 Some((parsed, incoming.clone()))
             }
         } else {
@@ -575,6 +589,21 @@ mod tests {
             store.tftp().bind_address().unwrap().to_string(),
             "192.168.2.1"
         );
+    }
+
+    #[test]
+    fn oversized_tftp_roots_are_refused_before_startup() {
+        let mut store = ConfigStore::default();
+        let err = store
+            .apply(&configs(&json!({"tftp": {"root": "x".repeat(4097)}})))
+            .unwrap_err();
+        assert!(err.0.contains("Root"), "got {}", err.0);
+        assert!(err.0.contains("4096") || err.0.contains("4,096"), "got {}", err.0);
+        assert!(
+            store.tftp().root.is_none(),
+            "the rejected TFTP root must not be stored for a later runtime snapshot"
+        );
+        assert!(store.tftp_raw.is_none(), "raw tftp config must remain unchanged");
     }
 
     #[test]

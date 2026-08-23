@@ -392,6 +392,19 @@ impl Options {
         Some(sanitize_text(&String::from_utf8_lossy(trimmed)))
     }
 
+    /// A text option decoded in full for protocol decisions.
+    ///
+    /// The display-facing [`Self::text`] truncates hostile client-controlled
+    /// strings before they reach logs and the UI. Protocol gates need the
+    /// complete value the client sent.
+    #[must_use]
+    pub fn text_full(&self, code: u8) -> Option<String> {
+        let raw = self.get(code)?;
+        let last = raw.iter().rposition(|b| *b != 0)?;
+        let trimmed: &[u8] = &raw[..=last];
+        Some(String::from_utf8_lossy(trimmed).into_owned())
+    }
+
     #[must_use]
     pub fn message_type(&self) -> Option<MessageType> {
         MessageType::from_wire(self.u8(OPTION_MESSAGE_TYPE)?)
