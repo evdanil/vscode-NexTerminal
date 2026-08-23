@@ -540,8 +540,6 @@ impl TransferSession {
 
     /// Feeds a DATA packet received from the peer to the machine.
     pub fn handle_data(&mut self, block: u16, data: &[u8]) -> DataOutcome {
-        self.touch();
-        self.retries = 0;
         // RFC 2347: after an OACK on a *write*, the client begins the transfer
         // with DATA(1) rather than acknowledging the OACK. Refusing to leave
         // `SendOack` until an ACK arrives drops that DATA on the floor, and the
@@ -555,8 +553,15 @@ impl TransferSession {
             self.phase = Phase::Receiving;
         }
         if self.phase != Phase::Receiving {
+            // DATA in a phase that never expects it — an RRQ waiting for ACKs,
+            // a transfer already finished — proves nothing about the peer, so it
+            // may not refresh the activity clock or refill the retry budget.
+            // Doing so let a peer hold a slot open for as long as it cared to
+            // send noise, and the slots are a bounded resource.
             return DataOutcome::default();
         }
+        self.touch();
+        self.retries = 0;
 
         // The block before the expected one in the same 16-bit sequence space
         // used by the wire format. A duplicate DATA(0) after the wrap is
@@ -1020,6 +1025,35 @@ mod tests {
         s.handle_ack(0);
         let packets = s.produce_next_send_packets().unwrap();
         assert_eq!(packets.len(), 4);
+    }
+
+    #[test]
+    fn data_arriving_during_a_read_does_not_refresh_the_transfer() {
+        // The mirror of the phantom-ACK case. An RRQ waiting for ACKs has no use
+        // for DATA, and the phase check does discard it — but only after the
+        // activity clock and the retry budget had already been reset. A peer
+        // could hold a slot open indefinitely by sending noise into it, and the
+        // slots are a bounded resource.
+        let temp = TempDir::new("session-read-phase-data");
+        let path = temp.path().join("payload.bin");
+        std::fs::write(&path, vec![1u8; 512 * 4]).unwrap();
+        let mut s = session_for_file(&path, raw(&[("blksize", "512")]));
+        s.init_for_read(512 * 4);
+        s.handle_ack(0);
+        let sent = s.produce_next_send_packets().unwrap();
+        s.record_outbound(&sent);
+        s.retries = 3;
+        let before = s.last_activity;
+
+        let outcome = s.handle_data(1, &vec![0u8; 512]);
+
+        assert!(outcome.write.is_none(), "nothing may be written during a read");
+        assert!(outcome.send.is_empty(), "and nothing answered");
+        assert_eq!(s.retries, 3, "noise must not refill the retry budget");
+        assert_eq!(
+            s.last_activity, before,
+            "nor hold the transfer open past its timeout"
+        );
     }
 
     #[test]
