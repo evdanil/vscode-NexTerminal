@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/tftp", "crates/dhcp", "crates/rpc", "crates/daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nexus-tftp = { path = "crates/tftp" }
+nexus-dhcp = { path = "crates/dhcp" }
+nexus-rpc = { path = "crates/rpc" }
+
+# Release profile for the shipped binary. `panic = "abort"` is deliberate: this
+# process supervises privileged UDP sockets, and a half-unwound daemon that
+# keeps a socket bound while its state machine is in an unknown condition is
+# strictly worse than one that dies and lets the host respawn it. The host's
+# exit handler already rejects every pending RPC and surfaces the exit code.
+[profile.release]
+panic = "abort"
+strip = true
+opt-level = 2
+# Rust's default leaves overflow checks OFF in release builds (opt-level > 0) —
+# only the dev/test profile has them on. That means the entire 351-test suite
+# ran in a build configuration where an overflow panics immediately, but the
+# shipped release binary would silently wrap instead, for exactly the packet-
+# parsing arithmetic this daemon exists to be careful about. Explicit here so
+# an untested overflow on adversarial input aborts cleanly (matching
+# panic = "abort" above and the host's respawn-on-exit handling) rather than
+# wrapping into a wrong-but-plausible value. The cost is a handful of extra
+# branches around integer ops on the daemon's own hot path, not a real one for
+# a per-packet, LAN-scale workload.
+overflow-checks = true

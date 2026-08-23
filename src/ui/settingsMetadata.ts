@@ -554,6 +554,30 @@ export const SETTINGS_META: SettingMeta[] = [
       "Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the Nexus Network Servers output channel records everything either way.",
     default: false
   },
+  {
+    key: "engine",
+    section: "nexus.networkServers",
+    label: "Server Engine",
+    type: "enum",
+    category: "networkServers",
+    subgroup: "Advanced",
+    description:
+      "Which implementation backs the embedded TFTP and DHCP services. Node runs the bundled JavaScript daemon and works on every supported platform. Rust runs a native binary speaking the identical stdio JSON-RPC protocol, using a packaged binary when one is installed or NEXUS_NETWORK_SERVER_DAEMON_BIN for development; if no native binary is available the JavaScript daemon is used instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Takes effect the next time the daemon starts.",
+    default: "node",
+    enumOptions: [
+      {
+        label: "Node",
+        value: "node",
+        description: "Bundled JavaScript daemon — available on every platform",
+        recommended: true
+      },
+      {
+        label: "Rust",
+        value: "rust",
+        description: "Native binary — used when a packaged or development binary is available"
+      }
+    ]
+  },
   // --- TFTP Server ---
   {
     key: "tftp.root",

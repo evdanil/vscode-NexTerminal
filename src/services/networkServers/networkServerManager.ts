@@ -42,8 +42,10 @@ import type {
 import { sanitizeDhcpConfig, sanitizeTftpConfig } from "./networkServerConfigValidation";
 import {
   NetworkServerDaemonHost,
+  resolveNativeDaemonBinaryPath,
   type DhcpRuntimeSnapshot,
   type NetworkServerAdapterConfig,
+  type NetworkServerEngine,
   type NetworkServerRuntimeSnapshot,
   type TftpRuntimeSnapshot
 } from "./daemonHost";
@@ -77,6 +79,9 @@ export function isNetworkServerVerboseMode(): boolean {
  * is plenty for a human-facing view.
  */
 const RUNTIME_REFRESH_DEBOUNCE_MS = 150;
+
+/** Environment override for the daemon implementation, honoured ahead of the setting. */
+const ENGINE_ENV_VAR = "NEXUS_NETWORK_SERVERS_ENGINE";
 
 /**
  * How many completed transfers the sidebar History keeps per service.
@@ -124,6 +129,18 @@ export function resolveDhcpLeaseStorePath(globalStoragePath: string): string {
  */
 export function resolveNetworkServerDaemonPath(extensionPath: string): string {
   return path.join(extensionPath, "dist", "services", "networkServers", "networkServerDaemon.js");
+}
+
+function normalizeNetworkServerEngine(value: unknown): NetworkServerEngine | undefined {
+  return value === "rust" || value === "node" ? value : undefined;
+}
+
+/** Resolves the configured daemon implementation preference. */
+export function readNetworkServerEngine(): NetworkServerEngine {
+  const fromEnv = normalizeNetworkServerEngine(process.env[ENGINE_ENV_VAR]);
+  if (fromEnv) return fromEnv;
+  const fromSetting = vscode.workspace.getConfiguration("nexus.networkServers").get<unknown>("engine");
+  return normalizeNetworkServerEngine(fromSetting) ?? "node";
 }
 
 /**
@@ -329,6 +346,8 @@ export class NetworkServerManager implements vscode.Disposable {
     this.outputChannel = options.outputChannel ?? vscode.window.createOutputChannel("Nexus Network Servers");
     this.host = new NetworkServerDaemonHost(resolveNetworkServerDaemonPath(options.extensionPath), {
       extensionRoot: options.extensionPath,
+      resolveEngine: readNetworkServerEngine,
+      nativeBinaryPath: resolveNativeDaemonBinaryPath(options.extensionPath),
       resolveSpawnConfig: () => readNetworkServerConfigs(options.globalStoragePath)
     });
 

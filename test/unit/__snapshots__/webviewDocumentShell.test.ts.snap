@@ -9832,6 +9832,22 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <div class="setting-desc">Show a notification for embedded TFTP and DHCP activity: each Start / Stop / Restart, every TFTP transfer that opens, finishes or fails, and every DHCP lease granted or declined. Off by default because a device booting over ZTP fetches one file per notification and a bench full of hardware leases addresses all day. Failed Start / Stop / Restart commands are always reported regardless of this setting, and the Nexus Network Servers output channel records everything either way.</div>
   <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.verboseMode"></span>
 </div>
+  <h4 class="settings-subgroup">Advanced</h4>
+  <div class="form-group">
+  <label id="setting-nexus-networkServers-engine-label">Server Engine</label>
+  <div class="setting-desc">Which implementation backs the embedded TFTP and DHCP services. Node runs the bundled JavaScript daemon and works on every supported platform. Rust runs a native binary speaking the identical stdio JSON-RPC protocol, using a packaged binary when one is installed or NEXUS_NETWORK_SERVER_DAEMON_BIN for development; if no native binary is available the JavaScript daemon is used instead and the reason is logged to the Nexus Network Servers output channel, so the services always start. Takes effect the next time the daemon starts.</div>
+  <div class="custom-select" data-section="nexus.networkServers" data-key="engine">
+    <input type="hidden" id="setting-nexus-networkServers-engine" value="node" />
+    <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-networkServers-engine-label" aria-expanded="false">
+      <span class="custom-select-text">Node</span>
+    </div>
+    <div class="custom-select-dropdown" role="listbox" aria-labelledby="setting-nexus-networkServers-engine-label">
+      <div class="custom-select-option selected" data-value="node" role="option" aria-selected="true">Node <span class="recommended-badge">recommended</span></div>
+        <div class="custom-select-option" data-value="rust" role="option" aria-selected="false">Rust</div>
+    </div>
+  </div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.engine"></span>
+</div>
 
   <h3 id="section-tftpServer">TFTP Server</h3>
   <h4 class="settings-subgroup">Network</h4>

@@ -5,7 +5,19 @@
  * message. A correct host must stop at the first protocol violation, so the
  * later line cannot reach a listener or settle a request.
  */
+const fs = require("node:fs");
+
 const mode = process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE || "clean";
+const signalFile = process.env.NEXUS_MOCK_NETWORK_DAEMON_SIGNAL_FILE;
+
+if (mode === "stdin-graceful-exit-record-sigterm") {
+  process.on("SIGTERM", () => {
+    if (signalFile) fs.appendFileSync(signalFile, `SIGTERM:${process.pid}\n`);
+  });
+  process.stdin.on("end", () => {
+    setTimeout(() => process.exit(0), 250);
+  });
+}
 
 const listResult = [
   { id: "tftp", name: "TFTP", port: 69, status: "stopped" },

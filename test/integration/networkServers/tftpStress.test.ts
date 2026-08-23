@@ -189,6 +189,25 @@ async function doWRQ(port: number, filename: string, payload: Buffer, opts: Reco
   }
 }
 
+function waitForTransferComplete(engine: TftpEngine, timeoutMs = 2_000): Promise<TftpTransferInfo> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onComplete = (info: TftpTransferInfo) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(info);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      engine.off("transfer:complete", onComplete);
+      reject(new Error(`transfer:complete was not emitted within ${String(timeoutMs)}ms`));
+    }, timeoutMs);
+    engine.once("transfer:complete", onComplete);
+  });
+}
+
 describe("TFTP E2E — Stress 30+ Concurrent Devices", () => {
   let root: string;
   beforeEach(() => {
@@ -302,16 +321,18 @@ describe("TFTP E2E — Stress 30+ Concurrent Devices", () => {
   it("exact-multiple WRQ sends the final empty DATA block and completes", async () => {
     const payload = randomPayload(128 * 4);
     await withEngine(root, true, {}, async (engine, port) => {
-      let completes = 0;
-      engine.on("transfer:complete", () => completes++);
+      const completed = waitForTransferComplete(engine);
 
       await doWRQ(port, "exact-multiple.bin", payload, {
         blksize: "128",
         windowsize: "4"
       });
+      const completeInfo = await completed;
 
       expect(fs.readFileSync(path.join(root, "exact-multiple.bin"))).toEqual(payload);
-      expect(completes, "the zero-length terminator must complete the server session").toBe(1);
+      expect(completeInfo.filename, "the zero-length terminator must complete the server session").toBe(
+        "exact-multiple.bin"
+      );
       expect(engine.activeTransfers()).toHaveLength(0);
     });
   });

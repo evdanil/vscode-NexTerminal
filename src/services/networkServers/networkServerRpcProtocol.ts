@@ -492,6 +492,19 @@ function parseTftpRuntime(fields: Fields): RpcTftpRuntimeSnapshot | undefined {
   return { snapshot: snapshot as RpcTftpRuntimeSnapshot["snapshot"], transfers, root, allowWrite, boundPort };
 }
 
+/**
+ * The lease array is a *view*, not the count.
+ *
+ * A pool may hold 65,536 addresses, and serialising every lease of a
+ * well-populated one runs to several megabytes — far past {@link MAX_RPC_LINE_BYTES},
+ * which does not truncate an over-long response but replaces it wholesale with
+ * `RESPONSE_TOO_LARGE`. The daemon therefore sends as many leases as one line
+ * carries, while `poolInfo.activeCount` keeps reporting the true figure.
+ *
+ * So the check is one-sided: more leases than the pool claims are active is
+ * still incoherent and refused, but fewer is the daemon staying inside the
+ * transport. Requiring equality here is what made a large pool unreadable.
+ */
 function parseDhcpRuntime(fields: Fields): RpcDhcpRuntimeSnapshot | undefined {
   if (!hasExactShape(fields, ["snapshot", "leases", "packetCounters", "poolInfo", "boundPort"], ["snapshot", "leases", "packetCounters", "poolInfo", "boundPort"])) return undefined;
   const snapshot = parseSnapshot(fields.get("snapshot"));
@@ -501,7 +514,7 @@ function parseDhcpRuntime(fields: Fields): RpcDhcpRuntimeSnapshot | undefined {
   const boundPort = nullablePort(fields.get("boundPort"));
   if (
     !snapshot || snapshot.id !== "dhcp" || !leases || !packetCounters || !poolInfo || boundPort === undefined
-    || poolInfo.activeCount !== leases.length
+    || leases.length > poolInfo.activeCount
   ) return undefined;
   return { snapshot: snapshot as RpcDhcpRuntimeSnapshot["snapshot"], leases, packetCounters, poolInfo, boundPort };
 }

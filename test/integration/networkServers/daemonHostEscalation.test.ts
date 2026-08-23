@@ -9,6 +9,7 @@ const FIXTURE = path.resolve(__dirname, "..", "..", "fixtures", "mockNetworkServ
 const READY_TIMEOUT_MS = 1000;
 
 type HostInternals = {
+  termTimers?: Map<object, unknown>;
   killTimers?: Map<object, unknown>;
 };
 
@@ -120,6 +121,7 @@ describe("NetworkServerDaemonHost — child-owned escalation", () => {
         await waitForExit(firstPid, 4_000),
         "disposing the replacement must not cancel the first generation's required SIGKILL escalation"
       ).toBe(true);
+      expect(internals.termTimers?.size, "each exited child must release only its own SIGTERM grace timer").toBe(0);
       expect(internals.killTimers?.size, "each exited child must release only its own escalation timer").toBe(0);
     } finally {
       host.dispose();

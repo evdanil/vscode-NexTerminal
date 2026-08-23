@@ -6,7 +6,12 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
-import { NetworkServerDaemonHost, type NetworkServerDaemonHostOptions } from "../../../src/services/networkServers/daemonHost";
+import {
+  DAEMON_BINARY_ENV_VAR,
+  NetworkServerDaemonHost,
+  resolveNativeDaemonBinaryPath,
+  type NetworkServerDaemonHostOptions
+} from "../../../src/services/networkServers/daemonHost";
 import type { NetworkServerConfigs } from "../../../src/services/networkServers/core";
 import { MAX_DAEMON_RPC_IN_FLIGHT } from "../../../src/services/networkServers/networkServerRpcProtocol";
 import { sleep } from "../../helpers/networkServerTestHelpers";
@@ -130,6 +135,7 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     }
     pids.clear();
     delete process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE;
+    delete process.env[DAEMON_BINARY_ENV_VAR];
   });
 
   function create(mode: string, options: NetworkServerDaemonHostOptions = {}): NetworkServerDaemonHost {
@@ -138,6 +144,58 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     hosts.push(host);
     return host;
   }
+
+  it("resolves platform-specific native daemon binary paths", () => {
+    expect(resolveNativeDaemonBinaryPath("/ext", "linux", "x64")).toBe(
+      path.join("/ext", "dist", "native", "network-server-daemon", "linux-x64", "nexus-network-server-daemon")
+    );
+    expect(resolveNativeDaemonBinaryPath("/ext", "win32", "x64")).toBe(
+      path.join("/ext", "dist", "native", "network-server-daemon", "win32-x64", "nexus-network-server-daemon.exe")
+    );
+    expect(resolveNativeDaemonBinaryPath("/ext", "freebsd" as NodeJS.Platform, "x64")).toBeUndefined();
+  });
+
+  it("falls back to the bundled Node daemon when rust is selected but the native binary is missing", async () => {
+    const host = create("clean", {
+      engine: "rust",
+      nativeBinaryPath: path.join(FIXTURES, "missing-native-daemon")
+    });
+    const logs: Array<{ id: string; level: string; message: string }> = [];
+    host.onDidLog((id, level, message) => logs.push({ id, level, message }));
+
+    await host.ensureStarted();
+    const pid = childPid(host);
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(logs).toContainEqual(expect.objectContaining({
+      id: "daemon",
+      level: "warn",
+      message: expect.stringContaining("using the bundled Node daemon")
+    }));
+  });
+
+  it("falls back to the bundled Node daemon when the native binary cannot start before ready", async () => {
+    const host = create("clean", {
+      engine: "rust",
+      // Exists, but it is a directory, not an executable daemon. That models an
+      // installed native artifact that spawn can see but cannot execute.
+      nativeBinaryPath: FIXTURES
+    });
+    const logs: Array<{ id: string; level: string; message: string }> = [];
+    host.onDidLog((id, level, message) => logs.push({ id, level, message }));
+
+    await host.ensureStarted();
+    const pid = childPid(host);
+    expect(pid).toBeTypeOf("number");
+    pids.add(pid!);
+    await expect(host.listServers()).resolves.toHaveLength(2);
+    expect(logs).toContainEqual(expect.objectContaining({
+      id: "daemon",
+      level: "warn",
+      message: expect.stringContaining("using the bundled Node daemon")
+    }));
+  });
 
   async function expectProtocolFailureThenCleanRestart(
     mode: string,

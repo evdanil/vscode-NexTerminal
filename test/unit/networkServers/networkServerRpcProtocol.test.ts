@@ -233,7 +233,7 @@ describe("network-server RPC protocol", () => {
       }));
     });
 
-    it("requires poolInfo.activeCount to match the returned DHCP leases", () => {
+    it("rejects more DHCP leases than poolInfo.activeCount claims are active", () => {
       expectRejected(rpcResultParsers.getServiceRuntime({
         ...DHCP_RUNTIME,
         poolInfo: { ...DHCP_RUNTIME.poolInfo, activeCount: 0 },
@@ -243,6 +243,23 @@ describe("network-server RPC protocol", () => {
         leases: [DHCP_RUNTIME.leases[0], { ...DHCP_RUNTIME.leases[0], mac: "aa:bb:cc:dd:ee:01", ip: "192.168.2.250", leaseType: "static" }],
         poolInfo: { ...DHCP_RUNTIME.poolInfo, activeCount: 1, staticEntryCount: 1 },
       }));
+    });
+
+    it("accepts fewer DHCP leases than are active, because the array is bounded by the line limit", () => {
+      // A pool of up to 65,536 addresses serialises to megabytes, well past
+      // MAX_RPC_LINE_BYTES — and an over-long line is replaced wholesale with
+      // RESPONSE_TOO_LARGE rather than truncated, so requiring equality here
+      // made a large pool show no leases at all. The daemon sends what one line
+      // carries; activeCount keeps reporting the truth.
+      const parsed = rpcResultParsers.getServiceRuntime({
+        ...DHCP_RUNTIME,
+        poolInfo: { ...DHCP_RUNTIME.poolInfo, activeCount: 5_000 },
+      });
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.value.leases).toHaveLength(1);
+        expect(parsed.value.poolInfo.activeCount).toBe(5_000);
+      }
     });
 
     it("accepts the full dynamic-plus-static DHCP lease maximum and rejects one more", () => {

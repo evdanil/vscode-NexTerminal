@@ -9,8 +9,8 @@
  *   never collides with a user-occupied port and never triggers a Windows
  *   Firewall prompt.
  * - **Coupled lifecycle**: closing stdin is an EOF the daemon treats as
- *   "shut down"; a SIGTERM → SIGKILL escalation in {@link dispose} guarantees
- *   no orphan holding UDP 69/67 after the extension host goes away.
+ *   "shut down"; a delayed SIGTERM → SIGKILL escalation in {@link dispose}
+ *   guarantees no orphan holding UDP 69/67 after the extension host goes away.
  * - **Crash isolation**: a fault in the DHCP library cannot take down the
  *   extension host, exactly as the serial sidecar isolates `serialport`.
  *
@@ -31,6 +31,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import { normalizeBoundedNumber } from "../../utils/helpers";
 import { attachBoundedLineReader } from "./boundedLineReader";
@@ -64,6 +65,11 @@ type RuntimeUpdateListener = (id: string) => void;
 type ConnectionListener = (id: string, event: ServerConnectionEvent) => void;
 type LogListener = (id: string, level: string, message: string) => void;
 type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void;
+
+/** Grace period for the daemon's stdin-EOF shutdown path before SIGTERM. */
+const DAEMON_STDIN_EOF_GRACE_MS = 500;
+/** Escalation after SIGTERM if the process is still alive. */
+const DAEMON_SIGKILL_ESCALATION_MS = 2000;
 
 /** In-flight JSON-RPC call awaiting its response. */
 interface PendingRequest {
@@ -164,10 +170,65 @@ export interface NetworkServerDaemonHostOptions {
    * default ports for services the user has reconfigured.
    */
   resolveSpawnConfig?: () => NetworkServerConfigs;
+  /**
+   * Which daemon implementation to spawn. `rust` is a preference: if no native
+   * binary is available for this platform, the host falls back to Node.
+   */
+  engine?: NetworkServerEngine;
+  /**
+   * Resolves the implementation preference at launch time. Used by the VS Code
+   * manager so a settings change takes effect on the next daemon start without
+   * requiring an extension-host reload.
+   */
+  resolveEngine?: () => NetworkServerEngine;
+  /** Absolute path to the native daemon binary, when one ships for this platform. */
+  nativeBinaryPath?: string;
 }
 
 /** Environment variable carrying the spawn-time configuration seed. */
 const CONFIG_ENV_VAR = "NEXUS_NETWORK_SERVERS_CONFIG";
+
+/** Which implementation backs the daemon child process. */
+export type NetworkServerEngine = "node" | "rust";
+
+/**
+ * Environment override for running a locally-built native daemon without a
+ * packaged artifact.
+ */
+export const DAEMON_BINARY_ENV_VAR = "NEXUS_NETWORK_SERVER_DAEMON_BIN";
+
+interface LaunchTarget {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly native: boolean;
+}
+
+function toNativeDaemonPlatformKey(platform: NodeJS.Platform, arch: string): string | undefined {
+  if (arch !== "x64" && arch !== "arm64") return undefined;
+  switch (platform) {
+    case "darwin":
+    case "linux":
+    case "win32":
+      return `${platform}-${arch}`;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Absolute path of the native daemon binary for the running platform, or
+ * `undefined` when the platform/architecture is unsupported.
+ */
+export function resolveNativeDaemonBinaryPath(
+  extensionPath: string,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string | undefined {
+  const platformKey = toNativeDaemonPlatformKey(platform, arch);
+  if (!platformKey) return undefined;
+  const binaryName = platform === "win32" ? "nexus-network-server-daemon.exe" : "nexus-network-server-daemon";
+  return path.join(extensionPath, "dist", "native", "network-server-daemon", platformKey, binaryName);
+}
 
 function normalizeRpcTimeoutMs(timeoutMs: number): number {
   return normalizeBoundedNumber(timeoutMs, 15_000, 2_000, 60_000);
@@ -204,6 +265,8 @@ export class NetworkServerDaemonHost {
   private nextGeneration = 1;
   private activeGeneration?: number;
   private readonly childIo = new Map<ChildProcess, ChildIoOwnership>();
+  /** SIGTERM grace timer belongs to the specific child whose stdin was closed. */
+  private readonly termTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
   /** SIGKILL escalation belongs to the specific child that received SIGTERM. */
   private readonly killTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
   /** A live child may close stdout only until this generation-owned deadline. */
@@ -393,9 +456,10 @@ export class NetworkServerDaemonHost {
   }
 
   /**
-   * Tears down the bridge: closes stdin (EOF → graceful daemon shutdown),
-   * SIGTERMs the child, escalates to SIGKILL after 2s, rejects every pending
-   * request and drops all listeners. Idempotent.
+   * Tears down the bridge: closes stdin (EOF → graceful daemon shutdown), gives
+   * that path a short grace window, then SIGTERMs the child and escalates to
+   * SIGKILL after 2s if it is still alive. Rejects every pending request and
+   * drops all listeners. Idempotent.
    */
   public dispose(): void {
     if (this.disposed) return;
@@ -425,8 +489,9 @@ export class NetworkServerDaemonHost {
   // ---------------------------------------------------------------------------
 
   /**
-   * Detaches a child from the bridge and kills it: SIGTERM, escalating to
-   * SIGKILL after 2s if it is still alive.
+   * Detaches a child from the bridge and tears it down: stdin EOF first, then
+   * SIGTERM after the EOF grace window, escalating to SIGKILL after 2s if it is
+   * still alive.
    *
    * Shared by {@link dispose} and by the ready-timeout path in {@link launch},
    * which needs exactly the same teardown — a child that never reported ready
@@ -453,12 +518,84 @@ export class NetworkServerDaemonHost {
     // Node can deliver a buffered EPIPE after exit/termination.
     this.detachChildProtocolIo(child);
     try { child.stdin?.end(); } catch { /* pipe already gone */ }
-    try { child.kill("SIGTERM"); } catch { /* already dead */ }
-    this.scheduleChildEscalation(child);
+    this.scheduleChildTermination(child);
+  }
+
+  /**
+   * Picks the child process to spawn.
+   *
+   * `engine: "rust"` is a preference, never a hard requirement. A user who
+   * opts in on a platform without a packaged binary must still get working
+   * TFTP/DHCP, so missing native artifacts degrade to the bundled Node daemon
+   * with a visible warning.
+   */
+  private resolveLaunchTarget(): LaunchTarget {
+    const nodeTarget = this.nodeLaunchTarget();
+    const engine = this.options.resolveEngine?.() ?? this.options.engine ?? "node";
+    if (engine !== "rust") return nodeTarget;
+
+    const override = process.env[DAEMON_BINARY_ENV_VAR]?.trim();
+    const binary = override && override.length > 0 ? override : this.options.nativeBinaryPath;
+    if (!binary) {
+      this.emitLog(
+        "daemon",
+        "warn",
+        `Engine 'rust' requested but no native daemon ships for ${process.platform}-${process.arch}; using the bundled Node daemon instead.`
+      );
+      return nodeTarget;
+    }
+    if (!existsSync(binary)) {
+      this.emitLog(
+        "daemon",
+        "warn",
+        `Engine 'rust' requested but the native daemon binary is missing at ${binary}; using the bundled Node daemon instead.`
+      );
+      return nodeTarget;
+    }
+    return { command: binary, args: [], native: true };
+  }
+
+  private nodeLaunchTarget(): LaunchTarget {
+    return { command: process.execPath, args: [this.daemonScriptPath], native: false };
   }
 
   private async launch(attempt: StartupAttempt): Promise<void> {
-    if (!existsSync(this.daemonScriptPath)) {
+    const target = this.resolveLaunchTarget();
+    if (target.native) {
+      try {
+        await this.launchTarget(attempt, target);
+        return;
+      } catch (error) {
+        if (!this.canRetryStartupAttempt(attempt)) throw error;
+        attempt.child = undefined;
+        attempt.generation = undefined;
+        this.startAttempt = attempt;
+        this.emitLog(
+          "daemon",
+          "warn",
+          `Native network servers daemon failed before reporting ready (${error instanceof Error ? error.message : String(error)}); using the bundled Node daemon instead.`
+        );
+        await this.launchTarget(attempt, this.nodeLaunchTarget());
+        return;
+      }
+    }
+    await this.launchTarget(attempt, target);
+  }
+
+  private canRetryStartupAttempt(attempt: StartupAttempt): boolean {
+    return !this.disposed
+      && !this.readyFlag
+      && !this.child
+      && (this.startAttempt === attempt || this.startAttempt === undefined);
+  }
+
+  private async launchTarget(attempt: StartupAttempt, target: LaunchTarget): Promise<void> {
+    if (this.disposed || this.startAttempt !== attempt || this.child) {
+      throw new Error(this.disposed
+        ? "Network servers daemon host is disposed"
+        : "Network servers daemon startup attempt was retired before spawn");
+    }
+    if (!target.native && !existsSync(this.daemonScriptPath)) {
       throw new Error(`Network servers daemon script not found: ${this.daemonScriptPath}`);
     }
 
@@ -472,15 +609,21 @@ export class NetworkServerDaemonHost {
         ? "Network servers daemon host is disposed"
         : "Network servers daemon startup attempt was retired before spawn");
     }
-    const child = spawn(process.execPath, [this.daemonScriptPath], {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(serializedSeed ? { [CONFIG_ENV_VAR]: serializedSeed } : {})
+    };
+    if (target.native) {
+      // The native daemon is a plain executable, not a Node/Electron script.
+      delete env.ELECTRON_RUN_AS_NODE;
+    } else {
+      env.ELECTRON_RUN_AS_NODE = "1";
+    }
+    const child = spawn(target.command, [...target.args], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: this.options.extensionRoot,
       windowsHide: true,
-      env: {
-        ...process.env,
-        ELECTRON_RUN_AS_NODE: "1",
-        ...(serializedSeed ? { [CONFIG_ENV_VAR]: serializedSeed } : {})
-      }
+      env
     });
     const generation = this.nextGeneration++;
     this.child = child;
@@ -494,6 +637,7 @@ export class NetworkServerDaemonHost {
     // listener below must ignore its later exit; the child still owns the
     // timer that would otherwise escalate an unrelated replacement.
     const clearChildTimers = () => {
+      this.clearChildTermination(child);
       this.clearChildEscalation(child);
       this.clearChildStdoutEofDeadline(child);
     };
@@ -993,7 +1137,37 @@ export class NetworkServerDaemonHost {
     }
   }
 
-  /** Installs no more than one unref'd escalation timer for this exact child. */
+  /** Installs no more than one unref'd SIGTERM timer for this exact child. */
+  private scheduleChildTermination(child: ChildProcess): void {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      this.clearChildTermination(child);
+      this.clearChildEscalation(child);
+      return;
+    }
+    if (this.termTimers.has(child)) return;
+
+    const timer = setTimeout(() => {
+      this.termTimers.delete(child);
+      if (child.exitCode !== null || child.signalCode !== null) {
+        this.clearChildEscalation(child);
+        return;
+      }
+      try { child.kill("SIGTERM"); } catch { /* already dead */ }
+      this.scheduleChildEscalation(child);
+    }, DAEMON_STDIN_EOF_GRACE_MS);
+    timer.unref();
+    this.termTimers.set(child, timer);
+  }
+
+  /** Clears only the SIGTERM timer owned by the child known to have ended. */
+  private clearChildTermination(child: ChildProcess): void {
+    const timer = this.termTimers.get(child);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.termTimers.delete(child);
+  }
+
+  /** Installs no more than one unref'd SIGKILL escalation timer for this exact child. */
   private scheduleChildEscalation(child: ChildProcess): void {
     if (child.exitCode !== null || child.signalCode !== null) {
       this.clearChildEscalation(child);
@@ -1007,7 +1181,7 @@ export class NetworkServerDaemonHost {
         return;
       }
       try { child.kill("SIGKILL"); } catch { /* already dead */ }
-    }, 2000);
+    }, DAEMON_SIGKILL_ESCALATION_MS);
     timer.unref();
     this.killTimers.set(child, timer);
   }
