@@ -25,7 +25,7 @@
 
 use crate::path_guard::{GuardError, PathGuard, RootError};
 use crate::protocol::{encode_error, parse_packet, peek_opcode, ProtocolError};
-use crate::session::{Direction, Phase, TransferInit, TransferSession};
+use crate::session::{block_distance, Direction, Phase, TransferInit, TransferSession};
 use crate::types::{ErrorCode, Opcode, Packet};
 use std::collections::HashMap;
 use std::fmt;
@@ -330,10 +330,35 @@ impl<S: Datagram> Wire<S> {
 // Core
 // ---------------------------------------------------------------------------
 
+/// The tail of a finished upload, kept alive for one retry interval.
+///
+/// RFC 1350 §6 dallies after the last ACK so that a lost final ACK can be
+/// answered again. Under RFC 7440 that ACK is cumulative over a whole window,
+/// so the block a client resends after losing it is the *first* one the window
+/// covered, not the last. State that keeps only `final_block` answers every
+/// other block with `UnknownTransferId`, which leaves the file complete on the
+/// server and the upload reported as failed on the client.
 struct CompletedWrite {
+    /// First and last block of the window the retained ACK stood for. The range
+    /// is a single block when the transfer ended on a window boundary, and
+    /// shorter than `windowsize` whenever the file ran out mid-window — which is
+    /// why the negotiated size cannot stand in for it.
+    window_start: u16,
     final_block: u16,
     ack: Vec<u8>,
     expires_at: Instant,
+}
+
+impl CompletedWrite {
+    /// True when `block` is one the retained ACK already covered.
+    ///
+    /// Distances run backwards from `final_block`, so a block ahead of it wraps
+    /// to the far end of the sequence space and lands outside the window: the
+    /// comparison needs no separate case for the wrap.
+    fn covers(&self, block: u16) -> bool {
+        block_distance(block, self.final_block)
+            <= block_distance(self.window_start, self.final_block)
+    }
 }
 
 /// The protocol core: everything except the socket loop itself.
@@ -522,7 +547,7 @@ impl<S: Datagram> TftpCore<S> {
         let Ok(Some(Packet::Data { block, .. })) = parse_packet(msg) else {
             return false;
         };
-        if block != completed.final_block {
+        if !completed.covers(block) {
             return false;
         }
         let ack = completed.ack.clone();
@@ -839,6 +864,7 @@ impl<S: Datagram> TftpCore<S> {
     fn finish_done(&mut self, peer: SocketAddr) {
         let completed_write = self.transfers.get(&peer).and_then(|session| {
             (session.direction == Direction::Write).then(|| CompletedWrite {
+                window_start: session.acked_window_start,
                 final_block: session.last_acked,
                 ack: crate::protocol::encode_ack(session.last_acked),
                 expires_at: Instant::now() + session.retry_interval(),
@@ -1379,6 +1405,77 @@ mod tests {
             std::fs::read(&destination).unwrap(),
             b"done",
             "the duplicate final DATA must not be appended a second time"
+        );
+    }
+
+    #[test]
+    fn a_completed_write_reacks_a_duplicate_from_anywhere_in_the_final_window() {
+        // windowsize=4, blksize=8: DATA(1) is full and draws no ACK, DATA(2) is
+        // short and completes the upload with the cumulative ACK(2). If that ACK
+        // is lost, an RFC 7440 client resumes from the first block it never saw
+        // acknowledged — DATA(1), not DATA(2). State that keeps only the final
+        // block answers UnknownTransferId there, which leaves the server holding
+        // a complete file while the client reports the upload as failed.
+        let temp = TempDir::new("engine-write-final-window-retry");
+        let destination = temp.path().join("up.bin");
+        let (mut core, rec) = core_for(&temp, true, 8);
+        let writer = peer(43214);
+        let options = RawOptions {
+            blksize: Some("8".to_owned()),
+            windowsize: Some("4".to_owned()),
+            ..RawOptions::default()
+        };
+
+        core.handle_message(&encode_wrq("up.bin", "octet", &options), writer);
+        core.handle_message(&encode_data(1, b"01234567"), writer);
+        core.handle_message(&encode_data(2, b"tail"), writer);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"01234567tail");
+
+        core.handle_message(&encode_data(1, b"01234567"), writer);
+
+        let sent = rec.sent.borrow();
+        assert_eq!(
+            ack_block(&sent.last().unwrap().1),
+            2,
+            "a duplicate from the completed window must draw the final cumulative ACK"
+        );
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"01234567tail",
+            "the duplicate must not be appended a second time"
+        );
+    }
+
+    #[test]
+    fn a_completed_write_rejects_a_duplicate_from_before_the_final_window() {
+        // windowsize=2, blksize=8: blocks 1-2 fill a window and draw ACK(2), then
+        // the short block 3 completes the upload on its own. The final window is
+        // therefore block 3 alone. A client that reached block 3 had already seen
+        // ACK(2), so a late DATA(2) is a stale network duplicate rather than a
+        // retry — bounding the dally by the negotiated windowsize instead of by
+        // the window that actually closed would answer it as if the transfer were
+        // still open.
+        let temp = TempDir::new("engine-write-stale-window-retry");
+        let (mut core, rec) = core_for(&temp, true, 8);
+        let writer = peer(43215);
+        let options = RawOptions {
+            blksize: Some("8".to_owned()),
+            windowsize: Some("2".to_owned()),
+            ..RawOptions::default()
+        };
+
+        core.handle_message(&encode_wrq("up.bin", "octet", &options), writer);
+        core.handle_message(&encode_data(1, b"01234567"), writer);
+        core.handle_message(&encode_data(2, b"89abcdef"), writer);
+        core.handle_message(&encode_data(3, b"tail"), writer);
+
+        core.handle_message(&encode_data(2, b"89abcdef"), writer);
+
+        let sent = rec.sent.borrow();
+        assert_eq!(
+            error_code(&sent.last().unwrap().1),
+            ErrorCode::UnknownTransferId.to_wire(),
+            "a block from before the completed window is not a final-window retry"
         );
     }
 

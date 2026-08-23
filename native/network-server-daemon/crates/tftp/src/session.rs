@@ -176,6 +176,11 @@ pub struct TransferSession {
     pub block: u16,
     /// Highest block the peer has confirmed, in wrap-safe terms.
     pub last_acked: u16,
+    /// First block covered by the cumulative ACK at [`Self::last_acked`], i.e.
+    /// the start of the window that ACK closed. A WRQ that ends mid-window
+    /// closes a window shorter than `windowsize`, so the negotiated size alone
+    /// does not say which blocks the final ACK stood for.
+    pub acked_window_start: u16,
     pub file_size: u64,
     /// Bytes moved so far, including not-yet-acknowledged in-flight data.
     pub bytes_transferred: u64,
@@ -220,6 +225,7 @@ impl TransferSession {
             error: None,
             block: 0,
             last_acked: 0,
+            acked_window_start: 1,
             file_size: 0,
             bytes_transferred: 0,
             tsize_at_start: None,
@@ -398,6 +404,7 @@ impl TransferSession {
         self.bytes_transferred = 0;
         self.block = 0;
         self.last_acked = 0;
+        self.acked_window_start = 1;
         self.file_offset = 0;
         // RFC 2349 §3: a client asking `tsize` with the value 0 on a read is
         // asking the server to fill it in.
@@ -420,6 +427,7 @@ impl TransferSession {
         self.bytes_transferred = 0;
         self.block = 1;
         self.last_acked = 0;
+        self.acked_window_start = 1;
         // Captured here so an upload can show a progress bar and an ETA. It is
         // the only size information a WRQ ever carries.
         self.tsize_at_start = self.opts.tsize;
@@ -581,6 +589,9 @@ impl TransferSession {
         let should_ack =
             is_last || block_distance(self.last_acked, current) >= self.opts.windowsize;
         if should_ack {
+            // Recorded before `last_acked` moves: the window this ACK closes
+            // began at the block after the previous cumulative ACK.
+            self.acked_window_start = next_block(self.last_acked);
             self.last_acked = current;
             if is_last {
                 self.phase = Phase::Done;
