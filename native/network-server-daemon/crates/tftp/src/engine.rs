@@ -241,6 +241,12 @@ impl Admission {
         true
     }
 
+    /// The ceiling this admission enforces.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.max
+    }
+
     /// Returns a slot.
     ///
     /// Must run on **every** path out of the request — including the many
@@ -887,7 +893,7 @@ impl<S: Datagram> TftpCore<S> {
             return;
         };
         if let Some(completed) = completed_write {
-            self.completed_writes.insert(peer, completed);
+            self.remember_completed_write(peer, completed);
         }
         self.wire.log(
             LogLevel::Info,
@@ -899,6 +905,38 @@ impl<S: Datagram> TftpCore<S> {
             ),
         );
         self.wire.emit(EngineEvent::TransferComplete(Box::new(info)));
+    }
+
+    /// Retains a finished upload's dally record, keeping the table bounded.
+    ///
+    /// Nothing charged these against the admission cap: the transfer is over by
+    /// the time one is made, so the slot has already been returned. With a
+    /// negotiated timeout they live for minutes, and an answered retry renews
+    /// one — so completed uploads from successive source ports grew the table
+    /// without bound while no transfer was active at all.
+    ///
+    /// Bounded by the same ceiling as concurrent transfers, which is the scale
+    /// of activity the service already commits to. Over it, the record closest
+    /// to expiring is dropped: it is the one whose client is least likely to
+    /// still be retrying, and losing it costs only the courtesy re-ACK — which
+    /// is what a peer got before any of this existed.
+    fn remember_completed_write(&mut self, peer: SocketAddr, completed: CompletedWrite) {
+        let now = Instant::now();
+        self.completed_writes.retain(|_, held| held.expires_at > now);
+        while self.completed_writes.len() >= self.admission.limit()
+            && !self.completed_writes.contains_key(&peer)
+        {
+            let Some(soonest) = self
+                .completed_writes
+                .iter()
+                .min_by_key(|(_, held)| held.expires_at)
+                .map(|(address, _)| *address)
+            else {
+                break;
+            };
+            self.completed_writes.remove(&soonest);
+        }
+        self.completed_writes.insert(peer, completed);
     }
 
     fn finish_error(&mut self, peer: SocketAddr, reason: String, code: Option<String>) {
@@ -1563,6 +1601,35 @@ mod tests {
         assert!(
             renewed > first,
             "each answered retry must restart the dally clock"
+        );
+    }
+
+    #[test]
+    fn completed_write_records_are_bounded_by_the_transfer_limit() {
+        // A dally record is created on every completed upload, and nothing
+        // charged it against the admission cap or any other maximum. With a
+        // negotiated timeout the records live for minutes, and a covered
+        // duplicate renews one indefinitely — so zero-byte uploads from
+        // successive source ports grow the table without bound while no transfer
+        // is active at all. My own note on the renewal fix said the table "stays
+        // bounded as before"; it was never bounded.
+        let temp = TempDir::new("engine-dally-flood");
+        let (mut core, _rec) = core_for(&temp, true, 4);
+        let options = RawOptions {
+            timeout: Some("255".to_owned()),
+            ..RawOptions::default()
+        };
+
+        for port in 0..64u16 {
+            let writer = peer(44000 + port);
+            core.handle_message(&encode_wrq(&format!("up{port}.bin"), "octet", &options), writer);
+            core.handle_message(&encode_data(1, b""), writer);
+        }
+
+        assert!(
+            core.completed_writes.len() <= 4,
+            "dally records must be bounded by the transfer limit; held {}",
+            core.completed_writes.len()
         );
     }
 
