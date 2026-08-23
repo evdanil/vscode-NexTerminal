@@ -739,6 +739,17 @@ export const SETTINGS_META: SettingMeta[] = [
     default: true
   },
   {
+    key: "dhcp.allowRelayAgents",
+    section: "nexus.networkServers",
+    label: "Serve Relayed Requests",
+    type: "boolean",
+    category: "dhcpServer",
+    subgroup: "Boot / ZTP",
+    description:
+      "Answer requests that name a relay agent in their giaddr field, per RFC 2131 §4.1. Off by default, and worth leaving off unless this server actually sits behind a DHCP relay: nothing in the protocol authenticates that field, so with it on, any device on the network can have a full configuration — subnet, gateway, DNS, boot options — sent to an address of its choosing. A bench or lab server has no relays in the picture and loses nothing by refusing them. Honoured by the Rust engine only; the JavaScript engine leaves reply routing to its DHCP library and always follows the RFC here.",
+    default: false
+  },
+  {
     key: "dhcp.vendorClassId",
     section: "nexus.networkServers",
     label: "Vendor Class Identifier Filter",

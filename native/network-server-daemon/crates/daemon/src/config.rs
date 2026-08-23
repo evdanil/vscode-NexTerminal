@@ -218,6 +218,11 @@ pub struct DhcpConfig {
     pub vendor_class_id: Option<String>,
     #[serde(default, deserialize_with = "present_but_not_null")]
     pub vendor_specific_options: Option<Vec<VendorOptionConfig>>,
+    /// Serve requests that name a relay agent in `giaddr`. Off by default: the
+    /// field is unauthenticated, so honouring it on a service with no relayed
+    /// segments turns any LAN peer into a reflector.
+    #[serde(default, deserialize_with = "present_but_not_null")]
+    pub allow_relay_agents: Option<bool>,
 }
 
 impl DhcpConfig {
@@ -310,6 +315,7 @@ impl DhcpConfig {
             }
         }
         options.lease_store_path = lease_store_path.map(PathBuf::from);
+        options.allow_relay_agents = self.allow_relay_agents.unwrap_or(false);
 
         let tftp_servers = match &self.tftp_server_addresses {
             Some(list) => parse_ipv4_list(list, "TFTP server address")?,

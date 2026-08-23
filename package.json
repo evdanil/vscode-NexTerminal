@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox and EVE-NG inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.203",
+  "version": "2.8.204",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -4167,6 +4167,12 @@
           "default": true,
           "order": 52,
           "markdownDescription": "**DHCP — Boot / ZTP.** Point DHCP clients at this machine's own TFTP service. When `#nexus.networkServers.dhcp.nextServer#` and `#nexus.networkServers.dhcp.tftpServerAddresses#` are both empty, options 66 and 150 are filled in from `#nexus.networkServers.tftp.interface#` so ZTP works without typing the same address twice. Setting either one by hand turns the link off for both — quietly advertising a second, different boot server under the other option number is how a device boots from the wrong host. If the TFTP service is bound to `0.0.0.0` (all interfaces) there is no single address to advertise, and both options are left unset rather than guessed."
+        },
+        "nexus.networkServers.dhcp.allowRelayAgents": {
+          "type": "boolean",
+          "default": false,
+          "order": 53,
+          "markdownDescription": "**DHCP — Serve relayed requests.** Answer requests that name a relay agent in their `giaddr` field, per RFC 2131 §4.1. Off by default, and worth leaving off unless this server actually sits behind a DHCP relay: nothing in the protocol authenticates that field, so with it on, any device on the network can have a full configuration — subnet, gateway, DNS, boot options — sent to an address of its choosing. A bench or lab server has no relays in the picture and loses nothing by refusing them. Honoured by the Rust engine only; the JavaScript engine leaves reply routing to its DHCP library and always follows the RFC here."
         },
         "nexus.networkServers.dhcp.vendorClassId": {
           "type": "string",

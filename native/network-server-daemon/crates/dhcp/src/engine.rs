@@ -229,6 +229,15 @@ pub struct EngineOptions {
     pub boot: BootOptions,
     pub tick_interval: Duration,
     pub persist_debounce: Duration,
+    /// Whether a request naming a relay agent in `giaddr` is served.
+    ///
+    /// Off by default. RFC 2131 §4.1 says answer through the relay named there,
+    /// and nothing in the protocol authenticates that field — so on a service
+    /// with no relayed segments it hands any LAN peer a reflector: spoof
+    /// `giaddr` and a full configuration (subnet, gateway, DNS, boot options)
+    /// goes to an uninvolved third address. A bench server has no relays in the
+    /// picture, so the capability stays available and stops being the default.
+    pub allow_relay_agents: bool,
 }
 
 impl Default for EngineOptions {
@@ -249,6 +258,7 @@ impl Default for EngineOptions {
             boot: BootOptions::default(),
             tick_interval: DEFAULT_TICK_INTERVAL,
             persist_debounce: DEFAULT_PERSIST_DEBOUNCE,
+            allow_relay_agents: false,
         }
     }
 }
@@ -341,6 +351,7 @@ pub struct DhcpCore<S: Datagram> {
     lease_store_path: Option<PathBuf>,
     persist_debounce: Duration,
     dirty_since: Option<Instant>,
+    allow_relay_agents: bool,
     /// Gate and tally for [`Self::log_notice`].
     notice_gate: Instant,
     notices_suppressed: u64,
@@ -383,6 +394,7 @@ impl<S: Datagram> DhcpCore<S> {
             boot: options.boot.clone(),
             lease_store_path: options.lease_store_path.clone(),
             persist_debounce: options.persist_debounce,
+            allow_relay_agents: options.allow_relay_agents,
             dirty_since: None,
             // Far enough back that the first notice is never gated.
             notice_gate: Instant::now()
@@ -565,6 +577,30 @@ impl<S: Datagram> DhcpCore<S> {
             format!("{} from MAC {mac}{suffix}", kind.as_str()),
         );
 
+        // RFC 2131 §4.1 says answer through the relay agent named in `giaddr`,
+        // and nothing in the protocol authenticates that field. This service
+        // serves the segment it is bound to — it has no relayed segments to
+        // reach, and no way to tell a relay from a peer claiming to be one — so
+        // honouring it bought nothing and handed any LAN peer a director's
+        // chair: spoof `giaddr` and a full configuration (subnet, gateway, DNS,
+        // boot options) is sent to an uninvolved third address, which is a
+        // reflector built out of a feature nobody here uses.
+        //
+        // Dropped before allocation, so a relayed request cannot consume a pool
+        // address either. Deployments that do sit behind a relay turn
+        // `allowRelayAgents` on and get RFC behaviour back unchanged.
+        if !message.giaddr.is_unspecified() && !self.allow_relay_agents {
+            self.log_notice(
+                LogLevel::Debug,
+                format!(
+                    "ignoring a request from {mac} that claims relay agent {} — this server \
+                     answers only the segment it is bound to",
+                    message.giaddr
+                ),
+            );
+            return;
+        }
+
         match kind {
             MessageType::Discover => self.handle_discover(&message, &mac, vendor_class.as_deref()),
             MessageType::Request => self.handle_request(&message, &mac, vendor_class.as_deref()),
@@ -633,6 +669,25 @@ impl<S: Datagram> DhcpCore<S> {
                 LogLevel::Info,
                 "the pool has addresses to offer again".to_owned(),
             );
+        }
+        // GHSA-9x42-hgm8-vwmv: an offer reserves a pool address for its
+        // lifetime and costs the peer a single packet, so fabricated MACs can
+        // hold the whole pool without ever completing DORA. Only a *fresh*
+        // claim is capped — a client that already holds an address is asking
+        // about the one it has, and refusing that would make this a defence
+        // that causes the outage it prevents.
+        if self.table.existing_address(mac, now).is_none()
+            && self.table.offer_capacity_reached(now)
+        {
+            self.log_notice(
+                LogLevel::Warn,
+                format!(
+                    "declining to offer {mac} an address: unclaimed offers already hold the \
+                     share of the pool reserved for them. A client that completes DHCP frees \
+                     its offer immediately; a flood of new addresses never does."
+                ),
+            );
+            return;
         }
         let hostname = request.options.text(OPTION_HOSTNAME);
         self.table.offer(mac, address, hostname, now);
@@ -1727,7 +1782,11 @@ mod tests {
 
     #[test]
     fn a_relayed_request_is_answered_through_the_relay_on_the_server_port() {
-        let mut h = Harness::new();
+        // Relay support is intact, behind the setting that now guards it: the
+        // RFC behaviour is a capability, it just is not the default.
+        let mut o = options();
+        o.allow_relay_agents = true;
+        let mut h = Harness::with(&o);
         let mut packet = discover(&MAC_A);
         // giaddr sits at offset 24.
         packet[24..28].copy_from_slice(&ip("10.9.9.1").octets());
@@ -2111,6 +2170,82 @@ mod tests {
             h.events().iter().any(|line| line.contains("suppressed")),
             "the gate must say what it stood in for"
         );
+    }
+
+    #[test]
+    fn a_request_claiming_to_be_relayed_is_not_answered_to_the_address_it_names() {
+        // GHSA-9x42-hgm8-vwmv, finding 1. RFC 2131 §4.1 says reply through the
+        // relay agent named in giaddr, and nothing in the protocol authenticates
+        // that field. On a service with no relay in the picture that turns any
+        // LAN peer into a director: spoof giaddr and the server sends a full
+        // configuration — subnet, gateway, DNS, boot options — to an uninvolved
+        // third address. This server does not serve relayed segments, so it has
+        // no reason to answer one.
+        let mut h = Harness::new();
+        let relayed = PacketBuilder::new(&MAC_A)
+            .message_type(1)
+            .giaddr(ip("10.0.0.200"))
+            .build();
+
+        h.feed(&relayed);
+
+        assert!(
+            h.sent.borrow().is_empty(),
+            "a relayed request must not be answered at all, least of all to the address it names"
+        );
+        assert!(
+            h.core.active_leases().is_empty(),
+            "and must not consume a pool address on the way"
+        );
+    }
+
+    #[test]
+    fn unclaimed_offers_cannot_hold_the_whole_pool() {
+        // GHSA-9x42-hgm8-vwmv, finding 2. A DISCOVER costs one packet and holds
+        // a pool address for the offer lifetime, so fabricated MACs can keep an
+        // entire pool reserved without ever completing DORA — no auth, just LAN
+        // presence. Some share of the pool has to stay reachable for clients
+        // that will actually bind.
+        let mut o = options();
+        o.range_start = ip("10.0.0.10");
+        o.range_end = ip("10.0.0.29"); // twenty addresses
+        let mut h = Harness::with(&o);
+
+        for i in 0..20u8 {
+            h.feed(&discover(&[0xCC, 0, 0, 0, 0, i]));
+        }
+
+        let offered = h.core.active_leases().len();
+        assert!(
+            offered < 20,
+            "unclaimed offers must not be able to take every address; {offered} of 20 held"
+        );
+    }
+
+    #[test]
+    fn the_offer_cap_never_turns_away_a_client_that_already_holds_a_lease() {
+        // The cap is for clients making a fresh claim. A device that already has
+        // an address is asking about the one it holds, so refusing it would turn
+        // a defence against fabricated MACs into an outage for real ones.
+        let mut o = options();
+        o.range_start = ip("10.0.0.10");
+        o.range_end = ip("10.0.0.29");
+        let mut h = Harness::with(&o);
+
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+        assert_eq!(h.last_reply().options.message_type(), Some(MessageType::Ack));
+
+        // Flood past the cap with fabricated MACs.
+        for i in 0..20u8 {
+            h.feed(&discover(&[0xCC, 0, 0, 0, 0, i]));
+        }
+
+        // The bound client comes back; it must still be served its own address.
+        h.feed(&discover(&MAC_A));
+        let reply = h.last_reply();
+        assert_eq!(reply.options.message_type(), Some(MessageType::Offer));
+        assert_eq!(reply.yiaddr, ip("10.0.0.10"));
     }
 
     #[test]

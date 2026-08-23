@@ -72,6 +72,7 @@ pub struct PacketBuilder {
     xid: u32,
     flags: u16,
     ciaddr: Ipv4Addr,
+    giaddr: Ipv4Addr,
     options: Vec<u8>,
 }
 
@@ -83,8 +84,16 @@ impl PacketBuilder {
             xid: 0x1234_5678,
             flags: 0,
             ciaddr: Ipv4Addr::UNSPECIFIED,
+            giaddr: Ipv4Addr::UNSPECIFIED,
             options: Vec::new(),
         }
+    }
+
+    /// The relay-agent address a client claims forwarded its request.
+    #[must_use]
+    pub fn giaddr(mut self, giaddr: Ipv4Addr) -> Self {
+        self.giaddr = giaddr;
+        self
     }
 
     #[must_use]
@@ -143,7 +152,7 @@ impl PacketBuilder {
         out.extend_from_slice(&self.ciaddr.octets());
         out.extend_from_slice(&[0u8; 4]); // yiaddr
         out.extend_from_slice(&[0u8; 4]); // siaddr
-        out.extend_from_slice(&[0u8; 4]); // giaddr
+        out.extend_from_slice(&self.giaddr.octets());
         let mut hardware = [0u8; MAX_HARDWARE_LEN];
         for (slot, byte) in hardware.iter_mut().zip(self.chaddr.iter()) {
             *slot = *byte;

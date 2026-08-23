@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.204] — 2026-08-23
+
+### Security
+
+Two hardening changes to the DHCP server, both reported by @kanekitakitos against the native engine and both applying to the settings you already have. Neither is a flaw peculiar to this implementation — they are properties DHCP has always had — but a bench server has no use for either, and the safe behaviour costs nothing here.
+
+- **A request naming a relay agent is no longer answered by default.** RFC 2131 §4.1 says reply through the relay named in the request's `giaddr` field, and nothing in the protocol authenticates that field. On a server that sits behind a real relay this is how DHCP works; on one that does not — which is nearly every use of this feature — it means any device on the network can have a full configuration, subnet and gateway and DNS and boot options, sent to an address it picks. Such requests are now ignored, before an address is reserved for them, and **Serve Relayed Requests** (`nexus.networkServers.dhcp.allowRelayAgents`) restores the RFC behaviour for anyone who does have a relay. The setting is honoured by the Rust engine; the JavaScript engine leaves reply routing to its DHCP library and continues to follow the RFC.
+
+- **Unclaimed offers can no longer hold the whole address pool.** A DISCOVER costs a client one packet and reserves an address for two minutes, so fabricated hardware addresses could keep a pool fully reserved without ever completing a handshake, and legitimate devices would find nothing left. Offers awaiting a claim are now capped at half the pool, and only for clients making a *fresh* claim — a device that already holds an address is asking about the one it has and is never turned away. A client refused an offer re-sends its request, so a genuine rush of devices larger than the cap is served as earlier offers become leases; a flood that never completes stays bounded.
+
 ## [2.8.203] — 2026-08-23
 
 ### Fixed
