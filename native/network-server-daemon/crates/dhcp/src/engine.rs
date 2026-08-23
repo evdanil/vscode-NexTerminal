@@ -844,6 +844,15 @@ impl<S: Datagram> DhcpCore<S> {
         };
         let leases = self.table.persistable_leases(persistence::now_epoch_ms());
         if let Err(error) = persistence::save_leases(&path, &leases) {
+            // The table stays dirty, so the next tick tries again once the
+            // debounce window has passed. Clearing the marker unconditionally
+            // made a transient failure permanent: with no later lease mutation
+            // to set it again, nothing would ever rewrite the file, and a crash
+            // after that would hand acknowledged addresses to somebody else.
+            // Re-marking from *now* rather than restoring the original instant
+            // also spaces the retries one debounce apart instead of reattempting
+            // on every tick.
+            self.dirty_since = Some(Instant::now());
             // Logged, never fatal: a lease server that stops serving because it
             // cannot write a cache file is strictly worse than one that serves
             // and warns.
@@ -1783,6 +1792,43 @@ mod tests {
         assert!(
             persistence::load_leases(&path).is_empty(),
             "an offer is a promise, not a claim"
+        );
+    }
+
+    #[test]
+    fn a_failed_lease_write_is_retried_once_the_filesystem_recovers() {
+        // Clearing the dirty marker before the write means a transient failure
+        // is never retried: if no further lease mutation follows and the daemon
+        // then dies, acknowledged leases are absent from disk and get handed to
+        // somebody else after the restart.
+        let dir = TempDir::new("dhcp-engine-persist-retry");
+        // A regular file where the store directory belongs, so `create_dir_all`
+        // fails the way an unavailable directory would.
+        let blocker = dir.path().join("store");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("dhcp-leases.json");
+        let mut o = options();
+        o.lease_store_path = Some(path.clone());
+        o.persist_debounce = Duration::ZERO;
+
+        let mut h = Harness::with(&o);
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+        h.core.tick();
+        assert!(
+            persistence::load_leases(&path).is_empty(),
+            "the obstructed write cannot have produced a file"
+        );
+
+        // The obstruction clears. No lease changes hands, so nothing marks the
+        // table dirty again — only the retained marker can bring the write back.
+        std::fs::remove_file(&blocker).unwrap();
+        h.core.tick();
+
+        assert_eq!(
+            persistence::load_leases(&path).len(),
+            1,
+            "a failed write must leave the table dirty so a later tick retries it"
         );
     }
 
