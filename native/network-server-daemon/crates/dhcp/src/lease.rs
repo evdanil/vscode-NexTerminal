@@ -721,8 +721,20 @@ impl LeaseTable {
 
     #[must_use]
     pub fn pool_info(&self, now_ms: u64) -> PoolInfo {
-        let size = pool_size(self.range_start, self.range_end);
         let active_count = self.active_leases(now_ms).len();
+        self.pool_info_for(active_count)
+    }
+
+    /// Pool figures for a lease count the caller already has.
+    ///
+    /// Lets a caller that has just built the lease list derive the count from
+    /// that same list rather than recomputing it against a second clock read.
+    /// The two must agree: the host rejects a runtime response carrying more
+    /// leases than the pool says are active, and treats the rejection as a
+    /// protocol failure that terminates the daemon.
+    #[must_use]
+    pub fn pool_info_for(&self, active_count: usize) -> PoolInfo {
+        let size = pool_size(self.range_start, self.range_end);
         let utilization_pct = if size > 0 {
             (active_count as f64 / f64::from(size) * 100.0).min(100.0)
         } else {

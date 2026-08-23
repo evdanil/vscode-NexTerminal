@@ -64,6 +64,18 @@ const RECV_BUFFER: usize = 65_536;
 /// same 1 MiB ceiling as everything else.
 const MAX_LISTED_DROPPED_LEASES: usize = 20;
 
+/// How often the per-packet DHCP notices may reach the log.
+///
+/// A DISCOVER is answered on every packet, so a scanner cycling spoofed MACs
+/// produces one JSON line per datagram — and once the pool is full, every one of
+/// them produces the *same* warning, indefinitely. The line is written
+/// synchronously on the socket thread, so when the host's reader falls behind
+/// the pipe fills and `write_all` blocks the thread that is supposed to be
+/// serving UDP. TFTP gates its per-packet progress line for exactly this reason;
+/// DHCP had no equivalent. The authoritative view is `getServiceRuntime` — these
+/// lines are commentary, and a count of what they stood in for keeps them honest.
+const NOTICE_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Consecutive unexpected socket errors tolerated before the loop gives up.
 ///
 /// Without a bound, a socket wedged in a permanently-failing state spins a core
@@ -329,6 +341,12 @@ pub struct DhcpCore<S: Datagram> {
     lease_store_path: Option<PathBuf>,
     persist_debounce: Duration,
     dirty_since: Option<Instant>,
+    /// Gate and tally for [`Self::log_notice`].
+    notice_gate: Instant,
+    notices_suppressed: u64,
+    /// True while the pool has nothing left to offer, so exhaustion is reported
+    /// when it begins rather than once per rejected DISCOVER.
+    pool_exhausted: bool,
     /// True while the last lease write failed and has not yet succeeded again.
     ///
     /// Retries run on the debounce interval, which is sub-second, so a store
@@ -366,6 +384,12 @@ impl<S: Datagram> DhcpCore<S> {
             lease_store_path: options.lease_store_path.clone(),
             persist_debounce: options.persist_debounce,
             dirty_since: None,
+            // Far enough back that the first notice is never gated.
+            notice_gate: Instant::now()
+                .checked_sub(NOTICE_LOG_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            notices_suppressed: 0,
+            pool_exhausted: false,
             persist_failed: false,
             counters: PacketCounters::default(),
         };
@@ -465,6 +489,28 @@ impl<S: Datagram> DhcpCore<S> {
         self.table.active_leases(persistence::now_epoch_ms())
     }
 
+    /// The whole runtime view, built from a single clock read.
+    ///
+    /// Assembling it from `active_leases()` and `pool_info()` read the clock
+    /// twice, and lease liveness is `expires_at_ms > now`. A lease expiring
+    /// between the two reads was in the array but not in the count, so the
+    /// response carried one more lease than the pool claimed was active — which
+    /// the host reads as corruption and answers by terminating the daemon. Rare,
+    /// self-correcting, and fatal: the worst combination to diagnose from a bug
+    /// report.
+    #[must_use]
+    pub fn runtime_snapshot(&self) -> RuntimeSnapshot {
+        self.runtime_snapshot_at(persistence::now_epoch_ms())
+    }
+
+    /// The clock seam, so the agreement above is testable.
+    #[must_use]
+    pub fn runtime_snapshot_at(&self, now_ms: u64) -> RuntimeSnapshot {
+        let leases = self.table.active_leases(now_ms);
+        let pool = self.table.pool_info_for(leases.len());
+        RuntimeSnapshot { leases, counters: self.counters(), pool }
+    }
+
     #[must_use]
     pub fn pool_info(&self) -> PoolInfo {
         self.table.pool_info(persistence::now_epoch_ms())
@@ -513,8 +559,11 @@ impl<S: Datagram> DhcpCore<S> {
             .as_deref()
             .map(|v| format!(" · vendor-class=\"{v}\""))
             .unwrap_or_default();
-        self.wire
-            .log(LogLevel::Debug, format!("{} from MAC {mac}{suffix}", kind.as_str()));
+        // One line per inbound packet, which is the loudest path there is.
+        self.log_notice(
+            LogLevel::Debug,
+            format!("{} from MAC {mac}{suffix}", kind.as_str()),
+        );
 
         match kind {
             MessageType::Discover => self.handle_discover(&message, &mac, vendor_class.as_deref()),
@@ -560,17 +609,31 @@ impl<S: Datagram> DhcpCore<S> {
         let now = persistence::now_epoch_ms();
         let requested = request.options.ipv4(OPTION_REQUESTED_IP);
         let Some(address) = self.table.select_address(mac, requested, now) else {
-            let info = self.table.pool_info(now);
-            self.wire.log(
-                LogLevel::Warn,
-                format!(
-                    "no address available for {mac}: the pool {} → {} is fully allocated \
-                     ({} of {} in use). Widen the range or wait for a lease to expire.",
-                    info.range_start, info.range_end, info.active_count, info.pool_size
-                ),
-            );
+            // Exhaustion is a state, not an event. Reported when it begins, so
+            // it is never gated behind the per-packet chatter and never repeats
+            // once per rejected DISCOVER — a scanner would otherwise produce the
+            // identical warning at line rate for as long as it cared to.
+            if !self.pool_exhausted {
+                self.pool_exhausted = true;
+                let info = self.table.pool_info(now);
+                self.wire.log(
+                    LogLevel::Warn,
+                    format!(
+                        "no address available for {mac}: the pool {} → {} is fully allocated \
+                         ({} of {} in use). Widen the range or wait for a lease to expire.",
+                        info.range_start, info.range_end, info.active_count, info.pool_size
+                    ),
+                );
+            }
             return;
         };
+        if self.pool_exhausted {
+            self.pool_exhausted = false;
+            self.wire.log(
+                LogLevel::Info,
+                "the pool has addresses to offer again".to_owned(),
+            );
+        }
         let hostname = request.options.text(OPTION_HOSTNAME);
         self.table.offer(mac, address, hostname, now);
 
@@ -582,8 +645,7 @@ impl<S: Datagram> DhcpCore<S> {
             self.counters.offer_count += 1;
             self.counters.packets_sent += 1;
         }
-        self.wire
-            .log(LogLevel::Info, format!("OFFER {address} to {mac}"));
+        self.log_notice(LogLevel::Info, format!("OFFER {address} to {mac}"));
     }
 
     fn handle_request(&mut self, request: &Message, mac: &MacKey, vendor_class: Option<&str>) {
@@ -790,8 +852,7 @@ impl<S: Datagram> DhcpCore<S> {
             self.counters.nak_count += 1;
             self.counters.packets_sent += 1;
         }
-        self.wire
-            .log(LogLevel::Info, format!("NAK to {mac}: {reason}"));
+        self.log_notice(LogLevel::Info, format!("NAK to {mac}: {reason}"));
     }
 
     /// Builds an OFFER or an ACK.
@@ -865,6 +926,38 @@ impl<S: Datagram> DhcpCore<S> {
 
     // -- maintenance ---------------------------------------------------------
 
+    /// Emits a per-packet notice at most once per interval, saying how many it
+    /// stood in for.
+    ///
+    /// Suppression is counted rather than silent: an operator reading "the pool
+    /// is full" needs to know whether that happened once or ten thousand times.
+    fn log_notice(&mut self, level: LogLevel, message: String) {
+        let now = Instant::now();
+        if now.duration_since(self.notice_gate) < NOTICE_LOG_INTERVAL {
+            self.notices_suppressed = self.notices_suppressed.saturating_add(1);
+            return;
+        }
+        self.notice_gate = now;
+        let suppressed = std::mem::take(&mut self.notices_suppressed);
+        if suppressed == 0 {
+            self.wire.log(level, message);
+        } else {
+            self.wire
+                .log(level, format!("{message} · {suppressed} similar suppressed"));
+        }
+    }
+
+    /// Reports and clears any notices the gate stood in for.
+    fn flush_suppressed_notices(&mut self) {
+        let suppressed = std::mem::take(&mut self.notices_suppressed);
+        if suppressed > 0 {
+            self.wire.log(
+                LogLevel::Debug,
+                format!("{suppressed} per-packet line(s) suppressed while the gate was closed"),
+            );
+        }
+    }
+
     fn mark_dirty(&mut self) {
         if self.dirty_since.is_none() {
             self.dirty_since = Some(Instant::now());
@@ -874,6 +967,10 @@ impl<S: Datagram> DhcpCore<S> {
     /// Expires lapsed claims and flushes the lease file once the debounce window
     /// has passed.
     pub fn tick(&mut self) {
+        // A burst that stops would otherwise leave its tally waiting for a next
+        // notice that never comes, and an operator would never learn how much
+        // the one line they did see stood in for.
+        self.flush_suppressed_notices();
         let now = persistence::now_epoch_ms();
         let expired = self.table.expire(now);
         for (mac, ip) in expired {
@@ -1129,11 +1226,7 @@ fn run_loop(
                 // nobody is left to serve.
                 Ok(Command::Stop) | Err(TryRecvError::Disconnected) => break 'outer,
                 Ok(Command::Snapshot(reply)) => {
-                    let _ = reply.send(RuntimeSnapshot {
-                        leases: core.active_leases(),
-                        counters: core.counters(),
-                        pool: core.pool_info(),
-                    });
+                    let _ = reply.send(core.runtime_snapshot());
                 }
                 Err(TryRecvError::Empty) => break,
             }
@@ -1949,6 +2042,74 @@ mod tests {
         assert!(
             restore_line.contains("2000"),
             "and must still say how many were dropped: {restore_line}"
+        );
+    }
+
+    #[test]
+    fn a_runtime_snapshot_agrees_with_itself_across_a_lease_expiry() {
+        // The snapshot used to read the clock twice — once for the lease array,
+        // once inside pool_info, which recomputed the count against its own
+        // `now`. Liveness is `expires_at_ms > now`, so a lease expiring between
+        // the two reads was in the array and not in the count, and the host
+        // rejects a response with more leases than the pool says are active,
+        // terminating the daemon. Millisecond-truncated reads make it rare, and
+        // the runtime refresh runs constantly, so it is exactly the kind of
+        // fault that surfaces once on a long-running bench and cannot be
+        // reproduced.
+        let mut h = Harness::new();
+        h.feed(&discover(&MAC_A));
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.1"))));
+
+        let expiry = h.core.active_leases()[0].expires_at;
+
+        // The skew the old assembly was exposed to, made explicit: two reads
+        // straddling the instant the lease lapses disagree by one.
+        assert_eq!(h.core.table.active_leases(expiry - 1).len(), 1);
+        assert_eq!(h.core.table.pool_info(expiry).active_count, 0);
+
+        // The composed snapshot cannot disagree with itself at any instant,
+        // including the one that splits those two answers.
+        for now in [expiry - 1, expiry, expiry + 1] {
+            let snapshot = h.core.runtime_snapshot_at(now);
+            assert_eq!(
+                snapshot.leases.len(),
+                snapshot.pool.active_count,
+                "the array and the count must be the same answer at {now}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flood_of_discovers_does_not_produce_a_line_per_packet() {
+        // DISCOVER is answered on every packet, so a scanner cycling spoofed
+        // MACs produced one JSON line per datagram — and once the pool filled,
+        // the same warning forever. Those lines are written synchronously on the
+        // socket thread, so a host reader that falls behind fills the pipe and
+        // blocks the thread that should be serving UDP.
+        let mut h = Harness::new();
+        for tail in 0..80u8 {
+            h.feed(&discover(&[0xCC, 0, 0, 0, 0, tail]));
+        }
+
+        let notices = h
+            .events()
+            .into_iter()
+            .filter(|line| {
+                line.contains("OFFER ")
+                    || line.contains("no address available")
+                    || line.contains("DHCPDISCOVER from MAC")
+            })
+            .count();
+        assert!(
+            notices <= 2,
+            "80 DISCOVERs in under a second must not each reach the log; got {notices}"
+        );
+        // The tally reaches the operator on the next tick even if the burst
+        // stopped and no further notice was ever due.
+        h.core.tick();
+        assert!(
+            h.events().iter().any(|line| line.contains("suppressed")),
+            "the gate must say what it stood in for"
         );
     }
 
