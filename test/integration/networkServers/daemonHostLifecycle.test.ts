@@ -15,6 +15,8 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { NetworkServerDaemonHost } from "../../../src/services/networkServers/daemonHost";
 import { sleep } from "../../helpers/networkServerTestHelpers";
@@ -93,6 +95,44 @@ describe("NetworkServerDaemonHost — a spawn that never reports ready", () => {
       expect(await waitForExit(pid!), "dispose must not leave a daemon holding UDP 69/67").toBe(true);
     } finally {
       delete process.env.NEXUS_MOCK_READY_DELAY_MS;
+    }
+  }, 20_000);
+
+  it("gives stdin EOF a grace window before SIGTERM during dispose", async () => {
+    if (process.platform === "win32") return;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-daemon-grace-"));
+    const signalFile = path.join(tempDir, "signals");
+    const previousMode = process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE;
+    const previousSignalFile = process.env.NEXUS_MOCK_NETWORK_DAEMON_SIGNAL_FILE;
+    process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = "stdin-graceful-exit-record-sigterm";
+    process.env.NEXUS_MOCK_NETWORK_DAEMON_SIGNAL_FILE = signalFile;
+    const host = new NetworkServerDaemonHost(path.join(FIXTURES, "mockNetworkServerDaemonMalformed.js"), {
+      readyTimeoutMs: READY_TIMEOUT_MS
+    });
+    hosts.push(host);
+
+    try {
+      await host.ensureStarted();
+      const pid = childPid(host);
+      expect(pid, "the fixture should have spawned").toBeTypeOf("number");
+
+      host.dispose();
+      expect(
+        await waitForExit(pid!, 3_000),
+        "a daemon that exits from stdin EOF during dispose should be allowed to reap itself"
+      ).toBe(true);
+      const signals = fs.existsSync(signalFile) ? fs.readFileSync(signalFile, "utf8") : "";
+      expect(
+        signals,
+        "SIGTERM before the EOF path can exit risks skipping native daemon cleanup"
+      ).not.toContain(`SIGTERM:${pid}`);
+    } finally {
+      host.dispose();
+      if (previousMode === undefined) delete process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE;
+      else process.env.NEXUS_MOCK_NETWORK_DAEMON_MODE = previousMode;
+      if (previousSignalFile === undefined) delete process.env.NEXUS_MOCK_NETWORK_DAEMON_SIGNAL_FILE;
+      else process.env.NEXUS_MOCK_NETWORK_DAEMON_SIGNAL_FILE = previousSignalFile;
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
   }, 20_000);
 

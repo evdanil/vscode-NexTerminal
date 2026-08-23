@@ -7,13 +7,13 @@
 //! # On signals
 //!
 //! `SIGTERM` and `SIGINT` are deliberately **not** handled. The host's teardown
-//! closes stdin first, and that EOF is the graceful path; the signals that
-//! follow are its escalation, and their default disposition already terminates
-//! the process and lets the operating system release every socket. Installing a
-//! handler would need either an extra dependency or `unsafe`, and would buy one
-//! log line — while risking the far worse outcome of *delaying* termination past
-//! the host's two-second escalation window, which is precisely how an orphan
-//! ends up holding UDP 69 into the next session.
+//! closes stdin first and gives that EOF path a grace window to stop services and
+//! flush state; the signals that follow are escalation, and their default
+//! disposition already terminates the process and lets the operating system
+//! release every socket. Installing a handler would need either an extra
+//! dependency or `unsafe`, and would buy one log line — while risking the worse
+//! outcome of delaying termination after the host has already escalated, which is
+//! how an orphan ends up holding UDP 69 into the next session.
 
 #![forbid(unsafe_code)]
 

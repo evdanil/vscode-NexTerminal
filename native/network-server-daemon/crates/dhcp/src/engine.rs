@@ -775,6 +775,7 @@ impl<S: Datagram> DhcpCore<S> {
         }
 
         let mut reply = ReplyBuilder::for_request(request);
+        reply.siaddr = self.server_id;
         if let Some(address) = address {
             reply.yiaddr = address;
         } else {
@@ -1220,6 +1221,21 @@ mod tests {
         assert_eq!(leases[0].ip, ip("10.0.0.10"));
         assert_eq!(leases[0].lease_type, LeaseType::Dynamic);
         assert!(h.lease_events().iter().any(|e| e.starts_with("bound AA-00-00-00-00-01 10.0.0.10")));
+    }
+
+    #[test]
+    fn offers_and_acks_carry_the_configured_server_identifier_in_siaddr() {
+        let mut o = options();
+        o.server_id = ip("10.0.0.77");
+        let mut h = Harness::with(&o);
+
+        h.feed(&discover(&MAC_A));
+        assert_eq!(h.last_reply().siaddr, ip("10.0.0.77"));
+
+        h.feed(&request(&MAC_A, Some(ip("10.0.0.10")), Some(ip("10.0.0.77"))));
+        let reply = h.last_reply();
+        assert_eq!(reply.options.message_type(), Some(MessageType::Ack));
+        assert_eq!(reply.siaddr, ip("10.0.0.77"));
     }
 
     #[test]
