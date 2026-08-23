@@ -23,15 +23,22 @@ native/network-server-daemon-artifacts/
 
 ## Current state
 
-No prebuilt network-server daemon binaries are committed in this repository
-today. The `rust` engine can still be exercised by setting
-`NEXUS_NETWORK_SERVER_DAEMON_BIN` to a locally built daemon, and future packaging
-can populate the platform directories shown above.
+No binaries are committed to this repository, and none should be — they are
+built at release time. `.github/workflows/release.yml` cross-builds the daemon on
+a native runner per platform (`build-network-server-daemon`), smoke-tests each
+one by actually starting it, uploads it as a CI artifact, and the packaging job
+downloads all six here before `npm run build:production` runs. That build sets
+`NETWORK_SERVER_DAEMON_REQUIRE_ALL=1`, so a platform that failed to build fails
+the release rather than shipping quietly without it, and the VSIX contents are
+verified per platform afterwards.
 
-An absent directory is deliberate: copying a binary into the wrong platform key
-would ship something that cannot execute there, and the fallback below would
-never fire because the file *would* exist. Until release automation supplies
-real artifacts, packaged extensions transparently use the bundled Node daemon.
+So a released VSIX carries all six; a local `npm run build` carries whatever you
+have built into these directories, which is usually none.
+
+For development, point `NEXUS_NETWORK_SERVER_DAEMON_BIN` at a locally built
+daemon instead of populating these directories by hand. Copying a binary into
+the wrong platform key would ship something that cannot execute there, and the
+fallback below would never fire because the file *would* exist.
 
 ## Graceful degradation (why a missing platform is safe)
 

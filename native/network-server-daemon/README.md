@@ -19,10 +19,11 @@ Both engines are proven on Windows x64: the full workspace test suite (351 tests
 including real-UDP e2e) passes, and the extension-side parity suite
 (`test/integration/networkServers/daemonEngineParity.test.ts`) drives the real
 `daemonHost.ts` RPC client against the built binary with identical results to the
-existing Node/TypeScript daemon. **Not yet done:** prebuilt artifacts for
-platforms other than `win32-x64` (macOS/Linux need their own native toolchain —
-see `native/network-server-daemon-artifacts/README.md`), CI automation to build
-those, and flipping the `nexus.networkServers.engine` default away from `"node"`.
+existing Node/TypeScript daemon. Prebuilt artifacts for all six supported platforms are built and packaged by
+`.github/workflows/release.yml` at release time — see
+`native/network-server-daemon-artifacts/README.md` for how that works.
+**Not yet done:** flipping the `nexus.networkServers.engine` default away from
+`"node"`, which waits on field evidence rather than on packaging.
 
 ## Layout
 
