@@ -62,6 +62,13 @@ const RECV_BUFFER: usize = 65_536;
 /// report it.
 const MAX_CONSECUTIVE_SOCKET_ERRORS: u32 = 100;
 
+/// How long a completed WRQ keeps enough state to answer duplicate final DATA.
+///
+/// The full transfer is already closed and reported complete. This tiny dally
+/// record exists only for the RFC 1350 final-ACK-loss case: the client repeats
+/// the last DATA block and needs the same ACK again.
+const COMPLETED_WRITE_DALLY: Duration = Duration::from_secs(10);
+
 /// Cap on operator-facing text lifted from a peer.
 ///
 /// A client controls its own ERROR message and its own filename, and both are
@@ -330,6 +337,12 @@ impl<S: Datagram> Wire<S> {
 // Core
 // ---------------------------------------------------------------------------
 
+struct CompletedWrite {
+    final_block: u16,
+    ack: Vec<u8>,
+    expires_at: Instant,
+}
+
 /// The protocol core: everything except the socket loop itself.
 pub struct TftpCore<S: Datagram> {
     wire: Wire<S>,
@@ -339,6 +352,7 @@ pub struct TftpCore<S: Datagram> {
     transfers: HashMap<SocketAddr, TransferSession>,
     write_handles: HashMap<SocketAddr, File>,
     write_paths: HashMap<SocketAddr, PathBuf>,
+    completed_writes: HashMap<SocketAddr, CompletedWrite>,
 }
 
 impl<S: Datagram> TftpCore<S> {
@@ -351,6 +365,7 @@ impl<S: Datagram> TftpCore<S> {
             transfers: HashMap::new(),
             write_handles: HashMap::new(),
             write_paths: HashMap::new(),
+            completed_writes: HashMap::new(),
         }
     }
 
@@ -408,6 +423,9 @@ impl<S: Datagram> TftpCore<S> {
             self.route_existing(msg, peer);
             return;
         }
+        if self.reack_completed_write(msg, peer) {
+            return;
+        }
         match Opcode::from_wire(raw_opcode) {
             Some(Opcode::Rrq | Opcode::Wrq) => self.handle_new_request(msg, peer),
             _ => {
@@ -424,6 +442,9 @@ impl<S: Datagram> TftpCore<S> {
 
     /// Runs retransmission, reaping and timeout handling for every session.
     pub fn tick(&mut self) {
+        let now = Instant::now();
+        self.completed_writes
+            .retain(|_, completed| completed.expires_at > now);
         let peers: Vec<SocketAddr> = self.transfers.keys().copied().collect();
         for peer in peers {
             let Some(session) = self.transfers.get_mut(&peer) else {
@@ -492,9 +513,29 @@ impl<S: Datagram> TftpCore<S> {
             let _ = std::fs::remove_file(path);
         }
         self.write_handles.clear();
+        self.completed_writes.clear();
     }
 
     // -- request handling ---------------------------------------------------
+
+    fn reack_completed_write(&mut self, msg: &[u8], peer: SocketAddr) -> bool {
+        let Some(completed) = self.completed_writes.get(&peer) else {
+            return false;
+        };
+        if completed.expires_at <= Instant::now() {
+            self.completed_writes.remove(&peer);
+            return false;
+        }
+        let Ok(Some(Packet::Data { block, .. })) = parse_packet(msg) else {
+            return false;
+        };
+        if block != completed.final_block {
+            return false;
+        }
+        let ack = completed.ack.clone();
+        self.wire.send_raw(peer, &[ack]);
+        true
+    }
 
     fn route_existing(&mut self, msg: &[u8], peer: SocketAddr) {
         let packet = match parse_packet(msg) {
@@ -803,9 +844,19 @@ impl<S: Datagram> TftpCore<S> {
     }
 
     fn finish_done(&mut self, peer: SocketAddr) {
+        let completed_write = self.transfers.get(&peer).and_then(|session| {
+            (session.direction == Direction::Write).then(|| CompletedWrite {
+                final_block: session.last_acked,
+                ack: crate::protocol::encode_ack(session.last_acked),
+                expires_at: Instant::now() + COMPLETED_WRITE_DALLY,
+            })
+        });
         let Some((info, _write_path)) = self.take(peer) else {
             return;
         };
+        if let Some(completed) = completed_write {
+            self.completed_writes.insert(peer, completed);
+        }
         self.wire.log(
             LogLevel::Info,
             format!(
@@ -1118,7 +1169,7 @@ fn run_loop(
 mod tests {
     use super::*;
     use crate::path_guard::PathGuard;
-    use crate::protocol::{encode_ack, encode_rrq, encode_wrq};
+    use crate::protocol::{encode_ack, encode_data, encode_rrq, encode_wrq};
     use crate::testsupport::TempDir;
     use crate::types::RawOptions;
     use std::cell::RefCell;
@@ -1158,6 +1209,13 @@ mod tests {
         match parse_packet(packet).unwrap() {
             Some(Packet::Error { code, .. }) => code,
             other => panic!("expected ERROR, got {other:?}"),
+        }
+    }
+
+    fn ack_block(packet: &[u8]) -> u16 {
+        match parse_packet(packet).unwrap() {
+            Some(Packet::Ack { block }) => block,
+            other => panic!("expected ACK, got {other:?}"),
         }
     }
 
@@ -1300,6 +1358,34 @@ mod tests {
         assert!(
             !destination.exists(),
             "client-aborted uploads must not leave partial files behind"
+        );
+    }
+
+    #[test]
+    fn a_completed_write_reacks_a_duplicate_final_data_packet() {
+        let temp = TempDir::new("engine-write-final-retry");
+        let destination = temp.path().join("up.bin");
+        let (mut core, rec) = core_for(&temp, true, 8);
+        let writer = peer(43212);
+
+        core.handle_message(&encode_wrq("up.bin", "octet", &RawOptions::default()), writer);
+        core.handle_message(&encode_data(1, b"done"), writer);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"done");
+
+        let duplicate_final = encode_data(1, b"done");
+        core.handle_message(&duplicate_final, writer);
+
+        let sent = rec.sent.borrow();
+        assert_eq!(ack_block(&sent[1].1), 1, "the final DATA must be acknowledged");
+        assert_eq!(
+            ack_block(&sent[2].1),
+            1,
+            "a duplicate final DATA must receive the same final ACK"
+        );
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"done",
+            "the duplicate final DATA must not be appended a second time"
         );
     }
 

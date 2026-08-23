@@ -242,7 +242,7 @@ impl BootOptions {
             next_server: normalize_option_text(next_server, "Next Server")?,
             boot_file_name: normalize_option_text(boot_file_name, "Boot File Name")?,
             tftp_server_addresses,
-            vendor_class_id: vendor_class_id.filter(|s| !s.trim().is_empty()),
+            vendor_class_id: normalize_option_text(vendor_class_id, "Vendor Class Identifier")?,
             vendor_specific: encode_vendor_specific_info(vendor_entries)?,
         })
     }
@@ -469,6 +469,17 @@ mod tests {
     #[test]
     fn a_client_that_sent_no_option_60_is_refused_when_a_class_is_configured() {
         assert!(!matches_vendor_class(Some("Cisco"), None));
+    }
+
+    #[test]
+    fn oversized_vendor_class_filters_are_refused() {
+        let too_long = "V".repeat(MAX_OPTION_VALUE_BYTES + 1);
+        let err = BootOptions::new(None, Some("ios.bin".to_owned()), Vec::new(), Some(too_long), &[])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BootOptionError::TextTooLong { label: "Vendor Class Identifier", len: 256 }
+        );
     }
 
     // -- writing into a reply ------------------------------------------------
