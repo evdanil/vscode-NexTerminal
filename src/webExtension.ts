@@ -184,7 +184,21 @@ const unsupportedCommands = [
   "nexus.networkServer.profile.apply",
   "nexus.networkServer.profile.rename",
   "nexus.networkServer.profile.duplicate",
-  "nexus.networkServer.profile.remove"
+  "nexus.networkServer.profile.remove",
+  // Local Server processes are spawned via node:child_process, which the web
+  // host has no equivalent for — every one of these commands is desktop-only.
+  "nexus.localServer.add",
+  "nexus.localServer.start",
+  "nexus.localServer.stop",
+  "nexus.localServer.restart",
+  "nexus.localServer.inspectLogs",
+  "nexus.localServer.edit",
+  "nexus.localServer.remove",
+  "nexus.localServer.rename",
+  "nexus.localServer.duplicate",
+  "nexus.localServer.copyInfo",
+  "nexus.localServer.moveToFolder",
+  "nexus.localServer.moveToRoot"
 ];
 
 export function activate(context: vscode.ExtensionContext): NexusExtensionApi {

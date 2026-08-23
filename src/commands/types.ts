@@ -38,6 +38,12 @@ export interface LocalShellTerminalEntry {
   pty?: import("../models/config").SessionPtyHandle;
 }
 export type LocalShellTerminalMap = Map<string, LocalShellTerminalEntry>;
+export interface LocalServerTerminalEntry {
+  terminal: vscode.Terminal;
+  configId: string;
+  pty?: import("../models/config").SessionPtyHandle;
+}
+export type LocalServerTerminalMap = Map<string, LocalServerTerminalEntry>;
 
 export interface CommandContext {
   core: NexusCore;
@@ -51,6 +57,7 @@ export interface CommandContext {
   sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
   localShellTerminals: LocalShellTerminalMap;
+  localServerTerminals: LocalServerTerminalMap;
   highlighter: TerminalHighlighter;
   macroAutoTrigger: MacroAutoTrigger;
   sftpService: SftpService;
