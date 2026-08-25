@@ -410,6 +410,11 @@ describe("palette fallback for stop / inspectLogs", () => {
       items.find((i) => i.config.id === "cfg-1")
     );
     await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    // Without this the test passed against the dead-end implementation that
+    // never opened a picker at all and reported the same notice
+    // unconditionally — i.e. "scoped to the picked config", the half this
+    // test exists for, went unasserted.
+    expect(quickPick).toHaveBeenCalledTimes(1);
     expect(h.inspectLogsTerminal).not.toHaveBeenCalled();
     expect(showInfo).toHaveBeenCalledWith("No running local server session to display.");
   });
