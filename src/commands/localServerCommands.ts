@@ -12,7 +12,7 @@
  *   nexus.localServer.edit        — open a WebviewFormPanel edit form
  *   nexus.localServer.remove      — disclosure-checked cascade removal under
  *                                   configMutationLock (same pattern as SSH)
- *   nexus.localServer.rename / duplicate / copyInfo / moveToFolder / moveToRoot
+ *   nexus.localServer.rename / duplicate / copyInfo / moveToFolder
  *                                   — standard CRUD inventory mutations
  *   nexus.localServer.inspectLogs — focus/reveal a running server's terminal
  *
@@ -43,6 +43,7 @@ import {
 } from "../ui/nexusTreeProvider";
 import {
   INVALID_FOLDER_PATH_MESSAGE,
+  getAncestorPaths,
   normalizeOptionalFolderPath
 } from "../utils/folderPaths";
 import { naturalCompare } from "../utils/naturalCompare";
@@ -224,6 +225,83 @@ async function pickLocalServer(
     { title }
   );
   return pick?.config;
+}
+
+/**
+ * Every folder path a local server could be moved into.
+ *
+ * `collectGroups` walks servers, serial and local-shell profiles but not local
+ * servers, so a folder that only holds local servers would be missing from its
+ * own subsystem's picker. Their groups are unioned in here rather than added to
+ * the shared helper, which is used for other things.
+ */
+function localServerFolderPaths(ctx: CommandContext): string[] {
+  const folders = new Set(collectGroups(ctx));
+  for (const server of ctx.core.getSnapshot().localServers) {
+    if (!server.group) continue;
+    for (const ancestor of getAncestorPaths(server.group)) {
+      folders.add(ancestor);
+    }
+  }
+  return [...folders].sort(naturalCompare);
+}
+
+/**
+ * The destination picker behind `moveToFolder`: "(root)", "New folder…", and
+ * every existing folder — the same shape macros have used all along
+ * (`pickFolderDestination` in macroCommands).
+ *
+ * Returns a folder path, `null` for "(root)" (clears `group`), or `undefined`
+ * if the user cancelled at any step.
+ *
+ * This is what replaced a separate always-present "Move to Root" entry, which
+ * needed a per-row `.inFolder` contextValue marker to know when to appear and
+ * duplicated in one narrow menu item what the picker offers as one of its
+ * choices.
+ */
+async function pickLocalServerFolderDestination(
+  ctx: CommandContext,
+  config: LocalServerConfig
+): Promise<string | null | undefined> {
+  // `folderKind`, not `kind` — vscode.QuickPickItem already declares its own
+  // numeric-enum `kind` (for separators), and intersecting a same-named
+  // string-literal property with it collapses to `never`.
+  type Choice = vscode.QuickPickItem & { folderKind: "root" | "new" | "folder"; path?: string };
+  const current = config.group;
+  const items: Choice[] = [
+    { label: "(root)", folderKind: "root", description: current ? undefined : "current" },
+    { label: "$(new-folder) New folder…", folderKind: "new" },
+    ...localServerFolderPaths(ctx).map((folder): Choice => ({
+      label: folder,
+      folderKind: "folder",
+      path: folder,
+      description: folder === current ? "current" : undefined
+    }))
+  ];
+  const picked = await vscode.window.showQuickPick(items, {
+    title: "Move to Folder",
+    placeHolder: "Select a destination folder"
+  });
+  if (!picked) return undefined;
+  if (picked.folderKind === "root") return null;
+  if (picked.folderKind === "folder") return picked.path ?? null;
+
+  const name = await vscode.window.showInputBox({
+    title: "New Local Server Folder",
+    prompt: "Enter a folder path (use / for nested folders)",
+    placeHolder: "e.g. Backends/APIs",
+    validateInput: (value) => {
+      if (!value.trim()) return "Folder path cannot be empty";
+      return normalizeOptionalFolderPath(value) === null ? INVALID_FOLDER_PATH_MESSAGE : null;
+    }
+  });
+  if (!name) return undefined;
+  const normalized = normalizeOptionalFolderPath(name);
+  // `null` is a rejected path and `""` a blank one; neither is a destination,
+  // and treating either as root would move the server somewhere the user never
+  // asked for.
+  if (!normalized) return undefined;
+  return normalized;
 }
 
 function errorMessageFor(error: unknown, prefix: string): string {
@@ -471,22 +549,9 @@ export function registerLocalServerCommands(
     vscode.commands.registerCommand("nexus.localServer.moveToFolder", async (arg?: unknown) => {
       const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Move Local Server"));
       if (!config) return;
-      const group = await vscode.window.showInputBox({
-        title: "Move to Folder",
-        value: config.group ?? "",
-        prompt: "Folder path (use / for nesting)",
-        validateInput: (value) => normalizeOptionalFolderPath(value) === null ? INVALID_FOLDER_PATH_MESSAGE : null
-      });
-      if (group === undefined) return;
-      const normalized = normalizeOptionalFolderPath(group);
-      if (normalized === null) return;
-      await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: normalized });
-    }),
-
-    vscode.commands.registerCommand("nexus.localServer.moveToRoot", async (arg?: unknown) => {
-      const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Move to Root"));
-      if (!config) return;
-      await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: undefined });
+      const destination = await pickLocalServerFolderDestination(ctx, config);
+      if (destination === undefined) return;
+      await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: destination ?? undefined });
     })
   ];
 }

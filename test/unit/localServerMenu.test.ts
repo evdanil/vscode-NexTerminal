@@ -3,24 +3,26 @@ import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 /**
- * "MOVE TO ROOT" ON A LOCAL SERVER ROW — THE MENU CLAUSE AND THE ROW IT GATES.
+ * THE LOCAL SERVERS CONTEXT MENU, AGAINST THE REAL package.json AND REAL ROWS.
  *
- * The entry was gated on `viewItemFolder != null`, a context key nothing in
- * `src/` ever sets. An unset key is `undefined`, and `undefined != null` is
- * false in VS Code's when-clause language, so the entry could never appear —
- * "Move to Root" was unreachable for every local server in a folder.
+ * History, because it explains what is asserted and what deliberately is not.
+ * "Move to Root" was a separate always-present entry gated on
+ * `viewItemFolder != null` — a context key nothing in `src/` ever sets, so it
+ * never appeared. VS Code has no per-item context key, so the first fix moved
+ * the folder state onto the row's own `contextValue` as a `.inFolder` suffix,
+ * which then had to be admitted by a regex in roughly eighteen other clauses
+ * so the suffix would not hide every OTHER entry on a foldered row.
  *
- * VS Code offers no per-item context key; per-item state travels on the item's
- * own `contextValue`, which is exactly how this view already distinguishes
- * `.ipmi` / `.eveRunning` / `.syncSource` rows. So the folder marker is a
- * `.inFolder` suffix, matched by regex in the `when` clause.
+ * That whole mechanism is gone. "Move to Folder…" now opens a picker whose
+ * destinations include "(root)", the shape macros have always used, so nothing
+ * in the manifest needs to know whether a row sits in a folder and every clause
+ * is back to its simple pre-suffix form.
  *
- * That suffix is load-bearing in both directions: it has to make `moveToRoot`
- * appear for a foldered row, and it must not make the other nine entries
- * DISAPPEAR for that same row — which is what would happen to every clause
- * still written as an exact `viewItem == nexus.localServer…` equality. Both
- * directions are asserted here against the real package.json and a real tree
- * item, because neither half is meaningful without the other.
+ * What survives is the coverage that mechanism's tests were missing: the
+ * generic terminal entries are walked alongside the `nexus.localServer.*` ones,
+ * every entry has to be reachable from a real row rather than merely agreeing
+ * with itself, and the `when`-clause helper models VS Code's actual operator
+ * precedence instead of flattening it.
  */
 
 vi.mock("vscode", () => ({
@@ -174,11 +176,9 @@ const contextMenu = packageJson.contributes.menus["view/item/context"] ?? [];
 
 /**
  * The generic terminal commands are contributed for local-server rows too, and
- * their clauses were rewritten by the same change that introduced the
- * `.inFolder` suffix. A filter on the `nexus.localServer.` command prefix
- * skipped all three, so reverting either of them to an exact `viewItem ==`
- * equality — the precise regression this file exists to catch, Reset and Clear
- * staying disabled on a foldered running row — left every test green.
+ * a filter on the `nexus.localServer.` command prefix skipped all three — so
+ * their local-server clauses had no coverage here at all, and breaking one of
+ * them left every test green.
  */
 const TERMINAL_COMMANDS = [
   "nexus.terminal.reset",
@@ -192,19 +192,20 @@ const localServerEntries = contextMenu.filter(
     (TERMINAL_COMMANDS.includes(entry.command) && (entry.when ?? "").includes("localServer"))
 );
 
-describe("LocalServerConfigTreeItem folder marker", () => {
-  it("marks a row that lives in a folder and leaves a root-level row unmarked", () => {
-    expect(configItem({ group: "Production/APIs" }).contextValue).toBe("nexus.localServer.inFolder");
+describe("LocalServerConfigTreeItem contextValue", () => {
+  it("says only whether the row is running — a folder is not part of its identity", () => {
+    // The `.inFolder` marker existed solely to gate a "Move to Root" entry that
+    // no longer exists. Re-introducing it would silently hide every clause
+    // written as an exact equality, which is now all of them again.
+    expect(configItem({ group: "Production/APIs" }).contextValue).toBe("nexus.localServer");
     expect(configItem({}).contextValue).toBe("nexus.localServer");
-  });
-
-  it("carries the marker independently of running state", () => {
-    expect(configItem({ group: "Production" }, true).contextValue).toBe("nexus.localServerRunning.inFolder");
+    expect(configItem({ group: "Production" }, true).contextValue).toBe("nexus.localServerRunning");
     expect(configItem({}, true).contextValue).toBe("nexus.localServerRunning");
   });
 
-  it("treats an empty-string group as root-level, not as a folder", () => {
-    expect(configItem({ group: "" }).contextValue).toBe("nexus.localServer");
+  it("is identical for a foldered and a root-level row, so one menu entry serves both", () => {
+    expect(configItem({ group: "Production" }).contextValue).toBe(configItem({}).contextValue);
+    expect(configItem({ group: "" }).contextValue).toBe(configItem({}).contextValue);
   });
 });
 
@@ -251,20 +252,22 @@ describe("whenMatches models VS Code's when-clause precedence", () => {
 });
 
 describe("Local Servers view/item/context menu gating", () => {
-  it("finds the moveToRoot entry to gate", () => {
-    expect(localServerEntries.some((e) => e.command === "nexus.localServer.moveToRoot")).toBe(true);
+  it("contributes no Move to Root command or menu entry at all", () => {
+    const manifest = readFileSync(packageJsonPath, "utf8");
+    expect(manifest).not.toContain("moveToRoot");
+    // And the mechanism that existed only to gate it is gone with it.
+    expect(manifest).not.toContain("inFolder");
+    expect(manifest).not.toContain("viewItemFolder");
   });
 
-  it("shows Move to Root only for a row that is actually in a folder", () => {
-    const entry = localServerEntries.find((e) => e.command === "nexus.localServer.moveToRoot")!;
-    const when = entry.when!;
-    // The bug: gated on a context key nothing sets, so it never showed at all.
-    expect(when).not.toContain("viewItemFolder");
-    expect(whenMatches(when, "nexus.localServer.inFolder")).toBe(true);
-    expect(whenMatches(when, "nexus.localServerRunning.inFolder")).toBe(true);
-    // And it stays hidden where it would be a no-op.
-    expect(whenMatches(when, "nexus.localServer")).toBe(false);
-    expect(whenMatches(when, "nexus.localServerRunning")).toBe(false);
+  it("offers Move to Folder… from every config row, foldered or not", () => {
+    // One entry replaces the old pair: its picker offers "(root)" as a
+    // destination, so a row already in a folder needs no separate command.
+    const when = localServerEntries.find((e) => e.command === "nexus.localServer.moveToFolder")!.when!;
+    expect(whenMatches(when, configItem({ group: "Production" }).contextValue!)).toBe(true);
+    expect(whenMatches(when, configItem({}).contextValue!)).toBe(true);
+    expect(whenMatches(when, configItem({ group: "Production" }, true).contextValue!)).toBe(true);
+    expect(whenMatches(when, configItem({}, true).contextValue!)).toBe(true);
   });
 
   it("covers the generic terminal entries, not only the nexus.localServer.* ones", () => {
@@ -278,60 +281,52 @@ describe("Local Servers view/item/context menu gating", () => {
     }
   });
 
-  it("keeps every other entry visible for a foldered row", () => {
-    // Adding a contextValue suffix silently hides any entry still written as
-    // an exact equality — the regression this suffix could most easily cause.
-    const others = localServerEntries.filter((e) => e.command !== "nexus.localServer.moveToRoot");
-    expect(others.length).toBeGreaterThan(0);
-    const bases = ["nexus.localServer", "nexus.localServerRunning"];
-    // Session rows carry no folder marker, but an entry contributed only for
-    // them (the inline session actions) is still reachable, so it counts
-    // towards the presence check below.
-    const reachableFrom = [...bases, "nexus.localServerSessionNode"];
-    for (const entry of others) {
-      // PRESENCE. Asserting only match(foldered) === match(root) is satisfied
-      // by false === false, so a clause mutated to match NOTHING passed. Every
-      // entry has to be reachable from at least one real row before the
-      // equality below means anything.
+  it("leaves every entry reachable from a real row", () => {
+    // PRESENCE. The predecessor of this test compared match(foldered) against
+    // match(root), which `false === false` satisfies — a clause mutated to
+    // match NOTHING still passed. Every entry must actually be reachable.
+    expect(localServerEntries.length).toBeGreaterThan(0);
+    const rows = [
+      configItem({}).contextValue!,
+      configItem({}, true).contextValue!,
+      "nexus.localServerSessionNode"
+    ];
+    for (const entry of localServerEntries) {
       expect(
-        reachableFrom.filter((base) => whenMatches(entry.when!, base)),
+        rows.filter((row) => whenMatches(entry.when!, row)),
         `${entry.command} (group ${entry.group}) matches no local-server row at all`
       ).not.toHaveLength(0);
-      for (const base of bases) {
-        expect(
-          whenMatches(entry.when!, `${base}.inFolder`),
-          `${entry.command} (group ${entry.group}) hides for a foldered ${base} row`
-        ).toBe(whenMatches(entry.when!, base));
-      }
     }
   });
 
-  it("shows Reset and Clear Scrollback on a running row whether or not it sits in a folder", () => {
-    // The original regression, now actually asserted: an exact
-    // `viewItem == nexus.localServerRunning` equality leaves both disabled for
-    // a foldered running row.
+  it("shows Reset and Clear Scrollback on every running row", () => {
     for (const command of ["nexus.terminal.reset", "nexus.terminal.clearScrollback"]) {
       const when = localServerEntries.find((e) => e.command === command)!.when!;
-      expect(whenMatches(when, "nexus.localServerRunning"), `${command} on a root running row`).toBe(true);
-      expect(whenMatches(when, "nexus.localServerRunning.inFolder"), `${command} on a foldered running row`).toBe(true);
+      expect(whenMatches(when, configItem({}, true).contextValue!), `${command} on a running config row`).toBe(true);
+      expect(
+        whenMatches(when, configItem({ group: "Production" }, true).contextValue!),
+        `${command} on a running config row inside a folder`
+      ).toBe(true);
       expect(whenMatches(when, "nexus.localServerSessionNode"), `${command} on a session row`).toBe(true);
+      // Still hidden where there is no terminal to act on.
+      expect(whenMatches(when, configItem({}).contextValue!), `${command} on a stopped row`).toBe(false);
     }
   });
 
   it("gates the real tree items rather than hypothetical contextValues", () => {
-    const foldered = configItem({ group: "Production" }).contextValue!;
-    const rootLevel = configItem({}).contextValue!;
-    const moveToRoot = localServerEntries.find((e) => e.command === "nexus.localServer.moveToRoot")!.when!;
-    const moveToFolder = localServerEntries.find((e) => e.command === "nexus.localServer.moveToFolder")!.when!;
-    expect(whenMatches(moveToRoot, foldered)).toBe(true);
-    expect(whenMatches(moveToRoot, rootLevel)).toBe(false);
-    // Its counterpart stays available from both places.
-    expect(whenMatches(moveToFolder, foldered)).toBe(true);
-    expect(whenMatches(moveToFolder, rootLevel)).toBe(true);
-  });
-
-  it("leaves no viewItemFolder reference anywhere in the manifest", () => {
-    expect(readFileSync(packageJsonPath, "utf8")).not.toContain("viewItemFolder");
+    // Every walked clause is exercised against the contextValue the tree
+    // provider actually produces, so a change on either side is caught.
+    const rows = [
+      configItem({ group: "Production" }).contextValue!,
+      configItem({}).contextValue!,
+      configItem({ group: "Production" }, true).contextValue!,
+      configItem({}, true).contextValue!
+    ];
+    for (const entry of localServerEntries) {
+      for (const row of rows) {
+        expect(() => whenMatches(entry.when!, row), `${entry.command} vs ${row}`).not.toThrow();
+      }
+    }
   });
 });
 
@@ -364,14 +359,13 @@ describe("Copy All is available on Local Servers rows", () => {
     expect(copyAll).toBe(clear);
   });
 
-  it.each([
-    "nexus.localServerRunning",
-    "nexus.localServerRunning.inFolder",
-    "nexus.localServerSessionNode"
-  ])("shows Copy All on a %s row", (contextValue) => {
-    const copyAll = localServerTerminalEntries("nexus.terminal.copyAll")[0].when!;
-    expect(whenMatches(copyAll, contextValue)).toBe(true);
-  });
+  it.each(["nexus.localServerRunning", "nexus.localServerSessionNode"])(
+    "shows Copy All on a %s row",
+    (contextValue) => {
+      const copyAll = localServerTerminalEntries("nexus.terminal.copyAll")[0].when!;
+      expect(whenMatches(copyAll, contextValue)).toBe(true);
+    }
+  );
 
   it("sits in the same menu group as Reset and Clear Scrollback", () => {
     const copyAll = localServerTerminalEntries("nexus.terminal.copyAll")[0];

@@ -1083,12 +1083,6 @@
         "title": "Move to Folder…",
         "category": "Nexus Local Servers",
         "icon": "$(folders)"
-      },
-      {
-        "command": "nexus.localServer.moveToRoot",
-        "title": "Move to Root",
-        "category": "Nexus Local Servers",
-        "icon": "$(remove-folder)"
       }
     ],
     "menus": {
@@ -1967,17 +1961,17 @@
         },
         {
           "command": "nexus.localServer.start",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServer",
           "group": "inline@1"
         },
         {
           "command": "nexus.localServer.stop",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning",
           "group": "inline@1"
         },
         {
           "command": "nexus.localServer.restart",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning",
           "group": "inline@2"
         },
         {
@@ -1997,72 +1991,67 @@
         },
         {
           "command": "nexus.localServer.start",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.localServer.stop",
-          "when": "view == nexusCommandCenter && (viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/ || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.localServer.restart",
-          "when": "view == nexusCommandCenter && (viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/ || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
           "group": "0_connect@3"
         },
         {
           "command": "nexus.localServer.inspectLogs",
-          "when": "view == nexusCommandCenter && (viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/ || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
           "group": "1_terminal@1"
         },
         {
           "command": "nexus.terminal.reset",
-          "when": "view == nexusCommandCenter && (viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/ || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
           "group": "1_terminal@2"
         },
         {
           "command": "nexus.terminal.clearScrollback",
-          "when": "view == nexusCommandCenter && (viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/ || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
           "group": "1_terminal@3"
         },
         {
           "command": "nexus.terminal.copyAll",
-          "when": "view == nexusCommandCenter && (viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/ || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
           "group": "1_terminal@4"
         },
         {
           "command": "nexus.localServer.edit",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.localServer.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.localServer.duplicate",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.localServer.moveToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
           "group": "1_manage@4"
         },
         {
-          "command": "nexus.localServer.moveToRoot",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?\\.inFolder$/",
-          "group": "1_manage@5"
-        },
-        {
           "command": "nexus.localServer.copyInfo",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.localServer.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
           "group": "3_destructive"
         }
       ],
@@ -2649,10 +2638,6 @@
         },
         {
           "command": "nexus.localServer.moveToFolder",
-          "when": "false"
-        },
-        {
-          "command": "nexus.localServer.moveToRoot",
           "when": "false"
         }
       ],

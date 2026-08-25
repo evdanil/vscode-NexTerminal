@@ -242,7 +242,7 @@ describe("formValuesToLocalServer", () => {
  * COMMAND PALETTE IS A FIRST-CLASS ENTRY POINT.
  *
  * `restart`, `edit`, `remove`, `rename`, `duplicate`, `copyInfo`,
- * `moveToFolder` and `moveToRoot` all resolve a config from the tree-item
+ * and `moveToFolder` all resolve a config from the tree-item
  * argument OR fall back to `pickLocalServer`. `stop` and `inspectLogs` did
  * not: invoked from the palette they got no argument, resolved nothing, and
  * dead-ended on a notice telling the user to right-click a tree row instead —
@@ -538,5 +538,150 @@ describe("palette fallback for stop / inspectLogs", () => {
     await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
     expect(h.inspectLogsTerminal).not.toHaveBeenCalled();
     expect(showInfo).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * "MOVE TO FOLDER…" REPLACES THE "MOVE TO ROOT" PAIR.
+ *
+ * Moving a local server used to be two commands: an input box asking for a
+ * folder path, plus a separate always-present "Move to Root" entry that needed
+ * a per-row `.inFolder` contextValue marker (and a matching regex in eighteen
+ * other `when` clauses) so it would only appear where it was not a no-op.
+ *
+ * Macros already solved this with one picker offering "(root)", "New folder…"
+ * and every existing folder — no second command, no per-row marker. Local
+ * servers now use the same shape, which is what let the marker be deleted.
+ */
+describe("moveToFolder destination picker", () => {
+  const quickPick = vscode.window.showQuickPick as unknown as ReturnType<typeof vi.fn>;
+  const inputBox = vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>;
+
+  function moveHarness(servers: Array<Partial<LocalServerConfig>> = []) {
+    const localServers = servers.map((s) => ({
+      id: "cfg-1",
+      name: "API",
+      executable: "node",
+      ...s
+    })) as LocalServerConfig[];
+    const saved: LocalServerConfig[] = [];
+    const ctx = {
+      core: {
+        getSnapshot: () => ({ localServers }),
+        getLocalServer: (id: string) => localServers.find((c) => c.id === id),
+        addOrUpdateLocalServerConfig: vi.fn(async (config: LocalServerConfig) => {
+          saved.push(config);
+        })
+      },
+      localServerTerminals: new Map(),
+      localServerManager: {
+        getActiveSessionIdForConfig: () => undefined,
+        isStoppingConfig: () => false,
+        hasPendingRestart: () => false,
+        lastTerminalForConfig: () => undefined
+      }
+    };
+    registerLocalServerCommands(ctx as never);
+    return { saved, addOrUpdate: ctx.core.addOrUpdateLocalServerConfig };
+  }
+
+  const run = (config: Partial<LocalServerConfig>) =>
+    registeredCommands.get("nexus.localServer.moveToFolder")!({ config: { id: "cfg-1" } });
+
+  beforeEach(() => {
+    quickPick.mockReset();
+    inputBox.mockReset();
+  });
+
+  /** The destination picker is the last showQuickPick call the command makes. */
+  const destinationItems = (): Array<{ label: string }> =>
+    quickPick.mock.calls[quickPick.mock.calls.length - 1][0] as Array<{ label: string }>;
+
+  it("offers (root), New folder… and every existing folder", async () => {
+    moveHarness([{ group: "Backends/APIs" }, { id: "cfg-2", name: "Worker", group: "Jobs" }]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({ group: "Backends/APIs" });
+
+    const labels = destinationItems().map((i) => i.label);
+    expect(labels[0]).toBe("(root)");
+    expect(labels[1]).toContain("New folder");
+    // Ancestors included, so an intermediate folder is a destination too.
+    expect(labels).toContain("Backends");
+    expect(labels).toContain("Backends/APIs");
+    expect(labels).toContain("Jobs");
+  });
+
+  it("clears the group when (root) is chosen — what the retired command did", async () => {
+    const h = moveHarness([{ group: "Backends/APIs" }]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label === "(root)")
+    );
+    await run({ group: "Backends/APIs" });
+    expect(h.saved).toHaveLength(1);
+    expect(h.saved[0].group).toBeUndefined();
+  });
+
+  it("moves into an existing folder when one is chosen", async () => {
+    const h = moveHarness([{ group: "Backends/APIs" }, { id: "cfg-2", name: "Worker", group: "Jobs" }]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label === "Jobs")
+    );
+    await run({ group: "Backends/APIs" });
+    expect(h.saved[0].group).toBe("Jobs");
+  });
+
+  it("marks the server's current folder so the picker says where it already is", async () => {
+    moveHarness([{ group: "Jobs" }]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({ group: "Jobs" });
+    const current = (destinationItems() as Array<{ label: string; description?: string }>).find(
+      (i) => i.label === "Jobs"
+    );
+    expect(current?.description).toBe("current");
+  });
+
+  it("marks (root) as current for a server that is not in a folder", async () => {
+    moveHarness([{}]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({});
+    const root = (destinationItems() as Array<{ label: string; description?: string }>).find(
+      (i) => i.label === "(root)"
+    );
+    expect(root?.description).toBe("current");
+  });
+
+  it("prompts for a path when New folder… is chosen, and moves there", async () => {
+    const h = moveHarness([{}]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label.includes("New folder"))
+    );
+    inputBox.mockImplementation(async () => "Backends/New");
+    await run({});
+    expect(h.saved[0].group).toBe("Backends/New");
+  });
+
+  it("writes nothing when the picker is dismissed", async () => {
+    const h = moveHarness([{ group: "Jobs" }]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({ group: "Jobs" });
+    expect(h.addOrUpdate).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when the New folder prompt is dismissed", async () => {
+    const h = moveHarness([{ group: "Jobs" }]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label.includes("New folder"))
+    );
+    inputBox.mockImplementation(async () => undefined);
+    await run({ group: "Jobs" });
+    // Dismissing the second step must not fall through to root: the server
+    // would be moved somewhere the user never asked for.
+    expect(h.addOrUpdate).not.toHaveBeenCalled();
+  });
+
+  it("no longer registers a Move to Root command", () => {
+    moveHarness([{}]);
+    expect(registeredCommands.has("nexus.localServer.moveToRoot")).toBe(false);
+    expect(registeredCommands.has("nexus.localServer.moveToFolder")).toBe(true);
   });
 });

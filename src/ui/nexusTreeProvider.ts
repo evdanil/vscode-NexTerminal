@@ -310,13 +310,12 @@ export class LocalServerConfigTreeItem extends vscode.TreeItem {
     this.description = showDescription
       ? `${iconInfo.description} · ${running ? parts.join(" ") : config.executable}`
       : undefined;
-    // "Move to Root" only makes sense for a row that is inside a folder. That
-    // used to be gated on a `viewItemFolder` context key nothing ever set, so
-    // the entry never appeared. Per-item state travels on contextValue in this
-    // view — same dot-suffix shape as `.ipmi` / `.eveRunning` / `.syncSource`
-    // on the server rows — and the `when` clauses match it with a regex.
-    const folderMarker = config.group ? ".inFolder" : "";
-    this.contextValue = `${running ? "nexus.localServerRunning" : "nexus.localServer"}${folderMarker}`;
+    // No folder marker on the contextValue. A `.inFolder` suffix existed only
+    // to gate a separate "Move to Root" entry; "Move to Folder…" now opens a
+    // picker that offers "(root)" as one of its destinations — the shape macros
+    // have always used — so nothing needs to know from the manifest whether
+    // this row sits in a folder.
+    this.contextValue = running ? "nexus.localServerRunning" : "nexus.localServer";
     this.iconPath = new vscode.ThemeIcon(iconInfo.icon, iconInfo.color);
     this.command = {
       command: "nexus.profile.actions",
