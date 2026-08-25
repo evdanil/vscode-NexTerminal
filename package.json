@@ -2026,6 +2026,11 @@
           "group": "1_terminal@3"
         },
         {
+          "command": "nexus.terminal.copyAll",
+          "when": "view == nexusCommandCenter && (viewItem =~ /^nexus\\.localServerRunning(\\.inFolder)?$/ || viewItem == nexus.localServerSessionNode)",
+          "group": "1_terminal@4"
+        },
+        {
           "command": "nexus.localServer.edit",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?(\\.inFolder)?$/",
           "group": "1_manage@1"

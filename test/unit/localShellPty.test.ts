@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
 
 vi.mock("vscode", () => {
   class MockEventEmitter<T> {
@@ -406,5 +407,51 @@ describe("LocalShellPty", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+  /**
+   * RESET MUST STAY DISTINGUISHABLE FROM CLEAR SCROLLBACK.
+   *
+   * Reset fires through the local writeEmitter only and never touches the
+   * TerminalCaptureBuffer; Clear Scrollback is the one command that empties
+   * it. When this pty's reset also erased the scrollback ([3J) the two
+   * adjacent menu entries looked identical on screen while only one of them
+   * emptied the buffer — so after a Reset the screen was blank and Copy All
+   * still returned the whole history.
+   */
+  it("resetTerminal() erases the visible screen without erasing the scrollback", () => {
+    const pty = new LocalShellPty({
+      sidecarPath: "/ext/dist/native/local-pty/linux-x64/nexus-local-pty",
+      shellPath: "/bin/bash",
+      shellArgs: [],
+      terminalName: "Nexus Local Shell: Bash",
+      spawnSidecar
+    });
+    const writes: string[] = [];
+    pty.onDidWrite((text) => writes.push(text));
+
+    pty.open({ rows: 24, columns: 80 });
+    sidecar.emitStdout({ type: "ready" });
+    writes.length = 0;
+    pty.resetTerminal();
+
+    expect(writes).toEqual([CLEAR_VISIBLE_SCREEN]);
+    // [3J is the erase-scrollback half; its presence is exactly what made
+    // Reset and Clear Scrollback indistinguishable.
+    expect(writes.join("")).not.toContain("[3J");
+  });
+
+  it("resetTerminal() sends nothing to the sidecar, so the child process is untouched", () => {
+    const pty = new LocalShellPty({
+      sidecarPath: "/ext/dist/native/local-pty/linux-x64/nexus-local-pty",
+      shellPath: "/bin/bash",
+      shellArgs: [],
+      terminalName: "Nexus Local Shell: Bash",
+      spawnSidecar
+    });
+    pty.open({ rows: 24, columns: 80 });
+    sidecar.emitStdout({ type: "ready" });
+    const before = sidecar.stdin.write.mock.calls.length;
+    pty.resetTerminal();
+    expect(sidecar.stdin.write.mock.calls.length).toBe(before);
   });
 });

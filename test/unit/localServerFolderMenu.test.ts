@@ -168,3 +168,47 @@ describe("Local Servers view/item/context menu gating", () => {
     expect(readFileSync(packageJsonPath, "utf8")).not.toContain("viewItemFolder");
   });
 });
+
+/**
+ * COPY ALL ON A LOCAL SERVER ROW.
+ *
+ * A local server terminal is a log view: reading it and taking the text
+ * elsewhere is most of what it is for. Reset and Clear Scrollback were
+ * contributed for these rows; Copy All — the one that hands the user the
+ * output — was not, so it was reachable only from the terminal tab itself.
+ */
+describe("Copy All is available on Local Servers rows", () => {
+  const localServerTerminalEntries = (command: string) =>
+    contextMenu.filter(
+      (entry) => entry.command === command && (entry.when ?? "").includes("localServer")
+    );
+
+  it.each(["nexus.terminal.reset", "nexus.terminal.clearScrollback", "nexus.terminal.copyAll"])(
+    "contributes %s for local-server rows",
+    (command) => {
+      expect(localServerTerminalEntries(command)).toHaveLength(1);
+    }
+  );
+
+  it("gates Copy All exactly as its two neighbours are gated", () => {
+    const copyAll = localServerTerminalEntries("nexus.terminal.copyAll")[0].when;
+    const reset = localServerTerminalEntries("nexus.terminal.reset")[0].when;
+    const clear = localServerTerminalEntries("nexus.terminal.clearScrollback")[0].when;
+    expect(copyAll).toBe(reset);
+    expect(copyAll).toBe(clear);
+  });
+
+  it.each([
+    "nexus.localServerRunning",
+    "nexus.localServerRunning.inFolder",
+    "nexus.localServerSessionNode"
+  ])("shows Copy All on a %s row", (contextValue) => {
+    const copyAll = localServerTerminalEntries("nexus.terminal.copyAll")[0].when!;
+    expect(whenMatches(copyAll, contextValue)).toBe(true);
+  });
+
+  it("sits in the same menu group as Reset and Clear Scrollback", () => {
+    const copyAll = localServerTerminalEntries("nexus.terminal.copyAll")[0];
+    expect(copyAll.group).toMatch(/^1_terminal@/);
+  });
+});
