@@ -91,9 +91,14 @@ vi.mock("../../src/utils/naturalCompare", () => ({ naturalCompare: (a: string, b
 
 vi.mock("../../src/commands/serverCommands", () => ({ collectGroups: () => [] }));
 
-import { formValuesToLocalServer } from "../../src/commands/localServerCommands";
+import * as vscode from "vscode";
+import { formValuesToLocalServer, registerLocalServerCommands } from "../../src/commands/localServerCommands";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import type { FormValues } from "../../src/ui/formTypes";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { CommandContext } from "../../src/commands/types";
+import type { LocalServerManager } from "../../src/services/local/localServerManager";
 
 beforeEach(() => {
   registeredCommands.clear();
@@ -225,5 +230,117 @@ describe("formValuesToLocalServer", () => {
     expect(result!.description).toBeUndefined();
     expect(result!.autoRestart).toBeUndefined();
     expect(result!.maxAutoRestarts).toBeUndefined();
+  });
+});
+
+/**
+ * nexus.localServer.moveToRoot has no input box of its own, but on the
+ * command-palette path (invoked with no arg) it falls through to
+ * pickLocalServer, whose quick pick embeds a config snapshot taken at
+ * OPEN time — same capture-then-write shape as rename / moveToFolder just
+ * fixed for #108, only the interactive pause is the picker instead of an
+ * input box.
+ */
+describe("nexus.localServer.moveToRoot re-resolves under the lock (issue #108)", () => {
+  function makeLocalServerConfig(overrides: Partial<LocalServerConfig> = {}): LocalServerConfig {
+    return {
+      id: "ls1",
+      name: "Dev Server",
+      executable: "node",
+      group: "Backend",
+      ...overrides
+    };
+  }
+
+  async function fixture(configs: LocalServerConfig[]): Promise<{ core: NexusCore }> {
+    const repo = new InMemoryConfigRepository([], [], [], [], [], [], configs);
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const ctx = {
+      core,
+      localServerTerminals: new Map(),
+      localServerManager: {}
+    } as unknown as CommandContext & { localServerManager: LocalServerManager };
+    registerLocalServerCommands(ctx);
+    return { core };
+  }
+
+  interface Deferred<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+  }
+
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  function moveToRoot(arg?: unknown): Promise<unknown> {
+    const cmd = registeredCommands.get("nexus.localServer.moveToRoot");
+    expect(cmd).toBeDefined();
+    return Promise.resolve(cmd!(arg));
+  }
+
+  it("does not revert a concurrent edit's other fields", async () => {
+    // pickLocalServer captures the config when the quick pick opens, then the
+    // picker awaits the user for an unbounded time. While it is open, an edit
+    // changes the executable. moveToRoot must apply ONLY group: undefined, to
+    // the CURRENT record — not write back the pre-picker snapshot, which
+    // silently undoes the edit to every other field.
+    const { core } = await fixture([makeLocalServerConfig({ executable: "node" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, executable: "python" });
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBeUndefined();
+    // Load-bearing: "node" here means moveToRoot reverted the concurrent edit.
+    expect(after.executable).toBe("python");
+  });
+
+  it("does not resurrect a config removed during the prompt", async () => {
+    const { core } = await fixture([makeLocalServerConfig()]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.removeLocalServerConfig("ls1");
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    expect(core.getLocalServer("ls1")).toBeUndefined();
+  });
+
+  it("bails when a concurrent move changed the group to some OTHER value (#84 P2-1)", async () => {
+    // The picker opened against group "Backend". Something else moved the
+    // record to "Frontend" while it was open, so this picker's decision was
+    // made against a folder that no longer applies — writing group: undefined
+    // here would overwrite that newer move.
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, group: "Frontend" });
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    expect(core.getLocalServer("ls1")!.group).toBe("Frontend");
   });
 });

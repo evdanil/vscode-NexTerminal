@@ -403,7 +403,14 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
           if (!profile) {
             return;
           }
-          await ctx.core.addOrUpdateTunnel(profile);
+          // #108 (serialization audit) — addOrUpdateTunnel persists a FULL
+          // collection snapshot, so serialize it under configMutationLock like
+          // every other tunnel writer, for consistency with #84. This is not a
+          // re-resolve fix: the value being written comes straight from the
+          // submitted form, not a pre-prompt capture, so there is no stale
+          // snapshot to clobber — the lock just keeps this write from
+          // interleaving with a concurrent one.
+          await configMutationLock.runExclusive(() => ctx.core.addOrUpdateTunnel(profile));
         },
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
@@ -447,7 +454,11 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
           const previousActive = ctx.core
             .getSnapshot()
             .activeTunnels.find((tunnel) => tunnel.profileId === existing.id);
-          await ctx.core.addOrUpdateTunnel(updated);
+          // #108 (serialization audit) — same reasoning as nexus.tunnel.add's
+          // onSubmit above: `updated` comes straight from the submitted form,
+          // not a pre-prompt capture, so this is a plain serialization wrap
+          // for consistency with #84, not a re-resolve fix.
+          await configMutationLock.runExclusive(() => ctx.core.addOrUpdateTunnel(updated));
 
           if (!previousActive || !isTunnelRouteChanged(existing, updated)) {
             return;
@@ -672,7 +683,10 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const copy = { ...profile, id: randomUUID(), name: `${profile.name} (copy)` };
-      await ctx.core.addOrUpdateTunnel(copy);
+      // #108 (serialization audit) — a fresh id means no existing record is at
+      // risk, so this is a plain serialization wrap for consistency with #84,
+      // not a re-resolve fix.
+      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateTunnel(copy));
     })
   ];
 }

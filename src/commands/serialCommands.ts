@@ -648,12 +648,38 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const updated = formValuesToSerial(values, existing);
-          if (!updated) {
-            return;
-          }
-          await ctx.core.addOrUpdateSerialProfile(updated);
-          if (ctx.core.isSerialProfileConnected(existing.id)) {
+          // ISSUE #108 FOLLOW-UP (Codex review) — formValuesToSerial has no
+          // form field for `deviceHint` (and falls back to `existing.mode`
+          // when the form omits mode), so it always CARRIES those over from
+          // whatever `existing` it's handed. `existing` here was captured
+          // BEFORE the form opened, and the form can sit open indefinitely
+          // (same hazard the six rename/move handlers were fixed for
+          // earlier on this branch). Left alone, anything that updates
+          // deviceHint while the form is open — Smart Follow's
+          // onResolvedPort is the live example — gets silently reverted the
+          // moment this Save commits.
+          //
+          // Fix: serialize the write under configMutationLock (this path
+          // was unserialized before), and re-resolve the LIVE record inside
+          // the lock instead of building from the pre-form snapshot.
+          // Form-backed fields still come from `values` and win as before;
+          // only the carried-over ones now source from the current record.
+          // The connected-sessions notice is UI, so it stays OUTSIDE the
+          // lock — a flag captured inside is read after the section ends.
+          let showConnectedNotice = false;
+          await configMutationLock.runExclusive(async () => {
+            const live = ctx.core.getSerialProfile(existing.id);
+            if (!live) {
+              throw new Error(`Serial profile "${existing.name}" was removed while this form was open. Nothing was saved.`);
+            }
+            const updated = formValuesToSerial(values, live);
+            if (!updated) {
+              return;
+            }
+            await ctx.core.addOrUpdateSerialProfile(updated);
+            showConnectedNotice = ctx.core.isSerialProfileConnected(existing.id);
+          });
+          if (showConnectedNotice) {
             void vscode.window.showInformationMessage(
               "Serial profile updated. Existing sessions keep current settings until reconnect."
             );
@@ -912,7 +938,33 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === profile.name) {
         return;
       }
-      await ctx.core.addOrUpdateSerialProfile({ ...profile, name: newName.trim() });
+      const trimmedName = newName.trim();
+      // #108 — same fix, and the same reasoning, as nexus.server.rename
+      // (commands/serverCommands.ts, #84 P1/P2-1): serialize under
+      // configMutationLock and RE-READ the live record inside the lock,
+      // applying ONLY the name. `profile` was captured before the input box
+      // opened, and nexus.serial.edit writes the same record; committing the
+      // captured full snapshot would revert that edit in every field except
+      // the one this prompt owns. Acquiring the lock around the old write
+      // would NOT have fixed it — the value was already stale by then.
+      // rename holds no lock of its own and runs after the input box resolves,
+      // so there is no re-entrancy or interactive-UI-under-lock hazard.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getSerialProfile(profile.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT rename changed the name to some OTHER
+        // value while this box was open: the live name no longer matches what
+        // this prompt started from, so writing would overwrite the newer
+        // rename with a decision made against a stale name. (Re-reading the
+        // other fields above is safe to keep — they are not the field this
+        // prompt owns — but a moved name means the prompt itself is stale.)
+        if (live.name !== profile.name) {
+          return;
+        }
+        await ctx.core.addOrUpdateSerialProfile({ ...live, name: trimmedName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.serial.duplicate", async (arg?: unknown) => {
@@ -921,7 +973,10 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const copy = { ...profile, id: randomUUID(), name: `${profile.name} (copy)` };
-      await ctx.core.addOrUpdateSerialProfile(copy);
+      // #108 (serialization audit) — a fresh id means no existing record is at
+      // risk, so this is a plain serialization wrap for consistency with #84,
+      // not a re-resolve fix.
+      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateSerialProfile(copy));
     }),
 
     vscode.commands.registerCommand("nexus.serial.sendBreak", async () => {

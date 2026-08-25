@@ -332,7 +332,25 @@ export function registerNetworkServerProfileCommands(
       if (!profile) return;
       const newName = await promptProfileName("Rename Profile", profile.name);
       if (!newName || newName === profile.name) return;
-      await persistProfile(ctx.core, { ...profile, name: newName });
+      // #108 — same fix, and the same reasoning, as nexus.server.rename (#84
+      // P1/P2-1): serialize under configMutationLock and RE-READ the live
+      // record inside the lock, applying ONLY the name. `profile` was
+      // captured before the input box opened; committing the captured full
+      // snapshot would revert any concurrent edit in every field except the
+      // one this prompt owns.
+      await configMutationLock.runExclusive(async () => {
+        const live = getProfile(ctx.core, profile.kind, profile.id);
+        if (!live || live.name === newName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT rename changed the name to some OTHER
+        // value while this box was open: writing here would overwrite that
+        // newer rename with a decision made against a stale name.
+        if (live.name !== profile.name) {
+          return;
+        }
+        await persistProfile(ctx.core, { ...live, name: newName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.networkServer.profile.duplicate", async (arg?: unknown) => {
