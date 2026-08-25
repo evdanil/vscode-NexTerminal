@@ -91,7 +91,8 @@ vi.mock("../../src/utils/naturalCompare", () => ({ naturalCompare: (a: string, b
 
 vi.mock("../../src/commands/serverCommands", () => ({ collectGroups: () => [] }));
 
-import { formValuesToLocalServer } from "../../src/commands/localServerCommands";
+import * as vscode from "vscode";
+import { formValuesToLocalServer, registerLocalServerCommands } from "../../src/commands/localServerCommands";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import type { FormValues } from "../../src/ui/formTypes";
 
@@ -225,5 +226,140 @@ describe("formValuesToLocalServer", () => {
     expect(result!.description).toBeUndefined();
     expect(result!.autoRestart).toBeUndefined();
     expect(result!.maxAutoRestarts).toBeUndefined();
+  });
+});
+
+/**
+ * COMMAND PALETTE IS A FIRST-CLASS ENTRY POINT.
+ *
+ * `restart`, `edit`, `remove`, `rename`, `duplicate`, `copyInfo`,
+ * `moveToFolder` and `moveToRoot` all resolve a config from the tree-item
+ * argument OR fall back to `pickLocalServer`. `stop` and `inspectLogs` did
+ * not: invoked from the palette they got no argument, resolved nothing, and
+ * dead-ended on a notice telling the user to right-click a tree row instead —
+ * a message, not a way through.
+ */
+describe("palette fallback for stop / inspectLogs", () => {
+  interface Harness {
+    stopConfig: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+    inspectLogsTerminal: ReturnType<typeof vi.fn>;
+    terminal: { show: ReturnType<typeof vi.fn> };
+  }
+
+  function harness(options: { runningConfigIds?: string[] } = {}): Harness {
+    const running = new Set(options.runningConfigIds ?? []);
+    const terminal = { show: vi.fn() };
+    const manager = {
+      stop: vi.fn(async () => {}),
+      stopConfig: vi.fn(async () => {}),
+      getActiveSessionIdForConfig: vi.fn((configId: string) =>
+        running.has(configId) ? `session-for-${configId}` : undefined
+      ),
+      inspectLogsTerminal: vi.fn(() => terminal)
+    };
+    const localServers = [
+      { id: "cfg-1", name: "API", executable: "node" },
+      { id: "cfg-2", name: "Worker", executable: "python" }
+    ];
+    const ctx = {
+      core: {
+        getSnapshot: () => ({ localServers }),
+        getLocalServer: (id: string) => localServers.find((c) => c.id === id)
+      },
+      localServerTerminals: new Map(),
+      localServerManager: manager
+    };
+    registerLocalServerCommands(ctx as never);
+    return {
+      stopConfig: manager.stopConfig,
+      stop: manager.stop,
+      inspectLogsTerminal: manager.inspectLogsTerminal,
+      terminal
+    };
+  }
+
+  const quickPick = vscode.window.showQuickPick as unknown as ReturnType<typeof vi.fn>;
+  const showInfo = vscode.window.showInformationMessage as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    quickPick.mockReset();
+    showInfo.mockReset();
+  });
+
+  it("stop with no argument offers the picker and stops the chosen config", async () => {
+    const h = harness({ runningConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-2")
+    );
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    // Before the fix the picker was never opened and this never ran.
+    expect(quickPick).toHaveBeenCalledTimes(1);
+    expect(h.stopConfig).toHaveBeenCalledWith("cfg-2", true);
+  });
+
+  it("stop titles its picker so the palette flow says what it is about to do", async () => {
+    harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    expect(quickPick.mock.calls[0][1]).toEqual({ title: "Stop Local Server" });
+  });
+
+  it("stop does nothing and says nothing when the picker is dismissed", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    expect(h.stopConfig).not.toHaveBeenCalled();
+    expect(showInfo).not.toHaveBeenCalled();
+  });
+
+  it("stop reports a config that is not running instead of silently no-opping", async () => {
+    // stopConfig() iterates the running set and returns quietly when it is
+    // empty, so a stopped pick would otherwise produce no feedback at all.
+    const h = harness({ runningConfigIds: [] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    expect(h.stopConfig).not.toHaveBeenCalled();
+    expect(showInfo).toHaveBeenCalledWith('Local server "API" is not running.');
+  });
+
+  it("stop still short-circuits on a session tree item without opening the picker", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"] });
+    await registeredCommands.get("nexus.localServer.stop")!({ session: { id: "sess-9" } });
+    expect(h.stop).toHaveBeenCalledWith("sess-9", true);
+    expect(quickPick).not.toHaveBeenCalled();
+  });
+
+  it("inspectLogs with no argument offers the picker and shows the chosen config's terminal", async () => {
+    const h = harness({ runningConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-2")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(quickPick).toHaveBeenCalledTimes(1);
+    expect(quickPick.mock.calls[0][1]).toEqual({ title: "Inspect Local Server Logs" });
+    expect(h.inspectLogsTerminal).toHaveBeenCalledWith("session-for-cfg-2");
+    expect(h.terminal.show).toHaveBeenCalledTimes(1);
+    expect(showInfo).not.toHaveBeenCalled();
+  });
+
+  it("inspectLogs keeps the 'no running session' notice, scoped to the picked config", async () => {
+    const h = harness({ runningConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(h.inspectLogsTerminal).not.toHaveBeenCalled();
+    expect(showInfo).toHaveBeenCalledWith("No running local server session to display.");
+  });
+
+  it("inspectLogs does nothing when the picker is dismissed", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(h.inspectLogsTerminal).not.toHaveBeenCalled();
+    expect(showInfo).not.toHaveBeenCalled();
   });
 });

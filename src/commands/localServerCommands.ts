@@ -231,14 +231,19 @@ export function registerLocalServerCommands(
           await manager.stop(sessionId, true);
           return;
         }
-        const config = toLocalServerFromArg(ctx.core, arg);
-        if (config) {
-          await manager.stopConfig(config.id, true);
+        // Palette invocation carries no tree item. Falling back to the picker
+        // here is what restart / edit / remove already do; without it the
+        // command dead-ended on a "right-click something instead" notice that
+        // offered no way to proceed.
+        const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Stop Local Server"));
+        if (!config) return;
+        // stopConfig no-ops on a config with nothing running, so say so rather
+        // than swallowing the request the way the old dead end did.
+        if (!manager.getActiveSessionIdForConfig(config.id)) {
+          void vscode.window.showInformationMessage(`Local server "${config.name}" is not running.`);
           return;
         }
-        void vscode.window.showInformationMessage(
-          "Right-click a local server or session to stop it."
-        );
+        await manager.stopConfig(config.id, true);
       } catch (error) {
         void vscode.window.showErrorMessage(errorMessageFor(error, "Failed to stop local server"));
       }
@@ -263,13 +268,16 @@ export function registerLocalServerCommands(
           return;
         }
       }
-      const config = toLocalServerFromArg(ctx.core, arg);
-      if (config) {
-        const active = manager.getActiveSessionIdForConfig(config.id);
-        if (active) {
-          manager.inspectLogsTerminal(active)?.show();
-          return;
-        }
+      // Same dead end as stop had: from the palette there was no tree item, so
+      // the command could only report that it had nothing to show. The picker
+      // makes the choice available; the "not running" notice survives, now
+      // scoped to the config the user actually chose.
+      const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Inspect Local Server Logs"));
+      if (!config) return;
+      const active = manager.getActiveSessionIdForConfig(config.id);
+      if (active) {
+        manager.inspectLogsTerminal(active)?.show();
+        return;
       }
       void vscode.window.showInformationMessage("No running local server session to display.");
     }),
