@@ -1549,3 +1549,49 @@ describe("terminal output performance defaults", () => {
     });
   });
 });
+
+/**
+ * LOCAL SERVERS vs NETWORK SERVERS IN THE COMMAND PALETTE.
+ *
+ * Two unrelated subsystems ship a start/stop/restart/inspect-logs quartet. The
+ * palette renders only "<category>: <title>", so "Nexus: Start Server" and
+ * "Nexus: Start Service" sat next to each other with nothing to tell them
+ * apart — one letter, and no hint that one spawns a local child process while
+ * the other drives an embedded TFTP/DHCP daemon. Distinctness as *strings* was
+ * never the problem and is not the fix; naming the subsystem is.
+ *
+ * Command IDs are deliberately untouched: they are the stable contract behind
+ * any user keybinding. Only the displayed titles change.
+ */
+describe("Local Servers command titles are unambiguous in the Command Palette", () => {
+  const titleOf = (command: string): string =>
+    packageJson.contributes.commands.find((c) => c.command === command)?.title ?? "";
+
+  const collidingVerbs = ["start", "stop", "restart", "inspectLogs"] as const;
+
+  it.each(collidingVerbs)("nexus.localServer.%s names the subsystem it acts on", (verb) => {
+    const title = titleOf(`nexus.localServer.${verb}`);
+    expect(title).not.toBe("");
+    expect(title).toMatch(/Local Server/);
+  });
+
+  it.each(collidingVerbs)(
+    "nexus.localServer.%s is not confusable with its Network Servers counterpart",
+    (verb) => {
+      const local = titleOf(`nexus.localServer.${verb}`);
+      const network = titleOf(`nexus.networkServer.${verb}`);
+      expect(network).not.toBe("");
+      expect(local).not.toBe(network);
+      // The real bar: neither title may be reachable from the other by
+      // swapping the single trailing noun ("Server" ⇄ "Service"), which is all
+      // that separated them before.
+      expect(local.replace(/Service/g, "Server")).not.toBe(network.replace(/Service/g, "Server"));
+    }
+  );
+
+  it("leaves the command IDs alone so existing keybindings keep working", () => {
+    for (const verb of collidingVerbs) {
+      expect(packageJson.contributes.commands.some((c) => c.command === `nexus.localServer.${verb}`)).toBe(true);
+    }
+  });
+});

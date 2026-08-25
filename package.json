@@ -1026,25 +1026,25 @@
       },
       {
         "command": "nexus.localServer.start",
-        "title": "Start Server",
+        "title": "Start Local Server",
         "category": "Nexus",
         "icon": "$(debug-start)"
       },
       {
         "command": "nexus.localServer.stop",
-        "title": "Stop Server",
+        "title": "Stop Local Server",
         "category": "Nexus",
         "icon": "$(debug-stop)"
       },
       {
         "command": "nexus.localServer.restart",
-        "title": "Restart Server",
+        "title": "Restart Local Server",
         "category": "Nexus",
         "icon": "$(sync)"
       },
       {
         "command": "nexus.localServer.inspectLogs",
-        "title": "Inspect Logs Terminal",
+        "title": "Inspect Local Server Logs",
         "category": "Nexus",
         "icon": "$(list-flat)"
       },
