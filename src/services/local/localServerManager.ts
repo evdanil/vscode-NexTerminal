@@ -198,7 +198,11 @@ function expandEnv(
   if (!env) return undefined;
   const result: Record<string, string | null | undefined> = {};
   for (const [key, value] of Object.entries(env)) {
-    result[key] = typeof value === "string" ? expandValue(value) : value;
+    // expandValue() maps an empty/blank string to undefined, which on the wire
+    // means "inherit" — the opposite of the "set this to an empty string" the
+    // parser now records for `KEY=`. Only a genuine null/undefined from the
+    // config may survive as such; a string stays a string.
+    result[key] = typeof value === "string" ? expandValue(value) ?? "" : value;
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }

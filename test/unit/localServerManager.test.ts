@@ -19,6 +19,7 @@ import * as path from "node:path";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import { LocalServerError } from "../../src/models/localServer";
 import { LocalServerManager } from "../../src/services/local/localServerManager";
+import { LocalShellPty } from "../../src/services/local/localShellPty";
 
 function normalizeMockPath(value: string): string {
   return value.replace(/\//g, "\\").toLowerCase();
@@ -343,5 +344,64 @@ describe("LocalServerManager — lifecycle cleanup (dispose / stopAll)", () => {
     const manager = fakeManager();
     manager.dispose();
     expect(() => manager.dispose()).not.toThrow();
+  });
+});
+
+/**
+ * THE ENV TEXTAREA'S THREE-STATE CONTRACT, END TO END.
+ *
+ * `splitEnvFromTextarea` records three distinct intents — `KEY=null` unsets,
+ * `KEY=undefined` inherits, `KEY=` sets an empty string — and the sidecar wire
+ * format preserves all three (JSON.stringify drops `undefined` keys, keeps
+ * `null`, keeps `""`). Between them sits `expandEnv`, and `expandValue` maps a
+ * blank string to `undefined`: an empty string handed in came out the far side
+ * as "inherit", the one state it was not. Fixing only the parser would have
+ * left `KEY=` still unexpressible, so this asserts what the PTY is actually
+ * handed rather than what the parser produced.
+ */
+describe("LocalServerManager — env pass-through preserves unset / inherit / empty-string", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+  });
+
+  it("hands the pty an empty string for KEY=, null for an unset, and undefined for an inherit", async () => {
+    const manager = fakeManager();
+    await manager.start(
+      baseConfig({
+        executable: "node",
+        env: { EMPTY: "", WILDCARD: null, INHERIT: undefined, REAL: "value" }
+      })
+    );
+
+    const options = vi.mocked(LocalShellPty).mock.calls[0][0] as {
+      env?: Record<string, string | null | undefined>;
+    };
+    expect(options.env).toBeDefined();
+    // The regression: this was `undefined` before, i.e. indistinguishable from
+    // INHERIT, so `KEY=` could never set a variable to "".
+    expect(options.env!.EMPTY).toBe("");
+    expect(options.env!.WILDCARD).toBeNull();
+    expect(options.env!.INHERIT).toBeUndefined();
+    expect(options.env!.REAL).toBe("value");
+  });
+
+  it("keeps the three states distinct once serialized for the sidecar", async () => {
+    const manager = fakeManager();
+    await manager.start(
+      baseConfig({ executable: "node", env: { EMPTY: "", WILDCARD: null, INHERIT: undefined } })
+    );
+    const options = vi.mocked(LocalShellPty).mock.calls[0][0] as { env?: Record<string, unknown> };
+    // This is exactly what LocalShellPty.sendFrame writes: `undefined` drops
+    // out (inherit), `null` survives (unset), `""` survives (set to empty).
+    const onTheWire = JSON.parse(JSON.stringify({ env: options.env })) as {
+      env: Record<string, unknown>;
+    };
+    expect(Object.prototype.hasOwnProperty.call(onTheWire.env, "INHERIT")).toBe(false);
+    expect(onTheWire.env.WILDCARD).toBeNull();
+    expect(onTheWire.env.EMPTY).toBe("");
   });
 });

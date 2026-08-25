@@ -157,6 +157,9 @@ describe("formValuesToLocalServer", () => {
   });
 
   it("parses env textarea keywords: null / undefined / empty string", () => {
+    // The field's hint states the contract: "Setting KEY=null unsets, KEY=
+    // passes an empty string." `KEY=` used to be folded in with `KEY=null`,
+    // which made an empty string unexpressible and the hint's promise false.
     const values: FormValues = {
       ...baseValues(),
       env: [
@@ -172,8 +175,14 @@ describe("formValuesToLocalServer", () => {
       FORCE_COLOR: "1",
       WILDCARD: null,
       INHERIT: undefined,
-      EMPTY: null
+      EMPTY: ""
     });
+    // toEqual treats a missing key and an undefined one alike, so pin the
+    // three states apart explicitly: only `null` is an unset.
+    expect(result!.env!.EMPTY).toBe("");
+    expect(result!.env!.WILDCARD).toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(result!.env!, "INHERIT")).toBe(true);
+    expect(result!.env!.INHERIT).toBeUndefined();
   });
 
   it("drops blank / whitespace-only argument lines", () => {
