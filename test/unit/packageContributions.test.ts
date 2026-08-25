@@ -1067,9 +1067,12 @@ describe("package contributions", () => {
     });
 
     /**
-     * OBSERVED, NOT VERIFIED — a user running EVE-NG Community reports that a
-     * sync or poll logs them out of the EVE-NG web UI, which reads as one
-     * active session per account. It is very likely what actually produces the
+     * BEHAVIOUR CONFIRMED ON COMMUNITY, MECHANISM INFERRED — signed in to the
+     * EVE-NG Community web UI, every sync or poll deauthenticated the browser
+     * session in direct testing. (This said "observed, not verified — a user
+     * reports" until that testing confirmed it; Professional remains untested.)
+     * The eviction is the confirmed part; the inference is that it is caused
+     * by one active session per account. It is very likely what actually produces the
      * mid-sync 412/(90001) the released one-shot re-login recovers from, and
      * with polling on and a browser open the two sessions keep evicting each
      * other. There is deliberately NO runtime warning for it — nothing on the
