@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { ActiveLocalShellSession, ActiveSerialSession, ActiveSession, SessionPtyHandle } from "../../models/config";
+import type { ActiveLocalServerSession } from "../../models/localServer";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { TerminalCaptureBuffer } from "./terminalCaptureBuffer";
 
@@ -20,6 +21,7 @@ interface CoreSnapshotLike {
   activeSessions: ReadonlyArray<Pick<ActiveSession, "pty">>;
   activeSerialSessions: ReadonlyArray<Pick<ActiveSerialSession, "pty" | "status">>;
   activeLocalShellSessions: ReadonlyArray<Pick<ActiveLocalShellSession, "pty">>;
+  activeLocalServerSessions: ReadonlyArray<Pick<ActiveLocalServerSession, "pty">>;
 }
 
 export interface NexusCoreLike {
@@ -86,6 +88,17 @@ export class TerminalRegistry implements vscode.Disposable {
     }
     for (const s of snap.activeLocalShellSessions) {
       if (s.pty === entry.pty) return true;
+    }
+    // No status exclusion here, unlike the serial branch above. Smart Follow
+    // registers a serial session while it is still "waiting" for a port to
+    // appear — a pty with no transport behind it — so "waiting" has to be
+    // filtered out. A local server session only exists in the snapshot between
+    // spawn and cleanupSession(): "starting" already has a live child process,
+    // and the terminal states of "failed"/"restarting" are torn straight back
+    // out by unregisterLocalServerSession. There is no equivalent
+    // pty-without-transport window, so pty identity alone is the whole answer.
+    for (const s of snap.activeLocalServerSessions) {
+      if (s.pty && s.pty === entry.pty) return true;
     }
     return false;
   }

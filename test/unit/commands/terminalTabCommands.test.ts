@@ -215,6 +215,35 @@ describe("terminalTabCommands", () => {
       expect(state.showInfo).not.toHaveBeenCalled();
       expect(state.showWarning).not.toHaveBeenCalled();
     });
+
+    it("tree-item path: resolves LocalServerConfigTreeItem via config.id, not the active terminal", () => {
+      // `LocalServerConfigTreeItem` carries `config: LocalServerConfig`. The old
+      // check probed a flat `configId` property that no tree item has, so this
+      // arg fell through to `window.activeTerminal` — resetting whichever tab
+      // happened to be focused. The two terminals below are deliberately
+      // DIFFERENT so that wrong answer is visible rather than coincidentally
+      // right.
+      const serverTerminal = fakeTerminal() as never;
+      const serverPty = fakePty();
+      const unrelatedTerminal = fakeTerminal() as never;
+      const unrelatedPty = fakePty();
+      const entries = new Map<unknown, RegistryEntry>();
+      const serverEntry: RegistryEntry = { terminal: serverTerminal, pty: serverPty as never, buffer: fakeBuffer("") as never };
+      const unrelatedEntry: RegistryEntry = { terminal: unrelatedTerminal, pty: unrelatedPty as never, buffer: fakeBuffer("") as never };
+      entries.set(serverTerminal, serverEntry);
+      entries.set(unrelatedTerminal, unrelatedEntry);
+      const deps = fakeDeps(entries, new Set([serverEntry, unrelatedEntry]));
+      deps.localServerTerminals = new Map([
+        ["ls-session-1", { terminal: serverTerminal, configId: "cfg-1", pty: serverPty as never }]
+      ]) as never;
+      state.activeTerminal = unrelatedTerminal;
+      registerTerminalTabCommands(context as never, deps as never);
+      const handler = state.registeredCommands.get("nexus.terminal.reset")!;
+      handler({ config: { id: "cfg-1", name: "API", executable: "node" } });
+      expect(serverPty.resetTerminal).toHaveBeenCalledTimes(1);
+      expect(unrelatedPty.resetTerminal).not.toHaveBeenCalled();
+    });
+
   });
 
   describe("nexus.terminal.copyAll", () => {

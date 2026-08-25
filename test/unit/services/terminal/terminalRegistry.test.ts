@@ -56,6 +56,7 @@ interface FakeNexusCore {
     activeSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
     activeSerialSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
     activeLocalShellSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+    activeLocalServerSessions: Array<{ id: string; status?: string; pty?: SessionPtyHandle }>;
   };
   onDidChange(l: () => void): () => void;
 }
@@ -87,6 +88,7 @@ function makeCore(): FakeNexusCore & {
   sessions: Array<{ id: string; pty?: SessionPtyHandle }>;
   serialSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
   localShellSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+  localServerSessions: Array<{ id: string; status?: string; pty?: SessionPtyHandle }>;
   emit: () => void;
 } {
   const listeners = new Set<() => void>();
@@ -94,11 +96,13 @@ function makeCore(): FakeNexusCore & {
     sessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
     serialSessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
     localShellSessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
+    localServerSessions: [] as Array<{ id: string; status?: string; pty?: SessionPtyHandle }>,
     getSnapshot() {
       return {
         activeSessions: core.sessions,
         activeSerialSessions: core.serialSessions,
-        activeLocalShellSessions: core.localShellSessions
+        activeLocalShellSessions: core.localShellSessions,
+        activeLocalServerSessions: core.localServerSessions
       };
     },
     onDidChange(l: () => void) {
@@ -236,6 +240,56 @@ describe("TerminalRegistry", () => {
     reg.register(terminal, pty);
     fireActiveTerminal(terminal);
     expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(true);
+    reg.dispose();
+  });
+
+  it("recognizes Local Server sessions as connected", () => {
+    // Before the fix `CoreSnapshotLike` had no `activeLocalServerSessions`
+    // field and `isConnected` had no loop over it, so a Local Server terminal
+    // was permanently "not connected" and Reset / Clear Scrollback stayed
+    // greyed out for its whole life.
+    const core = makeCore();
+    const reg = new TerminalRegistry(core);
+    const terminal = {} as never;
+    const pty = makePty();
+    core.localServerSessions.push({ id: "lsrv1", status: "running", pty });
+    reg.register(terminal, pty);
+    fireActiveTerminal(terminal);
+    expect(latestContextKey("nexus.isNexusTerminal")).toBe(true);
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(true);
+    reg.dispose();
+  });
+
+  it("counts a 'starting' Local Server session as connected and drops it on cleanup", () => {
+    // "starting" is the status the session is REGISTERED with, and the child
+    // process is already spawned by then — unlike serial "waiting" there is no
+    // pty-without-transport window to exclude. Teardown is by removal from the
+    // snapshot (unregisterLocalServerSession), not by a status value.
+    const core = makeCore();
+    const reg = new TerminalRegistry(core);
+    const terminal = {} as never;
+    const pty = makePty();
+    core.localServerSessions.push({ id: "lsrv1", status: "starting", pty });
+    reg.register(terminal, pty);
+    fireActiveTerminal(terminal);
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(true);
+    core.localServerSessions.length = 0;
+    core.emit();
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(false);
+    // The tab itself stays registered so Copy All keeps working (FR-011).
+    expect(reg.get(terminal)).toBeDefined();
+    reg.dispose();
+  });
+
+  it("does not treat an unrelated pty-less Local Server session as this terminal's", () => {
+    const core = makeCore();
+    const reg = new TerminalRegistry(core);
+    const terminal = {} as never;
+    const pty = makePty();
+    core.localServerSessions.push({ id: "other", status: "running" });
+    reg.register(terminal, pty);
+    fireActiveTerminal(terminal);
+    expect(latestContextKey("nexus.isNexusTerminalConnected")).toBe(false);
     reg.dispose();
   });
 

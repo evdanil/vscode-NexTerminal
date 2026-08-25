@@ -54,10 +54,18 @@ function resolveTerminal(
       if (entry.profileId === profileId) return entry.terminal;
     }
   }
-  if (asAny && typeof asAny === "object" && typeof (asAny as Record<string, unknown>).configId === "string") {
-    const configId = (asAny as { configId: string }).configId;
-    for (const entry of deps.localServerTerminals?.values() ?? []) {
-      if (entry.configId === configId) return entry.terminal;
+  // `LocalServerConfigTreeItem` carries `config: LocalServerConfig`, so the id
+  // is at `arg.config.id`. The earlier flat-`configId` probe matched no tree
+  // item this view ever produces, and the fall-through below then resolved the
+  // *active* terminal — a Reset from a local server's config row could clear an
+  // unrelated tab. No caller passes a flat `configId`.
+  if (asAny && typeof asAny === "object") {
+    const config = (asAny as { config?: { id?: unknown } }).config;
+    if (config && typeof config.id === "string") {
+      const configId = config.id;
+      for (const entry of deps.localServerTerminals?.values() ?? []) {
+        if (entry.configId === configId) return entry.terminal;
+      }
     }
   }
   return vscode.window.activeTerminal ?? undefined;
