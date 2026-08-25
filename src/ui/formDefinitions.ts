@@ -1256,7 +1256,12 @@ function localServerFields(
       type: "textarea",
       key: "env",
       label: "Environment Variables",
-      placeholder: "PORT=8080\nNODE_ENV=production\n# set key to null to unset\nDEBUG=",
+      // Each example sits under the comment that explains it. `DEBUG=` used to
+      // follow "set key to null to unset" directly, so the one line
+      // demonstrating the empty string read as the demonstration of unsetting —
+      // teaching the opposite of what it does.
+      placeholder:
+        "PORT=8080\nNODE_ENV=production\n# KEY=null unsets an inherited variable\nNO_COLOR=null\n# KEY= sets it to an empty string\nDEBUG=",
       value: envTextarea,
       hint: "One KEY=VALUE per line. Setting KEY=null unsets, KEY= passes an empty string. ${workspaceFolder}/${env:NAME} are expanded.",
       ...inheritVw

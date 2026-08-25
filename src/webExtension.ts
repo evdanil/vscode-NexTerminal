@@ -197,8 +197,7 @@ const unsupportedCommands = [
   "nexus.localServer.rename",
   "nexus.localServer.duplicate",
   "nexus.localServer.copyInfo",
-  "nexus.localServer.moveToFolder",
-  "nexus.localServer.moveToRoot"
+  "nexus.localServer.moveToFolder"
 ];
 
 export function activate(context: vscode.ExtensionContext): NexusExtensionApi {

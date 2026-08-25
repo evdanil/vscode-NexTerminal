@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   inventorySourceFormDefinition,
+  localServerFormDefinition,
   localShellFormDefinition,
   serialFormDefinition,
   serverFormDefinition,
@@ -1096,5 +1097,54 @@ describe("PR-F1 — filterable adopters (backlog #4)", () => {
   it("leaves small fixed-domain selects alone — authType is NOT filterable (filtering a 3-option list is noise)", () => {
     const definition = serverFormDefinition();
     expect(selectField(definition, "authType").filterable).toBeFalsy();
+  });
+});
+
+/**
+ * THE ENV PLACEHOLDER TEACHES THE CONTRACT, SO IT HAS TO TEACH IT CORRECTLY.
+ *
+ * `DEBUG=` sets an empty string. It used to sit directly under the line
+ * "# set key to null to unset", so the one example demonstrating the empty
+ * string read as the demonstration of unsetting — the opposite of what it does,
+ * and the only worked example a user sees before they type anything.
+ */
+describe("localServerFormDefinition — environment variables placeholder", () => {
+  const placeholderLines = (): string[] => {
+    const field = keyedField(localServerFormDefinition(), "env");
+    return (field as { placeholder: string }).placeholder.split("\n");
+  };
+
+  /** The comment line immediately above the first line that starts with `key=`. */
+  const commentAbove = (key: string): string => {
+    const lines = placeholderLines();
+    const index = lines.findIndex((line) => line.startsWith(`${key}=`));
+    expect(index, `no ${key}= example in the placeholder`).toBeGreaterThan(0);
+    return lines[index - 1];
+  };
+
+  it("demonstrates both the unset form and the empty-string form", () => {
+    const lines = placeholderLines();
+    expect(lines.some((line) => /=null$/.test(line))).toBe(true);
+    expect(lines.some((line) => /^[A-Z_]+=$/.test(line))).toBe(true);
+  });
+
+  it("does not file the empty-string example under a comment about unsetting", () => {
+    const comment = commentAbove("DEBUG");
+    expect(comment.startsWith("#"), `expected a comment above DEBUG=, got "${comment}"`).toBe(true);
+    expect(comment).not.toMatch(/unset/i);
+    expect(comment).toMatch(/empty/i);
+  });
+
+  it("files the null example under the comment about unsetting", () => {
+    const nullExample = placeholderLines().find((line) => /=null$/.test(line))!;
+    const comment = commentAbove(nullExample.split("=")[0]);
+    expect(comment.startsWith("#")).toBe(true);
+    expect(comment).toMatch(/unset/i);
+  });
+
+  it("keeps the field hint and the placeholder describing the same contract", () => {
+    const field = keyedField(localServerFormDefinition(), "env") as { hint: string };
+    expect(field.hint).toMatch(/KEY=null/);
+    expect(field.hint).toMatch(/empty string/i);
   });
 });

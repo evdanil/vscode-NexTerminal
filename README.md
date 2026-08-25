@@ -255,9 +255,9 @@ From NetBox, this fills itself in. Set the source's **Primary IP Family** — **
 2. Name it for the thing it runs — `API (dev)`, `Mock Billing`, `Vite watch`
 3. Set the executable. A bare name is looked up on `PATH`; `~`, `${workspaceFolder}` and `${env:NAME}` are expanded
 4. Add arguments one per line, and a working directory if the default is wrong. The directory must resolve inside a folder you have open — a profile pointing outside it is refused rather than started
-5. Add environment variables as `KEY=value`, one per line
+5. Add environment variables as `KEY=value`, one per line. Three forms are distinct: `KEY=value` sets it, `KEY=` sets it to an empty string, and `KEY=null` unsets it for the child process even when the extension host inherited one. `${workspaceFolder}` and `${env:NAME}` are expanded in values
 6. Optionally enable **Auto-Restart** so the process comes back when it exits on its own. Leave the per-profile limit empty to follow *Nexus Settings → Local Servers*, or set your own; `0` means never restart it
-7. Right-click the profile and choose **Start Server**. Its output opens in a Nexus terminal, and the row shows whether it is running, restarting or failed
+7. Right-click the profile and choose **Start**. Its output opens in a Nexus terminal, and the row shows whether it is running, restarting or failed. From the Command Palette the same commands are grouped under `Nexus Local Servers:` — `Nexus Local Servers: Start`, `Stop`, `Restart`, `Inspect Logs`
 
 Auto-restart counts *consecutive* failures. A server that runs for the stable-runtime threshold without exiting has its count cleared, so this bounds a crash loop rather than restarts over the profile's life — and once the limit is reached the server is marked failed and waits for you to start it again.
 

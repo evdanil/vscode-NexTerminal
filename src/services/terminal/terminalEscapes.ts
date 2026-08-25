@@ -1,10 +1,11 @@
-// Cursor-home then erase the visible screen. Used by remote/serial PTY
-// `resetTerminal()` where the remote shell can redraw — scrollback is left
-// intact so the user can scroll back through prior output.
+// Cursor-home then erase the visible screen. What EVERY pty's `resetTerminal()`
+// fires — SSH, Telnet, both serial ptys, and the local one. Scrollback is left
+// intact: on a remote session so the user can still scroll back through output
+// the shell will not redraw, and everywhere so that Reset stays visibly
+// distinct from Clear Scrollback, which is the only command that also empties
+// the TerminalCaptureBuffer behind Copy All.
+//
+// A reset that wiped scrollback made those two adjacent menu entries produce
+// identical-looking results while only one of them touched the buffer, so after
+// a Reset the screen was blank and Copy All still returned the whole history.
 export const CLEAR_VISIBLE_SCREEN = "\x1b[H\x1b[2J";
-
-// Erase the visible screen, erase the scrollback buffer (\x1b[3J), then home the
-// cursor. Used by LocalShellPty `resetTerminal()`: there is no remote redraw, so
-// clearing scrollback gives a genuinely clean slate. Prefer CLEAR_VISIBLE_SCREEN
-// for remote sessions where scrollback should survive a reset.
-export const CLEAR_SCREEN_AND_SCROLLBACK = "\x1b[2J\x1b[3J\x1b[H";

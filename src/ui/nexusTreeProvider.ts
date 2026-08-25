@@ -310,6 +310,11 @@ export class LocalServerConfigTreeItem extends vscode.TreeItem {
     this.description = showDescription
       ? `${iconInfo.description} · ${running ? parts.join(" ") : config.executable}`
       : undefined;
+    // No folder marker on the contextValue. A `.inFolder` suffix existed only
+    // to gate a separate "Move to Root" entry; "Move to Folder…" now opens a
+    // picker that offers "(root)" as one of its destinations — the shape macros
+    // have always used — so nothing needs to know from the manifest whether
+    // this row sits in a folder.
     this.contextValue = running ? "nexus.localServerRunning" : "nexus.localServer";
     this.iconPath = new vscode.ThemeIcon(iconInfo.icon, iconInfo.color);
     this.command = {

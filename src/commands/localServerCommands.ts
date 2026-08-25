@@ -12,15 +12,25 @@
  *   nexus.localServer.edit        — open a WebviewFormPanel edit form
  *   nexus.localServer.remove      — disclosure-checked cascade removal under
  *                                   configMutationLock (same pattern as SSH)
- *   nexus.localServer.rename / duplicate / copyInfo / moveToFolder / moveToRoot
- *                                   — standard CRUD inventory mutations;
- *                                   rename, moveToFolder, and moveToRoot
- *                                   re-read the live record under
- *                                   configMutationLock (#108) since each
- *                                   captures its config before an interactive
- *                                   pause (an input box, or — for moveToRoot's
- *                                   palette path — the quick pick itself)
+ *   nexus.localServer.rename / duplicate / copyInfo
+ *                                   — standard CRUD inventory mutations
+ *   nexus.localServer.moveToFolder— the single unified move command: one
+ *                                   destination picker offering "(root)",
+ *                                   "New folder…" and every existing folder
+ *   nexus.localServer.moveToRoot  — hidden back-compat alias (shipped before
+ *                                   moveToFolder's picker replaced it, so a
+ *                                   keybinding bound to it still works);
+ *                                   deliberately not declared in package.json,
+ *                                   same as nexus.macro.slot
  *   nexus.localServer.inspectLogs — focus/reveal a running server's terminal
+ *
+ * rename, moveToFolder, and moveToRoot each re-read the live record under
+ * configMutationLock before writing (#108): all three capture their config
+ * before an interactive pause — the rename input box, moveToFolder's
+ * destination picker, or, on the palette path, pickLocalServer's own quick
+ * pick — and each writes ONLY the field it owns, bailing out if the record was
+ * removed, already holds the target value, or was concurrently changed to some
+ * other value while the prompt was open.
  *
  * The manager is injected via ctx (set up in extension.ts). Commands never
  * write persisted config directly: they route through NexusCore methods that
@@ -50,6 +60,7 @@ import {
 } from "../ui/nexusTreeProvider";
 import {
   INVALID_FOLDER_PATH_MESSAGE,
+  getAncestorPaths,
   normalizeOptionalFolderPath
 } from "../utils/folderPaths";
 import { naturalCompare } from "../utils/naturalCompare";
@@ -83,10 +94,19 @@ function splitEnvFromTextarea(value: FormValues[string]): Record<string, string 
     if (equalIdx <= 0) continue;
     const key = line.slice(0, equalIdx).trim();
     const rawValue = line.slice(equalIdx + 1);
-    if (rawValue === "" || rawValue === "null") {
+    // Three distinct states: `KEY=null` unsets, `KEY=undefined` leaves the
+    // inherited value alone, and `KEY=` sets an empty string. Folding "" in
+    // with "null" made the empty string unexpressible and the field hint's
+    // promise about `KEY=` false. Note the hint documents only two of the
+    // three — `KEY=undefined` is implemented here but deliberately undocumented
+    // in the UI, so this comment is the record of it, not a restatement of what
+    // the form already says.
+    if (rawValue === "null") {
       result[key] = null;
     } else if (rawValue === "undefined") {
       result[key] = undefined;
+    } else if (rawValue === "") {
+      result[key] = "";
     } else {
       result[key] = rawValue.trim();
     }
@@ -176,13 +196,37 @@ function toLocalServerSessionIdFromArg(arg: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Narrows the picker to the configs a command can actually act on.
+ *
+ * `stop` and `inspectLogs` are the only two that need it: every other verb
+ * (restart / edit / remove / rename / duplicate / copyInfo / move…) operates
+ * on a config whatever its runtime state. Offering all of them from a Stop
+ * picker made the user guess which rows were live and then answered most
+ * picks with a refusal.
+ */
+interface LocalServerPickFilter {
+  include: (configId: string) => boolean;
+  /** Shown instead of an empty picker, matching the scripts-stop wording. */
+  emptyMessage: string;
+}
+
 async function pickLocalServer(
   core: import("../core/nexusCore").NexusCore,
-  title = "Select Local Server"
+  title = "Select Local Server",
+  filter?: LocalServerPickFilter
 ): Promise<LocalServerConfig | undefined> {
-  const servers = core.getSnapshot().localServers;
-  if (servers.length === 0) {
+  const configured = core.getSnapshot().localServers;
+  if (configured.length === 0) {
     void vscode.window.showWarningMessage("No Nexus Local Servers configured.");
+    return undefined;
+  }
+  // Filtering rather than annotating, which is what every sibling stop-like
+  // picker in this codebase already does: tunnelCommands lists activeTunnels,
+  // serialCommands lists serialTerminals, scriptCommands lists getRuns().
+  const servers = filter ? configured.filter((config) => filter.include(config.id)) : configured;
+  if (servers.length === 0) {
+    void vscode.window.showInformationMessage(filter!.emptyMessage);
     return undefined;
   }
   const pick = await vscode.window.showQuickPick(
@@ -200,6 +244,83 @@ async function pickLocalServer(
   return pick?.config;
 }
 
+/**
+ * Every folder path a local server could be moved into.
+ *
+ * `collectGroups` walks servers, serial and local-shell profiles but not local
+ * servers, so a folder that only holds local servers would be missing from its
+ * own subsystem's picker. Their groups are unioned in here rather than added to
+ * the shared helper, which is used for other things.
+ */
+function localServerFolderPaths(ctx: CommandContext): string[] {
+  const folders = new Set(collectGroups(ctx));
+  for (const server of ctx.core.getSnapshot().localServers) {
+    if (!server.group) continue;
+    for (const ancestor of getAncestorPaths(server.group)) {
+      folders.add(ancestor);
+    }
+  }
+  return [...folders].sort(naturalCompare);
+}
+
+/**
+ * The destination picker behind `moveToFolder`: "(root)", "New folder…", and
+ * every existing folder — the same shape macros have used all along
+ * (`pickFolderDestination` in macroCommands).
+ *
+ * Returns a folder path, `null` for "(root)" (clears `group`), or `undefined`
+ * if the user cancelled at any step.
+ *
+ * This is what replaced a separate always-present "Move to Root" entry, which
+ * needed a per-row `.inFolder` contextValue marker to know when to appear and
+ * duplicated in one narrow menu item what the picker offers as one of its
+ * choices.
+ */
+async function pickLocalServerFolderDestination(
+  ctx: CommandContext,
+  config: LocalServerConfig
+): Promise<string | null | undefined> {
+  // `folderKind`, not `kind` — vscode.QuickPickItem already declares its own
+  // numeric-enum `kind` (for separators), and intersecting a same-named
+  // string-literal property with it collapses to `never`.
+  type Choice = vscode.QuickPickItem & { folderKind: "root" | "new" | "folder"; path?: string };
+  const current = config.group;
+  const items: Choice[] = [
+    { label: "(root)", folderKind: "root", description: current ? undefined : "current" },
+    { label: "$(new-folder) New folder…", folderKind: "new" },
+    ...localServerFolderPaths(ctx).map((folder): Choice => ({
+      label: folder,
+      folderKind: "folder",
+      path: folder,
+      description: folder === current ? "current" : undefined
+    }))
+  ];
+  const picked = await vscode.window.showQuickPick(items, {
+    title: "Move to Folder",
+    placeHolder: "Select a destination folder"
+  });
+  if (!picked) return undefined;
+  if (picked.folderKind === "root") return null;
+  if (picked.folderKind === "folder") return picked.path ?? null;
+
+  const name = await vscode.window.showInputBox({
+    title: "New Local Server Folder",
+    prompt: "Enter a folder path (use / for nested folders)",
+    placeHolder: "e.g. Backends/APIs",
+    validateInput: (value) => {
+      if (!value.trim()) return "Folder path cannot be empty";
+      return normalizeOptionalFolderPath(value) === null ? INVALID_FOLDER_PATH_MESSAGE : null;
+    }
+  });
+  if (!name) return undefined;
+  const normalized = normalizeOptionalFolderPath(name);
+  // `null` is a rejected path and `""` a blank one; neither is a destination,
+  // and treating either as root would move the server somewhere the user never
+  // asked for.
+  if (!normalized) return undefined;
+  return normalized;
+}
+
 function errorMessageFor(error: unknown, prefix: string): string {
   if (error instanceof LocalServerError) {
     return `${prefix}: ${error.message} (${error.code})`;
@@ -212,6 +333,35 @@ export function registerLocalServerCommands(
   ctx: CommandContext & { localServerManager: LocalServerManager }
 ): vscode.Disposable[] {
   const manager = ctx.localServerManager;
+
+  /**
+   * Everything Stop can act on. Not just "has a live session": a config in its
+   * stopping grace window and one waiting out an auto-restart backoff are both
+   * things a user can meaningfully stop, and the second is the whole point of
+   * cancelPendingRestart — filtering it out of the picker would put that fix
+   * out of reach from the palette.
+   */
+  const stoppable = (configId: string): boolean =>
+    Boolean(manager.getActiveSessionIdForConfig(configId)) ||
+    manager.isStoppingConfig(configId) ||
+    manager.hasPendingRestart(configId);
+
+  const STOPPABLE_FILTER = {
+    include: stoppable,
+    emptyMessage: "No Nexus local servers are running."
+  };
+
+  /**
+   * Anything with a terminal worth looking at — a live session, or the tab a
+   * crashed session left behind. Restricting this to live sessions would put
+   * a crashed server's own failure output out of reach from the palette.
+   */
+  const INSPECTABLE_FILTER = {
+    include: (configId: string) =>
+      Boolean(manager.getActiveSessionIdForConfig(configId)) ||
+      manager.lastTerminalForConfig(configId) !== undefined,
+    emptyMessage: "No Nexus local server has an open terminal to inspect."
+  };
 
   return [
     vscode.commands.registerCommand("nexus.localServer.add", () => {
@@ -238,14 +388,40 @@ export function registerLocalServerCommands(
           await manager.stop(sessionId, true);
           return;
         }
-        const config = toLocalServerFromArg(ctx.core, arg);
-        if (config) {
-          await manager.stopConfig(config.id, true);
+        // Palette invocation carries no tree item. Falling back to the picker
+        // here is what restart / edit / remove already do; without it the
+        // command dead-ended on a "right-click something instead" notice that
+        // offered no way to proceed.
+        const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Stop Local Server", STOPPABLE_FILTER));
+        if (!config) return;
+        // stopConfig no-ops on a config with nothing running, so say so rather
+        // than swallowing the request the way the old dead end did.
+        if (!manager.getActiveSessionIdForConfig(config.id)) {
+          // A session already on its way down is excluded from
+          // getActiveSessionIdForConfig so restart() can re-start the config
+          // immediately — but the tree row still reads "stopping" for that
+          // window, so "is not running" here reads as affirmatively wrong.
+          if (manager.isStoppingConfig(config.id)) {
+            void vscode.window.showInformationMessage(`Local server "${config.name}" is already stopping.`);
+            return;
+          }
+          // "Nothing running" is not the same as "nothing about to run". A
+          // crashed auto-restart profile spends its whole backoff window —
+          // up to 30s — with no session, and reporting "not running" and
+          // returning left the timer armed to spawn the process again
+          // seconds after the user explicitly stopped it. `start()` already
+          // calls that timer off, which is why Restart got this right and
+          // Stop did not.
+          if (manager.cancelPendingRestart(config.id)) {
+            void vscode.window.showInformationMessage(
+              `Local server "${config.name}" is stopped — its pending auto-restart was cancelled.`
+            );
+            return;
+          }
+          void vscode.window.showInformationMessage(`Local server "${config.name}" is not running.`);
           return;
         }
-        void vscode.window.showInformationMessage(
-          "Right-click a local server or session to stop it."
-        );
+        await manager.stopConfig(config.id, true);
       } catch (error) {
         void vscode.window.showErrorMessage(errorMessageFor(error, "Failed to stop local server"));
       }
@@ -270,13 +446,25 @@ export function registerLocalServerCommands(
           return;
         }
       }
-      const config = toLocalServerFromArg(ctx.core, arg);
-      if (config) {
-        const active = manager.getActiveSessionIdForConfig(config.id);
-        if (active) {
-          manager.inspectLogsTerminal(active)?.show();
-          return;
-        }
+      // Same dead end as stop had: from the palette there was no tree item, so
+      // the command could only report that it had nothing to show. The picker
+      // makes the choice available; the "not running" notice survives, now
+      // scoped to the config the user actually chose.
+      const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Inspect Local Server Logs", INSPECTABLE_FILTER));
+      if (!config) return;
+      const active = manager.getActiveSessionIdForConfig(config.id);
+      if (active) {
+        manager.inspectLogsTerminal(active)?.show();
+        return;
+      }
+      // A crash unregisters the session but deliberately leaves the terminal
+      // open, because the failure output on it is the whole reason to look.
+      // Refusing here — with that tab sitting in the panel — was the command
+      // declining exactly when it was most useful.
+      const last = manager.lastTerminalForConfig(config.id);
+      if (last) {
+        last.show();
+        return;
       }
       void vscode.window.showInformationMessage("No running local server session to display.");
     }),
@@ -396,34 +584,32 @@ export function registerLocalServerCommands(
     vscode.commands.registerCommand("nexus.localServer.moveToFolder", async (arg?: unknown) => {
       const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Move Local Server"));
       if (!config) return;
-      const group = await vscode.window.showInputBox({
-        title: "Move to Folder",
-        value: config.group ?? "",
-        prompt: "Folder path (use / for nesting)",
-        validateInput: (value) => normalizeOptionalFolderPath(value) === null ? INVALID_FOLDER_PATH_MESSAGE : null
-      });
-      if (group === undefined) return;
-      const normalized = normalizeOptionalFolderPath(group);
-      if (normalized === null) return;
+      const destination = await pickLocalServerFolderDestination(ctx, config);
+      if (destination === undefined) return;
+      // `null` is the picker's "(root)" choice; the stored field is optional.
+      const target = destination ?? undefined;
       // #108 — same capture-then-write shape as nexus.localServer.rename just
       // above (and nexus.server.rename, #84 P1/P2-1): `config` was captured
-      // before the input box opened, so re-read the live record under the
-      // lock and apply ONLY the field this prompt owns (`group`).
+      // before the destination picker opened, so re-read the live record under
+      // the lock and apply ONLY the field this prompt owns (`group`).
       await configMutationLock.runExclusive(async () => {
         const live = ctx.core.getLocalServer(config.id);
-        if (!live || live.group === normalized) {
-          return; // removed, or already moved to this folder, while the box was open
+        if (!live || live.group === target) {
+          return; // removed, or already in this folder, while the picker was open
         }
         // #84 P2-1 — BAIL if a CONCURRENT move changed the group to some OTHER
-        // value while this box was open: writing here would overwrite that
+        // value while the picker was open: writing here would overwrite that
         // newer move with a decision made against a stale folder path.
         if (live.group !== config.group) {
           return;
         }
-        await ctx.core.addOrUpdateLocalServerConfig({ ...live, group: normalized });
+        await ctx.core.addOrUpdateLocalServerConfig({ ...live, group: target });
       });
     }),
 
+    // Undeclared in package.json — invisible in the palette and menus, but this
+    // ID shipped, so a keybinding or task bound to it keeps working. Its old
+    // one-step behaviour is kept as-is: root, no destination picker.
     vscode.commands.registerCommand("nexus.localServer.moveToRoot", async (arg?: unknown) => {
       const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Move to Root"));
       if (!config) return;

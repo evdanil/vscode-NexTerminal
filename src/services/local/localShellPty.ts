@@ -6,7 +6,7 @@ import type { SessionPtyHandle } from "../../models/config";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
-import { CLEAR_SCREEN_AND_SCROLLBACK } from "../terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
 import { OscContextFilter } from "../terminal/oscContextFilter";
 
 const MAX_FRAME_LENGTH = 1024 * 1024;
@@ -195,7 +195,12 @@ export class LocalShellPty implements vscode.Pseudoterminal, SessionPtyHandle {
   }
 
   public resetTerminal(): void {
-    this.writeEmitter.fire(CLEAR_SCREEN_AND_SCROLLBACK);
+    // Visible screen only, like every other pty here. Reset never touches the
+    // TerminalCaptureBuffer, so wiping the scrollback too made Reset and Clear
+    // Scrollback — adjacent entries in the same menu — look identical while
+    // only one of them actually emptied the buffer: after a Reset the screen
+    // was blank and Copy All still returned the whole history.
+    this.writeEmitter.fire(CLEAR_VISIBLE_SCREEN);
   }
 
   public markShuttingDown(reason: string): void {

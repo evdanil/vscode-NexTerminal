@@ -13,12 +13,13 @@
  * ever created.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import { LocalServerError } from "../../src/models/localServer";
 import { LocalServerManager } from "../../src/services/local/localServerManager";
+import { LocalShellPty } from "../../src/services/local/localShellPty";
 
 function normalizeMockPath(value: string): string {
   return value.replace(/\//g, "\\").toLowerCase();
@@ -34,6 +35,10 @@ const createTerminalMock = vi.fn(() => ({
 }));
 
 const mockStatEntries = vi.hoisted(() => new Map<string, "dir" | "file">());
+// Hoisted rather than local to the vscode factory so a test can fire a
+// terminal-close event: the manager subscribes here to forget the terminal it
+// keeps per config once its tab is actually gone.
+const closeTerminalListeners = vi.hoisted(() => [] as Array<(t: unknown) => void>);
 
 vi.mock("node:fs", () => ({
   existsSync: (value: string) => mockPathExists.has(normalizeMockPath(String(value))),
@@ -99,7 +104,7 @@ vi.mock("../../src/services/local/localShellPty", async (importOriginal) => {
 });
 
 vi.mock("vscode", () => {
-  const listeners: Array<(t: unknown) => void> = [];
+  const listeners = closeTerminalListeners;
   return {
     EventEmitter: class<T> {
       private readonly ls: Array<(e: T) => void> = [];
@@ -343,5 +348,270 @@ describe("LocalServerManager — lifecycle cleanup (dispose / stopAll)", () => {
     const manager = fakeManager();
     manager.dispose();
     expect(() => manager.dispose()).not.toThrow();
+  });
+});
+
+/**
+ * THE ENV TEXTAREA'S THREE-STATE CONTRACT, END TO END.
+ *
+ * `splitEnvFromTextarea` records three distinct intents — `KEY=null` unsets,
+ * `KEY=undefined` inherits, `KEY=` sets an empty string — and the sidecar wire
+ * format preserves all three (JSON.stringify drops `undefined` keys, keeps
+ * `null`, keeps `""`). Between them sits `expandEnv`, and `expandValue` maps a
+ * blank string to `undefined`: an empty string handed in came out the far side
+ * as "inherit", the one state it was not. Fixing only the parser would have
+ * left `KEY=` still unexpressible, so this asserts what the PTY is actually
+ * handed rather than what the parser produced.
+ */
+describe("LocalServerManager — env pass-through preserves unset / inherit / empty-string", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+  });
+
+  it("hands the pty an empty string for KEY=, null for an unset, and undefined for an inherit", async () => {
+    const manager = fakeManager();
+    await manager.start(
+      baseConfig({
+        executable: "node",
+        env: { EMPTY: "", WILDCARD: null, INHERIT: undefined, REAL: "value" }
+      })
+    );
+
+    const options = vi.mocked(LocalShellPty).mock.calls[0][0] as {
+      env?: Record<string, string | null | undefined>;
+    };
+    expect(options.env).toBeDefined();
+    // The regression: this was `undefined` before, i.e. indistinguishable from
+    // INHERIT, so `KEY=` could never set a variable to "".
+    expect(options.env!.EMPTY).toBe("");
+    expect(options.env!.WILDCARD).toBeNull();
+    expect(options.env!.INHERIT).toBeUndefined();
+    expect(options.env!.REAL).toBe("value");
+  });
+
+  it("keeps the three states distinct once serialized for the sidecar", async () => {
+    const manager = fakeManager();
+    await manager.start(
+      baseConfig({ executable: "node", env: { EMPTY: "", WILDCARD: null, INHERIT: undefined } })
+    );
+    const options = vi.mocked(LocalShellPty).mock.calls[0][0] as { env?: Record<string, unknown> };
+    // This is exactly what LocalShellPty.sendFrame writes: `undefined` drops
+    // out (inherit), `null` survives (unset), `""` survives (set to empty).
+    const onTheWire = JSON.parse(JSON.stringify({ env: options.env })) as {
+      env: Record<string, unknown>;
+    };
+    expect(Object.prototype.hasOwnProperty.call(onTheWire.env, "INHERIT")).toBe(false);
+    expect(onTheWire.env.WILDCARD).toBeNull();
+    expect(onTheWire.env.EMPTY).toBe("");
+  });
+});
+
+/**
+ * STOPPING A SERVER THAT IS MID-BACKOFF.
+ *
+ * When an auto-restart profile crashes, handleExit() schedules a retry (up to
+ * a 30s backoff) and cleanupSession() unregisters the session. For that whole
+ * window the config has no session and no terminal entry, so it reads as "not
+ * running" everywhere — while a timer is quietly waiting to spawn it again.
+ *
+ * `start()` has always called that timer off, which is why palette Restart
+ * behaved. Nothing else did, so a Stop issued during the window reported "not
+ * running" and returned, and the process came back seconds later.
+ */
+describe("LocalServerManager — cancelPendingRestart", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+    createTerminalMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Fires the pty's close listener for the Nth spawn, as a crash would. */
+  function crash(spawnIndex: number, code: number): void {
+    const pty = vi.mocked(LocalShellPty).mock.results[spawnIndex].value as {
+      onDidClose: { mock: { calls: Array<[(code: number) => void]> } };
+    };
+    pty.onDidClose.mock.calls[0][0](code);
+  }
+
+  async function startCrashLooping(): Promise<{ manager: LocalServerManager; core: ReturnType<typeof fakeCore> }> {
+    const core = fakeCore();
+    core.getLocalServer = vi.fn(() => baseConfig({ autoRestart: true }));
+    const manager = fakeManager({ core, terminals: new Map() });
+    await manager.start(baseConfig({ autoRestart: true }));
+    crash(0, 1);
+    return { manager, core };
+  }
+
+  it("respawns after the backoff when nothing calls the restart off", async () => {
+    // The control case. Without it, the assertion below cannot tell a
+    // cancelled restart apart from a restart that was never scheduled.
+    vi.useFakeTimers();
+    await startCrashLooping();
+    expect(createTerminalMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(createTerminalMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports that a restart was pending, and keeps the process from coming back", async () => {
+    vi.useFakeTimers();
+    const { manager } = await startCrashLooping();
+    expect(manager.cancelPendingRestart("cfg-1")).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(createTerminalMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports false when there was nothing pending, so a caller can tell the two apart", () => {
+    const manager = fakeManager();
+    expect(manager.cancelPendingRestart("cfg-1")).toBe(false);
+  });
+
+  it("is what start() uses, so a user-initiated start still pre-empts a pending retry", async () => {
+    vi.useFakeTimers();
+    const { manager } = await startCrashLooping();
+    await manager.start(baseConfig({ autoRestart: true }));
+    expect(createTerminalMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    // The scheduled retry must not add a third terminal on top of the manual start.
+    expect(createTerminalMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * THE ≤2s WINDOW WHERE A SERVER IS NEITHER RUNNING NOR STOPPED.
+ *
+ * getActiveSessionIdForConfig() reports a stopping session as not running so
+ * restart() can re-start the config without a false ServerAlreadyRunning.
+ * That is the right answer to "may I start?" and the wrong one to "what do I
+ * tell the user?" — the tree counts `stopping` as running and draws the row
+ * as such. isStoppingConfig() is what tells the two questions apart.
+ */
+describe("LocalServerManager — isStoppingConfig", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+    createTerminalMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports a session that is between stop() and teardown, which reads as not-running elsewhere", async () => {
+    vi.useFakeTimers();
+    const terminals = new Map();
+    const manager = fakeManager({ terminals });
+    const sessionId = await manager.start(baseConfig());
+    expect(manager.getActiveSessionIdForConfig("cfg-1")).toBe(sessionId);
+    expect(manager.isStoppingConfig("cfg-1")).toBe(false);
+
+    await manager.stop(sessionId, true);
+    // Both halves matter: the first is why the "not running" message fired,
+    // the second is what now keeps it from being said.
+    expect(manager.getActiveSessionIdForConfig("cfg-1")).toBeUndefined();
+    expect(manager.isStoppingConfig("cfg-1")).toBe(true);
+  });
+
+  it("stops reporting once the grace timer has finalized the session", async () => {
+    vi.useFakeTimers();
+    const manager = fakeManager({ terminals: new Map() });
+    const sessionId = await manager.start(baseConfig());
+    await manager.stop(sessionId, true);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(manager.isStoppingConfig("cfg-1")).toBe(false);
+  });
+
+  it("does not report an unrelated config", async () => {
+    vi.useFakeTimers();
+    const manager = fakeManager({ terminals: new Map() });
+    const sessionId = await manager.start(baseConfig());
+    await manager.stop(sessionId, true);
+    expect(manager.isStoppingConfig("cfg-other")).toBe(false);
+  });
+});
+
+/**
+ * INSPECT LOGS ON A SERVER THAT HAS ALREADY CRASHED.
+ *
+ * cleanupSession() drops the session-keyed terminal entry and deliberately
+ * leaves the terminal OPEN, because after a crash the failure output on it is
+ * the whole reason to look. Every lookup was session-keyed, so the command
+ * refused with that tab sitting in the panel. The manager therefore keeps the
+ * last terminal per *config*, past the death of the session that owned it —
+ * and drops it when the tab is actually closed, so it never hands back a dead
+ * reference.
+ */
+describe("LocalServerManager — lastTerminalForConfig", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+    createTerminalMock.mockClear();
+    closeTerminalListeners.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function crash(spawnIndex: number, code: number): void {
+    const pty = vi.mocked(LocalShellPty).mock.results[spawnIndex].value as {
+      onDidClose: { mock: { calls: Array<[(code: number) => void]> } };
+    };
+    pty.onDidClose.mock.calls[0][0](code);
+  }
+
+  it("has nothing for a config that has never run", () => {
+    const manager = fakeManager();
+    expect(manager.lastTerminalForConfig("cfg-1")).toBeUndefined();
+  });
+
+  it("still knows the terminal after the crash that unregistered the session", async () => {
+    const terminals = new Map();
+    const manager = fakeManager({ terminals });
+    const sessionId = await manager.start(baseConfig());
+    const terminal = createTerminalMock.mock.results[0].value;
+    crash(0, 1);
+
+    // Exactly the state the command used to refuse in: no session, no
+    // session-keyed terminal entry, terminal still open.
+    expect(manager.getActiveSessionIdForConfig("cfg-1")).toBeUndefined();
+    expect(terminals.has(sessionId)).toBe(false);
+    expect(manager.inspectLogsTerminal(sessionId)).toBeUndefined();
+    expect(manager.lastTerminalForConfig("cfg-1")).toBe(terminal);
+  });
+
+  it("forgets the terminal once its tab is closed, rather than handing back a dead reference", async () => {
+    const manager = fakeManager({ terminals: new Map() });
+    await manager.start(baseConfig());
+    const terminal = createTerminalMock.mock.results[0].value;
+    crash(0, 1);
+    expect(manager.lastTerminalForConfig("cfg-1")).toBe(terminal);
+
+    for (const listener of closeTerminalListeners) listener(terminal);
+    expect(manager.lastTerminalForConfig("cfg-1")).toBeUndefined();
+  });
+
+  it("tracks the newest terminal across a restart", async () => {
+    const manager = fakeManager({ terminals: new Map() });
+    await manager.start(baseConfig());
+    crash(0, 1);
+    await manager.start(baseConfig());
+    expect(manager.lastTerminalForConfig("cfg-1")).toBe(createTerminalMock.mock.results[1].value);
   });
 });

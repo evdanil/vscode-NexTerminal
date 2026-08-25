@@ -161,6 +161,9 @@ describe("formValuesToLocalServer", () => {
   });
 
   it("parses env textarea keywords: null / undefined / empty string", () => {
+    // The field's hint states the contract: "Setting KEY=null unsets, KEY=
+    // passes an empty string." `KEY=` used to be folded in with `KEY=null`,
+    // which made an empty string unexpressible and the hint's promise false.
     const values: FormValues = {
       ...baseValues(),
       env: [
@@ -176,8 +179,14 @@ describe("formValuesToLocalServer", () => {
       FORCE_COLOR: "1",
       WILDCARD: null,
       INHERIT: undefined,
-      EMPTY: null
+      EMPTY: ""
     });
+    // toEqual treats a missing key and an undefined one alike, so pin the
+    // three states apart explicitly: only `null` is an unset.
+    expect(result!.env!.EMPTY).toBe("");
+    expect(result!.env!.WILDCARD).toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(result!.env!, "INHERIT")).toBe(true);
+    expect(result!.env!.INHERIT).toBeUndefined();
   });
 
   it("drops blank / whitespace-only argument lines", () => {
@@ -234,6 +243,508 @@ describe("formValuesToLocalServer", () => {
 });
 
 /**
+ * COMMAND PALETTE IS A FIRST-CLASS ENTRY POINT.
+ *
+ * `restart`, `edit`, `remove`, `rename`, `duplicate`, `copyInfo`,
+ * and `moveToFolder` all resolve a config from the tree-item
+ * argument OR fall back to `pickLocalServer`. `stop` and `inspectLogs` did
+ * not: invoked from the palette they got no argument, resolved nothing, and
+ * dead-ended on a notice telling the user to right-click a tree row instead —
+ * a message, not a way through.
+ */
+describe("palette fallback for stop / inspectLogs", () => {
+  interface Harness {
+    stopConfig: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+    cancelPendingRestart: ReturnType<typeof vi.fn>;
+    inspectLogsTerminal: ReturnType<typeof vi.fn>;
+    lastTerminalForConfig: ReturnType<typeof vi.fn>;
+    terminal: { show: ReturnType<typeof vi.fn> };
+    lastTerminal: { show: ReturnType<typeof vi.fn> };
+  }
+
+  function harness(
+    options: {
+      runningConfigIds?: string[];
+      restartPendingConfigIds?: string[];
+      stoppingConfigIds?: string[];
+      /**
+       * Configs whose session ends while the picker is open: reported running
+       * the first time they are asked about (when the list is built) and gone
+       * from then on (when the pick is resolved).
+       */
+      vanishingConfigIds?: string[];
+      /** Configs whose crashed session left its terminal tab open. */
+      lastTerminalConfigIds?: string[];
+    } = {}
+  ): Harness {
+    const running = new Set(options.runningConfigIds ?? []);
+    const restartPending = new Set(options.restartPendingConfigIds ?? []);
+    const stopping = new Set(options.stoppingConfigIds ?? []);
+    const vanishing = new Set(options.vanishingConfigIds ?? []);
+    const lastTerminals = new Set(options.lastTerminalConfigIds ?? []);
+    const terminal = { show: vi.fn() };
+    const lastTerminal = { show: vi.fn() };
+    const manager = {
+      stop: vi.fn(async () => {}),
+      stopConfig: vi.fn(async () => {}),
+      getActiveSessionIdForConfig: vi.fn((configId: string) => {
+        if (vanishing.delete(configId)) return `session-for-${configId}`;
+        return running.has(configId) ? `session-for-${configId}` : undefined;
+      }),
+      hasPendingRestart: vi.fn((configId: string) => restartPending.has(configId)),
+      cancelPendingRestart: vi.fn((configId: string) => restartPending.delete(configId)),
+      isStoppingConfig: vi.fn((configId: string) => stopping.has(configId)),
+      inspectLogsTerminal: vi.fn(() => terminal),
+      lastTerminalForConfig: vi.fn((configId: string) =>
+        lastTerminals.has(configId) ? lastTerminal : undefined
+      )
+    };
+    const localServers = [
+      { id: "cfg-1", name: "API", executable: "node" },
+      { id: "cfg-2", name: "Worker", executable: "python" }
+    ];
+    const ctx = {
+      core: {
+        getSnapshot: () => ({ localServers }),
+        getLocalServer: (id: string) => localServers.find((c) => c.id === id)
+      },
+      localServerTerminals: new Map(),
+      localServerManager: manager
+    };
+    registerLocalServerCommands(ctx as never);
+    return {
+      stopConfig: manager.stopConfig,
+      stop: manager.stop,
+      cancelPendingRestart: manager.cancelPendingRestart,
+      inspectLogsTerminal: manager.inspectLogsTerminal,
+      lastTerminalForConfig: manager.lastTerminalForConfig,
+      terminal,
+      lastTerminal
+    };
+  }
+
+  const quickPick = vscode.window.showQuickPick as unknown as ReturnType<typeof vi.fn>;
+  const showInfo = vscode.window.showInformationMessage as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    quickPick.mockReset();
+    showInfo.mockReset();
+  });
+
+  it("stop with no argument offers the picker and stops the chosen config", async () => {
+    const h = harness({ runningConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-2")
+    );
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    // Before the fix the picker was never opened and this never ran.
+    expect(quickPick).toHaveBeenCalledTimes(1);
+    expect(h.stopConfig).toHaveBeenCalledWith("cfg-2", true);
+  });
+
+  it("stop titles its picker so the palette flow says what it is about to do", async () => {
+    harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    expect(quickPick.mock.calls[0][1]).toEqual({ title: "Stop Local Server" });
+  });
+
+  it("stop does nothing and says nothing when the picker is dismissed", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    expect(h.stopConfig).not.toHaveBeenCalled();
+    expect(showInfo).not.toHaveBeenCalled();
+  });
+
+  it("stop reports a config that is not running instead of silently no-opping", async () => {
+    // stopConfig() iterates the running set and returns quietly when it is
+    // empty, so a stopped pick would otherwise produce no feedback at all.
+    // Reached by right-clicking a stopped config row — the picker no longer
+    // offers such a config in the first place.
+    const h = harness({ runningConfigIds: [] });
+    await registeredCommands.get("nexus.localServer.stop")!({ config: { id: "cfg-1" } });
+    expect(quickPick).not.toHaveBeenCalled();
+    expect(h.stopConfig).not.toHaveBeenCalled();
+    expect(showInfo).toHaveBeenCalledWith('Local server "API" is not running.');
+  });
+
+  /**
+   * A crashed auto-restart profile spends its whole backoff window with no
+   * session, so the not-running pre-check fired, reported "not running" and
+   * returned — leaving the timer armed to spawn the process again seconds
+   * after the user explicitly stopped it.
+   */
+  it("stop calls off a pending auto-restart instead of reporting the config as merely not running", async () => {
+    const h = harness({ runningConfigIds: [], restartPendingConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    // A config waiting out a backoff has no session, so the running-only
+    // filter has to keep it anyway or this fix is unreachable from the palette.
+    expect(quickPick).toHaveBeenCalledTimes(1);
+    expect(h.cancelPendingRestart).toHaveBeenCalledWith("cfg-1");
+    // The old message claimed the user's stop had nothing to act on, while a
+    // restart it had just cancelled proves otherwise.
+    expect(showInfo).not.toHaveBeenCalledWith('Local server "API" is not running.');
+    expect(showInfo).toHaveBeenCalledWith(
+      'Local server "API" is stopped — its pending auto-restart was cancelled.'
+    );
+  });
+
+  /**
+   * `getActiveSessionIdForConfig` excludes a session that is stopping so that
+   * restart() can re-start the config without a false ServerAlreadyRunning.
+   * The tree counts the same state as running and draws the row as
+   * "stopping", so "is not running" contradicts what is on screen.
+   */
+  it("says a stopping server is stopping, not that it is not running", async () => {
+    const h = harness({ runningConfigIds: [], stoppingConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    // A stopping config is still something Stop can be asked about, so it has
+    // to survive the picker's running-only filter to reach this message.
+    expect(quickPick).toHaveBeenCalledTimes(1);
+    expect(showInfo).not.toHaveBeenCalledWith('Local server "API" is not running.');
+    expect(showInfo).toHaveBeenCalledWith('Local server "API" is already stopping.');
+    expect(h.stopConfig).not.toHaveBeenCalled();
+  });
+
+  it("stop still short-circuits on a session tree item without opening the picker", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"] });
+    await registeredCommands.get("nexus.localServer.stop")!({ session: { id: "sess-9" } });
+    expect(h.stop).toHaveBeenCalledWith("sess-9", true);
+    expect(quickPick).not.toHaveBeenCalled();
+  });
+
+  it("inspectLogs with no argument offers the picker and shows the chosen config's terminal", async () => {
+    const h = harness({ runningConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-2")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(quickPick).toHaveBeenCalledTimes(1);
+    expect(quickPick.mock.calls[0][1]).toEqual({ title: "Inspect Local Server Logs" });
+    expect(h.inspectLogsTerminal).toHaveBeenCalledWith("session-for-cfg-2");
+    expect(h.terminal.show).toHaveBeenCalledTimes(1);
+    expect(showInfo).not.toHaveBeenCalled();
+  });
+
+  it("inspectLogs keeps the 'no running session' notice, scoped to the picked config", async () => {
+    // The picker now only offers running configs, so this notice is reached
+    // by the race it was written for: the session ends while the picker is
+    // open. cfg-1 reads as running when the list is built and gone by the
+    // time the pick resolves.
+    const h = harness({ runningConfigIds: ["cfg-2"], vanishingConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    // Without this the test passed against the dead-end implementation that
+    // never opened a picker at all and reported the same notice
+    // unconditionally — i.e. "scoped to the picked config", the half this
+    // test exists for, went unasserted.
+    expect(quickPick).toHaveBeenCalledTimes(1);
+    expect(h.inspectLogsTerminal).not.toHaveBeenCalled();
+    expect(showInfo).toHaveBeenCalledWith("No running local server session to display.");
+  });
+
+  /**
+   * Every sibling stop-like picker in this codebase lists only what is
+   * active — tunnelCommands' activeTunnels, serialCommands' serialTerminals,
+   * scriptCommands' getRuns(). Listing every configured server made the user
+   * guess which rows were live, then refused most of the picks.
+   */
+  it("stop offers only the servers it can act on", async () => {
+    harness({ runningConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+    expect(offered).toEqual(["cfg-2"]);
+  });
+
+  it("inspectLogs offers only the servers with a session to show", async () => {
+    harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+    expect(offered).toEqual(["cfg-1"]);
+  });
+
+  it.each([
+    ["stop", "No Nexus local servers are running."],
+    ["inspectLogs", "No Nexus local server has an open terminal to inspect."]
+  ])("%s says why rather than opening an empty picker", async (verb, message) => {
+    harness({ runningConfigIds: [] });
+    await registeredCommands.get(`nexus.localServer.${verb}`)!(undefined);
+    expect(quickPick).not.toHaveBeenCalled();
+    expect(showInfo).toHaveBeenCalledWith(message);
+  });
+
+  /**
+   * cleanupSession() unregisters the crashed session but deliberately leaves
+   * its terminal open — the failure output on it is the whole reason to look.
+   * Every lookup was session-keyed, so the command refused with that tab
+   * sitting in the panel.
+   */
+  it("inspectLogs shows the terminal a crashed session left behind", async () => {
+    const h = harness({ runningConfigIds: [], lastTerminalConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-2")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(h.lastTerminal.show).toHaveBeenCalledTimes(1);
+    expect(showInfo).not.toHaveBeenCalled();
+  });
+
+  it("inspectLogs offers a crashed server, not only the live ones", async () => {
+    harness({ runningConfigIds: [], lastTerminalConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+    expect(offered).toEqual(["cfg-2"]);
+  });
+
+  it("inspectLogs prefers the live session over the leftover terminal", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"], lastTerminalConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(h.terminal.show).toHaveBeenCalledTimes(1);
+    expect(h.lastTerminal.show).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The filter is scoped to the two verbs that need it. restart / edit /
+   * remove / rename / duplicate / copyInfo legitimately act on a config
+   * whatever its state, and must keep listing all of them.
+   */
+  it.each(["restart", "edit", "remove", "rename", "duplicate", "copyInfo"])(
+    "%s still offers every configured server, running or not",
+    async (verb) => {
+      harness({ runningConfigIds: [] });
+      quickPick.mockImplementation(async () => undefined);
+      await registeredCommands.get(`nexus.localServer.${verb}`)!(undefined);
+      expect(quickPick).toHaveBeenCalledTimes(1);
+      const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+      expect(offered).toEqual(["cfg-1", "cfg-2"]);
+    }
+  );
+
+  it("inspectLogs does nothing when the picker is dismissed", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(h.inspectLogsTerminal).not.toHaveBeenCalled();
+    expect(showInfo).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * "MOVE TO FOLDER…" REPLACES THE "MOVE TO ROOT" PAIR.
+ *
+ * Moving a local server used to be two commands: an input box asking for a
+ * folder path, plus a separate always-present "Move to Root" entry that needed
+ * a per-row `.inFolder` contextValue marker (and a matching regex in eighteen
+ * other `when` clauses) so it would only appear where it was not a no-op.
+ *
+ * Macros already solved this with one picker offering "(root)", "New folder…"
+ * and every existing folder — no second command, no per-row marker. Local
+ * servers now use the same shape, which is what let the marker be deleted.
+ */
+describe("moveToFolder destination picker", () => {
+  const quickPick = vscode.window.showQuickPick as unknown as ReturnType<typeof vi.fn>;
+  const inputBox = vscode.window.showInputBox as unknown as ReturnType<typeof vi.fn>;
+
+  function moveHarness(servers: Array<Partial<LocalServerConfig>> = []) {
+    const localServers = servers.map((s) => ({
+      id: "cfg-1",
+      name: "API",
+      executable: "node",
+      ...s
+    })) as LocalServerConfig[];
+    const saved: LocalServerConfig[] = [];
+    const ctx = {
+      core: {
+        getSnapshot: () => ({ localServers }),
+        getLocalServer: (id: string) => localServers.find((c) => c.id === id),
+        addOrUpdateLocalServerConfig: vi.fn(async (config: LocalServerConfig) => {
+          saved.push(config);
+        })
+      },
+      localServerTerminals: new Map(),
+      localServerManager: {
+        getActiveSessionIdForConfig: () => undefined,
+        isStoppingConfig: () => false,
+        hasPendingRestart: () => false,
+        lastTerminalForConfig: () => undefined
+      }
+    };
+    registerLocalServerCommands(ctx as never);
+    return { saved, addOrUpdate: ctx.core.addOrUpdateLocalServerConfig };
+  }
+
+  const run = (config: Partial<LocalServerConfig>) =>
+    registeredCommands.get("nexus.localServer.moveToFolder")!({ config: { id: "cfg-1" } });
+
+  beforeEach(() => {
+    quickPick.mockReset();
+    inputBox.mockReset();
+  });
+
+  /** The destination picker is the last showQuickPick call the command makes. */
+  const destinationItems = (): Array<{ label: string }> =>
+    quickPick.mock.calls[quickPick.mock.calls.length - 1][0] as Array<{ label: string }>;
+
+  it("offers (root), New folder… and every existing folder", async () => {
+    moveHarness([{ group: "Backends/APIs" }, { id: "cfg-2", name: "Worker", group: "Jobs" }]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({ group: "Backends/APIs" });
+
+    const labels = destinationItems().map((i) => i.label);
+    expect(labels[0]).toBe("(root)");
+    expect(labels[1]).toContain("New folder");
+    // Ancestors included, so an intermediate folder is a destination too.
+    expect(labels).toContain("Backends");
+    expect(labels).toContain("Backends/APIs");
+    expect(labels).toContain("Jobs");
+  });
+
+  it("clears the group when (root) is chosen — what the retired command did", async () => {
+    const h = moveHarness([{ group: "Backends/APIs" }]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label === "(root)")
+    );
+    await run({ group: "Backends/APIs" });
+    expect(h.saved).toHaveLength(1);
+    expect(h.saved[0].group).toBeUndefined();
+  });
+
+  it("moves into an existing folder when one is chosen", async () => {
+    const h = moveHarness([{ group: "Backends/APIs" }, { id: "cfg-2", name: "Worker", group: "Jobs" }]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label === "Jobs")
+    );
+    await run({ group: "Backends/APIs" });
+    expect(h.saved[0].group).toBe("Jobs");
+  });
+
+  it("marks the server's current folder so the picker says where it already is", async () => {
+    moveHarness([{ group: "Jobs" }]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({ group: "Jobs" });
+    const current = (destinationItems() as Array<{ label: string; description?: string }>).find(
+      (i) => i.label === "Jobs"
+    );
+    expect(current?.description).toBe("current");
+  });
+
+  it("marks (root) as current for a server that is not in a folder", async () => {
+    moveHarness([{}]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({});
+    const root = (destinationItems() as Array<{ label: string; description?: string }>).find(
+      (i) => i.label === "(root)"
+    );
+    expect(root?.description).toBe("current");
+  });
+
+  it("prompts for a path when New folder… is chosen, and moves there", async () => {
+    const h = moveHarness([{}]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label.includes("New folder"))
+    );
+    inputBox.mockImplementation(async () => "Backends/New");
+    await run({});
+    expect(h.saved[0].group).toBe("Backends/New");
+  });
+
+  it("writes nothing when the picker is dismissed", async () => {
+    const h = moveHarness([{ group: "Jobs" }]);
+    quickPick.mockImplementation(async () => undefined);
+    await run({ group: "Jobs" });
+    expect(h.addOrUpdate).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when the New folder prompt is dismissed", async () => {
+    const h = moveHarness([{ group: "Jobs" }]);
+    quickPick.mockImplementation(async (items: Array<{ label: string }>) =>
+      items.find((i) => i.label.includes("New folder"))
+    );
+    inputBox.mockImplementation(async () => undefined);
+    await run({ group: "Jobs" });
+    // Dismissing the second step must not fall through to root: the server
+    // would be moved somewhere the user never asked for.
+    expect(h.addOrUpdate).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The menu entry is gone, the command ID is not: it shipped in a released
+   * version, so a user keybinding or task bound to it would break silently on
+   * upgrade. Kept registered but undeclared in package.json — the same hidden
+   * back-compat alias shape as `nexus.macro.slot` (the manifest side is
+   * asserted in localServerMenu.test.ts).
+   */
+  it("keeps Move to Root registered as a hidden back-compat alias", () => {
+    moveHarness([{}]);
+    expect(registeredCommands.has("nexus.localServer.moveToRoot")).toBe(true);
+    expect(registeredCommands.has("nexus.localServer.moveToFolder")).toBe(true);
+  });
+
+  it("moveToRoot clears the group directly, with no destination picker", async () => {
+    const h = moveHarness([{ group: "Backends/APIs" }]);
+    await registeredCommands.get("nexus.localServer.moveToRoot")!({ config: { id: "cfg-1" } });
+    // Routing this through the folder picker instead would leave the server in
+    // its folder until a second choice was made — from a keybinding, the point
+    // of the alias, there is nobody to make it.
+    expect(quickPick).not.toHaveBeenCalled();
+    expect(h.saved).toHaveLength(1);
+    expect(h.saved[0].group).toBeUndefined();
+  });
+});
+
+function makeLocalServerConfig(overrides: Partial<LocalServerConfig> = {}): LocalServerConfig {
+  return {
+    id: "ls1",
+    name: "Dev Server",
+    executable: "node",
+    group: "Backend",
+    ...overrides
+  };
+}
+
+async function fixture(configs: LocalServerConfig[]): Promise<{ core: NexusCore }> {
+  const repo = new InMemoryConfigRepository([], [], [], [], [], [], configs);
+  const core = new NexusCore(repo);
+  await core.initialize();
+  const ctx = {
+    core,
+    localServerTerminals: new Map(),
+    localServerManager: {}
+  } as unknown as CommandContext & { localServerManager: LocalServerManager };
+  registerLocalServerCommands(ctx);
+  return { core };
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
  * nexus.localServer.moveToRoot has no input box of its own, but on the
  * command-palette path (invoked with no arg) it falls through to
  * pickLocalServer, whose quick pick embeds a config snapshot taken at
@@ -242,42 +753,6 @@ describe("formValuesToLocalServer", () => {
  * input box.
  */
 describe("nexus.localServer.moveToRoot re-resolves under the lock (issue #108)", () => {
-  function makeLocalServerConfig(overrides: Partial<LocalServerConfig> = {}): LocalServerConfig {
-    return {
-      id: "ls1",
-      name: "Dev Server",
-      executable: "node",
-      group: "Backend",
-      ...overrides
-    };
-  }
-
-  async function fixture(configs: LocalServerConfig[]): Promise<{ core: NexusCore }> {
-    const repo = new InMemoryConfigRepository([], [], [], [], [], [], configs);
-    const core = new NexusCore(repo);
-    await core.initialize();
-    const ctx = {
-      core,
-      localServerTerminals: new Map(),
-      localServerManager: {}
-    } as unknown as CommandContext & { localServerManager: LocalServerManager };
-    registerLocalServerCommands(ctx);
-    return { core };
-  }
-
-  interface Deferred<T> {
-    promise: Promise<T>;
-    resolve: (value: T) => void;
-  }
-
-  function deferred<T>(): Deferred<T> {
-    let resolve!: (value: T) => void;
-    const promise = new Promise<T>((r) => {
-      resolve = r;
-    });
-    return { promise, resolve };
-  }
-
   function moveToRoot(arg?: unknown): Promise<unknown> {
     const cmd = registeredCommands.get("nexus.localServer.moveToRoot");
     expect(cmd).toBeDefined();
@@ -342,5 +817,175 @@ describe("nexus.localServer.moveToRoot re-resolves under the lock (issue #108)",
     await moving;
 
     expect(core.getLocalServer("ls1")!.group).toBe("Frontend");
+  });
+
+  it("writes nothing when the record is already at the root", async () => {
+    // Both halves matter: the record reached the root by another route while
+    // the picker was open, AND an edit changed a field this command does not
+    // own. Re-writing the pre-picker snapshot would be a no-op on `group` and
+    // would silently revert `executable` — which is exactly how the bug hid.
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.addOrUpdateLocalServerConfig({
+      ...core.getLocalServer("ls1")!,
+      group: undefined,
+      executable: "python"
+    });
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBeUndefined();
+    // Load-bearing: "node" here means moveToRoot wrote the stale snapshot back.
+    expect(after.executable).toBe("python");
+  });
+});
+
+/**
+ * The same #108 capture-then-write shape, on the command this PR redesigned:
+ * moveToFolder now captures its config and THEN opens the destination picker
+ * ("(root)" / "New folder…" / every existing folder). The picker is the
+ * interactive pause — the record can be edited, moved or removed by another
+ * window while it is open — so the write has to re-read the live record under
+ * configMutationLock and apply ONLY `group`.
+ */
+describe("nexus.localServer.moveToFolder re-resolves under the lock (issue #108)", () => {
+  beforeEach(() => {
+    vi.mocked(vscode.window.showQuickPick).mockReset();
+    vi.mocked(vscode.window.showInputBox).mockReset();
+  });
+
+  /**
+   * Runs moveToFolder against the tree-item path (so the ONLY quick pick is
+   * the destination picker) and hands back the offered items plus the deferred
+   * that resolves the user's choice. The command is left suspended on that
+   * picker exactly as it would be while a user thinks about it.
+   */
+  function openDestinationPicker(): {
+    moving: Promise<unknown>;
+    items: Array<{ label: string }>;
+    pick: Deferred<unknown>;
+  } {
+    let items: Array<{ label: string }> = [];
+    const pick = deferred<unknown>();
+    vi.mocked(vscode.window.showQuickPick).mockImplementation(((offered: Array<{ label: string }>) => {
+      items = offered;
+      return pick.promise;
+    }) as never);
+    const cmd = registeredCommands.get("nexus.localServer.moveToFolder");
+    expect(cmd).toBeDefined();
+    // The handler runs synchronously up to the picker's await, so `items` is
+    // populated by the time this returns.
+    const moving = Promise.resolve(cmd!({ config: { id: "ls1" } }));
+    return { moving, items, pick };
+  }
+
+  const itemNamed = (items: Array<{ label: string }>, label: string): unknown => {
+    const found = items.find((i) => i.label === label);
+    expect(found).toBeDefined();
+    return found;
+  };
+
+  it("does not revert a concurrent edit's other fields", async () => {
+    // The picker opened against the record as it was; while it was open an
+    // edit changed the executable. Committing the captured snapshot would
+    // apply the move AND silently undo that edit.
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, executable: "python" });
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBe("Frontend");
+    // Load-bearing: "node" here means moveToFolder reverted the concurrent edit.
+    expect(after.executable).toBe("python");
+  });
+
+  it("does not resurrect a config removed during the picker", async () => {
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.removeLocalServerConfig("ls1");
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    expect(core.getLocalServer("ls1")).toBeUndefined();
+  });
+
+  it("bails when a concurrent move changed the group to some OTHER value (#84 P2-1)", async () => {
+    // The picker opened against group "Backend". Something else moved the
+    // record to "Archive" while it was open, so this pick was made against a
+    // folder that no longer applies — writing "Frontend" here would overwrite
+    // that newer move.
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, group: "Archive" });
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    expect(core.getLocalServer("ls1")!.group).toBe("Archive");
+  });
+
+  it("writes nothing when the record already sits in the picked folder", async () => {
+    // Someone else made the same move first, and also edited a field this
+    // command does not own. Re-writing the captured snapshot would look like a
+    // no-op on `group` while reverting `executable`.
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({
+      ...core.getLocalServer("ls1")!,
+      group: "Frontend",
+      executable: "python"
+    });
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBe("Frontend");
+    // Load-bearing: "node" here means the stale snapshot was written back.
+    expect(after.executable).toBe("python");
+  });
+
+  it("clears the group through the same guarded write when (root) is picked", async () => {
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, executable: "python" });
+
+    pick.resolve(itemNamed(items, "(root)"));
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBeUndefined();
+    expect(after.executable).toBe("python");
   });
 });
