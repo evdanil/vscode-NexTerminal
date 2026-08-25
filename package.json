@@ -1026,68 +1026,68 @@
       },
       {
         "command": "nexus.localServer.start",
-        "title": "Start Local Server",
-        "category": "Nexus",
+        "title": "Start",
+        "category": "Nexus Local Servers",
         "icon": "$(debug-start)"
       },
       {
         "command": "nexus.localServer.stop",
-        "title": "Stop Local Server",
-        "category": "Nexus",
+        "title": "Stop",
+        "category": "Nexus Local Servers",
         "icon": "$(debug-stop)"
       },
       {
         "command": "nexus.localServer.restart",
-        "title": "Restart Local Server",
-        "category": "Nexus",
+        "title": "Restart",
+        "category": "Nexus Local Servers",
         "icon": "$(sync)"
       },
       {
         "command": "nexus.localServer.inspectLogs",
-        "title": "Inspect Local Server Logs",
-        "category": "Nexus",
+        "title": "Inspect Logs",
+        "category": "Nexus Local Servers",
         "icon": "$(list-flat)"
       },
       {
         "command": "nexus.localServer.edit",
         "title": "Edit",
-        "category": "Nexus",
+        "category": "Nexus Local Servers",
         "icon": "$(edit)"
       },
       {
         "command": "nexus.localServer.remove",
         "title": "Remove",
-        "category": "Nexus",
+        "category": "Nexus Local Servers",
         "icon": "$(trash)"
       },
       {
         "command": "nexus.localServer.rename",
         "title": "Rename",
-        "category": "Nexus",
+        "category": "Nexus Local Servers",
         "icon": "$(edit)"
       },
       {
         "command": "nexus.localServer.duplicate",
         "title": "Duplicate",
-        "category": "Nexus",
+        "category": "Nexus Local Servers",
         "icon": "$(copy)"
       },
       {
         "command": "nexus.localServer.copyInfo",
         "title": "Copy Command Line",
-        "category": "Nexus",
+        "category": "Nexus Local Servers",
         "icon": "$(clippy)"
       },
       {
         "command": "nexus.localServer.moveToFolder",
         "title": "Move to Folder…",
-        "category": "Nexus",
+        "category": "Nexus Local Servers",
         "icon": "$(folders)"
       },
       {
         "command": "nexus.localServer.moveToRoot",
         "title": "Move to Root",
-        "category": "Nexus",
+        "category": "Nexus Local Servers",
         "icon": "$(remove-folder)"
       }
     ],

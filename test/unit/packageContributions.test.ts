@@ -1554,43 +1554,108 @@ describe("terminal output performance defaults", () => {
  * LOCAL SERVERS vs NETWORK SERVERS IN THE COMMAND PALETTE.
  *
  * Two unrelated subsystems ship a start/stop/restart/inspect-logs quartet. The
- * palette renders only "<category>: <title>", so "Nexus: Start Server" and
- * "Nexus: Start Service" sat next to each other with nothing to tell them
- * apart — one letter, and no hint that one spawns a local child process while
- * the other drives an embedded TFTP/DHCP daemon. Distinctness as *strings* was
- * never the problem and is not the fix; naming the subsystem is.
+ * palette renders "<category>: <title>", so "Nexus: Start Server" and "Nexus:
+ * Start Service" sat next to each other with nothing to tell them apart — one
+ * letter, and no hint that one spawns a local child process while the other
+ * drives an embedded TFTP/DHCP daemon.
+ *
+ * Padding each *title* with "Local Server" fixed those four and left the other
+ * seven verbs worse off: `edit` / `remove` / `rename` / `duplicate` rendered as
+ * bare "Nexus: Edit", "Nexus: Remove"… with nothing naming the subsystem at
+ * all. The disambiguation belongs in the CATEGORY, which is the half VS Code
+ * renders in front of every one of them — and which context menus drop, so the
+ * right-click entries go back to reading as short verbs.
+ *
+ * What is asserted below is therefore the string a user actually sees in the
+ * palette, for EVERY local-server verb, not just the original four.
  *
  * Command IDs are deliberately untouched: they are the stable contract behind
- * any user keybinding. Only the displayed titles change.
+ * any user keybinding.
  */
 describe("Local Servers command titles are unambiguous in the Command Palette", () => {
-  const titleOf = (command: string): string =>
-    packageJson.contributes.commands.find((c) => c.command === command)?.title ?? "";
+  const LOCAL_SERVER_CATEGORY = "Nexus Local Servers";
 
-  const collidingVerbs = ["start", "stop", "restart", "inspectLogs"] as const;
+  const commandOf = (command: string) =>
+    packageJson.contributes.commands.find((c) => c.command === command);
 
-  it.each(collidingVerbs)("nexus.localServer.%s names the subsystem it acts on", (verb) => {
-    const title = titleOf(`nexus.localServer.${verb}`);
-    expect(title).not.toBe("");
-    expect(title).toMatch(/Local Server/);
+  /** However VS Code renders a palette row: "<category>: <title>", or the bare title. */
+  const paletteLabel = (command: string): string => {
+    const contributed = commandOf(command);
+    if (!contributed) return "";
+    return contributed.category ? `${contributed.category}: ${contributed.title}` : contributed.title;
+  };
+
+  /**
+   * `add` is deliberately excluded: it names its own subsystem in full ("Add
+   * Local Server Profile") and belongs to the cross-subsystem "Add … Profile"
+   * family that shares the plain "Nexus" category with nexus.server.add /
+   * nexus.serial.add / nexus.localShell.add.
+   */
+  const verbCommands = packageJson.contributes.commands
+    .map((c) => c.command)
+    .filter((id) => id.startsWith("nexus.localServer.") && id !== "nexus.localServer.add");
+
+  it("has verb commands to check", () => {
+    expect(verbCommands.length).toBeGreaterThanOrEqual(9);
   });
 
-  it.each(collidingVerbs)(
+  it.each(["start", "stop", "restart", "inspectLogs", "edit", "remove", "rename", "duplicate", "copyInfo"])(
+    "contributes nexus.localServer.%s, so no verb silently escapes this check",
+    (verb) => {
+      expect(verbCommands).toContain(`nexus.localServer.${verb}`);
+    }
+  );
+
+  it.each(verbCommands)("%s is filed under the Local Servers palette category", (command) => {
+    expect(commandOf(command)?.category).toBe(LOCAL_SERVER_CATEGORY);
+  });
+
+  it.each(verbCommands)("%s renders a palette row that names the subsystem", (command) => {
+    expect(paletteLabel(command)).toMatch(/^Nexus Local Servers: \S/);
+  });
+
+  /**
+   * The category carries the disambiguation now, so the title itself must go
+   * back to the terse verb the tunnel menu already uses — a context menu drops
+   * the category and shows only this.
+   */
+  it.each([
+    ["nexus.localServer.start", "Start"],
+    ["nexus.localServer.stop", "Stop"],
+    ["nexus.localServer.restart", "Restart"],
+    ["nexus.localServer.inspectLogs", "Inspect Logs"]
+  ])("%s reads as a short verb in the context menu", (command, title) => {
+    expect(commandOf(command)?.title).toBe(title);
+  });
+
+  it("collides with no other command's palette row", () => {
+    const everyLabel = packageJson.contributes.commands.map((c) => paletteLabel(c.command));
+    for (const command of verbCommands) {
+      const label = paletteLabel(command);
+      expect(everyLabel.filter((other) => other === label), `"${label}" is rendered by more than one command`)
+        .toHaveLength(1);
+    }
+  });
+
+  /**
+   * The original complaint, restated against the rendered row: a Local Servers
+   * entry must not be reachable from its Network Servers counterpart by
+   * swapping the trailing noun ("Server" ⇄ "Service"), which is all that
+   * separated "Nexus: Start Server" from "Nexus: Start Service".
+   */
+  it.each(["start", "stop", "restart", "inspectLogs"])(
     "nexus.localServer.%s is not confusable with its Network Servers counterpart",
     (verb) => {
-      const local = titleOf(`nexus.localServer.${verb}`);
-      const network = titleOf(`nexus.networkServer.${verb}`);
+      const local = paletteLabel(`nexus.localServer.${verb}`);
+      const network = paletteLabel(`nexus.networkServer.${verb}`);
       expect(network).not.toBe("");
       expect(local).not.toBe(network);
-      // The real bar: neither title may be reachable from the other by
-      // swapping the single trailing noun ("Server" ⇄ "Service"), which is all
-      // that separated them before.
       expect(local.replace(/Service/g, "Server")).not.toBe(network.replace(/Service/g, "Server"));
     }
   );
 
   it("leaves the command IDs alone so existing keybindings keep working", () => {
-    for (const verb of collidingVerbs) {
+    for (const verb of ["start", "stop", "restart", "inspectLogs"]) {
       expect(packageJson.contributes.commands.some((c) => c.command === `nexus.localServer.${verb}`)).toBe(true);
     }
   });

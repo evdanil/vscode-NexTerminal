@@ -399,9 +399,13 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
 
     if (arg instanceof LocalServerConfigTreeItem) {
       const picks: ProfileActionPick[] = [
-        { label: "Start Server", command: "nexus.localServer.start" },
-        { label: "Stop Server", command: "nexus.localServer.stop" },
-        { label: "Restart Server", command: "nexus.localServer.restart" },
+        // Terse verbs, matching the contributed titles. The picker is already
+        // titled "Local Server Actions", so repeating "Server" in every row
+        // said nothing the title had not; the four long labels here were also
+        // the retired ones, so a row click and a right-click disagreed.
+        { label: "Start", command: "nexus.localServer.start" },
+        { label: "Stop", command: "nexus.localServer.stop" },
+        { label: "Restart", command: "nexus.localServer.restart" },
         { label: "Inspect Logs", command: "nexus.localServer.inspectLogs" },
         { label: "Edit", command: "nexus.localServer.edit" },
         { label: "Duplicate", command: "nexus.localServer.duplicate" },
