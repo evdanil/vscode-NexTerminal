@@ -1,0 +1,143 @@
+# Pre-merge verification. Until this existed, `npm test` and
+# `npm run build:production` ran ONLY inside release.yml / publish-openvsx.yml
+# — that is, only at publish time, where a failure is discovered at the moment
+# of an irreversible push to the Marketplace and Open VSX. This runs the same
+# commands while a failure is still free.
+#
+# Deliberately NOT a release path: nothing here tags, publishes, or reads a
+# publishing secret.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A superseded run for the same ref is wasted work. Unlike auto-release.yml —
+# which must never be cancelled, because its trigger lives on a head commit no
+# later run will ever see again — a CI run carries no such one-shot state.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    name: Type-check, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # BEFORE the tests, not after: the integration suites load from dist/, so
+      # `npm test` first would fail for a missing build rather than a defect.
+      # build:production also covers `tsc --noEmit` and the packaged-bundle
+      # smoke test (scripts/smokeBundle.mjs).
+      - name: Build (type-check + bundle + bundle smoke test)
+        run: npm run build:production
+
+      - name: Test
+        run: npm test
+
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      native: ${{ steps.filter.outputs.native }}
+    steps:
+      # Full history: the diff below needs both endpoints present locally.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine whether native/ changed
+        id: filter
+        env:
+          # A pull_request compares against its base; a push against the
+          # previous head. `github.event.before` is all zeroes on a branch's
+          # first push, and unreachable after a force-push — both covered by
+          # the fallback below.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # FAIL OPEN, never closed: when the base is unusable we run the Rust
+          # job rather than silently skip it. A needless cargo build costs
+          # minutes; a skipped one lets a broken crate through.
+          if [ -z "$BASE" ] \
+            || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "Base ref unusable ('$BASE') — running the native job."
+            echo "native=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `git diff --quiet -- native/` rather than piping into `grep -q`.
+          # Under `set -o pipefail`, grep -q exits at the first match and can
+          # SIGPIPE git diff (exit 141), which would take the else branch and
+          # report native=false on a large diff that DID touch native/.
+          # --quiet exits 0 for "no differences", 1 for "differences".
+          if git diff --quiet "$BASE" "$HEAD" -- native/; then
+            echo "native=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "native=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  native:
+    name: Rust crates (host target)
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            native/local-pty
+            native/network-server-daemon
+
+      # Host target only. release.yml cross-compiles six targets; that belongs
+      # at release time. NO `cargo fmt --check` — these crates are not
+      # rustfmt-clean, so such a step would fail on arrival rather than report
+      # anything real.
+      #
+      # network-server-daemon is a VIRTUAL WORKSPACE with no default-members,
+      # so an unscoped --manifest-path covers all four member crates
+      # (tftp, dhcp, rpc, daemon). The release workflow scopes to
+      # `-p nexus-network-server-daemon`; broader is correct for CI.
+      - name: Build and test local-pty
+        run: |
+          cargo build --manifest-path native/local-pty/Cargo.toml
+          cargo test --manifest-path native/local-pty/Cargo.toml
+
+      - name: Build and test network-server-daemon
+        run: |
+          cargo build --manifest-path native/network-server-daemon/Cargo.toml
+          cargo test --manifest-path native/network-server-daemon/Cargo.toml
+
+      # The ONLY behavioural check that the Rust engine and the JavaScript
+      # fallback agree. It ran in no workflow before this one. Needs npm deps
+      # and a built daemon, both present by now.
+      - name: TypeScript/Rust parity suite
+        run: |
+          npm ci
+          npm run test:network-server-daemon:rust
