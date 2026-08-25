@@ -253,9 +253,16 @@ export function registerLocalServerCommands(
     emptyMessage: "No Nexus local servers are running."
   };
 
+  /**
+   * Anything with a terminal worth looking at — a live session, or the tab a
+   * crashed session left behind. Restricting this to live sessions would put
+   * a crashed server's own failure output out of reach from the palette.
+   */
   const INSPECTABLE_FILTER = {
-    include: (configId: string) => Boolean(manager.getActiveSessionIdForConfig(configId)),
-    emptyMessage: "No Nexus local servers are running."
+    include: (configId: string) =>
+      Boolean(manager.getActiveSessionIdForConfig(configId)) ||
+      manager.lastTerminalForConfig(configId) !== undefined,
+    emptyMessage: "No Nexus local server has an open terminal to inspect."
   };
 
   return [
@@ -350,6 +357,15 @@ export function registerLocalServerCommands(
       const active = manager.getActiveSessionIdForConfig(config.id);
       if (active) {
         manager.inspectLogsTerminal(active)?.show();
+        return;
+      }
+      // A crash unregisters the session but deliberately leaves the terminal
+      // open, because the failure output on it is the whole reason to look.
+      // Refusing here — with that tab sitting in the panel — was the command
+      // declining exactly when it was most useful.
+      const last = manager.lastTerminalForConfig(config.id);
+      if (last) {
+        last.show();
         return;
       }
       void vscode.window.showInformationMessage("No running local server session to display.");

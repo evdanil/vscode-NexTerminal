@@ -35,6 +35,10 @@ const createTerminalMock = vi.fn(() => ({
 }));
 
 const mockStatEntries = vi.hoisted(() => new Map<string, "dir" | "file">());
+// Hoisted rather than local to the vscode factory so a test can fire a
+// terminal-close event: the manager subscribes here to forget the terminal it
+// keeps per config once its tab is actually gone.
+const closeTerminalListeners = vi.hoisted(() => [] as Array<(t: unknown) => void>);
 
 vi.mock("node:fs", () => ({
   existsSync: (value: string) => mockPathExists.has(normalizeMockPath(String(value))),
@@ -100,7 +104,7 @@ vi.mock("../../src/services/local/localShellPty", async (importOriginal) => {
 });
 
 vi.mock("vscode", () => {
-  const listeners: Array<(t: unknown) => void> = [];
+  const listeners = closeTerminalListeners;
   return {
     EventEmitter: class<T> {
       private readonly ls: Array<(e: T) => void> = [];
@@ -536,5 +540,78 @@ describe("LocalServerManager — isStoppingConfig", () => {
     const sessionId = await manager.start(baseConfig());
     await manager.stop(sessionId, true);
     expect(manager.isStoppingConfig("cfg-other")).toBe(false);
+  });
+});
+
+/**
+ * INSPECT LOGS ON A SERVER THAT HAS ALREADY CRASHED.
+ *
+ * cleanupSession() drops the session-keyed terminal entry and deliberately
+ * leaves the terminal OPEN, because after a crash the failure output on it is
+ * the whole reason to look. Every lookup was session-keyed, so the command
+ * refused with that tab sitting in the panel. The manager therefore keeps the
+ * last terminal per *config*, past the death of the session that owned it —
+ * and drops it when the tab is actually closed, so it never hands back a dead
+ * reference.
+ */
+describe("LocalServerManager — lastTerminalForConfig", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+    createTerminalMock.mockClear();
+    closeTerminalListeners.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function crash(spawnIndex: number, code: number): void {
+    const pty = vi.mocked(LocalShellPty).mock.results[spawnIndex].value as {
+      onDidClose: { mock: { calls: Array<[(code: number) => void]> } };
+    };
+    pty.onDidClose.mock.calls[0][0](code);
+  }
+
+  it("has nothing for a config that has never run", () => {
+    const manager = fakeManager();
+    expect(manager.lastTerminalForConfig("cfg-1")).toBeUndefined();
+  });
+
+  it("still knows the terminal after the crash that unregistered the session", async () => {
+    const terminals = new Map();
+    const manager = fakeManager({ terminals });
+    const sessionId = await manager.start(baseConfig());
+    const terminal = createTerminalMock.mock.results[0].value;
+    crash(0, 1);
+
+    // Exactly the state the command used to refuse in: no session, no
+    // session-keyed terminal entry, terminal still open.
+    expect(manager.getActiveSessionIdForConfig("cfg-1")).toBeUndefined();
+    expect(terminals.has(sessionId)).toBe(false);
+    expect(manager.inspectLogsTerminal(sessionId)).toBeUndefined();
+    expect(manager.lastTerminalForConfig("cfg-1")).toBe(terminal);
+  });
+
+  it("forgets the terminal once its tab is closed, rather than handing back a dead reference", async () => {
+    const manager = fakeManager({ terminals: new Map() });
+    await manager.start(baseConfig());
+    const terminal = createTerminalMock.mock.results[0].value;
+    crash(0, 1);
+    expect(manager.lastTerminalForConfig("cfg-1")).toBe(terminal);
+
+    for (const listener of closeTerminalListeners) listener(terminal);
+    expect(manager.lastTerminalForConfig("cfg-1")).toBeUndefined();
+  });
+
+  it("tracks the newest terminal across a restart", async () => {
+    const manager = fakeManager({ terminals: new Map() });
+    await manager.start(baseConfig());
+    crash(0, 1);
+    await manager.start(baseConfig());
+    expect(manager.lastTerminalForConfig("cfg-1")).toBe(createTerminalMock.mock.results[1].value);
   });
 });

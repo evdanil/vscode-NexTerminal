@@ -254,7 +254,9 @@ describe("palette fallback for stop / inspectLogs", () => {
     stop: ReturnType<typeof vi.fn>;
     cancelPendingRestart: ReturnType<typeof vi.fn>;
     inspectLogsTerminal: ReturnType<typeof vi.fn>;
+    lastTerminalForConfig: ReturnType<typeof vi.fn>;
     terminal: { show: ReturnType<typeof vi.fn> };
+    lastTerminal: { show: ReturnType<typeof vi.fn> };
   }
 
   function harness(
@@ -268,13 +270,17 @@ describe("palette fallback for stop / inspectLogs", () => {
        * from then on (when the pick is resolved).
        */
       vanishingConfigIds?: string[];
+      /** Configs whose crashed session left its terminal tab open. */
+      lastTerminalConfigIds?: string[];
     } = {}
   ): Harness {
     const running = new Set(options.runningConfigIds ?? []);
     const restartPending = new Set(options.restartPendingConfigIds ?? []);
     const stopping = new Set(options.stoppingConfigIds ?? []);
     const vanishing = new Set(options.vanishingConfigIds ?? []);
+    const lastTerminals = new Set(options.lastTerminalConfigIds ?? []);
     const terminal = { show: vi.fn() };
+    const lastTerminal = { show: vi.fn() };
     const manager = {
       stop: vi.fn(async () => {}),
       stopConfig: vi.fn(async () => {}),
@@ -285,7 +291,10 @@ describe("palette fallback for stop / inspectLogs", () => {
       hasPendingRestart: vi.fn((configId: string) => restartPending.has(configId)),
       cancelPendingRestart: vi.fn((configId: string) => restartPending.delete(configId)),
       isStoppingConfig: vi.fn((configId: string) => stopping.has(configId)),
-      inspectLogsTerminal: vi.fn(() => terminal)
+      inspectLogsTerminal: vi.fn(() => terminal),
+      lastTerminalForConfig: vi.fn((configId: string) =>
+        lastTerminals.has(configId) ? lastTerminal : undefined
+      )
     };
     const localServers = [
       { id: "cfg-1", name: "API", executable: "node" },
@@ -305,7 +314,9 @@ describe("palette fallback for stop / inspectLogs", () => {
       stop: manager.stop,
       cancelPendingRestart: manager.cancelPendingRestart,
       inspectLogsTerminal: manager.inspectLogsTerminal,
-      terminal
+      lastTerminalForConfig: manager.lastTerminalForConfig,
+      terminal,
+      lastTerminal
     };
   }
 
@@ -460,11 +471,48 @@ describe("palette fallback for stop / inspectLogs", () => {
     expect(offered).toEqual(["cfg-1"]);
   });
 
-  it.each(["stop", "inspectLogs"])("%s says nothing is running rather than opening an empty picker", async (verb) => {
+  it.each([
+    ["stop", "No Nexus local servers are running."],
+    ["inspectLogs", "No Nexus local server has an open terminal to inspect."]
+  ])("%s says why rather than opening an empty picker", async (verb, message) => {
     harness({ runningConfigIds: [] });
     await registeredCommands.get(`nexus.localServer.${verb}`)!(undefined);
     expect(quickPick).not.toHaveBeenCalled();
-    expect(showInfo).toHaveBeenCalledWith("No Nexus local servers are running.");
+    expect(showInfo).toHaveBeenCalledWith(message);
+  });
+
+  /**
+   * cleanupSession() unregisters the crashed session but deliberately leaves
+   * its terminal open — the failure output on it is the whole reason to look.
+   * Every lookup was session-keyed, so the command refused with that tab
+   * sitting in the panel.
+   */
+  it("inspectLogs shows the terminal a crashed session left behind", async () => {
+    const h = harness({ runningConfigIds: [], lastTerminalConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-2")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(h.lastTerminal.show).toHaveBeenCalledTimes(1);
+    expect(showInfo).not.toHaveBeenCalled();
+  });
+
+  it("inspectLogs offers a crashed server, not only the live ones", async () => {
+    harness({ runningConfigIds: [], lastTerminalConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+    expect(offered).toEqual(["cfg-2"]);
+  });
+
+  it("inspectLogs prefers the live session over the leftover terminal", async () => {
+    const h = harness({ runningConfigIds: ["cfg-1"], lastTerminalConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    expect(h.terminal.show).toHaveBeenCalledTimes(1);
+    expect(h.lastTerminal.show).not.toHaveBeenCalled();
   });
 
   /**

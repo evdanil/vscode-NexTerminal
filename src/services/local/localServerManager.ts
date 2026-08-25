@@ -320,10 +320,34 @@ export class LocalServerManager implements vscode.Disposable {
    */
   private readonly restartAttempts = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * The most recent terminal opened for each *config*, kept past the death of
+   * the session that owned it.
+   *
+   * cleanupSession() drops the session-keyed entry but deliberately leaves the
+   * terminal open, because after a crash the failure output on it is the whole
+   * reason to look. Every lookup was session-keyed, so Inspect Logs answered
+   * "no session to display" while that tab sat in the panel — refusing exactly
+   * when the logs matter most.
+   *
+   * Kept per config, not per session, for the same reason restartAttempts is:
+   * each restart registers a new session id, and the user is asking about the
+   * server, not about one of its lives. Entries are removed when the terminal
+   * is actually closed, so this never hands out a dead reference.
+   */
+  private readonly lastTerminals = new Map<string, vscode.Terminal>();
   private readonly subscriptions: vscode.Disposable[] = [];
   private disposed = false;
 
-  public constructor(private readonly options: LocalServerManagerOptions) {}
+  public constructor(private readonly options: LocalServerManagerOptions) {
+    this.subscriptions.push(
+      vscode.window.onDidCloseTerminal((terminal) => {
+        for (const [configId, known] of this.lastTerminals.entries()) {
+          if (known === terminal) this.lastTerminals.delete(configId);
+        }
+      })
+    );
+  }
 
   public getActiveSessionIdForConfig(configId: string): string | undefined {
     for (const [sessionId, entry] of this.options.terminals.entries()) {
@@ -462,6 +486,7 @@ export class LocalServerManager implements vscode.Disposable {
 
     const termEntry: LocalServerTerminalEntry = { terminal, configId: config.id, pty };
     this.options.terminals.set(sessionId, termEntry);
+    this.lastTerminals.set(config.id, terminal);
     this.options.terminalRegistry?.register(terminal, pty);
 
     pty.onDidStartupComplete(() => {
@@ -559,6 +584,17 @@ export class LocalServerManager implements vscode.Disposable {
   public inspectLogsTerminal(sessionId: string): vscode.Terminal | undefined {
     const entry = this.entries.get(sessionId) ?? this.options.terminals.get(sessionId);
     return entry?.terminal;
+  }
+
+  /**
+   * The last terminal this config opened, alive or not, or undefined if it has
+   * never run in this window or its tab has since been closed.
+   *
+   * This is what makes Inspect Logs work on a crashed server: the session is
+   * gone, the terminal is not.
+   */
+  public lastTerminalForConfig(configId: string): vscode.Terminal | undefined {
+    return this.lastTerminals.get(configId);
   }
 
   private handleExit(sessionId: string, config: LocalServerConfig, exitCode: number | null): void {
@@ -684,6 +720,7 @@ export class LocalServerManager implements vscode.Disposable {
       this.clearTimers(entry);
     }
     this.entries.clear();
+    this.lastTerminals.clear();
     // Pending restarts live outside the entry map now, so they need cancelling
     // here too — a backoff timer surviving disposal would spawn a process for a
     // manager that no longer exists.
