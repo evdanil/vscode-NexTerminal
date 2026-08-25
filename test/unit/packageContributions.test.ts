@@ -1659,4 +1659,36 @@ describe("Local Servers command titles are unambiguous in the Command Palette", 
       expect(packageJson.contributes.commands.some((c) => c.command === `nexus.localServer.${verb}`)).toBe(true);
     }
   });
+
+  /**
+   * The README walks a first-time user to a menu item by name. Rejecting ONE
+   * known-stale string ("Start Server") would only know the label already
+   * retired; this reads the CONTRIBUTED title and holds the README to it, so
+   * the next retitle fails here rather than sending a reader looking for a
+   * menu entry that does not exist.
+   */
+  it("names the CURRENT contributed title where the README tells the user what to right-click", () => {
+    const title = commandOf("nexus.localServer.start")?.title ?? "";
+    expect(title).not.toBe("");
+    const instructions = [...readme.matchAll(/Right-click the profile and choose \*\*([^*]+)\*\*/g)].map((m) => m[1]);
+    expect(instructions).toContain(title);
+  });
+});
+
+/**
+ * The environment-variable field distinguishes `KEY=value`, `KEY=` (empty
+ * string) and `KEY=null` (unset). Only the form's own hint said so; the README
+ * documented the plain form alone, so the only place the contract was written
+ * down was a hint a user sees after they have already guessed.
+ */
+describe("Local Servers environment-variable contract is documented", () => {
+  it("documents the unset and empty-string forms in the README, not just KEY=value", () => {
+    const section = readme.slice(readme.indexOf("### Add a Local Server"));
+    const step = section.slice(0, section.indexOf("### ", 1));
+    expect(step).toContain("`KEY=value`");
+    expect(step).toContain("`KEY=`");
+    expect(step).toContain("`KEY=null`");
+    expect(step).toMatch(/empty string/i);
+    expect(step).toMatch(/unsets? it/i);
+  });
 });
