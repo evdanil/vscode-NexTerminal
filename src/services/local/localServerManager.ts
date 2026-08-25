@@ -370,6 +370,15 @@ export class LocalServerManager implements vscode.Disposable {
    * Returns true only when a restart was actually pending, so callers can tell
    * "nothing to do" apart from "I just called something off".
    */
+  /**
+   * Whether an auto-restart is armed for this config right now — the read-only
+   * half of cancelPendingRestart, for callers that need to decide whether a
+   * config is worth OFFERING before they decide what to do with it.
+   */
+  public hasPendingRestart(configId: string): boolean {
+    return this.restartTimers.has(configId);
+  }
+
   public cancelPendingRestart(configId: string): boolean {
     this.restartAttempts.delete(configId);
     const pending = this.restartTimers.get(configId);

@@ -262,18 +262,27 @@ describe("palette fallback for stop / inspectLogs", () => {
       runningConfigIds?: string[];
       restartPendingConfigIds?: string[];
       stoppingConfigIds?: string[];
+      /**
+       * Configs whose session ends while the picker is open: reported running
+       * the first time they are asked about (when the list is built) and gone
+       * from then on (when the pick is resolved).
+       */
+      vanishingConfigIds?: string[];
     } = {}
   ): Harness {
     const running = new Set(options.runningConfigIds ?? []);
     const restartPending = new Set(options.restartPendingConfigIds ?? []);
     const stopping = new Set(options.stoppingConfigIds ?? []);
+    const vanishing = new Set(options.vanishingConfigIds ?? []);
     const terminal = { show: vi.fn() };
     const manager = {
       stop: vi.fn(async () => {}),
       stopConfig: vi.fn(async () => {}),
-      getActiveSessionIdForConfig: vi.fn((configId: string) =>
-        running.has(configId) ? `session-for-${configId}` : undefined
-      ),
+      getActiveSessionIdForConfig: vi.fn((configId: string) => {
+        if (vanishing.delete(configId)) return `session-for-${configId}`;
+        return running.has(configId) ? `session-for-${configId}` : undefined;
+      }),
+      hasPendingRestart: vi.fn((configId: string) => restartPending.has(configId)),
       cancelPendingRestart: vi.fn((configId: string) => restartPending.delete(configId)),
       isStoppingConfig: vi.fn((configId: string) => stopping.has(configId)),
       inspectLogsTerminal: vi.fn(() => terminal)
@@ -337,11 +346,11 @@ describe("palette fallback for stop / inspectLogs", () => {
   it("stop reports a config that is not running instead of silently no-opping", async () => {
     // stopConfig() iterates the running set and returns quietly when it is
     // empty, so a stopped pick would otherwise produce no feedback at all.
+    // Reached by right-clicking a stopped config row — the picker no longer
+    // offers such a config in the first place.
     const h = harness({ runningConfigIds: [] });
-    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
-      items.find((i) => i.config.id === "cfg-1")
-    );
-    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    await registeredCommands.get("nexus.localServer.stop")!({ config: { id: "cfg-1" } });
+    expect(quickPick).not.toHaveBeenCalled();
     expect(h.stopConfig).not.toHaveBeenCalled();
     expect(showInfo).toHaveBeenCalledWith('Local server "API" is not running.');
   });
@@ -358,6 +367,9 @@ describe("palette fallback for stop / inspectLogs", () => {
       items.find((i) => i.config.id === "cfg-1")
     );
     await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    // A config waiting out a backoff has no session, so the running-only
+    // filter has to keep it anyway or this fix is unreachable from the palette.
+    expect(quickPick).toHaveBeenCalledTimes(1);
     expect(h.cancelPendingRestart).toHaveBeenCalledWith("cfg-1");
     // The old message claimed the user's stop had nothing to act on, while a
     // restart it had just cancelled proves otherwise.
@@ -379,6 +391,9 @@ describe("palette fallback for stop / inspectLogs", () => {
       items.find((i) => i.config.id === "cfg-1")
     );
     await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    // A stopping config is still something Stop can be asked about, so it has
+    // to survive the picker's running-only filter to reach this message.
+    expect(quickPick).toHaveBeenCalledTimes(1);
     expect(showInfo).not.toHaveBeenCalledWith('Local server "API" is not running.');
     expect(showInfo).toHaveBeenCalledWith('Local server "API" is already stopping.');
     expect(h.stopConfig).not.toHaveBeenCalled();
@@ -405,7 +420,11 @@ describe("palette fallback for stop / inspectLogs", () => {
   });
 
   it("inspectLogs keeps the 'no running session' notice, scoped to the picked config", async () => {
-    const h = harness({ runningConfigIds: ["cfg-2"] });
+    // The picker now only offers running configs, so this notice is reached
+    // by the race it was written for: the session ends while the picker is
+    // open. cfg-1 reads as running when the list is built and gone by the
+    // time the pick resolves.
+    const h = harness({ runningConfigIds: ["cfg-2"], vanishingConfigIds: ["cfg-1"] });
     quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
       items.find((i) => i.config.id === "cfg-1")
     );
@@ -418,6 +437,52 @@ describe("palette fallback for stop / inspectLogs", () => {
     expect(h.inspectLogsTerminal).not.toHaveBeenCalled();
     expect(showInfo).toHaveBeenCalledWith("No running local server session to display.");
   });
+
+  /**
+   * Every sibling stop-like picker in this codebase lists only what is
+   * active — tunnelCommands' activeTunnels, serialCommands' serialTerminals,
+   * scriptCommands' getRuns(). Listing every configured server made the user
+   * guess which rows were live, then refused most of the picks.
+   */
+  it("stop offers only the servers it can act on", async () => {
+    harness({ runningConfigIds: ["cfg-2"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+    expect(offered).toEqual(["cfg-2"]);
+  });
+
+  it("inspectLogs offers only the servers with a session to show", async () => {
+    harness({ runningConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async () => undefined);
+    await registeredCommands.get("nexus.localServer.inspectLogs")!(undefined);
+    const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+    expect(offered).toEqual(["cfg-1"]);
+  });
+
+  it.each(["stop", "inspectLogs"])("%s says nothing is running rather than opening an empty picker", async (verb) => {
+    harness({ runningConfigIds: [] });
+    await registeredCommands.get(`nexus.localServer.${verb}`)!(undefined);
+    expect(quickPick).not.toHaveBeenCalled();
+    expect(showInfo).toHaveBeenCalledWith("No Nexus local servers are running.");
+  });
+
+  /**
+   * The filter is scoped to the two verbs that need it. restart / edit /
+   * remove / rename / duplicate / copyInfo legitimately act on a config
+   * whatever its state, and must keep listing all of them.
+   */
+  it.each(["restart", "edit", "remove", "rename", "duplicate", "copyInfo"])(
+    "%s still offers every configured server, running or not",
+    async (verb) => {
+      harness({ runningConfigIds: [] });
+      quickPick.mockImplementation(async () => undefined);
+      await registeredCommands.get(`nexus.localServer.${verb}`)!(undefined);
+      expect(quickPick).toHaveBeenCalledTimes(1);
+      const offered = (quickPick.mock.calls[0][0] as Array<{ config: { id: string } }>).map((i) => i.config.id);
+      expect(offered).toEqual(["cfg-1", "cfg-2"]);
+    }
+  );
 
   it("inspectLogs does nothing when the picker is dismissed", async () => {
     const h = harness({ runningConfigIds: ["cfg-1"] });

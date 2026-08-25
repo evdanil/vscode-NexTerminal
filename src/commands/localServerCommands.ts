@@ -175,13 +175,37 @@ function toLocalServerSessionIdFromArg(arg: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Narrows the picker to the configs a command can actually act on.
+ *
+ * `stop` and `inspectLogs` are the only two that need it: every other verb
+ * (restart / edit / remove / rename / duplicate / copyInfo / move…) operates
+ * on a config whatever its runtime state. Offering all of them from a Stop
+ * picker made the user guess which rows were live and then answered most
+ * picks with a refusal.
+ */
+interface LocalServerPickFilter {
+  include: (configId: string) => boolean;
+  /** Shown instead of an empty picker, matching the scripts-stop wording. */
+  emptyMessage: string;
+}
+
 async function pickLocalServer(
   core: import("../core/nexusCore").NexusCore,
-  title = "Select Local Server"
+  title = "Select Local Server",
+  filter?: LocalServerPickFilter
 ): Promise<LocalServerConfig | undefined> {
-  const servers = core.getSnapshot().localServers;
-  if (servers.length === 0) {
+  const configured = core.getSnapshot().localServers;
+  if (configured.length === 0) {
     void vscode.window.showWarningMessage("No Nexus Local Servers configured.");
+    return undefined;
+  }
+  // Filtering rather than annotating, which is what every sibling stop-like
+  // picker in this codebase already does: tunnelCommands lists activeTunnels,
+  // serialCommands lists serialTerminals, scriptCommands lists getRuns().
+  const servers = filter ? configured.filter((config) => filter.include(config.id)) : configured;
+  if (servers.length === 0) {
+    void vscode.window.showInformationMessage(filter!.emptyMessage);
     return undefined;
   }
   const pick = await vscode.window.showQuickPick(
@@ -212,6 +236,28 @@ export function registerLocalServerCommands(
 ): vscode.Disposable[] {
   const manager = ctx.localServerManager;
 
+  /**
+   * Everything Stop can act on. Not just "has a live session": a config in its
+   * stopping grace window and one waiting out an auto-restart backoff are both
+   * things a user can meaningfully stop, and the second is the whole point of
+   * cancelPendingRestart — filtering it out of the picker would put that fix
+   * out of reach from the palette.
+   */
+  const stoppable = (configId: string): boolean =>
+    Boolean(manager.getActiveSessionIdForConfig(configId)) ||
+    manager.isStoppingConfig(configId) ||
+    manager.hasPendingRestart(configId);
+
+  const STOPPABLE_FILTER = {
+    include: stoppable,
+    emptyMessage: "No Nexus local servers are running."
+  };
+
+  const INSPECTABLE_FILTER = {
+    include: (configId: string) => Boolean(manager.getActiveSessionIdForConfig(configId)),
+    emptyMessage: "No Nexus local servers are running."
+  };
+
   return [
     vscode.commands.registerCommand("nexus.localServer.add", () => {
       void vscode.commands.executeCommand("nexus.profile.add", {
@@ -241,7 +287,7 @@ export function registerLocalServerCommands(
         // here is what restart / edit / remove already do; without it the
         // command dead-ended on a "right-click something instead" notice that
         // offered no way to proceed.
-        const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Stop Local Server"));
+        const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Stop Local Server", STOPPABLE_FILTER));
         if (!config) return;
         // stopConfig no-ops on a config with nothing running, so say so rather
         // than swallowing the request the way the old dead end did.
@@ -299,7 +345,7 @@ export function registerLocalServerCommands(
       // the command could only report that it had nothing to show. The picker
       // makes the choice available; the "not running" notice survives, now
       // scoped to the config the user actually chose.
-      const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Inspect Local Server Logs"));
+      const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Inspect Local Server Logs", INSPECTABLE_FILTER));
       if (!config) return;
       const active = manager.getActiveSessionIdForConfig(config.id);
       if (active) {
