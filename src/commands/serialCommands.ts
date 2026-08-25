@@ -648,12 +648,38 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const updated = formValuesToSerial(values, existing);
-          if (!updated) {
-            return;
-          }
-          await ctx.core.addOrUpdateSerialProfile(updated);
-          if (ctx.core.isSerialProfileConnected(existing.id)) {
+          // ISSUE #108 FOLLOW-UP (Codex review) — formValuesToSerial has no
+          // form field for `deviceHint` (and falls back to `existing.mode`
+          // when the form omits mode), so it always CARRIES those over from
+          // whatever `existing` it's handed. `existing` here was captured
+          // BEFORE the form opened, and the form can sit open indefinitely
+          // (same hazard the six rename/move handlers were fixed for
+          // earlier on this branch). Left alone, anything that updates
+          // deviceHint while the form is open — Smart Follow's
+          // onResolvedPort is the live example — gets silently reverted the
+          // moment this Save commits.
+          //
+          // Fix: serialize the write under configMutationLock (this path
+          // was unserialized before), and re-resolve the LIVE record inside
+          // the lock instead of building from the pre-form snapshot.
+          // Form-backed fields still come from `values` and win as before;
+          // only the carried-over ones now source from the current record.
+          // The connected-sessions notice is UI, so it stays OUTSIDE the
+          // lock — a flag captured inside is read after the section ends.
+          let showConnectedNotice = false;
+          await configMutationLock.runExclusive(async () => {
+            const live = ctx.core.getSerialProfile(existing.id);
+            if (!live) {
+              throw new Error(`Serial profile "${existing.name}" was removed while this form was open. Nothing was saved.`);
+            }
+            const updated = formValuesToSerial(values, live);
+            if (!updated) {
+              return;
+            }
+            await ctx.core.addOrUpdateSerialProfile(updated);
+            showConnectedNotice = ctx.core.isSerialProfileConnected(existing.id);
+          });
+          if (showConnectedNotice) {
             void vscode.window.showInformationMessage(
               "Serial profile updated. Existing sessions keep current settings until reconnect."
             );

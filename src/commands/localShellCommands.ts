@@ -668,11 +668,31 @@ export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposab
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const updated = formValuesToLocalShell(values, existing);
-          if (!updated) {
-            throw new Error("Fill in the required local shell fields before saving.");
-          }
-          await ctx.core.addOrUpdateLocalShellProfile(updated);
+          // ISSUE #108 FOLLOW-UP (Codex review) — formValuesToLocalShell has
+          // no form field for `env`, so it always CARRIES it over from
+          // whatever `existing` it's handed. `existing` here was captured
+          // BEFORE the form opened, and the form can sit open indefinitely
+          // (same hazard the six rename/move handlers were fixed for
+          // earlier on this branch). Left alone, anything that updates env
+          // while the form is open gets silently reverted the moment this
+          // Save commits.
+          //
+          // Fix: serialize the write under configMutationLock (this path
+          // was unserialized before), and re-resolve the LIVE record inside
+          // the lock instead of building from the pre-form snapshot.
+          // Form-backed fields still come from `values` and win as before;
+          // only `env` now sources from the current record.
+          await configMutationLock.runExclusive(async () => {
+            const live = ctx.core.getLocalShellProfile(existing.id);
+            if (!live) {
+              throw new Error(`Local shell profile "${existing.name}" was removed while this form was open. Nothing was saved.`);
+            }
+            const updated = formValuesToLocalShell(values, live);
+            if (!updated) {
+              throw new Error("Fill in the required local shell fields before saving.");
+            }
+            await ctx.core.addOrUpdateLocalShellProfile(updated);
+          });
         }
       });
     }),

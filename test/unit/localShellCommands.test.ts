@@ -50,6 +50,14 @@ vi.mock("../../src/services/scripts/scriptPicker", () => ({
   pickScriptFromWorkspace: (...args: unknown[]) => mockPickScriptFromWorkspace(...args)
 }));
 
+const mockWebviewFormPanelOpen = vi.fn();
+
+vi.mock("../../src/ui/webviewFormPanel", () => ({
+  WebviewFormPanel: {
+    open: (...args: unknown[]) => mockWebviewFormPanelOpen(...args)
+  }
+}));
+
 vi.mock("vscode", () => ({
   EventEmitter: class<T> {
     private readonly listeners: Array<(event: T) => void> = [];
@@ -144,6 +152,7 @@ import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { FormValues } from "../../src/ui/formTypes";
 
 function makeProfile(overrides: Partial<LocalShellProfile> = {}): LocalShellProfile {
   return {
@@ -912,6 +921,83 @@ describe("nexus.localShell.remove — the disclosure is re-checked under the loc
       await renaming;
 
       expect(core.getLocalShellProfile("local-1")!.name).toBe("Ops");
+    });
+  });
+
+  describe("nexus.localShell.edit re-resolves under the lock (issue #108 followups)", () => {
+    beforeEach(() => {
+      // getConfiguredVscodeTerminalProfileNames() (called while building the
+      // edit form) reads terminal.integrated.profiles.* — hand back whatever
+      // fallback it asks for so it resolves to an empty profile list.
+      mockGetConfiguration.mockImplementation(() => ({
+        get: (_key: string, fallback?: unknown) => fallback
+      }));
+    });
+
+    /**
+     * Drives the edit form open, then returns the onSubmit callback the real
+     * WebviewFormPanel would invoke on Save. WebviewFormPanel itself is
+     * mocked (module-level `mockWebviewFormPanelOpen`) — its real
+     * implementation talks to `vscode.window.createWebviewPanel`, which this
+     * file's vscode mock doesn't provide.
+     */
+    async function editLocalShell(arg: unknown): Promise<(values: FormValues) => Promise<void>> {
+      const cmd = registeredCommands.get("nexus.localShell.edit");
+      expect(cmd).toBeDefined();
+      await cmd!(arg);
+      const call = mockWebviewFormPanelOpen.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const options = call![2] as { onSubmit: (values: FormValues) => Promise<void> };
+      return options.onSubmit;
+    }
+
+    it("does not revert an env set concurrently while the form was open (kills writing the pre-form snapshot's env)", async () => {
+      // formValuesToLocalShell has no form field for env — it always carries it
+      // over from whatever `existing` it's handed. The edit form captures
+      // `existing` BEFORE opening, so if anything updates env while the form
+      // sits open, submitting with the STALE pre-form snapshot silently
+      // reverts that concurrent change.
+      const { core } = await fixture([makeProfile({ env: { OLD: "1" } })]);
+
+      const onSubmit = await editLocalShell("local-1");
+
+      // Concurrent change while the form sat open.
+      await core.addOrUpdateLocalShellProfile({
+        ...core.getLocalShellProfile("local-1")!,
+        env: { NEW: "2" }
+      });
+
+      // Submit with unrelated changes — no env field exists on the form.
+      await onSubmit({
+        name: "Dev",
+        launchMode: "custom",
+        shellPath: "/bin/zsh",
+        cwd: "/workspace",
+        startupCommand: "echo ready"
+      } as unknown as FormValues);
+
+      const after = core.getLocalShellProfile("local-1")!;
+      // Load-bearing: { OLD: "1" } here means the submit reverted the concurrent change.
+      expect(after.env).toEqual({ NEW: "2" });
+      expect(after.shellPath).toBe("/bin/zsh");
+    });
+
+    it("throws and saves nothing when the profile was removed while the form was open", async () => {
+      const { core } = await fixture([makeProfile()]);
+
+      const onSubmit = await editLocalShell("local-1");
+
+      await core.removeLocalShellProfile("local-1");
+
+      await expect(
+        onSubmit({
+          name: "Dev",
+          launchMode: "custom",
+          shellPath: "/bin/zsh"
+        } as unknown as FormValues)
+      ).rejects.toThrow('Local shell profile "Dev" was removed while this form was open. Nothing was saved.');
+
+      expect(core.getLocalShellProfile("local-1")).toBeUndefined();
     });
   });
 });
