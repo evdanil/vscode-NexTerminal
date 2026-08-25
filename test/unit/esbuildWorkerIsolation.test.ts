@@ -30,7 +30,8 @@ function configFor(suffix: string) {
 describe("out-of-host bundles are isolated from the vscode module", () => {
   const OUT_OF_HOST = [
     ["the script worker", "scriptWorker.js"],
-    ["the network server daemon", "networkServerDaemon.js"]
+    ["the network server daemon", "networkServerDaemon.js"],
+    ["the serial sidecar worker", "serialSidecarWorker.js"]
   ] as const;
 
   for (const [label, suffix] of OUT_OF_HOST) {

@@ -7,10 +7,21 @@ import { createRequire } from "node:module";
  * Marking `vscode` external is what previously let such an import through:
  * esbuild then emits a bare `require("vscode")`, which resolves only under the
  * extension host's injected module loader. The script worker (a
- * node:worker_threads Worker) and the network server daemon (a bare Node child
- * process) have no such loader, so the import failed at RUNTIME, inside an
- * isolated process, instead of here. Both source files carried a comment saying
- * they must not import `vscode`; this enforces it.
+ * node:worker_threads Worker), the network server daemon, and the serial
+ * sidecar worker (both bare Node child processes) have no such loader, so the
+ * import failed at RUNTIME, inside an isolated process, instead of here. The
+ * script worker and the daemon source files each carry a comment saying they
+ * must not import `vscode`; this enforces it for all three out-of-host
+ * bundles, including the sidecar worker, which had no such comment to falsify
+ * but is isolated identically to the daemon and gets the same guard.
+ *
+ * Without this plugin, an accidental `vscode` import in one of these bundles
+ * still fails the build — esbuild cannot resolve a package named "vscode" —
+ * but with esbuild's own default hint: "You can mark the path \"vscode\" as
+ * external to exclude it from the bundle". That is precisely the wrong advice
+ * here, since marking it external is what causes the runtime crash this
+ * plugin exists to prevent at build time. This plugin's error replaces that
+ * hint with the correct instruction.
  *
  * Applied ONLY to the out-of-host bundles. dist/extension.js and
  * dist/webExtension.js legitimately keep `vscode` external — it is the host API
@@ -87,14 +98,18 @@ export function createBuildConfigs({ production }) {
       platform: "browser"
     },
 
-    // Serial sidecar worker — runs as a child process, needs serialport at
-    // runtime. serialport has native addons loaded via node-gyp-build and must
-    // stay in node_modules.
+    // Serial sidecar worker — runs as a bare child process (spawned by
+    // SerialSidecarManager), needs serialport at runtime. serialport has
+    // native addons loaded via node-gyp-build and must stay in node_modules.
+    // Out-of-host exactly like the daemon below: no extension host, no
+    // injected `vscode` loader, so it gets the same guard. The plugin's
+    // /^vscode$/ resolve filter does not touch the "serialport" external.
     {
       ...common,
       entryPoints: ["src/services/serial/serialSidecarWorker.ts"],
       outfile: "dist/services/serial/serialSidecarWorker.js",
-      external: ["serialport"]
+      external: ["serialport"],
+      plugins: [denyVscodeImport("The serial sidecar worker bundle")]
     },
 
     // Script runtime worker — runs in a node:worker_threads Worker spawned by
