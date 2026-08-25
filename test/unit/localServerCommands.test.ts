@@ -679,9 +679,27 @@ describe("moveToFolder destination picker", () => {
     expect(h.addOrUpdate).not.toHaveBeenCalled();
   });
 
-  it("no longer registers a Move to Root command", () => {
+  /**
+   * The menu entry is gone, the command ID is not: it shipped in a released
+   * version, so a user keybinding or task bound to it would break silently on
+   * upgrade. Kept registered but undeclared in package.json — the same hidden
+   * back-compat alias shape as `nexus.macro.slot` (the manifest side is
+   * asserted in localServerMenu.test.ts).
+   */
+  it("keeps Move to Root registered as a hidden back-compat alias", () => {
     moveHarness([{}]);
-    expect(registeredCommands.has("nexus.localServer.moveToRoot")).toBe(false);
+    expect(registeredCommands.has("nexus.localServer.moveToRoot")).toBe(true);
     expect(registeredCommands.has("nexus.localServer.moveToFolder")).toBe(true);
+  });
+
+  it("moveToRoot clears the group directly, with no destination picker", async () => {
+    const h = moveHarness([{ group: "Backends/APIs" }]);
+    await registeredCommands.get("nexus.localServer.moveToRoot")!({ config: { id: "cfg-1" } });
+    // Routing this through the folder picker instead would leave the server in
+    // its folder until a second choice was made — from a keybinding, the point
+    // of the alias, there is nobody to make it.
+    expect(quickPick).not.toHaveBeenCalled();
+    expect(h.saved).toHaveLength(1);
+    expect(h.saved[0].group).toBeUndefined();
   });
 });

@@ -14,6 +14,10 @@
  *                                   configMutationLock (same pattern as SSH)
  *   nexus.localServer.rename / duplicate / copyInfo / moveToFolder
  *                                   — standard CRUD inventory mutations
+ *   nexus.localServer.moveToRoot  — hidden back-compat alias (shipped before
+ *                                   moveToFolder replaced it, so keybindings
+ *                                   bound to it still work); deliberately not
+ *                                   in package.json, same as nexus.macro.slot
  *   nexus.localServer.inspectLogs — focus/reveal a running server's terminal
  *
  * The manager is injected via ctx (set up in extension.ts). Commands never
@@ -552,6 +556,15 @@ export function registerLocalServerCommands(
       const destination = await pickLocalServerFolderDestination(ctx, config);
       if (destination === undefined) return;
       await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: destination ?? undefined });
+    }),
+
+    // Undeclared in package.json — invisible in the palette and menus, but this
+    // ID shipped, so a keybinding or task bound to it keeps working. Its old
+    // one-step behaviour is kept as-is: root, no destination picker.
+    vscode.commands.registerCommand("nexus.localServer.moveToRoot", async (arg?: unknown) => {
+      const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Move to Root"));
+      if (!config) return;
+      await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: undefined });
     })
   ];
 }
