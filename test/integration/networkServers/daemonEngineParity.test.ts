@@ -64,6 +64,7 @@ import {
 } from "../../../src/services/networkServers/daemonHost";
 import { encodeRRQ, encodeWRQ, encodeACK, getOpcode } from "../../../src/services/networkServers/tftp/engine/protocol";
 import { createUdpClient, mkdtemp, sleep } from "../../helpers/networkServerTestHelpers";
+import { createBuildConfigs } from "../../../scripts/buildConfigs.mjs";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 
@@ -84,22 +85,32 @@ const NATIVE_BIN =
 /** The Node bundle, built once — also the fallback target a Rust run must NOT hit. */
 let daemonScript: string;
 
-/** Builds the daemon entry point exactly as `esbuild.mjs` does, into a temp dir. */
+/**
+ * Builds the daemon entry point through the SAME configuration object
+ * `esbuild.mjs` consumes (`scripts/buildConfigs.mjs`), overridden only for
+ * `outfile` (a temp dir here) and `absWorkingDir`. Using the real
+ * configuration rather than a hand-copied one means this comment cannot go
+ * stale again the way it did when the deny-vscode-import plugin replaced
+ * `external: ["vscode"]` on the daemon build (see
+ * test/unit/esbuildWorkerIsolation.test.ts, which asserts the plugin is on
+ * that same configuration object) — a hand-copied build here kept declaring
+ * `vscode` external and this comment kept claiming parity after the two had
+ * diverged.
+ */
 async function buildDaemonBundle(): Promise<string> {
   const esbuild = await import("esbuild");
   const outdir = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-parity-build-"));
   const outfile = path.join(outdir, "networkServerDaemon.js");
+  const daemonConfig = createBuildConfigs({ production: true }).find((config) =>
+    config.outfile.endsWith("networkServerDaemon.js")
+  );
+  if (!daemonConfig) {
+    throw new Error("no build config produces a file ending in networkServerDaemon.js");
+  }
   await esbuild.build({
-    bundle: true,
-    platform: "node",
-    target: "es2022",
-    format: "cjs",
-    sourcemap: false,
-    loader: { ".node": "empty" },
+    ...daemonConfig,
     absWorkingDir: REPO_ROOT,
-    entryPoints: ["src/services/networkServers/networkServerDaemon.ts"],
-    outfile,
-    external: ["vscode"]
+    outfile
   });
   return outfile;
 }
