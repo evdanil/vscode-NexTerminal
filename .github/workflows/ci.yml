@@ -167,9 +167,17 @@ jobs:
       - name: Require the version to have moved
         env:
           # The pull request's OWN head commit — not the merge commit GitHub
-          # checks out. The merge commit already contains current main, so
-          # reading the version from it passes a bump-less pull request as soon
-          # as main bumps for any other reason.
+          # checks out — read on TWO axes below: against its own fork point,
+          # and against current origin/main. Neither axis alone is enough.
+          # Head-vs-origin/main alone misses a branch that forked BEFORE
+          # main's own last bump and never bumped at all: if main moves on
+          # while the branch sits still, head and origin/main end up unequal
+          # even though this pull request changed nothing, and an unrelated
+          # main bump satisfies the comparison by accident. Head-vs-fork-point
+          # alone misses the opposite case: two branches independently bump to
+          # the same next version, and this one merges cleanly after the other
+          # already claimed that version's tag. Both checks are needed; see
+          # below for which failure each one guards.
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
@@ -182,13 +190,28 @@ jobs:
           git fetch --no-tags origin main
           base_version=$(read_version "origin/main")
           head_version=$(read_version "$HEAD_SHA")
+          merge_base=$(git merge-base "$HEAD_SHA" origin/main)
+          fork_version=$(read_version "$merge_base")
 
-          echo "origin/main: $base_version"
+          echo "fork point:        $fork_version"
+          echo "origin/main:       $base_version"
           echo "pull request head: $head_version"
 
-          if [ "$head_version" = "$base_version" ]; then
-            echo "::error title=Version not bumped::package.json is still $head_version, the same version as origin/main. Every maintainer-authored change pull request bumps the patch version (CLAUDE.md), so main is always ready to release. Without it, auto-release later refuses with \"tag v$head_version already exists\" and does not say why."
+          # This pull request itself must have changed the version. Compares
+          # against the version AT THE FORK POINT, not against current
+          # origin/main, precisely so a stale branch that forked before main's
+          # last bump can't pass just because main moved on without it.
+          if [ "$head_version" = "$fork_version" ]; then
+            echo "::error title=Version not bumped::package.json is still $head_version, unchanged since this pull request's fork point. Every maintainer-authored change pull request bumps the patch version (CLAUDE.md), so main is always ready to release — without the bump, auto-release later refuses with \"tag v$head_version already exists\" and does not say why. Bump the patch version in package.json on this branch and push."
             exit 1
           fi
 
-          echo "Version moved $base_version -> $head_version."
+          # ...and it must not have bumped to a version origin/main already
+          # holds — two branches independently bumping to the same next
+          # version and one merging after the other already claimed the tag.
+          if [ "$head_version" = "$base_version" ]; then
+            echo "::error title=Version not bumped::package.json is still $head_version, the same version as origin/main. Every maintainer-authored change pull request bumps the patch version (CLAUDE.md), so main is always ready to release — without the bump, auto-release later refuses with \"tag v$head_version already exists\" and does not say why. Bump the patch version in package.json on this branch and push."
+            exit 1
+          fi
+
+          echo "Version moved $fork_version -> $head_version (origin/main: $base_version)."
