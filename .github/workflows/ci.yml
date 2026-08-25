@@ -143,3 +143,52 @@ jobs:
         run: |
           npm ci
           npm run test:network-server-daemon:rust
+
+  policy:
+    name: Version bump
+    # OWNER-authored pull requests only, and never on push (a push to main has
+    # already merged — failing it reports a fact nobody can act on).
+    #
+    # CONTRIBUTING.md:147 tells outside contributors NOT to bump the version:
+    # concurrent pull requests would collide on that line, and the maintainer
+    # bumps separately when merging. Running this check on their pull requests
+    # would post a permanent red mark they are forbidden to clear. CLAUDE.md's
+    # per-pull-request bump rule is addressed to maintainer-authored work, and
+    # so is this job.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.author_association == 'OWNER'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require the version to have moved
+        env:
+          # The pull request's OWN head commit — not the merge commit GitHub
+          # checks out. The merge commit already contains current main, so
+          # reading the version from it passes a bump-less pull request as soon
+          # as main bumps for any other reason.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            git show "$1:package.json" \
+              | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version"
+          }
+
+          git fetch --no-tags origin main
+          base_version=$(read_version "origin/main")
+          head_version=$(read_version "$HEAD_SHA")
+
+          echo "origin/main: $base_version"
+          echo "pull request head: $head_version"
+
+          if [ "$head_version" = "$base_version" ]; then
+            echo "::error title=Version not bumped::package.json is still $head_version, the same version as origin/main. Every maintainer-authored change pull request bumps the patch version (CLAUDE.md), so main is always ready to release. Without it, auto-release later refuses with \"tag v$head_version already exists\" and does not say why."
+            exit 1
+          fi
+
+          echo "Version moved $base_version -> $head_version."
