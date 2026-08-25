@@ -14,6 +14,7 @@ vi.mock("vscode", () => ({
   window: {
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showQuickPick: vi.fn(),
+    showInputBox: vi.fn(),
     showInformationMessage: vi.fn(),
     showErrorMessage: vi.fn(),
     createTerminal: vi.fn(() => ({ show: vi.fn(), dispose: vi.fn() }))
@@ -672,5 +673,69 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
       'Serial profile "USB Console" changed while the confirmation was open — nothing was removed. ' +
         "Remove it again to review the current details."
     ]);
+  });
+
+  describe("nexus.serial.rename re-resolves under the lock (issue #108)", () => {
+    function renameSerial(arg: unknown): Promise<unknown> {
+      const cmd = registeredCommands.get("nexus.serial.rename");
+      expect(cmd).toBeDefined();
+      return Promise.resolve(cmd!(arg));
+    }
+
+    it("does not revert a concurrent edit's other fields", async () => {
+      // The rename captures the profile, then awaits an input box. While that box
+      // is open, an edit changes the baud rate. The rename must apply ONLY the
+      // name, to the CURRENT record — not write back the snapshot it captured
+      // before the prompt, which silently undoes the edit.
+      const { core } = await fixture([makeSerialProfile({ baudRate: 9600 })]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameSerial({ profile: core.getSerialProfile("sp1") });
+      await core.addOrUpdateSerialProfile({ ...core.getSerialProfile("sp1")!, baudRate: 115200 });
+
+      prompt.resolve("Lab Bench");
+      await renaming;
+
+      const after = core.getSerialProfile("sp1")!;
+      expect(after.name).toBe("Lab Bench");
+      // Load-bearing: 9600 here means the rename reverted the edit.
+      expect(after.baudRate).toBe(115200);
+    });
+
+    it("does not resurrect a profile removed during the prompt", async () => {
+      const { core } = await fixture([makeSerialProfile()]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameSerial({ profile: core.getSerialProfile("sp1") });
+      await core.removeSerialProfile("sp1");
+
+      prompt.resolve("Lab Bench");
+      await renaming;
+
+      expect(core.getSerialProfile("sp1")).toBeUndefined();
+    });
+
+    it("bails when a concurrent rename moved the name (#84 P2-1)", async () => {
+      // The prompt started from "USB Console". Something else renamed it to
+      // "Bench" while the box was open, so this prompt's decision was made
+      // against a name that no longer exists — writing it would overwrite the
+      // newer rename.
+      const { core } = await fixture([makeSerialProfile()]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameSerial({ profile: core.getSerialProfile("sp1") });
+      await core.addOrUpdateSerialProfile({ ...core.getSerialProfile("sp1")!, name: "Bench" });
+
+      prompt.resolve("Lab Bench");
+      await renaming;
+
+      expect(core.getSerialProfile("sp1")!.name).toBe("Bench");
+    });
   });
 });

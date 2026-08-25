@@ -850,4 +850,68 @@ describe("nexus.localShell.remove — the disclosure is re-checked under the loc
         "nothing was removed. Remove it again to review the current details."
     ]);
   });
+
+  describe("nexus.localShell.rename re-resolves under the lock (issue #108)", () => {
+    function renameLocalShell(arg: unknown): Promise<unknown> {
+      const cmd = registeredCommands.get("nexus.localShell.rename");
+      expect(cmd).toBeDefined();
+      return Promise.resolve(cmd!(arg));
+    }
+
+    it("does not revert a concurrent edit's other fields", async () => {
+      // The rename captures the profile, then awaits an input box. While that box
+      // is open, an edit changes the shell path. The rename must apply ONLY the
+      // name, to the CURRENT record — not write back the snapshot it captured
+      // before the prompt, which silently undoes the edit.
+      const { core } = await fixture([makeProfile({ shellPath: "/bin/bash" })]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameLocalShell({ profile: core.getLocalShellProfile("local-1") });
+      await core.addOrUpdateLocalShellProfile({ ...core.getLocalShellProfile("local-1")!, shellPath: "/bin/zsh" });
+
+      prompt.resolve("Build Box");
+      await renaming;
+
+      const after = core.getLocalShellProfile("local-1")!;
+      expect(after.name).toBe("Build Box");
+      // Load-bearing: "/bin/bash" here means the rename reverted the edit.
+      expect(after.shellPath).toBe("/bin/zsh");
+    });
+
+    it("does not resurrect a profile removed during the prompt", async () => {
+      const { core } = await fixture([makeProfile()]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameLocalShell({ profile: core.getLocalShellProfile("local-1") });
+      await core.removeLocalShellProfile("local-1");
+
+      prompt.resolve("Build Box");
+      await renaming;
+
+      expect(core.getLocalShellProfile("local-1")).toBeUndefined();
+    });
+
+    it("bails when a concurrent rename moved the name (#84 P2-1)", async () => {
+      // The prompt started from "Dev". Something else renamed it to "Ops"
+      // while the box was open, so this prompt's decision was made against a
+      // name that no longer exists — writing it would overwrite the newer
+      // rename.
+      const { core } = await fixture([makeProfile()]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameLocalShell({ profile: core.getLocalShellProfile("local-1") });
+      await core.addOrUpdateLocalShellProfile({ ...core.getLocalShellProfile("local-1")!, name: "Ops" });
+
+      prompt.resolve("Build Box");
+      await renaming;
+
+      expect(core.getLocalShellProfile("local-1")!.name).toBe("Ops");
+    });
+  });
 });

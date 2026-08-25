@@ -13,13 +13,18 @@
  *   nexus.localServer.remove      — disclosure-checked cascade removal under
  *                                   configMutationLock (same pattern as SSH)
  *   nexus.localServer.rename / duplicate / copyInfo / moveToFolder / moveToRoot
- *                                   — standard CRUD inventory mutations
+ *                                   — standard CRUD inventory mutations; rename
+ *                                   and moveToFolder re-read the live record
+ *                                   under configMutationLock (#108) since each
+ *                                   captures its config before an interactive
+ *                                   input box
  *   nexus.localServer.inspectLogs — focus/reveal a running server's terminal
  *
  * The manager is injected via ctx (set up in extension.ts). Commands never
  * write persisted config directly: they route through NexusCore methods that
  * themselves serialize through ConfigRepository, while configMutationLock
- * guards the destructive "remove" entry point against rename/import races.
+ * guards the destructive "remove" entry point, and rename/moveToFolder's
+ * stale-capture re-reads, against concurrent writes.
  */
 
 import { randomUUID } from "node:crypto";
@@ -349,9 +354,27 @@ export function registerLocalServerCommands(
         prompt: "Enter new name",
         validateInput: (value) => (value.trim() ? null : "Name cannot be empty")
       });
-      if (newName && newName.trim() !== config.name) {
-        await ctx.core.addOrUpdateLocalServerConfig({ ...config, name: newName.trim() });
-      }
+      if (!newName || newName.trim() === config.name) return;
+      const trimmedName = newName.trim();
+      // #108 — same fix, and the same reasoning, as nexus.server.rename (#84
+      // P1/P2-1): serialize under configMutationLock and RE-READ the live
+      // record inside the lock, applying ONLY the name. `config` was
+      // captured before the input box opened, and nexus.localServer.edit
+      // writes the same record; committing the captured full snapshot would
+      // revert that edit in every field except the one this prompt owns.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalServer(config.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT rename changed the name to some OTHER
+        // value while this box was open: writing here would overwrite that
+        // newer rename with a decision made against a stale name.
+        if (live.name !== config.name) {
+          return;
+        }
+        await ctx.core.addOrUpdateLocalServerConfig({ ...live, name: trimmedName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.localServer.duplicate", async (arg?: unknown) => {
@@ -380,7 +403,23 @@ export function registerLocalServerCommands(
       if (group === undefined) return;
       const normalized = normalizeOptionalFolderPath(group);
       if (normalized === null) return;
-      await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: normalized });
+      // #108 — same capture-then-write shape as nexus.localServer.rename just
+      // above (and nexus.server.rename, #84 P1/P2-1): `config` was captured
+      // before the input box opened, so re-read the live record under the
+      // lock and apply ONLY the field this prompt owns (`group`).
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalServer(config.id);
+        if (!live || live.group === normalized) {
+          return; // removed, or already moved to this folder, while the box was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT move changed the group to some OTHER
+        // value while this box was open: writing here would overwrite that
+        // newer move with a decision made against a stale folder path.
+        if (live.group !== config.group) {
+          return;
+        }
+        await ctx.core.addOrUpdateLocalServerConfig({ ...live, group: normalized });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.localServer.moveToRoot", async (arg?: unknown) => {

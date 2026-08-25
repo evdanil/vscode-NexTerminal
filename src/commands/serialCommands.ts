@@ -912,7 +912,33 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       if (!newName || newName.trim() === profile.name) {
         return;
       }
-      await ctx.core.addOrUpdateSerialProfile({ ...profile, name: newName.trim() });
+      const trimmedName = newName.trim();
+      // #108 — same fix, and the same reasoning, as nexus.server.rename
+      // (commands/serverCommands.ts, #84 P1/P2-1): serialize under
+      // configMutationLock and RE-READ the live record inside the lock,
+      // applying ONLY the name. `profile` was captured before the input box
+      // opened, and nexus.serial.edit writes the same record; committing the
+      // captured full snapshot would revert that edit in every field except
+      // the one this prompt owns. Acquiring the lock around the old write
+      // would NOT have fixed it — the value was already stale by then.
+      // rename holds no lock of its own and runs after the input box resolves,
+      // so there is no re-entrancy or interactive-UI-under-lock hazard.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getSerialProfile(profile.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT rename changed the name to some OTHER
+        // value while this box was open: the live name no longer matches what
+        // this prompt started from, so writing would overwrite the newer
+        // rename with a decision made against a stale name. (Re-reading the
+        // other fields above is safe to keep — they are not the field this
+        // prompt owns — but a moved name means the prompt itself is stale.)
+        if (live.name !== profile.name) {
+          return;
+        }
+        await ctx.core.addOrUpdateSerialProfile({ ...live, name: trimmedName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.serial.duplicate", async (arg?: unknown) => {
@@ -921,7 +947,10 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const copy = { ...profile, id: randomUUID(), name: `${profile.name} (copy)` };
-      await ctx.core.addOrUpdateSerialProfile(copy);
+      // #108 (serialization audit) — a fresh id means no existing record is at
+      // risk, so this is a plain serialization wrap for consistency with #84,
+      // not a re-resolve fix.
+      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateSerialProfile(copy));
     }),
 
     vscode.commands.registerCommand("nexus.serial.sendBreak", async () => {

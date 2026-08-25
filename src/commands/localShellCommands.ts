@@ -803,14 +803,36 @@ export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposab
         prompt: "Enter new name",
         validateInput: (value) => (value.trim() ? null : "Name cannot be empty")
       });
-      if (newName && newName.trim() !== profile.name) {
-        await ctx.core.addOrUpdateLocalShellProfile({ ...profile, name: newName.trim() });
-      }
+      if (!newName || newName.trim() === profile.name) return;
+      const trimmedName = newName.trim();
+      // #108 — same fix, and the same reasoning, as nexus.server.rename (#84
+      // P1/P2-1): serialize under configMutationLock and RE-READ the live
+      // record inside the lock, applying ONLY the name. `profile` was
+      // captured before the input box opened, and nexus.localShell.edit
+      // writes the same record; committing the captured full snapshot would
+      // revert that edit in every field except the one this prompt owns.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalShellProfile(profile.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT rename changed the name to some OTHER
+        // value while this box was open: writing here would overwrite that
+        // newer rename with a decision made against a stale name.
+        if (live.name !== profile.name) {
+          return;
+        }
+        await ctx.core.addOrUpdateLocalShellProfile({ ...live, name: trimmedName });
+      });
     }),
     vscode.commands.registerCommand("nexus.localShell.duplicate", async (arg?: unknown) => {
       const profile = toLocalShellProfileFromArg(ctx.core, arg) ?? (await pickLocalShellProfile(ctx.core));
       if (!profile) return;
-      await ctx.core.addOrUpdateLocalShellProfile({ ...profile, id: randomUUID(), name: `${profile.name} (copy)` });
+      const copy = { ...profile, id: randomUUID(), name: `${profile.name} (copy)` };
+      // #108 (serialization audit) — a fresh id means no existing record is at
+      // risk, so this is a plain serialization wrap for consistency with #84,
+      // not a re-resolve fix.
+      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateLocalShellProfile(copy));
     }),
     vscode.commands.registerCommand("nexus.localShell.copyInfo", async (arg?: unknown) => {
       const profile = toLocalShellProfileFromArg(ctx.core, arg) ?? (await pickLocalShellProfile(ctx.core));
