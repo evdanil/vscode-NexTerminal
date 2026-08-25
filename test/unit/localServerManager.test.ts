@@ -13,7 +13,7 @@
  * ever created.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { LocalServerConfig } from "../../src/models/localServer";
@@ -403,5 +403,82 @@ describe("LocalServerManager — env pass-through preserves unset / inherit / em
     expect(Object.prototype.hasOwnProperty.call(onTheWire.env, "INHERIT")).toBe(false);
     expect(onTheWire.env.WILDCARD).toBeNull();
     expect(onTheWire.env.EMPTY).toBe("");
+  });
+});
+
+/**
+ * STOPPING A SERVER THAT IS MID-BACKOFF.
+ *
+ * When an auto-restart profile crashes, handleExit() schedules a retry (up to
+ * a 30s backoff) and cleanupSession() unregisters the session. For that whole
+ * window the config has no session and no terminal entry, so it reads as "not
+ * running" everywhere — while a timer is quietly waiting to spawn it again.
+ *
+ * `start()` has always called that timer off, which is why palette Restart
+ * behaved. Nothing else did, so a Stop issued during the window reported "not
+ * running" and returned, and the process came back seconds later.
+ */
+describe("LocalServerManager — cancelPendingRestart", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+    createTerminalMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Fires the pty's close listener for the Nth spawn, as a crash would. */
+  function crash(spawnIndex: number, code: number): void {
+    const pty = vi.mocked(LocalShellPty).mock.results[spawnIndex].value as {
+      onDidClose: { mock: { calls: Array<[(code: number) => void]> } };
+    };
+    pty.onDidClose.mock.calls[0][0](code);
+  }
+
+  async function startCrashLooping(): Promise<{ manager: LocalServerManager; core: ReturnType<typeof fakeCore> }> {
+    const core = fakeCore();
+    core.getLocalServer = vi.fn(() => baseConfig({ autoRestart: true }));
+    const manager = fakeManager({ core, terminals: new Map() });
+    await manager.start(baseConfig({ autoRestart: true }));
+    crash(0, 1);
+    return { manager, core };
+  }
+
+  it("respawns after the backoff when nothing calls the restart off", async () => {
+    // The control case. Without it, the assertion below cannot tell a
+    // cancelled restart apart from a restart that was never scheduled.
+    vi.useFakeTimers();
+    await startCrashLooping();
+    expect(createTerminalMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(createTerminalMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports that a restart was pending, and keeps the process from coming back", async () => {
+    vi.useFakeTimers();
+    const { manager } = await startCrashLooping();
+    expect(manager.cancelPendingRestart("cfg-1")).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(createTerminalMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports false when there was nothing pending, so a caller can tell the two apart", () => {
+    const manager = fakeManager();
+    expect(manager.cancelPendingRestart("cfg-1")).toBe(false);
+  });
+
+  it("is what start() uses, so a user-initiated start still pre-empts a pending retry", async () => {
+    vi.useFakeTimers();
+    const { manager } = await startCrashLooping();
+    await manager.start(baseConfig({ autoRestart: true }));
+    expect(createTerminalMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    // The scheduled retry must not add a third terminal on top of the manual start.
+    expect(createTerminalMock).toHaveBeenCalledTimes(2);
   });
 });

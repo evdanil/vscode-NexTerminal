@@ -252,12 +252,14 @@ describe("palette fallback for stop / inspectLogs", () => {
   interface Harness {
     stopConfig: ReturnType<typeof vi.fn>;
     stop: ReturnType<typeof vi.fn>;
+    cancelPendingRestart: ReturnType<typeof vi.fn>;
     inspectLogsTerminal: ReturnType<typeof vi.fn>;
     terminal: { show: ReturnType<typeof vi.fn> };
   }
 
-  function harness(options: { runningConfigIds?: string[] } = {}): Harness {
+  function harness(options: { runningConfigIds?: string[]; restartPendingConfigIds?: string[] } = {}): Harness {
     const running = new Set(options.runningConfigIds ?? []);
+    const restartPending = new Set(options.restartPendingConfigIds ?? []);
     const terminal = { show: vi.fn() };
     const manager = {
       stop: vi.fn(async () => {}),
@@ -265,6 +267,7 @@ describe("palette fallback for stop / inspectLogs", () => {
       getActiveSessionIdForConfig: vi.fn((configId: string) =>
         running.has(configId) ? `session-for-${configId}` : undefined
       ),
+      cancelPendingRestart: vi.fn((configId: string) => restartPending.delete(configId)),
       inspectLogsTerminal: vi.fn(() => terminal)
     };
     const localServers = [
@@ -283,6 +286,7 @@ describe("palette fallback for stop / inspectLogs", () => {
     return {
       stopConfig: manager.stopConfig,
       stop: manager.stop,
+      cancelPendingRestart: manager.cancelPendingRestart,
       inspectLogsTerminal: manager.inspectLogsTerminal,
       terminal
     };
@@ -332,6 +336,27 @@ describe("palette fallback for stop / inspectLogs", () => {
     await registeredCommands.get("nexus.localServer.stop")!(undefined);
     expect(h.stopConfig).not.toHaveBeenCalled();
     expect(showInfo).toHaveBeenCalledWith('Local server "API" is not running.');
+  });
+
+  /**
+   * A crashed auto-restart profile spends its whole backoff window with no
+   * session, so the not-running pre-check fired, reported "not running" and
+   * returned — leaving the timer armed to spawn the process again seconds
+   * after the user explicitly stopped it.
+   */
+  it("stop calls off a pending auto-restart instead of reporting the config as merely not running", async () => {
+    const h = harness({ runningConfigIds: [], restartPendingConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    expect(h.cancelPendingRestart).toHaveBeenCalledWith("cfg-1");
+    // The old message claimed the user's stop had nothing to act on, while a
+    // restart it had just cancelled proves otherwise.
+    expect(showInfo).not.toHaveBeenCalledWith('Local server "API" is not running.');
+    expect(showInfo).toHaveBeenCalledWith(
+      'Local server "API" is stopped — its pending auto-restart was cancelled.'
+    );
   });
 
   it("stop still short-circuits on a session tree item without opening the picker", async () => {

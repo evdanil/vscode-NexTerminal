@@ -339,6 +339,28 @@ export class LocalServerManager implements vscode.Disposable {
     return this.entries.get(sessionId);
   }
 
+  /**
+   * Calls off an auto-restart that handleExit() has already scheduled, and
+   * forgets the crash history that armed it.
+   *
+   * There is a window — up to the 30s backoff ceiling — in which a crashed
+   * auto-restart profile has no session and no terminal entry, so it reads as
+   * "not running" everywhere, while a timer is quietly waiting to spawn it
+   * again. Anything that means "this server should not be running" has to say
+   * so here, not just to the (absent) session.
+   *
+   * Returns true only when a restart was actually pending, so callers can tell
+   * "nothing to do" apart from "I just called something off".
+   */
+  public cancelPendingRestart(configId: string): boolean {
+    this.restartAttempts.delete(configId);
+    const pending = this.restartTimers.get(configId);
+    if (!pending) return false;
+    clearTimeout(pending);
+    this.restartTimers.delete(configId);
+    return true;
+  }
+
   public assertTrusted(): void {
     if (vscode.workspace.isTrusted === false) {
       throw new LocalServerError(
@@ -351,14 +373,10 @@ export class LocalServerManager implements vscode.Disposable {
   public async start(config: LocalServerConfig, options: { automatic?: boolean } = {}): Promise<string> {
     this.assertTrusted();
     if (!options.automatic) {
-      // A start the user asked for clears the crash history; a restart this
-      // manager scheduled must not, or the cap resets itself every attempt.
-      this.restartAttempts.delete(config.id);
-      const pending = this.restartTimers.get(config.id);
-      if (pending) {
-        clearTimeout(pending);
-        this.restartTimers.delete(config.id);
-      }
+      // A start the user asked for clears the crash history and any restart it
+      // had already scheduled; a restart this manager scheduled must not, or
+      // the cap resets itself every attempt.
+      this.cancelPendingRestart(config.id);
     }
     if (this.getActiveSessionIdForConfig(config.id)) {
       throw new LocalServerError(
