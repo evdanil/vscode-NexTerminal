@@ -60,7 +60,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine whether native/ changed
+      - name: Determine whether the Rust engine needs exercising
         id: filter
         env:
           # A pull_request compares against its base; a push against the
@@ -83,17 +83,45 @@ jobs:
             exit 0
           fi
 
-          # `git diff --quiet -- native/` rather than piping into `grep -q`.
+          # WHY THIS IS WIDER THAN `native/` (Codex review, P1). The Rust engine
+          # is the PRODUCT DEFAULT (`nexus.networkServers.engine` defaults to
+          # "rust" in package.json), but the always-on `npm test` never
+          # exercises it: daemonEngineParity.test.ts resolves its engine from
+          # NEXUS_NETWORK_SERVERS_ENGINE and falls back to "node", and the only
+          # thing that sets that variable to "rust" is
+          # scripts/runNetworkServerDaemonRustParity.mjs — which runs solely in
+          # the native job below. So with a `native/`-only filter, a change to
+          # the TypeScript daemon host, the RPC contract, the parity harness, or
+          # the runner itself could break the engine users actually run while
+          # every check stayed green. Each path here can alter host<->daemon
+          # behaviour without touching a single .rs file:
+          #   native/                              the crates themselves
+          #   src/services/networkServers/         the TS host + wire protocol
+          #   test/integration/networkServers/     the parity harness
+          #   scripts/runNetworkServerDaemonRustParity.mjs   the runner
+          #   scripts/installNetworkServerDaemonArtifacts.mjs  artifact staging
+          #   scripts/buildConfigs.mjs             the daemon bundle's build config
+          RUST_RELEVANT_PATHS=(
+            native/
+            src/services/networkServers/
+            test/integration/networkServers/
+            scripts/runNetworkServerDaemonRustParity.mjs
+            scripts/installNetworkServerDaemonArtifacts.mjs
+            scripts/buildConfigs.mjs
+          )
+
+          # `git diff --quiet -- <paths>` rather than piping into `grep -q`.
           # Under `set -o pipefail`, grep -q exits at the first match and can
           # SIGPIPE git diff (exit 141), which would take the else branch and
-          # report native=false on a large diff that DID touch native/.
+          # report native=false on a large diff that DID touch a relevant path.
           # --quiet exits 0 for "no differences", 1 for "differences".
-          if git diff --quiet "$BASE" "$HEAD" -- native/; then
+          if git diff --quiet "$BASE" "$HEAD" -- "${RUST_RELEVANT_PATHS[@]}"; then
             echo "native=false" >> "$GITHUB_OUTPUT"
-            echo "Decision: native=false (no changes under native/ between $BASE and $HEAD) — the Rust job is skipped."
+            echo "Decision: native=false (none of ${RUST_RELEVANT_PATHS[*]} changed between $BASE and $HEAD) — the Rust job is skipped."
           else
             echo "native=true" >> "$GITHUB_OUTPUT"
-            echo "Decision: native=true (native/ changed) — the Rust job runs."
+            echo "Decision: native=true (a Rust-relevant path changed) — the Rust job runs."
+            git diff --name-only "$BASE" "$HEAD" -- "${RUST_RELEVANT_PATHS[@]}" | sed 's/^/  /'
           fi
 
   native:
@@ -206,12 +234,36 @@ jobs:
             exit 1
           fi
 
-          # ...and it must not have bumped to a version origin/main already
-          # holds — two branches independently bumping to the same next
-          # version and one merging after the other already claimed the tag.
-          if [ "$head_version" = "$base_version" ]; then
-            echo "::error title=Version not bumped::package.json is still $head_version, the same version as origin/main. Every maintainer-authored change pull request bumps the patch version (CLAUDE.md), so main is always ready to release — without the bump, auto-release later refuses with \"tag v$head_version already exists\" and does not say why. Bump the patch version in package.json on this branch and push."
+          # ...and it must be STRICTLY GREATER than what origin/main holds
+          # (Codex review, P2). Equality alone was not enough, and passed two
+          # bad cases:
+          #   - the STALE BUMP: fork at 2.8.207, branch bumps to 2.8.208, main
+          #     meanwhile advances to 2.8.209. 2.8.208 differs from both, so
+          #     both equality tests passed — yet merging moves main BACKWARD to
+          #     a version whose tag may already exist, and auto-release then
+          #     refuses the next release with "tag already exists".
+          #   - the DOWNGRADE: any accidental edit to a lower version passed for
+          #     exactly the same reason.
+          # Ordering is the property actually wanted; equality was only ever a
+          # proxy for it. Deliberately NOT "must equal main's next patch" — a
+          # minor or major bump is legitimate and this must not reject one.
+          if ! node -e '
+            const parse = (v) => {
+              const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v.trim());
+              if (!m) {
+                console.error(`Cannot compare non x.y.z version: "${v}"`);
+                process.exit(2);
+              }
+              return m.slice(1, 4).map(Number);
+            };
+            const [a, b] = [parse(process.argv[1]), parse(process.argv[2])];
+            for (let i = 0; i < 3; i++) {
+              if (a[i] !== b[i]) process.exit(a[i] > b[i] ? 0 : 1);
+            }
+            process.exit(1);
+          ' "$head_version" "$base_version"; then
+            echo "::error title=Version must move forward::package.json is $head_version, which is not greater than origin/main's $base_version. Merging this would move main backward, onto a version whose tag may already exist — auto-release would then refuse the next release with \"tag already exists\" without saying why. Bump package.json above $base_version on this branch and push."
             exit 1
           fi
 
-          echo "Version moved $fork_version -> $head_version (origin/main: $base_version)."
+          echo "Version moved $fork_version -> $head_version, ahead of origin/main ($base_version)."
