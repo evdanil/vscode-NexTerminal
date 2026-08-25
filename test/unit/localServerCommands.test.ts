@@ -257,9 +257,16 @@ describe("palette fallback for stop / inspectLogs", () => {
     terminal: { show: ReturnType<typeof vi.fn> };
   }
 
-  function harness(options: { runningConfigIds?: string[]; restartPendingConfigIds?: string[] } = {}): Harness {
+  function harness(
+    options: {
+      runningConfigIds?: string[];
+      restartPendingConfigIds?: string[];
+      stoppingConfigIds?: string[];
+    } = {}
+  ): Harness {
     const running = new Set(options.runningConfigIds ?? []);
     const restartPending = new Set(options.restartPendingConfigIds ?? []);
+    const stopping = new Set(options.stoppingConfigIds ?? []);
     const terminal = { show: vi.fn() };
     const manager = {
       stop: vi.fn(async () => {}),
@@ -268,6 +275,7 @@ describe("palette fallback for stop / inspectLogs", () => {
         running.has(configId) ? `session-for-${configId}` : undefined
       ),
       cancelPendingRestart: vi.fn((configId: string) => restartPending.delete(configId)),
+      isStoppingConfig: vi.fn((configId: string) => stopping.has(configId)),
       inspectLogsTerminal: vi.fn(() => terminal)
     };
     const localServers = [
@@ -357,6 +365,23 @@ describe("palette fallback for stop / inspectLogs", () => {
     expect(showInfo).toHaveBeenCalledWith(
       'Local server "API" is stopped — its pending auto-restart was cancelled.'
     );
+  });
+
+  /**
+   * `getActiveSessionIdForConfig` excludes a session that is stopping so that
+   * restart() can re-start the config without a false ServerAlreadyRunning.
+   * The tree counts the same state as running and draws the row as
+   * "stopping", so "is not running" contradicts what is on screen.
+   */
+  it("says a stopping server is stopping, not that it is not running", async () => {
+    const h = harness({ runningConfigIds: [], stoppingConfigIds: ["cfg-1"] });
+    quickPick.mockImplementation(async (items: Array<{ config: { id: string } }>) =>
+      items.find((i) => i.config.id === "cfg-1")
+    );
+    await registeredCommands.get("nexus.localServer.stop")!(undefined);
+    expect(showInfo).not.toHaveBeenCalledWith('Local server "API" is not running.');
+    expect(showInfo).toHaveBeenCalledWith('Local server "API" is already stopping.');
+    expect(h.stopConfig).not.toHaveBeenCalled();
   });
 
   it("stop still short-circuits on a session tree item without opening the picker", async () => {

@@ -482,3 +482,59 @@ describe("LocalServerManager — cancelPendingRestart", () => {
     expect(createTerminalMock).toHaveBeenCalledTimes(2);
   });
 });
+
+/**
+ * THE ≤2s WINDOW WHERE A SERVER IS NEITHER RUNNING NOR STOPPED.
+ *
+ * getActiveSessionIdForConfig() reports a stopping session as not running so
+ * restart() can re-start the config without a false ServerAlreadyRunning.
+ * That is the right answer to "may I start?" and the wrong one to "what do I
+ * tell the user?" — the tree counts `stopping` as running and draws the row
+ * as such. isStoppingConfig() is what tells the two questions apart.
+ */
+describe("LocalServerManager — isStoppingConfig", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockPathExists.clear();
+    mockStatEntries.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+    createTerminalMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports a session that is between stop() and teardown, which reads as not-running elsewhere", async () => {
+    vi.useFakeTimers();
+    const terminals = new Map();
+    const manager = fakeManager({ terminals });
+    const sessionId = await manager.start(baseConfig());
+    expect(manager.getActiveSessionIdForConfig("cfg-1")).toBe(sessionId);
+    expect(manager.isStoppingConfig("cfg-1")).toBe(false);
+
+    await manager.stop(sessionId, true);
+    // Both halves matter: the first is why the "not running" message fired,
+    // the second is what now keeps it from being said.
+    expect(manager.getActiveSessionIdForConfig("cfg-1")).toBeUndefined();
+    expect(manager.isStoppingConfig("cfg-1")).toBe(true);
+  });
+
+  it("stops reporting once the grace timer has finalized the session", async () => {
+    vi.useFakeTimers();
+    const manager = fakeManager({ terminals: new Map() });
+    const sessionId = await manager.start(baseConfig());
+    await manager.stop(sessionId, true);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(manager.isStoppingConfig("cfg-1")).toBe(false);
+  });
+
+  it("does not report an unrelated config", async () => {
+    vi.useFakeTimers();
+    const manager = fakeManager({ terminals: new Map() });
+    const sessionId = await manager.start(baseConfig());
+    await manager.stop(sessionId, true);
+    expect(manager.isStoppingConfig("cfg-other")).toBe(false);
+  });
+});

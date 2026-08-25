@@ -340,6 +340,24 @@ export class LocalServerManager implements vscode.Disposable {
   }
 
   /**
+   * True while a session for this config sits between stop() and its final
+   * teardown — the ≤2s grace window bounded by LOCAL_SERVER_STOP_GRACE_MS.
+   *
+   * getActiveSessionIdForConfig() deliberately reports such a session as NOT
+   * running, so that restart() can re-start the config without tripping
+   * ServerAlreadyRunning. That answer is right for "may I start?" and wrong
+   * for "what do I tell the user?": the tree row still reads "stopping", so a
+   * message saying the server is not running contradicts what is on screen.
+   */
+  public isStoppingConfig(configId: string): boolean {
+    for (const [sessionId, entry] of this.options.terminals.entries()) {
+      if (entry.configId !== configId) continue;
+      if (this.entries.get(sessionId)?.stopping) return true;
+    }
+    return false;
+  }
+
+  /**
    * Calls off an auto-restart that handleExit() has already scheduled, and
    * forgets the crash history that armed it.
    *

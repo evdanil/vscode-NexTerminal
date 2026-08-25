@@ -246,6 +246,14 @@ export function registerLocalServerCommands(
         // stopConfig no-ops on a config with nothing running, so say so rather
         // than swallowing the request the way the old dead end did.
         if (!manager.getActiveSessionIdForConfig(config.id)) {
+          // A session already on its way down is excluded from
+          // getActiveSessionIdForConfig so restart() can re-start the config
+          // immediately — but the tree row still reads "stopping" for that
+          // window, so "is not running" here reads as affirmatively wrong.
+          if (manager.isStoppingConfig(config.id)) {
+            void vscode.window.showInformationMessage(`Local server "${config.name}" is already stopping.`);
+            return;
+          }
           // "Nothing running" is not the same as "nothing about to run". A
           // crashed auto-restart profile spends its whole backoff window —
           // up to 30s — with no session, and reporting "not running" and
