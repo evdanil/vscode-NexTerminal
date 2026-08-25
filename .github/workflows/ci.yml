@@ -90,8 +90,10 @@ jobs:
           # --quiet exits 0 for "no differences", 1 for "differences".
           if git diff --quiet "$BASE" "$HEAD" -- native/; then
             echo "native=false" >> "$GITHUB_OUTPUT"
+            echo "Decision: native=false (no changes under native/ between $BASE and $HEAD) — the Rust job is skipped."
           else
             echo "native=true" >> "$GITHUB_OUTPUT"
+            echo "Decision: native=true (native/ changed) — the Rust job runs."
           fi
 
   native:
