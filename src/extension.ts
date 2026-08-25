@@ -69,6 +69,7 @@ import {
   applyActiveTerminalChange,
   clearTrackedSessionActivity,
   focusSessionTerminal,
+  type SessionTerminalType,
   type TerminalFocusChangeOptions
 } from "./utils/sessionTerminalFocus";
 import { resolveScriptSessionForTerminal, resolveSessionForTerminal } from "./utils/terminalSessionLookup";
@@ -1272,13 +1273,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     }
   });
 
-  const focusSessionCommand = vscode.commands.registerCommand("nexus.focusSessionTerminal", (sessionId: string, type: "ssh" | "serial" | "localShell") => {
+  const focusSessionCommand = vscode.commands.registerCommand("nexus.focusSessionTerminal", (sessionId: string, type: SessionTerminalType) => {
     focusSessionTerminal(
       {
         core,
         sessionTerminals,
         serialTerminals,
         localShellTerminals,
+        localServerTerminals,
         activityIndicators: ctx.activityIndicators,
         onTerminalFocused: (terminal) => {
           ctx.focusedTerminal = terminal;
