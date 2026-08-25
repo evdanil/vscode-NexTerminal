@@ -14,6 +14,7 @@ vi.mock("vscode", () => ({
   window: {
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showQuickPick: vi.fn(),
+    showInputBox: vi.fn(),
     showInformationMessage: vi.fn(),
     showErrorMessage: vi.fn(),
     createTerminal: vi.fn(() => ({ show: vi.fn(), dispose: vi.fn() }))
@@ -70,6 +71,14 @@ vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
   createSessionTranscript: vi.fn(() => undefined)
 }));
 
+const mockWebviewFormPanelOpen = vi.fn();
+
+vi.mock("../../src/ui/webviewFormPanel", () => ({
+  WebviewFormPanel: {
+    open: (...args: unknown[]) => mockWebviewFormPanelOpen(...args)
+  }
+}));
+
 import * as vscode from "vscode";
 import { formValuesToSerial, registerSerialCommands } from "../../src/commands/serialCommands";
 import type { CommandContext } from "../../src/commands/types";
@@ -77,6 +86,7 @@ import { NexusCore } from "../../src/core/nexusCore";
 import type { SerialProfile } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { FormValues } from "../../src/ui/formTypes";
 
 describe("formValuesToSerial", () => {
   beforeEach(() => {
@@ -672,5 +682,144 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
       'Serial profile "USB Console" changed while the confirmation was open — nothing was removed. ' +
         "Remove it again to review the current details."
     ]);
+  });
+
+  describe("nexus.serial.rename re-resolves under the lock (issue #108)", () => {
+    function renameSerial(arg: unknown): Promise<unknown> {
+      const cmd = registeredCommands.get("nexus.serial.rename");
+      expect(cmd).toBeDefined();
+      return Promise.resolve(cmd!(arg));
+    }
+
+    it("does not revert a concurrent edit's other fields", async () => {
+      // The rename captures the profile, then awaits an input box. While that box
+      // is open, an edit changes the baud rate. The rename must apply ONLY the
+      // name, to the CURRENT record — not write back the snapshot it captured
+      // before the prompt, which silently undoes the edit.
+      const { core } = await fixture([makeSerialProfile({ baudRate: 9600 })]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameSerial({ profile: core.getSerialProfile("sp1") });
+      await core.addOrUpdateSerialProfile({ ...core.getSerialProfile("sp1")!, baudRate: 115200 });
+
+      prompt.resolve("Lab Bench");
+      await renaming;
+
+      const after = core.getSerialProfile("sp1")!;
+      expect(after.name).toBe("Lab Bench");
+      // Load-bearing: 9600 here means the rename reverted the edit.
+      expect(after.baudRate).toBe(115200);
+    });
+
+    it("does not resurrect a profile removed during the prompt", async () => {
+      const { core } = await fixture([makeSerialProfile()]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameSerial({ profile: core.getSerialProfile("sp1") });
+      await core.removeSerialProfile("sp1");
+
+      prompt.resolve("Lab Bench");
+      await renaming;
+
+      expect(core.getSerialProfile("sp1")).toBeUndefined();
+    });
+
+    it("bails when a concurrent rename moved the name (#84 P2-1)", async () => {
+      // The prompt started from "USB Console". Something else renamed it to
+      // "Bench" while the box was open, so this prompt's decision was made
+      // against a name that no longer exists — writing it would overwrite the
+      // newer rename.
+      const { core } = await fixture([makeSerialProfile()]);
+
+      const prompt = deferred<string>();
+      vi.mocked(vscode.window.showInputBox).mockReturnValue(prompt.promise as never);
+
+      const renaming = renameSerial({ profile: core.getSerialProfile("sp1") });
+      await core.addOrUpdateSerialProfile({ ...core.getSerialProfile("sp1")!, name: "Bench" });
+
+      prompt.resolve("Lab Bench");
+      await renaming;
+
+      expect(core.getSerialProfile("sp1")!.name).toBe("Bench");
+    });
+  });
+
+  describe("nexus.serial.edit re-resolves under the lock (issue #108 followups)", () => {
+    /**
+     * Drives the edit form open, then returns the onSubmit callback the real
+     * WebviewFormPanel would invoke on Save. WebviewFormPanel itself is
+     * mocked (module-level `mockWebviewFormPanelOpen`) — its real
+     * implementation talks to `vscode.window.createWebviewPanel`, which this
+     * file's vscode mock doesn't provide.
+     */
+    async function editSerial(arg: unknown): Promise<(values: FormValues) => Promise<void>> {
+      const cmd = registeredCommands.get("nexus.serial.edit");
+      expect(cmd).toBeDefined();
+      await cmd!(arg);
+      const call = mockWebviewFormPanelOpen.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      const options = call![2] as { onSubmit: (values: FormValues) => Promise<void> };
+      return options.onSubmit;
+    }
+
+    it("does not revert a deviceHint set concurrently while the form was open (kills writing the pre-form snapshot's deviceHint)", async () => {
+      // formValuesToSerial has no form field for deviceHint — it always carries
+      // it over from whatever `existing` it's handed. The edit form captures
+      // `existing` BEFORE opening, so if Smart Follow (or anything else) updates
+      // deviceHint while the form sits open, submitting with the STALE
+      // pre-form snapshot silently reverts that concurrent change.
+      const { core } = await fixture([
+        makeSerialProfile({ mode: "smartFollow", deviceHint: { manufacturer: "Old Co" } })
+      ]);
+
+      const onSubmit = await editSerial("sp1");
+
+      // Concurrent change while the form sat open — e.g. Smart Follow's
+      // onResolvedPort updating the saved hardware hint.
+      await core.addOrUpdateSerialProfile({
+        ...core.getSerialProfile("sp1")!,
+        deviceHint: { manufacturer: "New Co", serialNumber: "SN-42" }
+      });
+
+      // Submit with unrelated changes — no deviceHint field exists on the form.
+      await onSubmit({
+        name: "USB Console",
+        path: "COM3",
+        baudRate: "9600",
+        dataBits: "8",
+        stopBits: "1",
+        parity: "none"
+      } as unknown as FormValues);
+
+      const after = core.getSerialProfile("sp1")!;
+      // Load-bearing: "Old Co" here means the submit reverted the concurrent change.
+      expect(after.deviceHint).toEqual({ manufacturer: "New Co", serialNumber: "SN-42" });
+      expect(after.baudRate).toBe(9600);
+    });
+
+    it("throws and saves nothing when the profile was removed while the form was open", async () => {
+      const { core } = await fixture([makeSerialProfile()]);
+
+      const onSubmit = await editSerial("sp1");
+
+      await core.removeSerialProfile("sp1");
+
+      await expect(
+        onSubmit({
+          name: "USB Console",
+          path: "COM3",
+          baudRate: "9600",
+          dataBits: "8",
+          stopBits: "1",
+          parity: "none"
+        } as unknown as FormValues)
+      ).rejects.toThrow('Serial profile "USB Console" was removed while this form was open. Nothing was saved.');
+
+      expect(core.getSerialProfile("sp1")).toBeUndefined();
+    });
   });
 });

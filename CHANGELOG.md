@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.8.208] — 2026-08-25
+
+### Fixed
+
+- **Renaming a profile no longer discards an edit made while the rename box was open.** Rename, Move to Folder and Move to Root each read the profile, waited on your input, and then wrote the whole profile back as it looked *before* you were asked — so anything changed in the meantime was silently reverted, keeping only the new name or folder. Editing a profile in one place while renaming it from another is an unusual thing to do, but when it happened the edit disappeared without a word. All six commands now re-read the current record and change only the field they own, and a rename that finds the name already changed by something else steps aside rather than overwriting it. Affects serial profiles, local shell profiles, local servers and network server profiles.
+
+- **Editing a serial or local shell profile no longer reverts settings the form does not show.** The edit form rebuilt the profile from a snapshot taken when it opened, and a few fields are not on the form — the detected device hint and connection mode for serial profiles, the environment variables for local shell profiles. If those changed while the form sat open, saving put the old values back. The form now merges what you typed onto the profile as it currently stands. A profile deleted while its form is open reports that instead of quietly reappearing.
+
+### Changed
+
+- **Internal: the project now verifies every change before it lands rather than at publish time.** Builds, the full test suite and the Rust engine's parity checks previously ran only while publishing a release — the first moment a failure could no longer be taken back. They now run on every proposed change. Nothing about using the extension changes; this is about the version you install having been checked at a point where a problem still costs nothing.
+
+
 ## [2.8.207] — 2026-08-23
 
 ### Added

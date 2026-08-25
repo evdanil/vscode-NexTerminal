@@ -12,18 +12,31 @@
  *   nexus.localServer.edit        — open a WebviewFormPanel edit form
  *   nexus.localServer.remove      — disclosure-checked cascade removal under
  *                                   configMutationLock (same pattern as SSH)
- *   nexus.localServer.rename / duplicate / copyInfo / moveToFolder
+ *   nexus.localServer.rename / duplicate / copyInfo
  *                                   — standard CRUD inventory mutations
+ *   nexus.localServer.moveToFolder— the single unified move command: one
+ *                                   destination picker offering "(root)",
+ *                                   "New folder…" and every existing folder
  *   nexus.localServer.moveToRoot  — hidden back-compat alias (shipped before
- *                                   moveToFolder replaced it, so keybindings
- *                                   bound to it still work); deliberately not
- *                                   in package.json, same as nexus.macro.slot
+ *                                   moveToFolder's picker replaced it, so a
+ *                                   keybinding bound to it still works);
+ *                                   deliberately not declared in package.json,
+ *                                   same as nexus.macro.slot
  *   nexus.localServer.inspectLogs — focus/reveal a running server's terminal
+ *
+ * rename, moveToFolder, and moveToRoot each re-read the live record under
+ * configMutationLock before writing (#108): all three capture their config
+ * before an interactive pause — the rename input box, moveToFolder's
+ * destination picker, or, on the palette path, pickLocalServer's own quick
+ * pick — and each writes ONLY the field it owns, bailing out if the record was
+ * removed, already holds the target value, or was concurrently changed to some
+ * other value while the prompt was open.
  *
  * The manager is injected via ctx (set up in extension.ts). Commands never
  * write persisted config directly: they route through NexusCore methods that
  * themselves serialize through ConfigRepository, while configMutationLock
- * guards the destructive "remove" entry point against rename/import races.
+ * guards the destructive "remove" entry point, and rename/moveToFolder/
+ * moveToRoot's stale-capture re-reads, against concurrent writes.
  */
 
 import { randomUUID } from "node:crypto";
@@ -531,9 +544,27 @@ export function registerLocalServerCommands(
         prompt: "Enter new name",
         validateInput: (value) => (value.trim() ? null : "Name cannot be empty")
       });
-      if (newName && newName.trim() !== config.name) {
-        await ctx.core.addOrUpdateLocalServerConfig({ ...config, name: newName.trim() });
-      }
+      if (!newName || newName.trim() === config.name) return;
+      const trimmedName = newName.trim();
+      // #108 — same fix, and the same reasoning, as nexus.server.rename (#84
+      // P1/P2-1): serialize under configMutationLock and RE-READ the live
+      // record inside the lock, applying ONLY the name. `config` was
+      // captured before the input box opened, and nexus.localServer.edit
+      // writes the same record; committing the captured full snapshot would
+      // revert that edit in every field except the one this prompt owns.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalServer(config.id);
+        if (!live || live.name === trimmedName) {
+          return; // removed, or already renamed to this value, while the box was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT rename changed the name to some OTHER
+        // value while this box was open: writing here would overwrite that
+        // newer rename with a decision made against a stale name.
+        if (live.name !== config.name) {
+          return;
+        }
+        await ctx.core.addOrUpdateLocalServerConfig({ ...live, name: trimmedName });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.localServer.duplicate", async (arg?: unknown) => {
@@ -555,7 +586,25 @@ export function registerLocalServerCommands(
       if (!config) return;
       const destination = await pickLocalServerFolderDestination(ctx, config);
       if (destination === undefined) return;
-      await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: destination ?? undefined });
+      // `null` is the picker's "(root)" choice; the stored field is optional.
+      const target = destination ?? undefined;
+      // #108 — same capture-then-write shape as nexus.localServer.rename just
+      // above (and nexus.server.rename, #84 P1/P2-1): `config` was captured
+      // before the destination picker opened, so re-read the live record under
+      // the lock and apply ONLY the field this prompt owns (`group`).
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalServer(config.id);
+        if (!live || live.group === target) {
+          return; // removed, or already in this folder, while the picker was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT move changed the group to some OTHER
+        // value while the picker was open: writing here would overwrite that
+        // newer move with a decision made against a stale folder path.
+        if (live.group !== config.group) {
+          return;
+        }
+        await ctx.core.addOrUpdateLocalServerConfig({ ...live, group: target });
+      });
     }),
 
     // Undeclared in package.json — invisible in the palette and menus, but this
@@ -564,7 +613,24 @@ export function registerLocalServerCommands(
     vscode.commands.registerCommand("nexus.localServer.moveToRoot", async (arg?: unknown) => {
       const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Move to Root"));
       if (!config) return;
-      await ctx.core.addOrUpdateLocalServerConfig({ ...config, group: undefined });
+      // #108 — same capture-then-write shape as nexus.localServer.moveToFolder
+      // just above: on the palette path `config` comes from pickLocalServer's
+      // quick pick, which embeds a snapshot taken when the picker OPENED, and
+      // the user may sit on it for an unbounded time. Re-read the live record
+      // under the lock and apply ONLY the field this command owns (`group`).
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalServer(config.id);
+        if (!live || live.group === undefined) {
+          return; // removed, or already at the root, while the picker was open
+        }
+        // #84 P2-1 — BAIL if a CONCURRENT move changed the group to some OTHER
+        // value while the picker was open: writing here would overwrite that
+        // newer move with a decision made against a stale folder path.
+        if (live.group !== config.group) {
+          return;
+        }
+        await ctx.core.addOrUpdateLocalServerConfig({ ...live, group: undefined });
+      });
     })
   ];
 }

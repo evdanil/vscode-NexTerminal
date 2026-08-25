@@ -95,6 +95,10 @@ import * as vscode from "vscode";
 import { formValuesToLocalServer, registerLocalServerCommands } from "../../src/commands/localServerCommands";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import type { FormValues } from "../../src/ui/formTypes";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { CommandContext } from "../../src/commands/types";
+import type { LocalServerManager } from "../../src/services/local/localServerManager";
 
 beforeEach(() => {
   registeredCommands.clear();
@@ -701,5 +705,287 @@ describe("moveToFolder destination picker", () => {
     expect(quickPick).not.toHaveBeenCalled();
     expect(h.saved).toHaveLength(1);
     expect(h.saved[0].group).toBeUndefined();
+  });
+});
+
+function makeLocalServerConfig(overrides: Partial<LocalServerConfig> = {}): LocalServerConfig {
+  return {
+    id: "ls1",
+    name: "Dev Server",
+    executable: "node",
+    group: "Backend",
+    ...overrides
+  };
+}
+
+async function fixture(configs: LocalServerConfig[]): Promise<{ core: NexusCore }> {
+  const repo = new InMemoryConfigRepository([], [], [], [], [], [], configs);
+  const core = new NexusCore(repo);
+  await core.initialize();
+  const ctx = {
+    core,
+    localServerTerminals: new Map(),
+    localServerManager: {}
+  } as unknown as CommandContext & { localServerManager: LocalServerManager };
+  registerLocalServerCommands(ctx);
+  return { core };
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * nexus.localServer.moveToRoot has no input box of its own, but on the
+ * command-palette path (invoked with no arg) it falls through to
+ * pickLocalServer, whose quick pick embeds a config snapshot taken at
+ * OPEN time — same capture-then-write shape as rename / moveToFolder just
+ * fixed for #108, only the interactive pause is the picker instead of an
+ * input box.
+ */
+describe("nexus.localServer.moveToRoot re-resolves under the lock (issue #108)", () => {
+  function moveToRoot(arg?: unknown): Promise<unknown> {
+    const cmd = registeredCommands.get("nexus.localServer.moveToRoot");
+    expect(cmd).toBeDefined();
+    return Promise.resolve(cmd!(arg));
+  }
+
+  it("does not revert a concurrent edit's other fields", async () => {
+    // pickLocalServer captures the config when the quick pick opens, then the
+    // picker awaits the user for an unbounded time. While it is open, an edit
+    // changes the executable. moveToRoot must apply ONLY group: undefined, to
+    // the CURRENT record — not write back the pre-picker snapshot, which
+    // silently undoes the edit to every other field.
+    const { core } = await fixture([makeLocalServerConfig({ executable: "node" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, executable: "python" });
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBeUndefined();
+    // Load-bearing: "node" here means moveToRoot reverted the concurrent edit.
+    expect(after.executable).toBe("python");
+  });
+
+  it("does not resurrect a config removed during the prompt", async () => {
+    const { core } = await fixture([makeLocalServerConfig()]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.removeLocalServerConfig("ls1");
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    expect(core.getLocalServer("ls1")).toBeUndefined();
+  });
+
+  it("bails when a concurrent move changed the group to some OTHER value (#84 P2-1)", async () => {
+    // The picker opened against group "Backend". Something else moved the
+    // record to "Frontend" while it was open, so this picker's decision was
+    // made against a folder that no longer applies — writing group: undefined
+    // here would overwrite that newer move.
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, group: "Frontend" });
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    expect(core.getLocalServer("ls1")!.group).toBe("Frontend");
+  });
+
+  it("writes nothing when the record is already at the root", async () => {
+    // Both halves matter: the record reached the root by another route while
+    // the picker was open, AND an edit changed a field this command does not
+    // own. Re-writing the pre-picker snapshot would be a no-op on `group` and
+    // would silently revert `executable` — which is exactly how the bug hid.
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+
+    const moving = moveToRoot(undefined);
+    await core.addOrUpdateLocalServerConfig({
+      ...core.getLocalServer("ls1")!,
+      group: undefined,
+      executable: "python"
+    });
+
+    pick.resolve({ config: stale });
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBeUndefined();
+    // Load-bearing: "node" here means moveToRoot wrote the stale snapshot back.
+    expect(after.executable).toBe("python");
+  });
+});
+
+/**
+ * The same #108 capture-then-write shape, on the command this PR redesigned:
+ * moveToFolder now captures its config and THEN opens the destination picker
+ * ("(root)" / "New folder…" / every existing folder). The picker is the
+ * interactive pause — the record can be edited, moved or removed by another
+ * window while it is open — so the write has to re-read the live record under
+ * configMutationLock and apply ONLY `group`.
+ */
+describe("nexus.localServer.moveToFolder re-resolves under the lock (issue #108)", () => {
+  beforeEach(() => {
+    vi.mocked(vscode.window.showQuickPick).mockReset();
+    vi.mocked(vscode.window.showInputBox).mockReset();
+  });
+
+  /**
+   * Runs moveToFolder against the tree-item path (so the ONLY quick pick is
+   * the destination picker) and hands back the offered items plus the deferred
+   * that resolves the user's choice. The command is left suspended on that
+   * picker exactly as it would be while a user thinks about it.
+   */
+  function openDestinationPicker(): {
+    moving: Promise<unknown>;
+    items: Array<{ label: string }>;
+    pick: Deferred<unknown>;
+  } {
+    let items: Array<{ label: string }> = [];
+    const pick = deferred<unknown>();
+    vi.mocked(vscode.window.showQuickPick).mockImplementation(((offered: Array<{ label: string }>) => {
+      items = offered;
+      return pick.promise;
+    }) as never);
+    const cmd = registeredCommands.get("nexus.localServer.moveToFolder");
+    expect(cmd).toBeDefined();
+    // The handler runs synchronously up to the picker's await, so `items` is
+    // populated by the time this returns.
+    const moving = Promise.resolve(cmd!({ config: { id: "ls1" } }));
+    return { moving, items, pick };
+  }
+
+  const itemNamed = (items: Array<{ label: string }>, label: string): unknown => {
+    const found = items.find((i) => i.label === label);
+    expect(found).toBeDefined();
+    return found;
+  };
+
+  it("does not revert a concurrent edit's other fields", async () => {
+    // The picker opened against the record as it was; while it was open an
+    // edit changed the executable. Committing the captured snapshot would
+    // apply the move AND silently undo that edit.
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, executable: "python" });
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBe("Frontend");
+    // Load-bearing: "node" here means moveToFolder reverted the concurrent edit.
+    expect(after.executable).toBe("python");
+  });
+
+  it("does not resurrect a config removed during the picker", async () => {
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.removeLocalServerConfig("ls1");
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    expect(core.getLocalServer("ls1")).toBeUndefined();
+  });
+
+  it("bails when a concurrent move changed the group to some OTHER value (#84 P2-1)", async () => {
+    // The picker opened against group "Backend". Something else moved the
+    // record to "Archive" while it was open, so this pick was made against a
+    // folder that no longer applies — writing "Frontend" here would overwrite
+    // that newer move.
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, group: "Archive" });
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    expect(core.getLocalServer("ls1")!.group).toBe("Archive");
+  });
+
+  it("writes nothing when the record already sits in the picked folder", async () => {
+    // Someone else made the same move first, and also edited a field this
+    // command does not own. Re-writing the captured snapshot would look like a
+    // no-op on `group` while reverting `executable`.
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({
+      ...core.getLocalServer("ls1")!,
+      group: "Frontend",
+      executable: "python"
+    });
+
+    pick.resolve(itemNamed(items, "Frontend"));
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBe("Frontend");
+    // Load-bearing: "node" here means the stale snapshot was written back.
+    expect(after.executable).toBe("python");
+  });
+
+  it("clears the group through the same guarded write when (root) is picked", async () => {
+    const { core } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" }),
+      makeLocalServerConfig({ id: "ls2", name: "Web", group: "Frontend" })
+    ]);
+
+    const { moving, items, pick } = openDestinationPicker();
+    await core.addOrUpdateLocalServerConfig({ ...core.getLocalServer("ls1")!, executable: "python" });
+
+    pick.resolve(itemNamed(items, "(root)"));
+    await moving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.group).toBeUndefined();
+    expect(after.executable).toBe("python");
   });
 });
