@@ -105,17 +105,25 @@ export function readEveNgStatusPollSeconds(config: InventorySourceValues): numbe
 
 /**
  * PER-SOURCE LAB STATUS POLL — the field's hint. Its LAST clause is the one
- * that earns its length: EVE-NG (at least Community) appears to allow one
- * active session per user account, so a poll's login evicts the session the
- * user's own browser is holding — and the browser logging back in evicts
- * Nexus, which is very likely what produces the mid-sync
- * `412 … unauthorized (90001)` the one-shot re-login recovers from. This field
+ * that earns its length: EVE-NG Community allows one active session per user
+ * account, so a poll's login evicts the session the user's own browser is
+ * holding — and the browser logging back in evicts Nexus, which is very likely
+ * what produces the mid-sync `412 … unauthorized (90001)` the one-shot
+ * re-login recovers from.
+ *
+ * This is OBSERVED, not inferred: signed in to the Community web UI, every
+ * poll deauthenticated the browser session. It was hedged as "appears to"
+ * until that was confirmed. Professional is NOT verified in this respect —
+ * whether it permits concurrent sessions is unknown, which is why the hint
+ * below names Community specifically rather than EVE-NG in general, and why
+ * the Pro warning at the top of this file still calls Pro support
+ * preliminary. This field
  * is exactly where a user decides to turn polling on, so it is where the
  * caveat and its remedy (a separate EVE-NG account for Nexus) belong. The full
  * account is in the functional documentation, §4.12.4.
  */
 const EVE_NG_STATUS_POLL_DESCRIPTION =
-  "How often, in seconds, to refresh this source's lab running status while the Command Center is visible. 0 turns polling off for this source — use Refresh Lab Status when you want it. Note that EVE-NG (at least Community) appears to allow only one active session per user, so each poll can log you out of the EVE-NG web UI: give Nexus its own EVE-NG account, or leave this at 0.";
+  "How often, in seconds, to refresh this source's lab running status while the Command Center is visible. 0 turns polling off for this source — use Refresh Lab Status when you want it. Note that EVE-NG Community allows only one active session per user, so each poll logs you out of the EVE-NG web UI: give Nexus its own EVE-NG account, or leave this at 0.";
 
 /**
  * THE CONFIG FIELD LIST IS PART OF THE PROVIDER FINGERPRINT
