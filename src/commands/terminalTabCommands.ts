@@ -56,9 +56,16 @@ function resolveTerminal(
   }
   // `LocalServerConfigTreeItem` carries `config: LocalServerConfig`, so the id
   // is at `arg.config.id`. The earlier flat-`configId` probe matched no tree
-  // item this view ever produces, and the fall-through below then resolved the
-  // *active* terminal — a Reset from a local server's config row could clear an
-  // unrelated tab. No caller passes a flat `configId`.
+  // item this view ever produces, so EVERY invocation from a local server's
+  // config row fell through to the *active* terminal — a Reset there could
+  // clear an unrelated tab. No caller passes a flat `configId`.
+  //
+  // This narrows the hazard rather than removing it. On a miss — a session that
+  // died between the menu rendering and the click, say — control still reaches
+  // the `activeTerminal` fall-through below and can act on the wrong tab. That
+  // is the same residual shape as the `.profile` probe just above, and is
+  // pre-existing rather than new; the fall-through is what keeps palette
+  // invocation (which carries no argument at all) working.
   if (asAny && typeof asAny === "object") {
     const config = (asAny as { config?: { id?: unknown } }).config;
     if (config && typeof config.id === "string") {

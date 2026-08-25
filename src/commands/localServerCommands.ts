@@ -76,10 +76,13 @@ function splitEnvFromTextarea(value: FormValues[string]): Record<string, string 
     if (equalIdx <= 0) continue;
     const key = line.slice(0, equalIdx).trim();
     const rawValue = line.slice(equalIdx + 1);
-    // Three distinct states, as the field's own hint promises: `KEY=null`
-    // unsets, `KEY=undefined` leaves the inherited value alone, and `KEY=`
-    // sets an empty string. Folding "" in with "null" made the empty string
-    // unexpressible and the hint's promise about `KEY=` false.
+    // Three distinct states: `KEY=null` unsets, `KEY=undefined` leaves the
+    // inherited value alone, and `KEY=` sets an empty string. Folding "" in
+    // with "null" made the empty string unexpressible and the field hint's
+    // promise about `KEY=` false. Note the hint documents only two of the
+    // three — `KEY=undefined` is implemented here but deliberately undocumented
+    // in the UI, so this comment is the record of it, not a restatement of what
+    // the form already says.
     if (rawValue === "null") {
       result[key] = null;
     } else if (rawValue === "undefined") {

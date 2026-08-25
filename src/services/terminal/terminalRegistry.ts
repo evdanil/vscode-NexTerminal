@@ -91,12 +91,25 @@ export class TerminalRegistry implements vscode.Disposable {
     }
     // No status exclusion here, unlike the serial branch above. Smart Follow
     // registers a serial session while it is still "waiting" for a port to
-    // appear — a pty with no transport behind it — so "waiting" has to be
-    // filtered out. A local server session only exists in the snapshot between
-    // spawn and cleanupSession(): "starting" already has a live child process,
-    // and the terminal states of "failed"/"restarting" are torn straight back
-    // out by unregisterLocalServerSession. There is no equivalent
-    // pty-without-transport window, so pty identity alone is the whole answer.
+    // appear, and leaving it in would enable Reset/Clear on a tab that may
+    // never get a transport at all.
+    //
+    // A local server session does have pty-without-transport windows — the
+    // claim that it does not was simply wrong. registerLocalServerSession()
+    // runs immediately after createTerminal(), while the child process is only
+    // spawned inside LocalShellPty.open(), which VS Code calls on attach; and a
+    // session sits registered in "stopping" for up to the stop grace window
+    // while its transport is being torn down. What makes the filter
+    // unnecessary is the consequence, not the absence of the window: the two
+    // commands this key gates are transport-free. Reset writes an escape
+    // sequence to the local writeEmitter and Clear Scrollback empties a local
+    // buffer — neither touches the child, so both are harmless before it exists
+    // and after it is gone. A spawn that fails closes the terminal
+    // (onDidTerminateEarly), which unregisters the entry outright.
+    //
+    // The genuinely transient states are torn straight back out:
+    // handleExit() writes "failed" or "restarting" and calls cleanupSession()
+    // on the next line.
     for (const s of snap.activeLocalServerSessions) {
       if (s.pty && s.pty === entry.pty) return true;
     }
