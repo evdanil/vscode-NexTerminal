@@ -18,14 +18,22 @@ import * as vscode from "vscode";
 import type { NetworkServerKind } from "../models/networkServer";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
 import { networkInterfaceBindOptions, networkInterfaceNameForAddress } from "./networkInterfaceOptions";
+import type { NetworkInterfaceOption } from "./networkInterfaceOptions";
 import {
   NETWORK_SERVER_LABELS,
   currentPoolCount,
+  dhcpCidrDerivation,
+  dhcpCidrProblem,
+  dhcpCurrentCidr,
   dhcpDerivedAddresses,
+  dhcpInterfaceSubnetStatus,
   dhcpPoolProblem,
   dhcpRangeEndForCount,
+  isAutoFillable,
   isContiguousMask,
-  isValidIpv4
+  isDnsAutoFillable,
+  isValidIpv4,
+  suggestBindAddressForPool
 } from "./networkServerSettings";
 import type { SettingValue } from "./networkServerSettings";
 
@@ -163,6 +171,33 @@ function describeInterface(configured: string | undefined): string {
 }
 
 /**
+ * The pool a DHCP bind address is meant to serve, for the rows that compare the
+ * two.
+ *
+ * Snapshotted per pass of the editor loop, like every other setting read here —
+ * no watcher, no polling. Quick Adjust re-enumerates the NICs each time it is
+ * opened, and a NIC appearing while an input box is up is not a case worth a
+ * background subscription.
+ */
+interface PoolSubnetContext {
+  readonly rangeStart: string | undefined;
+  readonly subnet: string | undefined;
+  /**
+   * With a relay agent in front of it, serving a subnet this machine is not on
+   * is the point, so none of the off-subnet reporting applies.
+   */
+  readonly allowRelayAgents: boolean;
+}
+
+function dhcpPoolSubnetContext(section: vscode.WorkspaceConfiguration): PoolSubnetContext {
+  return {
+    rangeStart: rawString(section, "rangeStart"),
+    subnet: rawString(section, "subnet"),
+    allowRelayAgents: section.get<boolean>("allowRelayAgents", false) === true
+  };
+}
+
+/**
  * The NIC behind the configured bind address, resolved on every open.
  *
  * The setting stores an address, not an interface name, so the row alone cannot
@@ -170,15 +205,43 @@ function describeInterface(configured: string | undefined): string {
  * dropped since it was set leaves a value that looks fine and binds nothing.
  * Naming the interface it currently belongs to answers both questions at once,
  * and an address no NIC holds is called out rather than silently formatted.
+ *
+ * For DHCP the row answers one more question the address alone cannot: whether
+ * the NIC is on the subnet the pool hands out. A server bound to `192.168.1.x`
+ * offering `10.0.0.x` leases binds, listens and serves nothing usable, and
+ * every individual setting behind that is valid.
  */
-function describeInterfaceDetail(configured: string | undefined): string {
+function describeInterfaceDetail(configured: string | undefined, pool?: PoolSubnetContext): string {
   if (!configured || configured === "0.0.0.0") {
     return "Every IPv4 address on this machine — no single NIC, so no current IP to show.";
   }
   const name = networkInterfaceNameForAddress(configured);
-  return name
+  const base = name
     ? `${name} — current IP ${configured}`
     : `No interface on this machine currently holds ${configured} — current IP unknown.`;
+  if (!pool) return base;
+  const status = dhcpInterfaceSubnetStatus(
+    configured,
+    pool.subnet,
+    pool.rangeStart,
+    networkInterfaceBindOptions(),
+    pool.allowRelayAgents
+  );
+  if (status !== "mismatch") return base;
+  const cidr = dhcpCurrentCidr(pool.rangeStart, pool.subnet);
+  return cidr ? `${base} · not on the pool's subnet (${cidr})` : `${base} · not on the pool's subnet`;
+}
+
+/** Whether one offered address sits on the pool's subnet, as a plain fact. */
+function isOnPoolSubnet(
+  address: string,
+  pool: PoolSubnetContext,
+  interfaces: readonly NetworkInterfaceOption[]
+): boolean {
+  // Deliberately asks with relay support switched off: "is this NIC on the
+  // pool's subnet" has the same answer either way, and it is the *warning* that
+  // a relay agent makes irrelevant, not the fact.
+  return dhcpInterfaceSubnetStatus(address, pool.subnet, pool.rangeStart, interfaces, false) === "match";
 }
 
 /**
@@ -187,24 +250,56 @@ function describeInterfaceDetail(configured: string | undefined): string {
  * the setting holds but this machine no longer has is kept in the list and
  * flagged, so confirming the current value cannot silently rebind the service
  * to every interface.
+ *
+ * For DHCP, the NICs already on the pool's subnet say so, and a single
+ * unambiguous one is lifted to just below the all-interfaces row — the list is
+ * usually short, but the one entry that is certainly right should not be found
+ * by reading addresses octet by octet. Two or more matches are all annotated and
+ * none is promoted: picking one of them would be a coin toss the editor has no
+ * business making.
  */
-async function editInterface(kind: NetworkServerKind, configured: string | undefined): Promise<QuickAdjustOutcome> {
+async function editInterface(
+  kind: NetworkServerKind,
+  configured: string | undefined,
+  pool?: PoolSubnetContext
+): Promise<QuickAdjustOutcome> {
   const current = configured === "0.0.0.0" ? "" : (configured ?? "");
   const options = networkInterfaceBindOptions();
   const known = options.some((option) => option.value === current)
-    ? options
+    ? [...options]
     : [...options, { label: `${current} — not currently available`, value: current }];
+
+  const suggestion = pool
+    ? suggestBindAddressForPool(pool.rangeStart, pool.subnet, options, pool.allowRelayAgents)
+    : undefined;
+  if (suggestion && !suggestion.ambiguous) {
+    const index = known.findIndex((option) => option.value === suggestion.address);
+    // Index 1: immediately after the all-interfaces row, which keeps the lead.
+    if (index > 1) known.splice(1, 0, ...known.splice(index, 1));
+  }
+
   const pick = await vscode.window.showQuickPick<BindPick>(
-    known.map((option) => ({
-      label: option.label,
-      description: option.value === current ? "current" : undefined,
-      address: option.value
-    })),
+    known.map((option) => {
+      const notes: string[] = [];
+      if (option.value === current) notes.push("current");
+      if (pool && !isAllInterfacesValue(option.value) && isOnPoolSubnet(option.value, pool, options)) {
+        notes.push("matches the pool subnet");
+      }
+      return {
+        label: option.label,
+        description: notes.length > 0 ? notes.join(" · ") : undefined,
+        address: option.value
+      };
+    }),
     { title: `${SERVICE_LABELS[kind]} — Interface`, placeHolder: "Which NIC serves this service" }
   );
   if (!pick || pick.address === current) return "unchanged";
   await writeSetting(kind, "interface", pick.address.length > 0 ? pick.address : undefined);
   return "edited";
+}
+
+function isAllInterfacesValue(address: string): boolean {
+  return address.length === 0 || address === "0.0.0.0";
 }
 
 interface AccessPick extends vscode.QuickPickItem {
@@ -286,74 +381,49 @@ interface ConfirmPick extends vscode.QuickPickItem {
   readonly confirmed: boolean;
 }
 
-/**
- * Whether a setting may be recomputed from a new pool start.
- *
- * Blank is the codebase's existing "no opinion" signal — an unset key means the
- * packaged default applies — so a blank value is always fair game. Beyond that,
- * only a value this auto-fill would itself have written for the *previous* pool
- * start is replaced: that is a stale suggestion, not a decision, and leaving it
- * behind is how a move from one lab subnet to another ends up advertising the
- * old subnet's gateway. Anything else the user typed is left exactly as typed.
- */
-function isAutoFillable(current: string | undefined, previousDerived: string | undefined): boolean {
-  return current === undefined || (previousDerived !== undefined && current === previousDerived);
-}
-
-function isDnsAutoFillable(current: readonly string[], previousDerived: readonly string[] | undefined): boolean {
-  if (current.length === 0) return true;
-  if (previousDerived === undefined) return false;
-  return current.length === previousDerived.length && current.every((value, index) => value === previousDerived[index]);
-}
+/* `isAutoFillable` / `isDnsAutoFillable` moved to `networkServerSettings.ts`
+   when the full form grew the same CIDR row: both editors have to answer "may
+   this value be recomputed?" identically, and a gateway that survives in one
+   and is clobbered in the other is a divergence that only shows up on
+   someone's bench. */
 
 const AUTO_FILL_LABELS: Readonly<Record<string, string>> = {
+  subnet: "Subnet Mask",
+  rangeStart: "Pool Start",
+  rangeEnd: "Pool End",
   gateway: "Gateway",
   broadcast: "Broadcast",
-  dns: "DNS"
+  dns: "DNS",
+  interface: "Interface"
 };
 
+/** One setting the editor is offering to write, with how it reads in the prompt. */
+interface AutoFillWrite {
+  readonly key: string;
+  readonly value: SettingValue;
+  /** What the summary shows; defaults to the value itself. */
+  readonly display?: string;
+}
+
+function describeAutoFillWrite(write: AutoFillWrite): string {
+  const shown = write.display ?? (Array.isArray(write.value) ? write.value.join(", ") : String(write.value));
+  return `${AUTO_FILL_LABELS[write.key] ?? write.key} ${shown}`;
+}
+
 /**
- * Offers the addresses a new pool start implies — gateway, broadcast, DNS.
- *
- * The pool's own end address is not part of the offer: {@link editPoolStart}
- * already recomputes it unconditionally to preserve the pool size, and asking
- * about something that has already happened would misreport what the answer
- * changes.
- *
- * The netmask in force is respected rather than assumed: an explicit `subnet`
- * of, say, `255.255.254.0` derives a `.255`-crossing broadcast and the gateway
- * below it, and only an unset mask falls back to /24.
+ * The confirm-then-write half shared by every auto-fill offer.
  *
  * Confirmation is asked for rather than assumed. Nothing in the settings marks
  * a value as machine-suggested, so silence would be indistinguishable from the
  * editor overwriting fields the user never opened — and the prompt is skipped
- * entirely when every candidate is already a deliberate value, which is the
- * case that would have been annoying.
+ * entirely when there is nothing left to offer, which is the case that would
+ * have been annoying.
+ *
+ * @returns Whether anything was written.
  */
-async function offerPoolAutoFill(
-  rangeStart: string,
-  previousStart: string | undefined,
-  subnet: string | undefined
-): Promise<void> {
-  const derived = dhcpDerivedAddresses(rangeStart, subnet);
-  if (!derived) return;
-  const previous = previousStart ? dhcpDerivedAddresses(previousStart, subnet) : undefined;
-
-  const section = settingsSection("dhcp");
-  const dns = section
-    .get<string[]>("dns", [])
-    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-    .filter((entry) => entry.length > 0);
-
-  const writes: Array<[string, string | string[]]> = [];
-  if (isAutoFillable(rawString(section, "gateway"), previous?.gateway)) writes.push(["gateway", derived.gateway]);
-  if (isAutoFillable(rawString(section, "broadcast"), previous?.broadcast)) writes.push(["broadcast", derived.broadcast]);
-  if (isDnsAutoFillable(dns, previous?.dns)) writes.push(["dns", [...derived.dns]]);
-  if (writes.length === 0) return;
-
-  const summary = writes
-    .map(([key, value]) => `${AUTO_FILL_LABELS[key]} ${Array.isArray(value) ? value.join(", ") : value}`)
-    .join("  ·  ");
+async function confirmAutoFill(placeHolder: string, writes: readonly AutoFillWrite[]): Promise<boolean> {
+  if (writes.length === 0) return false;
+  const summary = writes.map(describeAutoFillWrite).join("  ·  ");
   const pick = await vscode.window.showQuickPick<ConfirmPick>(
     [
       { label: "$(check) Yes, auto-fill", detail: summary, confirmed: true },
@@ -365,14 +435,159 @@ async function offerPoolAutoFill(
     ],
     {
       title: "DHCP — Auto-Fill",
-      placeHolder: `Fill in the addresses that follow from ${rangeStart}?`,
+      placeHolder,
       ignoreFocusOut: true
     }
   );
-  if (!pick?.confirmed) return;
-  for (const [key, value] of writes) {
-    await writeSetting("dhcp", key, value);
+  if (!pick?.confirmed) return false;
+  for (const write of writes) {
+    await writeSetting("dhcp", write.key, write.value);
   }
+  return true;
+}
+
+function readDnsSetting(section: vscode.WorkspaceConfiguration): string[] {
+  return section
+    .get<string[]>("dns", [])
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter((entry) => entry.length > 0);
+}
+
+/**
+ * The NIC to offer along with a pool that has just moved subnet, if there is
+ * exactly one obvious answer.
+ *
+ * Only ever offered, never written on its own: rebinding the service is a
+ * bigger change than filling in a gateway, and the one case where the editor is
+ * sure — a single NIC already on the new subnet — is also the case where saying
+ * so out loud costs nothing. Ambiguity (two NICs on that subnet) and silence
+ * (none) both mean the picker stays the way to answer.
+ */
+function offSubnetInterfaceWrite(
+  section: vscode.WorkspaceConfiguration,
+  rangeStart: string | undefined,
+  subnet: string | undefined
+): AutoFillWrite | undefined {
+  const allowRelayAgents = section.get<boolean>("allowRelayAgents", false) === true;
+  const bindAddress = rawString(section, "interface");
+  const interfaces = networkInterfaceBindOptions();
+  const status = dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, allowRelayAgents);
+  if (status !== "mismatch") return undefined;
+  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, allowRelayAgents);
+  if (!suggestion || suggestion.ambiguous) return undefined;
+  return { key: "interface", value: suggestion.address };
+}
+
+/**
+ * Offers the addresses a new pool start implies — gateway, broadcast, DNS — and
+ * the NIC to serve them from when the pool has moved off the bound one.
+ *
+ * The pool's own end address is not part of the offer: {@link editPoolStart}
+ * already recomputes it unconditionally to preserve the pool size, and asking
+ * about something that has already happened would misreport what the answer
+ * changes.
+ *
+ * The netmask in force is respected rather than assumed: an explicit `subnet`
+ * of, say, `255.255.254.0` derives a `.255`-crossing broadcast and the gateway
+ * below it, and only an unset mask falls back to /24.
+ */
+async function offerPoolAutoFill(
+  rangeStart: string,
+  previousStart: string | undefined,
+  subnet: string | undefined
+): Promise<void> {
+  const derived = dhcpDerivedAddresses(rangeStart, subnet);
+  if (!derived) return;
+  const previous = previousStart ? dhcpDerivedAddresses(previousStart, subnet) : undefined;
+
+  const section = settingsSection("dhcp");
+  const dns = readDnsSetting(section);
+
+  const writes: AutoFillWrite[] = [];
+  if (isAutoFillable(rawString(section, "gateway"), previous?.gateway)) {
+    writes.push({ key: "gateway", value: derived.gateway });
+  }
+  if (isAutoFillable(rawString(section, "broadcast"), previous?.broadcast)) {
+    writes.push({ key: "broadcast", value: derived.broadcast });
+  }
+  if (isDnsAutoFillable(dns, previous?.dns)) writes.push({ key: "dns", value: [...derived.dns] });
+  const bind = offSubnetInterfaceWrite(section, rangeStart, subnet);
+  if (bind) writes.push(bind);
+
+  await confirmAutoFill(`Fill in the addresses that follow from ${rangeStart}?`, writes);
+}
+
+/**
+ * A whole network, entered once as CIDR.
+ *
+ * Nothing new is stored: `192.168.2.0/24` is a shorthand for the `subnet`,
+ * `rangeStart`, `rangeEnd`, `gateway` and `dns` keys that have always been the
+ * real settings — the same precedent the Pool Count row set, which asks for a
+ * count and stores the `rangeEnd` it implies. That is what makes the row need no
+ * migration in either direction: it seeds itself from the settings already
+ * there, and a `settings.json` reader still sees exactly the keys they did.
+ *
+ * The three keys the CIDR *is* — mask, pool start, pool end — are offered
+ * together with the two it merely implies. The implied pair is gated the way
+ * {@link offerPoolAutoFill} gates it, so a gateway the user typed survives a
+ * network change; the defining three are not, because a pool left on the old
+ * network after the mask moved to the new one is not a state the user could
+ * have meant. Nothing is written without the confirmation either way.
+ */
+async function editNetworkCidr(
+  rangeStart: string | undefined,
+  subnet: string | undefined
+): Promise<QuickAdjustOutcome> {
+  const seed = dhcpCurrentCidr(rangeStart, subnet) ?? "";
+  const entered = await vscode.window.showInputBox({
+    title: "DHCP — Network (CIDR)",
+    prompt:
+      "The whole network in one go, e.g. 192.168.2.0/24. Not stored as such — it fills in the subnet mask, the pool and the gateway that follow from it.",
+    placeHolder: seed.length > 0 ? seed : "192.168.2.0/24",
+    value: seed,
+    ignoreFocusOut: true,
+    validateInput: (raw) => dhcpCidrProblem(raw)
+  });
+  if (entered === undefined) return "unchanged";
+  // Submitting the seeded value unchanged still makes the offer, unlike the
+  // plain text rows. Re-entering the network a config is already on is how a
+  // pool that grew inconsistent with it gets straightened out, and the offer
+  // costs an Escape — the row writes nothing without the confirmation below,
+  // so browsing it still cannot mark the service as needing a restart.
+  const derived = dhcpCidrDerivation(entered);
+  if (!derived) return "unchanged";
+
+  const section = settingsSection("dhcp");
+  const previous = dhcpDerivedAddresses(rangeStart ?? DEFAULTS.rangeStart, subnet);
+  const dns = readDnsSetting(section);
+
+  const writes: AutoFillWrite[] = [];
+  if (rawString(section, "subnet") !== derived.subnet) writes.push({ key: "subnet", value: derived.subnet });
+  if (rawString(section, "rangeStart") !== derived.rangeStart) {
+    writes.push({ key: "rangeStart", value: derived.rangeStart });
+  }
+  if (rawString(section, "rangeEnd") !== derived.rangeEnd) {
+    writes.push({
+      key: "rangeEnd",
+      value: derived.rangeEnd,
+      display: `${derived.rangeEnd} (${String(derived.poolCount)} addresses)`
+    });
+  }
+  if (isAutoFillable(rawString(section, "gateway"), previous?.gateway)) {
+    writes.push({ key: "gateway", value: derived.gateway });
+  }
+  if (isAutoFillable(rawString(section, "broadcast"), previous?.broadcast)) {
+    writes.push({ key: "broadcast", value: derived.broadcast });
+  }
+  if (isDnsAutoFillable(dns, previous?.dns)) writes.push({ key: "dns", value: [...derived.dns] });
+  const bind = offSubnetInterfaceWrite(section, derived.rangeStart, derived.subnet);
+  if (bind) writes.push(bind);
+
+  const written = await confirmAutoFill(
+    `Apply ${derived.network}/${String(derived.prefix)} to these settings?`,
+    writes
+  );
+  return written ? "edited" : "unchanged";
 }
 
 /**
@@ -458,12 +673,21 @@ function dhcpQuickItems(): QuickAdjustItem[] {
   const gateway = rawString(section, "gateway");
   const leaseTimeSec = section.get<number>("leaseTimeSec", DEFAULTS.leaseTimeSec);
   const count = currentPoolCount(rangeStart, rangeEnd);
+  const pool = dhcpPoolSubnetContext(section);
   return [
     {
       label: "$(plug) Interface",
       description: describeInterface(bindAddress),
-      detail: describeInterfaceDetail(bindAddress),
-      run: () => editInterface("dhcp", bindAddress)
+      detail: describeInterfaceDetail(bindAddress, pool),
+      run: () => editInterface("dhcp", bindAddress, pool)
+    },
+    {
+      label: "$(symbol-numeric) Network (CIDR)",
+      // Reverse-derived from the settings that exist, so an untouched config
+      // shows its network without anything having been migrated.
+      description: dhcpCurrentCidr(rangeStart, subnet) ?? "no usable netmask configured",
+      detail: "Fills in the subnet mask, the pool and the gateway that follow from one network.",
+      run: () => editNetworkCidr(rangeStart, subnet)
     },
     {
       label: "$(globe) Pool Start",

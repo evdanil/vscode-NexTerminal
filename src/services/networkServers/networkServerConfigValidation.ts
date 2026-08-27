@@ -24,6 +24,17 @@ export type ValidationResult<T> =
 /** Must match the bounded allocator's accepted inclusive pool size. */
 export const MAX_DHCP_POOL_SIZE = 65_536;
 
+/**
+ * How many addresses a network entered as CIDR suggests, at most.
+ *
+ * Not a limit on what the pool may be — {@link MAX_DHCP_POOL_SIZE} is that —
+ * only on what is offered unasked. A `/16` typed into the editor means "this is
+ * my network", not "hand out sixty thousand leases", and a bench pool that size
+ * costs a lease store nobody wanted. 254 is the whole usable range of the /24
+ * these labs almost always are, so on the common case the cap never binds.
+ */
+export const SUGGESTED_CIDR_POOL_CAP = 254;
+
 /** Port 0 is deliberately accepted for test and ephemeral OS-assigned binds. */
 const MIN_PORT = 0;
 const MAX_PORT = 65_535;

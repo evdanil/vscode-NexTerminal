@@ -14,6 +14,16 @@ import * as os from "node:os";
 export interface NetworkInterfaceOption {
   readonly label: string;
   readonly value: string;
+  /**
+   * The NIC's own netmask, as `os.networkInterfaces()` reports it.
+   *
+   * Carried for the callers that describe an interface, not for the ones that
+   * compare it against a DHCP pool — that comparison has to run under the
+   * *pool's* mask, because a NIC on a wider one would claim a subnet it cannot
+   * actually serve. Absent for the all-interfaces choice, which is not one NIC,
+   * and for any address reported without a mask.
+   */
+  readonly netmask?: string;
 }
 
 /**
@@ -37,7 +47,15 @@ function ipv4Options(includeInternal: boolean): NetworkInterfaceOption[] {
       if (address.internal && !includeInternal) continue;
       if (address.address === "0.0.0.0" || seen.has(address.address)) continue;
       seen.add(address.address);
-      options.push({ label: `${name} — ${address.address}`, value: address.address });
+      const label = `${name} — ${address.address}`;
+      // The key is added only when there is one to add, so an option built from
+      // an address with no reported netmask stays shape-identical to what this
+      // enumerator has always returned.
+      options.push(
+        typeof address.netmask === "string" && address.netmask.length > 0
+          ? { label, value: address.address, netmask: address.netmask }
+          : { label, value: address.address }
+      );
     }
   }
   return options;

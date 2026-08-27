@@ -21,6 +21,8 @@ import type {
   NetworkServerTransferHistoryEntry,
   NetworkServerTransferSummary
 } from "../models/networkServer";
+import { networkInterfaceBindOptions } from "../commands/networkInterfaceOptions";
+import { dhcpCurrentCidr, dhcpInterfaceSubnetStatus } from "../commands/networkServerSettings";
 import {
   NETWORK_SERVER_KINDS,
   readDhcpConfig,
@@ -300,15 +302,26 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
     const detail = root.session?.detail;
     const config = readDhcpConfig();
     const leaseTimeSec = config.leaseTimeSec ?? 86_400;
+    const offSubnet = this.dhcpBindMismatch(config);
+    const tooltip = [
+      `Subnet: ${config.subnet ?? "255.255.255.0"}`,
+      `Gateway: ${config.gateway ?? "192.168.2.1"}`,
+      `DNS: ${config.dns?.join(", ") ?? "8.8.8.8, 8.8.4.4"}`
+    ];
+    if (offSubnet) {
+      tooltip.push(
+        "",
+        `⚠ The service is bound to ${offSubnet.bindAddress}, which is not on this pool's subnet${offSubnet.cidr ? ` (${offSubnet.cidr})` : ""}.`,
+        "Clients on the bound wire will be offered addresses they cannot use. Change the Interface setting, or the pool, so the two agree."
+      );
+    }
     const rows: NetworkServerDetailTreeItem[] = [
       new NetworkServerDetailTreeItem("networkServer:dhcp:pool", "DHCP Pool", {
-        description: `${config.rangeStart ?? "192.168.2.10"} → ${config.rangeEnd ?? "192.168.2.199"}`,
+        description: `${config.rangeStart ?? "192.168.2.10"} → ${config.rangeEnd ?? "192.168.2.199"}${
+          offSubnet ? " · ⚠ bound NIC is not on this subnet" : ""
+        }`,
         icon: "globe",
-        tooltip: [
-          `Subnet: ${config.subnet ?? "255.255.255.0"}`,
-          `Gateway: ${config.gateway ?? "192.168.2.1"}`,
-          `DNS: ${config.dns?.join(", ") ?? "8.8.8.8, 8.8.4.4"}`
-        ].join("\n")
+        tooltip: tooltip.join("\n")
       }),
       new NetworkServerDetailTreeItem("networkServer:dhcp:lease", "Lease Time", {
         description: this.leaseUtilizationDescription(leaseTimeSec, detail),
@@ -333,6 +346,35 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
 
     rows.push(this.staticLeasesGroup(config.static));
     return rows;
+  }
+
+  /**
+   * Whether the NIC the service binds is off the subnet the pool hands out.
+   *
+   * Advisory only — nothing here gates starting the service. The configuration
+   * is legal, it is even correct behind a relay agent (which is why
+   * `allowRelayAgents` suppresses the row entirely), and the daemon is the wrong
+   * place to be second-guessed from a tree view. But a lab that binds
+   * `192.168.1.x` and offers `10.0.0.x` leases looks perfectly configured in
+   * every individual row, so the pair is worth naming where the pool is shown.
+   *
+   * The NIC list is a snapshot taken as the row renders — the tree already
+   * refreshes on every core change, and a watcher for NIC arrivals would be a
+   * subscription paying for a case the next refresh covers anyway.
+   */
+  private dhcpBindMismatch(
+    config: ReturnType<typeof readDhcpConfig>
+  ): { bindAddress: string; cidr: string | undefined } | undefined {
+    const bindAddress = config.bindAddress;
+    const status = dhcpInterfaceSubnetStatus(
+      bindAddress,
+      config.subnet,
+      config.rangeStart,
+      networkInterfaceBindOptions(),
+      config.allowRelayAgents === true
+    );
+    if (status !== "mismatch" || !bindAddress) return undefined;
+    return { bindAddress, cidr: dhcpCurrentCidr(config.rangeStart, config.subnet) };
   }
 
   private leaseUtilizationDescription(leaseTimeSec: number, detail: NetworkServerRuntimeDetail | undefined): string {

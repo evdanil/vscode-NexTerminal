@@ -17,11 +17,21 @@ import {
   intToIp,
   ipToInt,
   isContiguousMask,
-  isValidIpv4
+  isSameSubnet,
+  isValidIpv4,
+  maskToPrefix,
+  networkAddress,
+  parseCidr,
+  prefixToMask
 } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
 import { DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
-import { MAX_DHCP_POOL_SIZE, validateDhcpFormInput } from "../services/networkServers/networkServerConfigValidation";
+import {
+  MAX_DHCP_POOL_SIZE,
+  SUGGESTED_CIDR_POOL_CAP,
+  validateDhcpFormInput
+} from "../services/networkServers/networkServerConfigValidation";
 import type { DhcpVendorSpecificEntry } from "../services/networkServers/core/index";
+import type { NetworkInterfaceOption } from "./networkInterfaceOptions";
 import type { NetworkServerKind } from "../models/networkServer";
 import type { NetworkServerConfigProfile } from "../models/networkServerProfile";
 import type { FormValues } from "../ui/formTypes";
@@ -213,6 +223,454 @@ export function dhcpDerivedAddresses(
   return { gateway, broadcast, dns: [gateway] };
 }
 
+/** The smallest and largest prefix a DHCP pool can be built on. */
+const MIN_POOL_PREFIX = 1;
+const MAX_POOL_PREFIX = 30;
+
+/**
+ * The CIDR a stored `rangeStart`/`subnet` pair already describes.
+ *
+ * CIDR is not a setting — nothing new is persisted for it — so the editor's row
+ * has to read one back out of the settings that do exist. That is what makes the
+ * feature need no migration: an existing `192.168.2.10` + `255.255.255.0` shows
+ * `192.168.2.0/24` the first time the row is rendered.
+ *
+ * @returns `undefined` when the mask is not a usable netmask or the start does
+ *   not parse — there is no network to name in either case.
+ */
+export function dhcpCurrentCidr(rangeStart: string | undefined, subnet: string | undefined): string | undefined {
+  const mask = subnet ?? DEFAULTS.subnet;
+  const start = rangeStart ?? DEFAULTS.rangeStart;
+  const prefix = maskToPrefix(mask);
+  if (prefix === undefined || !isValidIpv4(start)) return undefined;
+  return `${networkAddress(start, mask)}/${String(prefix)}`;
+}
+
+/** Every setting a network entered as CIDR implies. */
+export interface DhcpCidrDerivation {
+  readonly network: string;
+  readonly prefix: number;
+  /** Option 1. */
+  readonly subnet: string;
+  readonly rangeStart: string;
+  readonly rangeEnd: string;
+  /** Addresses in `[rangeStart, rangeEnd]`. */
+  readonly poolCount: number;
+  /** Option 3 — the top usable address, exactly as {@link dhcpDerivedAddresses} picks it. */
+  readonly gateway: string;
+  /** Option 28. */
+  readonly broadcast: string;
+  /** Option 6. */
+  readonly dns: readonly string[];
+}
+
+/**
+ * What a network in CIDR form implies for every DHCP setting it touches.
+ *
+ * The gateway, broadcast and DNS come straight from {@link dhcpDerivedAddresses}
+ * rather than being recomputed here, so the two entry points cannot drift: a
+ * CIDR typed in and a pool start typed in derive the same gateway for the same
+ * network, and a change to the top-usable convention lands on both at once.
+ *
+ * The pool starts one above the network address (the network address itself is
+ * not assignable) and stops {@link SUGGESTED_CIDR_POOL_CAP} addresses later at
+ * the most, one short of the usable host count so the gateway keeps its address
+ * out of the pool.
+ *
+ * @returns `undefined` for anything that is not a `/1`–`/30` network. `/31` and
+ *   `/32` parse as CIDR but describe no pool, and `/0` is not a subnet.
+ */
+export function dhcpCidrDerivation(text: string): DhcpCidrDerivation | undefined {
+  const parsed = parseCidr(text);
+  if (!parsed) return undefined;
+  const { network, prefix } = parsed;
+  if (prefix < MIN_POOL_PREFIX || prefix > MAX_POOL_PREFIX) return undefined;
+  const subnet = prefixToMask(prefix);
+  if (subnet === undefined) return undefined;
+  const rangeStart = intToIp((ipToInt(network) + 1) >>> 0);
+  const derived = dhcpDerivedAddresses(rangeStart, subnet);
+  if (!derived) return undefined;
+  // −2 drops the network and broadcast addresses; the further −1 is the gateway,
+  // which the pool must not hand to a second host.
+  const usableHosts = 2 ** (32 - prefix) - 2;
+  const poolCount = Math.min(usableHosts - 1, SUGGESTED_CIDR_POOL_CAP);
+  const rangeEnd = computeRangeEnd(rangeStart, poolCount);
+  if (!rangeEnd) return undefined;
+  return {
+    network,
+    prefix,
+    subnet,
+    rangeStart,
+    rangeEnd,
+    poolCount,
+    gateway: derived.gateway,
+    broadcast: derived.broadcast,
+    dns: derived.dns
+  };
+}
+
+/**
+ * Why a typed CIDR cannot become a pool, phrased for an input box.
+ *
+ * The three prefixes that are legal CIDR but useless here get their own message
+ * apiece rather than one shared range complaint: `/32` and `/31` are what
+ * someone reaches for when they mean "just this host" or "just this link", and
+ * "must be between 1 and 30" does not explain why the thing they typed —
+ * which is a perfectly real network — was refused.
+ *
+ * @returns `undefined` for a usable network, and for blank input, which the
+ *   editors treat as "leave it alone" rather than as an error.
+ */
+export function dhcpCidrProblem(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return undefined;
+  const parts = trimmed.split("/");
+  if (parts.length !== 2) {
+    return `Enter a network in CIDR form, e.g. 192.168.2.0/24 (got "${trimmed}").`;
+  }
+  const address = parts[0].trim();
+  const prefixText = parts[1].trim();
+  if (!isValidIpv4(address)) {
+    return `"${address}" is not a dotted-quad IPv4 address — enter a network like 192.168.2.0/24.`;
+  }
+  if (!/^[0-9]{1,3}$/.test(prefixText)) {
+    return `"${prefixText}" is not a prefix length — enter a whole number, e.g. ${address}/24.`;
+  }
+  const prefix = Number(prefixText);
+  if (prefix === 0) {
+    return "/0 is not a subnet — it covers every address there is, so there is no network to serve.";
+  }
+  if (prefix === 32) {
+    return `/32 is a single address — it has no host range, so there is nothing for a pool to hand out. Try ${address}/24.`;
+  }
+  if (prefix === 31) {
+    return `/31 is a point-to-point range (RFC 3021) — its two addresses are both endpoints, so there is no usable DHCP pool. Try ${address}/24.`;
+  }
+  if (prefix > MAX_POOL_PREFIX) {
+    return `A prefix length must be between ${String(MIN_POOL_PREFIX)} and ${String(MAX_POOL_PREFIX)} to leave room for a pool (got /${String(prefix)}).`;
+  }
+  if (!dhcpCidrDerivation(trimmed)) {
+    return `${trimmed} does not describe a usable DHCP subnet.`;
+  }
+  return undefined;
+}
+
+/** Whether a bind address means "every interface" rather than one NIC. */
+function isAllInterfaces(bindAddress: string | undefined): boolean {
+  const trimmed = bindAddress?.trim() ?? "";
+  return trimmed.length === 0 || trimmed === "0.0.0.0";
+}
+
+/** The pool's own network, or `undefined` when the settings do not describe one. */
+function poolNetwork(
+  rangeStart: string | undefined,
+  subnet: string | undefined
+): { start: string; mask: string } | undefined {
+  const mask = subnet ?? DEFAULTS.subnet;
+  const start = rangeStart ?? DEFAULTS.rangeStart;
+  if (!isValidIpv4(mask) || !isContiguousMask(mask) || !isValidIpv4(start)) return undefined;
+  return { start, mask };
+}
+
+/**
+ * How the interface the service binds relates to the subnet it serves.
+ *
+ * A DHCP server answers broadcasts that arrive on the wire it is bound to, so a
+ * NIC on `192.168.1.x` handing out `10.0.0.x` leases is a lab that looks
+ * configured and serves nothing. Nothing else in the settings catches it: every
+ * individual field is valid, and only the pair is wrong.
+ *
+ * - `all-interfaces` — the bind address is unset or `0.0.0.0`. Every NIC is
+ *   listening, so no single one can be off-subnet. Never a mismatch.
+ * - `unknown-address` — an address this machine does not currently hold. That
+ *   is already reported as its own problem where the address is shown; saying
+ *   "and it is on the wrong subnet" on top of it would be guessing.
+ * - `unusable-mask` — the pool's own subnet cannot be worked out (a
+ *   non-contiguous or malformed `subnet`, or a `rangeStart` that does not
+ *   parse). Whatever reports the bad field reports it; this one stays quiet.
+ *
+ * @param interfaces The already-filtered list from `networkInterfaceBindOptions()`.
+ *   Passing a raw `os.networkInterfaces()` read would let a WSL or Docker NIC
+ *   answer for a subnet no client is on.
+ * @param allowRelayAgents When set, serving a subnet this machine is not on is
+ *   the intended configuration — a relay agent forwards the request — so the
+ *   comparison is not a fault to report at all.
+ */
+export type DhcpInterfaceSubnetStatus =
+  | "all-interfaces"
+  | "match"
+  | "mismatch"
+  | "unknown-address"
+  | "unusable-mask";
+
+export function dhcpInterfaceSubnetStatus(
+  bindAddress: string | undefined,
+  subnet: string | undefined,
+  rangeStart: string | undefined,
+  interfaces: readonly NetworkInterfaceOption[],
+  allowRelayAgents = false
+): DhcpInterfaceSubnetStatus {
+  const address = bindAddress?.trim() ?? "";
+  if (isAllInterfaces(address)) return "all-interfaces";
+  if (allowRelayAgents) return "match";
+  const pool = poolNetwork(rangeStart, subnet);
+  if (!pool) return "unusable-mask";
+  if (!isValidIpv4(address) || !interfaces.some((option) => option.value === address)) return "unknown-address";
+  return isSameSubnet(address, pool.start, pool.mask) ? "match" : "mismatch";
+}
+
+/** A NIC that could serve the configured pool. */
+export interface BindAddressSuggestion {
+  readonly address: string;
+  /** More than one NIC is on the pool's subnet, so this one is a guess. */
+  readonly ambiguous: boolean;
+}
+
+/**
+ * The NIC that is already on the pool's subnet, if exactly one is.
+ *
+ * There is deliberately no fallback to "the first available interface" when
+ * nothing matches. Binding a DHCP server to an arbitrary NIC is how a bench
+ * service ends up answering DISCOVERs on an office network, and a suggestion
+ * that is wrong is worse than no suggestion — the user still has the picker.
+ *
+ * @param interfaces The already-filtered list from `networkInterfaceBindOptions()`,
+ *   for the same reason {@link dhcpInterfaceSubnetStatus} needs it: virtual NICs
+ *   (WSL, Hyper-V, Docker) sit on RFC1918 ranges and would match confidently.
+ * @returns The single matching address with `ambiguous: false`; the first of
+ *   several with `ambiguous: true`, which callers must not auto-select; or
+ *   `undefined` when nothing matches, when the pool's subnet is unusable, or
+ *   when relay agents are allowed and being off-subnet is intended.
+ */
+export function suggestBindAddressForPool(
+  rangeStart: string | undefined,
+  subnet: string | undefined,
+  interfaces: readonly NetworkInterfaceOption[],
+  allowRelayAgents = false
+): BindAddressSuggestion | undefined {
+  if (allowRelayAgents) return undefined;
+  const pool = poolNetwork(rangeStart, subnet);
+  if (!pool) return undefined;
+  const matches = interfaces.filter(
+    (option) => !isAllInterfaces(option.value) && isSameSubnet(option.value, pool.start, pool.mask)
+  );
+  if (matches.length === 0) return undefined;
+  return { address: matches[0].value, ambiguous: matches.length > 1 };
+}
+
+/**
+ * Whether a setting may be recomputed from a new pool start or network.
+ *
+ * Blank is the codebase's existing "no opinion" signal — an unset key means the
+ * packaged default applies — so a blank value is always fair game. Beyond that,
+ * only a value this auto-fill would itself have written for the *previous*
+ * network is replaced: that is a stale suggestion, not a decision, and leaving
+ * it behind is how a move from one lab subnet to another ends up advertising
+ * the old subnet's gateway. Anything else the user typed is left exactly as
+ * typed.
+ *
+ * Lives here rather than in either editor because both editors have to answer
+ * the question identically: a gateway that survives a CIDR change in the quick
+ * pick and is clobbered by the same change in the form is the sort of
+ * divergence that only shows up on someone's bench.
+ */
+export function isAutoFillable(current: string | undefined, previousDerived: string | undefined): boolean {
+  return current === undefined || (previousDerived !== undefined && current === previousDerived);
+}
+
+export function isDnsAutoFillable(
+  current: readonly string[],
+  previousDerived: readonly string[] | undefined
+): boolean {
+  if (current.length === 0) return true;
+  if (previousDerived === undefined) return false;
+  return current.length === previousDerived.length && current.every((value, index) => value === previousDerived[index]);
+}
+
+/**
+ * The full form's CIDR row, which is an input shape rather than a setting.
+ *
+ * Named once because three places have to agree on it: the field descriptor,
+ * the autofill dispatcher, and the submit-time check that refuses to save a
+ * network the editor could not make sense of. Nothing is ever written under
+ * this key — {@link networkServerProfileSettingUpdates} and the form's own
+ * setting writes both work from explicit lists.
+ */
+export const DHCP_CIDR_FIELD_KEY = "cidr";
+
+/** The DNS field's comma-separated text as the list it stands for. */
+function formDnsList(value: FormValues[string]): string[] {
+  if (typeof value !== "string") return [];
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+/**
+ * The NIC to fill in when a new network has moved the pool off the bound one.
+ *
+ * The full-form counterpart of the quick editor's `offSubnetInterfaceWrite`,
+ * reading the form's own values instead of the settings. Same restraint: only
+ * a single unambiguous NIC already on the new subnet is offered. Two matches
+ * are a coin toss the editor has no business making, and none means the picker
+ * stays the way to answer.
+ */
+function offSubnetBindAddress(
+  values: FormValues,
+  rangeStart: string,
+  subnet: string,
+  interfaces: readonly NetworkInterfaceOption[]
+): string | undefined {
+  const allowRelayAgents = readSettingBoolean(values.allowRelayAgents);
+  const bindAddress = readSettingString(values.interface);
+  if (dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, allowRelayAgents) !== "mismatch") {
+    return undefined;
+  }
+  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, allowRelayAgents);
+  return suggestion && !suggestion.ambiguous ? suggestion.address : undefined;
+}
+
+/**
+ * Every form field a network entered as CIDR fills in, or `undefined` when the
+ * text describes no usable pool.
+ *
+ * The gating is the quick editor's `editNetworkCidr` policy, field for field:
+ * the three keys the CIDR *is* — mask, pool start, pool size — are always
+ * offered, because a pool left on the old network after the mask moved to the
+ * new one is not a state the user could have meant; the two it merely implies
+ * (gateway, broadcast) and the DNS list are replaced only while they are blank
+ * or still hold what the PREVIOUS network derived.
+ *
+ * Pool *size* rather than pool end: the form asks for a count and computes the
+ * `rangeEnd` setting from it on submit ({@link dhcpRangeEndForCount}), so the
+ * count is the field a fill has to reach. Writing `rangeEnd` here would land on
+ * a key the form does not render and quietly leave the pool the old size.
+ *
+ * Nothing is written to settings — these are values for fields the user can
+ * still see, edit and abandon before Save, which is why there is no
+ * confirmation step like the quick editor's.
+ */
+export function dhcpCidrFormFills(
+  text: string,
+  values: FormValues,
+  interfaces: readonly NetworkInterfaceOption[]
+): Record<string, string> | undefined {
+  const derived = dhcpCidrDerivation(text);
+  if (!derived) return undefined;
+  const previous = dhcpDerivedAddresses(
+    readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart,
+    readSettingString(values.subnet)
+  );
+  const fills: Record<string, string> = {
+    // Normalised: a pool start typed as the CIDR host part (192.168.2.55/24)
+    // is echoed back as the network it names, matching what dhcpCurrentCidr
+    // would show the next time the form opens.
+    [DHCP_CIDR_FIELD_KEY]: `${derived.network}/${String(derived.prefix)}`,
+    subnet: derived.subnet,
+    rangeStart: derived.rangeStart,
+    poolCount: String(derived.poolCount)
+  };
+  if (isAutoFillable(readSettingString(values.gateway), previous?.gateway)) {
+    fills.gateway = derived.gateway;
+  }
+  if (isAutoFillable(readSettingString(values.broadcast), previous?.broadcast)) {
+    fills.broadcast = derived.broadcast;
+  }
+  if (isDnsAutoFillable(formDnsList(values.dns), previous?.dns)) {
+    fills.dns = derived.dns.join(", ");
+  }
+  const bind = offSubnetBindAddress(values, derived.rangeStart, derived.subnet, interfaces);
+  if (bind !== undefined) fills.interface = bind;
+  return fills;
+}
+
+/**
+ * The network a chosen NIC is itself on, in CIDR form.
+ *
+ * @returns `undefined` for the all-interfaces choice (not one NIC, so no
+ *   network), for an address this machine does not hold, and for one the
+ *   platform reported without a usable netmask — an older or unusual
+ *   `os.networkInterfaces()` answer must leave the pool alone rather than have
+ *   a mask guessed for it.
+ */
+export function dhcpInterfaceCidr(
+  address: string,
+  interfaces: readonly NetworkInterfaceOption[]
+): string | undefined {
+  if (isAllInterfaces(address)) return undefined;
+  const netmask = interfaces.find((option) => option.value === address)?.netmask;
+  if (netmask === undefined) return undefined;
+  if (!isValidIpv4(address) || !isValidIpv4(netmask) || !isContiguousMask(netmask)) return undefined;
+  const prefix = maskToPrefix(netmask);
+  if (prefix === undefined) return undefined;
+  return `${networkAddress(address, netmask)}/${String(prefix)}`;
+}
+
+/**
+ * The full form's single autofill entry point: what the field the user just
+ * committed implies for the rest of the DHCP form.
+ *
+ * Both directions land on {@link dhcpCidrFormFills} rather than deriving
+ * separately — a NIC is just another way of naming a network, and two
+ * derivations would agree today and drift the first time one is touched.
+ *
+ * @returns `undefined` for a field this form derives nothing from, and for
+ *   input that describes no usable pool (`/31`, `/32`, `/0`, anything
+ *   malformed). A partial fill would be worse than none: it would leave the
+ *   mask on one network and the pool on another.
+ */
+export function dhcpFormAutofillFields(
+  key: string,
+  value: string,
+  values: FormValues | undefined,
+  interfaces: readonly NetworkInterfaceOption[]
+): Record<string, string> | undefined {
+  const current = values ?? {};
+  if (key === DHCP_CIDR_FIELD_KEY) return dhcpCidrFormFills(value, current, interfaces);
+  if (key !== "interface") return undefined;
+  const cidr = dhcpInterfaceCidr(value, interfaces);
+  return cidr === undefined ? undefined : dhcpCidrFormFills(cidr, current, interfaces);
+}
+
+/** One entry of the form's bind-address picker, annotated for the pool it serves. */
+export interface DhcpInterfaceChoice {
+  readonly label: string;
+  readonly value: string;
+  /** Shown under the label in the dropdown; absent when there is nothing to say. */
+  readonly description?: string;
+}
+
+/**
+ * The bind-address options with the NICs already on the pool's subnet called
+ * out, so the one that is certainly right is not found by reading addresses
+ * octet by octet.
+ *
+ * Asked with relay support switched off, exactly as the quick picker's
+ * `isOnPoolSubnet` does: "is this NIC on the pool's subnet" has the same answer
+ * either way, and it is the *warning* a relay agent makes irrelevant, not the
+ * fact.
+ *
+ * The order is left alone. The quick picker lifts an unambiguous match to the
+ * top because a quick pick is scanned once and dismissed; a form's select is a
+ * fixed list the user comes back to, and reordering it between one open and the
+ * next costs more than the annotation saves.
+ */
+export function dhcpInterfaceChoices(
+  interfaces: readonly NetworkInterfaceOption[],
+  rangeStart: string | undefined,
+  subnet: string | undefined
+): DhcpInterfaceChoice[] {
+  return interfaces.map((option) => {
+    if (isAllInterfaces(option.value)) return { label: option.label, value: option.value };
+    const onSubnet =
+      dhcpInterfaceSubnetStatus(option.value, subnet, rangeStart, interfaces, false) === "match";
+    return onSubnet
+      ? { label: option.label, value: option.value, description: "matches the pool subnet" }
+      : { label: option.label, value: option.value };
+  });
+}
+
 /**
  * A saved profile expressed as the setting writes that restore it — the third
  * caller of the same `nexus.networkServers.<kind>.*` keys the form and the
@@ -274,6 +732,14 @@ export function networkServerProfileSettingUpdates(
  * use the packaged default", which is always valid.
  */
 export function validateDhcpValues(values: FormValues): string | undefined {
+  // Checked first, and by the same function the quick editor's input box uses.
+  // The CIDR row is the shorthand every other pool field was filled from, so
+  // when it is the thing that cannot be made sense of, saying so beats
+  // reporting whichever derived field happens to fail afterwards. A blank row
+  // is not an error — it means "leave the pool alone".
+  const cidrProblem =
+    typeof values[DHCP_CIDR_FIELD_KEY] === "string" ? dhcpCidrProblem(values[DHCP_CIDR_FIELD_KEY]) : undefined;
+  if (cidrProblem) return cidrProblem;
   const parserProblem = validateDhcpFormInput(values);
   if (parserProblem) return parserProblem;
   const rangeStart = readSettingString(values.rangeStart);
