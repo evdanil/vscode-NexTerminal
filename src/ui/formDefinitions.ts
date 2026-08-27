@@ -2061,6 +2061,13 @@ function dhcpServerFields(current: DhcpServerFormSeed, options?: NetworkServerFo
       "Which NIC serves DHCP. This is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The port is always UDP 67. Picking one fills in the network it is on.",
       true
     ),
+    {
+      type: "checkbox",
+      key: "allowRelayAgents",
+      label: "Serve relayed requests",
+      value: current.allowRelayAgents ?? false,
+      hint: "Answer requests naming a relay agent in giaddr (RFC 2131 §4.1). Leave off unless this server really sits behind a relay: nothing authenticates that field, so with it on any device on the network can have a full configuration sent to an address of its choosing. It also turns off the off-subnet warnings below, since serving a subnet this machine is not on is then the point. Honoured by the Rust engine only."
+    },
     { type: "section", label: "Address Pool" },
     {
       type: "text",

@@ -716,6 +716,12 @@ export function networkServerProfileSettingUpdates(
     ["tftpServerAddresses", config.tftpServerAddresses ? [...config.tftpServerAddresses] : undefined],
     ["vendorClassId", config.vendorClassId],
     ["vendorSpecificOptions", config.vendorSpecificOptions ? [...config.vendorSpecificOptions] : undefined],
+    // `captureDhcpProfileBody` has always stored this (it comes in with
+    // `readDhcpConfig`'s spread), so a profile that omitted the row here was
+    // capturing the setting and then silently declining to put it back — the
+    // one direction where "leave the live value alone" is indistinguishable
+    // from a restore that worked.
+    ["allowRelayAgents", config.allowRelayAgents === true],
     ["autoLinkTftp", profile.autoLinkTftp === true]
   ];
 }

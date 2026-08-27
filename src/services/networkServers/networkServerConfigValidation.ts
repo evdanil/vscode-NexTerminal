@@ -341,14 +341,33 @@ function parseTftpConfigAt(value: unknown, path: string): ValidationResult<TftpA
 function parseDhcpConfigAt(value: unknown, path: string): ValidationResult<DhcpAdapterConfig> {
   const errors: string[] = [];
   if (!isPlainRecord(value)) return { ok: false, errors: [`${path}: DHCP configuration must be an object.`] };
+  // `allowRelayAgents` belongs on this list because `readDhcpConfig()` puts it
+  // on EVERY config the host sends: it is spread in unconditionally, `false`
+  // included. Leaving it off rejected the whole payload as an unknown key, so
+  // with `nexus.networkServers.engine: "node"` the spawn seed was refused
+  // ("Rejected malformed NEXUS_NETWORK_SERVERS_CONFIG") and every `configure`
+  // RPC came back "Malformed RPC request." — the daemon then served adapter
+  // defaults while the sidebar showed the user's settings. The Rust daemon,
+  // which is the packaged default, has always accepted it (`allow_relay_agents`
+  // in crates/daemon/src/config.rs), which is why the fault was invisible
+  // unless the engine was switched.
   const keys = [
     "rangeStart", "rangeEnd", "subnet", "gateway", "dns", "leaseTimeSec", "serverId", "broadcast", "static",
     "bindAddress", "leaseStorePath", "bootFileName", "nextServer", "tftpServerAddresses", "vendorClassId", "vendorSpecificOptions",
+    "allowRelayAgents",
   ];
   pushUnknownKeys(value, keys, path, errors);
   const parsed: Mutable<DhcpAdapterConfig> = {};
   const numericRanges: { rangeStart?: number; rangeEnd?: number } = {};
 
+  if (hasOwn(value, "allowRelayAgents")) {
+    // Parsed rather than merely tolerated: the JavaScript engine cannot act on
+    // it (it delegates reply routing to the `dhcp` package), but the value has
+    // to survive into the config the controller compares, or toggling the
+    // setting would not read as a configuration change at all.
+    const allowRelayAgents = parseBoolean(value.allowRelayAgents, `${path}.allowRelayAgents`, "Serve Relayed Requests", errors);
+    if (allowRelayAgents !== undefined) parsed.allowRelayAgents = allowRelayAgents;
+  }
   if (hasOwn(value, "rangeStart")) {
     const address = parseIpv4(value.rangeStart, `${path}.rangeStart`, "Pool Start", errors);
     if (address) {
@@ -481,13 +500,22 @@ export function sanitizeTftpConfig(value: unknown): { readonly value: TftpAdapte
 export function sanitizeDhcpConfig(value: unknown): { readonly value: DhcpAdapterConfig; readonly warnings: readonly string[] } {
   const warnings: string[] = [];
   if (!isPlainRecord(value)) return { value: {}, warnings: ["dhcp: DHCP configuration must be an object."] };
+  // Kept in step with the strict parser's list above. `readDhcpConfig()` adds
+  // `allowRelayAgents` after this call rather than through it, so nothing
+  // reaches here carrying the key today — but two lists of the same keys that
+  // disagree is exactly the trap that produced the daemon-ingress bug.
   const keys = [
     "rangeStart", "rangeEnd", "subnet", "gateway", "dns", "leaseTimeSec", "serverId", "broadcast", "static",
     "bindAddress", "leaseStorePath", "bootFileName", "nextServer", "tftpServerAddresses", "vendorClassId", "vendorSpecificOptions",
+    "allowRelayAgents",
   ];
   pushUnknownKeys(value, keys, "dhcp", warnings);
   const parsed: Mutable<DhcpAdapterConfig> = {};
   const numericRanges: { rangeStart?: number; rangeEnd?: number } = {};
+  if (hasConfiguredValue(value, "allowRelayAgents")) {
+    const allowRelayAgents = parseBoolean(value.allowRelayAgents, "dhcp.allowRelayAgents", "Serve Relayed Requests", warnings);
+    if (allowRelayAgents !== undefined) parsed.allowRelayAgents = allowRelayAgents;
+  }
   if (hasConfiguredValue(value, "rangeStart")) {
     const address = parseIpv4(value.rangeStart, "dhcp.rangeStart", "Pool Start", warnings);
     if (address) {

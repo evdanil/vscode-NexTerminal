@@ -175,6 +175,7 @@ function networkServerSettingUpdates(kind: NetworkServerKind, values: FormValues
     ["tftpServerAddresses", parseCommaList(values.tftpServerAddresses)],
     ["vendorClassId", readSettingString(values.vendorClassId)],
     ["vendorSpecificOptions", parseVendorSpecificOptions(values.vendorSpecificOptions)],
+    ["allowRelayAgents", readSettingBoolean(values.allowRelayAgents)],
     ["autoLinkTftp", readSettingBoolean(values.autoLinkTftp)]
   ];
 }

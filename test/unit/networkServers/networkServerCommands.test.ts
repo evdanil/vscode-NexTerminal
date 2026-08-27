@@ -306,6 +306,24 @@ describe("registerNetworkServerCommands — edit", () => {
     expect(byKey("subnet")).toBeUndefined();
   });
 
+  it("writes the relay-agent switch the form now renders", async () => {
+    const manager = fakeManager();
+    const cmd = register(fakeContext(manager));
+    await cmd("nexus.networkServer.edit")("dhcp");
+    await formPanelOpens[0].handlers.onSubmit({
+      rangeStart: "172.28.1.10",
+      poolCount: "190",
+      allowRelayAgents: true
+    });
+
+    // Without this row the checkbox is a control that silently does nothing:
+    // the form renders it, the user clears it, Save reports success and the
+    // service goes on answering relayed requests.
+    expect(configUpdates).toContainEqual(expect.objectContaining({ key: "allowRelayAgents", value: true }));
+    await formPanelOpens[0].handlers.onSubmit({ rangeStart: "172.28.1.10", poolCount: "190" });
+    expect(configUpdates).toContainEqual(expect.objectContaining({ key: "allowRelayAgents", value: false }));
+  });
+
   it("never writes the CIDR row as a setting — it is an input shape, not a key", async () => {
     const manager = fakeManager();
     const cmd = register(fakeContext(manager));
