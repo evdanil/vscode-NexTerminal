@@ -95,7 +95,10 @@ describe("WebviewFormPanel submit handling", () => {
 
     await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
 
-    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
+    // The third argument is the form's own value snapshot. A message that
+    // carries none forwards `undefined` rather than an empty object, so a
+    // handler can tell "the webview sent nothing" from "the form is empty".
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined);
     // `key` echoes the request: the webview tracks which managed fields the
     // AUTH PROFILE select filled, and must not read another autofill-capable
     // select's answer as the profile's (kills dropping the echo).
@@ -124,8 +127,35 @@ describe("WebviewFormPanel submit handling", () => {
 
     await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
 
-    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined);
     expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
+  });
+
+  it("forwards the autofill message's form-value snapshot to the handler", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ subnet: "255.255.255.0" });
+
+    WebviewFormPanel.open("panel-autofill-values", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    expect(messageHandler).toBeDefined();
+
+    // The DHCP editor's CIDR row cannot decide what it may overwrite without
+    // this: a gateway the user typed has to survive, and only one a previous
+    // derivation wrote may be replaced. Dropping `values` on the floor here
+    // makes every such answer look like it is filling a blank form, which is
+    // precisely the "clobber a hand-set value" bug the payload exists to stop.
+    await Promise.resolve(
+      messageHandler!({
+        type: "autofill",
+        key: "cidr",
+        value: "10.0.0.0/24",
+        values: { gateway: "10.0.0.9", rangeStart: "192.168.2.10" }
+      })
+    );
+
+    expect(onAutofill).toHaveBeenCalledWith("cidr", "10.0.0.0/24", {
+      gateway: "10.0.0.9",
+      rangeStart: "192.168.2.10"
+    });
   });
 
   it("REVIEW FINDING 2 (P2) — a rejecting onTest is caught and shown as 'Test failed: ...' instead of escaping as an unhandled rejection (kills the uncaught onTest await)", async () => {

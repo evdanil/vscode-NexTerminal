@@ -26,7 +26,19 @@ import { NetworkServerError } from "../../../src/models/networkServer";
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const configUpdates = vi.hoisted(() => [] as Array<{ section: string; key: string; value: unknown; target: unknown }>);
 const formPanelOpens = vi.hoisted(
-  () => [] as Array<{ id: string; definition: unknown; handlers: { onSubmit: (values: Record<string, unknown>) => Promise<void> } }>
+  () =>
+    [] as Array<{
+      id: string;
+      definition: unknown;
+      handlers: {
+        onSubmit: (values: Record<string, unknown>) => Promise<void>;
+        onAutofill?: (
+          key: string,
+          value: string,
+          values?: Record<string, unknown>
+        ) => Promise<Record<string, string> | undefined>;
+      };
+    }>
 );
 
 vi.mock("vscode", () => ({
@@ -63,7 +75,7 @@ vi.mock("vscode", () => ({
 
 vi.mock("../../../src/ui/webviewFormPanel", () => ({
   WebviewFormPanel: {
-    open: (id: string, definition: unknown, handlers: { onSubmit: (values: Record<string, unknown>) => Promise<void> }) => {
+    open: (id: string, definition: unknown, handlers: (typeof formPanelOpens)[number]["handlers"]) => {
       formPanelOpens.push({ id, definition, handlers });
       return Promise.resolve(undefined);
     }
@@ -292,6 +304,60 @@ describe("registerNetworkServerCommands — edit", () => {
       "11:22:33:44:55:66": "172.28.1.52"
     });
     expect(byKey("subnet")).toBeUndefined();
+  });
+
+  it("never writes the CIDR row as a setting — it is an input shape, not a key", async () => {
+    const manager = fakeManager();
+    const cmd = register(fakeContext(manager));
+    await cmd("nexus.networkServer.edit")("dhcp");
+    await formPanelOpens[0].handlers.onSubmit({ cidr: "10.0.0.0/24", rangeStart: "10.0.0.1", poolCount: "253" });
+
+    expect(configUpdates.some((entry) => entry.key === "cidr")).toBe(false);
+    // The settings it stands for are what get written.
+    expect(configUpdates).toContainEqual(expect.objectContaining({ key: "rangeStart", value: "10.0.0.1" }));
+    expect(configUpdates).toContainEqual(expect.objectContaining({ key: "rangeEnd", value: "10.0.0.253" }));
+  });
+
+  it("refuses to save a CIDR row that describes no pool, and writes nothing", async () => {
+    const manager = fakeManager();
+    const cmd = register(fakeContext(manager));
+    await cmd("nexus.networkServer.edit")("dhcp");
+
+    // The row derived nothing when it was typed, so the rest of the pool still
+    // describes the OLD network — every individual field is valid and only the
+    // row that produced them is not. Saving anyway would store a configuration
+    // the user believes they replaced.
+    await expect(
+      formPanelOpens[0].handlers.onSubmit({ cidr: "10.0.0.0/31", rangeStart: "192.168.2.10" })
+    ).rejects.toThrow(/\/31 is a point-to-point range/);
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("wires an autofill handler for DHCP that derives the pool a network implies", async () => {
+    const manager = fakeManager();
+    const cmd = register(fakeContext(manager));
+    await cmd("nexus.networkServer.edit")("dhcp");
+
+    const onAutofill = formPanelOpens[0].handlers.onAutofill;
+    expect(onAutofill, "the DHCP form opened with no autofill handler").toBeDefined();
+    const fills = await onAutofill!("cidr", "10.0.0.0/24", {
+      rangeStart: "192.168.2.10",
+      subnet: "255.255.255.0",
+      gateway: "192.168.2.1"
+    });
+    expect(fills).toMatchObject({ subnet: "255.255.255.0", rangeStart: "10.0.0.1", poolCount: "253" });
+    // The hand-set gateway is not in the answer, so the field keeps it.
+    expect(fills).not.toHaveProperty("gateway");
+    // Nothing is written by an autofill — it fills fields, and Save is still
+    // what commits them.
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("wires no autofill handler for TFTP, which has no pool to derive", async () => {
+    const manager = fakeManager();
+    const cmd = register(fakeContext(manager));
+    await cmd("nexus.networkServer.edit")("tftp");
+    expect(formPanelOpens[0].handlers.onAutofill).toBeUndefined();
   });
 
   it("does not offer a restart when the service is not running", async () => {

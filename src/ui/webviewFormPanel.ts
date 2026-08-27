@@ -18,7 +18,11 @@ export class WebviewFormPanel {
     private readonly onBrowse?: (key: string) => Promise<string | undefined>,
     private readonly onScan?: (key: string) => Promise<string | undefined>,
     private readonly onCreateInline?: (key: string, values?: FormValues) => void,
-    private readonly onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>,
+    private readonly onAutofill?: (
+      key: string,
+      value: string,
+      values?: FormValues
+    ) => Promise<Record<string, string> | undefined>,
     private readonly onTest?: (values: FormValues) => void | Promise<void>
   ) {
     this.panel = vscode.window.createWebviewPanel(
@@ -69,7 +73,12 @@ export class WebviewFormPanel {
         this.onCreateInline(message.key, message.values);
       }
       if (message.type === "autofill" && this.onAutofill) {
-        const result = await this.onAutofill(message.key, message.value);
+        // `message.values` is the form's own snapshot at the moment the
+        // autofill fired. Handlers that answer from the chosen id alone (the
+        // auth-profile and device-template mirrors) simply do not declare the
+        // parameter; the DHCP editor needs it to decide which fields its
+        // derivation is allowed to overwrite.
+        const result = await this.onAutofill(message.key, message.value, message.values);
         if (result && !this.disposed) {
           // `key` travels back with the values: the webview tracks which keys
           // the AUTH PROFILE select filled (formHtml's profileFilledKeys), and
@@ -135,7 +144,7 @@ export class WebviewFormPanel {
       onBrowse?: (key: string) => Promise<string | undefined>;
       onScan?: (key: string) => Promise<string | undefined>;
       onCreateInline?: (key: string, values?: FormValues) => void;
-      onAutofill?: (key: string, value: string) => Promise<Record<string, string> | undefined>;
+      onAutofill?: (key: string, value: string, values?: FormValues) => Promise<Record<string, string> | undefined>;
       onTest?: (values: FormValues) => void | Promise<void>;
     }
   ): WebviewFormPanel {

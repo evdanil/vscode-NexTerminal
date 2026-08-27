@@ -66,12 +66,15 @@ function renderField(field: FormFieldDescriptor): string {
     case "hidden":
       return `<input type="hidden" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" />`;
 
-    case "text":
+    case "text": {
+      // Opt-in only: a field that declares no `autofill` emits the empty string
+      // here, so its markup is byte-for-byte what it has always been.
+      const textAutofillAttr = field.autofill ? ' data-autofill="true"' : "";
       if (field.scannable) {
         return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
   <div class="file-input-row">
-    <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />
+    <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr} />
     <button type="button" class="scan-btn" data-key="${key}">Scan</button>
   </div>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
@@ -79,9 +82,10 @@ function renderField(field: FormFieldDescriptor): string {
       }
       return `<div class="form-group"${vw}>
   <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
-  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req} />${renderHint(field)}
+  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
+    }
 
     // A `<textarea>` here renders `field.value` bare, unlike the Macro Editor's
     // (`TEXTAREA_LEADING_NEWLINE` in `macroEditorHtml.ts`), because the HTML
@@ -692,8 +696,17 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         })(defaultsTargets[di]);
       }
 
-      form.addEventListener("submit", function(e) {
-        e.preventDefault();
+      /**
+       * Everything this form would submit right now, in the shape the
+       * extension host reads (FormValues). One definition rather than the
+       * four near-identical copies this script used to carry: submit, Test
+       * Connection, the inline-create snapshot and — new — the autofill
+       * payload all need exactly the same collection, and a fifth copy is how
+       * they drift apart. Disabled controls are skipped because a hidden
+       * field's value is not part of the form's answer (updateVisibility
+       * disables what it hides).
+       */
+      function collectFormValues() {
         var values = {};
         for (var i = 0; i < form.elements.length; i++) {
           var el = form.elements[i];
@@ -707,7 +720,30 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             values[el.name] = el.value;
           }
         }
-        vscode.postMessage({ type: "submit", values: values });
+        return values;
+      }
+
+      /* An autofill-capable TEXT field — the DHCP editor's Network (CIDR) row.
+         The same round trip the autofill-capable SELECT below already makes,
+         fired on "change" rather than "input": a network is only meaningful
+         once it is committed, and deriving a whole pool from 192.168.2.0/2 on
+         the way to /24 would overwrite the very fields the user is about to
+         see filled correctly. The values snapshot rides along because the
+         answer decides what it may overwrite — a hand-typed gateway survives,
+         a stale derived one does not. Fields that did not opt in carry no
+         data-autofill attribute and are not touched by this loop. */
+      var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');
+      for (var afi = 0; afi < autofillInputs.length; afi++) {
+        (function(input) {
+          input.addEventListener("change", function() {
+            vscode.postMessage({ type: 'autofill', key: input.name, value: input.value, values: collectFormValues() });
+          });
+        })(autofillInputs[afi]);
+      }
+
+      form.addEventListener("submit", function(e) {
+        e.preventDefault();
+        vscode.postMessage({ type: "submit", values: collectFormValues() });
       });
 
       document.getElementById("cancel-btn").addEventListener("click", function() {
@@ -717,20 +753,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       var testBtn = document.getElementById("test-btn");
       if (testBtn) {
         testBtn.addEventListener("click", function() {
-          var values = {};
-          for (var i = 0; i < form.elements.length; i++) {
-            var el = form.elements[i];
-            if (el.disabled) continue;
-            if (!el.name) continue;
-            if (el.type === "checkbox") {
-              values[el.name] = el.checked;
-            } else if (el.type === "number") {
-              values[el.name] = el.value === "" ? undefined : Number(el.value);
-            } else {
-              values[el.name] = el.value;
-            }
-          }
-          vscode.postMessage({ type: "test", values: values });
+          vscode.postMessage({ type: "test", values: collectFormValues() });
         });
       }
 
@@ -844,20 +867,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // what the user has typed (issue #48 PR-E: "Save current filter as…"
           // needs the current Device Filter text). Same collection the submit
           // handler uses.
-          var createValues = {};
-          for (var cvi = 0; cvi < form.elements.length; cvi++) {
-            var cvEl = form.elements[cvi];
-            if (cvEl.disabled) continue;
-            if (!cvEl.name) continue;
-            if (cvEl.type === "checkbox") {
-              createValues[cvEl.name] = cvEl.checked;
-            } else if (cvEl.type === "number") {
-              createValues[cvEl.name] = cvEl.value === "" ? undefined : Number(cvEl.value);
-            } else {
-              createValues[cvEl.name] = cvEl.value;
-            }
-          }
-          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: createValues });
+          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: collectFormValues() });
           return;
         }
         selectCustomOption(wrapper, value);
@@ -876,7 +886,12 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           setFieldValue(wrapper.dataset.fillTarget, opt.dataset.fillValue);
         }
         if (wrapper.dataset.autofill === 'true' && value) {
-          vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value });
+          // The values snapshot rides along for the same reason the text
+          // autofill above carries it: an answer may have to keep what the
+          // user typed. The auth-profile mirror ignores it; the DHCP interface
+          // picker derives a whole pool from the chosen NIC and cannot
+          // without it.
+          vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value, values: collectFormValues() });
         }
         if (wrapper.dataset.name === 'authProfileId') {
           // The newly chosen profile has supplied nothing yet — the previous
@@ -970,7 +985,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             // inline-created auth profile is selected but never mirrors its
             // username into the managed field, and never locks it.
             if (wrapper.dataset.autofill === 'true' && msg.value) {
-              vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });
+              vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value, values: collectFormValues() });
             }
             if (wrapper.dataset.name === 'authProfileId') {
               // Same release as the user-click path above — an inline-created

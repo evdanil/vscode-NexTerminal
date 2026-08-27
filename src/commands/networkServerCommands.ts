@@ -34,6 +34,8 @@ import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
 import { openNetworkServerQuickAdjust } from "./networkServerQuickAdjust";
 import { loadNetworkServerProfile, saveCurrentNetworkServerProfile } from "./networkServerProfileCommands";
 import {
+  dhcpFormAutofillFields,
+  dhcpInterfaceChoices,
   dhcpRangeEndForCount,
   readSettingBoolean,
   readSettingNumber,
@@ -204,8 +206,26 @@ export function registerNetworkServerCommands(
       kind === "dhcp" ? dhcpFormSeed(manager.readConfig(kind) as DhcpAdapterConfig) : manager.readConfig(kind);
     // Enumerated per open, never cached: a VPN coming up or a dock being
     // unplugged changes the answer between one Edit and the next.
-    const form = networkServerFormDefinition(kind, seed, { interfaceOptions: networkInterfaceBindOptions() });
+    const interfaces = networkInterfaceBindOptions();
+    const dhcpSeed = kind === "dhcp" ? (seed as DhcpServerFormSeed) : undefined;
+    const form = networkServerFormDefinition(kind, seed, {
+      // The "matches the pool subnet" annotations are worked out here, against
+      // the pool the form OPENS on. They do not follow a network typed into the
+      // form afterwards — the same snapshot-per-open rule the quick editor
+      // applies, and the CIDR row's own fill covers the moved-pool case by
+      // offering the NIC that serves it.
+      interfaceOptions: dhcpSeed
+        ? dhcpInterfaceChoices(interfaces, dhcpSeed.rangeStart, dhcpSeed.subnet)
+        : interfaces
+    });
     WebviewFormPanel.open(`network-server-edit-${kind}`, form, {
+      // DHCP only, and synchronous underneath: deriving a pool from a network
+      // is arithmetic, so the round trip exists to keep that arithmetic out of
+      // the webview, not because anything here has to wait.
+      onAutofill:
+        kind === "dhcp"
+          ? (key, value, values) => Promise.resolve(dhcpFormAutofillFields(key, value, values, interfaces))
+          : undefined,
       onSubmit: async (values) => {
         const problem = kind === "dhcp" ? validateDhcpValues(values) : validateTftpFormInput(values);
         if (problem) {

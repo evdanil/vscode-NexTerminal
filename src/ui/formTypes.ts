@@ -44,7 +44,19 @@ interface FormFieldCommon {
 
 export type FormFieldDescriptor =
   | ({ type: "hidden"; key: string; value?: string } & FormFieldCommon)
-  | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean } & FormFieldCommon)
+  /**
+   * `autofill` opts a text input into the same round trip an autofill-capable
+   * SELECT already makes: on `change` (commit, not keystroke — a half-typed
+   * network must never be derived from) the webview posts
+   * `{type: "autofill", key, value, values}` and applies whatever `fillFields`
+   * comes back. The DHCP editor's Network (CIDR) row is the first user: what a
+   * network implies for the mask, the pool and the gateway is arithmetic the
+   * extension host owns, not the webview.
+   *
+   * Default false → today's markup, byte-for-byte. A field that does not set it
+   * emits no `data-autofill` attribute and wires no listener.
+   */
+  | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean; autofill?: boolean } & FormFieldCommon)
   | ({ type: "textarea"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; rows?: number } & FormFieldCommon)
   | ({ type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; step?: number | "any"; placeholder?: string; value?: number; defaultsFrom?: FieldDefaultsFrom } & FormFieldCommon)
@@ -132,7 +144,30 @@ export type FormMessage =
    * ignore it.
    */
   | { type: "createInline"; key: string; values?: FormValues }
-  | { type: "autofill"; key: string; value: string }
+  /**
+   * `values` — the same snapshot `createInline` above carries, for the same
+   * reason: an autofill answer often has to decide what it is ALLOWED to
+   * overwrite, and only the form knows what its fields currently hold. The DHCP
+   * editor's CIDR row needs it to keep a hand-typed gateway while still
+   * replacing one a previous derivation wrote (`isAutoFillable` in
+   * `networkServerSettings.ts`). Optional and additive: the auth-profile and
+   * device-template mirrors answer from the chosen id alone and ignore it.
+   *
+   * **Safety argument, and it is an argument rather than a guarantee:** this
+   * snapshot is collected from every enabled named control, so on a form that
+   * has password inputs (the SOCKS5 / HTTP proxy passwords on the server edit
+   * and unified profile forms) it carries whatever is currently typed into
+   * them. That is safe today only because no password-bearing form's
+   * `onAutofill` reads `values` — `serverCommands.ts` and `profileCommands.ts`
+   * both declare `(key, value)` and answer from the chosen auth-profile id
+   * alone; the only handler that takes the third parameter is the DHCP editor's
+   * (`networkServerCommands.ts`), on a form with no password field. Nothing in
+   * the type system enforces that, so the two forms' declared arity is pinned
+   * by tests (`serverCommands.test.ts`, `profileCommands.test.ts`). A new
+   * handler that wants to read `values` on a form with a password field is a
+   * change that needs re-reviewing, not one that is safe by construction.
+   */
+  | { type: "autofill"; key: string; value: string; values?: FormValues }
   | { type: "test"; values: FormValues };
 
 export type ExtensionMessage =

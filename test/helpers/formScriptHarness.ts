@@ -406,6 +406,11 @@ function buildFormDom(definition: FormDefinition): FormDom {
           const scan = group.append(new StubElement("BUTTON", ["scan-btn"]));
           scan.dataset.key = field.key;
         }
+        // Mirrors `renderField`'s opt-in `data-autofill="true"` on a text input,
+        // which is what the script's `input[data-autofill="true"]` sweep finds.
+        if (field.type === "text" && field.autofill) {
+          input.dataset.autofill = "true";
+        }
         register(field.key, input);
         controls.push(input);
         break;

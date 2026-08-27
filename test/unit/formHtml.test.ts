@@ -953,7 +953,12 @@ describe("renderFormHtml", () => {
     const selectIndex = block.indexOf("selectCustomOption(wrapper, msg.value);");
     expect(selectIndex).toBeGreaterThan(-1);
     expect(block).toContain("wrapper.dataset.autofill === 'true'");
-    expect(block).toContain("vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });");
+    // The payload gained a `values` snapshot (the DHCP interface picker derives
+    // a whole pool from the chosen NIC and has to know what the form already
+    // holds); the assertion stops before it so it keeps pinning what it was
+    // written to pin — that this branch posts an autofill for THIS wrapper's
+    // key and the INJECTED option's value.
+    expect(block).toContain("vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value,");
     expect(block).toContain("if (wrapper.dataset.name === 'authProfileId') {");
     expect(block.indexOf("type: 'autofill'")).toBeGreaterThan(selectIndex);
     // The release is the re-lock (it ends by re-evaluating both the lock and
@@ -1330,7 +1335,7 @@ describe("renderFormHtml — filterable client wiring is present in the emitted 
     // SAVED FILTER DEFINITIONS (issue #48 PR-E) — the create message now carries a
     // snapshot of the current form values, so "Save current filter as…" can act on
     // the typed Device Filter text.
-    expect(html).toContain("vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: createValues });");
+    expect(html).toContain("vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: collectFormValues() });");
     // And the discarded bare-remove idiom must be gone entirely (it existed
     // nowhere else in the emitted script).
     expect(html).not.toContain("wrapper.classList.remove('open')");
@@ -1484,19 +1489,26 @@ describe("FIX B — saved-filter picker synchronous fill (no round-trip race)", 
     )({ postMessage }, form, setFieldValue, noop, noop, noop) as (wrapper: unknown, opt: unknown) => void;
   }
 
-  /** Run the rendered submit handler and return the collected values it posts. */
+  /** Run the rendered submit handler and return the collected values it posts.
+   *  The collection itself now lives in the script's own `collectFormValues`
+   *  (one definition shared by submit / Test / inline-create / autofill), so it
+   *  is sliced out of the SAME rendered script and handed to the handler —
+   *  still the real code, not a re-implementation of it. */
   function collectSubmitValues(html: string, form: unknown): Record<string, unknown> {
     const src = extractFn(html, 'form.addEventListener("submit", function(e) {');
     // The extracted slice is `form.addEventListener("submit", function(e) { ... }`
     // — pull the inner handler out and invoke it.
     const inner = src.slice(src.indexOf("function(e)"));
+    const collectSrc = extractFn(html, "function collectFormValues()");
     let posted: Record<string, unknown> = {};
     const vscodeStub = {
       postMessage: (m: { type: string; values: Record<string, unknown> }) => {
         if (m.type === "submit") posted = m.values;
       }
     };
-    const handler = new Function("form", "vscode", `return (${inner});`)(form, vscodeStub) as (e: unknown) => void;
+    const handler = new Function("form", "vscode", `${collectSrc}\nreturn (${inner});`)(form, vscodeStub) as (
+      e: unknown
+    ) => void;
     handler({ preventDefault: () => {} });
     return posted;
   }
@@ -1551,5 +1563,76 @@ describe("FIX B — saved-filter picker synchronous fill (no round-trip race)", 
     // hand edit — nothing re-resolves the id, so the manual value wins.
     const values = collectSubmitValues(html, form);
     expect(values.cfg_filter).toBe("role=edge&site=mel");
+  });
+});
+
+/**
+ * The `text` field's opt-in autofill (Network (CIDR) in the DHCP editor).
+ *
+ * The point of the flag is that it is a flag: every other text field in the
+ * product has to render byte-for-byte what it always did, so the tests below
+ * compare the two renders of the SAME descriptor rather than merely checking
+ * that the attribute appears when asked for.
+ */
+describe("renderFormHtml — autofill on a text field", () => {
+  const base = { type: "text", key: "cidr", label: "Network (CIDR)", value: "10.0.0.0/24" } as const;
+
+  function render(field: FormDefinition["fields"][number]): string {
+    return renderFormHtml({ title: "T", fields: [field] });
+  }
+
+  it("emits data-autofill only for the field that asked for it", () => {
+    expect(render({ ...base, autofill: true })).toContain(
+      '<input type="text" id="field-cidr" name="cidr" value="10.0.0.0/24" placeholder="" data-autofill="true" />'
+    );
+    // Asserted on the input element, not on the document: the shared script
+    // mentions `data-autofill` in its selector no matter what the form renders,
+    // so a whole-document `not.toContain` would pass against an implementation
+    // that stamped the attribute on every text row.
+    expect(render({ ...base })).toContain(
+      '<input type="text" id="field-cidr" name="cidr" value="10.0.0.0/24" placeholder="" />'
+    );
+  });
+
+  it("leaves an unflagged text field's markup byte-for-byte unchanged", () => {
+    // The two renders differ by exactly the attribute — nothing else about the
+    // row (id, name, placeholder, required, hint, the error slot) moves. An
+    // implementation that restructured the input to make room for the flag
+    // would drift every form in the product at once.
+    const flagged = render({ ...base, autofill: true, required: true, placeholder: "192.168.2.0/24", hint: "h" });
+    const plain = render({ ...base, required: true, placeholder: "192.168.2.0/24", hint: "h" });
+    expect(flagged.replace(' data-autofill="true"', "")).toBe(plain);
+  });
+
+  it("carries the flag on a scannable text field too, without disturbing the Scan button", () => {
+    const flagged = render({ ...base, scannable: true, autofill: true });
+    const plain = render({ ...base, scannable: true });
+    expect(flagged).toContain('data-autofill="true"');
+    expect(flagged).toContain('<button type="button" class="scan-btn" data-key="cidr">Scan</button>');
+    expect(flagged.replace(' data-autofill="true"', "")).toBe(plain);
+  });
+
+  it("wires the change listener from the attribute, not from the field type", () => {
+    // The sweep is over `input[data-autofill="true"]`, so a form with no such
+    // field finds nothing and a form with one finds exactly it. Selecting on
+    // `input[type="text"]` instead would turn every text row into a round trip.
+    const html = render({ ...base, autofill: true });
+    expect(html).toContain(`var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');`);
+    expect(html).toContain(
+      "vscode.postMessage({ type: 'autofill', key: input.name, value: input.value, values: collectFormValues() });"
+    );
+    // "change", never "input": a network is only meaningful once committed, and
+    // deriving a pool from 192.168.2.0/2 on the way to /24 would overwrite the
+    // very fields the user is about to see filled correctly.
+    expect(html).toContain('input.addEventListener("change", function() {');
+  });
+
+  it("collects the submitted values through one shared function", () => {
+    // Four callers (submit, Test Connection, inline-create, autofill) need the
+    // identical collection; a private copy per caller is how they drift.
+    const html = renderFormHtml({ title: "T", fields: [], testable: true });
+    expect(html).toContain("function collectFormValues() {");
+    expect(html).toContain('vscode.postMessage({ type: "submit", values: collectFormValues() });');
+    expect(html).toContain('vscode.postMessage({ type: "test", values: collectFormValues() });');
   });
 });
