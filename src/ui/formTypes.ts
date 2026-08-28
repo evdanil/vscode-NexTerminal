@@ -187,4 +187,20 @@ export type ExtensionMessage =
    * the select's CURRENT value and drops anything that does not match (see
    * `fillAnswersCurrentSelection` in formHtml.ts).
    */
-  | { type: "fillFields"; key: string; value: string; values: Record<string, string> };
+  | { type: "fillFields"; key: string; value: string; values: Record<string, string> }
+  /**
+   * One `autofill` request has been answered — with a fill, with nothing, or
+   * with a failure. Posted for EVERY request, immediately after the
+   * `fillFields` it accompanies when there is one.
+   *
+   * REVIEW FINDING (P1) — the webview disables Save while an autofill is in
+   * flight, because a Save that beats the answer submits the values the answer
+   * was about to replace (for the DHCP CIDR row: the previous network's pool,
+   * with the typed network discarded, since `cidr` is never written as a
+   * setting). `fillFields` cannot release it: a derivation that fills nothing
+   * — a /32, a network that describes no pool — answers `undefined`, no
+   * `fillFields` is posted, and Save would stay disabled until the form was
+   * reopened. Hence a terminator that is unconditional rather than a payload
+   * that is not.
+   */
+  | { type: "autofillSettled"; key: string; value: string };

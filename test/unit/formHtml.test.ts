@@ -953,14 +953,13 @@ describe("renderFormHtml", () => {
     const selectIndex = block.indexOf("selectCustomOption(wrapper, msg.value);");
     expect(selectIndex).toBeGreaterThan(-1);
     expect(block).toContain("wrapper.dataset.autofill === 'true'");
-    // The payload gained a `values` snapshot (the DHCP interface picker derives
-    // a whole pool from the chosen NIC and has to know what the form already
-    // holds); the assertion stops before it so it keeps pinning what it was
-    // written to pin — that this branch posts an autofill for THIS wrapper's
-    // key and the INJECTED option's value.
-    expect(block).toContain("vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value,");
+    // The post goes through the script's own `postAutofill` (which also holds
+    // Save until the answer lands), so what is pinned here is the same thing it
+    // always was: that this branch posts an autofill for THIS wrapper's key and
+    // the INJECTED option's value.
+    expect(block).toContain("postAutofill(wrapper.dataset.name, msg.value);");
     expect(block).toContain("if (wrapper.dataset.name === 'authProfileId') {");
-    expect(block.indexOf("type: 'autofill'")).toBeGreaterThan(selectIndex);
+    expect(block.indexOf("postAutofill(wrapper.dataset.name, msg.value);")).toBeGreaterThan(selectIndex);
     // The release is the re-lock (it ends by re-evaluating both the lock and
     // visibility): an inline-created profile owns nothing until its own fill
     // answers, and the profile it replaces hands back what it displaced —
@@ -1500,15 +1499,24 @@ describe("FIX B — saved-filter picker synchronous fill (no round-trip race)", 
     // — pull the inner handler out and invoke it.
     const inner = src.slice(src.indexOf("function(e)"));
     const collectSrc = extractFn(html, "function collectFormValues()");
+    // The handler now posts through the script's own `postSubmit`, and holds
+    // the submission while an autofill round trip is outstanding — so both come
+    // out of the same rendered script, with no request pending (that case has
+    // its own tests in dhcpFormAutofillWiring.test.ts).
+    const postSubmitSrc = extractFn(html, "function postSubmit()");
     let posted: Record<string, unknown> = {};
     const vscodeStub = {
       postMessage: (m: { type: string; values: Record<string, unknown> }) => {
         if (m.type === "submit") posted = m.values;
       }
     };
-    const handler = new Function("form", "vscode", `${collectSrc}\nreturn (${inner});`)(form, vscodeStub) as (
-      e: unknown
-    ) => void;
+    const handler = new Function(
+      "form",
+      "vscode",
+      "pendingAutofills",
+      "deferredSubmit",
+      `${collectSrc}\n${postSubmitSrc}\nreturn (${inner});`
+    )(form, vscodeStub, [], false) as (e: unknown) => void;
     handler({ preventDefault: () => {} });
     return posted;
   }
@@ -1618,8 +1626,11 @@ describe("renderFormHtml — autofill on a text field", () => {
     // `input[type="text"]` instead would turn every text row into a round trip.
     const html = render({ ...base, autofill: true });
     expect(html).toContain(`var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');`);
+    expect(html).toContain("postAutofill(input.name, input.value);");
+    // `postAutofill` is the one place the message is built, so the snapshot the
+    // answer needs cannot be dropped from one caller and kept in another.
     expect(html).toContain(
-      "vscode.postMessage({ type: 'autofill', key: input.name, value: input.value, values: collectFormValues() });"
+      "vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues() });"
     );
     // "change", never "input": a network is only meaningful once committed, and
     // deriving a pool from 192.168.2.0/2 on the way to /24 would overwrite the

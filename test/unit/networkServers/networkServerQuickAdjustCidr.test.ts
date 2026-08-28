@@ -389,13 +389,44 @@ describe("the Interface row", () => {
     expect(row?.detail).toContain("eth0 — current IP 192.168.2.5");
   });
 
-  it("says nothing about the subnet for an all-interfaces bind", async () => {
+  it("says nothing about the subnet for an all-interfaces bind that a NIC can actually serve", async () => {
+    // eth1 IS on 10.0.0.0/24, so binding everything genuinely includes the wire
+    // the pool describes. The common, correct case, and it must stay silent.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")], eth1: [ipv4("10.0.0.5")] });
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99" });
+    quickPickScript = [dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    const row = quickPickCalls[0].find((entry) => entry.label.includes("Interface"));
+    expect(row?.detail).toBe("Every IPv4 address on this machine — no single NIC, so no current IP to show.");
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the row used to return before the subnet comparison
+   * for a blank or 0.0.0.0 bind, so this arrangement (bind everything, offer
+   * 10.0.0.x, hold nothing but a 192.168.2.x address) was the one unreachable
+   * pool the editor said nothing at all about.
+   */
+  it("flags an all-interfaces bind when NO NIC on this machine is on the pool's subnet", async () => {
     networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
     seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99" });
     quickPickScript = [dismiss];
     await openNetworkServerQuickAdjust("dhcp", deps());
 
     const row = quickPickCalls[0].find((entry) => entry.label.includes("Interface"));
-    expect(row?.detail).not.toContain("not on the pool's subnet");
+    expect(row?.detail).toContain("no NIC on this machine is on the pool's subnet (10.0.0.0/24)");
+    // The descriptive half of the line is unchanged — the warning is appended.
+    expect(row?.detail).toContain("Every IPv4 address on this machine");
+  });
+
+  it("says nothing about an unreachable all-interfaces bind when relay agents are allowed", async () => {
+    // Deliberately the same unreachable fixture as the test above, one flag apart.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", allowRelayAgents: true });
+    quickPickScript = [dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    const row = quickPickCalls[0].find((entry) => entry.label.includes("Interface"));
+    expect(row?.detail).toBe("Every IPv4 address on this machine — no single NIC, so no current IP to show.");
   });
 });

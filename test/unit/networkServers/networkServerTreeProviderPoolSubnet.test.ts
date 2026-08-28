@@ -117,6 +117,53 @@ describe("DHCP Pool row — off-subnet bind", () => {
   });
 });
 
+/**
+ * REVIEW FINDING (P2) — an all-interfaces bind used to skip the comparison
+ * altogether, so a pool no NIC on this machine can serve was the one broken
+ * arrangement this row never mentioned. "Listening everywhere" is not
+ * "reachable everywhere": with no address on the pool's wire, the DISCOVERs
+ * never arrive.
+ */
+describe("DHCP Pool row — an all-interfaces bind with no NIC on the pool's subnet", () => {
+  /** Nothing on 10.0.0.0/24 — the pool is unreachable however it is bound. */
+  function noMatchingNic(): void {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
+  }
+
+  it("marks the row", () => {
+    noMatchingNic();
+    expect(poolRow({ ...POOL }).description).toBe("10.0.0.10 → 10.0.0.99 · ⚠ no NIC is on this subnet");
+    expect(poolRow({ ...POOL, bindAddress: "0.0.0.0" }).description).toContain("⚠ no NIC is on this subnet");
+  });
+
+  it("explains it in the tooltip without naming a bound address there is none of", () => {
+    noMatchingNic();
+    const tooltip = String(poolRow({ ...POOL }).tooltip);
+    expect(tooltip).toContain("No interface on this machine is on this pool's subnet (10.0.0.0/24).");
+    expect(tooltip).not.toContain("The service is bound to");
+    // The configuration lines it has always shown are still there.
+    expect(tooltip).toContain("Subnet: 255.255.255.0");
+  });
+
+  it("stays quiet with relay agents allowed, on the very same fixture", () => {
+    noMatchingNic();
+    expect(poolRow({ ...POOL, allowRelayAgents: true }).description).toBe("10.0.0.10 → 10.0.0.99");
+  });
+
+  it("stays quiet when the pool's own mask is unusable", () => {
+    noMatchingNic();
+    expect(poolRow({ ...POOL, subnet: "255.0.255.0" }).description).not.toContain("⚠");
+  });
+
+  it("changes nothing else about the branch — the warning is advisory only", () => {
+    noMatchingNic();
+    const warned = dhcpRows({ ...POOL });
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")], eth1: [ipv4("10.0.0.5")] });
+    const clean = dhcpRows({ ...POOL });
+    expect(warned.map((row) => row.id)).toEqual(clean.map((row) => row.id));
+  });
+});
+
 describe("DHCP Pool row — when no warning is due", () => {
   it("stays quiet for a NIC on the pool's subnet", () => {
     const row = poolRow({ ...POOL, bindAddress: "10.0.0.5" });
@@ -124,7 +171,9 @@ describe("DHCP Pool row — when no warning is due", () => {
     expect(String(row.tooltip)).not.toContain("⚠");
   });
 
-  it("stays quiet for an all-interfaces bind, which is on every subnet at once", () => {
+  it("stays quiet for an all-interfaces bind that a NIC can actually serve", () => {
+    // The shared fixture's eth1 is on 10.0.0.0/24, so every-NIC really does
+    // include the pool's wire. The common, correct case.
     expect(poolRow({ ...POOL }).description).not.toContain("⚠");
     expect(poolRow({ ...POOL, bindAddress: "" }).description).not.toContain("⚠");
     expect(poolRow({ ...POOL, bindAddress: "0.0.0.0" }).description).not.toContain("⚠");

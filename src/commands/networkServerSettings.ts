@@ -380,24 +380,36 @@ function poolNetwork(
  * configured and serves nothing. Nothing else in the settings catches it: every
  * individual field is valid, and only the pair is wrong.
  *
- * - `all-interfaces` — the bind address is unset or `0.0.0.0`. Every NIC is
- *   listening, so no single one can be off-subnet. Never a mismatch.
+ * - `all-interfaces` — the bind address is unset or `0.0.0.0`, and at least one
+ *   of this machine's NICs is on the pool's subnet. Every NIC is listening, so
+ *   the one that serves this pool is among them.
+ * - `all-interfaces-off-subnet` — the same bind, with NO NIC on the pool's
+ *   subnet. Listening on every interface does not put this machine on a wire it
+ *   has no address on: the DISCOVERs never arrive, exactly as they do not for a
+ *   bind to one wrong NIC. Kept apart from `mismatch` because there is no bound
+ *   address to name and no single NIC to blame — the remedy is the pool or a
+ *   NIC that does not exist yet, not the Interface setting.
  * - `unknown-address` — an address this machine does not currently hold. That
  *   is already reported as its own problem where the address is shown; saying
  *   "and it is on the wrong subnet" on top of it would be guessing.
  * - `unusable-mask` — the pool's own subnet cannot be worked out (a
  *   non-contiguous or malformed `subnet`, or a `rangeStart` that does not
- *   parse). Whatever reports the bad field reports it; this one stays quiet.
+ *   parse). Whatever reports the bad field reports it; this one stays quiet —
+ *   including under an all-interfaces bind, where a "looks fine" answer would
+ *   be an assertion about a subnet nothing here could work out.
  *
  * @param interfaces The already-filtered list from `networkInterfaceBindOptions()`.
  *   Passing a raw `os.networkInterfaces()` read would let a WSL or Docker NIC
- *   answer for a subnet no client is on.
+ *   answer for a subnet no client is on — and under an all-interfaces bind that
+ *   list is now the whole basis of the answer, not just a membership check for
+ *   one address.
  * @param allowRelayAgents When set, serving a subnet this machine is not on is
  *   the intended configuration — a relay agent forwards the request — so the
- *   comparison is not a fault to report at all.
+ *   comparison is not a fault to report at all, in either bind mode.
  */
 export type DhcpInterfaceSubnetStatus =
   | "all-interfaces"
+  | "all-interfaces-off-subnet"
   | "match"
   | "mismatch"
   | "unknown-address"
@@ -411,12 +423,39 @@ export function dhcpInterfaceSubnetStatus(
   allowRelayAgents = false
 ): DhcpInterfaceSubnetStatus {
   const address = bindAddress?.trim() ?? "";
-  if (isAllInterfaces(address)) return "all-interfaces";
-  if (allowRelayAgents) return "match";
+  const bindsEveryInterface = isAllInterfaces(address);
+  // Relay agents first, and for both bind modes: with one in front of the
+  // service, being off the pool's subnet is the configuration the user asked
+  // for, so there is no comparison worth making.
+  if (allowRelayAgents) return bindsEveryInterface ? "all-interfaces" : "match";
   const pool = poolNetwork(rangeStart, subnet);
   if (!pool) return "unusable-mask";
+  if (bindsEveryInterface) {
+    // "Every NIC" is not "every subnet". The question is the same one a bound
+    // address is asked — is this machine on the wire the pool describes — put
+    // to the whole filtered list instead of to one address.
+    return interfacesOnPoolSubnet(interfaces, pool).length > 0 ? "all-interfaces" : "all-interfaces-off-subnet";
+  }
   if (!isValidIpv4(address) || !interfaces.some((option) => option.value === address)) return "unknown-address";
   return isSameSubnet(address, pool.start, pool.mask) ? "match" : "mismatch";
+}
+
+/**
+ * The NICs from the already-filtered list that sit on the pool's own subnet.
+ *
+ * Shared by the all-interfaces branch above and {@link suggestBindAddressForPool}
+ * so the two cannot drift: "is anything here on that subnet" and "which one
+ * would I suggest" have to be the same question, or the status warns about a
+ * pool the suggestion is happy to serve. The all-interfaces row is excluded —
+ * its empty address masks to 0.0.0.0 and would match a 0.0.0.0 pool network.
+ */
+function interfacesOnPoolSubnet(
+  interfaces: readonly NetworkInterfaceOption[],
+  pool: { start: string; mask: string }
+): NetworkInterfaceOption[] {
+  return interfaces.filter(
+    (option) => !isAllInterfaces(option.value) && isSameSubnet(option.value, pool.start, pool.mask)
+  );
 }
 
 /** A NIC that could serve the configured pool. */
@@ -451,9 +490,7 @@ export function suggestBindAddressForPool(
   if (allowRelayAgents) return undefined;
   const pool = poolNetwork(rangeStart, subnet);
   if (!pool) return undefined;
-  const matches = interfaces.filter(
-    (option) => !isAllInterfaces(option.value) && isSameSubnet(option.value, pool.start, pool.mask)
-  );
+  const matches = interfacesOnPoolSubnet(interfaces, pool);
   if (matches.length === 0) return undefined;
   return { address: matches[0].value, ambiguous: matches.length > 1 };
 }

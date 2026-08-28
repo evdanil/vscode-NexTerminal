@@ -210,15 +210,21 @@ function dhcpPoolSubnetContext(section: vscode.WorkspaceConfiguration): PoolSubn
  * the NIC is on the subnet the pool hands out. A server bound to `192.168.1.x`
  * offering `10.0.0.x` leases binds, listens and serves nothing usable, and
  * every individual setting behind that is valid.
+ *
+ * That question is asked for an all-interfaces bind too, which is why the
+ * "every address on this machine" case no longer returns before reaching it.
+ * Listening on every NIC is not the same as being on every subnet: with no NIC
+ * on the pool's wire the DISCOVERs never arrive, and the row that used to be
+ * the reassuring one was the only place the user was told nothing about it.
  */
 function describeInterfaceDetail(configured: string | undefined, pool?: PoolSubnetContext): string {
-  if (!configured || configured === "0.0.0.0") {
-    return "Every IPv4 address on this machine — no single NIC, so no current IP to show.";
-  }
-  const name = networkInterfaceNameForAddress(configured);
-  const base = name
-    ? `${name} — current IP ${configured}`
-    : `No interface on this machine currently holds ${configured} — current IP unknown.`;
+  const bindsEveryInterface = !configured || configured === "0.0.0.0";
+  const name = bindsEveryInterface ? undefined : networkInterfaceNameForAddress(configured);
+  const base = bindsEveryInterface
+    ? "Every IPv4 address on this machine — no single NIC, so no current IP to show."
+    : name
+      ? `${name} — current IP ${configured}`
+      : `No interface on this machine currently holds ${configured} — current IP unknown.`;
   if (!pool) return base;
   const status = dhcpInterfaceSubnetStatus(
     configured,
@@ -227,9 +233,15 @@ function describeInterfaceDetail(configured: string | undefined, pool?: PoolSubn
     networkInterfaceBindOptions(),
     pool.allowRelayAgents
   );
-  if (status !== "mismatch") return base;
+  if (status !== "mismatch" && status !== "all-interfaces-off-subnet") return base;
   const cidr = dhcpCurrentCidr(pool.rangeStart, pool.subnet);
-  return cidr ? `${base} · not on the pool's subnet (${cidr})` : `${base} · not on the pool's subnet`;
+  // Two different faults, so two different sentences: one names a NIC that is
+  // on the wrong wire, the other says there is no right wire to be on.
+  const complaint =
+    status === "all-interfaces-off-subnet"
+      ? "no NIC on this machine is on the pool's subnet"
+      : "not on the pool's subnet";
+  return cidr ? `${base} · ${complaint} (${cidr})` : `${base} · ${complaint}`;
 }
 
 /** Whether one offered address sits on the pool's subnet, as a plain fact. */

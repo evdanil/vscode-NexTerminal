@@ -422,6 +422,9 @@ function buildFormDom(definition: FormDefinition): FormDom {
   const actions = form.append(new StubElement("DIV", ["actions"]));
   const saveBtn = actions.append(new StubElement("BUTTON"));
   saveBtn.type = "submit";
+  // Mirrors the rendered `id="save-btn"`, which the script disables while an
+  // autofill round trip is outstanding.
+  byId.set("save-btn", saveBtn);
   const cancelBtn = actions.append(new StubElement("BUTTON"));
   byId.set("cancel-btn", cancelBtn);
   if (definition.testable) {
@@ -494,6 +497,15 @@ export interface FormHarness {
   choose: (key: string, value: string) => void;
   deliver: (msg: ExtensionMessage) => void;
   submit: () => FormValues;
+  /**
+   * Submits without insisting that anything was posted — the shape needed to
+   * observe a Save the script HELD because an autofill was still in flight.
+   * Returns the submitted values, or `undefined` when the attempt posted
+   * nothing.
+   */
+  attemptSubmit: () => FormValues | undefined;
+  /** Whether the Save button is currently disabled. */
+  saveDisabled: () => boolean;
   value: (key: string) => string;
   locked: (key: string) => boolean;
   selectLabel: (key: string) => string;
@@ -599,6 +611,13 @@ export function openForm(definition: FormDefinition): FormHarness {
       }
       return last.values;
     },
+    attemptSubmit: () => {
+      const before = posted.length;
+      dom.submit();
+      const last = posted[posted.length - 1];
+      return posted.length > before && last?.type === "submit" ? last.values : undefined;
+    },
+    saveDisabled: () => dom.byId.get("save-btn")?.disabled === true,
     value: (key) => control(key).value,
     locked: (key) => {
       const el = dom.byId.get(`field-${key}`);

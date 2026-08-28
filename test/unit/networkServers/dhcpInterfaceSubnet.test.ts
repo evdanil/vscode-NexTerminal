@@ -51,9 +51,78 @@ describe("dhcpInterfaceSubnetStatus — the all-interfaces bind", () => {
     ["an empty bind address", ""],
     ["whitespace", "   "],
     ["the literal 0.0.0.0", "0.0.0.0"]
-  ])("reports %s as all-interfaces even when the pool is somewhere else entirely", (_label, bindAddress) => {
-    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+  ])("reports %s as all-interfaces when a NIC on this machine IS on the pool's subnet", (_label, bindAddress) => {
+    // eth1 is the one that can serve 10.0.0.0/24; eth0 is there so the fixture
+    // is not simply "everything matches".
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")], eth1: [ipv4("10.0.0.5")] });
     expect(dhcpInterfaceSubnetStatus(bindAddress, "255.255.255.0", "10.0.0.10", options())).toBe("all-interfaces");
+  });
+
+  /**
+   * REVIEW FINDING (P2) — this block previously asserted "all-interfaces even
+   * when the pool is somewhere else entirely", which is the defect written down
+   * as an expectation. Listening on every NIC does not put the machine on a
+   * wire it holds no address on: the fixture below binds everything, offers
+   * 10.0.0.x, and has nothing but a 192.168.1.x NIC to offer it from, which is
+   * exactly as unreachable as binding that NIC by name — and was the one
+   * arrangement reported as clean.
+   */
+  it.each([
+    ["an unset bind address", undefined],
+    ["an empty bind address", ""],
+    ["whitespace", "   "],
+    ["the literal 0.0.0.0", "0.0.0.0"]
+  ])("reports %s as off-subnet when NO NIC on this machine is on the pool's subnet", (_label, bindAddress) => {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(dhcpInterfaceSubnetStatus(bindAddress, "255.255.255.0", "10.0.0.10", options())).toBe(
+      "all-interfaces-off-subnet"
+    );
+  });
+
+  it("ignores the all-interfaces row itself when looking for a NIC on the subnet", () => {
+    // The list's first entry carries an empty address, which masks to 0.0.0.0
+    // and would "match" a 0.0.0.0 pool under a careless filter — answering
+    // "all-interfaces, fine" for a pool no NIC can serve.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "0.0.0.5", options())).toBe("all-interfaces-off-subnet");
+  });
+
+  it("compares under the pool's mask here too, not under each NIC's own wider one", () => {
+    // 10.0.1.20/16 contains 10.0.0.0/24 without being on it — the same trap the
+    // bound-NIC case is checked against, applied to the whole list.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.1.20", "255.255.0.0")] });
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options())).toBe("all-interfaces-off-subnet");
+    expect(dhcpInterfaceSubnetStatus("", "255.255.0.0", "10.0.0.10", options())).toBe("all-interfaces");
+  });
+
+  it("only ever considers the FILTERED list, so a WSL or Docker NIC cannot vouch for the pool", () => {
+    // The internal adapter is on the pool's subnet and the real NIC is not.
+    // Re-reading os.networkInterfaces() here — or being handed a raw read —
+    // would report this unreachable pool as fine.
+    networkInterfaces.mockReturnValue({
+      "vEthernet (WSL)": [ipv4("10.0.0.99", "255.255.255.0", true)],
+      eth0: [ipv4("192.168.1.20")]
+    });
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options())).toBe("all-interfaces-off-subnet");
+  });
+
+  it("stays quiet with relay agents allowed, even with no NIC on the pool's subnet", () => {
+    // The same unreachable fixture as above, one flag apart: a relay agent in
+    // front of the service is precisely the case where serving a subnet this
+    // machine is not on is the intended configuration.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options(), false)).toBe(
+      "all-interfaces-off-subnet"
+    );
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options(), true)).toBe("all-interfaces");
+  });
+
+  it("reports an unusable pool mask rather than an off-subnet all-interfaces bind", () => {
+    // Non-contiguous, and a NIC list that would otherwise read as off-subnet:
+    // there is no subnet to be off, so whatever reports the bad mask reports it.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(dhcpInterfaceSubnetStatus("", "255.0.255.0", "10.0.0.10", options())).toBe("unusable-mask");
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "not-an-ip", options())).toBe("unusable-mask");
   });
 });
 

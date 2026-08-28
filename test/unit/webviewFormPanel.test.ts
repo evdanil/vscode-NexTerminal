@@ -129,6 +129,64 @@ describe("WebviewFormPanel submit handling", () => {
 
     expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined);
     expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
+    // REVIEW FINDING (P1) — but the request IS answered. The webview disables
+    // Save for the length of the round trip, and an answer that fills nothing
+    // (a /32, a profile that supplies no usable value) is still the end of that
+    // round trip. Without this terminator the button stays disabled for the
+    // life of the panel, because no fillFields is coming.
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "autofillSettled",
+      key: "authProfileId",
+      value: "ap1"
+    });
+  });
+
+  it("answers an autofill whose handler THROWS, so a failed round trip cannot leave Save disabled forever", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockRejectedValue(new Error("vault read failed"));
+
+    WebviewFormPanel.open("panel-autofill-throws", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    expect(messageHandler).toBeDefined();
+
+    await expect(
+      Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24" }))
+    ).rejects.toThrow("vault read failed");
+
+    // The rejection still propagates (that is unchanged), but the terminator
+    // goes out first — a `finally`, not a success-path post.
+    expect(postMessage).toHaveBeenCalledWith({ type: "autofillSettled", key: "cidr", value: "10.0.0.0/24" });
+  });
+
+  it("answers an autofill on a panel that wired no onAutofill at all", async () => {
+    const onSubmit = vi.fn();
+
+    WebviewFormPanel.open("panel-autofill-unwired", { title: "Autofill", fields: [] }, { onSubmit });
+    expect(messageHandler).toBeDefined();
+
+    await Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24" }));
+
+    // No form does this today, but the failure mode if one ever did is a Save
+    // button that never comes back — silent, and only in that one form.
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
+    expect(postMessage).toHaveBeenCalledWith({ type: "autofillSettled", key: "cidr", value: "10.0.0.0/24" });
+  });
+
+  it("posts the terminator AFTER the fill it accompanies", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ subnet: "255.255.255.0" });
+
+    WebviewFormPanel.open("panel-autofill-order", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24" }));
+
+    // Order is the whole point: a submit the webview deferred is flushed by the
+    // terminator, and must be collected over the FILLED fields. Reversed, the
+    // held Save would go out carrying the values the fill was about to replace
+    // — the exact loss the hold exists to prevent.
+    // `postMessage` is declared with no parameters (it only ever needs to
+    // resolve), so read the recorded arguments through `unknown`.
+    const types = (postMessage.mock.calls as unknown as Array<[{ type: string }]>).map((call) => call[0].type);
+    expect(types.indexOf("fillFields")).toBeGreaterThan(-1);
+    expect(types.indexOf("autofillSettled")).toBeGreaterThan(types.indexOf("fillFields"));
   });
 
   it("forwards the autofill message's form-value snapshot to the handler", async () => {

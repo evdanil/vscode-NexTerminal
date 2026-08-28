@@ -302,7 +302,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   <form id="nexus-form">
     ${fieldsHtml}
     <div class="actions">
-      <button type="submit" class="btn-primary">Save</button>
+      <button type="submit" class="btn-primary" id="save-btn">Save</button>
       ${definition.testable ? `<button type="button" class="btn-secondary" id="test-btn"${visibleWhenDataAttr(definition.testableWhen)}>Test Connection</button>` : ""}
       <button type="button" class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
@@ -723,6 +723,78 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         return values;
       }
 
+      /**
+       * ── SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP ────────────────────
+       * REVIEW FINDING (P1) — an autofill is a round trip through the
+       * extension host, and a Save clicked while one is in flight submits the
+       * fields as they were BEFORE the answer landed. For the DHCP editor's
+       * CIDR row that is silent data loss in both directions: the old subnet,
+       * pool and gateway are saved as though nothing had been typed, and the
+       * network that WAS typed is discarded with them, because "cidr" is an
+       * input shape the settings layer deliberately never writes (see
+       * DHCP_CIDR_FIELD_KEY). The user sees a network go in and a save go
+       * through, and gets neither.
+       *
+       * Racing faster is not available — the answer is asynchronous by
+       * construction — so Save is held instead. Requests are tracked one by
+       * one rather than by a flag, because several can be outstanding at once:
+       * committing the CIDR row and then picking a NIC posts two, and a flag
+       * would re-open Save on the first answer with the second still in the
+       * air — the same race, one round trip later. Each is identified by the
+       * key and value it asked about, which is what both answers echo back.
+       *
+       * A submit attempted meanwhile is DEFERRED, not dropped: the disabled
+       * button stops the click, but Enter in a text field submits a form
+       * regardless of what the buttons look like, and silently swallowing that
+       * is its own defect. It fires once the last answer lands, over values
+       * collected then — which is exactly what the user meant by Save.
+       *
+       * A request is released by whichever of its two answers arrives:
+       * fillFields when there were values to fill, and the unconditional
+       * autofillSettled that follows it. The terminator is what makes this
+       * safe rather than merely usual — a derivation that fills nothing (a
+       * /32, a network that describes no pool) sends no fillFields at all, and
+       * releasing on fillFields alone would leave Save dead until the form was
+       * reopened.
+       */
+      var pendingAutofills = [];
+      var deferredSubmit = false;
+      var saveBtn = document.getElementById("save-btn");
+
+      /** Identifies one request by what it asked about; NUL cannot occur in
+       *  either half, so the two cannot be confused by concatenation. */
+      function autofillToken(key, value) {
+        return String(key) + "\\u0000" + String(value);
+      }
+
+      function postAutofill(key, value) {
+        pendingAutofills.push(autofillToken(key, value));
+        if (saveBtn) saveBtn.disabled = true;
+        vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues() });
+      }
+
+      /** One answer — a fill, an empty answer, or a failure — has come back.
+       *  Idempotent per request: the first of the two answers releases it and
+       *  the second finds nothing to release, so an answer can never pay off
+       *  a DIFFERENT request that is still outstanding. An answer for a
+       *  request this form never made (another panel's shape, a hand-built
+       *  test message) matches nothing and is ignored. */
+      function autofillSettled(key, value) {
+        var index = pendingAutofills.indexOf(autofillToken(key, value));
+        if (index === -1) return;
+        pendingAutofills.splice(index, 1);
+        if (pendingAutofills.length > 0) return;
+        if (saveBtn) saveBtn.disabled = false;
+        if (deferredSubmit) {
+          deferredSubmit = false;
+          postSubmit();
+        }
+      }
+
+      function postSubmit() {
+        vscode.postMessage({ type: "submit", values: collectFormValues() });
+      }
+
       /* An autofill-capable TEXT field — the DHCP editor's Network (CIDR) row.
          The same round trip the autofill-capable SELECT below already makes,
          fired on "change" rather than "input": a network is only meaningful
@@ -736,14 +808,18 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       for (var afi = 0; afi < autofillInputs.length; afi++) {
         (function(input) {
           input.addEventListener("change", function() {
-            vscode.postMessage({ type: 'autofill', key: input.name, value: input.value, values: collectFormValues() });
+            postAutofill(input.name, input.value);
           });
         })(autofillInputs[afi]);
       }
 
       form.addEventListener("submit", function(e) {
         e.preventDefault();
-        vscode.postMessage({ type: "submit", values: collectFormValues() });
+        if (pendingAutofills.length > 0) {
+          deferredSubmit = true;
+          return;
+        }
+        postSubmit();
       });
 
       document.getElementById("cancel-btn").addEventListener("click", function() {
@@ -891,7 +967,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // user typed. The auth-profile mirror ignores it; the DHCP interface
           // picker derives a whole pool from the chosen NIC and cannot
           // without it.
-          vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value, values: collectFormValues() });
+          postAutofill(wrapper.dataset.name, value);
         }
         if (wrapper.dataset.name === 'authProfileId') {
           // The newly chosen profile has supplied nothing yet — the previous
@@ -985,7 +1061,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             // inline-created auth profile is selected but never mirrors its
             // username into the managed field, and never locks it.
             if (wrapper.dataset.autofill === 'true' && msg.value) {
-              vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value, values: collectFormValues() });
+              postAutofill(wrapper.dataset.name, msg.value);
             }
             if (wrapper.dataset.name === 'authProfileId') {
               // Same release as the user-click path above — an inline-created
@@ -996,7 +1072,13 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           }
         }
         if (msg.type === "fillFields") {
+          // Released AFTER the fill is applied, so a submit this answer frees
+          // is collected over the filled fields rather than the stale ones.
           applyFillFields(msg);
+          autofillSettled(msg.key, msg.value);
+        }
+        if (msg.type === "autofillSettled") {
+          autofillSettled(msg.key, msg.value);
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");

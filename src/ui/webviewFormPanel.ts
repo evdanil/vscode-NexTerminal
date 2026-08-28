@@ -72,34 +72,55 @@ export class WebviewFormPanel {
       if (message.type === "createInline" && this.onCreateInline) {
         this.onCreateInline(message.key, message.values);
       }
-      if (message.type === "autofill" && this.onAutofill) {
+      if (message.type === "autofill") {
         // `message.values` is the form's own snapshot at the moment the
         // autofill fired. Handlers that answer from the chosen id alone (the
         // auth-profile and device-template mirrors) simply do not declare the
         // parameter; the DHCP editor needs it to decide which fields its
         // derivation is allowed to overwrite.
-        const result = await this.onAutofill(message.key, message.value, message.values);
-        if (result && !this.disposed) {
-          // `key` travels back with the values: the webview tracks which keys
-          // the AUTH PROFILE select filled (formHtml's profileFilledKeys), and
-          // must not let another autofill-capable select's answer be mistaken
-          // for the profile's.
-          //
-          // REVIEW FINDING (P2) — and `value` travels back with it, so the
-          // webview can tell WHICH option this answer was composed for. This
-          // await is a round trip the user can outrun: selecting a profile and
-          // then `(None)` (or a different profile) before it returns left the
-          // late answer being applied to a selection it does not describe,
-          // putting a deselected profile's credentials into fields the release
-          // had just unlocked — which the save path then stores as the user's
-          // own. Answering with the id makes that answer discardable rather
-          // than merely unlikely.
-          void this.panel.webview.postMessage({
-            type: "fillFields",
-            key: message.key,
-            value: message.value,
-            values: result
-          });
+        //
+        // REVIEW FINDING (P1) — the `finally` is the contract the webview
+        // holds Save against: every request is answered exactly once, whether
+        // it filled anything, filled nothing, or threw. A form that renders an
+        // autofill-capable control but wires no `onAutofill` (none does today)
+        // is answered here too, rather than leaving its Save button disabled
+        // for the life of the panel.
+        try {
+          const result = this.onAutofill
+            ? await this.onAutofill(message.key, message.value, message.values)
+            : undefined;
+          if (result && !this.disposed) {
+            // `key` travels back with the values: the webview tracks which keys
+            // the AUTH PROFILE select filled (formHtml's profileFilledKeys), and
+            // must not let another autofill-capable select's answer be mistaken
+            // for the profile's.
+            //
+            // REVIEW FINDING (P2) — and `value` travels back with it, so the
+            // webview can tell WHICH option this answer was composed for. This
+            // await is a round trip the user can outrun: selecting a profile and
+            // then `(None)` (or a different profile) before it returns left the
+            // late answer being applied to a selection it does not describe,
+            // putting a deselected profile's credentials into fields the release
+            // had just unlocked — which the save path then stores as the user's
+            // own. Answering with the id makes that answer discardable rather
+            // than merely unlikely.
+            void this.panel.webview.postMessage({
+              type: "fillFields",
+              key: message.key,
+              value: message.value,
+              values: result
+            });
+          }
+        } finally {
+          // Posted after the fill, so a submit the webview deferred is flushed
+          // over the filled values rather than the ones it was holding.
+          if (!this.disposed) {
+            void this.panel.webview.postMessage({
+              type: "autofillSettled",
+              key: message.key,
+              value: message.value
+            });
+          }
         }
       }
       if (message.type === "test" && this.onTest) {

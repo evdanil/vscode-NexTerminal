@@ -35,13 +35,27 @@ function lastAutofill(posted: readonly FormMessage[]): Extract<FormMessage, { ty
   return message as Extract<FormMessage, { type: "autofill" }>;
 }
 
-/** Answers an autofill the way `openFullForm` wires it, and delivers the result. */
+/**
+ * Answers an autofill the way `openFullForm` wires it, and delivers the result
+ * exactly as `WebviewFormPanel` does: the fill when there is one, and then the
+ * `autofillSettled` terminator unconditionally. Answering only the first half
+ * would leave the form holding Save for a round trip the host considers over —
+ * which is the whole reason the terminator exists.
+ */
 function answerAutofill(harness: ReturnType<typeof openForm>): Record<string, string> | undefined {
   const message = lastAutofill(harness.posted);
+  return answer(harness, message);
+}
+
+function answer(
+  harness: ReturnType<typeof openForm>,
+  message: Extract<FormMessage, { type: "autofill" }>
+): Record<string, string> | undefined {
   const fills = dhcpFormAutofillFields(message.key, message.value, message.values, INTERFACES);
   if (fills) {
     harness.deliver({ type: "fillFields", key: message.key, value: message.value, values: fills });
   }
+  harness.deliver({ type: "autofillSettled", key: message.key, value: message.value });
   return fills;
 }
 
@@ -106,6 +120,10 @@ describe("DHCP form — a network typed into the CIDR row", () => {
     // filled "as much as it could" would leave the mask on 255.255.255.255 with
     // the pool still on the old network.
     expect(answerAutofill(harness)).toBeUndefined();
+    // And Save is usable again on the strength of the terminator alone: no
+    // fillFields was ever posted for this request, so releasing on the payload
+    // would leave the button dead for the life of the panel.
+    expect(harness.saveDisabled()).toBe(false);
     const values = harness.submit();
     expect(values.subnet).toBe("255.255.255.0");
     expect(values.rangeStart).toBe("192.168.2.10");
@@ -114,18 +132,35 @@ describe("DHCP form — a network typed into the CIDR row", () => {
   it("discards an answer for a network the user has already moved away from", () => {
     const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
     harness.type("cidr", "10.0.0.0/24");
-    const message = lastAutofill(harness.posted);
-    const fills = dhcpFormAutofillFields(message.key, message.value, message.values, INTERFACES)!;
+    const first = lastAutofill(harness.posted);
+    const fills = dhcpFormAutofillFields(first.key, first.value, first.values, INTERFACES)!;
 
     // The round trip is outrun: the user retypes before the answer lands.
     harness.type("cidr", "172.16.0.0/16");
-    harness.deliver({ type: "fillFields", key: "cidr", value: "10.0.0.0/24", values: fills });
+    const second = lastAutofill(harness.posted);
+    const secondFills = dhcpFormAutofillFields(second.key, second.value, second.values, INTERFACES)!;
 
-    const values = harness.submit();
-    expect(values.cidr).toBe("172.16.0.0/16");
+    harness.deliver({ type: "fillFields", key: "cidr", value: "10.0.0.0/24", values: fills });
+    harness.deliver({ type: "autofillSettled", key: "cidr", value: "10.0.0.0/24" });
+
+    // Read off the fields rather than through a submit: the SECOND request is
+    // still outstanding, so Save is held (the late answer released its own
+    // request and nothing else) and there is deliberately nothing to submit.
+    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.value("cidr")).toBe("172.16.0.0/16");
     // 10.0.0.x must not be half-applied under a row that now says 172.16.0.0/16.
-    expect(values.subnet).toBe("255.255.255.0");
-    expect(values.rangeStart).toBe("192.168.2.10");
+    expect(harness.value("subnet")).toBe("255.255.255.0");
+    expect(harness.value("rangeStart")).toBe("192.168.2.10");
+
+    // The second (and last) outstanding request answers: only now is Save
+    // actually released, and over the network the user meant, not the first
+    // one they typed and moved away from.
+    harness.deliver({ type: "fillFields", key: "cidr", value: "172.16.0.0/16", values: secondFills });
+    harness.deliver({ type: "autofillSettled", key: "cidr", value: "172.16.0.0/16" });
+
+    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.value("subnet")).toBe(secondFills.subnet);
+    expect(harness.value("rangeStart")).toBe(secondFills.rangeStart);
   });
 });
 
@@ -178,5 +213,77 @@ describe("DHCP form — a NIC picked from the interface select", () => {
     const field = definition.fields.find((entry) => "key" in entry && entry.key === "interface");
     expect(field).not.toHaveProperty("autofill");
     expect(field).toMatchObject({ type: "select" });
+  });
+});
+
+/**
+ * REVIEW FINDING (P1) — Save against an autofill still in flight.
+ *
+ * The submission is collected synchronously from the DOM, and the fill that is
+ * about to change that DOM is a round trip. Nothing but this hold stands
+ * between "typed a network, clicked Save" and a record saved on the PREVIOUS
+ * network with the typed one thrown away — `cidr` is an input shape the
+ * settings layer never writes (see the "never writes the CIDR row as a setting"
+ * test in networkServerCommands.test.ts), so the network the user entered
+ * survives nowhere else.
+ */
+describe("DHCP form — Save while an autofill is in flight", () => {
+  it("holds the submission until the typed network has been derived, then submits the DERIVED values", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.type("cidr", "10.0.0.0/24");
+
+    // Save, before the answer lands. Nothing may go out: the values collected
+    // here are 192.168.2.x, and posting them saves the old pool while the
+    // network that would have replaced it is dropped on the floor.
+    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.attemptSubmit()).toBeUndefined();
+    expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+
+    answerAutofill(harness);
+
+    // The Save the user asked for happens, over the values that answer wrote —
+    // it is deferred, not discarded (Enter submits a form whatever the buttons
+    // look like, so dropping it would be its own defect).
+    const submitted = harness.posted.filter((message) => message.type === "submit");
+    expect(submitted).toHaveLength(1);
+    const values = submitted[0].type === "submit" ? submitted[0].values : {};
+    expect(values.subnet).toBe("255.255.255.0");
+    expect(values.rangeStart).toBe("10.0.0.1");
+    expect(values.broadcast).toBe("10.0.0.255");
+    expect(harness.saveDisabled()).toBe(false);
+  });
+
+  it("holds it for a NIC picked from the select too, not only for the CIDR row", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.choose("interface", "10.0.0.5");
+
+    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.attemptSubmit()).toBeUndefined();
+    answerAutofill(harness);
+
+    const submitted = harness.posted.filter((message) => message.type === "submit");
+    expect(submitted).toHaveLength(1);
+    const values = submitted[0].type === "submit" ? submitted[0].values : {};
+    expect(values.rangeStart).toBe("10.0.0.1");
+    expect(values.cidr).toBe("10.0.0.0/24");
+  });
+
+  it("submits immediately once the answer has landed — the normal-speed path is untouched", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.type("cidr", "10.0.0.0/24");
+    answerAutofill(harness);
+
+    expect(harness.saveDisabled()).toBe(false);
+    const values = harness.submit();
+    expect(values.rangeStart).toBe("10.0.0.1");
+    expect(harness.posted.filter((message) => message.type === "submit")).toHaveLength(1);
+  });
+
+  it("never holds a form with no autofill-capable control at all", () => {
+    // The TFTP editor posts no autofill from anywhere, so Save must behave as it
+    // always has: enabled at open, submitting on the spot.
+    const harness = openForm(networkServerFormDefinition("tftp", {}, { interfaceOptions: [...INTERFACES] }));
+    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.attemptSubmit()).toBeDefined();
   });
 });
