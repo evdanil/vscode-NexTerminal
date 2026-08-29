@@ -29,7 +29,8 @@ vi.mock("vscode", () => ({
   window: {
     showQuickPick: vi.fn(),
     showInputBox: vi.fn(),
-    showInformationMessage: vi.fn()
+    showInformationMessage: vi.fn(),
+    showWarningMessage: vi.fn()
   },
   workspace: {
     getConfiguration: (section: string) => ({
@@ -123,6 +124,7 @@ beforeEach(() => {
   }) as never);
 
   vi.mocked(vscode.window.showInformationMessage).mockReset();
+  vi.mocked(vscode.window.showWarningMessage).mockReset();
 });
 
 describe("the Network (CIDR) row", () => {
@@ -221,7 +223,10 @@ describe("applying a CIDR", () => {
     await openNetworkServerQuickAdjust("dhcp", deps());
 
     expect(written("rangeStart")).toBe("192.168.2.1");
-    expect(written("rangeEnd")).toBe("192.168.2.253");
+    // …and stops below eth0's own 192.168.2.5 rather than at .253: this is the
+    // exact case where re-applying the current network would otherwise widen
+    // the pool over the address the service answers from.
+    expect(written("rangeEnd")).toBe("192.168.2.4");
   });
 
   it("does nothing at all when the box is submitted empty", async () => {
@@ -254,6 +259,108 @@ describe("applying a CIDR", () => {
       "Restart DHCP to apply the new settings?",
       "Restart"
     );
+  });
+});
+
+/**
+ * REVIEW FINDING (P1) — the pool this row writes must not contain an address
+ * this machine already holds, or the allocator can lease the DHCP server its
+ * own IP. The quick editor derives against the same filtered NIC list the
+ * Interface row reads, so the two cannot disagree about what is taken.
+ */
+describe("applying a CIDR — this machine's own addresses stay out of the pool", () => {
+  it("stops the pool below the local address on the network being applied", async () => {
+    networkInterfaces.mockReturnValue({ eth1: [ipv4("10.0.0.42")] });
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("rangeStart")).toBe("10.0.0.1");
+    expect(written("rangeEnd")).toBe("10.0.0.41");
+    // The network itself is untouched — only the pool was moved off .42.
+    expect(written("subnet")).toBe("255.255.255.0");
+    expect(written("gateway")).toBe("10.0.0.254");
+  });
+
+  it("steps the start over a local address sitting on the first host address", async () => {
+    networkInterfaces.mockReturnValue({ eth1: [ipv4("10.0.0.1")] });
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("rangeStart")).toBe("10.0.0.2");
+    expect(written("rangeEnd")).toBe("10.0.0.253");
+  });
+
+  it("writes nothing and says why when this machine leaves the network no pool", async () => {
+    // A /30 has one poolable address and eth1 is on it. The input box's
+    // validator passes the network — it asks about the network, not about this
+    // host — so without a word here the Enter would simply do nothing.
+    networkInterfaces.mockReturnValue({ eth1: [ipv4("10.0.0.1", "255.255.255.252")] });
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), dismiss];
+    inputScript = ["10.0.0.0/30"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("rangeStart")).toBe("192.168.2.10");
+    expect(written("subnet")).toBeUndefined();
+    expect(vi.mocked(vscode.window.showWarningMessage).mock.calls[0]?.[0]).toContain("leaves no pool");
+  });
+
+  it("says nothing for a box submitted empty, which still means 'leave it alone'", async () => {
+    seed({ rangeStart: "192.168.2.10" });
+    quickPickScript = [pickRow("Network (CIDR)"), dismiss];
+    inputScript = [""];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * REVIEW FINDING (P1) — the Server Identifier (option 54) follows the network
+ * like the gateway does. Without it, applying 10.0.0.0/24 leaves clients being
+ * told to renew against the packaged 192.168.2.1, which is not on their wire.
+ */
+describe("applying a CIDR — the server identifier", () => {
+  it("writes it alongside the gateway while it is unset", async () => {
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("10.0.0.254");
+  });
+
+  it("replaces one this row suggested for the previous network", async () => {
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", serverId: "192.168.2.254" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("10.0.0.254");
+  });
+
+  it("leaves a hand-set one alone while still moving the pool", async () => {
+    // The packaged address, typed in — not what the old /24 derived (.254), so
+    // it is a decision rather than a stale suggestion.
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", serverId: "192.168.2.1" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("192.168.2.1");
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
+
+  it("writes nothing when the confirmation is declined", async () => {
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(false), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBeUndefined();
   });
 });
 

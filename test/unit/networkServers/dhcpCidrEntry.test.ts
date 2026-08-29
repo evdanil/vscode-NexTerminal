@@ -135,6 +135,89 @@ describe("dhcpCidrDerivation — the pool a network implies", () => {
   );
 });
 
+/**
+ * REVIEW FINDING (P1) — the suggested pool must not contain an address this
+ * machine already holds.
+ *
+ * A NIC on 192.168.2.10/24 deriving 192.168.2.1–192.168.2.253 lets the
+ * allocator lease 192.168.2.10 to a client, which is an IP conflict with the
+ * very machine serving the leases. The settings model one contiguous range with
+ * no holes, so the range is moved instead: the start steps over an address
+ * sitting on it, and the end stops below the first one above it.
+ */
+describe("dhcpCidrDerivation — this machine's own addresses stay out of the pool", () => {
+  it("stops the pool below a local address that falls inside it", () => {
+    const derived = dhcpCidrDerivation("192.168.2.0/24", ["192.168.2.10"])!;
+    expect(derived.rangeStart).toBe("192.168.2.1");
+    expect(derived.rangeEnd).toBe("192.168.2.9");
+    expect(derived.poolCount).toBe(9);
+    // The network itself is untouched — only the pool moved.
+    expect(derived.subnet).toBe("255.255.255.0");
+    expect(derived.gateway).toBe("192.168.2.254");
+  });
+
+  it("steps the START over a local address sitting exactly on it", () => {
+    // The shrink branch cannot help here: there is nothing below .1 to keep.
+    const derived = dhcpCidrDerivation("10.0.0.0/24", ["10.0.0.1"])!;
+    expect(derived.rangeStart).toBe("10.0.0.2");
+    expect(derived.rangeEnd).toBe("10.0.0.253");
+    expect(derived.poolCount).toBe(252);
+  });
+
+  it("keeps stepping while the addresses above the start are taken too", () => {
+    // Two addresses on one wire is ordinary (a static plus a DHCP lease), so a
+    // single step is not enough — and the top of the pool must still stay one
+    // below the gateway, never grow onto it.
+    const derived = dhcpCidrDerivation("10.0.0.0/24", ["10.0.0.2", "10.0.0.1", "10.0.0.3"])!;
+    expect(derived.rangeStart).toBe("10.0.0.4");
+    expect(derived.rangeEnd).toBe("10.0.0.253");
+    expect(derived.rangeEnd).not.toBe(derived.gateway);
+    expect(derived.poolCount).toBe(250);
+  });
+
+  it("shrinks once rather than hunting for the largest gap above the hole", () => {
+    // .1–.4 is a real pool that keeps rangeStart where the network says it
+    // belongs; .6–.253 is bigger but starts somewhere the network did not name.
+    const derived = dhcpCidrDerivation("10.0.0.0/24", ["10.0.0.5"])!;
+    expect(derived.rangeStart).toBe("10.0.0.1");
+    expect(derived.rangeEnd).toBe("10.0.0.4");
+  });
+
+  it("derives nothing when this machine occupies every address the pool could use", () => {
+    // A /30 has exactly one poolable address (.1 — .2 is the gateway), and it
+    // is taken. Same "no usable pool" answer /31 and /32 already get.
+    expect(dhcpCidrDerivation("10.0.0.0/30", ["10.0.0.1"])).toBeUndefined();
+    // A /29 leaves .1–.5; holding all five is the same dead end.
+    expect(
+      dhcpCidrDerivation("10.0.0.0/29", ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"])
+    ).toBeUndefined();
+  });
+
+  it("ignores addresses on other networks, the all-interfaces blank, and junk", () => {
+    // An untouched result, byte for byte — the exclusion must be inert unless
+    // something actually collides.
+    const plain = dhcpCidrDerivation("10.0.0.0/24");
+    expect(dhcpCidrDerivation("10.0.0.0/24", ["192.168.9.5", "", "not-an-ip", "10.1.0.4"])).toEqual(plain);
+    // Above the pool but inside the network: the gateway's own address and the
+    // ones between it and the pool's end are not in the range either.
+    expect(dhcpCidrDerivation("10.0.0.0/24", ["10.0.0.254"])).toEqual(plain);
+  });
+
+  it("leaves a capped wide network the same size, only moved", () => {
+    // /16 is capped at SUGGESTED_CIDR_POOL_CAP. Stepping the start over a
+    // conflict must re-measure the pool from that cap, not shorten it.
+    const derived = dhcpCidrDerivation("10.0.0.0/16", ["10.0.0.1"])!;
+    expect(derived.rangeStart).toBe("10.0.0.2");
+    expect(derived.poolCount).toBe(SUGGESTED_CIDR_POOL_CAP);
+    expect(derived.rangeEnd).toBe("10.0.0.255");
+  });
+
+  it("is unchanged when no addresses are supplied at all", () => {
+    // The feasibility check in dhcpCidrProblem calls it this way.
+    expect(dhcpCidrDerivation("192.168.2.0/24", [])).toEqual(dhcpCidrDerivation("192.168.2.0/24"));
+  });
+});
+
 describe("dhcpCidrDerivation — gateway parity with dhcpDerivedAddresses", () => {
   it.each(["10.0.0.0/24", "192.168.2.0/24", "172.16.0.0/20", "10.1.2.0/29", "10.0.0.0/30", "128.0.0.0/8"])(
     "%s derives the same gateway, broadcast and DNS as the pool-start path",

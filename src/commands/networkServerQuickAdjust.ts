@@ -540,11 +540,20 @@ async function offerPoolAutoFill(
  * there, and a `settings.json` reader still sees exactly the keys they did.
  *
  * The three keys the CIDR *is* — mask, pool start, pool end — are offered
- * together with the two it merely implies. The implied pair is gated the way
+ * together with the ones it merely implies. The implied set is gated the way
  * {@link offerPoolAutoFill} gates it, so a gateway the user typed survives a
  * network change; the defining three are not, because a pool left on the old
  * network after the mask moved to the new one is not a state the user could
  * have meant. Nothing is written without the confirmation either way.
+ *
+ * The server identifier (option 54) is one of the implied ones, derived from
+ * the gateway address because the packaged defaults are the same address for
+ * both. Without it a `10.0.0.0/24` config keeps advertising the packaged
+ * `192.168.2.1` for renewals, on a network no client can reach it at.
+ *
+ * The pool is derived against this machine's own addresses, so re-applying the
+ * network it is already on cannot produce a pool containing the very NIC the
+ * service answers from.
  */
 async function editNetworkCidr(
   rangeStart: string | undefined,
@@ -566,8 +575,25 @@ async function editNetworkCidr(
   // pool that grew inconsistent with it gets straightened out, and the offer
   // costs an Escape — the row writes nothing without the confirmation below,
   // so browsing it still cannot mark the service as needing a restart.
-  const derived = dhcpCidrDerivation(entered);
-  if (!derived) return "unchanged";
+  // Same NIC enumeration `offSubnetInterfaceWrite` reads, and for the same
+  // reason it is filtered rather than taken raw from `os.networkInterfaces()`:
+  // a WSL or Docker address has no business shaping a pool for a real wire.
+  const ownAddresses = networkInterfaceBindOptions().map((option) => option.value);
+  const derived = dhcpCidrDerivation(entered, ownAddresses);
+  if (!derived) {
+    // A blank box, or anything the validator already refused, is silent — blank
+    // means "leave it alone" and the box itself said the rest. The one case
+    // worth a word is the network that IS usable in the abstract and only this
+    // machine has no room in: the validator passes it (it asks about the
+    // network, not about this host), so an unexplained Enter-does-nothing is
+    // the alternative.
+    if (dhcpCidrDerivation(entered)) {
+      await vscode.window.showWarningMessage(
+        `${entered.trim()} leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here.`
+      );
+    }
+    return "unchanged";
+  }
 
   const section = settingsSection("dhcp");
   const previous = dhcpDerivedAddresses(rangeStart ?? DEFAULTS.rangeStart, subnet);
@@ -587,6 +613,13 @@ async function editNetworkCidr(
   }
   if (isAutoFillable(rawString(section, "gateway"), previous?.gateway)) {
     writes.push({ key: "gateway", value: derived.gateway });
+  }
+  // Gated against the PREVIOUS network's GATEWAY rather than a remembered
+  // `serverId`: the gateway address is what this offer would itself have
+  // written here (the packaged serverId and gateway are one address), so it is
+  // the only prior value that counts as a stale suggestion.
+  if (isAutoFillable(rawString(section, "serverId"), previous?.gateway)) {
+    writes.push({ key: "serverId", value: derived.gateway });
   }
   if (isAutoFillable(rawString(section, "broadcast"), previous?.broadcast)) {
     writes.push({ key: "broadcast", value: derived.broadcast });

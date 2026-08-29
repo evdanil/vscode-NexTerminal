@@ -264,6 +264,79 @@ export interface DhcpCidrDerivation {
   readonly dns: readonly string[];
 }
 
+/** The pool window {@link excludeOwnAddresses} settled on. */
+interface DhcpPoolWindow {
+  readonly rangeStart: string;
+  readonly rangeEnd: string;
+  readonly poolCount: number;
+}
+
+/**
+ * Moves the suggested pool clear of the addresses this machine already holds.
+ *
+ * The settings model a pool as one contiguous `rangeStart`/`rangeEnd` pair —
+ * there is no way to express a hole — so an occupied address is dealt with by
+ * moving an END of the range, never by punching one out of the middle:
+ *
+ *  1. An address sitting exactly ON the start is stepped over: the start
+ *     advances by one and the pool is re-measured from the ORIGINAL size logic
+ *     (still capped, still stopping below the gateway). Repeated, because the
+ *     next address up may be occupied too — a machine with two addresses on the
+ *     same wire is ordinary.
+ *  2. The lowest address left inside the window is then strictly above the
+ *     start, so the pool simply stops one address below it. A single shrink,
+ *     not a hunt for the largest gap: the range below the first conflict is the
+ *     one that keeps `rangeStart` where the network says it should be, and
+ *     "build the range around" the machine's own address is precisely the
+ *     remedy this is for.
+ *  3. If the start runs past the last poolable address on the way, there is no
+ *     pool to suggest at all — the same answer `/31`, `/32` and `/0` already
+ *     get, for the same reason: nothing this network could hand out.
+ *
+ * NOT solved by a reservation. The engine's `config.static` list
+ * (`DhcpEngine.ts`) keys reservations by the MAC of the DEVICE they are for,
+ * and the serving interface is not a client: no MAC ever asks for its address,
+ * so an entry for it would be a fabricated key holding a slot no request will
+ * ever match. That is a misuse of the reservation schema, not a fix — the
+ * address has to be outside the pool, not spoken for inside it.
+ */
+function excludeOwnAddresses(input: {
+  readonly firstHost: string;
+  readonly poolSize: number;
+  readonly poolTop: number;
+  readonly network: string;
+  readonly subnet: string;
+  readonly ownAddresses: readonly string[] | undefined;
+}): DhcpPoolWindow | undefined {
+  const { firstHost, poolSize, poolTop, network, subnet } = input;
+  const occupied = Array.from(
+    new Set(
+      (input.ownAddresses ?? [])
+        .filter((address) => isValidIpv4(address) && isSameSubnet(address, network, subnet))
+        .map((address) => ipToInt(address) >>> 0)
+    )
+  ).sort((left, right) => left - right);
+
+  let start = ipToInt(firstHost) >>> 0;
+  for (;;) {
+    if (start > poolTop) return undefined;
+    const end = Math.min(start + poolSize - 1, poolTop);
+    const lowest = occupied.find((address) => address >= start && address <= end);
+    if (lowest === undefined) {
+      return { rangeStart: intToIp(start), rangeEnd: intToIp(end), poolCount: end - start + 1 };
+    }
+    if (lowest === start) {
+      start = (start + 1) >>> 0;
+      continue;
+    }
+    return {
+      rangeStart: intToIp(start),
+      rangeEnd: intToIp((lowest - 1) >>> 0),
+      poolCount: lowest - start
+    };
+  }
+}
+
 /**
  * What a network in CIDR form implies for every DHCP setting it touches.
  *
@@ -277,25 +350,58 @@ export interface DhcpCidrDerivation {
  * the most, one short of the usable host count so the gateway keeps its address
  * out of the pool.
  *
+ * `ownAddresses` are this machine's own IPv4 addresses — plain strings, not
+ * `NetworkInterfaceOption`s, so this stays pure arithmetic with no dependency
+ * on the NIC enumerator. Any of them that land on the derived network are kept
+ * OUT of the suggested pool: a server that can lease the address it is itself
+ * answering from creates an IP conflict with its own clients, and
+ * `192.168.2.10/24` deriving `192.168.2.1`–`192.168.2.253` is exactly that.
+ * See {@link excludeOwnAddresses} for how the single contiguous range is moved
+ * around them, and why a reservation is not the answer.
+ *
+ * Omitting the argument means "exclude nothing", which is byte-for-byte the
+ * behaviour this function has always had — the feasibility check in
+ * {@link dhcpCidrProblem} wants exactly that, since it is asking whether the
+ * NETWORK describes a pool, not whether this particular machine has room in it.
+ *
  * @returns `undefined` for anything that is not a `/1`–`/30` network. `/31` and
- *   `/32` parse as CIDR but describe no pool, and `/0` is not a subnet.
+ *   `/32` parse as CIDR but describe no pool, and `/0` is not a subnet. Also
+ *   `undefined` when `ownAddresses` occupy every candidate start, i.e. the
+ *   network is real but leaves this machine no address it could hand out — the
+ *   same "no usable pool" contract, reached from the other direction.
  */
-export function dhcpCidrDerivation(text: string): DhcpCidrDerivation | undefined {
+export function dhcpCidrDerivation(
+  text: string,
+  ownAddresses?: readonly string[]
+): DhcpCidrDerivation | undefined {
   const parsed = parseCidr(text);
   if (!parsed) return undefined;
   const { network, prefix } = parsed;
   if (prefix < MIN_POOL_PREFIX || prefix > MAX_POOL_PREFIX) return undefined;
   const subnet = prefixToMask(prefix);
   if (subnet === undefined) return undefined;
-  const rangeStart = intToIp((ipToInt(network) + 1) >>> 0);
-  const derived = dhcpDerivedAddresses(rangeStart, subnet);
+  const firstHost = intToIp((ipToInt(network) + 1) >>> 0);
+  const derived = dhcpDerivedAddresses(firstHost, subnet);
   if (!derived) return undefined;
   // −2 drops the network and broadcast addresses; the further −1 is the gateway,
   // which the pool must not hand to a second host.
   const usableHosts = 2 ** (32 - prefix) - 2;
-  const poolCount = Math.min(usableHosts - 1, SUGGESTED_CIDR_POOL_CAP);
-  const rangeEnd = computeRangeEnd(rangeStart, poolCount);
-  if (!rangeEnd) return undefined;
+  const poolSize = Math.min(usableHosts - 1, SUGGESTED_CIDR_POOL_CAP);
+  if (computeRangeEnd(firstHost, poolSize) === "") return undefined;
+  const window = excludeOwnAddresses({
+    firstHost,
+    poolSize,
+    // The gateway is the top usable address, so the last address a pool may
+    // reach is the one below it. Expressed as a ceiling rather than as a count
+    // because advancing the start past an occupied address must not push the
+    // far end onto the gateway.
+    poolTop: (ipToInt(derived.gateway) - 1) >>> 0,
+    network,
+    subnet,
+    ownAddresses
+  });
+  if (!window) return undefined;
+  const { rangeStart, rangeEnd, poolCount } = window;
   return {
     network,
     prefix,
@@ -575,9 +681,22 @@ function offSubnetBindAddress(
  * The gating is the quick editor's `editNetworkCidr` policy, field for field:
  * the three keys the CIDR *is* — mask, pool start, pool size — are always
  * offered, because a pool left on the old network after the mask moved to the
- * new one is not a state the user could have meant; the two it merely implies
- * (gateway, broadcast) and the DNS list are replaced only while they are blank
- * or still hold what the PREVIOUS network derived.
+ * new one is not a state the user could have meant; the ones it merely implies
+ * (gateway, broadcast, server identifier) and the DNS list are replaced only
+ * while they are blank or still hold what the PREVIOUS network derived.
+ *
+ * The server identifier (option 54) is derived from the same address as the
+ * gateway, because that is the packaged convention — `DEFAULTS.serverId` and
+ * `DEFAULTS.gateway` are the one address `192.168.2.1`. Leaving it out is how a
+ * `10.0.0.0/24` lab ends up telling clients to renew against a `192.168.2.1`
+ * that is not on their wire. It is gated against the PREVIOUS network's
+ * gateway, not against a separate remembered `serverId`: the gateway is what
+ * this fill would itself have written there, so it is the only value that
+ * counts as a stale suggestion rather than a decision.
+ *
+ * The addresses this machine holds are excluded from the suggested pool (see
+ * {@link dhcpCidrDerivation}), which is why the NIC list is now needed for the
+ * derivation itself and not only for the bind-address offer.
  *
  * Pool *size* rather than pool end: the form asks for a count and computes the
  * `rangeEnd` setting from it on submit ({@link dhcpRangeEndForCount}), so the
@@ -593,7 +712,10 @@ export function dhcpCidrFormFills(
   values: FormValues,
   interfaces: readonly NetworkInterfaceOption[]
 ): Record<string, string> | undefined {
-  const derived = dhcpCidrDerivation(text);
+  const derived = dhcpCidrDerivation(
+    text,
+    interfaces.map((option) => option.value)
+  );
   if (!derived) return undefined;
   const previous = dhcpDerivedAddresses(
     readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart,
@@ -610,6 +732,9 @@ export function dhcpCidrFormFills(
   };
   if (isAutoFillable(readSettingString(values.gateway), previous?.gateway)) {
     fills.gateway = derived.gateway;
+  }
+  if (isAutoFillable(readSettingString(values.serverId), previous?.gateway)) {
+    fills.serverId = derived.gateway;
   }
   if (isAutoFillable(readSettingString(values.broadcast), previous?.broadcast)) {
     fills.broadcast = derived.broadcast;
@@ -654,8 +779,9 @@ export function dhcpInterfaceCidr(
  *
  * @returns `undefined` for a field this form derives nothing from, and for
  *   input that describes no usable pool (`/31`, `/32`, `/0`, anything
- *   malformed). A partial fill would be worse than none: it would leave the
- *   mask on one network and the pool on another.
+ *   malformed, or a network on which this machine's own addresses leave no
+ *   room). A partial fill would be worse than none: it would leave the mask on
+ *   one network and the pool on another.
  */
 export function dhcpFormAutofillFields(
   key: string,

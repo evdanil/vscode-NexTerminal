@@ -52,7 +52,10 @@ describe("dhcpCidrFormFills — the keys a network always defines", () => {
     // Filling `rangeEnd` instead would write to a key this form does not
     // render: the mask and start would move to 10.0.0.x while Pool Count still
     // showed — and still saved — the old network's length.
-    expect(fills.poolCount).toBe("253");
+    //
+    // Four, not the 253 a bare /24 would give: eth1 holds 10.0.0.5 on this
+    // machine, so the pool stops below it (see the exclusion suite below).
+    expect(fills.poolCount).toBe("4");
     expect(fills).not.toHaveProperty("rangeEnd");
   });
 
@@ -111,6 +114,72 @@ describe("dhcpCidrFormFills — what it may not overwrite", () => {
     expect(dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, dns: "1.1.1.1, 8.8.8.8" }, INTERFACES)).not.toHaveProperty(
       "dns"
     );
+  });
+});
+
+/**
+ * REVIEW FINDING (P1) — the Server Identifier (option 54) is one of the
+ * addresses a network implies, and leaving it out is how a 10.0.0.0/24 lab goes
+ * on telling clients to renew against the packaged 192.168.2.1. It is derived
+ * from the gateway because the packaged defaults are the same address for both
+ * (DEFAULTS.serverId === DEFAULTS.gateway), and gated on the PREVIOUS network's
+ * gateway for the same reason: that is what this fill would itself have written
+ * there.
+ */
+describe("dhcpCidrFormFills — the server identifier", () => {
+  it("fills it from the new gateway while the field is blank", () => {
+    expect(dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, INTERFACES)?.serverId).toBe("10.0.0.254");
+    expect(dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, serverId: "  " }, INTERFACES)?.serverId).toBe(
+      "10.0.0.254"
+    );
+  });
+
+  it("replaces one the PREVIOUS network derived", () => {
+    // 192.168.2.254 is what this fill would have written for 192.168.2.0/24 —
+    // a stale suggestion, and one that now names an address off the new wire.
+    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, serverId: "192.168.2.254" }, INTERFACES)!;
+    expect(fills.serverId).toBe("10.0.0.254");
+  });
+
+  it("keeps one the user set explicitly", () => {
+    // The packaged default address, typed in. Not what the previous network
+    // derived (.254), so it is a decision and survives the change.
+    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, serverId: "192.168.2.1" }, INTERFACES)!;
+    expect(fills).not.toHaveProperty("serverId");
+    // …and the rest of the fill still happens.
+    expect(fills.subnet).toBe("255.255.255.0");
+  });
+});
+
+/**
+ * REVIEW FINDING (P1) — the form's own derivation must exclude the addresses
+ * this machine holds, not just the quick editor's. Both write the same settings.
+ */
+describe("dhcpCidrFormFills — this machine's own addresses stay out of the pool", () => {
+  it("stops the pool below the NIC that is on the new network", () => {
+    // eth1 holds 10.0.0.5. Without the exclusion the pool is .1–.253 and the
+    // allocator can lease the serving machine's own address.
+    const fills = dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, INTERFACES)!;
+    expect(fills.rangeStart).toBe("10.0.0.1");
+    expect(fills.poolCount).toBe("4");
+  });
+
+  it("steps the start over a NIC sitting on the first host address", () => {
+    const onFirstHost: readonly NetworkInterfaceOption[] = [
+      { label: "All interfaces (0.0.0.0)", value: "" },
+      { label: "eth1 — 10.0.0.1", value: "10.0.0.1", netmask: "255.255.255.0" }
+    ];
+    const fills = dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, onFirstHost)!;
+    expect(fills.rangeStart).toBe("10.0.0.2");
+    expect(fills.poolCount).toBe("252");
+  });
+
+  it("fills nothing when this machine leaves the network no poolable address", () => {
+    const cramped: readonly NetworkInterfaceOption[] = [
+      { label: "eth1 — 10.0.0.1", value: "10.0.0.1", netmask: "255.255.255.252" }
+    ];
+    // /30: .1 is the only poolable address and this machine holds it.
+    expect(dhcpCidrFormFills("10.0.0.0/30", UNTOUCHED, cramped)).toBeUndefined();
   });
 });
 

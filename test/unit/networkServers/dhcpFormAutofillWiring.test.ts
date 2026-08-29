@@ -111,7 +111,9 @@ describe("DHCP form — a network typed into the CIDR row", () => {
     const values: FormValues = harness.submit();
     expect(values.subnet).toBe("255.255.255.0");
     expect(values.rangeStart).toBe("10.0.0.1");
-    expect(values.poolCount).toBe(253);
+    // Stops below eth1's own 10.0.0.5 rather than running to .253 — the pool
+    // may not contain an address this machine already holds.
+    expect(values.poolCount).toBe(4);
     expect(values.broadcast).toBe("10.0.0.255");
     // The decision the user made survives the network change.
     expect(values.gateway).toBe("192.168.2.1");
@@ -393,6 +395,75 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     const values = submitted[0].type === "submit" ? submitted[0].values : {};
     expect(values.cidr).toBe("10.0.0.0/24");
     expect(values.rangeStart).toBe("10.0.0.1");
+  });
+
+  /**
+   * REVIEW FINDING (P2) — a late answer must not overwrite a target field the
+   * user edited AFTER the request went out.
+   *
+   * The extension host decides what it may fill from the values SNAPSHOT the
+   * request carried (isAutoFillable: blank, or still holding what the previous
+   * network derived). Edit a target while the round trip is out and that
+   * decision is about a value the field no longer holds. The existing
+   * stale-answer guard cannot see it: it asks only whether the field the
+   * request was ABOUT — the CIDR row — still holds the value it was about, and
+   * it does. Nothing has moved the CIDR; the TARGET moved.
+   */
+  it("keeps a gateway hand-typed while the answer was in flight, and still applies the untouched fields (kills applying every returned value blind: the host cleared a blank gateway for filling, and the value the user typed a moment later is silently replaced by the derived one)", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.type("cidr", "10.0.0.0/24");
+    const request = lastAutofill(harness.posted);
+    // The host answers the snapshot as it was: gateway was blank, so the fill
+    // includes one.
+    const fills = dhcpFormAutofillFields(request.key, request.value, request.values, INTERFACES)!;
+    expect(fills.gateway).toBe("10.0.0.254");
+    expect(fills.serverId).toBe("10.0.0.254");
+
+    // …and only now, still before the answer lands, the user types a gateway
+    // of their own.
+    harness.type("gateway", "10.0.0.99");
+
+    harness.deliver({
+      type: "fillFields",
+      key: request.key,
+      value: request.value,
+      values: fills,
+      requestId: request.requestId
+    });
+    harness.deliver({
+      type: "autofillSettled",
+      key: request.key,
+      value: request.value,
+      requestId: request.requestId
+    });
+
+    // Their edit stands.
+    expect(harness.value("gateway")).toBe("10.0.0.99");
+    // Everything they did NOT touch still lands — skipping the whole answer
+    // would throw away the mask and the pool over one edited field.
+    expect(harness.value("subnet")).toBe("255.255.255.0");
+    expect(harness.value("rangeStart")).toBe("10.0.0.1");
+    expect(harness.value("broadcast")).toBe("10.0.0.255");
+    expect(harness.value("serverId")).toBe("10.0.0.254");
+    expect(harness.saveDisabled()).toBe(false);
+  });
+
+  it("applies an answer that matches no pending request unchanged, as it always has", () => {
+    // A hand-built message with an id this script never minted — there is no
+    // snapshot to judge it against, so the lenient path is the one that was
+    // there before, matching how an unrenderable key is treated.
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.deliver({
+      type: "fillFields",
+      key: "cidr",
+      // Echoes the CIDR row as it stands, so the existing stale-answer guard
+      // lets it through and the no-snapshot path is what is actually exercised.
+      value: harness.value("cidr"),
+      values: { subnet: "255.255.254.0", rangeStart: "10.4.6.1" },
+      requestId: 9999
+    });
+    expect(harness.value("subnet")).toBe("255.255.254.0");
+    expect(harness.value("rangeStart")).toBe("10.4.6.1");
   });
 
   it("never holds a form with no autofill-capable control at all", () => {

@@ -2049,6 +2049,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * and by the echoed value so an answer for an option the user has since
        * moved away from is discarded rather than applied
        * (fillAnswersCurrentSelection).
+       *
+       * REVIEW FINDING (P2) — and, for the DHCP path, scoped by the SNAPSHOT
+       * the request carried, so a target field hand-edited while the answer was
+       * in flight keeps the user's edit — see autofillSnapshot and the note on
+       * pendingAutofills.
        */
       function applyFillFields(msg) {
         // Stale answers are dropped whole — values, ownership and all. A
@@ -2060,7 +2065,19 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
+        // Read once, not per key: collecting inside the loop would compare the
+        // later keys against a form this very loop has already been writing to.
+        var requestSnapshot = isProfileFill ? undefined : autofillSnapshot(msg.requestId);
+        var liveValues = requestSnapshot ? collectFormValues() : undefined;
         for (var fk in fillValues) {
+          if (!isProfileFill && requestSnapshot && liveValues[fk] !== requestSnapshot[fk]) {
+            // Hand-edited since this request went out. The host decided what it
+            // was allowed to overwrite from the snapshot above, so its answer
+            // for THIS key is reasoning about a value that no longer exists —
+            // every other key in the same answer is still good and still
+            // applied.
+            continue;
+          }
           if (isProfileFill) {
             // A key supplied BLANK owns nothing (filledKeysFromValues), so
             // writing it would replace the user's own value with one nothing
@@ -2270,6 +2287,34 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * /32, a network that describes no pool) sends no fillFields at all, and
        * releasing on fillFields alone would leave Save dead until the form was
        * reopened.
+       *
+       * REVIEW FINDING (P2) — each pending request also KEEPS the values
+       * snapshot it was sent with, because the host's decision about what it
+       * may overwrite is made against that snapshot and the user can edit a
+       * target field after it was taken.
+       *
+       * The host gates gateway, broadcast, serverId and dns on isAutoFillable
+       * against the snapshot the request carried: blank, or still holding what
+       * the PREVIOUS network derived. Commit a CIDR, then — while the round
+       * trip is out — hand-type a gateway, and that gating is answering a
+       * question about a value the field no longer holds. fillAnswersCurrentSelection
+       * cannot catch it: it asks only whether the field the request was ABOUT
+       * (msg.key, the CIDR row) still holds the value it was about, and it
+       * does. The initiating row is untouched; it is the TARGET that moved.
+       *
+       * So the answer is re-checked field by field against the snapshot before
+       * anything is written (applyFillFields): a target still holding what it
+       * held at request time is filled as before, one that has since diverged
+       * is left alone, and the rest of the same answer still lands. Skipping
+       * the whole answer instead would throw away the mask and pool the user
+       * asked for over one edited gateway.
+       *
+       * An answer whose requestId matches no pending entry is applied
+       * unconditionally, exactly as before — same leniency as
+       * fillAnswersCurrentSelection's "a control this form does not render is
+       * applied as before". There is no snapshot to judge it against, and the
+       * only things that reach that state are a hand-built message and an
+       * answer that arrived after its own terminator.
        */
       var pendingAutofills = [];
       var deferredSubmit = false;
@@ -2278,8 +2323,12 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
 
       function postAutofill(key, value) {
         var requestId = nextAutofillRequestId++;
-        pendingAutofills.push(requestId);
-        vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues(), requestId: requestId });
+        // Collected ONCE and used twice — the payload the host reasons over and
+        // the copy this script judges the answer against have to be the same
+        // object, or the two ends are comparing different forms.
+        var snapshot = collectFormValues();
+        pendingAutofills.push({ id: requestId, snapshot: snapshot });
+        vscode.postMessage({ type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId });
         /**
          * REVIEW FINDING (P2) — the disable is deferred by one MACROTASK, and
          * that is the whole point of the setTimeout.
@@ -2310,6 +2359,19 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         }, 0);
       }
 
+      /** The values snapshot the still-pending request was sent with, or
+       *  undefined when nothing pending matches — see the note on
+       *  pendingAutofills for why that case applies the answer as before.
+       *  Always read BEFORE autofillSettled retires the entry, which is why the
+       *  message handler applies the fill first and settles second. */
+      function autofillSnapshot(requestId) {
+        if (requestId === undefined) return undefined;
+        for (var pi = 0; pi < pendingAutofills.length; pi++) {
+          if (pendingAutofills[pi].id === requestId) return pendingAutofills[pi].snapshot;
+        }
+        return undefined;
+      }
+
       /** One answer — a fill, an empty answer, or a failure — has come back.
        *  Idempotent per request: the first of the two answers releases it and
        *  the second finds nothing to release, so an answer can never pay off
@@ -2319,7 +2381,13 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        *  nothing, and is ignored. */
       function autofillSettled(requestId) {
         if (requestId === undefined) return;
-        var index = pendingAutofills.indexOf(requestId);
+        var index = -1;
+        for (var si = 0; si < pendingAutofills.length; si++) {
+          if (pendingAutofills[si].id === requestId) {
+            index = si;
+            break;
+          }
+        }
         if (index === -1) return;
         pendingAutofills.splice(index, 1);
         if (pendingAutofills.length > 0) return;
@@ -3680,6 +3748,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * and by the echoed value so an answer for an option the user has since
        * moved away from is discarded rather than applied
        * (fillAnswersCurrentSelection).
+       *
+       * REVIEW FINDING (P2) — and, for the DHCP path, scoped by the SNAPSHOT
+       * the request carried, so a target field hand-edited while the answer was
+       * in flight keeps the user's edit — see autofillSnapshot and the note on
+       * pendingAutofills.
        */
       function applyFillFields(msg) {
         // Stale answers are dropped whole — values, ownership and all. A
@@ -3691,7 +3764,19 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
+        // Read once, not per key: collecting inside the loop would compare the
+        // later keys against a form this very loop has already been writing to.
+        var requestSnapshot = isProfileFill ? undefined : autofillSnapshot(msg.requestId);
+        var liveValues = requestSnapshot ? collectFormValues() : undefined;
         for (var fk in fillValues) {
+          if (!isProfileFill && requestSnapshot && liveValues[fk] !== requestSnapshot[fk]) {
+            // Hand-edited since this request went out. The host decided what it
+            // was allowed to overwrite from the snapshot above, so its answer
+            // for THIS key is reasoning about a value that no longer exists —
+            // every other key in the same answer is still good and still
+            // applied.
+            continue;
+          }
           if (isProfileFill) {
             // A key supplied BLANK owns nothing (filledKeysFromValues), so
             // writing it would replace the user's own value with one nothing
@@ -3901,6 +3986,34 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * /32, a network that describes no pool) sends no fillFields at all, and
        * releasing on fillFields alone would leave Save dead until the form was
        * reopened.
+       *
+       * REVIEW FINDING (P2) — each pending request also KEEPS the values
+       * snapshot it was sent with, because the host's decision about what it
+       * may overwrite is made against that snapshot and the user can edit a
+       * target field after it was taken.
+       *
+       * The host gates gateway, broadcast, serverId and dns on isAutoFillable
+       * against the snapshot the request carried: blank, or still holding what
+       * the PREVIOUS network derived. Commit a CIDR, then — while the round
+       * trip is out — hand-type a gateway, and that gating is answering a
+       * question about a value the field no longer holds. fillAnswersCurrentSelection
+       * cannot catch it: it asks only whether the field the request was ABOUT
+       * (msg.key, the CIDR row) still holds the value it was about, and it
+       * does. The initiating row is untouched; it is the TARGET that moved.
+       *
+       * So the answer is re-checked field by field against the snapshot before
+       * anything is written (applyFillFields): a target still holding what it
+       * held at request time is filled as before, one that has since diverged
+       * is left alone, and the rest of the same answer still lands. Skipping
+       * the whole answer instead would throw away the mask and pool the user
+       * asked for over one edited gateway.
+       *
+       * An answer whose requestId matches no pending entry is applied
+       * unconditionally, exactly as before — same leniency as
+       * fillAnswersCurrentSelection's "a control this form does not render is
+       * applied as before". There is no snapshot to judge it against, and the
+       * only things that reach that state are a hand-built message and an
+       * answer that arrived after its own terminator.
        */
       var pendingAutofills = [];
       var deferredSubmit = false;
@@ -3909,8 +4022,12 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
 
       function postAutofill(key, value) {
         var requestId = nextAutofillRequestId++;
-        pendingAutofills.push(requestId);
-        vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues(), requestId: requestId });
+        // Collected ONCE and used twice — the payload the host reasons over and
+        // the copy this script judges the answer against have to be the same
+        // object, or the two ends are comparing different forms.
+        var snapshot = collectFormValues();
+        pendingAutofills.push({ id: requestId, snapshot: snapshot });
+        vscode.postMessage({ type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId });
         /**
          * REVIEW FINDING (P2) — the disable is deferred by one MACROTASK, and
          * that is the whole point of the setTimeout.
@@ -3941,6 +4058,19 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         }, 0);
       }
 
+      /** The values snapshot the still-pending request was sent with, or
+       *  undefined when nothing pending matches — see the note on
+       *  pendingAutofills for why that case applies the answer as before.
+       *  Always read BEFORE autofillSettled retires the entry, which is why the
+       *  message handler applies the fill first and settles second. */
+      function autofillSnapshot(requestId) {
+        if (requestId === undefined) return undefined;
+        for (var pi = 0; pi < pendingAutofills.length; pi++) {
+          if (pendingAutofills[pi].id === requestId) return pendingAutofills[pi].snapshot;
+        }
+        return undefined;
+      }
+
       /** One answer — a fill, an empty answer, or a failure — has come back.
        *  Idempotent per request: the first of the two answers releases it and
        *  the second finds nothing to release, so an answer can never pay off
@@ -3950,7 +4080,13 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        *  nothing, and is ignored. */
       function autofillSettled(requestId) {
         if (requestId === undefined) return;
-        var index = pendingAutofills.indexOf(requestId);
+        var index = -1;
+        for (var si = 0; si < pendingAutofills.length; si++) {
+          if (pendingAutofills[si].id === requestId) {
+            index = si;
+            break;
+          }
+        }
         if (index === -1) return;
         pendingAutofills.splice(index, 1);
         if (pendingAutofills.length > 0) return;

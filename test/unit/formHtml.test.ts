@@ -1629,8 +1629,15 @@ describe("renderFormHtml — autofill on a text field", () => {
     expect(html).toContain("postAutofill(input.name, input.value);");
     // `postAutofill` is the one place the message is built, so the snapshot the
     // answer needs cannot be dropped from one caller and kept in another.
+    //
+    // Collected ONCE into a local and used twice — the payload the host reasons
+    // over and the copy kept against the pending request have to be the same
+    // object. Two `collectFormValues()` calls could disagree, and the whole
+    // point of keeping it is comparing the answer against what the host saw.
+    expect(html).toContain("var snapshot = collectFormValues();");
+    expect(html).toContain("pendingAutofills.push({ id: requestId, snapshot: snapshot });");
     expect(html).toContain(
-      "vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues(), requestId: requestId });"
+      "vscode.postMessage({ type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId });"
     );
     // "change", never "input": a network is only meaningful once committed, and
     // deriving a pool from 192.168.2.0/2 on the way to /24 would overwrite the
