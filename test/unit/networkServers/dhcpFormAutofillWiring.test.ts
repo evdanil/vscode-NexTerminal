@@ -153,7 +153,7 @@ describe("DHCP form — a network typed into the CIDR row", () => {
     // And Save is usable again on the strength of the terminator alone: no
     // fillFields was ever posted for this request, so releasing on the payload
     // would leave the button dead for the life of the panel.
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
     const values = harness.submit();
     expect(values.subnet).toBe("255.255.255.0");
     expect(values.rangeStart).toBe("192.168.2.10");
@@ -176,8 +176,7 @@ describe("DHCP form — a network typed into the CIDR row", () => {
     // Read off the fields rather than through a submit: the SECOND request is
     // still outstanding, so Save is held (the late answer released its own
     // request and nothing else) and there is deliberately nothing to submit.
-    harness.flushTimers();
-    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.saveHeld()).toBe(true);
     expect(harness.value("cidr")).toBe("172.16.0.0/16");
     // 10.0.0.x must not be half-applied under a row that now says 172.16.0.0/16.
     expect(harness.value("subnet")).toBe("255.255.255.0");
@@ -189,7 +188,7 @@ describe("DHCP form — a network typed into the CIDR row", () => {
     harness.deliver({ type: "fillFields", key: "cidr", value: "172.16.0.0/16", values: secondFills, requestId: second.requestId });
     harness.deliver({ type: "autofillSettled", key: "cidr", value: "172.16.0.0/16", requestId: second.requestId });
 
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
     expect(harness.value("subnet")).toBe(secondFills.subnet);
     expect(harness.value("rangeStart")).toBe(secondFills.rangeStart);
   });
@@ -356,10 +355,9 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     // Save, before the answer lands. Nothing may go out: the values collected
     // here are 192.168.2.x, and posting them saves the old pool while the
     // network that would have replaced it is dropped on the floor.
-    // The hold itself lands one macrotask after the request is posted (see
-    // postAutofill), which a browser reaches before the user's next gesture.
-    harness.flushTimers();
-    expect(harness.saveDisabled()).toBe(true);
+    // The hold is applied in the same breath as the request is posted (see
+    // postAutofill) — no timer stands between the two any more.
+    expect(harness.saveHeld()).toBe(true);
     expect(harness.attemptSubmit()).toBeUndefined();
     expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
 
@@ -374,15 +372,14 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     expect(values.subnet).toBe("255.255.255.0");
     expect(values.rangeStart).toBe("10.0.0.1");
     expect(values.broadcast).toBe("10.0.0.255");
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
   });
 
   it("holds it for a NIC picked from the select too, not only for the CIDR row", () => {
     const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
     harness.choose("interface", "10.0.0.5");
 
-    harness.flushTimers();
-    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.saveHeld()).toBe(true);
     expect(harness.attemptSubmit()).toBeUndefined();
     answerAutofill(harness);
 
@@ -398,56 +395,112 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     harness.type("cidr", "10.0.0.0/24");
     answerAutofill(harness);
 
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
     const values = harness.submit();
     expect(values.rangeStart).toBe("10.0.0.1");
     expect(harness.posted.filter((message) => message.type === "submit")).toHaveLength(1);
   });
 
   /**
-   * REVIEW FINDING (P2) — the hold must not eat the very click that triggered
-   * the round trip.
+   * REVIEW FINDING (P2, then P1 again in the fifth round) — the hold must not
+   * eat the very click that triggered the round trip, AND no timing of the
+   * native `disabled` attribute can guarantee that.
    *
    * Clicking Save while the CIDR row still has focus is ONE gesture, and the
    * browser delivers it in this order: mousedown on the button, the blur-driven
    * "change" on the input (which is what posts the autofill), mouseup, click.
-   * A hold applied synchronously from that change handler lands between the
-   * mousedown and the click, and a browser refuses to dispatch a click on a
-   * control that is disabled by then — so no click, no "submit" event, and the
-   * deferral in the submit handler is never reached at all. The round trip
-   * finishes, Save comes back, and the user's click is simply gone.
+   * A browser refuses to dispatch a click on a control that is disabled by the
+   * time it weighs it — so a disable landing anywhere between the mousedown and
+   * the click means no click, no "submit" event, and the deferral in the submit
+   * handler is never reached at all. The round trip finishes, Save comes back,
+   * and the user's click is simply gone.
    *
-   * `clickSave()` is the pointer path and honours `disabled`; `attemptSubmit()`
-   * is the Enter-key path, which a disabled button never blocked.
+   * Both attempted timings land there. Disabling synchronously from the change
+   * handler obviously does. Deferring it by one macrotask (setTimeout(fn, 0))
+   * only narrows the window: the macrotask runs when the queue next drains, not
+   * when the user's finger comes up, so a press held longer than a tick — a
+   * duration nothing bounds — still gets the disable in before mouseup.
+   *
+   * `clickSave()` models exactly that press: it drains any macrotask the script
+   * queued BEFORE dispatching, and then honours `disabled` the way a browser
+   * does. So it is red against either abandoned mechanism, and green only
+   * because the script now marks the button rather than disabling it.
+   * `attemptSubmit()` is the Enter-key path, which a disabled button never
+   * blocked and where no macrotask can interleave.
    */
-  it("defers the Save clicked in the SAME gesture that committed the CIDR row, instead of swallowing the click (kills disabling the button synchronously in postAutofill: the browser suppresses the click, no submit event fires, and the Save is discarded rather than held)", () => {
+  it("defers a Save clicked at any point in the gesture that committed the CIDR row, however long the press is held (kills disabling the button in postAutofill, synchronously OR on a zero-delay timer: the browser suppresses the click, no submit event fires, and the Save is discarded rather than held)", () => {
     const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
 
-    // The blur-driven change fires the autofill. Still inside that gesture, so
-    // no macrotask has run yet — `flushTimers` is deliberately NOT called.
+    // The blur-driven change fires the autofill, and the button is marked held
+    // right then — the mark is visual, so applying it mid-gesture is safe.
     harness.type("cidr", "10.0.0.0/24");
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(true);
+    // The property that would swallow the click is untouched, now and at every
+    // step below.
+    expect(harness.saveNativelyDisabled()).toBe(false);
 
-    // …and the click that caused the blur lands. It must reach the form, where
-    // the existing deferral holds it: nothing is posted yet.
+    // …and the click that caused the blur lands, after a press long enough for
+    // a queued macrotask to have run. It must still reach the form, where the
+    // deferral holds it: nothing is posted yet.
     expect(harness.clickSave()).toBeUndefined();
     expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+    expect(harness.saveNativelyDisabled()).toBe(false);
 
-    // Only now does the hold apply — in time to refuse a SECOND click, which is
-    // what it is for.
-    harness.flushTimers();
-    expect(harness.saveDisabled()).toBe(true);
+    // An impatient second click while the round trip is still out. It reaches
+    // the form too and is deferred again — repeats are harmless rather than
+    // de-duplicated, because postSubmit fires once when the list empties.
+    expect(harness.saveHeld()).toBe(true);
     expect(harness.clickSave()).toBeUndefined();
 
     answerAutofill(harness);
 
-    // The click the user actually made is honoured, over the derived values.
+    // The click the user actually made is honoured, ONCE, over the derived
+    // values.
     const submitted = harness.posted.filter((message) => message.type === "submit");
     expect(submitted).toHaveLength(1);
     const values = submitted[0].type === "submit" ? submitted[0].values : {};
     expect(values.rangeStart).toBe("10.0.0.1");
     expect(values.broadcast).toBe("10.0.0.255");
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
+    expect(harness.saveNativelyDisabled()).toBe(false);
+  });
+
+  /**
+   * The property the fifth round's fix actually rests on: the hold does not
+   * depend on elapsed time AT ALL. There is no moment after the request is
+   * posted at which a submit attempt behaves differently, because the only
+   * thing holding Save is the pendingAutofills check in the submit handler,
+   * which is read at the instant of the submit and never on a schedule.
+   *
+   * The two routes are spelled out separately because they reach the form
+   * through different browser machinery — a pointer activation, which a
+   * disabled button suppresses, and Enter's implicit submission, which it never
+   * did — and the hold has to be the same for both.
+   */
+  it("holds every submit attempted while the request is out, whatever route it takes and whenever it is made", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.type("cidr", "10.0.0.0/24");
+
+    // Pointer, then Enter, then pointer again — no answer in between, and no
+    // notion of time passing between them.
+    expect(harness.clickSave()).toBeUndefined();
+    expect(harness.attemptSubmit()).toBeUndefined();
+    expect(harness.clickSave()).toBeUndefined();
+    expect(harness.saveHeld()).toBe(true);
+    // Each of those reached the form and was deferred there. Nothing was
+    // suppressed on the way in, which is only true while the button's native
+    // `disabled` stays off — including after a press long enough to drain the
+    // task queue, which the first `clickSave` above already modelled.
+    expect(harness.saveNativelyDisabled()).toBe(false);
+    expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+
+    answerAutofill(harness);
+
+    const submitted = harness.posted.filter((message) => message.type === "submit");
+    expect(submitted).toHaveLength(1);
+    const values = submitted[0].type === "submit" ? submitted[0].values : {};
+    expect(values.cidr).toBe("10.0.0.0/24");
+    expect(values.rangeStart).toBe("10.0.0.1");
   });
 
   /**
@@ -468,7 +521,6 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     harness.type("cidr", "10.0.0.0/24");
     harness.type("cidr", "172.16.0.0/16");
     harness.type("cidr", "10.0.0.0/24");
-    harness.flushTimers();
 
     const requests = harness.posted.filter((message) => message.type === "autofill");
     expect(requests).toHaveLength(3);
@@ -487,12 +539,12 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     // submitted. Under key/value correlation the first request's pair of
     // answers has already retired the third request's entry, the second one
     // empties the list, and the held Save fires here.
-    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.saveHeld()).toBe(true);
     expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
 
     // Its own answer, and only its own, releases it.
     answer(harness, requests[2] as Extract<FormMessage, { type: "autofill" }>);
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
     const submitted = harness.posted.filter((message) => message.type === "submit");
     expect(submitted).toHaveLength(1);
     const values = submitted[0].type === "submit" ? submitted[0].values : {};
@@ -549,7 +601,7 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     expect(harness.value("rangeStart")).toBe("10.0.0.1");
     expect(harness.value("broadcast")).toBe("10.0.0.255");
     expect(harness.value("serverId")).toBe("10.0.0.5");
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
   });
 
   it("applies an answer that matches no pending request unchanged, as it always has", () => {
@@ -574,7 +626,7 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     // The TFTP editor posts no autofill from anywhere, so Save must behave as it
     // always has: enabled at open, submitting on the spot.
     const harness = openForm(networkServerFormDefinition("tftp", {}, { interfaceOptions: [...INTERFACES] }));
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
     expect(harness.attemptSubmit()).toBeDefined();
   });
 });
@@ -629,7 +681,7 @@ describe("DHCP form — Enter pressed in the CIDR row", () => {
     expect(values.subnet).toBe("255.255.255.0");
     expect(values.rangeStart).toBe("10.0.0.1");
     expect(values.broadcast).toBe("10.0.0.255");
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
   });
 
   it("commits once when a \"change\" follows the same Enter, rather than posting the round trip twice", () => {
@@ -645,7 +697,7 @@ describe("DHCP form — Enter pressed in the CIDR row", () => {
 
     expect(harness.posted.filter((message) => message.type === "autofill")).toHaveLength(1);
     answerAutofill(harness);
-    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.saveHeld()).toBe(false);
     expect(harness.submit().rangeStart).toBe("10.0.0.1");
   });
 

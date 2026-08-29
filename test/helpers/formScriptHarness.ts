@@ -28,6 +28,11 @@ export class StubElement {
   public parentElement: StubElement | undefined;
   public readonly dataset: Record<string, string | undefined> = {};
   public readonly style: Record<string, string> = {};
+  /** Plain attributes set through `setAttribute` — today only the Save button's
+   *  `aria-busy`. `data-*` deliberately does NOT live here: the scripts under
+   *  test reach those through `dataset`, and two stores for one attribute
+   *  would disagree the moment anything wrote through the other one. */
+  private readonly attributes = new Map<string, string>();
   public value = "";
   public checked = false;
   public required = false;
@@ -111,6 +116,21 @@ export class StubElement {
         }
       }
     };
+  }
+
+  public setAttribute(name: string, value: string): void {
+    if (name.startsWith("data-")) {
+      throw new Error(`setAttribute("${name}") — this stub keeps data-* in \`dataset\`, write it there`);
+    }
+    this.attributes.set(name, value);
+  }
+
+  public getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+
+  public removeAttribute(name: string): void {
+    this.attributes.delete(name);
   }
 
   public append(child: StubElement): StubElement {
@@ -226,7 +246,7 @@ function readAttribute(el: StubElement, name: string): string | undefined {
   if (name === "name") {
     return el.name;
   }
-  return undefined;
+  return el.getAttribute(name) ?? undefined;
 }
 
 /** Supports exactly the selector shapes the rendered script uses. */
@@ -437,8 +457,8 @@ function buildFormDom(definition: FormDefinition): FormDom {
   const actions = form.append(new StubElement("DIV", ["actions"]));
   const saveBtn = actions.append(new StubElement("BUTTON"));
   saveBtn.type = "submit";
-  // Mirrors the rendered `id="save-btn"`, which the script disables while an
-  // autofill round trip is outstanding.
+  // Mirrors the rendered `id="save-btn"`, which the script MARKS (class +
+  // aria-busy, never `disabled`) while an autofill round trip is outstanding.
   byId.set("save-btn", saveBtn);
   const cancelBtn = actions.append(new StubElement("BUTTON"));
   byId.set("cancel-btn", cancelBtn);
@@ -519,31 +539,52 @@ export interface FormHarness {
    * nothing.
    *
    * This is the ENTER-KEY path: a form submits on Enter in a text field
-   * whatever its buttons look like, so the button's disabled state is
-   * deliberately not consulted. For the pointer path use `clickSave`.
+   * whatever the buttons look like, and no macrotask can interleave — the
+   * submission is the keydown's default action and runs in the same task. For
+   * the pointer path use `clickSave`.
    */
   attemptSubmit: () => FormValues | undefined;
   /**
-   * The POINTER path: a real click on the Save button, which a browser refuses
-   * to dispatch at all while the button is disabled — no click, and therefore
-   * no `submit` event for the form's own handler to defer. That difference is
-   * exactly what `attemptSubmit` cannot see, and is where the "Save clicked
-   * while the CIDR row was still committing" defect lived.
+   * The POINTER path: a real click on the Save button.
+   *
+   * It models two things `attemptSubmit` cannot, and both are the ground the
+   * "Save clicked while the CIDR row was still committing" defect was fought
+   * over:
+   *   * a browser refuses to dispatch a click on a control whose native
+   *     `disabled` is set — no click, and therefore no `submit` event for the
+   *     form's handler to defer. The script under test no longer sets that
+   *     property at all, so this never fires today; it is kept because it is
+   *     the TRIPWIRE. Bring the disable back and every pointer test here goes
+   *     red on a Save that was swallowed rather than held;
+   *   * a physical press is not instantaneous. Any macrotask the script queued
+   *     during the blur-driven "change" runs before the click is dispatched
+   *     whenever the user holds the button down longer than one tick, which no
+   *     API bounds — so queued tasks are drained FIRST, which is exactly the
+   *     timing the fifth review finding is about. The script queues none any
+   *     more; a reintroduced `setTimeout(disable, 0)` would land here.
    *
    * Returns the submitted values, or `undefined` when the click was suppressed
    * or the submit handler held it.
    */
   clickSave: () => FormValues | undefined;
   /**
-   * Runs the macrotasks the script has queued (`setTimeout`), which is where
-   * the deferred Save-button disable lives. A browser reaches these between one
-   * user gesture and the next, so tests that model two separate interactions
-   * flush in between; a test that models a SINGLE gesture (the blur-driven
-   * change and the click that caused it) deliberately does not.
+   * Whether the Save button carries the "an autofill round trip is outstanding"
+   * mark — the `save-held` class and `aria-busy`, which are appearance and
+   * assistive semantics only and cannot suppress an event.
+   *
+   * Throws if the two disagree: they are one state with two spellings, and a
+   * button that looks held to the eye but not to a screen reader (or the
+   * reverse) is a defect this should not be able to hide.
    */
-  flushTimers: () => void;
-  /** Whether the Save button is currently disabled. */
-  saveDisabled: () => boolean;
+  saveHeld: () => boolean;
+  /**
+   * Whether the Save button's NATIVE `disabled` property is set — which the
+   * script must never do, because it makes the browser swallow the click that
+   * carries the user's Save instead of letting the form's handler defer it.
+   * Exposed so one test can state that invariant outright rather than leaving
+   * it to be inferred from a click that happened to get through.
+   */
+  saveNativelyDisabled: () => boolean;
   /** The `requestId` the script stamped on its most recent `autofill` post —
    *  what an answer must echo back to release that request. */
   lastAutofillRequestId: () => number | undefined;
@@ -622,9 +663,13 @@ export function openForm(definition: FormDefinition): FormHarness {
 
   // The script's macrotask queue, owned by the test rather than by the runtime.
   // `setTimeout` is passed in as a parameter so it SHADOWS the Node global
-  // inside the script's scope: the deferred Save-button disable then lands here
-  // instead of on a real timer, and a test says explicitly when the browser
-  // would have got round to it (see `flushTimers`).
+  // inside the script's scope — anything the script queues lands here instead
+  // of on a real timer that a synchronous test would never see fire.
+  //
+  // The script queues NOTHING today: the Save-button hold used to be deferred
+  // by one macrotask and no longer is. The queue is kept anyway, drained by
+  // `clickSave`, so that a reintroduced timer is observed rather than silently
+  // dropped — see the note on `clickSave`.
   const timers: Array<() => void> = [];
 
   const factory = new Function(
@@ -660,8 +705,8 @@ export function openForm(definition: FormDefinition): FormHarness {
     }
   );
 
-  const flushTimers = (): void => {
-    // Drained rather than iterated: a queued task may queue another.
+  /** Drained rather than iterated: a queued task may queue another. */
+  const runQueuedTasks = (): void => {
     while (timers.length > 0) {
       timers.shift()!();
     }
@@ -717,9 +762,13 @@ export function openForm(definition: FormDefinition): FormHarness {
       return posted.length > before && last?.type === "submit" ? last.values : undefined;
     },
     clickSave: () => {
+      // The press is held long enough for the queue to drain before the click
+      // is dispatched — legal, unbounded, and the timing the fifth review
+      // finding is about.
+      runQueuedTasks();
       // What a browser does with a click on a disabled control: nothing. No
       // click event, and so no `submit` event either — the form's handler is
-      // never reached, which is why a Save held this way cannot even be
+      // never reached, which is why a Save held that way cannot even be
       // deferred.
       if (dom.byId.get("save-btn")?.disabled === true) {
         return undefined;
@@ -729,8 +778,18 @@ export function openForm(definition: FormDefinition): FormHarness {
       const last = posted[posted.length - 1];
       return posted.length > before && last?.type === "submit" ? last.values : undefined;
     },
-    flushTimers,
-    saveDisabled: () => dom.byId.get("save-btn")?.disabled === true,
+    saveHeld: () => {
+      const button = dom.byId.get("save-btn");
+      const marked = button?.classList.contains("save-held") === true;
+      const announced = button?.getAttribute("aria-busy") === "true";
+      if (marked !== announced) {
+        throw new Error(
+          `Save button's visual hold (${marked}) and aria-busy (${announced}) disagree — they are one state`
+        );
+      }
+      return marked;
+    },
+    saveNativelyDisabled: () => dom.byId.get("save-btn")?.disabled === true,
     lastAutofillRequestId: () => {
       const message = [...posted].reverse().find((entry) => entry.type === "autofill");
       return message?.type === "autofill" ? message.requestId : undefined;

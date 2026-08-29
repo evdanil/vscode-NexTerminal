@@ -1498,6 +1498,18 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     .actions button[data-visible-when].field-visible {
       display: inline-flex;
     }
+    /* Save while an autofill round trip is outstanding. APPEARANCE ONLY — the
+       button stays natively clickable and its click is deferred, not dropped
+       (see "SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP" in the script below).
+       Dimmed like the shared \`:disabled\` rules so it reads as held, and
+       \`progress\` rather than \`not-allowed\` because the Save is coming. */
+    .actions button.save-held {
+      opacity: 0.5;
+      cursor: progress;
+    }
+    .actions button.save-held:hover {
+      background: var(--vscode-button-background);
+    }
   </style>
 </head>
 <body>
@@ -2270,19 +2282,55 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * decide whether the FILL is still about the option now selected (see
        * fillAnswersCurrentSelection) — and both are echoed on both answers.
        *
-       * A submit attempted meanwhile is DEFERRED, not dropped. The disabled
-       * button stops a LATER click from ever reaching the form, but two kinds
-       * of submit still do reach it and silently swallowing either is its own
-       * defect: Enter in a text field submits a form regardless of what the
-       * buttons look like, and the click that fired this round trip in the
-       * first place is still in flight when it is posted (which is why the
-       * button is not disabled until the gesture carrying that click is over —
-       * see postAutofill). Either fires once the last answer lands, over values
-       * collected then — which is exactly what the user meant by Save.
+       * A submit attempted meanwhile is DEFERRED, not dropped, and ONE check
+       * does that: pendingAutofills non-empty at the top of the form's own
+       * "submit" handler means remember the intent and fire it when the last
+       * answer lands, over values collected then — which is exactly what the
+       * user meant by Save. Every route into a submission arrives at that one
+       * handler: Enter in a text field, a click on Save, and the click that
+       * fired this round trip in the first place and is still in flight when it
+       * is posted. Nothing else may stand in front of it.
        *
-       * REVIEW FINDING (P1) — that deferral only works if something is PENDING
-       * by the time submit is dispatched, and a commit does not only happen on
-       * blur. The round trip is started from "change" on purpose (deriving a
+       * REVIEW FINDING (P1, fifth round) — HOLDING SAVE IS NOT THE BUTTON'S
+       * JOB. The Save button is marked held VISUALLY and only visually (the
+       * save-held class plus aria-busy, applied in postAutofill and cleared in
+       * autofillSettled); its native \`disabled\` property is never set. Two
+       * rounds were spent trying to make \`disabled\` safe, and both are recorded
+       * here as ABANDONED so a third attempt is not made.
+       *
+       * \`disabled\` on a type="submit" button does not merely grey it: the
+       * browser then refuses to dispatch click, and therefore submit, on that
+       * button at all. That makes it a second gate in front of the deferral
+       * above — one that SWALLOWS a submit instead of deferring it, which is
+       * precisely the silent loss this whole block exists to prevent. Both
+       * timings failed for the same reason:
+       *   * disabling synchronously from the "change" that posts the request
+       *     lands mid-gesture. Clicking Save while the CIDR row still has focus
+       *     delivers mousedown on the button, then the blur-driven "change" —
+       *     which is what calls postAutofill — then mouseup, then click. The
+       *     button is disabled by the time the browser weighs that click, so no
+       *     click, no "submit" event, and the user's Save is simply gone;
+       *   * deferring the disable by one macrotask (setTimeout(fn, 0)) only
+       *     narrows that window. A macrotask runs when the queue next drains,
+       *     which is not when the user's finger comes up: hold the button down
+       *     longer than one tick — a duration no API bounds and no pointer
+       *     hardware promises — and the disable still lands between mousedown
+       *     and mouseup, with the same swallowed click.
+       * There is no third timing to try, because the events being raced are the
+       * user's own. So the mechanism is gone rather than re-tuned: a class and
+       * an ARIA attribute cannot suppress a dispatch, every submit the user
+       * makes reaches the deferral, and nothing about the hold depends on
+       * elapsed time any more.
+       *
+       * The cost is that Save can be clicked repeatedly while a round trip is
+       * out, and that is deliberately not de-duplicated: each attempt sets the
+       * same deferredSubmit flag, and postSubmit fires once, when the last
+       * answer lands.
+       *
+       * REVIEW FINDING (P1) — the submit handler's deferral only works if
+       * something is PENDING by the time submit is dispatched, and a commit
+       * does not only happen on blur. The round trip is started from "change"
+       * on purpose (deriving a
        * whole pool from 192.168.2.0/2 on the way to /24 would overwrite the
        * fields the user is about to see filled correctly), and "change" on a
        * text input is a blur-time event. Enter does NOT blur: it is the
@@ -2370,6 +2418,22 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       var nextAutofillRequestId = 1;
       var saveBtn = document.getElementById("save-btn");
 
+      /* The "a round trip is outstanding" mark on Save: appearance and
+         assistive semantics, never behaviour — see "HOLDING SAVE IS NOT THE
+         BUTTON'S JOB" above for why the native disabled property is not touched
+         here. aria-busy rather than aria-disabled: the click IS honoured, just
+         not yet, and telling a screen reader the control is unavailable would
+         be the same lie the disabled attribute used to tell the browser. */
+      function markSaveHeld(held) {
+        if (!saveBtn) return;
+        saveBtn.classList.toggle("save-held", held);
+        if (held) {
+          saveBtn.setAttribute("aria-busy", "true");
+        } else {
+          saveBtn.removeAttribute("aria-busy");
+        }
+      }
+
       /**
        * REVIEW FINDING (P1) — previousValue is what THIS FIELD held immediately
        * before the gesture being reported, and it exists because for a SELECT
@@ -2397,37 +2461,16 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         // object, or the two ends are comparing different forms.
         var snapshot = collectFormValues();
         pendingAutofills.push({ id: requestId, snapshot: snapshot });
+        /* Marked in the same breath as the push, with no timer between them,
+           because nothing about event DISPATCH depends on this any more — the
+           deferral in the submit handler is what actually holds Save. The
+           macrotask that used to sit here was protecting an in-flight click
+           from the disabled attribute; with the attribute gone there is nothing
+           left for it to protect. */
+        markSaveHeld(true);
         var request = { type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId };
         if (previousValue !== undefined) request.previousValue = previousValue;
         vscode.postMessage(request);
-        /**
-         * REVIEW FINDING (P2) — the disable is deferred by one MACROTASK, and
-         * that is the whole point of the setTimeout.
-         *
-         * A click on Save while the CIDR row still has focus dispatches, in
-         * one gesture: mousedown on the button, then the blur-driven "change"
-         * on the input — which is what calls this function — then mouseup,
-         * then click. Disabling here and now happens BETWEEN the mousedown and
-         * the click, and a browser re-reads "disabled" as it is about to
-         * dispatch each of those: the click never fires, so the form's own
-         * "submit" never fires, so the deferral in the submit handler never
-         * sees it. The user's Save is silently dropped and they have to click
-         * a second time.
-         *
-         * A macrotask runs after the events already queued for the CURRENT
-         * gesture have been delivered, and long before any follow-up click a
-         * human could make — so the in-flight click still reaches the submit
-         * handler and is deferred there, while a later click still finds the
-         * button held. A microtask would NOT do: microtasks drain between
-         * event dispatches, i.e. still ahead of the queued click.
-         *
-         * The guard is for the request that settles before its own deferred
-         * disable runs (nothing outstanding any more): disabling then would
-         * strand Save on a round trip that is already over.
-         */
-        setTimeout(function() {
-          if (saveBtn && pendingAutofills.length > 0) saveBtn.disabled = true;
-        }, 0);
       }
 
       /** The values snapshot the still-pending request was sent with, or
@@ -2462,7 +2505,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         if (index === -1) return;
         pendingAutofills.splice(index, 1);
         if (pendingAutofills.length > 0) return;
-        if (saveBtn) saveBtn.disabled = false;
+        markSaveHeld(false);
         if (deferredSubmit) {
           deferredSubmit = false;
           postSubmit();
@@ -3310,6 +3353,18 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     .actions button[data-visible-when].field-visible {
       display: inline-flex;
     }
+    /* Save while an autofill round trip is outstanding. APPEARANCE ONLY — the
+       button stays natively clickable and its click is deferred, not dropped
+       (see "SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP" in the script below).
+       Dimmed like the shared \`:disabled\` rules so it reads as held, and
+       \`progress\` rather than \`not-allowed\` because the Save is coming. */
+    .actions button.save-held {
+      opacity: 0.5;
+      cursor: progress;
+    }
+    .actions button.save-held:hover {
+      background: var(--vscode-button-background);
+    }
   </style>
 </head>
 <body>
@@ -4082,19 +4137,55 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * decide whether the FILL is still about the option now selected (see
        * fillAnswersCurrentSelection) — and both are echoed on both answers.
        *
-       * A submit attempted meanwhile is DEFERRED, not dropped. The disabled
-       * button stops a LATER click from ever reaching the form, but two kinds
-       * of submit still do reach it and silently swallowing either is its own
-       * defect: Enter in a text field submits a form regardless of what the
-       * buttons look like, and the click that fired this round trip in the
-       * first place is still in flight when it is posted (which is why the
-       * button is not disabled until the gesture carrying that click is over —
-       * see postAutofill). Either fires once the last answer lands, over values
-       * collected then — which is exactly what the user meant by Save.
+       * A submit attempted meanwhile is DEFERRED, not dropped, and ONE check
+       * does that: pendingAutofills non-empty at the top of the form's own
+       * "submit" handler means remember the intent and fire it when the last
+       * answer lands, over values collected then — which is exactly what the
+       * user meant by Save. Every route into a submission arrives at that one
+       * handler: Enter in a text field, a click on Save, and the click that
+       * fired this round trip in the first place and is still in flight when it
+       * is posted. Nothing else may stand in front of it.
        *
-       * REVIEW FINDING (P1) — that deferral only works if something is PENDING
-       * by the time submit is dispatched, and a commit does not only happen on
-       * blur. The round trip is started from "change" on purpose (deriving a
+       * REVIEW FINDING (P1, fifth round) — HOLDING SAVE IS NOT THE BUTTON'S
+       * JOB. The Save button is marked held VISUALLY and only visually (the
+       * save-held class plus aria-busy, applied in postAutofill and cleared in
+       * autofillSettled); its native \`disabled\` property is never set. Two
+       * rounds were spent trying to make \`disabled\` safe, and both are recorded
+       * here as ABANDONED so a third attempt is not made.
+       *
+       * \`disabled\` on a type="submit" button does not merely grey it: the
+       * browser then refuses to dispatch click, and therefore submit, on that
+       * button at all. That makes it a second gate in front of the deferral
+       * above — one that SWALLOWS a submit instead of deferring it, which is
+       * precisely the silent loss this whole block exists to prevent. Both
+       * timings failed for the same reason:
+       *   * disabling synchronously from the "change" that posts the request
+       *     lands mid-gesture. Clicking Save while the CIDR row still has focus
+       *     delivers mousedown on the button, then the blur-driven "change" —
+       *     which is what calls postAutofill — then mouseup, then click. The
+       *     button is disabled by the time the browser weighs that click, so no
+       *     click, no "submit" event, and the user's Save is simply gone;
+       *   * deferring the disable by one macrotask (setTimeout(fn, 0)) only
+       *     narrows that window. A macrotask runs when the queue next drains,
+       *     which is not when the user's finger comes up: hold the button down
+       *     longer than one tick — a duration no API bounds and no pointer
+       *     hardware promises — and the disable still lands between mousedown
+       *     and mouseup, with the same swallowed click.
+       * There is no third timing to try, because the events being raced are the
+       * user's own. So the mechanism is gone rather than re-tuned: a class and
+       * an ARIA attribute cannot suppress a dispatch, every submit the user
+       * makes reaches the deferral, and nothing about the hold depends on
+       * elapsed time any more.
+       *
+       * The cost is that Save can be clicked repeatedly while a round trip is
+       * out, and that is deliberately not de-duplicated: each attempt sets the
+       * same deferredSubmit flag, and postSubmit fires once, when the last
+       * answer lands.
+       *
+       * REVIEW FINDING (P1) — the submit handler's deferral only works if
+       * something is PENDING by the time submit is dispatched, and a commit
+       * does not only happen on blur. The round trip is started from "change"
+       * on purpose (deriving a
        * whole pool from 192.168.2.0/2 on the way to /24 would overwrite the
        * fields the user is about to see filled correctly), and "change" on a
        * text input is a blur-time event. Enter does NOT blur: it is the
@@ -4182,6 +4273,22 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
       var nextAutofillRequestId = 1;
       var saveBtn = document.getElementById("save-btn");
 
+      /* The "a round trip is outstanding" mark on Save: appearance and
+         assistive semantics, never behaviour — see "HOLDING SAVE IS NOT THE
+         BUTTON'S JOB" above for why the native disabled property is not touched
+         here. aria-busy rather than aria-disabled: the click IS honoured, just
+         not yet, and telling a screen reader the control is unavailable would
+         be the same lie the disabled attribute used to tell the browser. */
+      function markSaveHeld(held) {
+        if (!saveBtn) return;
+        saveBtn.classList.toggle("save-held", held);
+        if (held) {
+          saveBtn.setAttribute("aria-busy", "true");
+        } else {
+          saveBtn.removeAttribute("aria-busy");
+        }
+      }
+
       /**
        * REVIEW FINDING (P1) — previousValue is what THIS FIELD held immediately
        * before the gesture being reported, and it exists because for a SELECT
@@ -4209,37 +4316,16 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         // object, or the two ends are comparing different forms.
         var snapshot = collectFormValues();
         pendingAutofills.push({ id: requestId, snapshot: snapshot });
+        /* Marked in the same breath as the push, with no timer between them,
+           because nothing about event DISPATCH depends on this any more — the
+           deferral in the submit handler is what actually holds Save. The
+           macrotask that used to sit here was protecting an in-flight click
+           from the disabled attribute; with the attribute gone there is nothing
+           left for it to protect. */
+        markSaveHeld(true);
         var request = { type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId };
         if (previousValue !== undefined) request.previousValue = previousValue;
         vscode.postMessage(request);
-        /**
-         * REVIEW FINDING (P2) — the disable is deferred by one MACROTASK, and
-         * that is the whole point of the setTimeout.
-         *
-         * A click on Save while the CIDR row still has focus dispatches, in
-         * one gesture: mousedown on the button, then the blur-driven "change"
-         * on the input — which is what calls this function — then mouseup,
-         * then click. Disabling here and now happens BETWEEN the mousedown and
-         * the click, and a browser re-reads "disabled" as it is about to
-         * dispatch each of those: the click never fires, so the form's own
-         * "submit" never fires, so the deferral in the submit handler never
-         * sees it. The user's Save is silently dropped and they have to click
-         * a second time.
-         *
-         * A macrotask runs after the events already queued for the CURRENT
-         * gesture have been delivered, and long before any follow-up click a
-         * human could make — so the in-flight click still reaches the submit
-         * handler and is deferred there, while a later click still finds the
-         * button held. A microtask would NOT do: microtasks drain between
-         * event dispatches, i.e. still ahead of the queued click.
-         *
-         * The guard is for the request that settles before its own deferred
-         * disable runs (nothing outstanding any more): disabling then would
-         * strand Save on a round trip that is already over.
-         */
-        setTimeout(function() {
-          if (saveBtn && pendingAutofills.length > 0) saveBtn.disabled = true;
-        }, 0);
       }
 
       /** The values snapshot the still-pending request was sent with, or
@@ -4274,7 +4360,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         if (index === -1) return;
         pendingAutofills.splice(index, 1);
         if (pendingAutofills.length > 0) return;
-        if (saveBtn) saveBtn.disabled = false;
+        markSaveHeld(false);
         if (deferredSubmit) {
           deferredSubmit = false;
           postSubmit();
