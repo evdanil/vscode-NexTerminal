@@ -319,22 +319,102 @@ describe("applying a CIDR — this machine's own addresses stay out of the pool"
 });
 
 /**
- * REVIEW FINDING (P1) — the Server Identifier (option 54) follows the network
- * like the gateway does. Without it, applying 10.0.0.0/24 leaves clients being
- * told to renew against the packaged 192.168.2.1, which is not on their wire.
+ * REVIEW FINDING (P1) — the Server Identifier (option 54) has to follow the
+ * network. Without it, applying 10.0.0.0/24 leaves clients being told to renew
+ * against the packaged 192.168.2.1, which is not on their wire.
+ *
+ * REVIEW FINDING (P1, second round) — and it must NOT be taken from the derived
+ * gateway. `DhcpEngine` copies `serverId` verbatim into option 54 and into the
+ * BOOTP `siaddr` a ZTP client boots from, so it has to name an address this
+ * machine actually answers on. The gateway this codebase derives is the top
+ * usable address of the network — the router's, or nobody's. The two agreed
+ * only because the packaged defaults are one address (DEFAULTS.serverId ===
+ * DEFAULTS.gateway === 192.168.2.1).
+ *
+ * Every fixture below therefore puts a real NIC on the network being applied,
+ * at an address that is deliberately NOT the derived gateway: eth1 holds
+ * 10.0.0.5 while 10.0.0.0/24 derives 10.0.0.254.
  */
 describe("applying a CIDR — the server identifier", () => {
-  it("writes it alongside the gateway while it is unset", async () => {
+  /** eth0 on the old network, eth1 on the one about to be applied. */
+  function twoNics(): void {
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5")],
+      eth1: [ipv4("10.0.0.5")]
+    });
+  }
+
+  it("writes the serving NIC's address, not the gateway, while it is unset", async () => {
+    twoNics();
     seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
     quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
     inputScript = ["10.0.0.0/24"];
     await openNetworkServerQuickAdjust("dhcp", deps());
 
-    expect(written("serverId")).toBe("10.0.0.254");
+    expect(written("serverId")).toBe("10.0.0.5");
+    // The gateway setting is still the gateway — only option 54 moved.
+    expect(written("gateway")).toBe("10.0.0.254");
   });
 
-  it("replaces one this row suggested for the previous network", async () => {
-    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", serverId: "192.168.2.254" });
+  it("uses the bound NIC itself when it is already on the new subnet", async () => {
+    // The `match` branch, put where a suggestion could not answer at all: TWO
+    // NICs are on 10.0.0.0/24 and the service is bound to the second of them.
+    // An implementation that only ever asked suggestBindAddressForPool would
+    // write nothing here, and one that took its first match would write the
+    // wrong NIC's address.
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5")],
+      eth1: [ipv4("10.0.0.5")],
+      eth2: [ipv4("10.0.0.6")]
+    });
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", interface: "10.0.0.6" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("10.0.0.6");
+  });
+
+  it("leaves it untouched when no NIC of this machine is on the new network", async () => {
+    // The default fixture holds only 192.168.2.5. 172.30.0.0/24 is a fine
+    // network that this machine is simply not on, so there is no address to
+    // advertise — and the gateway is not a stand-in for one. The key is left
+    // UNSET, which is the case a fill would always have been free to take: an
+    // implementation deriving option 54 from the network writes 172.30.0.254
+    // here, an address belonging to nothing.
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["172.30.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBeUndefined();
+    // The rest of the network still applied.
+    expect(written("rangeStart")).toBe("172.30.0.1");
+    expect(written("gateway")).toBe("172.30.0.254");
+  });
+
+  it("writes nothing for it when two NICs are on the new network", async () => {
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5")],
+      eth1: [ipv4("10.0.0.5")],
+      eth2: [ipv4("10.0.0.6")]
+    });
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBeUndefined();
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
+
+  it("keeps the gateway fallback while relay agents are allowed", async () => {
+    // Deliberately unchanged from the round before: with a relay in front there
+    // is by design no local NIC on the pool's subnet, and what option 54 should
+    // say then is a separate question. Pinned so the branch cannot move by
+    // accident with the rest.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", allowRelayAgents: true });
     quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
     inputScript = ["10.0.0.0/24"];
     await openNetworkServerQuickAdjust("dhcp", deps());
@@ -342,9 +422,62 @@ describe("applying a CIDR — the server identifier", () => {
     expect(written("serverId")).toBe("10.0.0.254");
   });
 
-  it("leaves a hand-set one alone while still moving the pool", async () => {
-    // The packaged address, typed in — not what the old /24 derived (.254), so
-    // it is a decision rather than a stale suggestion.
+  it("writes nothing when the confirmation is declined", async () => {
+    twoNics();
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(false), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBeUndefined();
+  });
+});
+
+/**
+ * The gate on the offer above, which had to move with it: what counts as "still
+ * holding what the PREVIOUS network auto-filled" is the same NIC resolution run
+ * against the previous rangeStart/subnet, not the previous gateway.
+ *
+ * Both fixtures below hold an address on the OLD network as well as the new
+ * one, which is what makes the previous auto-fill resolvable at all and lets
+ * the two possible baselines disagree.
+ */
+describe("applying a CIDR — what counts as a stale server identifier", () => {
+  beforeEach(() => {
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5")],
+      eth1: [ipv4("10.0.0.5")]
+    });
+  });
+
+  it("replaces one that is still the PREVIOUS network's resolved address", async () => {
+    // 192.168.2.5 is exactly what this offer would have written while the
+    // config was on 192.168.2.0/24 — a stale suggestion naming the old wire.
+    // A gate on the previous GATEWAY would not recognise it and would leave it.
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", serverId: "192.168.2.5" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("10.0.0.5");
+  });
+
+  it("keeps the PREVIOUS network's gateway, which this offer would never have written", async () => {
+    // The discriminating case for the gate itself. Under the old
+    // gateway-based baseline this was treated as the offer's own leftover and
+    // silently replaced. No version of this offer writes a gateway to serverId
+    // any more, so someone typed it, and a hand-set option 54 has to survive.
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", serverId: "192.168.2.254" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("192.168.2.254");
+    // …and the network still applied over it.
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
+
+  it("keeps any other address the user typed", async () => {
     seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", serverId: "192.168.2.1" });
     quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
     inputScript = ["10.0.0.0/24"];
@@ -352,15 +485,6 @@ describe("applying a CIDR — the server identifier", () => {
 
     expect(written("serverId")).toBe("192.168.2.1");
     expect(written("rangeStart")).toBe("10.0.0.1");
-  });
-
-  it("writes nothing when the confirmation is declined", async () => {
-    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199" });
-    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(false), dismiss];
-    inputScript = ["10.0.0.0/24"];
-    await openNetworkServerQuickAdjust("dhcp", deps());
-
-    expect(written("serverId")).toBeUndefined();
   });
 });
 

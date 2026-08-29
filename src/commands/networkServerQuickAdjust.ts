@@ -33,6 +33,7 @@ import {
   isContiguousMask,
   isDnsAutoFillable,
   isValidIpv4,
+  resolveDhcpServerIdentifier,
   suggestBindAddressForPool
 } from "./networkServerSettings";
 import type { SettingValue } from "./networkServerSettings";
@@ -474,15 +475,20 @@ function readDnsSetting(section: vscode.WorkspaceConfiguration): string[] {
  * sure — a single NIC already on the new subnet — is also the case where saying
  * so out loud costs nothing. Ambiguity (two NICs on that subnet) and silence
  * (none) both mean the picker stays the way to answer.
+ *
+ * @param interfaces Passed in rather than enumerated here so a caller that also
+ *   needs the NIC list — {@link editNetworkCidr}, which derives the pool around
+ *   this machine's addresses and resolves the server identifier from them —
+ *   asks the platform once and cannot end up comparing two different answers.
  */
 function offSubnetInterfaceWrite(
   section: vscode.WorkspaceConfiguration,
   rangeStart: string | undefined,
-  subnet: string | undefined
+  subnet: string | undefined,
+  interfaces: readonly NetworkInterfaceOption[]
 ): AutoFillWrite | undefined {
   const allowRelayAgents = section.get<boolean>("allowRelayAgents", false) === true;
   const bindAddress = rawString(section, "interface");
-  const interfaces = networkInterfaceBindOptions();
   const status = dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, allowRelayAgents);
   if (status !== "mismatch") return undefined;
   const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, allowRelayAgents);
@@ -523,7 +529,7 @@ async function offerPoolAutoFill(
     writes.push({ key: "broadcast", value: derived.broadcast });
   }
   if (isDnsAutoFillable(dns, previous?.dns)) writes.push({ key: "dns", value: [...derived.dns] });
-  const bind = offSubnetInterfaceWrite(section, rangeStart, subnet);
+  const bind = offSubnetInterfaceWrite(section, rangeStart, subnet, networkInterfaceBindOptions());
   if (bind) writes.push(bind);
 
   await confirmAutoFill(`Fill in the addresses that follow from ${rangeStart}?`, writes);
@@ -546,10 +552,14 @@ async function offerPoolAutoFill(
  * network after the mask moved to the new one is not a state the user could
  * have meant. Nothing is written without the confirmation either way.
  *
- * The server identifier (option 54) is one of the implied ones, derived from
- * the gateway address because the packaged defaults are the same address for
- * both. Without it a `10.0.0.0/24` config keeps advertising the packaged
- * `192.168.2.1` for renewals, on a network no client can reach it at.
+ * The server identifier (option 54) is offered too, but it is not derived from
+ * the network like the rest: it is this machine's own address on the wire it
+ * serves, so it comes from the serving NIC via `resolveDhcpServerIdentifier`.
+ * Without it a `10.0.0.0/24` config keeps advertising the packaged
+ * `192.168.2.1` for renewals, on a network no client can reach it at; taken
+ * from the gateway instead, it advertises an address that belongs to the router
+ * or to nothing. When no single NIC of this machine can be identified for the
+ * new pool, nothing is offered for it at all.
  *
  * The pool is derived against this machine's own addresses, so re-applying the
  * network it is already on cannot produce a pool containing the very NIC the
@@ -578,7 +588,8 @@ async function editNetworkCidr(
   // Same NIC enumeration `offSubnetInterfaceWrite` reads, and for the same
   // reason it is filtered rather than taken raw from `os.networkInterfaces()`:
   // a WSL or Docker address has no business shaping a pool for a real wire.
-  const ownAddresses = networkInterfaceBindOptions().map((option) => option.value);
+  const interfaces = networkInterfaceBindOptions();
+  const ownAddresses = interfaces.map((option) => option.value);
   const derived = dhcpCidrDerivation(entered, ownAddresses);
   if (!derived) {
     // A blank box, or anything the validator already refused, is silent — blank
@@ -597,6 +608,7 @@ async function editNetworkCidr(
 
   const section = settingsSection("dhcp");
   const previous = dhcpDerivedAddresses(rangeStart ?? DEFAULTS.rangeStart, subnet);
+  const allowRelayAgents = section.get<boolean>("allowRelayAgents", false) === true;
   const dns = readDnsSetting(section);
 
   const writes: AutoFillWrite[] = [];
@@ -614,18 +626,29 @@ async function editNetworkCidr(
   if (isAutoFillable(rawString(section, "gateway"), previous?.gateway)) {
     writes.push({ key: "gateway", value: derived.gateway });
   }
-  // Gated against the PREVIOUS network's GATEWAY rather than a remembered
-  // `serverId`: the gateway address is what this offer would itself have
-  // written here (the packaged serverId and gateway are one address), so it is
-  // the only prior value that counts as a stale suggestion.
-  if (isAutoFillable(rawString(section, "serverId"), previous?.gateway)) {
-    writes.push({ key: "serverId", value: derived.gateway });
+  // Option 54 is this machine's address on the wire it serves, not an address
+  // the network implies, so it is resolved from the NIC that will serve the new
+  // pool. The bind address as it stands feeds BOTH resolutions: the rebind
+  // below is only an offer and nothing has been written yet, so the previous
+  // one is asking "would this bind address already have produced this serverId
+  // under the network as it stood". That is the gate — the PREVIOUS gateway is
+  // no longer a value this offer would ever have written here, so it can no
+  // longer be treated as a stale suggestion of its own.
+  const bindAddress = rawString(section, "interface");
+  const resolvedServerId = allowRelayAgents
+    ? derived.gateway
+    : resolveDhcpServerIdentifier(derived.rangeStart, derived.subnet, bindAddress, interfaces);
+  const previousServerId = allowRelayAgents
+    ? previous?.gateway
+    : resolveDhcpServerIdentifier(rangeStart ?? DEFAULTS.rangeStart, subnet, bindAddress, interfaces);
+  if (resolvedServerId !== undefined && isAutoFillable(rawString(section, "serverId"), previousServerId)) {
+    writes.push({ key: "serverId", value: resolvedServerId });
   }
   if (isAutoFillable(rawString(section, "broadcast"), previous?.broadcast)) {
     writes.push({ key: "broadcast", value: derived.broadcast });
   }
   if (isDnsAutoFillable(dns, previous?.dns)) writes.push({ key: "dns", value: [...derived.dns] });
-  const bind = offSubnetInterfaceWrite(section, derived.rangeStart, derived.subnet);
+  const bind = offSubnetInterfaceWrite(section, derived.rangeStart, derived.subnet, interfaces);
   if (bind) writes.push(bind);
 
   const written = await confirmAutoFill(

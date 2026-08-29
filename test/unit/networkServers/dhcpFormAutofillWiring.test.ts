@@ -417,7 +417,8 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     // includes one.
     const fills = dhcpFormAutofillFields(request.key, request.value, request.values, INTERFACES)!;
     expect(fills.gateway).toBe("10.0.0.254");
-    expect(fills.serverId).toBe("10.0.0.254");
+    // Option 54 is the NIC's address, not the gateway — eth1 holds 10.0.0.5.
+    expect(fills.serverId).toBe("10.0.0.5");
 
     // …and only now, still before the answer lands, the user types a gateway
     // of their own.
@@ -444,7 +445,7 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     expect(harness.value("subnet")).toBe("255.255.255.0");
     expect(harness.value("rangeStart")).toBe("10.0.0.1");
     expect(harness.value("broadcast")).toBe("10.0.0.255");
-    expect(harness.value("serverId")).toBe("10.0.0.254");
+    expect(harness.value("serverId")).toBe("10.0.0.5");
     expect(harness.saveDisabled()).toBe(false);
   });
 

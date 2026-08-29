@@ -602,6 +602,62 @@ export function suggestBindAddressForPool(
 }
 
 /**
+ * The address to advertise as the Server Identifier (option 54) for a pool.
+ *
+ * Option 54 is not another address the network implies — it is *this machine's*
+ * address on the wire it serves. `DhcpEngine` copies the `serverId` setting
+ * verbatim into every OFFER and ACK, both as option 54 and as the BOOTP
+ * `siaddr` a ZTP client reads its image from; the engine never recomputes it per
+ * interface. So a value that names no host is not a cosmetic slip — renewals go
+ * to an address nothing answers on, and a ZTP boot fetches from nowhere.
+ *
+ * That rules out the gateway, which is what an earlier pass used here. The
+ * gateway this codebase derives is the top usable address of the network
+ * ({@link dhcpDerivedAddresses}), chosen because that is where lab appliances
+ * put a router — it is an address on the pool's subnet, not an address anyone
+ * on this machine holds. The two only ever agreed by coincidence:
+ * `DEFAULTS.serverId` and `DEFAULTS.gateway` are both `192.168.2.1`, and that
+ * coincidence does not survive a `10.0.0.0/24` whose gateway derives to
+ * `10.0.0.254` while the service answers from `10.0.0.10`.
+ *
+ * The question is therefore the bind address's, not the network's, and it is
+ * answered with the same two primitives the bind-address offer uses so a third
+ * inline "is there a NIC on this subnet" cannot drift from them:
+ *
+ *  - a bind address {@link dhcpInterfaceSubnetStatus} calls a `match` is
+ *    already an address this machine currently holds on this exact subnet, so
+ *    it is returned as-is with nothing further to check;
+ *  - otherwise the single unambiguous NIC on the pool's subnet, exactly as
+ *    {@link suggestBindAddressForPool} picks the one to bind — the NIC that
+ *    will serve the pool is the NIC clients see this machine on.
+ *
+ * Both are asked with `allowRelayAgents` forced off, because this is a
+ * different question from the one that flag answers. Relay support says being
+ * off-subnet is *acceptable*; it does not make an off-subnet address into one
+ * of this machine's. Callers that allow relay agents therefore get `undefined`
+ * here and must decide for themselves what to advertise.
+ *
+ * @returns `undefined` whenever no single NIC of this machine can be identified
+ *   for the pool — no match, nothing on the subnet, or more than one. There is
+ *   deliberately no fallback: an unresolved case means "no confident answer",
+ *   and callers must leave whatever is configured alone rather than write an
+ *   address picked for the shape of it. Same restraint, and the same reason, as
+ *   {@link suggestBindAddressForPool}'s refusal to guess.
+ */
+export function resolveDhcpServerIdentifier(
+  rangeStart: string | undefined,
+  subnet: string | undefined,
+  bindAddress: string | undefined,
+  interfaces: readonly NetworkInterfaceOption[]
+): string | undefined {
+  if (dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, false) === "match") {
+    return bindAddress?.trim();
+  }
+  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, false);
+  return suggestion && !suggestion.ambiguous ? suggestion.address : undefined;
+}
+
+/**
  * Whether a setting may be recomputed from a new pool start or network.
  *
  * Blank is the codebase's existing "no opinion" signal — an unset key means the
@@ -685,14 +741,22 @@ function offSubnetBindAddress(
  * (gateway, broadcast, server identifier) and the DNS list are replaced only
  * while they are blank or still hold what the PREVIOUS network derived.
  *
- * The server identifier (option 54) is derived from the same address as the
- * gateway, because that is the packaged convention — `DEFAULTS.serverId` and
- * `DEFAULTS.gateway` are the one address `192.168.2.1`. Leaving it out is how a
- * `10.0.0.0/24` lab ends up telling clients to renew against a `192.168.2.1`
- * that is not on their wire. It is gated against the PREVIOUS network's
- * gateway, not against a separate remembered `serverId`: the gateway is what
- * this fill would itself have written there, so it is the only value that
- * counts as a stale suggestion rather than a decision.
+ * The server identifier (option 54) is the one implied field that does NOT come
+ * from the network: it is this machine's own address on the wire it serves, so
+ * it is resolved from the serving NIC by {@link resolveDhcpServerIdentifier}.
+ * Leaving it out is how a `10.0.0.0/24` lab ends up telling clients to renew
+ * against a `192.168.2.1` that is not on their wire; filling it from the
+ * gateway is how they end up renewing against a `10.0.0.254` that belongs to
+ * the router, or to nothing at all. Its gate is the same resolution run against
+ * the PREVIOUS network — "is what is there still what this fill would itself
+ * have written before the network moved" — rather than the previous gateway,
+ * which this fill no longer writes and so can no longer claim as its own.
+ *
+ * With relay agents allowed there is by design no local NIC on the pool's
+ * subnet, so the resolution answers `undefined` and the previously shipped
+ * gateway fallback is kept for that branch alone. What option 54 *should* say
+ * when every request arrives through a relay is a real question, and not this
+ * one.
  *
  * The addresses this machine holds are excluded from the suggested pool (see
  * {@link dhcpCidrDerivation}), which is why the NIC list is now needed for the
@@ -717,10 +781,9 @@ export function dhcpCidrFormFills(
     interfaces.map((option) => option.value)
   );
   if (!derived) return undefined;
-  const previous = dhcpDerivedAddresses(
-    readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart,
-    readSettingString(values.subnet)
-  );
+  const previousRangeStart = readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart;
+  const previousSubnet = readSettingString(values.subnet);
+  const previous = dhcpDerivedAddresses(previousRangeStart, previousSubnet);
   const fills: Record<string, string> = {
     // Normalised: a pool start typed as the CIDR host part (192.168.2.55/24)
     // is echoed back as the network it names, matching what dhcpCurrentCidr
@@ -733,8 +796,22 @@ export function dhcpCidrFormFills(
   if (isAutoFillable(readSettingString(values.gateway), previous?.gateway)) {
     fills.gateway = derived.gateway;
   }
-  if (isAutoFillable(readSettingString(values.serverId), previous?.gateway)) {
-    fills.serverId = derived.gateway;
+  // The bind address as it stands, used for BOTH resolutions on purpose. The
+  // interface fill below has not been applied yet — nothing here writes
+  // settings — so the address this machine is on is the same one either side of
+  // the network change, and the previous-network resolution is asking exactly
+  // "would this bind address already have produced this serverId, before the
+  // network moved".
+  const bindAddress = readSettingString(values.interface);
+  const relayed = readSettingBoolean(values.allowRelayAgents);
+  const resolvedServerId = relayed
+    ? derived.gateway
+    : resolveDhcpServerIdentifier(derived.rangeStart, derived.subnet, bindAddress, interfaces);
+  const previousServerId = relayed
+    ? previous?.gateway
+    : resolveDhcpServerIdentifier(previousRangeStart, previousSubnet, bindAddress, interfaces);
+  if (resolvedServerId !== undefined && isAutoFillable(readSettingString(values.serverId), previousServerId)) {
+    fills.serverId = resolvedServerId;
   }
   if (isAutoFillable(readSettingString(values.broadcast), previous?.broadcast)) {
     fills.broadcast = derived.broadcast;

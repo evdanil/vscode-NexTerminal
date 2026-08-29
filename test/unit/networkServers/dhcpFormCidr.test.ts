@@ -118,36 +118,117 @@ describe("dhcpCidrFormFills — what it may not overwrite", () => {
 });
 
 /**
- * REVIEW FINDING (P1) — the Server Identifier (option 54) is one of the
- * addresses a network implies, and leaving it out is how a 10.0.0.0/24 lab goes
- * on telling clients to renew against the packaged 192.168.2.1. It is derived
- * from the gateway because the packaged defaults are the same address for both
- * (DEFAULTS.serverId === DEFAULTS.gateway), and gated on the PREVIOUS network's
- * gateway for the same reason: that is what this fill would itself have written
- * there.
+ * REVIEW FINDING (P1) — the Server Identifier (option 54) has to be filled, or a
+ * 10.0.0.0/24 lab goes on telling clients to renew against the packaged
+ * 192.168.2.1.
+ *
+ * REVIEW FINDING (P1, second round) — but NOT from the gateway. `DhcpEngine`
+ * copies `serverId` verbatim into option 54 and into BOOTP `siaddr`, so it has
+ * to be an address this machine actually answers on; the derived gateway is the
+ * top usable address of the network, which belongs to the router or to nothing.
+ * The two agreed only because the packaged defaults happen to be the same
+ * address (DEFAULTS.serverId === DEFAULTS.gateway === 192.168.2.1), and that
+ * coincidence does not survive an arbitrary derived network. The fixture is
+ * built so the difference is visible: the NIC on 10.0.0.0/24 is 10.0.0.5 while
+ * the gateway derives to 10.0.0.254.
  */
 describe("dhcpCidrFormFills — the server identifier", () => {
-  it("fills it from the new gateway while the field is blank", () => {
-    expect(dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, INTERFACES)?.serverId).toBe("10.0.0.254");
-    expect(dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, serverId: "  " }, INTERFACES)?.serverId).toBe(
-      "10.0.0.254"
-    );
+  it("fills it from the NIC that will serve the new pool, not from the gateway", () => {
+    // The exact reported case: eth1 holds 10.0.0.5, the derived gateway is
+    // 10.0.0.254. Writing the gateway sends renewals — and ZTP siaddr fetches —
+    // to an address this machine is not on.
+    expect(dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, INTERFACES)?.serverId).toBe("10.0.0.5");
+    expect(dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, serverId: "  " }, INTERFACES)?.serverId).toBe("10.0.0.5");
+    // …and the gateway field itself is still the gateway, unchanged.
+    expect(dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, INTERFACES)?.gateway).toBe("10.0.0.254");
   });
 
-  it("replaces one the PREVIOUS network derived", () => {
-    // 192.168.2.254 is what this fill would have written for 192.168.2.0/24 —
-    // a stale suggestion, and one that now names an address off the new wire.
-    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, serverId: "192.168.2.254" }, INTERFACES)!;
+  it("uses the bound NIC itself when it is already on the new subnet", () => {
+    // The `match` branch, put where a suggestion could not answer at all: TWO
+    // NICs are on 10.0.0.0/24 and the service is bound to the second of them.
+    // The address the service is bound to IS the address clients see this
+    // machine on, so there is nothing ambiguous about it — an implementation
+    // that only ever asked suggestBindAddressForPool would fill nothing here,
+    // and one that took its first match would fill the wrong NIC.
+    const ambiguous: readonly NetworkInterfaceOption[] = [
+      ...INTERFACES,
+      { label: "eth2 — 10.0.0.6", value: "10.0.0.6", netmask: "255.255.255.0" }
+    ];
+    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, interface: "10.0.0.6" }, ambiguous)!;
+    expect(fills.serverId).toBe("10.0.0.6");
+  });
+
+  it("fills nothing when no NIC of this machine is on the new network", () => {
+    // 172.30.0.0/24 is a perfectly good network that this machine is simply not
+    // on. There is no address to advertise, so the setting is left exactly as
+    // it stands — including not being filled with the gateway.
+    const blank = dhcpCidrFormFills("172.30.0.0/24", UNTOUCHED, INTERFACES)!;
+    expect(blank).not.toHaveProperty("serverId");
+    // The rest of the network still applies.
+    expect(blank.rangeStart).toBe("172.30.0.1");
+    expect(blank.gateway).toBe("172.30.0.254");
+
+    const set = dhcpCidrFormFills("172.30.0.0/24", { ...UNTOUCHED, serverId: "192.168.2.1" }, INTERFACES)!;
+    expect(set).not.toHaveProperty("serverId");
+  });
+
+  it("fills nothing when two NICs are on the new network — that pick is a coin toss", () => {
+    const ambiguous: readonly NetworkInterfaceOption[] = [
+      ...INTERFACES,
+      { label: "eth2 — 10.0.0.6", value: "10.0.0.6", netmask: "255.255.255.0" }
+    ];
+    expect(dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, ambiguous)).not.toHaveProperty("serverId");
+  });
+
+  it("keeps the gateway fallback while relay agents are allowed", () => {
+    // Deliberately unchanged from the round before: with a relay in front there
+    // is by design no local NIC on the pool's subnet, and what option 54 should
+    // say in that case is a separate question. The one thing pinned here is
+    // that this branch did not quietly move with the rest.
+    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, allowRelayAgents: true }, INTERFACES)!;
     expect(fills.serverId).toBe("10.0.0.254");
   });
+});
 
-  it("keeps one the user set explicitly", () => {
-    // The packaged default address, typed in. Not what the previous network
-    // derived (.254), so it is a decision and survives the change.
-    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, serverId: "192.168.2.1" }, INTERFACES)!;
+/**
+ * The gate on the fill above, which had to move with it: what counts as "still
+ * holding what the PREVIOUS network auto-filled" is now the same NIC resolution
+ * run against the previous rangeStart/subnet, not the previous gateway.
+ *
+ * The fixture puts the previous network on 192.168.9.0/24, where this machine
+ * DOES hold an address (eth0, 192.168.9.5) — that is what makes the previous
+ * auto-fill resolvable and the two baselines tell different stories.
+ */
+describe("dhcpCidrFormFills — what counts as a stale server identifier", () => {
+  /** A form whose previous network is one this machine is on. */
+  const ON_PREVIOUS: FormValues = {
+    rangeStart: "192.168.9.10",
+    subnet: "255.255.255.0",
+    interface: "192.168.9.5"
+  };
+
+  it("refreshes one that is still the PREVIOUS network's resolved address", () => {
+    // 192.168.9.5 is exactly what this fill would have written while the form
+    // was on 192.168.9.0/24. Leaving it behind is a server identifier naming
+    // the old wire. Gating on the previous GATEWAY instead would miss it.
+    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...ON_PREVIOUS, serverId: "192.168.9.5" }, INTERFACES)!;
+    expect(fills.serverId).toBe("10.0.0.5");
+  });
+
+  it("keeps the PREVIOUS network's gateway, which this fill would never have written", () => {
+    // The discriminating case. Under the old gateway-based gate this value was
+    // treated as the fill's own leftover and silently replaced; it is not — no
+    // version of this fill writes a gateway to serverId any more, so someone
+    // typed it, and a hand-set option 54 has to survive a network change.
+    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...ON_PREVIOUS, serverId: "192.168.9.254" }, INTERFACES)!;
     expect(fills).not.toHaveProperty("serverId");
-    // …and the rest of the fill still happens.
-    expect(fills.subnet).toBe("255.255.255.0");
+    // …and the rest of the network still applies over it.
+    expect(fills.rangeStart).toBe("10.0.0.1");
+  });
+
+  it("keeps any other address the user typed", () => {
+    const fills = dhcpCidrFormFills("10.0.0.0/24", { ...ON_PREVIOUS, serverId: "192.168.9.99" }, INTERFACES)!;
+    expect(fills).not.toHaveProperty("serverId");
   });
 });
 
