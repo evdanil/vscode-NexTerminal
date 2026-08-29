@@ -21,7 +21,8 @@ export class WebviewFormPanel {
     private readonly onAutofill?: (
       key: string,
       value: string,
-      values?: FormValues
+      values?: FormValues,
+      previousValue?: string
     ) => Promise<Record<string, string> | undefined>,
     private readonly onTest?: (values: FormValues) => void | Promise<void>
   ) {
@@ -79,6 +80,13 @@ export class WebviewFormPanel {
         // parameter; the DHCP editor needs it to decide which fields its
         // derivation is allowed to overwrite.
         //
+        // `message.previousValue` is threaded the same way and is a SEPARATE
+        // fact from the snapshot rather than a slice of it: a select applies
+        // its new option to the DOM before this request is posted, so the
+        // snapshot already carries the new value under that key and the value
+        // it replaced survives nowhere else. Forwarded verbatim, `undefined`
+        // included (a text commit sends none) — this layer never invents one.
+        //
         // REVIEW FINDING (P1) — the `finally` is the contract the webview
         // holds Save against: every request is answered exactly once, whether
         // it filled anything, filled nothing, or threw. A form that renders an
@@ -96,7 +104,7 @@ export class WebviewFormPanel {
         const requestId = message.requestId;
         try {
           const result = this.onAutofill
-            ? await this.onAutofill(message.key, message.value, message.values)
+            ? await this.onAutofill(message.key, message.value, message.values, message.previousValue)
             : undefined;
           if (result && !this.disposed) {
             // `key` travels back with the values: the webview tracks which keys
@@ -176,7 +184,12 @@ export class WebviewFormPanel {
       onBrowse?: (key: string) => Promise<string | undefined>;
       onScan?: (key: string) => Promise<string | undefined>;
       onCreateInline?: (key: string, values?: FormValues) => void;
-      onAutofill?: (key: string, value: string, values?: FormValues) => Promise<Record<string, string> | undefined>;
+      onAutofill?: (
+        key: string,
+        value: string,
+        values?: FormValues,
+        previousValue?: string
+      ) => Promise<Record<string, string> | undefined>;
       onTest?: (values: FormValues) => void | Promise<void>;
     }
   ): WebviewFormPanel {

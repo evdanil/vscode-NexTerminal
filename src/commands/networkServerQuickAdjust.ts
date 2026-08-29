@@ -559,7 +559,10 @@ async function offerPoolAutoFill(
  * `192.168.2.1` for renewals, on a network no client can reach it at; taken
  * from the gateway instead, it advertises an address that belongs to the router
  * or to nothing. When no single NIC of this machine can be identified for the
- * new pool, nothing is offered for it at all.
+ * new pool, nothing is offered for it at all — and with relay agents allowed
+ * that is the whole story, because a relayed pool is on a subnet this machine
+ * has no NIC on by design. Nothing is offered for the identifier there, so the
+ * configured one survives; the gateway is not a stand-in for it.
  *
  * The pool is derived against this machine's own addresses, so re-applying the
  * network it is already on cannot produce a pool containing the very NIC the
@@ -628,21 +631,40 @@ async function editNetworkCidr(
   }
   // Option 54 is this machine's address on the wire it serves, not an address
   // the network implies, so it is resolved from the NIC that will serve the new
-  // pool. The bind address as it stands feeds BOTH resolutions: the rebind
-  // below is only an offer and nothing has been written yet, so the previous
-  // one is asking "would this bind address already have produced this serverId
-  // under the network as it stood". That is the gate — the PREVIOUS gateway is
-  // no longer a value this offer would ever have written here, so it can no
-  // longer be treated as a stale suggestion of its own.
-  const bindAddress = rawString(section, "interface");
-  const resolvedServerId = allowRelayAgents
-    ? derived.gateway
-    : resolveDhcpServerIdentifier(derived.rangeStart, derived.subnet, bindAddress, interfaces);
-  const previousServerId = allowRelayAgents
-    ? previous?.gateway
-    : resolveDhcpServerIdentifier(rangeStart ?? DEFAULTS.rangeStart, subnet, bindAddress, interfaces);
-  if (resolvedServerId !== undefined && isAutoFillable(rawString(section, "serverId"), previousServerId)) {
-    writes.push({ key: "serverId", value: resolvedServerId });
+  // pool. The bind address as it stands feeds BOTH resolutions: this row is
+  // reached only from the Network (CIDR) input box, which cannot change the
+  // `interface` setting as a side effect of itself, and the rebind below is an
+  // offer that has written nothing yet — so the address this machine is on is
+  // genuinely the same one either side, and the previous resolution is asking
+  // "would this bind address already have produced this serverId under the
+  // network as it stood". That is the gate — the PREVIOUS gateway is no longer
+  // a value this offer would ever have written here, so it can no longer be
+  // treated as a stale suggestion of its own.
+  //
+  // REVIEW FINDING (P1) — and with relay agents allowed, nothing is offered for
+  // it at all. A relayed pool is on a subnet this machine holds no NIC on, so
+  // there is no address to resolve; the derived gateway an earlier pass fell
+  // back to is the CLIENT subnet's router, and writing it told every client to
+  // renew (and to fetch a ZTP image from `siaddr`) at an address this service
+  // does not answer on. Declining to write leaves whatever identifier is
+  // configured — the only value here that can name a reachable address.
+  if (!allowRelayAgents) {
+    const bindAddress = rawString(section, "interface");
+    const resolvedServerId = resolveDhcpServerIdentifier(
+      derived.rangeStart,
+      derived.subnet,
+      bindAddress,
+      interfaces
+    );
+    const previousServerId = resolveDhcpServerIdentifier(
+      rangeStart ?? DEFAULTS.rangeStart,
+      subnet,
+      bindAddress,
+      interfaces
+    );
+    if (resolvedServerId !== undefined && isAutoFillable(rawString(section, "serverId"), previousServerId)) {
+      writes.push({ key: "serverId", value: resolvedServerId });
+    }
   }
   if (isAutoFillable(rawString(section, "broadcast"), previous?.broadcast)) {
     writes.push({ key: "broadcast", value: derived.broadcast });

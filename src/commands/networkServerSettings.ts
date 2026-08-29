@@ -634,8 +634,11 @@ export function suggestBindAddressForPool(
  * Both are asked with `allowRelayAgents` forced off, because this is a
  * different question from the one that flag answers. Relay support says being
  * off-subnet is *acceptable*; it does not make an off-subnet address into one
- * of this machine's. Callers that allow relay agents therefore get `undefined`
- * here and must decide for themselves what to advertise.
+ * of this machine's. Callers that allow relay agents therefore do not ask this
+ * at all: neither editor auto-fills the identifier in relay mode, because the
+ * pool's subnet is by design a wire this machine is not on and the only
+ * addresses derivable from it — the gateway above all — belong to the client
+ * side. The configured value is left alone instead.
  *
  * @returns `undefined` whenever no single NIC of this machine can be identified
  *   for the pool — no match, nothing on the subnet, or more than one. There is
@@ -752,11 +755,18 @@ function offSubnetBindAddress(
  * have written before the network moved" — rather than the previous gateway,
  * which this fill no longer writes and so can no longer claim as its own.
  *
- * With relay agents allowed there is by design no local NIC on the pool's
- * subnet, so the resolution answers `undefined` and the previously shipped
- * gateway fallback is kept for that branch alone. What option 54 *should* say
- * when every request arrives through a relay is a real question, and not this
- * one.
+ * REVIEW FINDING (P1) — with relay agents allowed, NOTHING is written for it.
+ * A relayed pool is on a subnet this machine holds no NIC on; that is what the
+ * relay is for. There is therefore no address to resolve, and the derived
+ * gateway an earlier pass fell back to here is the CLIENT subnet's router:
+ * a server bound at `192.168.1.5` serving `10.0.0.0/24` through a relay told
+ * every client that option 54 and BOOTP `siaddr` were `10.0.0.254`, so unicast
+ * renewals and ZTP image fetches went to the gateway instead of to this
+ * service. Fabricating a value is worse than declining to: leaving the branch
+ * out entirely preserves whatever identifier the user configured, which is the
+ * only thing here that can name a reachable address. The gate below is what
+ * makes "not written" the whole story — an unresolved server identifier never
+ * reaches `fills`, so the field keeps what it has.
  *
  * The addresses this machine holds are excluded from the suggested pool (see
  * {@link dhcpCidrDerivation}), which is why the NIC list is now needed for the
@@ -770,11 +780,22 @@ function offSubnetBindAddress(
  * Nothing is written to settings — these are values for fields the user can
  * still see, edit and abandon before Save, which is why there is no
  * confirmation step like the quick editor's.
+ *
+ * @param previousBindAddress The bind address as it stood BEFORE whatever
+ *   gesture triggered this fill, for the previous-network server identifier
+ *   baseline alone. Supplied only by the INTERFACE trigger, where the webview
+ *   has already applied the new selection to the DOM before posting, so
+ *   `values.interface` is the new NIC on both sides of the change and this is
+ *   the only surviving record of the old one. Omitted by the CIDR-text trigger,
+ *   which cannot move the bind address by committing itself — there the current
+ *   address genuinely IS the address either side, and the fallback below says
+ *   exactly that.
  */
 export function dhcpCidrFormFills(
   text: string,
   values: FormValues,
-  interfaces: readonly NetworkInterfaceOption[]
+  interfaces: readonly NetworkInterfaceOption[],
+  previousBindAddress?: string
 ): Record<string, string> | undefined {
   const derived = dhcpCidrDerivation(
     text,
@@ -796,22 +817,42 @@ export function dhcpCidrFormFills(
   if (isAutoFillable(readSettingString(values.gateway), previous?.gateway)) {
     fills.gateway = derived.gateway;
   }
-  // The bind address as it stands, used for BOTH resolutions on purpose. The
-  // interface fill below has not been applied yet — nothing here writes
-  // settings — so the address this machine is on is the same one either side of
-  // the network change, and the previous-network resolution is asking exactly
-  // "would this bind address already have produced this serverId, before the
-  // network moved".
-  const bindAddress = readSettingString(values.interface);
-  const relayed = readSettingBoolean(values.allowRelayAgents);
-  const resolvedServerId = relayed
-    ? derived.gateway
-    : resolveDhcpServerIdentifier(derived.rangeStart, derived.subnet, bindAddress, interfaces);
-  const previousServerId = relayed
-    ? previous?.gateway
-    : resolveDhcpServerIdentifier(previousRangeStart, previousSubnet, bindAddress, interfaces);
-  if (resolvedServerId !== undefined && isAutoFillable(readSettingString(values.serverId), previousServerId)) {
-    fills.serverId = resolvedServerId;
+  // Relay mode writes no server identifier at all — there is no NIC of this
+  // machine on a relayed client subnet to resolve one from, and the derived
+  // gateway is the CLIENT's router rather than this service. See the doc
+  // comment above; skipping the block entirely is also why no previous-network
+  // resolution is computed for it.
+  if (!readSettingBoolean(values.allowRelayAgents)) {
+    // Two bind addresses, because the two resolutions are two different
+    // questions. `bindAddress` answers "what would this fill write NOW", and
+    // has to be the address currently selected. `previousBind` answers "would
+    // this fill itself have written what is sitting in the field, under the
+    // network as it stood" — and for an INTERFACE change the address that was
+    // selected then is not this one. The webview applies the selection before
+    // it posts, so reusing `bindAddress` for both asks the previous-network
+    // question about the NEW NIC: switching between two NICs on ONE subnet
+    // (10.0.0.5 → 10.0.0.6) then resolves .6 on both sides, an auto-filled
+    // serverId of .5 fails isAutoFillable and survives, and the service
+    // answers from .6 while telling clients to renew at .5. Absent a supplied
+    // one — the CIDR-text trigger, which moves no NIC — the current address
+    // IS the address either side and the fallback is exact.
+    const bindAddress = readSettingString(values.interface);
+    const previousBind = readSettingString(previousBindAddress ?? bindAddress);
+    const resolvedServerId = resolveDhcpServerIdentifier(
+      derived.rangeStart,
+      derived.subnet,
+      bindAddress,
+      interfaces
+    );
+    const previousServerId = resolveDhcpServerIdentifier(
+      previousRangeStart,
+      previousSubnet,
+      previousBind,
+      interfaces
+    );
+    if (resolvedServerId !== undefined && isAutoFillable(readSettingString(values.serverId), previousServerId)) {
+      fills.serverId = resolvedServerId;
+    }
   }
   if (isAutoFillable(readSettingString(values.broadcast), previous?.broadcast)) {
     fills.broadcast = derived.broadcast;
@@ -854,6 +895,21 @@ export function dhcpInterfaceCidr(
  * separately — a NIC is just another way of naming a network, and two
  * derivations would agree today and drift the first time one is touched.
  *
+ * The two triggers are NOT interchangeable in one respect, which is what
+ * `previousValue` is for. Committing the CIDR row changes that row and nothing
+ * else, so the bind address in `values` is the address this machine was on both
+ * before and after. Picking a NIC changes the bind address itself, and the
+ * webview has already applied that selection by the time this runs — so
+ * `values.interface` holds the NEW address on both sides, and the previous one
+ * survives only in `previousValue`. It is passed on for the interface trigger
+ * alone; the CIDR trigger passes nothing and {@link dhcpCidrFormFills} falls
+ * back to the current address, which for that trigger is correct rather than
+ * merely convenient.
+ *
+ * @param previousValue What the field named by `key` held immediately before
+ *   this change. Meaningful only for `interface`; ignored for anything else,
+ *   including a CIDR commit, where the field it would describe is not a bind
+ *   address at all.
  * @returns `undefined` for a field this form derives nothing from, and for
  *   input that describes no usable pool (`/31`, `/32`, `/0`, anything
  *   malformed, or a network on which this machine's own addresses leave no
@@ -864,13 +920,14 @@ export function dhcpFormAutofillFields(
   key: string,
   value: string,
   values: FormValues | undefined,
-  interfaces: readonly NetworkInterfaceOption[]
+  interfaces: readonly NetworkInterfaceOption[],
+  previousValue?: string
 ): Record<string, string> | undefined {
   const current = values ?? {};
   if (key === DHCP_CIDR_FIELD_KEY) return dhcpCidrFormFills(value, current, interfaces);
   if (key !== "interface") return undefined;
   const cidr = dhcpInterfaceCidr(value, interfaces);
-  return cidr === undefined ? undefined : dhcpCidrFormFills(cidr, current, interfaces);
+  return cidr === undefined ? undefined : dhcpCidrFormFills(cidr, current, interfaces, previousValue);
 }
 
 /** One entry of the form's bind-address picker, annotated for the pool it serves. */

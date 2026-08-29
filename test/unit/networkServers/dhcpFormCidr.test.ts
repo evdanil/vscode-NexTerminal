@@ -180,13 +180,50 @@ describe("dhcpCidrFormFills — the server identifier", () => {
     expect(dhcpCidrFormFills("10.0.0.0/24", UNTOUCHED, ambiguous)).not.toHaveProperty("serverId");
   });
 
-  it("keeps the gateway fallback while relay agents are allowed", () => {
-    // Deliberately unchanged from the round before: with a relay in front there
-    // is by design no local NIC on the pool's subnet, and what option 54 should
-    // say in that case is a separate question. The one thing pinned here is
-    // that this branch did not quietly move with the rest.
+  /**
+   * REVIEW FINDING (P1, third round) — the relay branch's gateway fallback was
+   * itself the defect, not merely an unaddressed corner. A server bound at
+   * 192.168.1.5 serving 10.0.0.0/24 through a relay was told to advertise
+   * 10.0.0.254 as option 54 and BOOTP `siaddr` — the CLIENT subnet's router.
+   * Unicast renewals and ZTP image fetches then went to the router rather than
+   * to this service. There is no address to derive here: the relayed subnet is
+   * one this machine deliberately holds no NIC on, so the configured identifier
+   * is the only thing that can name a reachable address, and it is left alone.
+   */
+  it("writes nothing at all while relay agents are allowed, rather than the client subnet's gateway", () => {
     const fills = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, allowRelayAgents: true }, INTERFACES)!;
-    expect(fills.serverId).toBe("10.0.0.254");
+    expect(fills).not.toHaveProperty("serverId");
+    // The rest of the network still applies — only option 54 abstains.
+    expect(fills.rangeStart).toBe("10.0.0.1");
+    expect(fills.gateway).toBe("10.0.0.254");
+  });
+
+  it("leaves a configured identifier alone under relay, even one that matches the OLD gateway", () => {
+    // The exact value the removed fallback would have claimed as its own stale
+    // suggestion: 192.168.2.254 is what the previous /24 derived. Under the old
+    // `previous?.gateway` baseline this was replaced with 10.0.0.254; there is
+    // no baseline now because there is no fill, so it survives untouched.
+    const fills = dhcpCidrFormFills(
+      "10.0.0.0/24",
+      { ...UNTOUCHED, allowRelayAgents: true, serverId: "192.168.2.254" },
+      INTERFACES
+    )!;
+    expect(fills).not.toHaveProperty("serverId");
+  });
+
+  it("abstains under relay even when a NIC of this machine IS on the pool's subnet", () => {
+    // eth1 holds 10.0.0.5, so a resolution would succeed here. Relay mode still
+    // says nothing: with giaddr in play the requests this server answers do not
+    // arrive on that wire, and the flag is the user's statement that the pool's
+    // subnet is not where clients are. Kills "resolve first, fall back to the
+    // gateway only when resolution fails" — that implementation would fill
+    // 10.0.0.5 here and go green on the two cases above.
+    const fills = dhcpCidrFormFills(
+      "10.0.0.0/24",
+      { ...UNTOUCHED, allowRelayAgents: true, interface: "10.0.0.5" },
+      INTERFACES
+    )!;
+    expect(fills).not.toHaveProperty("serverId");
   });
 });
 
@@ -375,6 +412,83 @@ describe("dhcpFormAutofillFields — the form's single entry point", () => {
     expect(fills.rangeStart).toBe("10.0.0.1");
     // Nothing is set, so everything is fair game.
     expect(fills.gateway).toBe("10.0.0.254");
+  });
+});
+
+/**
+ * REVIEW FINDING (P1, third round) — the two triggers that reach
+ * `dhcpCidrFormFills` disagree about what the bind address was, and only one of
+ * them can use `values.interface` for both sides of the change.
+ *
+ * A CIDR commit changes that row and nothing else, so the address in the
+ * snapshot is the address either side. An INTERFACE selection changes the bind
+ * address itself, and the webview applies the selection to the DOM before it
+ * posts (`selectCustomOption` runs ahead of `postAutofill`), so by the time the
+ * derivation runs `values.interface` already holds the NEW NIC. Resolving the
+ * PREVIOUS network's identifier from it therefore answers a question about the
+ * new NIC.
+ *
+ * On two NICs sharing one subnet that is not a near-miss, it is silent
+ * breakage: both resolutions land on the new address, the auto-filled
+ * identifier still naming the old one fails `isAutoFillable`, it survives as
+ * though hand-set, and the socket then answers from .6 while every OFFER tells
+ * clients to renew at .5. `previousValue` — the field's value immediately
+ * before the selection — is threaded through the round trip for exactly this.
+ */
+describe("dhcpFormAutofillFields — switching between two NICs on ONE subnet", () => {
+  /** Both eth1 and eth2 are on 10.0.0.0/24; nothing else about them differs. */
+  const SAME_SUBNET: readonly NetworkInterfaceOption[] = [
+    ...INTERFACES,
+    { label: "eth2 — 10.0.0.6", value: "10.0.0.6", netmask: "255.255.255.0" }
+  ];
+
+  /**
+   * The form as the webview posts it for a 10.0.0.5 → 10.0.0.6 selection: the
+   * pool is already on 10.0.0.0/24, `serverId` holds what this fill wrote for
+   * 10.0.0.5, and `interface` ALREADY reads 10.0.0.6 because the DOM was
+   * updated before the message went out. The old address survives only as the
+   * fifth argument.
+   */
+  const AFTER_SELECTING_SIX: FormValues = {
+    rangeStart: "10.0.0.1",
+    subnet: "255.255.255.0",
+    interface: "10.0.0.6",
+    serverId: "10.0.0.5"
+  };
+
+  it("refreshes the identifier to the NIC now bound, instead of leaving the one it replaced", () => {
+    const fills = dhcpFormAutofillFields("interface", "10.0.0.6", AFTER_SELECTING_SIX, SAME_SUBNET, "10.0.0.5")!;
+    // The socket is about to bind .6; option 54 and BOOTP siaddr have to say so.
+    expect(fills.serverId).toBe("10.0.0.6");
+  });
+
+  it("still keeps an identifier the user typed, which no selection ever wrote", () => {
+    // The other half of the same gate, on the same fixture: 10.0.0.99 is not
+    // what this fill would have written for EITHER NIC, so it is a decision.
+    // An implementation that simply always refreshed on an interface change
+    // would go green above and destroy this.
+    const fills = dhcpFormAutofillFields(
+      "interface",
+      "10.0.0.6",
+      { ...AFTER_SELECTING_SIX, serverId: "10.0.0.99" },
+      SAME_SUBNET,
+      "10.0.0.5"
+    )!;
+    expect(fills).not.toHaveProperty("serverId");
+  });
+
+  it("falls back to the current address when no previous one is supplied — the CIDR trigger's case", () => {
+    // Committing a network cannot move the bind address as a side effect of
+    // itself, so that trigger passes nothing and the fallback has to read the
+    // current address for both sides. Here that means the identifier standing
+    // at .6 is recognised as this fill's own and refreshed for the new network.
+    const fills = dhcpFormAutofillFields(
+      "cidr",
+      "192.168.9.0/24",
+      { ...AFTER_SELECTING_SIX, serverId: "10.0.0.6" },
+      SAME_SUBNET
+    )!;
+    expect(fills.serverId).toBe("192.168.9.5");
   });
 });
 

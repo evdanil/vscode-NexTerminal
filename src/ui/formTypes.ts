@@ -173,8 +173,31 @@ export type FormMessage =
    * `onAutofill` handler sees it or needs to. See the "SAVE MUST NOT OUTRUN AN
    * AUTOFILL ROUND TRIP" comment in formHtml.ts for why key and value cannot
    * do that job.
+   *
+   * `previousValue` is a different question from `value`, and the two are easy
+   * to confuse: `value` says WHAT THIS FIELD NOW HOLDS — the option just
+   * chosen, the network just committed — while `previousValue` says what the
+   * SAME field held immediately before that. It is present only for a SELECT,
+   * because only there does the change land in the DOM before the request is
+   * posted: `selectCustomOption` runs first, so `values[key]` in the snapshot
+   * above is already the new option and the old one is unrecoverable from this
+   * message otherwise. A text commit changes nothing but itself, so the CIDR
+   * row sends none and its host keeps reading `values` as the state on both
+   * sides of the change. The only reader today is the DHCP editor, which needs
+   * the pre-selection BIND ADDRESS to decide whether the configured option 54
+   * is a stale value of its own or a hand-set one (`dhcpCidrFormFills` in
+   * `networkServerSettings.ts`). It carries no more than `values` already
+   * does — the previously selected option of a control whose current value is
+   * in that snapshot — so it does not widen the safety argument above.
    */
-  | { type: "autofill"; key: string; value: string; values?: FormValues; requestId?: number }
+  | {
+      type: "autofill";
+      key: string;
+      value: string;
+      previousValue?: string;
+      values?: FormValues;
+      requestId?: number;
+    }
   | { type: "test"; values: FormValues };
 
 export type ExtensionMessage =

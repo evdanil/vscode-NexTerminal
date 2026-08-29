@@ -98,7 +98,11 @@ describe("WebviewFormPanel submit handling", () => {
     // The third argument is the form's own value snapshot. A message that
     // carries none forwards `undefined` rather than an empty object, so a
     // handler can tell "the webview sent nothing" from "the form is empty".
-    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined);
+    //
+    // The fourth is what the field held immediately BEFORE this change, which
+    // only a select sends (see the previousValue note in formTypes.ts). Same
+    // rule: absent means absent, never invented here.
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined, undefined);
     // `key` echoes the request: the webview tracks which managed fields the
     // AUTH PROFILE select filled, and must not read another autofill-capable
     // select's answer as the profile's (kills dropping the echo).
@@ -145,7 +149,33 @@ describe("WebviewFormPanel submit handling", () => {
     });
     // The handler is never told about it — no onAutofill implementation has any
     // reason to know which request it is answering.
-    expect(onAutofill).toHaveBeenCalledWith("cidr", "10.0.0.0/24", undefined);
+    expect(onAutofill).toHaveBeenCalledWith("cidr", "10.0.0.0/24", undefined, undefined);
+  });
+
+  it("forwards the value the field held before the change, which a SELECT is the only sender of (kills dropping previousValue at this layer: the snapshot already carries the NEW option under that key, so the DHCP editor's previous-network gate would resolve the NIC that was just selected on both sides)", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ serverId: "10.0.0.6" });
+
+    WebviewFormPanel.open("panel-autofill-prev", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await Promise.resolve(
+      messageHandler!({
+        type: "autofill",
+        key: "interface",
+        value: "10.0.0.6",
+        previousValue: "10.0.0.5",
+        // Exactly the shape the webview posts: the selection is applied to the
+        // DOM before the message goes out, so the snapshot says .6 too and the
+        // replaced address survives in no other field of this message.
+        values: { interface: "10.0.0.6", serverId: "10.0.0.5" }
+      })
+    );
+
+    expect(onAutofill).toHaveBeenCalledWith(
+      "interface",
+      "10.0.0.6",
+      { interface: "10.0.0.6", serverId: "10.0.0.5" },
+      "10.0.0.5"
+    );
   });
 
   it("echoes the request's id on the terminator even when the handler THROWS", async () => {
@@ -176,7 +206,7 @@ describe("WebviewFormPanel submit handling", () => {
 
     await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
 
-    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined);
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined, undefined);
     expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
     // REVIEW FINDING (P1) — but the request IS answered. The webview disables
     // Save for the length of the round trip, and an answer that fills nothing
@@ -259,10 +289,13 @@ describe("WebviewFormPanel submit handling", () => {
       })
     );
 
-    expect(onAutofill).toHaveBeenCalledWith("cidr", "10.0.0.0/24", {
-      gateway: "10.0.0.9",
-      rangeStart: "192.168.2.10"
-    });
+    expect(onAutofill).toHaveBeenCalledWith(
+      "cidr",
+      "10.0.0.0/24",
+      { gateway: "10.0.0.9", rangeStart: "192.168.2.10" },
+      // A CIDR commit sends no previous value — it changes only its own row.
+      undefined
+    );
   });
 
   it("REVIEW FINDING 2 (P2) — a rejecting onTest is caught and shown as 'Test failed: ...' instead of escaping as an unhandled rejection (kills the uncaught onTest await)", async () => {

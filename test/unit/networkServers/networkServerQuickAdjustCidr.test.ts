@@ -408,18 +408,61 @@ describe("applying a CIDR — the server identifier", () => {
     expect(written("rangeStart")).toBe("10.0.0.1");
   });
 
-  it("keeps the gateway fallback while relay agents are allowed", async () => {
-    // Deliberately unchanged from the round before: with a relay in front there
-    // is by design no local NIC on the pool's subnet, and what option 54 should
-    // say then is a separate question. Pinned so the branch cannot move by
-    // accident with the rest.
+  /**
+   * REVIEW FINDING (P1, third round) — the relay branch's gateway fallback was
+   * itself the defect. A server bound at 192.168.2.5 serving 10.0.0.0/24
+   * through a relay was told to advertise 10.0.0.254 for option 54 and BOOTP
+   * `siaddr` — the CLIENT subnet's router, not this service — so unicast
+   * renewals and ZTP image fetches went somewhere this server does not answer.
+   * Nothing can be derived here: the relayed subnet is one this machine holds
+   * no NIC on by design. So nothing is offered, and the configured identifier
+   * (or its absence) survives.
+   */
+  it("offers nothing for it while relay agents are allowed, rather than the client subnet's gateway", async () => {
     networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
     seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", allowRelayAgents: true });
     quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
     inputScript = ["10.0.0.0/24"];
     await openNetworkServerQuickAdjust("dhcp", deps());
 
-    expect(written("serverId")).toBe("10.0.0.254");
+    expect(written("serverId")).toBeUndefined();
+    // The rest of the network still applied — only option 54 abstained.
+    expect(written("rangeStart")).toBe("10.0.0.1");
+    expect(written("gateway")).toBe("10.0.0.254");
+  });
+
+  it("leaves a configured identifier alone under relay, even one matching the OLD gateway", async () => {
+    // 192.168.2.254 is exactly what the previous /24 derived, which is what the
+    // removed `previous?.gateway` baseline treated as this offer's own stale
+    // suggestion — it was silently replaced by 10.0.0.254. With no fill there
+    // is no baseline, and a hand-set option 54 survives.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
+    seed({
+      rangeStart: "192.168.2.10",
+      rangeEnd: "192.168.2.199",
+      allowRelayAgents: true,
+      serverId: "192.168.2.254"
+    });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("192.168.2.254");
+  });
+
+  it("abstains under relay even when a NIC of this machine IS on the pool's subnet", async () => {
+    // eth1 holds 10.0.0.5, so a NIC resolution would succeed. Relay mode still
+    // says nothing — the flag is the user's statement that clients are not on
+    // that wire. Kills "resolve first, fall back to the gateway only when the
+    // resolution fails", which would write 10.0.0.5 here.
+    twoNics();
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", allowRelayAgents: true });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBeUndefined();
+    expect(written("rangeStart")).toBe("10.0.0.1");
   });
 
   it("writes nothing when the confirmation is declined", async () => {

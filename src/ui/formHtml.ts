@@ -874,14 +874,36 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       var nextAutofillRequestId = 1;
       var saveBtn = document.getElementById("save-btn");
 
-      function postAutofill(key, value) {
+      /**
+       * REVIEW FINDING (P1) — previousValue is what THIS FIELD held immediately
+       * before the gesture being reported, and it exists because for a SELECT
+       * the snapshot cannot say. A select is applied to the DOM before the
+       * round trip is posted (selectCustomOption runs first, so the trigger and
+       * the hidden input already show the new option), which means the
+       * snapshot's entry for this key is the NEW value on both sides of the
+       * change. A host that needs the pre-selection value — the DHCP editor's
+       * bind address, whose option 54 gate asks "what would this fill have
+       * written BEFORE the NIC moved" — cannot recover it from the snapshot,
+       * and reusing the new one silently answers that question with the new
+       * NIC. Two NICs on one subnet is where that shows: switching 10.0.0.5 to
+       * 10.0.0.6 leaves a server identifier of .5 looking hand-set, and the
+       * DHCP socket then answers from .6 while telling clients to renew at .5.
+       *
+       * Sent only when the caller has one to send. A TEXT field's commit
+       * changes only itself and never moves the bind address, so the CIDR row
+       * passes nothing and the host keeps its existing "same address either
+       * side" reading for that trigger.
+       */
+      function postAutofill(key, value, previousValue) {
         var requestId = nextAutofillRequestId++;
         // Collected ONCE and used twice — the payload the host reasons over and
         // the copy this script judges the answer against have to be the same
         // object, or the two ends are comparing different forms.
         var snapshot = collectFormValues();
         pendingAutofills.push({ id: requestId, snapshot: snapshot });
-        vscode.postMessage({ type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId });
+        var request = { type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId };
+        if (previousValue !== undefined) request.previousValue = previousValue;
+        vscode.postMessage(request);
         /**
          * REVIEW FINDING (P2) — the disable is deferred by one MACROTASK, and
          * that is the whole point of the setTimeout.
@@ -1126,6 +1148,16 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: collectFormValues() });
           return;
         }
+        // Read BEFORE selectCustomOption writes the new option into the hidden
+        // input this reads through: after that call the control holds the NEW
+        // value and the old one is gone from the DOM entirely. dataset.prev is
+        // NOT the place to get it — it is written here and at the
+        // addSelectOption path below but read nowhere and seeded nowhere, so on
+        // the first selection after the form opens it is simply undefined,
+        // exactly when the configured value is the one a host would need.
+        // fieldValue reads the control the render seeded, so the very first
+        // change reports the value the form opened with.
+        var previousValue = fieldValue(wrapper.dataset.name);
         selectCustomOption(wrapper, value);
         wrapper.dataset.prev = value;
         // FIX B (PR #64 Codex round 2) — a fillTarget select fills its target
@@ -1146,8 +1178,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // autofill above carries it: an answer may have to keep what the
           // user typed. The auth-profile mirror ignores it; the DHCP interface
           // picker derives a whole pool from the chosen NIC and cannot
-          // without it.
-          postAutofill(wrapper.dataset.name, value);
+          // without it. previousValue rides along for what the snapshot CANNOT
+          // say (see postAutofill): this selection is already in the DOM, so
+          // the snapshot's copy of this key is the new option on both sides of
+          // the change.
+          postAutofill(wrapper.dataset.name, value, previousValue);
         }
         if (wrapper.dataset.name === 'authProfileId') {
           // The newly chosen profile has supplied nothing yet — the previous
@@ -1227,6 +1262,15 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
                 dropdown.appendChild(newOpt);
               }
             }
+            // Captured before the selection lands, for the same reason and in
+            // the same order as the user-click path above. The DHCP interface
+            // picker cannot reach here (it renders no inline-create row, and
+            // the DHCP form wires no onCreateInline, so nothing ever posts
+            // addSelectOption for it) — but the auth profile select IS both
+            // autofill-capable and inline-creatable, and leaving one of the two
+            // selection paths reporting nothing is how the next autofill host
+            // that needs a pre-selection value finds it only half wired.
+            var previousValue = fieldValue(wrapper.dataset.name);
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
             // FIX B — mirror the user-click path's synchronous fill for a
@@ -1241,7 +1285,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             // inline-created auth profile is selected but never mirrors its
             // username into the managed field, and never locks it.
             if (wrapper.dataset.autofill === 'true' && msg.value) {
-              postAutofill(wrapper.dataset.name, msg.value);
+              postAutofill(wrapper.dataset.name, msg.value, previousValue);
             }
             if (wrapper.dataset.name === 'authProfileId') {
               // Same release as the user-click path above — an inline-created

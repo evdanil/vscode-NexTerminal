@@ -956,10 +956,19 @@ describe("renderFormHtml", () => {
     // The post goes through the script's own `postAutofill` (which also holds
     // Save until the answer lands), so what is pinned here is the same thing it
     // always was: that this branch posts an autofill for THIS wrapper's key and
-    // the INJECTED option's value.
-    expect(block).toContain("postAutofill(wrapper.dataset.name, msg.value);");
+    // the INJECTED option's value — now with the value the field held before
+    // the injection, exactly as the user-click path sends it.
+    expect(block).toContain("postAutofill(wrapper.dataset.name, msg.value, previousValue);");
     expect(block).toContain("if (wrapper.dataset.name === 'authProfileId') {");
-    expect(block.indexOf("postAutofill(wrapper.dataset.name, msg.value);")).toBeGreaterThan(selectIndex);
+    expect(block.indexOf("postAutofill(wrapper.dataset.name, msg.value, previousValue);")).toBeGreaterThan(
+      selectIndex
+    );
+    // Captured BEFORE the selection lands, or it reports the option that was
+    // just injected as the one it replaced — the same defect on this path that
+    // the interface picker hit on the user-click path.
+    const previousIndex = block.indexOf("var previousValue = fieldValue(wrapper.dataset.name);");
+    expect(previousIndex).toBeGreaterThan(-1);
+    expect(previousIndex).toBeLessThan(selectIndex);
     // The release is the re-lock (it ends by re-evaluating both the lock and
     // visibility): an inline-created profile owns nothing until its own fill
     // answers, and the profile it replaces hands back what it displaced —
@@ -1476,6 +1485,11 @@ describe("FIX B — saved-filter picker synchronous fill (no round-trip race)", 
     postMessage: (m: unknown) => void
   ): (wrapper: unknown, opt: unknown) => void {
     const src = extractFn(html, "function(wrapper, opt) {");
+    // The callback now records what the field held BEFORE the pick, through the
+    // script's own `fieldValue`. Sliced out of the SAME rendered script rather
+    // than stubbed, so a capture that read the wrong thing (or read it after
+    // the selection landed) still shows up here.
+    const fieldValueSrc = extractFn(html, "function fieldValue(key)");
     const noop = (): void => {};
     return new Function(
       "vscode",
@@ -1484,8 +1498,9 @@ describe("FIX B — saved-filter picker synchronous fill (no round-trip race)", 
       "selectCustomOption",
       "setCustomSelectOpen",
       "releaseProfileOwnedFields",
-      `return (${src});`
-    )({ postMessage }, form, setFieldValue, noop, noop, noop) as (wrapper: unknown, opt: unknown) => void;
+      "postAutofill",
+      `${fieldValueSrc}\nreturn (${src});`
+    )({ postMessage }, form, setFieldValue, noop, noop, noop, noop) as (wrapper: unknown, opt: unknown) => void;
   }
 
   /** Run the rendered submit handler and return the collected values it posts.
@@ -1626,6 +1641,9 @@ describe("renderFormHtml — autofill on a text field", () => {
     // `input[type="text"]` instead would turn every text row into a round trip.
     const html = render({ ...base, autofill: true });
     expect(html).toContain(`var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');`);
+    // Two arguments, not three: a text commit changes only its own row and can
+    // never move another field, so it has no "value this field held before"
+    // worth reporting and `postAutofill` leaves `previousValue` off the wire.
     expect(html).toContain("postAutofill(input.name, input.value);");
     // `postAutofill` is the one place the message is built, so the snapshot the
     // answer needs cannot be dropped from one caller and kept in another.
@@ -1637,8 +1655,14 @@ describe("renderFormHtml — autofill on a text field", () => {
     expect(html).toContain("var snapshot = collectFormValues();");
     expect(html).toContain("pendingAutofills.push({ id: requestId, snapshot: snapshot });");
     expect(html).toContain(
-      "vscode.postMessage({ type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId });"
+      "var request = { type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId };"
     );
+    // Added only when the caller supplied one, so the CIDR row's message is
+    // byte-identical to what it always was and a host cannot tell "the field
+    // was blank before" from "this trigger reports no before" by its absence
+    // alone — the two are distinguished by which control posted it.
+    expect(html).toContain("if (previousValue !== undefined) request.previousValue = previousValue;");
+    expect(html).toContain("vscode.postMessage(request);");
     // "change", never "input": a network is only meaningful once committed, and
     // deriving a pool from 192.168.2.0/2 on the way to /24 would overwrite the
     // very fields the user is about to see filled correctly.

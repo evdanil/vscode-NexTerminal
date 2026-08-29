@@ -42,16 +42,29 @@ function lastAutofill(posted: readonly FormMessage[]): Extract<FormMessage, { ty
  * would leave the form holding Save for a round trip the host considers over —
  * which is the whole reason the terminator exists.
  */
-function answerAutofill(harness: ReturnType<typeof openForm>): Record<string, string> | undefined {
+function answerAutofill(
+  harness: ReturnType<typeof openForm>,
+  interfaces: readonly NetworkInterfaceOption[] = INTERFACES
+): Record<string, string> | undefined {
   const message = lastAutofill(harness.posted);
-  return answer(harness, message);
+  return answer(harness, message, interfaces);
 }
 
 function answer(
   harness: ReturnType<typeof openForm>,
-  message: Extract<FormMessage, { type: "autofill" }>
+  message: Extract<FormMessage, { type: "autofill" }>,
+  interfaces: readonly NetworkInterfaceOption[] = INTERFACES
 ): Record<string, string> | undefined {
-  const fills = dhcpFormAutofillFields(message.key, message.value, message.values, INTERFACES);
+  // `previousValue` is forwarded exactly as WebviewFormPanel forwards it —
+  // verbatim, `undefined` included. Dropping it here would make every test in
+  // this file blind to the interface-change baseline it exists to carry.
+  const fills = dhcpFormAutofillFields(
+    message.key,
+    message.value,
+    message.values,
+    interfaces,
+    message.previousValue
+  );
   // `requestId` is echoed on both answers exactly as WebviewFormPanel echoes
   // it — it is what the webview matches its pending request against, and it is
   // read back off the posted request rather than guessed, since the counter
@@ -231,6 +244,96 @@ describe("DHCP form — a NIC picked from the interface select", () => {
     const field = definition.fields.find((entry) => "key" in entry && entry.key === "interface");
     expect(field).not.toHaveProperty("autofill");
     expect(field).toMatchObject({ type: "select" });
+  });
+});
+
+/**
+ * REVIEW FINDING (P1, third round) — the interface picker's autofill has to
+ * carry the address the picker held BEFORE the click, and only the round trip
+ * end to end can show why.
+ *
+ * The script applies the selection to the DOM (`selectCustomOption`) before it
+ * posts, so the `values` snapshot the host reasons over already names the NEW
+ * NIC — there is no "before" left in the message unless one is put there. The
+ * host's option 54 gate asks whether the configured identifier is still what
+ * this fill itself wrote for the PREVIOUS network, and answering that against
+ * the new NIC makes an auto-filled identifier look hand-set.
+ *
+ * Two NICs on ONE subnet is the fixture that makes the difference visible: the
+ * network does not change at all, so nothing else in the fill moves and the
+ * identifier is the only thing that can be wrong. Under the old code the form
+ * saves `serverId: 10.0.0.5` with the socket bound to 10.0.0.6 — every OFFER
+ * and ACK then points renewals and ZTP `siaddr` at the NIC the service just
+ * stopped using.
+ */
+describe("DHCP form — switching between two NICs on the SAME subnet", () => {
+  /** eth1 and eth2 differ in nothing but their host octet. */
+  const SAME_SUBNET: readonly NetworkInterfaceOption[] = [
+    { label: "All interfaces (0.0.0.0)", value: "" },
+    { label: "eth1 — 10.0.0.5", value: "10.0.0.5", netmask: "255.255.255.0" },
+    { label: "eth2 — 10.0.0.6", value: "10.0.0.6", netmask: "255.255.255.0" }
+  ];
+
+  /** The form as it stands after a previous fill: bound to .5, option 54 .5. */
+  function boundToFive() {
+    const seed = {
+      rangeStart: "10.0.0.1",
+      rangeEnd: "10.0.0.4",
+      subnet: "255.255.255.0",
+      bindAddress: "10.0.0.5",
+      serverId: "10.0.0.5"
+    };
+    return networkServerFormDefinition("dhcp", seed, {
+      interfaceOptions: dhcpInterfaceChoices(SAME_SUBNET, seed.rangeStart, seed.subnet)
+    });
+  }
+
+  it("posts the NIC the picker held before the click, which the values snapshot no longer can", () => {
+    const harness = openForm(boundToFive());
+    harness.choose("interface", "10.0.0.6");
+
+    const message = lastAutofill(harness.posted);
+    expect(message.value).toBe("10.0.0.6");
+    // The snapshot is taken after the selection landed in the DOM, so it says
+    // .6 — which is precisely why the old address needs its own field.
+    expect(message.values?.interface).toBe("10.0.0.6");
+    expect(message.previousValue).toBe("10.0.0.5");
+  });
+
+  it("refreshes the server identifier to the newly bound NIC", () => {
+    const harness = openForm(boundToFive());
+    harness.choose("interface", "10.0.0.6");
+    answerAutofill(harness, SAME_SUBNET);
+
+    const values = harness.submit();
+    expect(values.interface).toBe("10.0.0.6");
+    // The whole point: the socket is about to bind .6, so option 54 and BOOTP
+    // siaddr must say .6. Left at .5, renewals go unanswered.
+    expect(values.serverId).toBe("10.0.0.6");
+    // Same subnet either side, so nothing else moved.
+    expect(values.subnet).toBe("255.255.255.0");
+    expect(values.rangeStart).toBe("10.0.0.1");
+  });
+
+  it("reports the value the form OPENED with on the very first change, not undefined", () => {
+    // Nothing has been selected yet in this session, so a record kept only by
+    // previous selections (the write-only `dataset.prev`) would be empty here —
+    // and the first NIC switch after opening the form is the common case, not
+    // an edge one. The capture reads the rendered control instead.
+    const harness = openForm(boundToFive());
+    expect(harness.posted.filter((entry) => entry.type === "autofill")).toEqual([]);
+    harness.choose("interface", "10.0.0.6");
+    expect(lastAutofill(harness.posted).previousValue).toBe("10.0.0.5");
+  });
+
+  it("sends no previous value for a CIDR commit, which cannot move the bind address", () => {
+    const harness = openForm(boundToFive());
+    harness.type("cidr", "192.168.9.0/24");
+    // Committing a network changes that row alone, so the snapshot's bind
+    // address is the address either side and the host's fallback is exact.
+    // Sending the CIDR row's own former text here would be answering a
+    // different question with a value that is not an address at all.
+    expect(lastAutofill(harness.posted).previousValue).toBeUndefined();
   });
 });
 

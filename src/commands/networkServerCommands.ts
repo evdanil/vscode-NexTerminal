@@ -223,9 +223,17 @@ export function registerNetworkServerCommands(
       // DHCP only, and synchronous underneath: deriving a pool from a network
       // is arithmetic, so the round trip exists to keep that arithmetic out of
       // the webview, not because anything here has to wait.
+      //
+      // `previousValue` is the fourth parameter for the Interface picker alone:
+      // the webview applies a selection to the DOM before it posts, so the
+      // `values` snapshot names the NEW NIC on both sides of the change and the
+      // one it replaced reaches the derivation only here. Forwarded rather than
+      // interpreted — `dhcpFormAutofillFields` decides which trigger it means
+      // anything for.
       onAutofill:
         kind === "dhcp"
-          ? (key, value, values) => Promise.resolve(dhcpFormAutofillFields(key, value, values, interfaces))
+          ? (key, value, values, previousValue) =>
+              Promise.resolve(dhcpFormAutofillFields(key, value, values, interfaces, previousValue))
           : undefined,
       onSubmit: async (values) => {
         const problem = kind === "dhcp" ? validateDhcpValues(values) : validateTftpFormInput(values);
