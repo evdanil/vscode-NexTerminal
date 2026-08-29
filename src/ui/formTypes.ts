@@ -166,8 +166,15 @@ export type FormMessage =
    * by tests (`serverCommands.test.ts`, `profileCommands.test.ts`). A new
    * handler that wants to read `values` on a form with a password field is a
    * change that needs re-reviewing, not one that is safe by construction.
+   *
+   * `requestId` is minted by the webview, one per request, and is what the
+   * webview correlates the answers against. `WebviewFormPanel` echoes it back
+   * on both `fillFields` and `autofillSettled` without inspecting it; no
+   * `onAutofill` handler sees it or needs to. See the "SAVE MUST NOT OUTRUN AN
+   * AUTOFILL ROUND TRIP" comment in formHtml.ts for why key and value cannot
+   * do that job.
    */
-  | { type: "autofill"; key: string; value: string; values?: FormValues }
+  | { type: "autofill"; key: string; value: string; values?: FormValues; requestId?: number }
   | { type: "test"; values: FormValues };
 
 export type ExtensionMessage =
@@ -186,8 +193,15 @@ export type ExtensionMessage =
    * save path reads them as the user's own. The webview compares this against
    * the select's CURRENT value and drops anything that does not match (see
    * `fillAnswersCurrentSelection` in formHtml.ts).
+   *
+   * `requestId` echoes the request itself, and is what releases the webview's
+   * hold on Save. It is a separate question from `value`: `value` says which
+   * OPTION the payload describes (so a stale fill can be dropped), while the id
+   * says which REQUEST has been answered (so a repeated key/value pair — the
+   * same network typed, changed and retyped — cannot release a sibling request
+   * that is still outstanding).
    */
-  | { type: "fillFields"; key: string; value: string; values: Record<string, string> }
+  | { type: "fillFields"; key: string; value: string; values: Record<string, string>; requestId?: number }
   /**
    * One `autofill` request has been answered — with a fill, with nothing, or
    * with a failure. Posted for EVERY request, immediately after the
@@ -202,5 +216,8 @@ export type ExtensionMessage =
    * `fillFields` is posted, and Save would stay disabled until the form was
    * reopened. Hence a terminator that is unconditional rather than a payload
    * that is not.
+   *
+   * `requestId` echoes the request this terminates; it, and not the key/value
+   * pair, is what the webview matches against its pending list.
    */
-  | { type: "autofillSettled"; key: string; value: string };
+  | { type: "autofillSettled"; key: string; value: string; requestId?: number };

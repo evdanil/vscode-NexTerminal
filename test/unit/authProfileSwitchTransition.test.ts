@@ -77,8 +77,15 @@ function answerAutofill(harness: FormHarness, profiles: AuthProfile[]): void {
   if (values) {
     // `value` echoes the id the request named, exactly as WebviewFormPanel
     // answers — the webview drops an answer that does not describe the option
-    // currently selected (see the late-answer tests below).
-    harness.deliver({ type: "fillFields", key: autofill.key, value: autofill.value, values });
+    // currently selected (see the late-answer tests below). `requestId` echoes
+    // the request itself, which is what releases the webview's hold on Save.
+    harness.deliver({
+      type: "fillFields",
+      key: autofill.key,
+      value: autofill.value,
+      values,
+      requestId: autofill.requestId
+    });
   }
 }
 
@@ -580,7 +587,8 @@ describe("an auth-profile switch hands back the values the previous profile disp
         type: "fillFields",
         key: "authProfileId",
         value: KEY_PROFILE.id,
-        values: { username: "   ", authType: "key" }
+        values: { username: "   ", authType: "key" },
+        requestId: harness.lastAutofillRequestId()
       });
 
       expect(harness.value("username")).toBe("my-own-account");
@@ -754,7 +762,10 @@ describe("an auth-profile switch hands back the values the previous profile disp
     /** Composes the extension's answer to the autofill just posted, WITHOUT
      *  delivering it — the half of `answerAutofill` that runs before the round
      *  trip returns. */
-    function composeAnswer(harness: FormHarness, profiles: AuthProfile[]): { profileId: string; values: Record<string, string> } {
+    function composeAnswer(
+      harness: FormHarness,
+      profiles: AuthProfile[]
+    ): { profileId: string; values: Record<string, string>; requestId: number | undefined } {
       const autofill = [...harness.posted].reverse().find((msg) => msg.type === "autofill");
       if (!autofill || autofill.type !== "autofill") {
         throw new Error("no autofill was posted");
@@ -763,7 +774,10 @@ describe("an auth-profile switch hands back the values the previous profile disp
       if (!values) {
         throw new Error("the mirror declined to answer");
       }
-      return { profileId: autofill.value, values };
+      // The id is captured with the answer, not read back at delivery time: by
+      // then a LATER request has been posted, and answering it with that one's
+      // id is the very confusion the id exists to prevent.
+      return { profileId: autofill.value, values, requestId: autofill.requestId };
     }
 
     it("is discarded when the profile was deselected, so an UNLINKED save cannot adopt its credentials (kills applying a fillFields payload without checking which option it describes: with no link left, every submitted credential is kept verbatim as the user's own)", async () => {
@@ -776,7 +790,13 @@ describe("an auth-profile switch hands back the values the previous profile disp
       // values back and unlocks the fields…
       harness.choose("authProfileId", "");
       // …and only now does the profile's answer land.
-      harness.deliver({ type: "fillFields", key: "authProfileId", value: late.profileId, values: late.values });
+      harness.deliver({
+        type: "fillFields",
+        key: "authProfileId",
+        value: late.profileId,
+        values: late.values,
+        requestId: late.requestId
+      });
 
       expect(harness.value("username")).toBe("my-own-account");
       expect(harness.value("keyPath")).toBe("/home/me/.ssh/my_own_key");
@@ -803,7 +823,13 @@ describe("an auth-profile switch hands back the values the previous profile disp
       // A second profile is picked and answers normally, in time.
       pickProfile(harness, PROFILES, KEYLESS_PROFILE.id);
       // Only now does the FIRST profile's answer arrive.
-      harness.deliver({ type: "fillFields", key: "authProfileId", value: late.profileId, values: late.values });
+      harness.deliver({
+        type: "fillFields",
+        key: "authProfileId",
+        value: late.profileId,
+        values: late.values,
+        requestId: late.requestId
+      });
 
       // The key path field belongs to the user under a keyless key profile —
       // it must still hold the server's own file, not the first profile's.
@@ -861,7 +887,8 @@ describe("an auth-profile switch hands back the values the previous profile disp
         type: "fillFields",
         key: "authProfileId",
         value: PASSWORD_PROFILE.id,
-        values: usernameMirror(PASSWORD_PROFILE)!
+        values: usernameMirror(PASSWORD_PROFILE)!,
+        requestId: harness.lastAutofillRequestId()
       });
       expect(harness.value("defaultUsername")).toBe("labuser");
       expect(harness.locked("defaultUsername")).toBe(true);
@@ -887,7 +914,8 @@ describe("an auth-profile switch hands back the values the previous profile disp
         type: "fillFields",
         key: "authProfileId",
         value: PASSWORD_PROFILE.id,
-        values: usernameMirror(PASSWORD_PROFILE)!
+        values: usernameMirror(PASSWORD_PROFILE)!,
+        requestId: harness.lastAutofillRequestId()
       });
       expect(harness.value("defaultUsername")).toBe("labuser");
 

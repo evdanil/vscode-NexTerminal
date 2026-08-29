@@ -1630,7 +1630,7 @@ describe("renderFormHtml — autofill on a text field", () => {
     // `postAutofill` is the one place the message is built, so the snapshot the
     // answer needs cannot be dropped from one caller and kept in another.
     expect(html).toContain(
-      "vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues() });"
+      "vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues(), requestId: requestId });"
     );
     // "change", never "input": a network is only meaningful once committed, and
     // deriving a pool from 192.168.2.0/2 on the way to /24 would overwrite the

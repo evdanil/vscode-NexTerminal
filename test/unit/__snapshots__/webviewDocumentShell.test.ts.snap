@@ -2236,13 +2236,31 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * one rather than by a flag, because several can be outstanding at once:
        * committing the CIDR row and then picking a NIC posts two, and a flag
        * would re-open Save on the first answer with the second still in the
-       * air — the same race, one round trip later. Each is identified by the
-       * key and value it asked about, which is what both answers echo back.
+       * air — the same race, one round trip later.
        *
-       * A submit attempted meanwhile is DEFERRED, not dropped: the disabled
-       * button stops the click, but Enter in a text field submits a form
-       * regardless of what the buttons look like, and silently swallowing that
-       * is its own defect. It fires once the last answer lands, over values
+       * REVIEW FINDING (P2) — each request is identified by a REQUEST ID this
+       * script mints, not by the key and value it asked about. Key and value
+       * do not identify anything: the same pair can be asked twice before
+       * either answer returns (type a network, change it, change it back), and
+       * two identical tokens in the pending list are indistinguishable. Each
+       * request is answered TWICE in the usual case (fillFields, then the
+       * terminator), so the first request's pair of answers would release BOTH
+       * of those entries — retiring an outstanding request that has not been
+       * answered at all, and letting a deferred Save fire over a snapshot its
+       * own answer was about to correct. Ids are unique per request whatever
+       * was asked, so an answer can only ever release the request it answers.
+       * Key and value still travel with the answer for a different job — they
+       * decide whether the FILL is still about the option now selected (see
+       * fillAnswersCurrentSelection) — and both are echoed on both answers.
+       *
+       * A submit attempted meanwhile is DEFERRED, not dropped. The disabled
+       * button stops a LATER click from ever reaching the form, but two kinds
+       * of submit still do reach it and silently swallowing either is its own
+       * defect: Enter in a text field submits a form regardless of what the
+       * buttons look like, and the click that fired this round trip in the
+       * first place is still in flight when it is posted (which is why the
+       * button is not disabled until the gesture carrying that click is over —
+       * see postAutofill). Either fires once the last answer lands, over values
        * collected then — which is exactly what the user meant by Save.
        *
        * A request is released by whichever of its two answers arrives:
@@ -2255,18 +2273,41 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        */
       var pendingAutofills = [];
       var deferredSubmit = false;
+      var nextAutofillRequestId = 1;
       var saveBtn = document.getElementById("save-btn");
 
-      /** Identifies one request by what it asked about; NUL cannot occur in
-       *  either half, so the two cannot be confused by concatenation. */
-      function autofillToken(key, value) {
-        return String(key) + "\\u0000" + String(value);
-      }
-
       function postAutofill(key, value) {
-        pendingAutofills.push(autofillToken(key, value));
-        if (saveBtn) saveBtn.disabled = true;
-        vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues() });
+        var requestId = nextAutofillRequestId++;
+        pendingAutofills.push(requestId);
+        vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues(), requestId: requestId });
+        /**
+         * REVIEW FINDING (P2) — the disable is deferred by one MACROTASK, and
+         * that is the whole point of the setTimeout.
+         *
+         * A click on Save while the CIDR row still has focus dispatches, in
+         * one gesture: mousedown on the button, then the blur-driven "change"
+         * on the input — which is what calls this function — then mouseup,
+         * then click. Disabling here and now happens BETWEEN the mousedown and
+         * the click, and a browser re-reads "disabled" as it is about to
+         * dispatch each of those: the click never fires, so the form's own
+         * "submit" never fires, so the deferral in the submit handler never
+         * sees it. The user's Save is silently dropped and they have to click
+         * a second time.
+         *
+         * A macrotask runs after the events already queued for the CURRENT
+         * gesture have been delivered, and long before any follow-up click a
+         * human could make — so the in-flight click still reaches the submit
+         * handler and is deferred there, while a later click still finds the
+         * button held. A microtask would NOT do: microtasks drain between
+         * event dispatches, i.e. still ahead of the queued click.
+         *
+         * The guard is for the request that settles before its own deferred
+         * disable runs (nothing outstanding any more): disabling then would
+         * strand Save on a round trip that is already over.
+         */
+        setTimeout(function() {
+          if (saveBtn && pendingAutofills.length > 0) saveBtn.disabled = true;
+        }, 0);
       }
 
       /** One answer — a fill, an empty answer, or a failure — has come back.
@@ -2274,9 +2315,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        *  the second finds nothing to release, so an answer can never pay off
        *  a DIFFERENT request that is still outstanding. An answer for a
        *  request this form never made (another panel's shape, a hand-built
-       *  test message) matches nothing and is ignored. */
-      function autofillSettled(key, value) {
-        var index = pendingAutofills.indexOf(autofillToken(key, value));
+       *  test message) carries an id this script never minted, matches
+       *  nothing, and is ignored. */
+      function autofillSettled(requestId) {
+        if (requestId === undefined) return;
+        var index = pendingAutofills.indexOf(requestId);
         if (index === -1) return;
         pendingAutofills.splice(index, 1);
         if (pendingAutofills.length > 0) return;
@@ -2571,10 +2614,10 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           // Released AFTER the fill is applied, so a submit this answer frees
           // is collected over the filled fields rather than the stale ones.
           applyFillFields(msg);
-          autofillSettled(msg.key, msg.value);
+          autofillSettled(msg.requestId);
         }
         if (msg.type === "autofillSettled") {
-          autofillSettled(msg.key, msg.value);
+          autofillSettled(msg.requestId);
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");
@@ -3824,13 +3867,31 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * one rather than by a flag, because several can be outstanding at once:
        * committing the CIDR row and then picking a NIC posts two, and a flag
        * would re-open Save on the first answer with the second still in the
-       * air — the same race, one round trip later. Each is identified by the
-       * key and value it asked about, which is what both answers echo back.
+       * air — the same race, one round trip later.
        *
-       * A submit attempted meanwhile is DEFERRED, not dropped: the disabled
-       * button stops the click, but Enter in a text field submits a form
-       * regardless of what the buttons look like, and silently swallowing that
-       * is its own defect. It fires once the last answer lands, over values
+       * REVIEW FINDING (P2) — each request is identified by a REQUEST ID this
+       * script mints, not by the key and value it asked about. Key and value
+       * do not identify anything: the same pair can be asked twice before
+       * either answer returns (type a network, change it, change it back), and
+       * two identical tokens in the pending list are indistinguishable. Each
+       * request is answered TWICE in the usual case (fillFields, then the
+       * terminator), so the first request's pair of answers would release BOTH
+       * of those entries — retiring an outstanding request that has not been
+       * answered at all, and letting a deferred Save fire over a snapshot its
+       * own answer was about to correct. Ids are unique per request whatever
+       * was asked, so an answer can only ever release the request it answers.
+       * Key and value still travel with the answer for a different job — they
+       * decide whether the FILL is still about the option now selected (see
+       * fillAnswersCurrentSelection) — and both are echoed on both answers.
+       *
+       * A submit attempted meanwhile is DEFERRED, not dropped. The disabled
+       * button stops a LATER click from ever reaching the form, but two kinds
+       * of submit still do reach it and silently swallowing either is its own
+       * defect: Enter in a text field submits a form regardless of what the
+       * buttons look like, and the click that fired this round trip in the
+       * first place is still in flight when it is posted (which is why the
+       * button is not disabled until the gesture carrying that click is over —
+       * see postAutofill). Either fires once the last answer lands, over values
        * collected then — which is exactly what the user meant by Save.
        *
        * A request is released by whichever of its two answers arrives:
@@ -3843,18 +3904,41 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        */
       var pendingAutofills = [];
       var deferredSubmit = false;
+      var nextAutofillRequestId = 1;
       var saveBtn = document.getElementById("save-btn");
 
-      /** Identifies one request by what it asked about; NUL cannot occur in
-       *  either half, so the two cannot be confused by concatenation. */
-      function autofillToken(key, value) {
-        return String(key) + "\\u0000" + String(value);
-      }
-
       function postAutofill(key, value) {
-        pendingAutofills.push(autofillToken(key, value));
-        if (saveBtn) saveBtn.disabled = true;
-        vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues() });
+        var requestId = nextAutofillRequestId++;
+        pendingAutofills.push(requestId);
+        vscode.postMessage({ type: 'autofill', key: key, value: value, values: collectFormValues(), requestId: requestId });
+        /**
+         * REVIEW FINDING (P2) — the disable is deferred by one MACROTASK, and
+         * that is the whole point of the setTimeout.
+         *
+         * A click on Save while the CIDR row still has focus dispatches, in
+         * one gesture: mousedown on the button, then the blur-driven "change"
+         * on the input — which is what calls this function — then mouseup,
+         * then click. Disabling here and now happens BETWEEN the mousedown and
+         * the click, and a browser re-reads "disabled" as it is about to
+         * dispatch each of those: the click never fires, so the form's own
+         * "submit" never fires, so the deferral in the submit handler never
+         * sees it. The user's Save is silently dropped and they have to click
+         * a second time.
+         *
+         * A macrotask runs after the events already queued for the CURRENT
+         * gesture have been delivered, and long before any follow-up click a
+         * human could make — so the in-flight click still reaches the submit
+         * handler and is deferred there, while a later click still finds the
+         * button held. A microtask would NOT do: microtasks drain between
+         * event dispatches, i.e. still ahead of the queued click.
+         *
+         * The guard is for the request that settles before its own deferred
+         * disable runs (nothing outstanding any more): disabling then would
+         * strand Save on a round trip that is already over.
+         */
+        setTimeout(function() {
+          if (saveBtn && pendingAutofills.length > 0) saveBtn.disabled = true;
+        }, 0);
       }
 
       /** One answer — a fill, an empty answer, or a failure — has come back.
@@ -3862,9 +3946,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        *  the second finds nothing to release, so an answer can never pay off
        *  a DIFFERENT request that is still outstanding. An answer for a
        *  request this form never made (another panel's shape, a hand-built
-       *  test message) matches nothing and is ignored. */
-      function autofillSettled(key, value) {
-        var index = pendingAutofills.indexOf(autofillToken(key, value));
+       *  test message) carries an id this script never minted, matches
+       *  nothing, and is ignored. */
+      function autofillSettled(requestId) {
+        if (requestId === undefined) return;
+        var index = pendingAutofills.indexOf(requestId);
         if (index === -1) return;
         pendingAutofills.splice(index, 1);
         if (pendingAutofills.length > 0) return;
@@ -4159,10 +4245,10 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           // Released AFTER the fill is applied, so a submit this answer frees
           // is collected over the filled fields rather than the stale ones.
           applyFillFields(msg);
-          autofillSettled(msg.key, msg.value);
+          autofillSettled(msg.requestId);
         }
         if (msg.type === "autofillSettled") {
-          autofillSettled(msg.key, msg.value);
+          autofillSettled(msg.requestId);
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");

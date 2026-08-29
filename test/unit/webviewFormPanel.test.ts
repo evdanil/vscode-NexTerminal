@@ -118,6 +118,55 @@ describe("WebviewFormPanel submit handling", () => {
     });
   });
 
+  it("echoes the request's id on BOTH answers, without the handler ever seeing it (kills stamping only the fill, or only the terminator: the webview correlates on the id, so an answer without one releases nothing and Save stays held for the life of the panel)", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ subnet: "255.255.255.0" });
+
+    WebviewFormPanel.open("panel-autofill-id", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await Promise.resolve(
+      messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24", requestId: 7 })
+    );
+
+    // The id is the webview's own correlation handle: two requests can carry the
+    // same key and value (a network typed, changed and retyped), so key/value
+    // cannot say WHICH request an answer settles.
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "fillFields",
+      key: "cidr",
+      value: "10.0.0.0/24",
+      values: { subnet: "255.255.255.0" },
+      requestId: 7
+    });
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "autofillSettled",
+      key: "cidr",
+      value: "10.0.0.0/24",
+      requestId: 7
+    });
+    // The handler is never told about it — no onAutofill implementation has any
+    // reason to know which request it is answering.
+    expect(onAutofill).toHaveBeenCalledWith("cidr", "10.0.0.0/24", undefined);
+  });
+
+  it("echoes the request's id on the terminator even when the handler THROWS", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockRejectedValue(new Error("vault read failed"));
+
+    WebviewFormPanel.open("panel-autofill-id-throws", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await expect(
+      Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24", requestId: 11 }))
+    ).rejects.toThrow("vault read failed");
+
+    // A failed round trip is still a round trip that ended, and an unstamped
+    // terminator would leave its request outstanding for ever.
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "autofillSettled",
+      key: "cidr",
+      value: "10.0.0.0/24",
+      requestId: 11
+    });
+  });
+
   it("does not post fillFields when autofill returns undefined", async () => {
     const onSubmit = vi.fn();
     const onAutofill = vi.fn().mockResolvedValue(undefined);

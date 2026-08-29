@@ -5163,13 +5163,21 @@ describe("inventoryCommands", () => {
       const requested = [...harness.posted].reverse().find((msg) => msg.type === "autofill");
       expect(requested?.type).toBe("autofill");
       const requestedId = requested!.type === "autofill" ? requested.value : "";
+      const requestNumber = requested!.type === "autofill" ? requested.requestId : undefined;
       // …the extension composes its real answer…
       const answer = await onAutofill!("authProfileId", requestedId);
       expect(answer).toEqual({ defaultUsername: "labuser" });
       // …the user reaches (None) before it can be delivered…
       harness.choose("authProfileId", "");
-      // …and only now does it arrive, exactly as WebviewFormPanel posts it.
-      harness.deliver({ type: "fillFields", key: "authProfileId", value: requestedId, values: answer! });
+      // …and only now does it arrive, exactly as WebviewFormPanel posts it —
+      // carrying back the id of the request it answers.
+      harness.deliver({
+        type: "fillFields",
+        key: "authProfileId",
+        value: requestedId,
+        values: answer!,
+        requestId: requestNumber
+      });
 
       expect(harness.value("defaultUsername")).toBe("source-own-account");
       expect(harness.locked("defaultUsername")).toBe(false);
@@ -5279,7 +5287,13 @@ describe("inventoryCommands", () => {
 
       harness.choose("authProfileId", "p3");
       const answer = await onAutofill!("authProfileId", "p3");
-      harness.deliver({ type: "fillFields", key: "authProfileId", value: "p3", values: answer! });
+      harness.deliver({
+        type: "fillFields",
+        key: "authProfileId",
+        value: "p3",
+        values: answer!,
+        requestId: harness.lastAutofillRequestId()
+      });
       // The profile fills nothing, so this is the user's own fallback (seeded
       // from mostCommonUsername), still editable.
       expect(harness.locked("defaultUsername")).toBe(false);

@@ -52,10 +52,25 @@ function answer(
   message: Extract<FormMessage, { type: "autofill" }>
 ): Record<string, string> | undefined {
   const fills = dhcpFormAutofillFields(message.key, message.value, message.values, INTERFACES);
+  // `requestId` is echoed on both answers exactly as WebviewFormPanel echoes
+  // it — it is what the webview matches its pending request against, and it is
+  // read back off the posted request rather than guessed, since the counter
+  // that mints it is the script's own.
   if (fills) {
-    harness.deliver({ type: "fillFields", key: message.key, value: message.value, values: fills });
+    harness.deliver({
+      type: "fillFields",
+      key: message.key,
+      value: message.value,
+      values: fills,
+      requestId: message.requestId
+    });
   }
-  harness.deliver({ type: "autofillSettled", key: message.key, value: message.value });
+  harness.deliver({
+    type: "autofillSettled",
+    key: message.key,
+    value: message.value,
+    requestId: message.requestId
+  });
   return fills;
 }
 
@@ -140,12 +155,13 @@ describe("DHCP form — a network typed into the CIDR row", () => {
     const second = lastAutofill(harness.posted);
     const secondFills = dhcpFormAutofillFields(second.key, second.value, second.values, INTERFACES)!;
 
-    harness.deliver({ type: "fillFields", key: "cidr", value: "10.0.0.0/24", values: fills });
-    harness.deliver({ type: "autofillSettled", key: "cidr", value: "10.0.0.0/24" });
+    harness.deliver({ type: "fillFields", key: "cidr", value: "10.0.0.0/24", values: fills, requestId: first.requestId });
+    harness.deliver({ type: "autofillSettled", key: "cidr", value: "10.0.0.0/24", requestId: first.requestId });
 
     // Read off the fields rather than through a submit: the SECOND request is
     // still outstanding, so Save is held (the late answer released its own
     // request and nothing else) and there is deliberately nothing to submit.
+    harness.flushTimers();
     expect(harness.saveDisabled()).toBe(true);
     expect(harness.value("cidr")).toBe("172.16.0.0/16");
     // 10.0.0.x must not be half-applied under a row that now says 172.16.0.0/16.
@@ -155,8 +171,8 @@ describe("DHCP form — a network typed into the CIDR row", () => {
     // The second (and last) outstanding request answers: only now is Save
     // actually released, and over the network the user meant, not the first
     // one they typed and moved away from.
-    harness.deliver({ type: "fillFields", key: "cidr", value: "172.16.0.0/16", values: secondFills });
-    harness.deliver({ type: "autofillSettled", key: "cidr", value: "172.16.0.0/16" });
+    harness.deliver({ type: "fillFields", key: "cidr", value: "172.16.0.0/16", values: secondFills, requestId: second.requestId });
+    harness.deliver({ type: "autofillSettled", key: "cidr", value: "172.16.0.0/16", requestId: second.requestId });
 
     expect(harness.saveDisabled()).toBe(false);
     expect(harness.value("subnet")).toBe(secondFills.subnet);
@@ -235,6 +251,9 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     // Save, before the answer lands. Nothing may go out: the values collected
     // here are 192.168.2.x, and posting them saves the old pool while the
     // network that would have replaced it is dropped on the floor.
+    // The hold itself lands one macrotask after the request is posted (see
+    // postAutofill), which a browser reaches before the user's next gesture.
+    harness.flushTimers();
     expect(harness.saveDisabled()).toBe(true);
     expect(harness.attemptSubmit()).toBeUndefined();
     expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
@@ -257,6 +276,7 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
     harness.choose("interface", "10.0.0.5");
 
+    harness.flushTimers();
     expect(harness.saveDisabled()).toBe(true);
     expect(harness.attemptSubmit()).toBeUndefined();
     answerAutofill(harness);
@@ -277,6 +297,102 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     const values = harness.submit();
     expect(values.rangeStart).toBe("10.0.0.1");
     expect(harness.posted.filter((message) => message.type === "submit")).toHaveLength(1);
+  });
+
+  /**
+   * REVIEW FINDING (P2) — the hold must not eat the very click that triggered
+   * the round trip.
+   *
+   * Clicking Save while the CIDR row still has focus is ONE gesture, and the
+   * browser delivers it in this order: mousedown on the button, the blur-driven
+   * "change" on the input (which is what posts the autofill), mouseup, click.
+   * A hold applied synchronously from that change handler lands between the
+   * mousedown and the click, and a browser refuses to dispatch a click on a
+   * control that is disabled by then — so no click, no "submit" event, and the
+   * deferral in the submit handler is never reached at all. The round trip
+   * finishes, Save comes back, and the user's click is simply gone.
+   *
+   * `clickSave()` is the pointer path and honours `disabled`; `attemptSubmit()`
+   * is the Enter-key path, which a disabled button never blocked.
+   */
+  it("defers the Save clicked in the SAME gesture that committed the CIDR row, instead of swallowing the click (kills disabling the button synchronously in postAutofill: the browser suppresses the click, no submit event fires, and the Save is discarded rather than held)", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+
+    // The blur-driven change fires the autofill. Still inside that gesture, so
+    // no macrotask has run yet — `flushTimers` is deliberately NOT called.
+    harness.type("cidr", "10.0.0.0/24");
+    expect(harness.saveDisabled()).toBe(false);
+
+    // …and the click that caused the blur lands. It must reach the form, where
+    // the existing deferral holds it: nothing is posted yet.
+    expect(harness.clickSave()).toBeUndefined();
+    expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+
+    // Only now does the hold apply — in time to refuse a SECOND click, which is
+    // what it is for.
+    harness.flushTimers();
+    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.clickSave()).toBeUndefined();
+
+    answerAutofill(harness);
+
+    // The click the user actually made is honoured, over the derived values.
+    const submitted = harness.posted.filter((message) => message.type === "submit");
+    expect(submitted).toHaveLength(1);
+    const values = submitted[0].type === "submit" ? submitted[0].values : {};
+    expect(values.rangeStart).toBe("10.0.0.1");
+    expect(values.broadcast).toBe("10.0.0.255");
+    expect(harness.saveDisabled()).toBe(false);
+  });
+
+  /**
+   * REVIEW FINDING (P2) — answers are correlated by REQUEST ID, not by the
+   * key/value pair they echo.
+   *
+   * The same network can be asked about twice before either answer returns —
+   * type it, change it, change it back — and each request is answered twice
+   * (the fill, then the unconditional terminator). Correlating on key/value,
+   * the FIRST request's two answers retire both of the identical entries, so a
+   * request that has not been answered at all is released early and a deferred
+   * Save goes out over the snapshot its own answer was about to correct.
+   */
+  it("keeps a repeated network's second request outstanding until its OWN answer lands (kills correlating answers by the key/value they echo: the first request's fill and terminator retire both identical entries, releasing a request nobody answered)", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+
+    // A → B → A, all three committed before any answer is delivered.
+    harness.type("cidr", "10.0.0.0/24");
+    harness.type("cidr", "172.16.0.0/16");
+    harness.type("cidr", "10.0.0.0/24");
+    harness.flushTimers();
+
+    const requests = harness.posted.filter((message) => message.type === "autofill");
+    expect(requests).toHaveLength(3);
+    // Three requests, three distinct ids — the point of minting them.
+    const ids = requests.map((message) => (message.type === "autofill" ? message.requestId : undefined));
+    expect(new Set(ids).size).toBe(3);
+
+    // The user asks to Save. Held, because three round trips are outstanding.
+    expect(harness.attemptSubmit()).toBeUndefined();
+
+    // The first two answer, in order, exactly as WebviewFormPanel posts them.
+    answer(harness, requests[0] as Extract<FormMessage, { type: "autofill" }>);
+    answer(harness, requests[1] as Extract<FormMessage, { type: "autofill" }>);
+
+    // The THIRD is still in the air, so Save is still held and nothing has been
+    // submitted. Under key/value correlation the first request's pair of
+    // answers has already retired the third request's entry, the second one
+    // empties the list, and the held Save fires here.
+    expect(harness.saveDisabled()).toBe(true);
+    expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+
+    // Its own answer, and only its own, releases it.
+    answer(harness, requests[2] as Extract<FormMessage, { type: "autofill" }>);
+    expect(harness.saveDisabled()).toBe(false);
+    const submitted = harness.posted.filter((message) => message.type === "submit");
+    expect(submitted).toHaveLength(1);
+    const values = submitted[0].type === "submit" ? submitted[0].values : {};
+    expect(values.cidr).toBe("10.0.0.0/24");
+    expect(values.rangeStart).toBe("10.0.0.1");
   });
 
   it("never holds a form with no autofill-capable control at all", () => {

@@ -502,10 +502,36 @@ export interface FormHarness {
    * observe a Save the script HELD because an autofill was still in flight.
    * Returns the submitted values, or `undefined` when the attempt posted
    * nothing.
+   *
+   * This is the ENTER-KEY path: a form submits on Enter in a text field
+   * whatever its buttons look like, so the button's disabled state is
+   * deliberately not consulted. For the pointer path use `clickSave`.
    */
   attemptSubmit: () => FormValues | undefined;
+  /**
+   * The POINTER path: a real click on the Save button, which a browser refuses
+   * to dispatch at all while the button is disabled — no click, and therefore
+   * no `submit` event for the form's own handler to defer. That difference is
+   * exactly what `attemptSubmit` cannot see, and is where the "Save clicked
+   * while the CIDR row was still committing" defect lived.
+   *
+   * Returns the submitted values, or `undefined` when the click was suppressed
+   * or the submit handler held it.
+   */
+  clickSave: () => FormValues | undefined;
+  /**
+   * Runs the macrotasks the script has queued (`setTimeout`), which is where
+   * the deferred Save-button disable lives. A browser reaches these between one
+   * user gesture and the next, so tests that model two separate interactions
+   * flush in between; a test that models a SINGLE gesture (the blur-driven
+   * change and the click that caused it) deliberately does not.
+   */
+  flushTimers: () => void;
   /** Whether the Save button is currently disabled. */
   saveDisabled: () => boolean;
+  /** The `requestId` the script stamped on its most recent `autofill` post —
+   *  what an answer must echo back to release that request. */
+  lastAutofillRequestId: () => number | undefined;
   value: (key: string) => string;
   locked: (key: string) => boolean;
   selectLabel: (key: string) => string;
@@ -550,6 +576,13 @@ export function openForm(definition: FormDefinition): FormHarness {
     }
   };
 
+  // The script's macrotask queue, owned by the test rather than by the runtime.
+  // `setTimeout` is passed in as a parameter so it SHADOWS the Node global
+  // inside the script's scope: the deferred Save-button disable then lands here
+  // instead of on a real timer, and a test says explicitly when the browser
+  // would have got round to it (see `flushTimers`).
+  const timers: Array<() => void> = [];
+
   const factory = new Function(
     "document",
     "window",
@@ -557,6 +590,7 @@ export function openForm(definition: FormDefinition): FormHarness {
     "selectCustomOption",
     "initCustomSelects",
     "initCustomComboboxes",
+    "setTimeout",
     source
   ) as (
     document: unknown,
@@ -564,7 +598,8 @@ export function openForm(definition: FormDefinition): FormHarness {
     acquireVsCodeApi: () => { postMessage: (msg: FormMessage) => void },
     selectCustomOption: (wrapper: StubElement, value: string) => void,
     initCustomSelects: (cb: (wrapper: StubElement, option: StubElement) => void) => void,
-    initCustomComboboxes: () => void
+    initCustomComboboxes: () => void,
+    setTimeout: (fn: () => void, delay?: number) => void
   ) => void;
 
   factory(
@@ -575,8 +610,18 @@ export function openForm(definition: FormDefinition): FormHarness {
     (cb) => {
       optionClick = cb;
     },
-    () => {}
+    () => {},
+    (fn) => {
+      timers.push(fn);
+    }
   );
+
+  const flushTimers = (): void => {
+    // Drained rather than iterated: a queued task may queue another.
+    while (timers.length > 0) {
+      timers.shift()!();
+    }
+  };
 
   const control = (key: string): StubElement => {
     const el = dom.form.elements?.[key];
@@ -617,7 +662,25 @@ export function openForm(definition: FormDefinition): FormHarness {
       const last = posted[posted.length - 1];
       return posted.length > before && last?.type === "submit" ? last.values : undefined;
     },
+    clickSave: () => {
+      // What a browser does with a click on a disabled control: nothing. No
+      // click event, and so no `submit` event either — the form's handler is
+      // never reached, which is why a Save held this way cannot even be
+      // deferred.
+      if (dom.byId.get("save-btn")?.disabled === true) {
+        return undefined;
+      }
+      const before = posted.length;
+      dom.submit();
+      const last = posted[posted.length - 1];
+      return posted.length > before && last?.type === "submit" ? last.values : undefined;
+    },
+    flushTimers,
     saveDisabled: () => dom.byId.get("save-btn")?.disabled === true,
+    lastAutofillRequestId: () => {
+      const message = [...posted].reverse().find((entry) => entry.type === "autofill");
+      return message?.type === "autofill" ? message.requestId : undefined;
+    },
     value: (key) => control(key).value,
     locked: (key) => {
       const el = dom.byId.get(`field-${key}`);

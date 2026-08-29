@@ -85,6 +85,15 @@ export class WebviewFormPanel {
         // autofill-capable control but wires no `onAutofill` (none does today)
         // is answered here too, rather than leaving its Save button disabled
         // for the life of the panel.
+        //
+        // REVIEW FINDING (P2) — `requestId` is the webview's own correlation
+        // handle and is echoed back verbatim on BOTH answers. It is captured
+        // here rather than read off `message` at each post site so that the two
+        // answers to one request can never carry different ids, and it is
+        // deliberately opaque to this layer: no `onAutofill` handler is told
+        // about it, because none of them has any reason to care which request
+        // it is answering.
+        const requestId = message.requestId;
         try {
           const result = this.onAutofill
             ? await this.onAutofill(message.key, message.value, message.values)
@@ -108,7 +117,8 @@ export class WebviewFormPanel {
               type: "fillFields",
               key: message.key,
               value: message.value,
-              values: result
+              values: result,
+              requestId
             });
           }
         } finally {
@@ -118,7 +128,8 @@ export class WebviewFormPanel {
             void this.panel.webview.postMessage({
               type: "autofillSettled",
               key: message.key,
-              value: message.value
+              value: message.value,
+              requestId
             });
           }
         }
