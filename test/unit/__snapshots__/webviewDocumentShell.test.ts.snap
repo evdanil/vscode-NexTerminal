@@ -2280,6 +2280,55 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * see postAutofill). Either fires once the last answer lands, over values
        * collected then — which is exactly what the user meant by Save.
        *
+       * REVIEW FINDING (P1) — that deferral only works if something is PENDING
+       * by the time submit is dispatched, and a commit does not only happen on
+       * blur. The round trip is started from "change" on purpose (deriving a
+       * whole pool from 192.168.2.0/2 on the way to /24 would overwrite the
+       * fields the user is about to see filled correctly), and "change" on a
+       * text input is a blur-time event. Enter does NOT blur: it is the
+       * browser's implicit submission, and the input still holds focus while the
+       * form submits. So the deferral was reached with pendingAutofills empty —
+       * nothing in flight because nothing had been committed — and the submit
+       * went straight out over the network the user had just replaced, with the
+       * replacement discarded. Same silent loss as the P1 above, one event
+       * earlier: "cidr" is never persisted (DHCP_CIDR_FIELD_KEY), so the typed
+       * network survives nowhere else.
+       *
+       * The commit is therefore ALSO fired from "keydown" on Enter, and no
+       * preventDefault goes with it. Submission is the DEFAULT ACTION of that
+       * key event, and a default action runs only after every listener for the
+       * event has returned; postAutofill is synchronous, so the pending entry
+       * exists before the form's own "submit" is dispatched and the deferral
+       * above sees it — exactly as it does for the click path. Cancelling the
+       * event instead would mean re-submitting the form by hand, which is more
+       * machinery for the same result.
+       *
+       * Both listeners call ONE commit, gated on the field having actually been
+       * edited (an "input" event since the last commit). The gate is not
+       * tidiness:
+       *   * whichever listener fires first clears it, so if this engine also
+       *     fires "change" for an Enter-driven submission the second one posts
+       *     nothing. A duplicate round trip would be harmless — ids make
+       *     concurrent requests independent (P2 above) — but one that cannot be
+       *     minted needs no de-duplication at all;
+       *   * "change" already means "the user edited this", and Enter does not.
+       *     Enter in an untouched CIDR row is plain "save", and deriving from it
+       *     would be destructive rather than merely wasteful: dhcpCidrFormFills
+       *     writes subnet, rangeStart and poolCount UNCONDITIONALLY (they are
+       *     what the network says, not suggestions the host may decline), so a
+       *     hand-typed pool start would be replaced by the network's first host
+       *     on the way out — and the snapshot guard below cannot catch it,
+       *     because the snapshot is taken after that edit and the field still
+       *     agrees with it;
+       *   * a value written back BY an answer (applyFillFields → setFieldValue)
+       *     dispatches no "input" and so is not an edit — the normalised CIDR
+       *     the host echoes does not ask to be derived a second time.
+       *
+       * The pointer path is unchanged and is still the blur-driven "change".
+       * The two gestures reach the same hazard through different events and each
+       * needs its own listener: a click blurs the field and never produces a
+       * keydown, an Enter produces a keydown and never blurs the field.
+       *
        * A request is released by whichever of its two answers arrives:
        * fillFields when there were values to fill, and the unconditional
        * autofillSettled that follows it. The terminator is what makes this
@@ -2404,18 +2453,38 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
 
       /* An autofill-capable TEXT field — the DHCP editor's Network (CIDR) row.
          The same round trip the autofill-capable SELECT below already makes,
-         fired on "change" rather than "input": a network is only meaningful
+         fired on COMMIT rather than on "input": a network is only meaningful
          once it is committed, and deriving a whole pool from 192.168.2.0/2 on
          the way to /24 would overwrite the very fields the user is about to
          see filled correctly. The values snapshot rides along because the
          answer decides what it may overwrite — a hand-typed gateway survives,
          a stale derived one does not. Fields that did not opt in carry no
-         data-autofill attribute and are not touched by this loop. */
+         data-autofill attribute and are not touched by this loop.
+
+         A commit is EITHER of the two gestures that end an edit: blur, which
+         is what "change" is, and Enter, which submits the form without
+         blurring anything. See the fourth REVIEW FINDING on pendingAutofills
+         for why both are needed, why one shared commit rather than two, why
+         the "edited" gate is load-bearing and why no preventDefault. */
       var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');
       for (var afi = 0; afi < autofillInputs.length; afi++) {
         (function(input) {
-          input.addEventListener("change", function() {
+          /* Set by the user's own editing — typing, pasting, dropping text,
+             undo — and cleared by the commit it belongs to. A programmatic
+             write (setFieldValue, and so applyFillFields) dispatches no "input"
+             event and is deliberately not an edit. */
+          var edited = false;
+          function commitAutofill() {
+            if (!edited) return;
+            edited = false;
             postAutofill(input.name, input.value);
+          }
+          input.addEventListener("input", function() {
+            edited = true;
+          });
+          input.addEventListener("change", commitAutofill);
+          input.addEventListener("keydown", function(event) {
+            if (event.key === "Enter") commitAutofill();
           });
         })(autofillInputs[afi]);
       }
@@ -3979,6 +4048,55 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * see postAutofill). Either fires once the last answer lands, over values
        * collected then — which is exactly what the user meant by Save.
        *
+       * REVIEW FINDING (P1) — that deferral only works if something is PENDING
+       * by the time submit is dispatched, and a commit does not only happen on
+       * blur. The round trip is started from "change" on purpose (deriving a
+       * whole pool from 192.168.2.0/2 on the way to /24 would overwrite the
+       * fields the user is about to see filled correctly), and "change" on a
+       * text input is a blur-time event. Enter does NOT blur: it is the
+       * browser's implicit submission, and the input still holds focus while the
+       * form submits. So the deferral was reached with pendingAutofills empty —
+       * nothing in flight because nothing had been committed — and the submit
+       * went straight out over the network the user had just replaced, with the
+       * replacement discarded. Same silent loss as the P1 above, one event
+       * earlier: "cidr" is never persisted (DHCP_CIDR_FIELD_KEY), so the typed
+       * network survives nowhere else.
+       *
+       * The commit is therefore ALSO fired from "keydown" on Enter, and no
+       * preventDefault goes with it. Submission is the DEFAULT ACTION of that
+       * key event, and a default action runs only after every listener for the
+       * event has returned; postAutofill is synchronous, so the pending entry
+       * exists before the form's own "submit" is dispatched and the deferral
+       * above sees it — exactly as it does for the click path. Cancelling the
+       * event instead would mean re-submitting the form by hand, which is more
+       * machinery for the same result.
+       *
+       * Both listeners call ONE commit, gated on the field having actually been
+       * edited (an "input" event since the last commit). The gate is not
+       * tidiness:
+       *   * whichever listener fires first clears it, so if this engine also
+       *     fires "change" for an Enter-driven submission the second one posts
+       *     nothing. A duplicate round trip would be harmless — ids make
+       *     concurrent requests independent (P2 above) — but one that cannot be
+       *     minted needs no de-duplication at all;
+       *   * "change" already means "the user edited this", and Enter does not.
+       *     Enter in an untouched CIDR row is plain "save", and deriving from it
+       *     would be destructive rather than merely wasteful: dhcpCidrFormFills
+       *     writes subnet, rangeStart and poolCount UNCONDITIONALLY (they are
+       *     what the network says, not suggestions the host may decline), so a
+       *     hand-typed pool start would be replaced by the network's first host
+       *     on the way out — and the snapshot guard below cannot catch it,
+       *     because the snapshot is taken after that edit and the field still
+       *     agrees with it;
+       *   * a value written back BY an answer (applyFillFields → setFieldValue)
+       *     dispatches no "input" and so is not an edit — the normalised CIDR
+       *     the host echoes does not ask to be derived a second time.
+       *
+       * The pointer path is unchanged and is still the blur-driven "change".
+       * The two gestures reach the same hazard through different events and each
+       * needs its own listener: a click blurs the field and never produces a
+       * keydown, an Enter produces a keydown and never blurs the field.
+       *
        * A request is released by whichever of its two answers arrives:
        * fillFields when there were values to fill, and the unconditional
        * autofillSettled that follows it. The terminator is what makes this
@@ -4103,18 +4221,38 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
 
       /* An autofill-capable TEXT field — the DHCP editor's Network (CIDR) row.
          The same round trip the autofill-capable SELECT below already makes,
-         fired on "change" rather than "input": a network is only meaningful
+         fired on COMMIT rather than on "input": a network is only meaningful
          once it is committed, and deriving a whole pool from 192.168.2.0/2 on
          the way to /24 would overwrite the very fields the user is about to
          see filled correctly. The values snapshot rides along because the
          answer decides what it may overwrite — a hand-typed gateway survives,
          a stale derived one does not. Fields that did not opt in carry no
-         data-autofill attribute and are not touched by this loop. */
+         data-autofill attribute and are not touched by this loop.
+
+         A commit is EITHER of the two gestures that end an edit: blur, which
+         is what "change" is, and Enter, which submits the form without
+         blurring anything. See the fourth REVIEW FINDING on pendingAutofills
+         for why both are needed, why one shared commit rather than two, why
+         the "edited" gate is load-bearing and why no preventDefault. */
       var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');
       for (var afi = 0; afi < autofillInputs.length; afi++) {
         (function(input) {
-          input.addEventListener("change", function() {
+          /* Set by the user's own editing — typing, pasting, dropping text,
+             undo — and cleared by the commit it belongs to. A programmatic
+             write (setFieldValue, and so applyFillFields) dispatches no "input"
+             event and is deliberately not an edit. */
+          var edited = false;
+          function commitAutofill() {
+            if (!edited) return;
+            edited = false;
             postAutofill(input.name, input.value);
+          }
+          input.addEventListener("input", function() {
+            edited = true;
+          });
+          input.addEventListener("change", commitAutofill);
+          input.addEventListener("keydown", function(event) {
+            if (event.key === "Enter") commitAutofill();
           });
         })(autofillInputs[afi]);
       }

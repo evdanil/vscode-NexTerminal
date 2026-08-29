@@ -20,7 +20,7 @@ import type { ExtensionMessage, FormDefinition, FormMessage, FormValues } from "
  * file input's baseline `readonly`).
  * ──────────────────────────────────────────────────────────────────────── */
 
-type DomEvent = { preventDefault: () => void; target?: StubElement };
+type DomEvent = { preventDefault: () => void; target?: StubElement; key?: string };
 type DomListener = (event?: DomEvent) => void;
 
 export class StubElement {
@@ -165,10 +165,25 @@ export class StubElement {
     this.listeners.set(type, existing);
   }
 
-  public dispatch(type: string): void {
+  /**
+   * `event` is optional because most of what this stub fires — "input",
+   * "change" — is read by listeners that take no argument at all, and passing
+   * one would say something about the event object those listeners never look
+   * at. A keyboard listener does look (`event.key`), so callers that fire one
+   * supply it; `dispatchKey` below is the only spelling of that in use, and a
+   * bare `dispatch("keydown")` deliberately throws inside such a listener
+   * rather than quietly behaving like a key that is not Enter.
+   */
+  public dispatch(type: string, event?: DomEvent): void {
     for (const listener of this.listeners.get(type) ?? []) {
-      listener();
+      listener(event);
     }
+  }
+
+  /** A keyboard event carrying `key`, the property the scripts under test read
+   *  (`event.key === "Enter"`) — never `keyCode`, which nothing here uses. */
+  public dispatchKey(type: string, key: string): void {
+    this.dispatch(type, { key, target: this, preventDefault: () => {} });
   }
 
   /**
@@ -535,8 +550,37 @@ export interface FormHarness {
   value: (key: string) => string;
   locked: (key: string) => boolean;
   selectLabel: (key: string) => string;
-  /** Types into a field, refusing if the form has it locked. */
+  /** Types into a field AND leaves it, refusing if the form has it locked —
+   *  "input" then "change", which is the pair a browser delivers for an edit
+   *  the user then blurs away from. */
   type: (key: string, value: string) => void;
+  /**
+   * Types into a field and LEAVES THE CARET IN IT: "input" only, no "change".
+   *
+   * That is the state a text control is actually in while the user is still
+   * looking at it, and `type` cannot represent it — "change" is a blur-time
+   * event, so a test that always fires it can never see a handler that only
+   * runs on blur. It is also the shape a PASTE has (paste fires "input" and
+   * nothing else until focus moves), so the two are the same fixture.
+   */
+  typeFocused: (key: string, value: string) => void;
+  /** The "change" a real blur produces, with no accompanying edit — for
+   *  observing what a commit does when the value was already committed by
+   *  another gesture. */
+  blur: (key: string) => void;
+  /**
+   * Presses Enter on a specific field: a "keydown" carrying `key: "Enter"`.
+   *
+   * Deliberately does NOT submit. In a browser the submission is the DEFAULT
+   * ACTION of this event and therefore runs after every listener has returned,
+   * so a test spells the two halves out in that order — `pressEnter(...)`, then
+   * `attemptSubmit()` for the implicit submission it causes — and can assert on
+   * what the form had already done in between.
+   */
+  pressEnter: (key: string) => void;
+  /** `pressEnter` for any other key — what a mid-edit keystroke looks like, so
+   *  a handler can be shown to ignore one. */
+  pressKey: (key: string, keyName: string) => void;
   /** The Browse dialog's answer — the only way to change a file field. */
   browseResult: (key: string, path: string) => void;
 }
@@ -631,6 +675,16 @@ export function openForm(definition: FormDefinition): FormHarness {
     return el;
   };
 
+  /** A control the user could actually have put a value into — shared by every
+   *  editing gesture so none of them can fake input into a locked field. */
+  const editable = (key: string): StubElement => {
+    const el = control(key);
+    if (el.readOnly) {
+      throw new Error(`field ${key} is read-only — the user could not have typed this`);
+    }
+    return el;
+  };
+
   return {
     posted,
     choose: (key, value) => {
@@ -698,14 +752,19 @@ export function openForm(definition: FormDefinition): FormHarness {
     },
     selectLabel: (key) => dom.byId.get(`field-${key}`)?.querySelector(".custom-select-text")?.textContent ?? "",
     type: (key, value) => {
-      const el = control(key);
-      if (el.readOnly) {
-        throw new Error(`field ${key} is read-only — the user could not have typed this`);
-      }
+      const el = editable(key);
       el.value = value;
       el.dispatch("input");
       el.dispatch("change");
     },
+    typeFocused: (key, value) => {
+      const el = editable(key);
+      el.value = value;
+      el.dispatch("input");
+    },
+    blur: (key) => control(key).dispatch("change"),
+    pressEnter: (key) => control(key).dispatchKey("keydown", "Enter"),
+    pressKey: (key, keyName) => control(key).dispatchKey("keydown", keyName),
     browseResult: (key, path) => dom.deliverMessage({ type: "browseResult", key, path })
   };
 }

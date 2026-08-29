@@ -475,3 +475,112 @@ describe("DHCP form — Save while an autofill is in flight", () => {
     expect(harness.attemptSubmit()).toBeDefined();
   });
 });
+
+/**
+ * REVIEW FINDING (P1) — Enter does not blur, so nothing was ever committed.
+ *
+ * The round trip starts on "change", which on a text input is a BLUR-time
+ * event. Pressing Enter while the CIDR row still holds focus is the browser's
+ * implicit submission: the form submits and the input keeps the caret, so
+ * "change" has not run, pendingAutofills is empty, and the deferral above —
+ * which is the entire defence — is reached with nothing to defer for. The
+ * previous network's subnet, pool and gateway are posted as though nothing
+ * had been typed, and the network that WAS typed goes nowhere, because
+ * `cidr` is an input shape the settings layer never writes.
+ *
+ * `typeFocused` is what makes this visible at all: `type` fires "change" too,
+ * which is a blur the user has not performed, and under it the defect cannot
+ * be reproduced.
+ */
+describe("DHCP form — Enter pressed in the CIDR row", () => {
+  it("commits the typed network from the keydown, before the implicit submission it causes, and saves the DERIVED values (kills committing on \"change\" alone: nothing is pending when Enter submits, so the old network is saved and the typed one is discarded)", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+
+    // Typed, and the caret is still in the field — exactly as it is at the
+    // instant the user reaches for Enter.
+    harness.typeFocused("cidr", "10.0.0.0/24");
+    expect(harness.posted.filter((message) => message.type === "autofill")).toEqual([]);
+
+    // Enter. The commit has to happen HERE, in the keydown listener, because
+    // submission is that event's default action and runs after it returns.
+    harness.pressEnter("cidr");
+    const requests = harness.posted.filter((message) => message.type === "autofill");
+    expect(requests).toHaveLength(1);
+    expect(lastAutofill(harness.posted).value).toBe("10.0.0.0/24");
+    expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+
+    // …and now the implicit submission itself. It must find the request
+    // pending and be held — no preventDefault is involved, so this is the
+    // browser's own submit reaching the form's handler.
+    expect(harness.attemptSubmit()).toBeUndefined();
+    expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+
+    answerAutofill(harness);
+
+    const submitted = harness.posted.filter((message) => message.type === "submit");
+    expect(submitted).toHaveLength(1);
+    const values = submitted[0].type === "submit" ? submitted[0].values : {};
+    // The network the user actually entered, and the pool derived from it —
+    // not one field of the 192.168.2.x form they replaced.
+    expect(values.cidr).toBe("10.0.0.0/24");
+    expect(values.subnet).toBe("255.255.255.0");
+    expect(values.rangeStart).toBe("10.0.0.1");
+    expect(values.broadcast).toBe("10.0.0.255");
+    expect(harness.saveDisabled()).toBe(false);
+  });
+
+  it("commits once when a \"change\" follows the same Enter, rather than posting the round trip twice", () => {
+    // Whether an engine also fires "change" for an Enter-driven submission is
+    // not this script's to decide, so both orders have to be survivable. A
+    // duplicate would be harmless — request ids make concurrent requests
+    // independent — but the shared "edited" gate means the second gesture for
+    // one edit finds nothing left to commit and mints nothing.
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.typeFocused("cidr", "10.0.0.0/24");
+    harness.pressEnter("cidr");
+    harness.blur("cidr");
+
+    expect(harness.posted.filter((message) => message.type === "autofill")).toHaveLength(1);
+    answerAutofill(harness);
+    expect(harness.saveDisabled()).toBe(false);
+    expect(harness.submit().rangeStart).toBe("10.0.0.1");
+  });
+
+  it("posts nothing for Enter in a CIDR row the user never edited, so a hand-set pool start survives the save (kills committing on every Enter: dhcpCidrFormFills writes rangeStart unconditionally, and the snapshot guard cannot object because the field still holds what the snapshot took)", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    // The user's own pool start, and a CIDR row left exactly as rendered.
+    harness.type("rangeStart", "192.168.2.50");
+    harness.pressEnter("cidr");
+
+    expect(harness.posted.filter((message) => message.type === "autofill")).toEqual([]);
+    // Nothing in flight, so the implicit submission goes straight out — and
+    // it carries the pool start the user typed, not the network's first host.
+    expect(harness.attemptSubmit()?.rangeStart).toBe("192.168.2.50");
+  });
+
+  it("does not re-derive from a CIDR the ANSWER wrote back (kills judging the commit on whether the value changed: the host normalises the row, so a value-comparison gate reads its own fill as a fresh edit)", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    // A host part rather than a network address, so the answer writes a
+    // DIFFERENT string back into the row than the user typed.
+    harness.typeFocused("cidr", "10.0.0.77/24");
+    harness.pressEnter("cidr");
+    answerAutofill(harness);
+    expect(harness.value("cidr")).toBe("10.0.0.0/24");
+
+    const before = harness.posted.filter((message) => message.type === "autofill").length;
+    harness.pressEnter("cidr");
+    expect(harness.posted.filter((message) => message.type === "autofill")).toHaveLength(before);
+    expect(harness.attemptSubmit()?.rangeStart).toBe("10.0.0.1");
+  });
+
+  it("ignores every other key — only Enter ends an edit", () => {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.typeFocused("cidr", "10.0.0.0/24");
+    // Mid-edit keystrokes must not derive a pool from a half-typed network,
+    // which is the reason this row never listened to "input" in the first
+    // place.
+    harness.pressKey("cidr", "0");
+    harness.pressKey("cidr", "Tab");
+    expect(harness.posted.filter((message) => message.type === "autofill")).toEqual([]);
+  });
+});
