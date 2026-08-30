@@ -683,3 +683,90 @@ describe("networkInterfaceBindOptions — netmask passthrough", () => {
     expect(options()[0]).toEqual({ label: "All interfaces (0.0.0.0)", value: "" });
   });
 });
+
+/**
+ * REVIEW FINDING (P2, carried over from #111) — the module this file exercises
+ * documented `networkInterfaceBindOptions()` as already excluding WSL, Hyper-V
+ * and Docker adapters. It never did: `ipv4Options` drops `internal` addresses
+ * and nothing else, and a hypervisor switch is reported as external. So the one
+ * arrangement the comment claimed was impossible — a virtual adapter as the
+ * single confident answer for a lab pool — was the one that happened.
+ *
+ * These fixtures are deliberately NOT marked `internal`, which is what makes
+ * them fail against the old implementation instead of being filtered out before
+ * the comparison ever sees them.
+ */
+describe("suggestBindAddressForPool — a virtual adapter is never the confident answer", () => {
+  it("declines to auto-select a Docker bridge that is the only NIC on the pool's subnet", () => {
+    networkInterfaces.mockReturnValue({
+      docker0: [ipv4("172.17.0.1", "255.255.0.0")],
+      eth0: [ipv4("192.168.1.20")]
+    });
+    // Still reported — something IS on that subnet — but never as a NIC to
+    // bind to on the user's behalf, which is what `ambiguous` gates.
+    expect(suggestBindAddressForPool("172.17.0.10", "255.255.0.0", options())).toEqual({
+      address: "172.17.0.1",
+      ambiguous: true
+    });
+  });
+
+  it.each([
+    ["a Hyper-V switch by name", "vEthernet (Default Switch)"],
+    ["a WSL host link by name", "vEthernet (WSL)"],
+    ["a VirtualBox host-only adapter", "vboxnet0"],
+    ["a libvirt bridge", "virbr0"],
+    ["a VPN tunnel", "tun0"]
+  ])("declines %s the same way", (_label, name) => {
+    networkInterfaces.mockReturnValue({ [name]: [ipv4("10.0.0.5")] });
+    expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toEqual({
+      address: "10.0.0.5",
+      ambiguous: true
+    });
+  });
+
+  it("recognises a renamed Hyper-V adapter by its MAC when the name says nothing", () => {
+    // A renamed Windows connection keeps its 00:15:5d OUI. Without the MAC arm
+    // this fixture is indistinguishable from a physical NIC.
+    networkInterfaces.mockReturnValue({
+      "Ethernet 3": [{ ...ipv4("10.0.0.5"), mac: "00:15:5d:01:02:03" }]
+    });
+    expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toEqual({
+      address: "10.0.0.5",
+      ambiguous: true
+    });
+  });
+
+  it("lets a physical NIC win outright rather than calling the pair a tie", () => {
+    // Both are on the pool's subnet. Counting the bridge as a rival match would
+    // report `ambiguous` and suppress the auto-selection of the real answer —
+    // the virtual NIC was never a candidate, so this is not a tie.
+    networkInterfaces.mockReturnValue({
+      docker0: [ipv4("10.0.0.1")],
+      eth0: [ipv4("10.0.0.5")]
+    });
+    expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toEqual({
+      address: "10.0.0.5",
+      ambiguous: false
+    });
+  });
+
+  it("leaves the Server Identifier unresolved rather than deriving it from a bridge", () => {
+    // One lever, three consumers: `resolveDhcpServerIdentifier` gates on the
+    // same `ambiguous` flag, so option 54 stops naming the bridge too.
+    networkInterfaces.mockReturnValue({ docker0: [ipv4("10.0.0.1")] });
+    expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "", options())).toBeUndefined();
+  });
+
+  it("still honours a bind the user made to a virtual adapter themselves", () => {
+    // The flag governs suggestion, not use. A VM lab served over a host-only
+    // switch is a real setup, and it must not start reporting itself broken.
+    networkInterfaces.mockReturnValue({ docker0: [ipv4("10.0.0.1")] });
+    expect(dhcpInterfaceSubnetStatus("10.0.0.1", "255.255.255.0", "10.0.0.10", options())).toBe("match");
+    expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "10.0.0.1", options())).toBe("10.0.0.1");
+  });
+
+  it("keeps a virtual adapter in the picker", () => {
+    networkInterfaces.mockReturnValue({ docker0: [ipv4("172.17.0.1", "255.255.0.0")] });
+    expect(options().map((option) => option.value)).toContain("172.17.0.1");
+  });
+});

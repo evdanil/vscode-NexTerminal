@@ -306,12 +306,12 @@ function excludeOwnAddresses(input: {
   readonly poolTop: number;
   readonly network: string;
   readonly subnet: string;
-  readonly ownAddresses: readonly string[] | undefined;
+  readonly excludedAddresses: readonly string[] | undefined;
 }): DhcpPoolWindow | undefined {
   const { firstHost, poolSize, poolTop, network, subnet } = input;
   const occupied = Array.from(
     new Set(
-      (input.ownAddresses ?? [])
+      (input.excludedAddresses ?? [])
         .filter((address) => isValidIpv4(address) && isSameSubnet(address, network, subnet))
         .map((address) => ipToInt(address) >>> 0)
     )
@@ -364,6 +364,20 @@ function excludeOwnAddresses(input: {
  * {@link dhcpCidrProblem} wants exactly that, since it is asking whether the
  * NETWORK describes a pool, not whether this particular machine has room in it.
  *
+ * `reservedAddresses` are kept out of the pool the same way, and exist because
+ * this machine's own addresses are not the only ones on the wire that must not
+ * be leased. A gateway or DNS server the user configured by hand SURVIVES this
+ * fill — {@link isAutoFillable} preserves anything that is not a stale
+ * suggestion — so it is an address the pool has to be built around, exactly as
+ * a local NIC is. Without it, a manual gateway of `10.0.0.1` plus a typed
+ * `10.0.0.0/24` derives `10.0.0.1`–`10.0.0.253` and the service can hand the
+ * router's own address to a client. They are a separate parameter rather than
+ * merged into `ownAddresses` by the callers because the two mean different
+ * things to the one caller that reports on them: "this machine has no room on
+ * that network" and "your own settings leave no room" are different sentences.
+ * See {@link preservedInfrastructureAddresses} for working out which values
+ * will in fact survive, which both editors must decide identically.
+ *
  * @returns `undefined` for anything that is not a `/1`–`/30` network. `/31` and
  *   `/32` parse as CIDR but describe no pool, and `/0` is not a subnet. Also
  *   `undefined` when `ownAddresses` occupy every candidate start, i.e. the
@@ -372,7 +386,8 @@ function excludeOwnAddresses(input: {
  */
 export function dhcpCidrDerivation(
   text: string,
-  ownAddresses?: readonly string[]
+  ownAddresses?: readonly string[],
+  reservedAddresses?: readonly string[]
 ): DhcpCidrDerivation | undefined {
   const parsed = parseCidr(text);
   if (!parsed) return undefined;
@@ -398,7 +413,7 @@ export function dhcpCidrDerivation(
     poolTop: (ipToInt(derived.gateway) - 1) >>> 0,
     network,
     subnet,
-    ownAddresses
+    excludedAddresses: [...(ownAddresses ?? []), ...(reservedAddresses ?? [])]
   });
   if (!window) return undefined;
   const { rangeStart, rangeEnd, poolCount } = window;
@@ -579,11 +594,14 @@ function poolNetwork(
  *   including under an all-interfaces bind, where a "looks fine" answer would
  *   be an assertion about a subnet nothing here could work out.
  *
- * @param interfaces The already-filtered list from `networkInterfaceBindOptions()`.
- *   Passing a raw `os.networkInterfaces()` read would let a WSL or Docker NIC
- *   answer for a subnet no client is on — and under an all-interfaces bind that
- *   list is now the whole basis of the answer, not just a membership check for
- *   one address.
+ * @param interfaces From `networkInterfaceBindOptions()`, which filters loopback
+ *   and flags virtual NICs without dropping them. This comparison reads the
+ *   flag deliberately NOT at all: it asks whether the DISCOVERs can arrive, and
+ *   under an all-interfaces bind they genuinely do arrive on a Hyper-V switch
+ *   or a Docker bridge the socket is listening on. Warning that a pool served
+ *   over a host-only switch is unreachable would be a false alarm about a
+ *   working setup. What the flag governs is the opposite direction — picking a
+ *   NIC *for* the user — and lives in {@link suggestBindAddressForPool}.
  * @param allowRelayAgents When set, serving a subnet this machine is not on is
  *   the intended configuration — a relay agent forwards the request — so the
  *   comparison is not a fault to report at all, in either bind mode.
@@ -734,9 +752,23 @@ export interface BindAddressSuggestion {
  * NIC whose own mask is narrower than the pool's, or is unverifiable, is not
  * offered at all — and does not count towards `ambiguous` either.
  *
- * @param interfaces The already-filtered list from `networkInterfaceBindOptions()`,
- *   for the same reason {@link dhcpInterfaceSubnetStatus} needs it: virtual NICs
- *   (WSL, Hyper-V, Docker) sit on RFC1918 ranges and would match confidently.
+ * A NIC flagged `virtual` is held to the same rule for the same reason. A
+ * Hyper-V switch, a Docker bridge and a WSL host link all sit on RFC1918 ranges
+ * and would otherwise match a lab pool *confidently* — `docker0` on
+ * `172.17.0.1/16` is the single unambiguous NIC for a `172.17.0.0/16` pool, and
+ * offering it would bind the service to a bridge no physical client is on. So a
+ * virtual NIC is never the confident answer: it is returned only when nothing
+ * else matched, and then as `ambiguous`, which every consumer already reads as
+ * "do not act on this by yourself". It stays fully usable — the picker lists
+ * it, and a bind the user makes to it is a `match` like any other, which is
+ * what keeps a deliberately-served VM network working.
+ *
+ * `ambiguous` therefore means "no single CANDIDATE", not "more than one NIC
+ * matched": one physical match alongside a virtual one is unambiguous, because
+ * the virtual one was never in the running.
+ *
+ * @param interfaces From `networkInterfaceBindOptions()`, which flags virtual
+ *   NICs rather than dropping them (see above) and filters loopback.
  * @param rangeEnd The pool's configured last address, when the caller has it —
  *   see {@link dhcpInterfaceSubnetStatus}'s parameter of the same name. The two
  *   have to be asked with the same window or the status warns about a pool this
@@ -758,7 +790,12 @@ export function suggestBindAddressForPool(
   if (!pool) return undefined;
   const matches = interfacesOnPoolSubnet(interfaces, pool);
   if (matches.length === 0) return undefined;
-  return { address: matches[0].value, ambiguous: matches.length > 1 };
+  const candidates = matches.filter((option) => option.virtual !== true);
+  // Nothing but virtual adapters on this subnet: still an answer worth
+  // returning — a caller showing the list wants to know one exists — but never
+  // a confident one, so it goes back marked the way a genuine tie does.
+  if (candidates.length === 0) return { address: matches[0].value, ambiguous: true };
+  return { address: candidates[0].value, ambiguous: candidates.length > 1 };
 }
 
 /**
@@ -953,6 +990,45 @@ export function isDnsAutoFillable(
 }
 
 /**
+ * The infrastructure addresses a CIDR fill is about to leave alone, and which
+ * therefore have to be kept out of the pool it derives.
+ *
+ * A fill replaces the gateway and DNS only when they are its own stale
+ * suggestions ({@link isAutoFillable}); anything the user typed survives. That
+ * makes the surviving values part of the network the new pool is being built
+ * on, no different from an address a NIC here holds — a router at `10.0.0.1`
+ * is a router whether this machine can see it in `os.networkInterfaces()` or
+ * not, and leasing its address to a client breaks the network either way.
+ *
+ * Deciding this BEFORE the derivation is what makes the ordering work, and it
+ * is possible because neither predicate consults the new network: both compare
+ * the value in hand against what the PREVIOUS network would have derived.
+ *
+ * The Server Identifier is deliberately not in here. When it is auto-filled it
+ * resolves to an address this machine holds, which `ownAddresses` already
+ * covers; when it is preserved it is the user's own statement about which of
+ * this machine's addresses to advertise. Neither case adds an address the pool
+ * does not already know about, and asking for it here would need the derived
+ * window that {@link refreshDhcpServerIdentifier} is itself resolved from.
+ *
+ * @param previous What the network as it stood would have derived, or
+ *   `undefined` when it derives nothing — in which case no current value can be
+ *   a stale suggestion, so every one of them is preserved and excluded.
+ */
+export function preservedInfrastructureAddresses(args: {
+  readonly gateway: string | undefined;
+  readonly dns: readonly string[];
+  readonly previous: { readonly gateway: string; readonly dns: readonly string[] } | undefined;
+}): string[] {
+  const preserved: string[] = [];
+  if (!isAutoFillable(args.gateway, args.previous?.gateway) && args.gateway !== undefined) {
+    preserved.push(args.gateway);
+  }
+  if (!isDnsAutoFillable(args.dns, args.previous?.dns)) preserved.push(...args.dns);
+  return preserved.filter((address) => isValidIpv4(address));
+}
+
+/**
  * The full form's CIDR row, which is an input shape rather than a setting.
  *
  * Named once because three places have to agree on it: the field descriptor,
@@ -1075,13 +1151,25 @@ export function dhcpCidrFormFills(
   interfaces: readonly NetworkInterfaceOption[],
   previousBindAddress?: string
 ): Record<string, string> | undefined {
-  const derived = dhcpCidrDerivation(
-    text,
-    interfaces.map((option) => option.value)
-  );
-  if (!derived) return undefined;
   const previousRangeStart = readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart;
   const previousSubnet = readSettingString(values.subnet);
+  // The previous network is resolved BEFORE the derivation, not after it as an
+  // earlier pass had it, because the pool has to be built around the gateway
+  // and DNS this fill is going to preserve — and which those are is a question
+  // about the OLD network (see `preservedInfrastructureAddresses`). Nothing
+  // here reads `derived`, so the move is an ordering change and not a
+  // behavioural one for any value below.
+  const previous = dhcpDerivedAddresses(previousRangeStart, previousSubnet);
+  const derived = dhcpCidrDerivation(
+    text,
+    interfaces.map((option) => option.value),
+    preservedInfrastructureAddresses({
+      gateway: readSettingString(values.gateway),
+      dns: formDnsList(values.dns),
+      previous
+    })
+  );
+  if (!derived) return undefined;
   // The form renders a pool COUNT, not an end, and derives `rangeEnd` from the
   // pair on submit (see the `rangeEnd` row in `networkServerCommands.ts`). The
   // previous window is therefore reconstructed the same way rather than read
@@ -1090,7 +1178,6 @@ export function dhcpCidrFormFills(
   // one is asked about a narrow one would compare two different questions'
   // answers through the gate.
   const previousRangeEnd = dhcpRangeEndForCount(previousRangeStart, readSettingNumber(values.poolCount));
-  const previous = dhcpDerivedAddresses(previousRangeStart, previousSubnet);
   const fills: Record<string, string> = {
     // Normalised: a pool start typed as the CIDR host part (192.168.2.55/24)
     // is echoed back as the network it names, matching what dhcpCurrentCidr
@@ -1209,8 +1296,57 @@ export function dhcpFormAutofillFields(
   const current = values ?? {};
   if (key === DHCP_CIDR_FIELD_KEY) return dhcpCidrFormFills(value, current, interfaces);
   if (key !== "interface") return undefined;
+  // Under a relay agent the two triggers stop meaning the same thing. Typing a
+  // CIDR still says "serve THIS network" — that is the whole point of the row,
+  // and a relayed pool is a network the user has to name by hand precisely
+  // because this machine is not on it. Picking a NIC says only "answer from
+  // this address", and the NIC's own network is the LOCAL one, on the far side
+  // of the relay from every client. Deriving the pool from it replaces the
+  // relayed subnet, pool, gateway, broadcast and DNS with a network no client
+  // is on: rebinding a server that relays `10.0.0.0/24` from `192.168.1.5` to
+  // `192.168.1.6` silently starts offering `192.168.1.0/24` on Save.
+  if (readSettingBoolean(current.allowRelayAgents)) {
+    return dhcpRelayBindFills(value, current, interfaces, previousValue);
+  }
   const cidr = dhcpInterfaceCidr(value, interfaces);
   return cidr === undefined ? undefined : dhcpCidrFormFills(cidr, current, interfaces, previousValue);
+}
+
+/**
+ * What a NIC change implies when a relay agent is in front of the service:
+ * the Server Identifier, and nothing else.
+ *
+ * The identifier still has to move, and is the one value here that genuinely
+ * does. Option 54 and BOOTP `siaddr` name the address clients reach THIS
+ * machine on, which a relay does not change — the relay forwards to it — so a
+ * rebind from `192.168.1.5` to `192.168.1.6` leaves an auto-filled identifier
+ * pointing at an address the socket has stopped answering on. The gate is
+ * {@link refreshDhcpServerIdentifier}'s, shared with the other call sites, so
+ * an identifier the user typed survives this exactly as it survives the rest.
+ *
+ * Both endpoints carry the pool as it stands, unchanged: picking a NIC does not
+ * move the pool, and under relay {@link resolveDhcpServerIdentifier} does not
+ * read it at all. It is passed rather than omitted so the two sides are asked
+ * the same question, which is the property the gate depends on.
+ */
+function dhcpRelayBindFills(
+  value: string,
+  values: FormValues,
+  interfaces: readonly NetworkInterfaceOption[],
+  previousValue?: string
+): Record<string, string> | undefined {
+  const rangeStart = readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart;
+  const subnet = readSettingString(values.subnet);
+  const rangeEnd = dhcpRangeEndForCount(rangeStart, readSettingNumber(values.poolCount));
+  const pool = { rangeStart, subnet, rangeEnd };
+  const resolved = refreshDhcpServerIdentifier({
+    next: { ...pool, bindAddress: value },
+    previous: { ...pool, bindAddress: readSettingString(previousValue ?? value) },
+    interfaces,
+    allowRelayAgents: true,
+    configuredServerId: readSettingString(values.serverId)
+  });
+  return resolved === undefined ? undefined : { serverId: resolved };
 }
 
 /** One entry of the form's bind-address picker, annotated for the pool it serves. */
