@@ -343,6 +343,59 @@ describe("DHCP submit validation — a network this machine leaves no room in", 
   });
 });
 
+/**
+ * REVIEW FINDING (expert review of the 2.8.211 follow-up) — the block above
+ * closed this hole for the addresses this MACHINE holds, and the follow-up that
+ * taught the CIDR fill to also keep a hand-set gateway or DNS server out of the
+ * pool reopened it for those: the fill derived with them excluded, the submit
+ * check did not, so a network they crowded out filled nothing and saved
+ * cleanly — the same silent discard, reached from the other side.
+ *
+ * The machine holds nothing on 10.0.0.x in these fixtures, so only the
+ * preserved gateway can refuse the network. That is what makes them fail
+ * against a check that asks only about own addresses.
+ */
+describe("DHCP submit validation — a network the preserved settings leave no room in", () => {
+  const CIDR_RESERVED_TAKEN =
+    "10.0.0.0/30 leaves no pool once the gateway and DNS addresses you set by hand are kept out — every address it could hand out is already spoken for.";
+
+  it("rejects the network instead of saving the pool the form still held", async () => {
+    // .1 is the /30's only poolable address, and the gateway on the form is a
+    // decision the fill preserves rather than one it would overwrite.
+    await expect(submitDhcp({ ...VALID, gateway: "10.0.0.1", cidr: "10.0.0.0/30" })).rejects.toThrow(
+      CIDR_RESERVED_TAKEN
+    );
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("applies the same rule to a hand-set DNS server", async () => {
+    await expect(submitDhcp({ ...VALID, dns: "10.0.0.1", cidr: "10.0.0.0/30" })).rejects.toThrow(
+      CIDR_RESERVED_TAKEN
+    );
+  });
+
+  it("saves the network when the gateway on it is one the fill would replace", async () => {
+    // 192.168.2.254 is what the previous network derives, so it is a stale
+    // suggestion, not a reservation — it is about to be overwritten and cannot
+    // crowd anything out.
+    await expect(
+      submitDhcp({ ...VALID, gateway: "192.168.2.254", cidr: "10.0.0.0/30" })
+    ).resolves.toBeUndefined();
+  });
+
+  it("saves a network with room to spare alongside the preserved gateway", async () => {
+    await expect(submitDhcp({ ...VALID, gateway: "10.0.0.1", cidr: "10.0.0.0/24" })).resolves.toBeUndefined();
+  });
+
+  it("names this machine's own occupancy first when both would refuse it", async () => {
+    // One message per cause, and the one the user cannot edit comes first.
+    machineOn("10.0.0.1");
+    await expect(submitDhcp({ ...VALID, gateway: "10.0.0.1", cidr: "10.0.0.0/30" })).rejects.toThrow(
+      "this machine's own addresses"
+    );
+  });
+});
+
 describe("DHCP submit validation — scope", () => {
   it("leaves the TFTP form unvalidated, since it has no address fields", async () => {
     await expect(submitTftp({ root: "/srv/tftp", port: "69" })).resolves.toBeUndefined();

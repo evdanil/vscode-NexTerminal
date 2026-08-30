@@ -188,6 +188,26 @@ describe("applying a CIDR", () => {
     expect(written("gateway")).toBeUndefined();
   });
 
+  /**
+   * REVIEW FINDING (expert review of the 2.8.211 follow-up) — the test below
+   * uses a gateway on the OLD network, which `isSameSubnet` filters out of the
+   * exclusion set before it can matter, so it passed against the broken code
+   * too. This one puts the preserved gateway ON the network being typed, which
+   * is the only arrangement that pins the wiring: delete the `reserved`
+   * argument from this editor's `dhcpCidrDerivation` call and it goes red.
+   */
+  it("builds the pool around a hand-set gateway that is on the NEW network", async () => {
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", gateway: "10.0.0.1" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    // The gateway is a decision and survives untouched...
+    expect(written("gateway")).toBe("10.0.0.1");
+    // ...so the pool must start above it rather than on it.
+    expect(written("rangeStart")).toBe("10.0.0.2");
+  });
+
   it("leaves a hand-set gateway alone while still moving the pool", async () => {
     // 192.168.2.1 is not what this editor would have suggested for the old
     // network (it suggests the top usable address), so it is a decision.

@@ -724,15 +724,62 @@ describe("suggestBindAddressForPool — a virtual adapter is never the confident
     });
   });
 
-  it("recognises a renamed Hyper-V adapter by its MAC when the name says nothing", () => {
+  it("recognises a renamed Hyper-V adapter on a host by its MAC when the name says nothing", () => {
     // A renamed Windows connection keeps its 00:15:5d OUI. Without the MAC arm
-    // this fixture is indistinguishable from a physical NIC.
+    // this fixture is indistinguishable from a physical NIC. `Ethernet` is the
+    // host's own hardware, and its presence is what makes the MAC arm
+    // trustworthy here — see the guest case below.
     networkInterfaces.mockReturnValue({
+      Ethernet: [{ ...ipv4("192.168.1.20"), mac: "3c:52:82:aa:bb:cc" }],
       "Ethernet 3": [{ ...ipv4("10.0.0.5"), mac: "00:15:5d:01:02:03" }]
     });
     expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toEqual({
       address: "10.0.0.5",
       ambiguous: true
+    });
+  });
+
+  /**
+   * REVIEW FINDING (expert review of this change) — a hypervisor OUI means the
+   * opposite thing depending on which side of the hypervisor we are on. Inside
+   * a guest it belongs to the machine's one REAL NIC, and VS Code running in a
+   * VM bridged to a physical lab wire is an ordinary bench for this extension.
+   * Flagging it there does not withhold a nicety: under the default
+   * all-interfaces bind `suggestBindAddressForPool` is the only route to option
+   * 54, so a previously auto-filled Server Identifier would stop following the
+   * network it names.
+   */
+  describe("inside a VM guest, where the hypervisor MAC is the real NIC", () => {
+    it("does not flag the guest's only NIC", () => {
+      networkInterfaces.mockReturnValue({
+        ens33: [{ ...ipv4("10.0.0.5"), mac: "00:0c:29:11:22:33" }]
+      });
+      expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toEqual({
+        address: "10.0.0.5",
+        ambiguous: false
+      });
+    });
+
+    it("keeps resolving the Server Identifier under the default all-interfaces bind", () => {
+      // The consequence the flag would otherwise have. `""` is the packaged
+      // bind, so this goes through the suggestion rather than the match branch.
+      networkInterfaces.mockReturnValue({
+        ens33: [{ ...ipv4("10.0.0.5"), mac: "52:54:00:11:22:33" }]
+      });
+      expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "", options())).toBe("10.0.0.5");
+    });
+
+    it("still flags a container bridge alongside it, which the NAME settles", () => {
+      // A guest running Docker: the MAC arm is dropped for ens33, but docker0
+      // is named, and a name is unambiguous on either side of a hypervisor.
+      networkInterfaces.mockReturnValue({
+        docker0: [{ ...ipv4("10.0.0.1"), mac: "02:42:ac:11:00:01" }],
+        ens33: [{ ...ipv4("10.0.0.5"), mac: "00:0c:29:11:22:33" }]
+      });
+      expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toEqual({
+        address: "10.0.0.5",
+        ambiguous: false
+      });
     });
   });
 

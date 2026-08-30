@@ -39,6 +39,14 @@ export interface NetworkInterfaceOption {
    * auto-select and an auto-derived Server Identifier both stay off it (see
    * that function for why one lever covers all three consumers).
    *
+   * Withholding the identifier is why the flag is set conservatively rather
+   * than generously. Under an all-interfaces bind it is the ONLY route to
+   * option 54, so flagging a NIC that is really serving the pool does not just
+   * decline to fill the field — it can leave an identifier filled for the
+   * previous network sitting there after a change, which is worse than either
+   * filling or clearing it. `applyVirtualMacArm` exists for the one case where
+   * that was reachable.
+   *
    * Absent when the NIC does not look virtual — including on any platform whose
    * `os.networkInterfaces()` answer this heuristic does not recognise, which is
    * the same "no opinion" the key's absence has always meant.
@@ -50,10 +58,12 @@ export interface NetworkInterfaceOption {
  * Adapter names that belong to a hypervisor, container runtime or VPN rather
  * than to a physical wire.
  *
- * Anchored where the name is a whole identifier (`docker0`, `vmnet8`) and
- * substring-matched only for the Windows spellings, which are prose
- * (`vEthernet (WSL)`, `VMware Network Adapter VMnet1`). `br-` is Docker's
- * user-defined bridge, whose suffix is a network id.
+ * Anchored at the start throughout, and closed at the end only where the name
+ * is a whole identifier (`docker0`, `vmnet8`). The Windows spellings are prose
+ * and are matched anywhere in it (`vEthernet (WSL)`, `VMware Network Adapter
+ * VMnet1`); `br-` is Docker's user-defined bridge, whose suffix is a network
+ * id; and `virbr` is left open because libvirt suffixes its own (`virbr0-nic`),
+ * every one of which is as virtual as the bridge itself.
  */
 const VIRTUAL_INTERFACE_NAMES: readonly RegExp[] = [
   /^docker\d*$/i,
@@ -92,19 +102,25 @@ const VIRTUAL_MAC_PREFIXES: readonly string[] = [
 ];
 
 /**
- * Whether a NIC looks virtual, from the two things `os.networkInterfaces()`
- * reports about it.
+ * Whether a NIC's NAME says it is virtual.
  *
- * A heuristic, deliberately, and the asymmetry of its two failure modes is what
- * makes one acceptable here. A false POSITIVE costs a suggestion: the address
- * stays in the picker, still annotated as matching the pool subnet, and the
- * user selects it themselves. A false NEGATIVE is simply today's behaviour. So
- * the list may be incomplete without the feature becoming wrong — only less
- * helpful — and nothing downstream may treat the flag as an assertion that the
- * NIC is unusable.
+ * A heuristic, deliberately, and one whose two failure modes are not equally
+ * bad. A false NEGATIVE is simply the behaviour that shipped in 2.8.210. A
+ * false POSITIVE costs more than the convenience it looks like: besides
+ * withholding the suggestion, it stops `resolveDhcpServerIdentifier` resolving
+ * option 54 under an all-interfaces bind, which can leave a PREVIOUSLY
+ * auto-filled identifier pointing at the old subnet after a network change
+ * instead of following it. So the list may be incomplete without the feature
+ * becoming wrong, but it may not be liberal — every pattern here has to name a
+ * thing that is virtual by construction, and nothing downstream may treat the
+ * flag as an assertion that the NIC is unusable.
  */
-export function isVirtualInterface(name: string, mac?: string): boolean {
-  if (VIRTUAL_INTERFACE_NAMES.some((pattern) => pattern.test(name))) return true;
+export function isVirtualInterfaceName(name: string): boolean {
+  return VIRTUAL_INTERFACE_NAMES.some((pattern) => pattern.test(name));
+}
+
+/** Whether a NIC's MAC carries a hypervisor's OUI. */
+export function hasVirtualInterfaceMac(mac?: string): boolean {
   const normalised = (mac ?? "").toLowerCase();
   if (normalised.length === 0 || normalised === "00:00:00:00:00:00") return false;
   return VIRTUAL_MAC_PREFIXES.some((prefix) => normalised.startsWith(prefix));
@@ -122,31 +138,64 @@ export const ALL_INTERFACES_OPTION: NetworkInterfaceOption = {
   value: ALL_INTERFACES_VALUE
 };
 
+/**
+ * The MAC arm is trusted only while it leaves something unflagged.
+ *
+ * A hypervisor OUI means two opposite things depending on which side of the
+ * hypervisor this code is running on. On a HOST, `00:15:5d` is a Hyper-V switch
+ * — the case the name arm misses when the connection has been renamed, which is
+ * the whole reason the MAC arm exists. Inside a GUEST, it is the machine's one
+ * real NIC: a VS Code running in a VMware or KVM VM, bridged to a physical lab
+ * wire, is a perfectly ordinary bench for this extension (EVE-NG is exactly
+ * that), and flagging its only NIC would withhold the Server Identifier the
+ * pool needs rather than withhold a nicety.
+ *
+ * The two are told apart by what is left over. A host has something that is
+ * neither named nor MAC'd as virtual — its own hardware. A guest does not. So
+ * when honouring the MAC arm would flag EVERY remaining NIC, the signal is
+ * telling us where we are running, not what this adapter is, and it is dropped;
+ * names, which are unambiguous either way, are always honoured.
+ */
+function applyVirtualMacArm(
+  entries: readonly { readonly name: string; readonly mac?: string }[]
+): boolean[] {
+  const byName = entries.map((entry) => isVirtualInterfaceName(entry.name));
+  const byMac = entries.map((entry, index) => !byName[index] && hasVirtualInterfaceMac(entry.mac));
+  const survivesMacArm = entries.some((_entry, index) => !byName[index] && !byMac[index]);
+  return entries.map((_entry, index) => byName[index] || (survivesMacArm && byMac[index]));
+}
+
 function ipv4Options(includeInternal: boolean): NetworkInterfaceOption[] {
-  const options: NetworkInterfaceOption[] = [];
   const seen = new Set<string>();
+  const entries: { name: string; address: string; netmask?: string; mac?: string }[] = [];
   for (const [name, addresses] of Object.entries(os.networkInterfaces())) {
     for (const address of addresses ?? []) {
       if (address.family !== "IPv4") continue;
       if (address.internal && !includeInternal) continue;
       if (address.address === "0.0.0.0" || seen.has(address.address)) continue;
       seen.add(address.address);
-      const label = `${name} — ${address.address}`;
-      // Each key is added only when there is something to add, so an option
-      // built from an address with no reported netmask — and one on a NIC that
-      // does not look virtual — stays shape-identical to what this enumerator
-      // has always returned.
-      const option: NetworkInterfaceOption = { label, value: address.address };
-      options.push({
-        ...option,
-        ...(typeof address.netmask === "string" && address.netmask.length > 0
-          ? { netmask: address.netmask }
-          : {}),
-        ...(isVirtualInterface(name, address.mac) ? { virtual: true } : {})
+      entries.push({
+        name,
+        address: address.address,
+        netmask: typeof address.netmask === "string" && address.netmask.length > 0 ? address.netmask : undefined,
+        mac: address.mac
       });
     }
   }
-  return options;
+  // Decided across the whole list rather than per NIC, because whether a
+  // hypervisor MAC means "this adapter is virtual" depends on what else is
+  // here — see `applyVirtualMacArm`.
+  const virtual = applyVirtualMacArm(entries);
+  // Each key is added only when there is something to add, so an option built
+  // from an address with no reported netmask — and one on a NIC that does not
+  // look virtual — stays shape-identical to what this enumerator has always
+  // returned.
+  return entries.map((entry, index) => ({
+    label: `${entry.name} — ${entry.address}`,
+    value: entry.address,
+    ...(entry.netmask === undefined ? {} : { netmask: entry.netmask }),
+    ...(virtual[index] ? { virtual: true } : {})
+  }));
 }
 
 /**

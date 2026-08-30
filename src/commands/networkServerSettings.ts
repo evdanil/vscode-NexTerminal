@@ -455,7 +455,11 @@ export function dhcpCidrDerivation(
  * @returns `undefined` for a usable network, and for blank input, which the
  *   editors treat as "leave it alone" rather than as an error.
  */
-export function dhcpCidrProblem(text: string, ownAddresses?: readonly string[]): string | undefined {
+export function dhcpCidrProblem(
+  text: string,
+  ownAddresses?: readonly string[],
+  reservedAddresses?: readonly string[]
+): string | undefined {
   const trimmed = text.trim();
   if (trimmed.length === 0) return undefined;
   const parts = trimmed.split("/");
@@ -487,11 +491,17 @@ export function dhcpCidrProblem(text: string, ownAddresses?: readonly string[]):
     return `${trimmed} does not describe a usable DHCP subnet.`;
   }
   // Reached only for a network that IS usable in the abstract — the check above
-  // already said so — so the only thing this can be refusing is the machine's
-  // own occupancy of it. Same wording the quick editor's post-selection warning
-  // uses for the same cause, per this function's one-message-per-cause rule.
+  // already said so — so the only thing left to refuse is somebody's occupancy
+  // of it. Same wording the quick editor's post-selection warning uses for the
+  // same causes, per this function's one-message-per-cause rule, and in the
+  // same order: this machine's own addresses first, because "your hardware is
+  // on it" is a fact the user cannot edit, while a reserved address is a
+  // setting of theirs they can.
   if (ownAddresses && !dhcpCidrDerivation(trimmed, ownAddresses)) {
     return `${trimmed} leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here.`;
+  }
+  if (reservedAddresses && !dhcpCidrDerivation(trimmed, ownAddresses, reservedAddresses)) {
+    return `${trimmed} leaves no pool once the gateway and DNS addresses you set by hand are kept out — every address it could hand out is already spoken for.`;
   }
   return undefined;
 }
@@ -1455,19 +1465,35 @@ export function networkServerProfileSettingUpdates(
  * use the packaged default", which is always valid.
  */
 export function validateDhcpValues(values: FormValues, ownAddresses?: readonly string[]): string | undefined {
+  // The reserved addresses are worked out here rather than taken as a
+  // parameter, from the same fields and by the same helper `dhcpCidrFormFills`
+  // uses, because the two have to agree by construction. Threading them from
+  // the caller would let one editor's idea of "preserved" drift from the
+  // other's, which is the very divergence this check exists to close.
+  const reservedAddresses = preservedInfrastructureAddresses({
+    gateway: readSettingString(values.gateway),
+    dns: formDnsList(values.dns),
+    previous: dhcpDerivedAddresses(
+      readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart,
+      readSettingString(values.subnet)
+    )
+  });
   // Checked first, and by the same function the quick editor's input box uses.
   // The CIDR row is the shorthand every other pool field was filled from, so
   // when it is the thing that cannot be made sense of, saying so beats
   // reporting whichever derived field happens to fail afterwards. A blank row
   // is not an error — it means "leave the pool alone".
   //
-  // `ownAddresses` is what makes the CIDR row's autofill and this check ask the
-  // same question. The autofill derives with this machine's addresses excluded;
-  // without passing them here too, a network that leaves no room on this host
-  // would fill nothing and still save, keeping the pool the form opened on.
+  // `ownAddresses` and the reserved addresses above are what make the CIDR row's
+  // autofill and this check ask the same question. The autofill derives with
+  // both excluded; without excluding them here too, a network that leaves no
+  // room once they are kept out would fill nothing and still save, keeping the
+  // pool the form opened on and discarding the typed network without a word.
+  // The reserved half was the half that got away: a hand-set gateway of
+  // 10.0.0.1 with 10.0.0.0/30 typed in filled nothing and saved cleanly.
   const cidrProblem =
     typeof values[DHCP_CIDR_FIELD_KEY] === "string"
-      ? dhcpCidrProblem(values[DHCP_CIDR_FIELD_KEY], ownAddresses)
+      ? dhcpCidrProblem(values[DHCP_CIDR_FIELD_KEY], ownAddresses, reservedAddresses)
       : undefined;
   if (cidrProblem) return cidrProblem;
   const parserProblem = validateDhcpFormInput(values);
