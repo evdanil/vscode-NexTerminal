@@ -211,16 +211,82 @@ describe("dhcpCidrFormFills — the server identifier", () => {
     expect(fills).not.toHaveProperty("serverId");
   });
 
-  it("abstains under relay even when a NIC of this machine IS on the pool's subnet", () => {
-    // eth1 holds 10.0.0.5, so a resolution would succeed here. Relay mode still
-    // says nothing: with giaddr in play the requests this server answers do not
-    // arrive on that wire, and the flag is the user's statement that the pool's
-    // subnet is not where clients are. Kills "resolve first, fall back to the
-    // gateway only when resolution fails" — that implementation would fill
-    // 10.0.0.5 here and go green on the two cases above.
+  /**
+   * REVIEW FINDING (P1, fifth round — relay with an explicit held bind). This
+   * test used to assert the opposite — that relay mode filled NOTHING even with
+   * an explicit, held bind address — and that assertion was pinning the defect
+   * rather than a decision.
+   *
+   * The blanket relay skip read "a relayed pool is on a wire this machine holds
+   * no NIC on, so there is no address to resolve". True of the POOL, false of
+   * the BIND: `interface` here names an address this machine currently holds and
+   * the socket is about to answer from, and option 54 / BOOTP `siaddr` have to
+   * name exactly that. Abstaining left a config advertising whatever stale
+   * identifier was configured — including the packaged 192.168.2.1 — on a
+   * service reachable at 10.0.0.5.
+   *
+   * The fixture keeps the discriminator the old test had: the gateway derives to
+   * 10.0.0.254, so "fall back to the gateway" is still visibly wrong.
+   */
+  it("fills it from an explicit, currently-held bind address under relay", () => {
     const fills = dhcpCidrFormFills(
       "10.0.0.0/24",
       { ...UNTOUCHED, allowRelayAgents: true, interface: "10.0.0.5" },
+      INTERFACES
+    )!;
+    expect(fills.serverId).toBe("10.0.0.5");
+    // Not the derived gateway, which is the client subnet's router.
+    expect(fills.gateway).toBe("10.0.0.254");
+  });
+
+  it("fills it from a bind that is OFF the relayed pool's subnet, which is relay's own arrangement", () => {
+    // The reported shape: bound to 192.168.9.5, relaying 10.0.0.0/24. Off-subnet
+    // is the point under relay, and 192.168.9.5 is still where this service
+    // answers. Without the flag this same call fills 10.0.0.5 instead — the NIC
+    // on the pool's wire — so the flag genuinely changes the answer.
+    const relayed = dhcpCidrFormFills(
+      "10.0.0.0/24",
+      { ...UNTOUCHED, allowRelayAgents: true, interface: "192.168.9.5" },
+      INTERFACES
+    )!;
+    expect(relayed.serverId).toBe("192.168.9.5");
+    const direct = dhcpCidrFormFills("10.0.0.0/24", { ...UNTOUCHED, interface: "192.168.9.5" }, INTERFACES)!;
+    expect(direct.serverId).toBe("10.0.0.5");
+  });
+
+  it("fills nothing under relay for an all-interfaces bind, which names no single address", () => {
+    // The "don't guess" half of the fix, and the regression guard on it: eth1 is
+    // on 10.0.0.0/24, so an implementation that fell through to the NIC
+    // suggestion under relay would fill 10.0.0.5 for all of these.
+    for (const bind of [undefined, "", "   ", "0.0.0.0"]) {
+      const values: FormValues = { ...UNTOUCHED, allowRelayAgents: true };
+      if (bind !== undefined) values.interface = bind;
+      expect(dhcpCidrFormFills("10.0.0.0/24", values, INTERFACES)!).not.toHaveProperty("serverId");
+    }
+  });
+
+  it("fills nothing under relay for a bind no interface here holds", () => {
+    // `dhcpInterfaceSubnetStatus` calls any non-blank bind a `match` under relay
+    // — it is answering "is off-subnet a fault", not "is this a real address" —
+    // so an implementation that delegated to it would advertise 172.30.9.9 and
+    // 'eth0', neither of which exists on this machine.
+    for (const bind of ["172.30.9.9", "eth0"]) {
+      const fills = dhcpCidrFormFills(
+        "10.0.0.0/24",
+        { ...UNTOUCHED, allowRelayAgents: true, interface: bind },
+        INTERFACES
+      )!;
+      expect(fills).not.toHaveProperty("serverId");
+    }
+  });
+
+  it("still gates under relay, so a hand-set identifier survives the network change", () => {
+    // Forwarding the flag must not turn the relay path into an unconditional
+    // write. The bind does not move here, so the previous resolution is also
+    // 10.0.0.5; 192.168.2.1 is neither that nor blank, so someone typed it.
+    const fills = dhcpCidrFormFills(
+      "10.0.0.0/24",
+      { ...UNTOUCHED, allowRelayAgents: true, interface: "10.0.0.5", serverId: "192.168.2.1" },
       INTERFACES
     )!;
     expect(fills).not.toHaveProperty("serverId");

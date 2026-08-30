@@ -414,11 +414,15 @@ describe("applying a CIDR — the server identifier", () => {
    * through a relay was told to advertise 10.0.0.254 for option 54 and BOOTP
    * `siaddr` — the CLIENT subnet's router, not this service — so unicast
    * renewals and ZTP image fetches went somewhere this server does not answer.
-   * Nothing can be derived here: the relayed subnet is one this machine holds
-   * no NIC on by design. So nothing is offered, and the configured identifier
-   * (or its absence) survives.
+   *
+   * REVIEW FINDING (P1, fifth round — relay with an explicit held bind) — the
+   * fix for that was a blanket relay skip, which went too far. Relay mode now
+   * abstains only where the BIND names no single address of this machine, which
+   * is what the three fixtures below have in common: none of them seeds
+   * `interface`, so the service binds every NIC and there is no one address for
+   * option 54 to name. The gateway is still never a stand-in.
    */
-  it("offers nothing for it while relay agents are allowed, rather than the client subnet's gateway", async () => {
+  it("offers nothing for it under relay while the service binds every interface", async () => {
     networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
     seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", allowRelayAgents: true });
     quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
@@ -434,8 +438,9 @@ describe("applying a CIDR — the server identifier", () => {
   it("leaves a configured identifier alone under relay, even one matching the OLD gateway", async () => {
     // 192.168.2.254 is exactly what the previous /24 derived, which is what the
     // removed `previous?.gateway` baseline treated as this offer's own stale
-    // suggestion — it was silently replaced by 10.0.0.254. With no fill there
-    // is no baseline, and a hand-set option 54 survives.
+    // suggestion — it was silently replaced by 10.0.0.254. The bind is
+    // all-interfaces, so nothing resolves, there is no baseline, and a hand-set
+    // option 54 survives.
     networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
     seed({
       rangeStart: "192.168.2.10",
@@ -450,11 +455,11 @@ describe("applying a CIDR — the server identifier", () => {
     expect(written("serverId")).toBe("192.168.2.254");
   });
 
-  it("abstains under relay even when a NIC of this machine IS on the pool's subnet", async () => {
-    // eth1 holds 10.0.0.5, so a NIC resolution would succeed. Relay mode still
-    // says nothing — the flag is the user's statement that clients are not on
-    // that wire. Kills "resolve first, fall back to the gateway only when the
-    // resolution fails", which would write 10.0.0.5 here.
+  it("abstains for an all-interfaces bind under relay even when a NIC IS on the pool's subnet", async () => {
+    // eth1 holds 10.0.0.5, so a NIC *suggestion* would succeed. It is not asked
+    // for: under relay the bind is the only thing that can name this service's
+    // address, and "every interface" names none. Kills falling through to the
+    // pool-subnet suggestion under relay, which would write 10.0.0.5 here.
     twoNics();
     seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.199", allowRelayAgents: true });
     quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
@@ -462,6 +467,74 @@ describe("applying a CIDR — the server identifier", () => {
     await openNetworkServerQuickAdjust("dhcp", deps());
 
     expect(written("serverId")).toBeUndefined();
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
+
+  /**
+   * REVIEW FINDING (P1, fifth round — relay with an explicit held bind), the
+   * half the blanket skip was getting wrong. A service bound to a concrete
+   * address this machine holds answers from that address with a relay in front
+   * of it just as without one, and option 54 has to say so — otherwise a relayed
+   * lab goes on advertising whatever stale identifier is configured.
+   */
+  it("offers the explicitly bound address under relay when this machine holds it", async () => {
+    // Bound to eth0's own 192.168.2.5, relaying 10.0.0.0/24 — deliberately OFF
+    // the pool's subnet, which is the arrangement relay exists for. The derived
+    // gateway (10.0.0.254) and the pool's NIC (10.0.0.5) are both visibly
+    // different answers, so neither wrong implementation can pass.
+    twoNics();
+    seed({
+      rangeStart: "192.168.2.10",
+      rangeEnd: "192.168.2.199",
+      interface: "192.168.2.5",
+      allowRelayAgents: true
+    });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("192.168.2.5");
+    expect(written("gateway")).toBe("10.0.0.254");
+  });
+
+  it("offers nothing under relay for a bind address this machine does not hold", async () => {
+    // The other guard on "don't guess": the address in the setting is stale (a
+    // dock unplugged, a VPN dropped), so it names nothing reachable. Note that
+    // `dhcpInterfaceSubnetStatus` calls ANY non-blank bind a `match` under
+    // relay, so an implementation that resolved through it would advertise
+    // 172.30.9.9 here.
+    twoNics();
+    seed({
+      rangeStart: "192.168.2.10",
+      rangeEnd: "192.168.2.199",
+      interface: "172.30.9.9",
+      allowRelayAgents: true
+    });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBeUndefined();
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
+
+  it("still gates the relay offer, so a hand-set identifier survives the network change", async () => {
+    // The bind does not move here, so the previous resolution is 192.168.2.5
+    // too; 192.168.2.99 is neither that nor blank, so someone typed it. Kills
+    // "under relay, always write the bind address".
+    twoNics();
+    seed({
+      rangeStart: "192.168.2.10",
+      rangeEnd: "192.168.2.199",
+      interface: "192.168.2.5",
+      allowRelayAgents: true,
+      serverId: "192.168.2.99"
+    });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("192.168.2.99");
     expect(written("rangeStart")).toBe("10.0.0.1");
   });
 
@@ -760,10 +833,23 @@ describe("the Interface row — the server identifier follows the rebind", () =>
     expect(written("serverId")).toBe("10.0.0.1");
   });
 
-  it("writes nothing for it under relay agents, where no local NIC is the answer", async () => {
-    // Same fixture as the first test, one flag apart. A relayed pool is on a
-    // wire this machine holds no NIC on by design, so the NIC just picked is
-    // not the address clients renew at either.
+  /**
+   * REVIEW FINDING (P1, fifth round — relay with an explicit held bind). This
+   * test used to assert the OPPOSITE: that a rebind under relay left `serverId`
+   * at the old address. That assertion was pinning the defect, not a decision.
+   *
+   * The relay carve-out it encoded reasoned "a relayed pool is on a wire this
+   * machine holds no NIC on, so no local NIC is the answer" — true of the POOL,
+   * false of the BIND. Both `10.0.0.5` and `10.0.0.6` are addresses this machine
+   * genuinely holds and the picker only offers held addresses, so after the
+   * rebind the socket answers from `.6`. Leaving option 54 and BOOTP `siaddr`
+   * naming `.5` is the exact fault this row was added to fix, reintroduced by a
+   * flag that says nothing about which address this service answers on.
+   */
+  it("moves the identifier to the newly picked NIC under relay too, since both addresses are held here", async () => {
+    // Same fixture as the first test, one flag apart — and now the same answer,
+    // which is the point: the relay flag says clients are reached through a
+    // relay, not that this machine stopped having an address.
     threeNics();
     seed({
       rangeStart: "10.0.0.10",
@@ -776,6 +862,65 @@ describe("the Interface row — the server identifier follows the rebind", () =>
     await openNetworkServerQuickAdjust("dhcp", deps());
 
     expect(written("interface")).toBe("10.0.0.6");
+    expect(written("serverId")).toBe("10.0.0.6");
+  });
+
+  it("still leaves a hand-set identifier alone under relay — the gate applies in both modes", async () => {
+    // The other half of the fix. Forwarding the relay flag must not turn the
+    // rebind into an unconditional write: 10.0.0.1 is not what the old bind
+    // resolved to, so someone typed it. Kills "under relay, just write the
+    // address that was picked".
+    threeNics();
+    seed({
+      rangeStart: "10.0.0.10",
+      rangeEnd: "10.0.0.99",
+      interface: "10.0.0.5",
+      serverId: "10.0.0.1",
+      allowRelayAgents: true
+    });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("10.0.0.6");
+    expect(written("serverId")).toBe("10.0.0.1");
+  });
+
+  it("follows an OFF-subnet pick under relay, which is the arrangement relay is for", async () => {
+    // eth0 is off the pool's subnet, and under relay that is the intended
+    // configuration rather than a fault: the DISCOVERs arrive relayed. The
+    // service is about to answer from 192.168.2.5, so that is what clients must
+    // renew against. Without relay this same pick resolves nothing (see the
+    // ambiguity test above), so the flag is genuinely load-bearing here.
+    threeNics();
+    seed({
+      rangeStart: "10.0.0.10",
+      rangeEnd: "10.0.0.99",
+      interface: "10.0.0.5",
+      serverId: "10.0.0.5",
+      allowRelayAgents: true
+    });
+    quickPickScript = [pickRow("Interface"), pickRow("eth0"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("192.168.2.5");
+    expect(written("serverId")).toBe("192.168.2.5");
+  });
+
+  it("writes nothing for it under relay when the pick is all-interfaces, which names no address", async () => {
+    // The "don't guess" half of the fix. All-interfaces is not one address, so
+    // there is nothing for option 54 to name and the configured value stands.
+    threeNics();
+    seed({
+      rangeStart: "10.0.0.10",
+      rangeEnd: "10.0.0.99",
+      interface: "10.0.0.5",
+      serverId: "10.0.0.5",
+      allowRelayAgents: true
+    });
+    quickPickScript = [pickRow("Interface"), pickRow("All interfaces"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBeUndefined();
     expect(written("serverId")).toBe("10.0.0.5");
   });
 

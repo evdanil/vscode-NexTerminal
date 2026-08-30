@@ -29,6 +29,8 @@ vi.mock("node:os", () => ({ networkInterfaces }));
 import { networkInterfaceBindOptions } from "../../../src/commands/networkInterfaceOptions";
 import {
   dhcpInterfaceSubnetStatus,
+  refreshDhcpServerIdentifier,
+  resolveDhcpServerIdentifier,
   suggestBindAddressForPool
 } from "../../../src/commands/networkServerSettings";
 
@@ -344,6 +346,200 @@ describe("suggestBindAddressForPool", () => {
     expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options(), true)).toBeUndefined();
     // Without the flag the same fixture does produce a suggestion.
     expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options(), false)).toBeDefined();
+  });
+});
+
+/**
+ * REVIEW FINDING (P1, fifth round — relay with an explicit held bind).
+ *
+ * Under `allowRelayAgents` the identifier used to be skipped outright, at all
+ * three trigger points independently. The reasoning — "a relayed pool is on a
+ * wire this machine holds no NIC on, so there is no address to resolve" — is
+ * true of the POOL and false of the BIND. A service bound to a concrete address
+ * this machine holds answers from that address whether or not a relay sits in
+ * front of it, and option 54 (copied verbatim into BOOTP `siaddr`) has to name
+ * the address renewals and ZTP fetches can actually reach.
+ *
+ * The relay branch is therefore an IDENTITY check on the bind alone, with no
+ * subnet comparison — being off-subnet is the whole point under relay — and it
+ * is deliberately NOT a delegation to `dhcpInterfaceSubnetStatus`'s own relay
+ * branch, which answers `match` for any non-blank string. That branch is asking
+ * "is off-subnet a fault", not "does this name an address", so resolving
+ * through it would advertise typos and addresses nothing here holds.
+ */
+describe("resolveDhcpServerIdentifier — the relay branch", () => {
+  it("resolves an explicit bind address this machine holds, off the pool's subnet and all", () => {
+    // The reported arrangement: bound to 192.168.1.20, relaying 10.0.0.0/24.
+    // Without relay this same call resolves nothing (no NIC is on the pool's
+    // subnet), so the flag is genuinely what changes the answer here.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "192.168.1.20", options(), true)).toBe(
+      "192.168.1.20"
+    );
+    expect(
+      resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "192.168.1.20", options(), false)
+    ).toBeUndefined();
+  });
+
+  it("does not consult the pool's subnet at all — two NICs on it change nothing", () => {
+    // Ambiguity on the pool's subnet is what makes the NON-relay path abstain.
+    // Under relay the bind names the answer outright, so the pool's occupancy
+    // is irrelevant. Kills "run the ordinary resolution and only skip the
+    // subnet warning".
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.1.20")],
+      eth1: [ipv4("10.0.0.5")],
+      eth2: [ipv4("10.0.0.6")]
+    });
+    expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "192.168.1.20", options(), true)).toBe(
+      "192.168.1.20"
+    );
+    expect(
+      resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "192.168.1.20", options(), false)
+    ).toBeUndefined();
+  });
+
+  it("resolves nothing for an all-interfaces bind, which names no single address", () => {
+    // eth1 is on the pool's subnet, so an implementation that fell through to
+    // the NIC suggestion would answer 10.0.0.5 for all four of these.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")], eth1: [ipv4("10.0.0.5")] });
+    for (const bind of [undefined, "", "   ", "0.0.0.0"]) {
+      expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", bind, options(), true)).toBeUndefined();
+    }
+  });
+
+  it("resolves nothing for a bind no interface here holds, rather than echoing it back", () => {
+    // This is the case that makes delegating to `dhcpInterfaceSubnetStatus`'s
+    // relay branch wrong: it calls both of these `match`, so a delegating
+    // implementation writes them into option 54 and clients renew at an address
+    // that exists nowhere.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(dhcpInterfaceSubnetStatus("172.16.9.9", "255.255.255.0", "10.0.0.10", options(), true)).toBe("match");
+    expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "172.16.9.9", options(), true)).toBeUndefined();
+
+    expect(dhcpInterfaceSubnetStatus("not-an-ip", "255.255.255.0", "10.0.0.10", options(), true)).toBe("match");
+    expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "not-an-ip", options(), true)).toBeUndefined();
+  });
+
+  it("answers from the bind even when the pool's own mask is unusable", () => {
+    // Nothing in the relay branch depends on the pool parsing, which is the
+    // other half of "no subnet comparison": the address is the answer whatever
+    // the pool says. Non-relay reports `unusable-mask` and resolves nothing.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(resolveDhcpServerIdentifier("not-an-ip", "255.0.255.0", "192.168.1.20", options(), true)).toBe(
+      "192.168.1.20"
+    );
+    expect(resolveDhcpServerIdentifier("not-an-ip", "255.0.255.0", "192.168.1.20", options(), false)).toBeUndefined();
+  });
+
+  it("defaults to the non-relay branch when the flag is omitted", () => {
+    // Every pre-existing caller passed four arguments, so the added parameter
+    // must not change what they get.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")] });
+    expect(resolveDhcpServerIdentifier("10.0.0.10", "255.255.255.0", "192.168.1.20", options())).toBeUndefined();
+  });
+});
+
+/**
+ * The shape the three trigger points now share — the full form's CIDR/NIC
+ * autofill, Quick Adjust's Network row and Quick Adjust's Interface row. Each
+ * had grown its own copy of "resolve the new state, resolve the one it replaces,
+ * write only if what is configured is still the old resolution", which is why
+ * the relay defect above had to be found and fixed three times over.
+ */
+describe("refreshDhcpServerIdentifier — the shared resolve/gate shape", () => {
+  /** eth1 and eth2 both on the pool's subnet; eth0 off it. */
+  function threeNics(): void {
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.1.20")],
+      eth1: [ipv4("10.0.0.5")],
+      eth2: [ipv4("10.0.0.6")]
+    });
+  }
+
+  const POOL = { rangeStart: "10.0.0.10", subnet: "255.255.255.0" };
+
+  it("refreshes an identifier that is still the previous state's resolution", () => {
+    threeNics();
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...POOL, bindAddress: "10.0.0.6" },
+        previous: { ...POOL, bindAddress: "10.0.0.5" },
+        interfaces: options(),
+        allowRelayAgents: false,
+        configuredServerId: "10.0.0.5"
+      })
+    ).toBe("10.0.0.6");
+  });
+
+  it("leaves an identifier the previous state would never have resolved to", () => {
+    threeNics();
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...POOL, bindAddress: "10.0.0.6" },
+        previous: { ...POOL, bindAddress: "10.0.0.5" },
+        interfaces: options(),
+        allowRelayAgents: false,
+        configuredServerId: "10.0.0.99"
+      })
+    ).toBeUndefined();
+  });
+
+  it("fills a blank identifier, which is the codebase's 'no opinion' signal", () => {
+    threeNics();
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...POOL, bindAddress: "10.0.0.6" },
+        previous: { ...POOL, bindAddress: "10.0.0.5" },
+        interfaces: options(),
+        allowRelayAgents: false,
+        configuredServerId: undefined
+      })
+    ).toBe("10.0.0.6");
+  });
+
+  it("forwards the relay flag to BOTH resolutions rather than deciding on its own", () => {
+    // Off-subnet on both sides, so under relay both resolve and the gate can
+    // recognise the old one as its own; a wrapper that abstained on the flag —
+    // or that forwarded it to only one of the two calls — answers undefined.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")], eth1: [ipv4("192.168.1.21")] });
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...POOL, bindAddress: "192.168.1.21" },
+        previous: { ...POOL, bindAddress: "192.168.1.20" },
+        interfaces: options(),
+        allowRelayAgents: true,
+        configuredServerId: "192.168.1.20"
+      })
+    ).toBe("192.168.1.21");
+  });
+
+  it("still gates under relay, so a hand-set identifier survives a rebind", () => {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.1.20")], eth1: [ipv4("192.168.1.21")] });
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...POOL, bindAddress: "192.168.1.21" },
+        previous: { ...POOL, bindAddress: "192.168.1.20" },
+        interfaces: options(),
+        allowRelayAgents: true,
+        configuredServerId: "192.168.1.99"
+      })
+    ).toBeUndefined();
+  });
+
+  it("answers undefined when the NEXT state resolves nothing, whatever is configured", () => {
+    // Ambiguous pool subnet and an off-subnet bind: no confident answer, so the
+    // configured value stands even though it is blank and would be fair game.
+    threeNics();
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...POOL, bindAddress: "192.168.1.20" },
+        previous: { ...POOL, bindAddress: "10.0.0.5" },
+        interfaces: options(),
+        allowRelayAgents: false,
+        configuredServerId: undefined
+      })
+    ).toBeUndefined();
   });
 });
 

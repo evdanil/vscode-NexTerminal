@@ -691,9 +691,14 @@ export function suggestBindAddressForPool(
  * coincidence does not survive a `10.0.0.0/24` whose gateway derives to
  * `10.0.0.254` while the service answers from `10.0.0.10`.
  *
- * The question is therefore the bind address's, not the network's, and it is
- * answered with the same two primitives the bind-address offer uses so a third
- * inline "is there a NIC on this subnet" cannot drift from them:
+ * The question is therefore the bind address's, not the network's — and it is
+ * answered in two different ways, because relay mode does not ask a
+ * differently-flagged version of the same question, it asks a narrower one.
+ *
+ * WITHOUT a relay agent the pool's subnet IS the wire clients are on, so the
+ * question is "which address of this machine is on that wire", answered with
+ * the same two primitives the bind-address offer uses so a third inline "is
+ * there a NIC on this subnet" cannot drift from them:
  *
  *  - a bind address {@link dhcpInterfaceSubnetStatus} calls a `match` is
  *    already an address this machine currently holds on this exact subnet, so
@@ -702,33 +707,119 @@ export function suggestBindAddressForPool(
  *    {@link suggestBindAddressForPool} picks the one to bind — the NIC that
  *    will serve the pool is the NIC clients see this machine on.
  *
- * Both are asked with `allowRelayAgents` forced off, because this is a
- * different question from the one that flag answers. Relay support says being
- * off-subnet is *acceptable*; it does not make an off-subnet address into one
- * of this machine's. Callers that allow relay agents therefore do not ask this
- * at all: neither editor auto-fills the identifier in relay mode, because the
- * pool's subnet is by design a wire this machine is not on and the only
- * addresses derivable from it — the gateway above all — belong to the client
- * side. The configured value is left alone instead.
+ * Both are asked with `allowRelayAgents` forced off: they are subnet
+ * comparisons, and the flag's entire effect on them is to stop comparing.
  *
- * @returns `undefined` whenever no single NIC of this machine can be identified
- *   for the pool — no match, nothing on the subnet, or more than one. There is
- *   deliberately no fallback: an unresolved case means "no confident answer",
- *   and callers must leave whatever is configured alone rather than write an
- *   address picked for the shape of it. Same restraint, and the same reason, as
- *   {@link suggestBindAddressForPool}'s refusal to guess.
+ * WITH a relay agent the pool's subnet is by design a wire this machine is NOT
+ * on, so every subnet comparison is meaningless and no NIC can be *suggested*
+ * from the pool at all. What survives is the identity question about the bind
+ * alone, asked directly here: an explicit bind address this machine currently
+ * holds is still the address renewals and ZTP `siaddr` fetches have to reach —
+ * a service bound to a concrete `192.168.1.5` while relaying `10.0.0.0/24`
+ * answers from `192.168.1.5`, relay or not, and that is exactly what option 54
+ * has to say. Nothing else resolves: an all-interfaces or unset bind names no
+ * single address, and a bind that is not a dotted quad, or is one no interface
+ * here holds, names nothing reachable.
+ *
+ * That identity check is made inline rather than by delegating to
+ * {@link dhcpInterfaceSubnetStatus}'s own relay branch, which answers `match`
+ * for ANY non-blank bind string. That branch is answering "is being off-subnet
+ * a fault" — no, for a relayed pool, whatever the string says — not "does this
+ * string name an address". Resolving an identifier through it would advertise
+ * typos and addresses nothing here holds, which is worse than the blanket relay
+ * skip this branch replaces.
+ *
+ * That blanket skip is what stood before: relay mode wrote no identifier at
+ * all, at any of the three call sites, on the reasoning that a relayed pool
+ * implies no local NIC. True of the POOL, false of the BIND — which is why
+ * {@link suggestBindAddressForPool}'s own relay bail is left exactly as it is
+ * and simply goes unreached from here: "which NIC should I BIND to" really is
+ * unanswerable for a relayed pool, and it is a different question from this one.
+ *
+ * @returns `undefined` whenever no single address of this machine can be
+ *   identified — without relay: no match, nothing on the pool's subnet, or more
+ *   than one; with relay: a bind that is all-interfaces, unset, malformed, or
+ *   unheld. There is deliberately no fallback: an unresolved case means "no
+ *   confident answer", and callers must leave whatever is configured alone
+ *   rather than write an address picked for the shape of it. Same restraint,
+ *   and the same reason, as {@link suggestBindAddressForPool}'s refusal to guess.
  */
 export function resolveDhcpServerIdentifier(
   rangeStart: string | undefined,
   subnet: string | undefined,
   bindAddress: string | undefined,
-  interfaces: readonly NetworkInterfaceOption[]
+  interfaces: readonly NetworkInterfaceOption[],
+  allowRelayAgents = false
 ): string | undefined {
+  if (allowRelayAgents) {
+    const trimmed = bindAddress?.trim() ?? "";
+    if (isAllInterfaces(trimmed) || !isValidIpv4(trimmed)) return undefined;
+    return interfaces.some((option) => option.value === trimmed) ? trimmed : undefined;
+  }
   if (dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, false) === "match") {
     return bindAddress?.trim();
   }
   const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, false);
   return suggestion && !suggestion.ambiguous ? suggestion.address : undefined;
+}
+
+/** One side of a server-identifier refresh: the pool and the bind, together. */
+export interface DhcpServerIdentifierEndpoint {
+  readonly rangeStart: string | undefined;
+  readonly subnet: string | undefined;
+  readonly bindAddress: string | undefined;
+}
+
+/**
+ * The Server Identifier a change implies, or `undefined` to leave the
+ * configured one alone.
+ *
+ * This is the whole "resolve for the new state, resolve for the state it
+ * replaces, write only if what is configured is still the old resolution"
+ * shape, named once. It was independently copy-pasted at three trigger points —
+ * {@link dhcpCidrFormFills} (the full form's CIDR and NIC-pick autofill),
+ * `editNetworkCidr` and `rebindServerIdentifier` (Quick Adjust's Network row and
+ * Interface row) — which is precisely why the relay-mode defect above had to be
+ * found and fixed three separate times. A fourth trigger point calls this
+ * instead of reimplementing the shape a fourth time.
+ *
+ * The endpoints are OBJECTS rather than positional arguments on purpose. Every
+ * caller holds two bind addresses that differ by one field and read identically
+ * at a call site, and mixing them up is not a near-miss: see the comment in
+ * {@link dhcpCidrFormFills} for the exact bug — switching between two NICs on
+ * ONE subnet resolved the NEW address on both sides, the stale identifier
+ * survived the gate as though hand-set, and the service answered from `.6` while
+ * telling every client to renew at `.5`. A shape that has to be labelled cannot
+ * be transposed in silence.
+ *
+ * `allowRelayAgents` is FORWARDED, not decided here and not decided by the
+ * callers: {@link resolveDhcpServerIdentifier} is the single place that knows
+ * what relay mode does to this question, and both resolutions have to be asked
+ * under the same rules or the gate compares two different questions' answers.
+ */
+export function refreshDhcpServerIdentifier(args: {
+  readonly next: DhcpServerIdentifierEndpoint;
+  readonly previous: DhcpServerIdentifierEndpoint;
+  readonly interfaces: readonly NetworkInterfaceOption[];
+  readonly allowRelayAgents: boolean;
+  readonly configuredServerId: string | undefined;
+}): string | undefined {
+  const resolved = resolveDhcpServerIdentifier(
+    args.next.rangeStart,
+    args.next.subnet,
+    args.next.bindAddress,
+    args.interfaces,
+    args.allowRelayAgents
+  );
+  if (resolved === undefined) return undefined;
+  const previous = resolveDhcpServerIdentifier(
+    args.previous.rangeStart,
+    args.previous.subnet,
+    args.previous.bindAddress,
+    args.interfaces,
+    args.allowRelayAgents
+  );
+  return isAutoFillable(args.configuredServerId, previous) ? resolved : undefined;
 }
 
 /**
@@ -826,18 +917,26 @@ function offSubnetBindAddress(
  * have written before the network moved" — rather than the previous gateway,
  * which this fill no longer writes and so can no longer claim as its own.
  *
- * REVIEW FINDING (P1) — with relay agents allowed, NOTHING is written for it.
- * A relayed pool is on a subnet this machine holds no NIC on; that is what the
- * relay is for. There is therefore no address to resolve, and the derived
- * gateway an earlier pass fell back to here is the CLIENT subnet's router:
- * a server bound at `192.168.1.5` serving `10.0.0.0/24` through a relay told
- * every client that option 54 and BOOTP `siaddr` were `10.0.0.254`, so unicast
- * renewals and ZTP image fetches went to the gateway instead of to this
- * service. Fabricating a value is worse than declining to: leaving the branch
- * out entirely preserves whatever identifier the user configured, which is the
- * only thing here that can name a reachable address. The gate below is what
- * makes "not written" the whole story — an unresolved server identifier never
- * reaches `fills`, so the field keeps what it has.
+ * REVIEW FINDING (P1) — with relay agents allowed, the derived GATEWAY is never
+ * written for it. A relayed pool is on the client subnet, so its gateway is the
+ * CLIENT subnet's router: a server bound at `192.168.1.5` serving `10.0.0.0/24`
+ * through a relay told every client that option 54 and BOOTP `siaddr` were
+ * `10.0.0.254`, so unicast renewals and ZTP image fetches went to the router
+ * instead of to this service. Fabricating a value is worse than declining to.
+ *
+ * REVIEW FINDING (P1, fifth round — relay with an explicit held bind) — but the
+ * fix for that was a blanket relay skip *here*, and it went too far. It read
+ * "relay means no address to resolve", which is true of the POOL and false of
+ * the BIND: a service bound to a concrete address this machine holds answers
+ * from that address whether or not a relay sits in front of it, and that is
+ * exactly what option 54 must name. Relay mode is now FORWARDED into
+ * {@link refreshDhcpServerIdentifier} rather than decided here, so the abstain
+ * happens only where it is genuinely warranted — an all-interfaces, unset,
+ * malformed or unheld bind, i.e. a bind that names no single address of this
+ * machine. See {@link resolveDhcpServerIdentifier} for the two-branch contract.
+ * The gate is still what makes "not written" the whole story either way — an
+ * unresolved server identifier never reaches `fills`, so the field keeps what it
+ * has.
  *
  * The addresses this machine holds are excluded from the suggested pool (see
  * {@link dhcpCidrDerivation}), which is why the NIC list is now needed for the
@@ -888,43 +987,30 @@ export function dhcpCidrFormFills(
   if (isAutoFillable(readSettingString(values.gateway), previous?.gateway)) {
     fills.gateway = derived.gateway;
   }
-  // Relay mode writes no server identifier at all — there is no NIC of this
-  // machine on a relayed client subnet to resolve one from, and the derived
-  // gateway is the CLIENT's router rather than this service. See the doc
-  // comment above; skipping the block entirely is also why no previous-network
-  // resolution is computed for it.
-  if (!readSettingBoolean(values.allowRelayAgents)) {
-    // Two bind addresses, because the two resolutions are two different
-    // questions. `bindAddress` answers "what would this fill write NOW", and
-    // has to be the address currently selected. `previousBind` answers "would
-    // this fill itself have written what is sitting in the field, under the
-    // network as it stood" — and for an INTERFACE change the address that was
-    // selected then is not this one. The webview applies the selection before
-    // it posts, so reusing `bindAddress` for both asks the previous-network
-    // question about the NEW NIC: switching between two NICs on ONE subnet
-    // (10.0.0.5 → 10.0.0.6) then resolves .6 on both sides, an auto-filled
-    // serverId of .5 fails isAutoFillable and survives, and the service
-    // answers from .6 while telling clients to renew at .5. Absent a supplied
-    // one — the CIDR-text trigger, which moves no NIC — the current address
-    // IS the address either side and the fallback is exact.
-    const bindAddress = readSettingString(values.interface);
-    const previousBind = readSettingString(previousBindAddress ?? bindAddress);
-    const resolvedServerId = resolveDhcpServerIdentifier(
-      derived.rangeStart,
-      derived.subnet,
-      bindAddress,
-      interfaces
-    );
-    const previousServerId = resolveDhcpServerIdentifier(
-      previousRangeStart,
-      previousSubnet,
-      previousBind,
-      interfaces
-    );
-    if (resolvedServerId !== undefined && isAutoFillable(readSettingString(values.serverId), previousServerId)) {
-      fills.serverId = resolvedServerId;
-    }
-  }
+  // Two bind addresses, because the two resolutions are two different
+  // questions. `bindAddress` answers "what would this fill write NOW", and has
+  // to be the address currently selected. `previousBind` answers "would this
+  // fill itself have written what is sitting in the field, under the network as
+  // it stood" — and for an INTERFACE change the address that was selected then
+  // is not this one. The webview applies the selection before it posts, so
+  // reusing `bindAddress` for both asks the previous-network question about the
+  // NEW NIC: switching between two NICs on ONE subnet (10.0.0.5 → 10.0.0.6)
+  // then resolves .6 on both sides, an auto-filled serverId of .5 fails
+  // isAutoFillable and survives, and the service answers from .6 while telling
+  // clients to renew at .5. Absent a supplied one — the CIDR-text trigger,
+  // which moves no NIC — the current address IS the address either side and the
+  // fallback is exact. Labelled endpoints rather than four positional address
+  // arguments precisely so that mix-up cannot be reintroduced silently.
+  const bindAddress = readSettingString(values.interface);
+  const previousBind = readSettingString(previousBindAddress ?? bindAddress);
+  const resolvedServerId = refreshDhcpServerIdentifier({
+    next: { rangeStart: derived.rangeStart, subnet: derived.subnet, bindAddress },
+    previous: { rangeStart: previousRangeStart, subnet: previousSubnet, bindAddress: previousBind },
+    interfaces,
+    allowRelayAgents: readSettingBoolean(values.allowRelayAgents),
+    configuredServerId: readSettingString(values.serverId)
+  });
+  if (resolvedServerId !== undefined) fills.serverId = resolvedServerId;
   if (isAutoFillable(readSettingString(values.broadcast), previous?.broadcast)) {
     fills.broadcast = derived.broadcast;
   }
