@@ -704,3 +704,129 @@ describe("the Interface row", () => {
     expect(row?.detail).toBe("Every IPv4 address on this machine — no single NIC, so no current IP to show.");
   });
 });
+
+/**
+ * REVIEW FINDING (P1, fourth round) — the Interface row is the third place the
+ * bind address moves, and the only one the identifier fix had not reached. The
+ * two CIDR rows move the pool under a fixed bind; this row moves the bind under
+ * a fixed pool, and option 54 is a function of both. Switching a same-subnet NIC
+ * wrote `interface` alone, so a service now bound to 10.0.0.6 kept advertising
+ * 10.0.0.5 for renewals and for the BOOTP `siaddr` a ZTP client boots from —
+ * an address it no longer answers on.
+ *
+ * The pool never moves in these fixtures. Only the bind does, which is what
+ * makes the two resolutions differ and the tests discriminating.
+ */
+describe("the Interface row — the server identifier follows the rebind", () => {
+  /** eth0 off the pool's subnet, eth1 and eth2 both on it. */
+  function threeNics(): void {
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5")],
+      eth1: [ipv4("10.0.0.5")],
+      eth2: [ipv4("10.0.0.6")]
+    });
+  }
+
+  it("moves an auto-derived identifier to the newly picked same-subnet NIC", async () => {
+    // 10.0.0.5 is exactly what the OLD bind resolved to, i.e. a value this
+    // editor would itself have written — stale the moment the bind moves.
+    threeNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.5" });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("10.0.0.6");
+    expect(written("serverId")).toBe("10.0.0.6");
+  });
+
+  it("fills an unset identifier from the newly picked NIC", async () => {
+    threeNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5" });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("10.0.0.6");
+  });
+
+  it("leaves a hand-set identifier alone while still rebinding", async () => {
+    // 10.0.0.1 is not what the old bind resolved to (that was 10.0.0.5), so
+    // someone typed it — a decision, not a leftover suggestion.
+    threeNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.1" });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("10.0.0.6");
+    expect(written("serverId")).toBe("10.0.0.1");
+  });
+
+  it("writes nothing for it under relay agents, where no local NIC is the answer", async () => {
+    // Same fixture as the first test, one flag apart. A relayed pool is on a
+    // wire this machine holds no NIC on by design, so the NIC just picked is
+    // not the address clients renew at either.
+    threeNics();
+    seed({
+      rangeStart: "10.0.0.10",
+      rangeEnd: "10.0.0.99",
+      interface: "10.0.0.5",
+      serverId: "10.0.0.5",
+      allowRelayAgents: true
+    });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("10.0.0.6");
+    expect(written("serverId")).toBe("10.0.0.5");
+  });
+
+  it("does not follow an off-subnet pick when the pool's subnet is ambiguous", async () => {
+    // eth0 is a real, allowed choice — the picker annotates the matching NICs
+    // rather than restricting the list. It is not on the pool's subnet, so the
+    // question falls back to "which single NIC is", and eth1/eth2 both are:
+    // no confident answer, so the configured identifier survives untouched.
+    // Kills "just write the address that was picked", which lands 192.168.2.5
+    // in option 54 for a 10.0.0.0/24 pool.
+    threeNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.5" });
+    quickPickScript = [pickRow("Interface"), pickRow("eth0"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("192.168.2.5");
+    expect(written("serverId")).toBe("10.0.0.5");
+  });
+
+  it("keeps the pool's own NIC on an off-subnet pick when exactly one is on it", async () => {
+    // Only eth1 is on 10.0.0.0/24, so the fallback resolves — and resolves to
+    // the same address as before. The identifier stays with the wire the pool
+    // describes rather than following the bind off it.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")], eth1: [ipv4("10.0.0.5")] });
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.5" });
+    quickPickScript = [pickRow("Interface"), pickRow("eth0"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("192.168.2.5");
+    expect(written("serverId")).toBe("10.0.0.5");
+  });
+
+  it("writes neither setting when the picker is dismissed", async () => {
+    threeNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.5" });
+    quickPickScript = [pickRow("Interface"), dismiss, dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("10.0.0.5");
+    expect(written("serverId")).toBe("10.0.0.5");
+  });
+
+  it("writes neither setting when the current NIC is re-picked", async () => {
+    threeNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.1" });
+    quickPickScript = [pickRow("Interface"), pickRow("eth1"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("10.0.0.5");
+    // Confirming the bind that is already in force is not an occasion to
+    // recompute anything — a hand-set identifier included.
+    expect(written("serverId")).toBe("10.0.0.1");
+  });
+});

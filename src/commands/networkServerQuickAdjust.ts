@@ -258,6 +258,58 @@ function isOnPoolSubnet(
 }
 
 /**
+ * The Server Identifier a rebind implies, or `undefined` to leave it alone.
+ *
+ * REVIEW FINDING (P1) — the Interface row is the third place a bind address
+ * changes, and the only one that was never taught this. The CIDR rows move the
+ * pool under a fixed bind; this row moves the bind under a fixed pool, and
+ * option 54 is a function of both. Switching from `10.0.0.5` to `10.0.0.6` used
+ * to write `interface` alone, leaving the identifier — copied verbatim into
+ * every OFFER/ACK and into the BOOTP `siaddr` a ZTP client boots from — naming
+ * the address the socket no longer answers on.
+ *
+ * The gate is {@link editNetworkCidr}'s, field for field: only a value the
+ * PREVIOUS bind address would itself have resolved to is recomputed, so an
+ * identifier the user typed survives a NIC change. The pool does not move here,
+ * so both resolutions are asked against the same `rangeStart`/`subnet` and only
+ * the bind address differs — which is exactly the question being asked.
+ *
+ * Relay mode abstains, the same carve-out and for the same reason: a relayed
+ * pool is on a wire this machine holds no NIC on by design, so no local NIC —
+ * newly picked or otherwise — is the address to advertise, and the configured
+ * one is the only value that can name a reachable host.
+ *
+ * An off-subnet pick is not special-cased. The picker allows one (it annotates
+ * the matching NICs rather than restricting the list), and
+ * {@link resolveDhcpServerIdentifier} already answers it under its own no-guess
+ * contract: the new bind is not a `match`, so the question falls back to "is
+ * there a single NIC on the pool's subnet" — which yields that NIC when there
+ * is exactly one, and `undefined` when there are none or several. `undefined`
+ * leaves the configured identifier untouched, because no confident answer is
+ * not a licence to write one.
+ *
+ * Written without {@link confirmAutoFill}, unlike the CIDR rows' identifier
+ * write. Those rows derive a setting the user never opened a picker for; this
+ * one is a side effect of a choice the Quick Pick itself already confirmed —
+ * a second dialog would be asking the user to approve the NIC they just
+ * approved.
+ */
+function rebindServerIdentifier(
+  previousBind: string,
+  nextBind: string,
+  pool: PoolSubnetContext,
+  interfaces: readonly NetworkInterfaceOption[],
+  section: vscode.WorkspaceConfiguration
+): string | undefined {
+  if (pool.allowRelayAgents) return undefined;
+  const resolved = resolveDhcpServerIdentifier(pool.rangeStart, pool.subnet, nextBind, interfaces);
+  if (resolved === undefined) return undefined;
+  const previous = resolveDhcpServerIdentifier(pool.rangeStart, pool.subnet, previousBind, interfaces);
+  const configured = rawString(section, "serverId");
+  return isAutoFillable(configured, previous) ? resolved : undefined;
+}
+
+/**
  * The bind-address picker, enumerated per open — a VPN coming up or a dock
  * being unplugged changes the answer between one edit and the next. An address
  * the setting holds but this machine no longer has is kept in the list and
@@ -270,11 +322,16 @@ function isOnPoolSubnet(
  * by reading addresses octet by octet. Two or more matches are all annotated and
  * none is promoted: picking one of them would be a coin toss the editor has no
  * business making.
+ *
+ * A DHCP rebind carries the Server Identifier with it when that identifier is
+ * still the old NIC's — see {@link rebindServerIdentifier}. TFTP passes no pool
+ * and has no such setting, so the branch is inert there.
  */
 async function editInterface(
   kind: NetworkServerKind,
   configured: string | undefined,
-  pool?: PoolSubnetContext
+  pool?: PoolSubnetContext,
+  section?: vscode.WorkspaceConfiguration
 ): Promise<QuickAdjustOutcome> {
   const current = configured === "0.0.0.0" ? "" : (configured ?? "");
   const options = networkInterfaceBindOptions();
@@ -307,7 +364,15 @@ async function editInterface(
     { title: `${SERVICE_LABELS[kind]} — Interface`, placeHolder: "Which NIC serves this service" }
   );
   if (!pick || pick.address === current) return "unchanged";
+  // Both bind addresses are passed explicitly rather than re-read, so the gate
+  // asks about the old NIC and the new one regardless of which write lands
+  // first — `current` is the old address, already normalised out of "0.0.0.0".
+  const serverId =
+    kind === "dhcp" && pool && section
+      ? rebindServerIdentifier(current, pick.address, pool, options, section)
+      : undefined;
   await writeSetting(kind, "interface", pick.address.length > 0 ? pick.address : undefined);
+  if (serverId !== undefined) await writeSetting("dhcp", "serverId", serverId);
   return "edited";
 }
 
@@ -769,7 +834,7 @@ function dhcpQuickItems(): QuickAdjustItem[] {
       label: "$(plug) Interface",
       description: describeInterface(bindAddress),
       detail: describeInterfaceDetail(bindAddress, pool),
-      run: () => editInterface("dhcp", bindAddress, pool)
+      run: () => editInterface("dhcp", bindAddress, pool, section)
     },
     {
       label: "$(symbol-numeric) Network (CIDR)",
