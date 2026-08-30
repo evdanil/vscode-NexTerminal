@@ -252,6 +252,130 @@ describe("suggestBindAddressForPool — the NIC's own mask has to cover the pool
   });
 });
 
+/**
+ * REVIEW FINDING — the coverage check above used to be a PREFIX comparison: the
+ * NIC's own mask had to be equal or wider than the pool's, i.e. it had to be
+ * on-link for the entire ADVERTISED subnet. That is only the right question for
+ * a pool that fills its subnet, and a hand-configured one often does not.
+ *
+ * The pool the report named — `10.0.0.130`–`10.0.0.200` advertised on a /24 — is
+ * served perfectly by a `10.0.0.254/25` NIC: every address it hands out is on
+ * `10.0.0.128/25`. Only the lower half of the /24, which the pool never touches,
+ * is off-link. `/25 <= /24` is false regardless, so the sidebar warned, the
+ * matching-NIC suggestion vanished, and server-ID resolution declined a bind
+ * that was never wrong.
+ *
+ * The window is now compared directly, so each fixture below moves the pool's
+ * own extent and nothing else. Where an END alone can decide the answer the NIC
+ * is a /26, whose link stops short of the subnet broadcast: with a /25 NIC every
+ * end inside the advertised /24 is covered, so a /25 fixture would be answering
+ * about the START and reading as though it were about the end.
+ */
+describe("dhcpInterfaceSubnetStatus — the pool's configured range, not the whole subnet", () => {
+  it("accepts the exact arrangement the report named", () => {
+    // Pool 10.0.0.130–10.0.0.200 advertised on a /24, served from 10.0.0.128/25.
+    // Every address it hands out is on that NIC's own link; only the lower half
+    // of the /24, which the pool never touches, is not. `/25 <= /24` is false,
+    // so the prefix comparison this replaces called it a mismatch.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.254", "255.255.255.0", "10.0.0.130", options(), false, "10.0.0.200")
+    ).toBe("match");
+    // The same NIC and the same advertised subnet, with the pool's START moved
+    // into the half it is NOT on: still a mismatch, so the fixture above is
+    // discriminating on the pool's extent rather than simply unrejectable.
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.254", "255.255.255.0", "10.0.0.10", options(), false, "10.0.0.200")
+    ).toBe("mismatch");
+  });
+
+  it("says the same for an all-interfaces bind", () => {
+    // The list-wide half of the question: that NIC really can serve this pool,
+    // so binding everything reaches it — and cannot for the wider one.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.130", options(), false, "10.0.0.200")).toBe(
+      "all-interfaces"
+    );
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options(), false, "10.0.0.200")).toBe(
+      "all-interfaces-off-subnet"
+    );
+  });
+
+  it("turns on the END alone, and falls back to the subnet broadcast without one", () => {
+    // eth0 is 10.0.0.128/26 — 10.0.0.128 through 10.0.0.191 — and the pool
+    // starts inside that link in all three calls, so ONLY the end can decide.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.130", "255.255.255.192")] });
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.130", "255.255.255.0", "10.0.0.130", options(), false, "10.0.0.190")
+    ).toBe("match");
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.130", "255.255.255.0", "10.0.0.130", options(), false, "10.0.0.200")
+    ).toBe("mismatch");
+    // No end at all is the conservative question — the widest pool that start
+    // could imply runs to 10.0.0.255, past this NIC's link — so the caller has
+    // to supply the window to get the narrower answer.
+    expect(dhcpInterfaceSubnetStatus("10.0.0.130", "255.255.255.0", "10.0.0.130", options())).toBe("mismatch");
+  });
+
+  it("refuses an end that inverts the range or does not parse, rather than widening on it", () => {
+    // `rangeEnd` is a stored setting, so a hand-edited settings.json or a
+    // restored profile can invert it. An inverted window would satisfy the
+    // containment test trivially and wave through the very NIC this check
+    // exists to catch, so it falls back to the conservative question instead.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.130", "255.255.255.192")] });
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.130", "255.255.255.0", "10.0.0.130", options(), false, "10.0.0.20")
+    ).toBe("mismatch");
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.130", "255.255.255.0", "10.0.0.130", options(), false, "not-an-ip")
+    ).toBe("mismatch");
+    // The same NIC and start with a usable end is a match, so the two above are
+    // rejections of the END, not of the fixture.
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.130", "255.255.255.0", "10.0.0.130", options(), false, "10.0.0.190")
+    ).toBe("match");
+  });
+
+  it("refuses an end that is valid and ordered but sits OUTSIDE the advertised subnet", () => {
+    // The other shape a stored `rangeEnd` arrives in from a hand-edited
+    // settings.json or a restored profile: left over from a network that was
+    // wider before, so it parses and is above the start yet names an address
+    // this pool could never hand out.
+    //
+    // The guard on the inverted case alone let it through, and the damage is the
+    // reverse of that one's: `end` is what the NIC has to cover, so a `10.20.x`
+    // end demands coverage no NIC on this subnet has. eth0 below is the textbook
+    // CORRECT bind — 10.0.0.5 on the very /24 being advertised, on-link for
+    // every address in it, the exact pair the prefix check this replaced always
+    // accepted — and it was reported as a mismatch, sending the user hunting for
+    // a fault in a bind that is beyond reproach.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.5", "255.255.255.0")] });
+    expect(
+      dhcpInterfaceSubnetStatus("10.0.0.5", "255.255.255.0", "10.0.0.130", options(), false, "10.20.30.40")
+    ).toBe("match");
+    // Not a fixture that answers "match" whatever it is handed: a NIC that
+    // genuinely does not cover the pool still fails, out-of-subnet end and all.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5", "255.255.255.0")] });
+    expect(
+      dhcpInterfaceSubnetStatus("192.168.2.5", "255.255.255.0", "10.0.0.130", options(), false, "10.20.30.40")
+    ).toBe("mismatch");
+  });
+});
+
+describe("suggestBindAddressForPool — the pool's configured range, not the whole subnet", () => {
+  it("offers the NIC that covers the configured range, and stays silent without the end", () => {
+    // The suggestion has to agree with the status above or the warning fires on
+    // a pool the picker refuses to offer an address for — and vice versa.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.130", "255.255.255.192")] });
+    expect(suggestBindAddressForPool("10.0.0.130", "255.255.255.0", options(), false, "10.0.0.190")).toEqual({
+      address: "10.0.0.130",
+      ambiguous: false
+    });
+    expect(suggestBindAddressForPool("10.0.0.130", "255.255.255.0", options(), false, "10.0.0.200")).toBeUndefined();
+    expect(suggestBindAddressForPool("10.0.0.130", "255.255.255.0", options())).toBeUndefined();
+  });
+});
+
 describe("dhcpInterfaceSubnetStatus — the cases that must stay quiet", () => {
   it("says nothing about a subnet when relay agents are allowed, with a bind that IS off-subnet", () => {
     // The fixture is genuinely off-subnet: a same-subnet one would read as a

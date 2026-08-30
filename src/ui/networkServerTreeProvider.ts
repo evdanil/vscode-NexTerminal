@@ -383,12 +383,19 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
     config: ReturnType<typeof readDhcpConfig>
   ): { bindAddress: string | undefined; cidr: string | undefined } | undefined {
     const bindAddress = config.bindAddress;
+    // The pool's configured END is passed too, so the row asks about the
+    // addresses this pool really hands out rather than about the whole
+    // advertised subnet. A pool deliberately confined to part of its subnet —
+    // `10.0.0.130`–`10.0.0.200` inside a `/24` — is entirely reachable from a
+    // `10.0.0.254/25` NIC, and warning about that arrangement sent the user
+    // looking for a fault that was not there.
     const status = dhcpInterfaceSubnetStatus(
       bindAddress,
       config.subnet,
       config.rangeStart,
       networkInterfaceBindOptions(),
-      config.allowRelayAgents === true
+      config.allowRelayAgents === true,
+      config.rangeEnd
     );
     if (status === "all-interfaces-off-subnet") {
       return { bindAddress: undefined, cidr: dhcpCurrentCidr(config.rangeStart, config.subnet) };

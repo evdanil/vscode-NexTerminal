@@ -215,8 +215,13 @@ export function registerNetworkServerCommands(
       // form afterwards — the same snapshot-per-open rule the quick editor
       // applies, and the CIDR row's own fill covers the moved-pool case by
       // offering the NIC that serves it.
+      // The pool's own END goes with its start: a NIC only has to be on-link for
+      // the addresses the pool actually hands out, so a manually narrowed range
+      // inside a wider advertised subnet is served fine by a NIC that covers the
+      // range but not the subnet — annotating it as a non-match would send the
+      // user hunting for a NIC that does not need to exist.
       interfaceOptions: dhcpSeed
-        ? dhcpInterfaceChoices(interfaces, dhcpSeed.rangeStart, dhcpSeed.subnet)
+        ? dhcpInterfaceChoices(interfaces, dhcpSeed.rangeStart, dhcpSeed.subnet, dhcpSeed.rangeEnd)
         : interfaces
     });
     WebviewFormPanel.open(`network-server-edit-${kind}`, form, {

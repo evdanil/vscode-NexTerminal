@@ -487,15 +487,64 @@ function isAllInterfaces(bindAddress: string | undefined): boolean {
   return trimmed.length === 0 || trimmed === "0.0.0.0";
 }
 
-/** The pool's own network, or `undefined` when the settings do not describe one. */
+/**
+ * The pool's own network and the window it actually hands out, or `undefined`
+ * when the settings do not describe one.
+ *
+ * `rangeEnd` is optional, and its absence is not a gap to be filled with a
+ * guess: the subnet broadcast is the widest end the `rangeStart`/`subnet` pair
+ * could imply, so a caller that does not know the configured end asks the most
+ * conservative question available to it — "could this NIC serve ANY pool
+ * starting here". A caller that does know the end asks the narrower, truthful
+ * one.
+ *
+ * The fallback window still begins at `start`, not at the subnet's network
+ * address, so it is not literally the whole-subnet question the prefix check
+ * this replaced asked. It is a WIDENING of it and never the reverse: a NIC whose
+ * prefix was equal-or-wider is on-link for the entire subnet, so it contains
+ * `start`–broadcast too and every pair the old check accepted is still accepted.
+ * What it additionally accepts is the NIC that covers the pool's start and
+ * everything above it — which is a true answer the old spelling could not give,
+ * since a pool cannot hand out an address below its own start.
+ *
+ * An end that does not parse, one BELOW the start, or one ABOVE the subnet's own
+ * broadcast falls back to that same conservative broadcast rather than being
+ * used. `rangeEnd` is a stored setting ({@link dhcpRangeOrderProblem} refuses an
+ * inverted pair at the point of entry, but a hand-edited `settings.json` or a
+ * restored profile arrives unchecked), and neither malformed shape may be taken
+ * at face value:
+ *
+ *  - an INVERTED window would make the containment test below trivially true — a
+ *    NIC merely on-link with the START would be accepted for a pool that
+ *    describes no usable window at all. Widening on the strength of nonsense is
+ *    the one outcome worse than the conservative fallback.
+ *  - an end OUTSIDE the subnet — a stale value left behind when the network was
+ *    narrowed, which is exactly as reachable from a hand-edited file as an
+ *    inverted one — would break the "pure widening" property this function's
+ *    whole contract rests on. `end` is what the NIC has to cover, so an end past
+ *    the subnet's broadcast demands coverage of addresses the pool cannot
+ *    possibly hand out, and a NIC that is on-link for the ENTIRE advertised
+ *    subnet gets reported as a mismatch — the old prefix check's own accepted
+ *    case, newly rejected. Bounding the end by the broadcast keeps every pair the
+ *    prefix check accepted accepted.
+ */
 function poolNetwork(
   rangeStart: string | undefined,
-  subnet: string | undefined
-): { start: string; mask: string } | undefined {
+  subnet: string | undefined,
+  rangeEnd?: string
+): { start: string; mask: string; end: string } | undefined {
   const mask = subnet ?? DEFAULTS.subnet;
   const start = rangeStart ?? DEFAULTS.rangeStart;
   if (!isValidIpv4(mask) || !isContiguousMask(mask) || !isValidIpv4(start)) return undefined;
-  return { start, mask };
+  const broadcast = computeBroadcastAddress(start, mask);
+  const usableEnd =
+    rangeEnd !== undefined &&
+    isValidIpv4(rangeEnd) &&
+    compareIpv4(rangeEnd, start) >= 0 &&
+    compareIpv4(rangeEnd, broadcast) <= 0
+      ? rangeEnd
+      : undefined;
+  return { start, mask, end: usableEnd ?? broadcast };
 }
 
 /**
@@ -508,8 +557,8 @@ function poolNetwork(
  *
  * "On the pool's subnet" is two conditions, not one. The NIC's address masking
  * into the pool's network under the *pool's* mask is necessary but not
- * sufficient: the NIC's OWN mask has to be wide enough to cover the whole pool
- * as well, or part of the range is off-link from this host's point of view. Both
+ * sufficient: the NIC's own link has to span every address the pool hands out as
+ * well, or part of the range is off-link from this host's point of view. Both
  * are checked by {@link nicCoversPool}, which every branch below goes through.
  *
  * - `all-interfaces` — the bind address is unset or `0.0.0.0`, and at least one
@@ -538,6 +587,15 @@ function poolNetwork(
  * @param allowRelayAgents When set, serving a subnet this machine is not on is
  *   the intended configuration — a relay agent forwards the request — so the
  *   comparison is not a fault to report at all, in either bind mode.
+ * @param rangeEnd The pool's configured last address, when the caller has it.
+ *   Omitted, the comparison falls back to `start`–subnet-broadcast (not the
+ *   subnet's own network–broadcast; see {@link poolNetwork}) — the widest window
+ *   that start could imply, and the most conservative question a caller that does
+ *   not know the end can ask honestly. Supplied, a NIC that covers the
+ *   configured window is a `match` even when it does not cover the rest of the
+ *   advertised subnet, which is the whole point: a pool of
+ *   `10.0.0.130`–`10.0.0.200` on a `/24` is entirely reachable from a
+ *   `10.0.0.254/25` NIC, and warning about it is a false alarm.
  */
 export type DhcpInterfaceSubnetStatus =
   | "all-interfaces"
@@ -552,7 +610,8 @@ export function dhcpInterfaceSubnetStatus(
   subnet: string | undefined,
   rangeStart: string | undefined,
   interfaces: readonly NetworkInterfaceOption[],
-  allowRelayAgents = false
+  allowRelayAgents = false,
+  rangeEnd?: string
 ): DhcpInterfaceSubnetStatus {
   const address = bindAddress?.trim() ?? "";
   const bindsEveryInterface = isAllInterfaces(address);
@@ -560,7 +619,7 @@ export function dhcpInterfaceSubnetStatus(
   // service, being off the pool's subnet is the configuration the user asked
   // for, so there is no comparison worth making.
   if (allowRelayAgents) return bindsEveryInterface ? "all-interfaces" : "match";
-  const pool = poolNetwork(rangeStart, subnet);
+  const pool = poolNetwork(rangeStart, subnet, rangeEnd);
   if (!pool) return "unusable-mask";
   if (bindsEveryInterface) {
     // "Every NIC" is not "every subnet". The question is the same one a bound
@@ -586,12 +645,13 @@ export function dhcpInterfaceSubnetStatus(
  *
  * Membership is {@link nicCoversPool}'s two conditions, not just the address
  * one: sitting in the pool's network is necessary but not sufficient, because a
- * NIC whose own mask is narrower than the pool's is off-link for part of the
- * range it would be handing out. The all-interfaces row is excluded there too.
+ * NIC whose own link does not span the whole `start`–`end` window is off-link
+ * for part of the range it would be handing out. The all-interfaces row is
+ * excluded there too.
  */
 function interfacesOnPoolSubnet(
   interfaces: readonly NetworkInterfaceOption[],
-  pool: { start: string; mask: string }
+  pool: { start: string; mask: string; end: string }
 ): NetworkInterfaceOption[] {
   return interfaces.filter((option) => nicCoversPool(option, pool));
 }
@@ -601,35 +661,59 @@ function interfacesOnPoolSubnet(
  *
  * Two conditions, and the second is the one an address-only comparison misses.
  * The NIC's address has to mask into the pool's network under the POOL's mask —
- * necessary, but not sufficient — and the NIC's OWN mask has to be equal or
- * wider than the pool's, i.e. a numerically smaller-or-equal prefix length.
+ * necessary, but not sufficient — and the NIC's own link has to contain the
+ * whole `start`–`end` window, or part of the range is off-link from this host's
+ * point of view.
  *
  * Worked example: `10.0.0.254/25` masks into `10.0.0.0/24` exactly as a
  * legitimate NIC would, so the address test passes. But this host's own subnet
- * for that NIC is `10.0.0.128/25` — the pool's lower half is not on-link at all.
- * The broadcast DISCOVER still arrives, which is precisely why the arrangement
- * looks configured; the unicast REQUEST/ACK of a renewal for `10.0.0.10` does
- * not route back out of that interface.
+ * for that NIC is `10.0.0.128/25` — a pool of `10.0.0.10`–`10.0.0.200` has its
+ * lower half off-link entirely. The broadcast DISCOVER still arrives, which is
+ * precisely why the arrangement looks configured; the unicast REQUEST/ACK of a
+ * renewal for `10.0.0.10` does not route back out of that interface.
+ *
+ * REVIEW FINDING — the second condition used to be a PREFIX comparison: the
+ * NIC's own mask had to be equal or wider than the pool's, i.e. it had to cover
+ * the entire advertised subnet. That is the right question only for a pool that
+ * fills its subnet, and a hand-configured one often does not. The very same
+ * `10.0.0.254/25` NIC serves a pool of `10.0.0.130`–`10.0.0.200` perfectly —
+ * every address in it is on `10.0.0.128/25` — yet `/25 <= /24` is false, so the
+ * sidebar warned, the matching-NIC suggestions vanished and server-ID resolution
+ * declined a bind that was never wrong. The condition the doc always claimed is
+ * coverage of the offered RANGE, so both endpoints are now compared against the
+ * NIC's own network and broadcast directly.
+ *
+ * That is a pure widening even where no configured end is known:
+ * {@link poolNetwork} falls back to `start`–subnet-broadcast, and a NIC whose
+ * prefix was equal-or-wider necessarily contains the whole subnet, so every pair
+ * the prefix check accepted this one accepts too. It additionally accepts two
+ * kinds of NIC the prefix spelling could not: the one whose link covers the
+ * configured range inside a wider advertised subnet — which is the fix — and,
+ * where no end is configured, the one whose link covers everything from the
+ * pool's start upwards, since a pool never hands out an address below its own
+ * start.
  *
  * A NIC mask that cannot be verified — absent, not a dotted quad, or
- * non-contiguous — is never a match. `maskToPrefix` already refuses the last
- * two, so `undefined` covers every unverifiable case in one check, and refusing
- * follows this file's standing rule that a wrong answer about a bind is worse
- * than none (see {@link suggestBindAddressForPool}).
+ * non-contiguous — is never a match, following this file's standing rule that a
+ * wrong answer about a bind is worse than none (see
+ * {@link suggestBindAddressForPool}).
  *
  * The all-interfaces pseudo-option is excluded here rather than at the call
  * sites: it is not one NIC, and its empty address masks to `0.0.0.0`, which
  * would falsely match a `0.0.0.0` pool network.
  */
-function nicCoversPool(option: NetworkInterfaceOption, pool: { start: string; mask: string }): boolean {
+function nicCoversPool(
+  option: NetworkInterfaceOption,
+  pool: { start: string; mask: string; end: string }
+): boolean {
   if (isAllInterfaces(option.value)) return false;
   if (!isSameSubnet(option.value, pool.start, pool.mask)) return false;
-  // `maskToPrefix` already refuses a non-dotted-quad and a non-contiguous mask,
-  // so an undefined answer covers every unverifiable case in one check.
-  const nicPrefix = option.netmask === undefined ? undefined : maskToPrefix(option.netmask);
-  const poolPrefix = maskToPrefix(pool.mask);
-  if (nicPrefix === undefined || poolPrefix === undefined) return false;
-  return nicPrefix <= poolPrefix;
+  if (option.netmask === undefined || !isValidIpv4(option.netmask) || !isContiguousMask(option.netmask)) {
+    return false;
+  }
+  const nicNetwork = networkAddress(option.value, option.netmask);
+  const nicBroadcast = computeBroadcastAddress(option.value, option.netmask);
+  return compareIpv4(nicNetwork, pool.start) <= 0 && compareIpv4(pool.end, nicBroadcast) <= 0;
 }
 
 /** A NIC that could serve the configured pool. */
@@ -653,6 +737,10 @@ export interface BindAddressSuggestion {
  * @param interfaces The already-filtered list from `networkInterfaceBindOptions()`,
  *   for the same reason {@link dhcpInterfaceSubnetStatus} needs it: virtual NICs
  *   (WSL, Hyper-V, Docker) sit on RFC1918 ranges and would match confidently.
+ * @param rangeEnd The pool's configured last address, when the caller has it —
+ *   see {@link dhcpInterfaceSubnetStatus}'s parameter of the same name. The two
+ *   have to be asked with the same window or the status warns about a pool this
+ *   function is happy to offer a NIC for.
  * @returns The single matching address with `ambiguous: false`; the first of
  *   several with `ambiguous: true`, which callers must not auto-select; or
  *   `undefined` when nothing matches, when the pool's subnet is unusable, or
@@ -662,10 +750,11 @@ export function suggestBindAddressForPool(
   rangeStart: string | undefined,
   subnet: string | undefined,
   interfaces: readonly NetworkInterfaceOption[],
-  allowRelayAgents = false
+  allowRelayAgents = false,
+  rangeEnd?: string
 ): BindAddressSuggestion | undefined {
   if (allowRelayAgents) return undefined;
-  const pool = poolNetwork(rangeStart, subnet);
+  const pool = poolNetwork(rangeStart, subnet, rangeEnd);
   if (!pool) return undefined;
   const matches = interfacesOnPoolSubnet(interfaces, pool);
   if (matches.length === 0) return undefined;
@@ -749,17 +838,18 @@ export function resolveDhcpServerIdentifier(
   subnet: string | undefined,
   bindAddress: string | undefined,
   interfaces: readonly NetworkInterfaceOption[],
-  allowRelayAgents = false
+  allowRelayAgents = false,
+  rangeEnd?: string
 ): string | undefined {
   if (allowRelayAgents) {
     const trimmed = bindAddress?.trim() ?? "";
     if (isAllInterfaces(trimmed) || !isValidIpv4(trimmed)) return undefined;
     return interfaces.some((option) => option.value === trimmed) ? trimmed : undefined;
   }
-  if (dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, false) === "match") {
+  if (dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, false, rangeEnd) === "match") {
     return bindAddress?.trim();
   }
-  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, false);
+  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, false, rangeEnd);
   return suggestion && !suggestion.ambiguous ? suggestion.address : undefined;
 }
 
@@ -768,6 +858,15 @@ export interface DhcpServerIdentifierEndpoint {
   readonly rangeStart: string | undefined;
   readonly subnet: string | undefined;
   readonly bindAddress: string | undefined;
+  /**
+   * The pool's configured last address on this side of the change, when the
+   * caller has it. Omitted, the resolution asks about `start`–subnet-broadcast
+   * — the conservative fallback, and what every caller got before the window was
+   * threaded through; see {@link dhcpInterfaceSubnetStatus}'s parameter of the
+   * same name and {@link poolNetwork} for why that is not literally the whole
+   * subnet.
+   */
+  readonly rangeEnd?: string;
 }
 
 /**
@@ -809,7 +908,8 @@ export function refreshDhcpServerIdentifier(args: {
     args.next.subnet,
     args.next.bindAddress,
     args.interfaces,
-    args.allowRelayAgents
+    args.allowRelayAgents,
+    args.next.rangeEnd
   );
   if (resolved === undefined) return undefined;
   const previous = resolveDhcpServerIdentifier(
@@ -817,7 +917,8 @@ export function refreshDhcpServerIdentifier(args: {
     args.previous.subnet,
     args.previous.bindAddress,
     args.interfaces,
-    args.allowRelayAgents
+    args.allowRelayAgents,
+    args.previous.rangeEnd
   );
   return isAutoFillable(args.configuredServerId, previous) ? resolved : undefined;
 }
@@ -884,14 +985,21 @@ function offSubnetBindAddress(
   values: FormValues,
   rangeStart: string,
   subnet: string,
-  interfaces: readonly NetworkInterfaceOption[]
+  interfaces: readonly NetworkInterfaceOption[],
+  rangeEnd?: string
 ): string | undefined {
   const allowRelayAgents = readSettingBoolean(values.allowRelayAgents);
   const bindAddress = readSettingString(values.interface);
-  if (dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, allowRelayAgents) !== "mismatch") {
-    return undefined;
-  }
-  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, allowRelayAgents);
+  const status = dhcpInterfaceSubnetStatus(
+    bindAddress,
+    subnet,
+    rangeStart,
+    interfaces,
+    allowRelayAgents,
+    rangeEnd
+  );
+  if (status !== "mismatch") return undefined;
+  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, allowRelayAgents, rangeEnd);
   return suggestion && !suggestion.ambiguous ? suggestion.address : undefined;
 }
 
@@ -974,6 +1082,14 @@ export function dhcpCidrFormFills(
   if (!derived) return undefined;
   const previousRangeStart = readSettingString(values.rangeStart) ?? DEFAULTS.rangeStart;
   const previousSubnet = readSettingString(values.subnet);
+  // The form renders a pool COUNT, not an end, and derives `rangeEnd` from the
+  // pair on submit (see the `rangeEnd` row in `networkServerCommands.ts`). The
+  // previous window is therefore reconstructed the same way rather than read
+  // from a field that does not exist — letting the previous-state resolution
+  // fall back to the conservative `start`–subnet-broadcast window while the next
+  // one is asked about a narrow one would compare two different questions'
+  // answers through the gate.
+  const previousRangeEnd = dhcpRangeEndForCount(previousRangeStart, readSettingNumber(values.poolCount));
   const previous = dhcpDerivedAddresses(previousRangeStart, previousSubnet);
   const fills: Record<string, string> = {
     // Normalised: a pool start typed as the CIDR host part (192.168.2.55/24)
@@ -1004,8 +1120,18 @@ export function dhcpCidrFormFills(
   const bindAddress = readSettingString(values.interface);
   const previousBind = readSettingString(previousBindAddress ?? bindAddress);
   const resolvedServerId = refreshDhcpServerIdentifier({
-    next: { rangeStart: derived.rangeStart, subnet: derived.subnet, bindAddress },
-    previous: { rangeStart: previousRangeStart, subnet: previousSubnet, bindAddress: previousBind },
+    next: {
+      rangeStart: derived.rangeStart,
+      subnet: derived.subnet,
+      bindAddress,
+      rangeEnd: derived.rangeEnd
+    },
+    previous: {
+      rangeStart: previousRangeStart,
+      subnet: previousSubnet,
+      bindAddress: previousBind,
+      rangeEnd: previousRangeEnd
+    },
     interfaces,
     allowRelayAgents: readSettingBoolean(values.allowRelayAgents),
     configuredServerId: readSettingString(values.serverId)
@@ -1017,7 +1143,7 @@ export function dhcpCidrFormFills(
   if (isDnsAutoFillable(formDnsList(values.dns), previous?.dns)) {
     fills.dns = derived.dns.join(", ");
   }
-  const bind = offSubnetBindAddress(values, derived.rangeStart, derived.subnet, interfaces);
+  const bind = offSubnetBindAddress(values, derived.rangeStart, derived.subnet, interfaces, derived.rangeEnd);
   if (bind !== undefined) fills.interface = bind;
   return fills;
 }
@@ -1113,12 +1239,13 @@ export interface DhcpInterfaceChoice {
 export function dhcpInterfaceChoices(
   interfaces: readonly NetworkInterfaceOption[],
   rangeStart: string | undefined,
-  subnet: string | undefined
+  subnet: string | undefined,
+  rangeEnd?: string
 ): DhcpInterfaceChoice[] {
   return interfaces.map((option) => {
     if (isAllInterfaces(option.value)) return { label: option.label, value: option.value };
     const onSubnet =
-      dhcpInterfaceSubnetStatus(option.value, subnet, rangeStart, interfaces, false) === "match";
+      dhcpInterfaceSubnetStatus(option.value, subnet, rangeStart, interfaces, false, rangeEnd) === "match";
     return onSubnet
       ? { label: option.label, value: option.value, description: "matches the pool subnet" }
       : { label: option.label, value: option.value };

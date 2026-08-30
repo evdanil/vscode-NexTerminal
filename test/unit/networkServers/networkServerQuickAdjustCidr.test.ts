@@ -714,6 +714,40 @@ describe("the Interface row", () => {
     expect(bindPicker[3].description).toBe("matches the pool subnet");
   });
 
+  it("stays quiet for a pool confined to the part of its subnet the bound NIC is on", async () => {
+    // End-to-end for the range fix: the NIC is 10.0.0.128/25 and the pool
+    // advertises a /24, but every address it hands out is inside that /25, so
+    // nothing is off-link. Both surfaces this row drives have to agree — the
+    // detail line and the picker's annotation are asked the same question — and
+    // the wiring only reaches them if `rangeEnd` is threaded from the settings
+    // through `PoolSubnetContext`.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+    seed({ rangeStart: "10.0.0.130", rangeEnd: "10.0.0.200", subnet: "255.255.255.0", interface: "10.0.0.254" });
+    quickPickScript = [pickRow("Interface"), dismiss, dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    const row = quickPickCalls[0].find((entry) => entry.label.includes("Interface"));
+    expect(row?.detail).not.toContain("not on the pool's subnet");
+    const bindPicker = quickPickCalls[1] as Array<{ label: string; description?: string }>;
+    expect(bindPicker.find((entry) => entry.label.startsWith("eth0"))?.description).toContain(
+      "matches the pool subnet"
+    );
+  });
+
+  it("still flags that NIC when the pool reaches past its link", async () => {
+    // One setting apart from the fixture above: the pool now starts below
+    // 10.0.0.128, so its lower half really is off-link and the warning is due.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.200", subnet: "255.255.255.0", interface: "10.0.0.254" });
+    quickPickScript = [pickRow("Interface"), dismiss, dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    const row = quickPickCalls[0].find((entry) => entry.label.includes("Interface"));
+    expect(row?.detail).toContain("not on the pool's subnet (10.0.0.0/24)");
+    const bindPicker = quickPickCalls[1] as Array<{ label: string; description?: string }>;
+    expect(bindPicker.find((entry) => entry.label.startsWith("eth0"))?.description).toBe("current");
+  });
+
   it("flags an off-subnet bind in the row's detail line, naming the pool's network", async () => {
     networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5")] });
     seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "192.168.2.5" });
@@ -951,6 +985,51 @@ describe("the Interface row — the server identifier follows the rebind", () =>
 
     expect(written("interface")).toBe("192.168.2.5");
     expect(written("serverId")).toBe("10.0.0.5");
+  });
+
+  /**
+   * The window has to be the SAME on both endpoints, and every fixture above is
+   * blind to that: their NICs are plain /24s whose mask equals the advertised
+   * subnet, so `start`–subnet-broadcast and the configured `rangeStart`–
+   * `rangeEnd` window are covered alike and the end never changes an answer.
+   * Handing `previous` no `rangeEnd` while `next` gets one passes all of them.
+   *
+   * This one is the `/26`-inside-a-`/24` shape the range fix's own fixtures use
+   * (see `dhcpInterfaceSubnet.test.ts`): both NICs are on 10.0.0.128/26, which
+   * stops at 10.0.0.191, while the pool advertises a /24. The configured window
+   * 10.0.0.130–10.0.0.190 is inside that link; the conservative fallback window
+   * 10.0.0.130–10.0.0.255 is not. So the two windows disagree about these NICs,
+   * and asking the two sides different questions is visible in the outcome:
+   *
+   *  - both sides asked the configured window (the fix): the old bind resolves
+   *    to 10.0.0.130, which is exactly what `serverId` holds, so the identifier
+   *    is stale-by-derivation and follows the rebind to 10.0.0.140;
+   *  - `previous` left to fall back (the bug): its NIC covers nothing up to
+   *    10.0.0.255, so the previous resolution is `undefined`, the gate reads the
+   *    configured identifier as hand-set, and 10.0.0.130 survives a rebind that
+   *    just moved the socket to 10.0.0.140 — option 54 and the BOOTP `siaddr`
+   *    naming an address this service no longer answers on, which is the exact
+   *    fault this whole row exists to prevent.
+   */
+  it("carries the identifier when the NIC covers the configured range but not the whole subnet", async () => {
+    // Both NICs are 10.0.0.128/26 — 10.0.0.128 through 10.0.0.191 — so neither
+    // is on-link for the /24 the pool advertises, only for the range it uses.
+    networkInterfaces.mockReturnValue({
+      eth1: [ipv4("10.0.0.130", "255.255.255.192")],
+      eth2: [ipv4("10.0.0.140", "255.255.255.192")]
+    });
+    seed({
+      rangeStart: "10.0.0.130",
+      rangeEnd: "10.0.0.190",
+      subnet: "255.255.255.0",
+      interface: "10.0.0.130",
+      serverId: "10.0.0.130"
+    });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("10.0.0.140");
+    expect(written("serverId")).toBe("10.0.0.140");
   });
 
   it("writes neither setting when the picker is dismissed", async () => {

@@ -184,6 +184,14 @@ interface PoolSubnetContext {
   readonly rangeStart: string | undefined;
   readonly subnet: string | undefined;
   /**
+   * The pool's last address, so the NIC comparison asks about the range the pool
+   * really hands out rather than about the whole advertised subnet. A pool
+   * confined to part of its subnet by hand — `10.0.0.130`–`10.0.0.200` inside a
+   * `/24` — is served perfectly by a `10.0.0.254/25` NIC, and demanding whole-
+   * subnet coverage reported that as a mismatch.
+   */
+  readonly rangeEnd: string | undefined;
+  /**
    * With a relay agent in front of it, serving a subnet this machine is not on
    * is the point, so none of the off-subnet reporting applies.
    */
@@ -194,6 +202,7 @@ function dhcpPoolSubnetContext(section: vscode.WorkspaceConfiguration): PoolSubn
   return {
     rangeStart: rawString(section, "rangeStart"),
     subnet: rawString(section, "subnet"),
+    rangeEnd: rawString(section, "rangeEnd"),
     allowRelayAgents: section.get<boolean>("allowRelayAgents", false) === true
   };
 }
@@ -232,7 +241,8 @@ function describeInterfaceDetail(configured: string | undefined, pool?: PoolSubn
     pool.subnet,
     pool.rangeStart,
     networkInterfaceBindOptions(),
-    pool.allowRelayAgents
+    pool.allowRelayAgents,
+    pool.rangeEnd
   );
   if (status !== "mismatch" && status !== "all-interfaces-off-subnet") return base;
   const cidr = dhcpCurrentCidr(pool.rangeStart, pool.subnet);
@@ -254,7 +264,9 @@ function isOnPoolSubnet(
   // Deliberately asks with relay support switched off: "is this NIC on the
   // pool's subnet" has the same answer either way, and it is the *warning* that
   // a relay agent makes irrelevant, not the fact.
-  return dhcpInterfaceSubnetStatus(address, pool.subnet, pool.rangeStart, interfaces, false) === "match";
+  return (
+    dhcpInterfaceSubnetStatus(address, pool.subnet, pool.rangeStart, interfaces, false, pool.rangeEnd) === "match"
+  );
 }
 
 /**
@@ -310,9 +322,19 @@ function rebindServerIdentifier(
   interfaces: readonly NetworkInterfaceOption[],
   section: vscode.WorkspaceConfiguration
 ): string | undefined {
+  // The pool does not move on this row, so the SAME window goes to both
+  // endpoints — the bind address is the only field that differs, which is the
+  // whole question. Asking one side about the configured window while the other
+  // fell back to the conservative `start`–subnet-broadcast one would compare two
+  // different questions' answers through the gate.
   return refreshDhcpServerIdentifier({
-    next: { rangeStart: pool.rangeStart, subnet: pool.subnet, bindAddress: nextBind },
-    previous: { rangeStart: pool.rangeStart, subnet: pool.subnet, bindAddress: previousBind },
+    next: { rangeStart: pool.rangeStart, subnet: pool.subnet, bindAddress: nextBind, rangeEnd: pool.rangeEnd },
+    previous: {
+      rangeStart: pool.rangeStart,
+      subnet: pool.subnet,
+      bindAddress: previousBind,
+      rangeEnd: pool.rangeEnd
+    },
     interfaces,
     allowRelayAgents: pool.allowRelayAgents,
     configuredServerId: rawString(section, "serverId")
@@ -350,7 +372,7 @@ async function editInterface(
     : [...options, { label: `${current} — not currently available`, value: current }];
 
   const suggestion = pool
-    ? suggestBindAddressForPool(pool.rangeStart, pool.subnet, options, pool.allowRelayAgents)
+    ? suggestBindAddressForPool(pool.rangeStart, pool.subnet, options, pool.allowRelayAgents, pool.rangeEnd)
     : undefined;
   if (suggestion && !suggestion.ambiguous) {
     const index = known.findIndex((option) => option.value === suggestion.address);
@@ -568,18 +590,34 @@ function readDnsSetting(section: vscode.WorkspaceConfiguration): string[] {
  *   which derive the pool around this machine's addresses and resolve the server
  *   identifier from them — asks the platform once and cannot end up comparing two
  *   different answers.
+ * @param rangeEnd The last address the pool being moved to will hand out, when
+ *   the caller knows it. The NIC only has to be on-link for the addresses the
+ *   pool really offers, so a range confined to part of a wider advertised subnet
+ *   is not a `mismatch` for a NIC that covers the range — offering a rebind
+ *   there would move the service off a wire it was serving correctly. Omitted,
+ *   the question falls back to `start`–subnet-broadcast, exactly as before —
+ *   which is a widening of, not literally, the whole subnet: see
+ *   `poolNetwork` in `networkServerSettings.ts`.
  */
 function offSubnetInterfaceWrite(
   section: vscode.WorkspaceConfiguration,
   rangeStart: string | undefined,
   subnet: string | undefined,
-  interfaces: readonly NetworkInterfaceOption[]
+  interfaces: readonly NetworkInterfaceOption[],
+  rangeEnd?: string
 ): BindAutoFillWrite | undefined {
   const allowRelayAgents = section.get<boolean>("allowRelayAgents", false) === true;
   const bindAddress = rawString(section, "interface");
-  const status = dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, allowRelayAgents);
+  const status = dhcpInterfaceSubnetStatus(
+    bindAddress,
+    subnet,
+    rangeStart,
+    interfaces,
+    allowRelayAgents,
+    rangeEnd
+  );
   if (status !== "mismatch") return undefined;
-  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, allowRelayAgents);
+  const suggestion = suggestBindAddressForPool(rangeStart, subnet, interfaces, allowRelayAgents, rangeEnd);
   if (!suggestion || suggestion.ambiguous) return undefined;
   return { key: "interface", value: suggestion.address };
 }
@@ -633,15 +671,26 @@ function offSubnetInterfaceWrite(
  * The gate is {@link refreshDhcpServerIdentifier}'s, shared with the other three
  * call sites, so an identifier the user typed survives a pool move exactly as it
  * survives a network change, and relay mode is forwarded rather than re-decided.
+ *
+ * @param count How many addresses the pool hands out. Taken as a parameter
+ *   rather than re-read from the settings because {@link editPoolStart} has
+ *   already written the NEW `rangeEnd` by the time it calls here — a re-read
+ *   would hand the "previous" resolution the window that replaced it. The size
+ *   is what survives a start move (that is the row's whole contract), so both
+ *   windows are reconstructed from it and their own start, the same way
+ *   `dhcpCidrFormFills` reconstructs the form's previous end.
  */
 async function offerPoolAutoFill(
   rangeStart: string,
   previousStart: string | undefined,
-  subnet: string | undefined
+  subnet: string | undefined,
+  count: number
 ): Promise<void> {
   const derived = dhcpDerivedAddresses(rangeStart, subnet);
   if (!derived) return;
   const previous = previousStart ? dhcpDerivedAddresses(previousStart, subnet) : undefined;
+  const rangeEnd = dhcpRangeEndForCount(rangeStart, count);
+  const previousRangeEnd = previousStart ? dhcpRangeEndForCount(previousStart, count) : undefined;
 
   const section = settingsSection("dhcp");
   const dns = readDnsSetting(section);
@@ -659,12 +708,12 @@ async function offerPoolAutoFill(
   // enumerations across one edit can disagree about which NICs exist.
   const interfaces = networkInterfaceBindOptions();
   const bindAddress = rawString(section, "interface");
-  const bind = offSubnetInterfaceWrite(section, rangeStart, subnet, interfaces);
+  const bind = offSubnetInterfaceWrite(section, rangeStart, subnet, interfaces, rangeEnd);
   if (bind) writes.push(bind);
 
   const resolvedServerId = refreshDhcpServerIdentifier({
-    next: { rangeStart, subnet, bindAddress: bind ? bind.value : bindAddress },
-    previous: { rangeStart: previousStart, subnet, bindAddress },
+    next: { rangeStart, subnet, bindAddress: bind ? bind.value : bindAddress, rangeEnd },
+    previous: { rangeStart: previousStart, subnet, bindAddress, rangeEnd: previousRangeEnd },
     interfaces,
     allowRelayAgents: section.get<boolean>("allowRelayAgents", false) === true,
     configuredServerId: rawString(section, "serverId")
@@ -800,12 +849,28 @@ async function editNetworkCidr(
   // The shape below is `refreshDhcpServerIdentifier`, the same one the full
   // form's fill and the Interface row's rebind now go through; keeping three
   // hand-written copies of it is what made the relay defect a three-site fix.
+  //
+  // Both windows are the ones really in force on their own side: the CIDR
+  // derivation carries the pool end it is about to write, and the previous side
+  // reads the `rangeEnd` setting as it stands — the pool this row is replacing.
+  // The packaged end is substituted only when the start is packaged too, since
+  // the two defaults are one pool; pinning the packaged end to a start the user
+  // did set would describe a window neither of them means, and an unset end with
+  // a set start falls back to the conservative `start`–subnet-broadcast question
+  // instead.
+  const previousRangeEnd = rawString(section, "rangeEnd") ?? (rangeStart === undefined ? DEFAULTS.rangeEnd : undefined);
   const resolvedServerId = refreshDhcpServerIdentifier({
-    next: { rangeStart: derived.rangeStart, subnet: derived.subnet, bindAddress: rawString(section, "interface") },
+    next: {
+      rangeStart: derived.rangeStart,
+      subnet: derived.subnet,
+      bindAddress: rawString(section, "interface"),
+      rangeEnd: derived.rangeEnd
+    },
     previous: {
       rangeStart: rangeStart ?? DEFAULTS.rangeStart,
       subnet,
-      bindAddress: rawString(section, "interface")
+      bindAddress: rawString(section, "interface"),
+      rangeEnd: previousRangeEnd
     },
     interfaces,
     allowRelayAgents,
@@ -816,7 +881,7 @@ async function editNetworkCidr(
     writes.push({ key: "broadcast", value: derived.broadcast });
   }
   if (isDnsAutoFillable(dns, previous?.dns)) writes.push({ key: "dns", value: [...derived.dns] });
-  const bind = offSubnetInterfaceWrite(section, derived.rangeStart, derived.subnet, interfaces);
+  const bind = offSubnetInterfaceWrite(section, derived.rangeStart, derived.subnet, interfaces, derived.rangeEnd);
   if (bind) writes.push(bind);
 
   const written = await confirmAutoFill(
@@ -861,7 +926,7 @@ async function editPoolStart(
   await writeSetting("dhcp", "rangeEnd", dhcpRangeEndForCount(rangeStart, count));
   // Only a concrete start is worth deriving from: clearing the field hands the
   // whole pool back to the packaged defaults, which are already consistent.
-  if (rangeStart) await offerPoolAutoFill(rangeStart, current, subnet);
+  if (rangeStart) await offerPoolAutoFill(rangeStart, current, subnet, count);
   return "edited";
 }
 

@@ -164,6 +164,52 @@ describe("DHCP Pool row — an all-interfaces bind with no NIC on the pool's sub
   });
 });
 
+/**
+ * REVIEW FINDING — the row demanded that the bound NIC be on-link for the whole
+ * ADVERTISED subnet, not for the range the pool really hands out. A pool
+ * deliberately confined to part of its subnet is the arrangement that broke:
+ * every address it offers is reachable, and the row warned about it anyway.
+ *
+ * These are the end-to-end half of the fix — the provider has to pass the
+ * configured `rangeEnd` down for any of it to reach the sidebar — so each pair
+ * moves the pool's range and nothing else.
+ */
+describe("DHCP Pool row — a range narrower than the subnet it advertises", () => {
+  /** 10.0.0.128/25: the lower half of the advertised /24 is not on this link. */
+  function halfSubnetNic(): void {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+  }
+
+  it("stays quiet for a pool confined to the half the bound NIC is on", () => {
+    halfSubnetNic();
+    const row = poolRow({ ...POOL, rangeStart: "10.0.0.130", rangeEnd: "10.0.0.200", bindAddress: "10.0.0.254" });
+    expect(row.description).toBe("10.0.0.130 → 10.0.0.200");
+    expect(String(row.tooltip)).not.toContain("⚠");
+  });
+
+  it("stays quiet for an all-interfaces bind over the same pool", () => {
+    halfSubnetNic();
+    expect(poolRow({ ...POOL, rangeStart: "10.0.0.130", rangeEnd: "10.0.0.200" }).description).not.toContain("⚠");
+  });
+
+  it("still warns when the pool's START reaches into the half the NIC is not on", () => {
+    halfSubnetNic();
+    // One field apart from the fixture above.
+    expect(
+      poolRow({ ...POOL, rangeStart: "10.0.0.10", rangeEnd: "10.0.0.200", bindAddress: "10.0.0.254" }).description
+    ).toContain("⚠ bound NIC is not on this subnet");
+  });
+
+  it("still warns when only the pool's END runs past the NIC's link", () => {
+    // eth0 is 10.0.0.128/26 — 10.0.0.128 through 10.0.0.191 — and the pool
+    // starts inside it either way, so the END is the only thing that moves.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.130", "255.255.255.192")] });
+    const shared = { ...POOL, rangeStart: "10.0.0.130", bindAddress: "10.0.0.130" };
+    expect(poolRow({ ...shared, rangeEnd: "10.0.0.190" }).description).not.toContain("⚠");
+    expect(poolRow({ ...shared, rangeEnd: "10.0.0.200" }).description).toContain("⚠");
+  });
+});
+
 describe("DHCP Pool row — when no warning is due", () => {
   it("stays quiet for a NIC on the pool's subnet", () => {
     const row = poolRow({ ...POOL, bindAddress: "10.0.0.5" });
