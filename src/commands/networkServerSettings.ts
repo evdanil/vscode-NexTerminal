@@ -424,10 +424,23 @@ export function dhcpCidrDerivation(
  * "must be between 1 and 30" does not explain why the thing they typed —
  * which is a perfectly real network — was refused.
  *
+ * `ownAddresses` are this machine's own IPv4 addresses, as
+ * {@link dhcpCidrDerivation} takes them. Supplied, they add one further reason
+ * a real network still cannot become a pool: every address it could hand out is
+ * already held here. Omitted — the quick editor's live input box passes
+ * nothing — the check is skipped entirely, so the question stays "does this
+ * NETWORK describe a pool", which is the only thing an input box validating
+ * keystroke by keystroke can honestly answer.
+ *
+ * The full form supplies them, because that path has no other line of defence:
+ * its autofill derives WITH exclusion, so a network with no room here fills
+ * nothing, and without this check Save would then persist the pool the form was
+ * still holding from before — the typed network discarded in silence.
+ *
  * @returns `undefined` for a usable network, and for blank input, which the
  *   editors treat as "leave it alone" rather than as an error.
  */
-export function dhcpCidrProblem(text: string): string | undefined {
+export function dhcpCidrProblem(text: string, ownAddresses?: readonly string[]): string | undefined {
   const trimmed = text.trim();
   if (trimmed.length === 0) return undefined;
   const parts = trimmed.split("/");
@@ -457,6 +470,13 @@ export function dhcpCidrProblem(text: string): string | undefined {
   }
   if (!dhcpCidrDerivation(trimmed)) {
     return `${trimmed} does not describe a usable DHCP subnet.`;
+  }
+  // Reached only for a network that IS usable in the abstract — the check above
+  // already said so — so the only thing this can be refusing is the machine's
+  // own occupancy of it. Same wording the quick editor's post-selection warning
+  // uses for the same cause, per this function's one-message-per-cause rule.
+  if (ownAddresses && !dhcpCidrDerivation(trimmed, ownAddresses)) {
+    return `${trimmed} leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here.`;
   }
   return undefined;
 }
@@ -1034,14 +1054,21 @@ export function networkServerProfileSettingUpdates(
  * intact. Only non-blank values are checked — blank means "clear the key and
  * use the packaged default", which is always valid.
  */
-export function validateDhcpValues(values: FormValues): string | undefined {
+export function validateDhcpValues(values: FormValues, ownAddresses?: readonly string[]): string | undefined {
   // Checked first, and by the same function the quick editor's input box uses.
   // The CIDR row is the shorthand every other pool field was filled from, so
   // when it is the thing that cannot be made sense of, saying so beats
   // reporting whichever derived field happens to fail afterwards. A blank row
   // is not an error — it means "leave the pool alone".
+  //
+  // `ownAddresses` is what makes the CIDR row's autofill and this check ask the
+  // same question. The autofill derives with this machine's addresses excluded;
+  // without passing them here too, a network that leaves no room on this host
+  // would fill nothing and still save, keeping the pool the form opened on.
   const cidrProblem =
-    typeof values[DHCP_CIDR_FIELD_KEY] === "string" ? dhcpCidrProblem(values[DHCP_CIDR_FIELD_KEY]) : undefined;
+    typeof values[DHCP_CIDR_FIELD_KEY] === "string"
+      ? dhcpCidrProblem(values[DHCP_CIDR_FIELD_KEY], ownAddresses)
+      : undefined;
   if (cidrProblem) return cidrProblem;
   const parserProblem = validateDhcpFormInput(values);
   if (parserProblem) return parserProblem;

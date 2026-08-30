@@ -278,3 +278,71 @@ describe("dhcpCidrProblem", () => {
     expect(dhcpCidrProblem("10.0.0.0")).toContain("CIDR form");
   });
 });
+
+/**
+ * REVIEW FINDING (P2) — a network this machine leaves no room in must be
+ * refused, not treated as an empty entry.
+ *
+ * The full form's autofill already derives WITH this machine's addresses
+ * excluded, so such a network fills nothing. Without the same exclusion here,
+ * the submit check called the network fine and Save wrote the pool the form had
+ * been holding all along — the typed network discarded without a word.
+ *
+ * The argument is optional, and stays optional: the quick editor's live input
+ * box passes nothing and must keep passing everything a network can justify,
+ * because it validates as the user types and only the network is settled then.
+ */
+describe("dhcpCidrProblem — this machine's own addresses", () => {
+  it("refuses a network whose only poolable address this machine holds", () => {
+    // A /30 leaves exactly one address a pool could hand out (.1 — .2 is the
+    // gateway), and this machine is on it.
+    const problem = dhcpCidrProblem("10.0.0.0/30", ["10.0.0.1"]);
+    expect(problem).toBe(
+      "10.0.0.0/30 leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here."
+    );
+    // Not the generic "does not describe a usable DHCP subnet" — the network is
+    // real, and the reason it was refused is about this host, not about it.
+    expect(problem).not.toContain("does not describe a usable DHCP subnet");
+  });
+
+  it("refuses a /29 whose five poolable addresses are all held here", () => {
+    expect(dhcpCidrProblem("10.0.0.0/29", ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"])).toContain(
+      "leaves no pool once this machine's own addresses on it are kept out"
+    );
+  });
+
+  it("reports the trimmed network, matching every other message this function returns", () => {
+    expect(dhcpCidrProblem("  10.0.0.0/30  ", ["10.0.0.1"])).toBe(
+      "10.0.0.0/30 leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here."
+    );
+  });
+
+  it("passes a network that still has room once this machine is kept out", () => {
+    // The pool only moves: .1 is taken, so it starts at .2.
+    expect(dhcpCidrProblem("10.0.0.0/24", ["10.0.0.1"])).toBeUndefined();
+    // Addresses elsewhere, the all-interfaces blank and junk collide with
+    // nothing, so they cannot refuse anything either.
+    expect(dhcpCidrProblem("10.0.0.0/30", ["192.168.9.5", "", "not-an-ip"])).toBeUndefined();
+    // The /30's gateway is not a poolable address, so holding it costs nothing.
+    expect(dhcpCidrProblem("10.0.0.0/30", ["10.0.0.2"])).toBeUndefined();
+    expect(dhcpCidrProblem("10.0.0.0/24", [])).toBeUndefined();
+  });
+
+  it("still reports the malformed and no-pool prefixes ahead of the occupancy check", () => {
+    // The specific message for the shape of the entry wins: someone who typed a
+    // /31 needs to hear about the /31, not about their own NICs.
+    expect(dhcpCidrProblem("10.0.0.0/31", ["10.0.0.1"])).toContain("RFC 3021");
+    expect(dhcpCidrProblem("10.0.0.7/32", ["10.0.0.7"])).toContain("single address");
+    expect(dhcpCidrProblem("0.0.0.0/0", ["10.0.0.1"])).toContain("not a subnet");
+    expect(dhcpCidrProblem("999.0.0.1/24", ["10.0.0.1"])).toContain("999.0.0.1");
+    // Blank is still "leave it alone", not an error, whatever this machine holds.
+    expect(dhcpCidrProblem("   ", ["10.0.0.1"])).toBeUndefined();
+  });
+
+  it("is byte-for-byte the old function when no addresses are supplied", () => {
+    // The quick editor's live `validateInput` calls it exactly this way.
+    expect(dhcpCidrProblem("10.0.0.0/30")).toBeUndefined();
+    expect(dhcpCidrProblem("10.0.0.0/29")).toBeUndefined();
+    expect(dhcpCidrProblem("10.0.0.0/24")).toBeUndefined();
+  });
+});

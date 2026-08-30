@@ -236,7 +236,17 @@ export function registerNetworkServerCommands(
               Promise.resolve(dhcpFormAutofillFields(key, value, values, interfaces, previousValue))
           : undefined,
       onSubmit: async (values) => {
-        const problem = kind === "dhcp" ? validateDhcpValues(values) : validateTftpFormInput(values);
+        // The same NIC list the autofill derives against, from the same
+        // per-open enumeration: a CIDR the autofill could fill nothing for
+        // because this machine holds every poolable address must not then save
+        // as if the row had been left blank.
+        const problem =
+          kind === "dhcp"
+            ? validateDhcpValues(
+                values,
+                interfaces.map((option) => option.value)
+              )
+            : validateTftpFormInput(values);
         if (problem) {
           // Thrown, not reported here: WebviewFormPanel turns this into a
           // "Save failed" message and leaves the panel open with the input.
