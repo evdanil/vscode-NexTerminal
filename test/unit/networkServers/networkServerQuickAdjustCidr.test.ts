@@ -975,3 +975,109 @@ describe("the Interface row — the server identifier follows the rebind", () =>
     expect(written("serverId")).toBe("10.0.0.1");
   });
 });
+
+/**
+ * The FOURTH place a change moves the wire this service answers on, and the last
+ * one the identifier fix had not reached. The two CIDR rows move the pool under
+ * a fixed bind, the Interface row moves the bind under a fixed pool — and this
+ * row moves the pool AND, in the same confirmation, offers to rebind the NIC
+ * under it. Moving Pool Start from 192.168.2.x to 10.0.0.x used to fill in the
+ * gateway and rebind `interface`, while leaving option 54 (and the BOOTP
+ * `siaddr` a ZTP client boots from) naming the NIC the socket had just stopped
+ * answering on.
+ *
+ * The rebind being part of the same batch is what makes this row its own case:
+ * the bind that will be in force once the offer is accepted is the SUGGESTED
+ * one, not the configured one, so that is what `next` has to be resolved
+ * against. `previous` still asks under the bind as it stands, because at that
+ * point nothing has moved it.
+ */
+describe("the Pool Start row — the server identifier follows the rebind", () => {
+  /** eth0 off the 10.0.0.0/24 pool, eth1 on it. */
+  function twoNics(): void {
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5")],
+      eth1: [ipv4("10.0.0.5")]
+    });
+  }
+
+  it("fills the identifier from the bound NIC on a same-subnet move, with no rebind involved", async () => {
+    // The bind is already on the pool's subnet, so `offSubnetInterfaceWrite` has
+    // nothing to say and the identifier resolves through the `match` branch —
+    // the bound NIC itself, not eth0 and not the derived gateway (10.0.0.254).
+    twoNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5" });
+    quickPickScript = [pickRow("Pool Start"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.20"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    // The pool moved and kept its 90-address size.
+    expect(written("rangeStart")).toBe("10.0.0.20");
+    expect(written("rangeEnd")).toBe("10.0.0.109");
+    // Nothing rebound: the bind was never off the pool's subnet.
+    expect(written("interface")).toBe("10.0.0.5");
+    expect(written("serverId")).toBe("10.0.0.5");
+    // …and it is the NIC's address, not the address the network implies.
+    expect(written("gateway")).toBe("10.0.0.254");
+  });
+
+  it("names the NIC the socket will actually answer on, on a cross-subnet move that also rebinds", async () => {
+    // The move takes the pool off eth0, so the batch carries a rebind to eth1.
+    // Option 54 has to end up naming 10.0.0.5, not the 192.168.2.5 still in the
+    // settings when the offer is assembled — this pins the end-to-end result,
+    // not the specific `next.bindAddress` spelling that produces it: per the
+    // doc comment on offerPoolAutoFill, resolving against the suggested bind
+    // or the still-configured one is provably the same NIC here today, so no
+    // fixture in this file can (or needs to) tell those two spellings apart.
+    twoNics();
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.2.99", interface: "192.168.2.5" });
+    quickPickScript = [pickRow("Pool Start"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.20"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("rangeStart")).toBe("10.0.0.20");
+    expect(written("interface")).toBe("10.0.0.5");
+    expect(written("serverId")).toBe("10.0.0.5");
+    // Neither the old bind nor the derived gateway.
+    expect(written("gateway")).toBe("10.0.0.254");
+  });
+
+  it("keeps the explicitly bound address under relay, where the pool is deliberately elsewhere", async () => {
+    // The arrangement relay exists for: bound to eth0's own 192.168.2.5 while
+    // serving a relayed 10.0.0.0/24. No NIC is suggested from a relayed pool, so
+    // nothing rebinds — and the service still answers from 192.168.2.5, which is
+    // what renewals and ZTP fetches have to reach. Both wrong answers are
+    // visibly different here: the pool's NIC (10.0.0.5) and the derived gateway
+    // (10.0.0.254).
+    twoNics();
+    seed({
+      rangeStart: "192.168.2.10",
+      rangeEnd: "192.168.2.99",
+      interface: "192.168.2.5",
+      allowRelayAgents: true
+    });
+    quickPickScript = [pickRow("Pool Start"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.20"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("192.168.2.5");
+    expect(written("serverId")).toBe("192.168.2.5");
+    expect(written("gateway")).toBe("10.0.0.254");
+  });
+
+  it("leaves a hand-set identifier alone while still moving the pool", async () => {
+    // 10.0.0.1 is not what the pool as it stood resolved to (that was 10.0.0.5),
+    // so someone typed it — a decision, not a leftover suggestion. Kills an
+    // ungated write, which lands 10.0.0.5 in option 54 over the top of it.
+    twoNics();
+    seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.1" });
+    quickPickScript = [pickRow("Pool Start"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.20"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("10.0.0.1");
+    // The rest of the offer still applied over it, so the batch did run.
+    expect(written("rangeStart")).toBe("10.0.0.20");
+    expect(written("gateway")).toBe("10.0.0.254");
+  });
+});

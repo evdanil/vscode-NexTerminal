@@ -493,6 +493,18 @@ interface AutoFillWrite {
   readonly display?: string;
 }
 
+/**
+ * The bind-address offer specifically, whose value is known to be one address.
+ *
+ * Narrower than {@link AutoFillWrite} on purpose: callers that have to reason
+ * about the bind the batch is *about to* establish — {@link offerPoolAutoFill}
+ * resolves the Server Identifier against it — would otherwise have to re-narrow
+ * a `SettingValue` that can also be a number, a list or a record, and the only
+ * safe way to do that inline is a guard that reads as though the value might
+ * genuinely be something else.
+ */
+type BindAutoFillWrite = AutoFillWrite & { readonly value: string };
+
 function describeAutoFillWrite(write: AutoFillWrite): string {
   const shown = write.display ?? (Array.isArray(write.value) ? write.value.join(", ") : String(write.value));
   return `${AUTO_FILL_LABELS[write.key] ?? write.key} ${shown}`;
@@ -552,16 +564,17 @@ function readDnsSetting(section: vscode.WorkspaceConfiguration): string[] {
  * (none) both mean the picker stays the way to answer.
  *
  * @param interfaces Passed in rather than enumerated here so a caller that also
- *   needs the NIC list — {@link editNetworkCidr}, which derives the pool around
- *   this machine's addresses and resolves the server identifier from them —
- *   asks the platform once and cannot end up comparing two different answers.
+ *   needs the NIC list — {@link editNetworkCidr} and {@link offerPoolAutoFill},
+ *   which derive the pool around this machine's addresses and resolve the server
+ *   identifier from them — asks the platform once and cannot end up comparing two
+ *   different answers.
  */
 function offSubnetInterfaceWrite(
   section: vscode.WorkspaceConfiguration,
   rangeStart: string | undefined,
   subnet: string | undefined,
   interfaces: readonly NetworkInterfaceOption[]
-): AutoFillWrite | undefined {
+): BindAutoFillWrite | undefined {
   const allowRelayAgents = section.get<boolean>("allowRelayAgents", false) === true;
   const bindAddress = rawString(section, "interface");
   const status = dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, allowRelayAgents);
@@ -583,6 +596,43 @@ function offSubnetInterfaceWrite(
  * The netmask in force is respected rather than assumed: an explicit `subnet`
  * of, say, `255.255.254.0` derives a `.255`-crossing broadcast and the gateway
  * below it, and only an unset mask falls back to /24.
+ *
+ * The Server Identifier (option 54) rides along for the same reason it does on
+ * the two CIDR rows and the Interface row — this is the FOURTH place a change
+ * moves the wire the service answers on, and the only one the identifier fix had
+ * not reached. Moving the pool from `192.168.2.x` to `10.0.0.x` here rebound the
+ * `interface` (below) and filled in the gateway, while leaving option 54 — and
+ * the BOOTP `siaddr` a ZTP client boots from — naming the NIC the socket had
+ * just stopped answering on.
+ *
+ * `editNetworkCidr` can also offer an interface rebind in the same batch it
+ * resolves the identifier against, and gets away with reading the identifier
+ * from the configured bind regardless, because the network it derives is
+ * itself built from this machine's own addresses — the rebind it offers can
+ * only ever point at a NIC that derivation already accounted for. This
+ * trigger point has no such guarantee: the pool here is whatever the user
+ * typed, so `offSubnetInterfaceWrite`'s offer is the only place a bind that
+ * will actually be in force once the confirmation is accepted gets decided.
+ * The `next` endpoint therefore reads the suggestion when there is one and
+ * the configured bind otherwise; only `previous` — which asks "would the
+ * pool as it stood already have resolved to what is configured" — is asked
+ * under the bind as it stands, because at that point nothing has moved it.
+ *
+ * As the two functions stand today that distinction cannot change an answer, and
+ * no test can pin it: `offSubnetInterfaceWrite` offers a bind only when the
+ * configured one is a `mismatch` for the new pool, and the address it offers is
+ * `suggestBindAddressForPool`'s — which is the very fallback
+ * {@link resolveDhcpServerIdentifier} reaches for a bind that is not a `match`.
+ * Both spellings therefore resolve to the same NIC in every reachable state. It
+ * is written the explicit way regardless, because the equality is a coincidence
+ * of those two functions agreeing rather than a property of this one: the moment
+ * the rebind offer narrows (a NIC it declines to suggest, a confirmation split
+ * out of this batch) the naive spelling starts advertising an address the socket
+ * is about to stop answering on, silently and with no test to catch it.
+ *
+ * The gate is {@link refreshDhcpServerIdentifier}'s, shared with the other three
+ * call sites, so an identifier the user typed survives a pool move exactly as it
+ * survives a network change, and relay mode is forwarded rather than re-decided.
  */
 async function offerPoolAutoFill(
   rangeStart: string,
@@ -604,8 +654,22 @@ async function offerPoolAutoFill(
     writes.push({ key: "broadcast", value: derived.broadcast });
   }
   if (isDnsAutoFillable(dns, previous?.dns)) writes.push({ key: "dns", value: [...derived.dns] });
-  const bind = offSubnetInterfaceWrite(section, rangeStart, subnet, networkInterfaceBindOptions());
+  // Enumerated once and shared by the rebind offer and the identifier
+  // resolution below, for the reason `offSubnetInterfaceWrite` documents: two
+  // enumerations across one edit can disagree about which NICs exist.
+  const interfaces = networkInterfaceBindOptions();
+  const bindAddress = rawString(section, "interface");
+  const bind = offSubnetInterfaceWrite(section, rangeStart, subnet, interfaces);
   if (bind) writes.push(bind);
+
+  const resolvedServerId = refreshDhcpServerIdentifier({
+    next: { rangeStart, subnet, bindAddress: bind ? bind.value : bindAddress },
+    previous: { rangeStart: previousStart, subnet, bindAddress },
+    interfaces,
+    allowRelayAgents: section.get<boolean>("allowRelayAgents", false) === true,
+    configuredServerId: rawString(section, "serverId")
+  });
+  if (resolvedServerId !== undefined) writes.push({ key: "serverId", value: resolvedServerId });
 
   await confirmAutoFill(`Fill in the addresses that follow from ${rangeStart}?`, writes);
 }
